@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     msgpack_decode,
     msgpack_encode,
+    row_output_ids,
     unwrap_from_pickle,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
@@ -109,6 +110,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def finished(self):
         return self._finished
@@ -185,7 +187,10 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
         customized_info = unwrap_from_pickle(payload.customized_info)
 
-        self.assertEqual(payload.output_ids, [[10, 11], [20, 21, 22], [30]])
+        self.assertEqual(
+            [list(row_output_ids(payload, i)) for i in range(3)],
+            [[10, 11], [20, 21, 22], [30]],
+        )
         self.assertEqual(
             customized_info["probe"],
             [[None, None], [200, 201, 202], [None]],
@@ -844,7 +849,7 @@ class TestOutputStreamerStreamInterval(unittest.TestCase):
                     req.output_ids.extend(range(num_tokens))
                     accumulator = _accumulator()
                     accumulator.accept(req=req)
-                    sent.append(sum(map(len, accumulator.output_ids)))
+                    sent.append(len(accumulator.output_ids_flat))
                 self.assertEqual(sent, expected)
 
 
@@ -1086,6 +1091,55 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         )
 
         self.assertEqual(payload.http_worker_ipcs, [])
+
+
+class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
+    def test_payload_carries_prefill_spans_for_finished_requests(self):
+        """Prefill spans computed before the KV release ride out with the finished request."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20], finished=True)
+        finished_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4),
+            WeightVersionSpan(version="v1", start=4, end=6),
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.prefill_weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v0", start=0, end=4),
+                    WeightVersionSpan(version="v1", start=4, end=6),
+                ],
+            ],
+        )
+
+    def test_an_unfinished_request_withholds_its_prefill_spans(self):
+        """Spans of a request still generating must not ship before its finishing chunk."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        streaming_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4)
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+
+    def test_payload_omits_prefill_spans_when_the_flag_is_off(self):
+        """With tracking disabled every request contributes None, so nothing goes on the wire."""
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=_FakeReq("r0", [10], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+        self.assertIsNotNone(payload.weight_versions)
 
 
 if __name__ == "__main__":

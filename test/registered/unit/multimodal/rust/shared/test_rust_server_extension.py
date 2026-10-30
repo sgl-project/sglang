@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
@@ -126,7 +127,8 @@ def build_rust_frame_metadata_fixture() -> dict:
         rids=["done", "running"],
         finished_reasons=[{"type": "length", "length": 3}, None],
         prompt_tokens=[5, 6],
-        output_ids=[array("q", [1, 2, 3]), array("q", [4])],
+        output_ids_flat=array("q", [1, 2, 3, 4]),
+        output_ids_offsets=[0, 3, 4],
         cached_tokens=[0, 0],
         reasoning_tokens=[0, 0],
         weight_versions=[swapped, None],
@@ -147,7 +149,8 @@ def build_rust_frame_metadata_fixture() -> dict:
         rids=["logprobs", "plain"],
         finished_reasons=[{"type": "length", "length": 2}, None],
         prompt_tokens=[3, 4],
-        output_ids=[array("q", [7, 8]), array("q", [9])],
+        output_ids_flat=array("q", [7, 8, 9]),
+        output_ids_offsets=[0, 2, 3],
         cached_tokens=[0, 0],
         reasoning_tokens=[0, 0],
         weight_versions=[single, None],
@@ -205,7 +208,8 @@ def build_rust_frame_metadata_fixture() -> dict:
             rids=rids,
             finished_reasons=[{"type": "length", "length": 1}] * len(rids),
             prompt_tokens=[16] * len(rids),
-            output_ids=[array("q", [1])] * len(rids),
+            output_ids_flat=array("q", [1] * len(rids)),
+            output_ids_offsets=list(range(len(rids) + 1)),
             cached_tokens=[req.cached_tokens for req in reqs.values()],
             reasoning_tokens=[0] * len(rids),
             weight_versions=None,
@@ -293,13 +297,15 @@ def generation_payload(rows: dict, **columns) -> SimpleNamespace:
     """A `push_generation` payload for `rows` (rid -> new output ids), every
     optional column unset unless `columns` sets it."""
     rids = list(rows)
+    output_ids_flat, output_ids_offsets = flatten_output_ids(rows.values())
     return SimpleNamespace(
         **{
             **NO_EXTRAS,
             "rids": rids,
             "finished_reasons": [None] * len(rids),
             "prompt_tokens": [1] * len(rids),
-            "output_ids": [array("q", ids) for ids in rows.values()],
+            "output_ids_flat": output_ids_flat,
+            "output_ids_offsets": output_ids_offsets,
             "cached_tokens": [0] * len(rids),
             "reasoning_tokens": [0] * len(rids),
             "weight_versions": None,

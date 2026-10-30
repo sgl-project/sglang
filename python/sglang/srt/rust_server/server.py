@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import operator
 import os
 import time
 from array import array
@@ -550,7 +551,6 @@ class RustServer:
         buffers plus a per-position ``lens`` vector (0 = null position). Hidden
         states flatten to rows of floats (one row per output position).
         """
-        output_ids = payload.output_ids or []
         prompt_tokens = payload.prompt_tokens or []
 
         # Hot-path guard: almost no decode step wants logprobs / hidden states,
@@ -569,15 +569,14 @@ class RustServer:
         # Python-level pass over the batch costs inter-token latency: `rids` are
         # the plain rid strings (hashed to a routing key on the Rust side with a
         # per-process seed, off the GIL — not parsed; a rid is any string),
-        # `finished_reasons` already `dict | None`, and `output_ids` entries are
-        # always `array("q")` slices of `Req.output_ids` (never None), so both
-        # `map`s stay in C and their bytes go out as-is: one memcpy per request,
-        # no per-element repack. Measured at 256 single-token requests: 10 us,
-        # against 18 us for `array("i", chain.from_iterable(...))`.
+        # `finished_reasons` already `dict | None`, and the token ids already
+        # one flat `array("q")`, whose bytes go out as-is in one copy, with
+        # `tok_lens` taken from its row offsets in a C-level `map`.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
-        tok_lens = list(map(len, output_ids))
-        flat_ids = b"".join(map(array.tobytes, output_ids))
+        offsets = payload.output_ids_offsets
+        tok_lens = list(map(operator.sub, offsets[1:], offsets[:-1]))
+        flat_ids = payload.output_ids_flat.tobytes()
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution

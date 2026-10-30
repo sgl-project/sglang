@@ -449,7 +449,7 @@ DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.se
 
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-1027`.
 - **Monokernels.** At low concurrency, add the monokernel flags below.
-- **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
+- **HiCache.** At high concurrency, add one of the TP4 HiCache blocks below instead. Use the 10–24 block through concurrency 24 and the 28–40 block above it. Within each block, set `--max-running-requests` and `--cuda-graph-max-bs-decode` to the concurrency cap, and select the listed `--prefill-decode-interval`. `--hicache-size` is the host tier in GB per rank: 253 GB needs about 1.01 TB across four ranks, and 310 GB needs about 1.24 TB.
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -487,9 +487,39 @@ python -m sglang.launch_server \
   --prefill-decode-interval 64
 ```
 
-```bash HiCache (high concurrency)
+At concurrency 1, set `--max-running-requests 1`, `--cuda-graph-max-bs-decode 1`, and leave `--prefill-decode-interval` at the base value of 20.
+
+```bash HiCache (concurrency 10-24)
+PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --tp-size 4 \
   --ep-size 4 \
+  --mem-fraction-static 0.88 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --prefill-decode-interval 64 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs-decode 4 \
+  --swa-full-tokens-ratio 0.1 \
+  --enable-hierarchical-cache \
+  --hicache-size 253 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
+
+At concurrency 16, also set `--schedule-policy shortest-prefill-first`, `--max-running-requests 12`, `--cuda-graph-max-bs-decode 12`, and `--prefill-decode-interval 96`; leave `--mem-fraction-static` at the base value of 0.85. At concurrency 24, set `--schedule-policy shortest-prefill-first`, `--max-running-requests 48`, `--mem-fraction-static 0.96`, and `--prefill-decode-interval 48`; leave `--cuda-graph-max-bs-decode` at the base value of 128.
+
+```bash HiCache (concurrency 28-40)
+PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+  --tp-size 4 \
+  --ep-size 4 \
+  --mem-fraction-static 0.86 \
+  --chunked-prefill-size 16384 \
+  --max-prefill-tokens 16384 \
+  --prefill-decode-interval 80 \
   --max-running-requests 80 \
   --swa-full-tokens-ratio 0.1 \
   --schedule-policy shortest-prefill-first \
@@ -499,6 +529,8 @@ python -m sglang.launch_server \
   --hicache-io-backend kernel \
   --hicache-mem-layout page_first
 ```
+
+At concurrency 28, set `--max-running-requests 56` and `--cuda-graph-max-bs-decode 56`. At concurrency 36, set `--max-running-requests 72`, `--cuda-graph-max-bs-decode 72`, and `--prefill-decode-interval 24`. At concurrency 40, leave `--cuda-graph-max-bs-decode` at the base value of 128.
 
 ## 1. Model introduction
 
