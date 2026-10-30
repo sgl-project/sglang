@@ -4,6 +4,7 @@ import sys
 import time
 import unittest
 
+import psutil
 import requests
 import torch
 
@@ -16,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    find_available_port,
     popen_launch_server,
 )
 
@@ -29,8 +31,9 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner). Each class also has a vmm_fd variant, which
-# brings up one more fixture.
-register_cuda_ci(est_time=780, stage="extra-a", runner_config="2-gpu-large")
+# brings up one more fixture. The vmm_fd two-client class uses one GPU but runs
+# on the 2-GPU runner only, to keep its extra server launches out of base-b.
+register_cuda_ci(est_time=970, stage="extra-a", runner_config="2-gpu-large")
 register_cuda_ci(est_time=142, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
@@ -84,6 +87,47 @@ def _read_logs(paths) -> str:
             with open(path, errors="replace") as f:
                 logs += f.read()
     return logs
+
+
+def _daemon_pid(device_uuid) -> int:
+    """The PID that the daemon serving ``device_uuid`` wrote to its ready file."""
+    with open(get_ready_path(device_uuid)) as f:
+        for line in f:
+            key, _, value = line.strip().partition("=")
+            if key == "pid":
+                return int(value)
+    raise RuntimeError(f"No pid in {get_ready_path(device_uuid)}")
+
+
+def _open_fd_count(pid: int) -> int:
+    return len(os.listdir(f"/proc/{pid}/fd"))
+
+
+def _wait_for_log_count(paths, text: str, count: int, timeout: float = 30) -> int:
+    """How often ``text`` appears in the logs, once that reaches ``count`` or
+    after ``timeout`` seconds. The launcher copies a server's output into the
+    log files from a thread, so a line can land after the server is healthy."""
+    deadline = time.time() + timeout
+    while True:
+        found = _read_logs(paths).count(text)
+        if found >= count or time.time() > deadline:
+            return found
+        time.sleep(1)
+
+
+def _still_running(procs) -> list:
+    """The processes in ``procs`` that have not exited. A zombie has already
+    released its resources, so it does not count. (Polled rather than
+    psutil.wait_procs, which can fail on processes that are not our children;
+    see kill_process_tree.)"""
+    running = []
+    for proc in procs:
+        try:
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                running.append(proc)
+        except psutil.NoSuchProcess:
+            pass
+    return running
 
 
 @unittest.skipIf(
@@ -559,6 +603,124 @@ class TestWeightCacheDaemonQwen3MoeAttnCPVmmFd(
     @classmethod
     def extra_args(cls) -> list:
         return _moe_runner_args()
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2,
+    "Three servers come and go next to one daemon, so this class runs in the "
+    "2-GPU suite (extra-a) only, to limit the per-PR 1-GPU suite's runtime; "
+    "the test itself uses one GPU",
+)
+class TestWeightCacheDaemonVmmFdTwoClients(TestWeightCacheDaemonTP1Smoke):
+    """Two engines on one GPU map the same vmm_fd allocations of one daemon.
+
+    The fixture's server (A) and a second one (B) attach. A is stopped with
+    SIGTERM, and B keeps serving A's greedy completions. A third server (C)
+    attaches next to B, B is killed with SIGKILL, and C keeps serving them.
+    The daemon's open file descriptors stay the same throughout: it closed
+    the fds it exported for every fetch.
+    """
+
+    # The test stops the fixture's server itself; a retry would reuse it.
+    expect_server_exit = True
+    daemon_args = VMM_FD_ARGS
+    # Every server gets the same small KV cache, so that two of them can run
+    # next to each other with the same configuration.
+    server_args = [*VMM_FD_ARGS, "--max-total-tokens", "16384"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.other_servers = []
+        cls.other_logs = []
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            for process in cls.other_servers:
+                if process.poll() is None:
+                    kill_process_tree(process.pid)
+            for stream in cls.other_logs:
+                stream.close()
+                if os.path.exists(stream.name):
+                    os.unlink(stream.name)
+        finally:
+            # Do not signal a process that has already exited: its PID may
+            # belong to another process by now.
+            for attr in ("process", "daemon_process"):
+                process = getattr(cls, attr, None)
+                if process is not None and process.poll() is not None:
+                    setattr(cls, attr, None)
+            super().tearDownClass()
+
+    def _launch_server(self, label: str):
+        """Another client-mode server on the fixture's GPU and daemon."""
+        port = find_available_port(int(self.base_url.rsplit(":", 1)[1]) + 100)
+        base_url = f"http://127.0.0.1:{port}"
+        # Open until tearDownClass: the launcher copies the server's output
+        # into them for as long as it runs.
+        streams = [
+            open(f"/tmp/test_weight_cache_daemon_two_clients_{label}_{name}.log", "w")
+            for name in ("stdout", "stderr")
+        ]
+        self.other_logs.extend(streams)
+        process = popen_launch_server(
+            self.model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp",
+                str(self.tp_size),
+                "--weight-cache-mode",
+                "client",
+                *self.server_args,
+            ],
+            return_stdout_stderr=tuple(streams),
+        )
+        self.other_servers.append(process)
+        # At least: a retried launch logs into the same files. A server that
+        # fell back to disk could only mean the daemon is gone, which the fd
+        # checks of the test would catch.
+        mapped = _wait_for_log_count(
+            [stream.name for stream in streams], "vmm_fd: mapped", self.tp_size
+        )
+        self.assertGreaterEqual(
+            mapped,
+            self.tp_size,
+            f"Expected server {label} to map the daemon's vmm_fd allocations.",
+        )
+        return process, base_url
+
+    def test_two_clients_one_exits(self):
+        # Last in name order: it stops the fixture's server, A.
+        reference = self.greedy_outputs
+        daemon_pid = _daemon_pid(self.gpu_uuids[0])
+        b, b_url = self._launch_server("B")
+        self.assertEqual(_greedy_completions(b_url, self.model), reference)
+        # A and B have both fetched from the daemon by now.
+        daemon_fds = _open_fd_count(daemon_pid)
+
+        # SIGTERM to A's launcher, as an operator would send it; then wait
+        # until every process of A has exited, and its mappings with it.
+        a_procs = [psutil.Process(self.process.pid)]
+        a_procs += a_procs[0].children(recursive=True)
+        self.process.terminate()
+        self.process.wait(timeout=120)
+        deadline = time.time() + 60
+        while _still_running(a_procs) and time.time() < deadline:
+            time.sleep(1)
+        self.assertEqual(
+            _still_running(a_procs), [], "Server A did not exit after SIGTERM."
+        )
+        self.assertEqual(_greedy_completions(b_url, self.model), reference)
+        self.assertEqual(_open_fd_count(daemon_pid), daemon_fds)
+
+        _, c_url = self._launch_server("C")
+        self.assertEqual(_greedy_completions(c_url, self.model), reference)
+        # SIGKILL to every process of B; returns once they have exited.
+        kill_process_tree(b.pid)
+        self.assertEqual(_greedy_completions(c_url, self.model), reference)
+        self.assertEqual(_open_fd_count(daemon_pid), daemon_fds)
 
 
 if __name__ == "__main__":
