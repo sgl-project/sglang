@@ -335,58 +335,49 @@ def generate_gsm8k_dataset(
 def generate_gsm8k_shared_prefix_dataset(
     model_path,
     source_dataset_path,
-    test_dataset_path,
     batch_size,
     input_len,
     output_file,
 ):
     """Generate a natural-text shared-prefix dataset from GSM8K.
 
-    bench_serving's generated-shared-prefix dataset builds system prompts
-    from random token ids, which the DSPARK draft cannot predict - the
+    bench_serving's generated-shared-prefix dataset builds prompts from
+    random token ids, which the DSPARK draft cannot predict - the measured
     acceptance length collapses to ~1.6 vs the dev-measured 3.9 on natural
-    text. This generator instead builds a byte-identical natural-text
-    prefix (one GSM8K question repeated to ~input_len tokens) shared by
-    every row, plus a short unique GSM8K question as the per-row suffix,
-    so radix-cache sharing stays near 100% while the draft sees real
-    language.
+    text. This generator instead pads one GSM8K QA pool (natural text,
+    repeated cyclically) slightly past input_len and writes batch_size
+    identical rows, so bench_serving's random-mode truncation leaves every
+    request byte-identical - the same 100%-cache shape as the dev
+    acceptance dataset (sharegpt_natural_shared_131072_100cache_480.json),
+    whose divergence points sit beyond the truncation length on purpose.
 
     Output is a JSON array in the ShareGPT "conversations" layout that
-    bench_serving --dataset-name random consumes via
-    sample_random_requests.
+    bench_serving --dataset-name random consumes via sample_random_requests.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     train_data = load_jsonl(source_dataset_path)
-    test_data = load_jsonl(test_dataset_path)
-    if batch_size > len(test_data):
-        multiplier = (batch_size // len(test_data)) + 1
-        test_data = (test_data * multiplier)[:batch_size]
-    else:
-        test_data = test_data[:batch_size]
-
-    # Shared prefix: repeat the first QA pair's tokens up to 99% of input_len.
-    prefix_text = format_qa(train_data[0])
-    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
-    target_prefix = int(input_len * 0.99)
-    repeat = (target_prefix // len(prefix_ids)) + 1
-    prefix_ids = (prefix_ids * repeat)[:target_prefix]
-    prefix_text = tokenizer.decode(prefix_ids)
+    pool_ids = []
+    total = 0
+    target = int(input_len * 1.01)  # over-fill: truncation lands inside the shared prefix
+    for item in train_data * ((target // 500) + 1):  # a QA pair is ~200-500 tokens
+        ids = tokenizer.encode(format_qa(item), add_special_tokens=False)
+        pool_ids.extend(ids)
+        total = len(pool_ids)
+        if total >= target:
+            break
+    pool_ids = pool_ids[:total]
+    prompt_text = tokenizer.decode(pool_ids[:target])
 
     output_data = []
-    for item in test_data:
-        question = item["question"]
-        answer = item["answer"]
-        full_text = (
-            f"{prefix_text}Question: {question}\n"
-            f"Let's think step by step\nAnswer:\n{answer}"
-        )
+    for i in range(batch_size):
         output_data.append(
             {
+                "id": f"gsm8k_shared_prefix_{i:02d}",
                 "conversations": [
-                    {"from": "human", "value": full_text},
+                    {"from": "human", "value": prompt_text},
                     {"from": "gpt", "value": "none"},
-                ]
+                ],
             }
         )
 
@@ -395,7 +386,10 @@ def generate_gsm8k_shared_prefix_dataset(
         os.makedirs(output_dir, exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False)
-    print(f"Shared-prefix GSM8K dataset saved to {output_file} ({len(output_data)} rows)")
+    print(
+        f"Shared-prefix GSM8K dataset saved to {output_file} "
+        f"({len(output_data)} identical rows of ~{input_len} tokens)"
+    )
 
 
 def generate_random_dataset(

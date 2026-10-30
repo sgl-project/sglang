@@ -412,15 +412,16 @@ def run_bench_serving(
         # Natural-text shared-prefix dataset: bench_serving's built-in
         # generated-shared-prefix prompts are random token ids, which the
         # DSPARK draft cannot predict (accept len ~1.6, run 40993824705).
-        # Build a GSM8K question repeated to ~99% of input_len shared by
-        # every row with a unique short question suffix per row, then send
-        # it through the plain random-dataset path like the dev scripts do.
+        # Pad one GSM8K QA pool to 101% of input_len and emit identical
+        # rows, so random-mode truncation leaves every request
+        # byte-identical - the dev acceptance shape
+        # (sharegpt_natural_shared_131072_100cache_480.json, whose
+        # divergence points sit past the truncation length on purpose).
         dataset_file = "/tmp/datasets/gsm8k_shared_prefix.json"
         if not os.path.exists(dataset_file):
             generate_gsm8k_shared_prefix_dataset(
                 model_path=model_path,
                 source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
-                test_dataset_path=GSM8K_DATASET_TEST_FILE,
                 batch_size=num_prompts,
                 input_len=input_len,
                 output_file=dataset_file,
