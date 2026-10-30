@@ -164,19 +164,23 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "flux3_text_encode",
         )
-        image_stage = (
-            Flux3ImageTargetEncodeStage
-            if server_args.disagg_encode_only
-            else Flux3ImageConditionEncodeStage
-        )
         self.add_stage_factory(
             RoleType.IMAGE_ENCODER,
-            lambda: image_stage(
+            lambda: Flux3ImageConditionEncodeStage(
                 vae=self.get_module("vae"),
                 package_config=package_config,
             ),
             "flux3_condition_encode",
         )
+        if server_args.disagg_encode_only:
+            self.add_stage_factory(
+                RoleType.IMAGE_ENCODER,
+                lambda: Flux3ImageTargetEncodeStage(
+                    vae=self.get_module("vae"),
+                    package_config=package_config,
+                ),
+                "flux3_target_encode",
+            )
         self.add_stage_factory(
             RoleType.DENOISER,
             lambda: Flux3ImageDenoiseStage(

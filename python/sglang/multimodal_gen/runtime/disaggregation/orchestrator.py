@@ -32,7 +32,10 @@ from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
     RequestTracker,
 )
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.roles import (
+    RoleType,
+    needs_image_encoder,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     send_tensors,
     unpack_tensors,
@@ -64,6 +67,14 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _inline_local_file(path):
+    if isinstance(path, str) and os.path.isfile(path):
+        return "data:application/octet-stream;base64," + base64.b64encode(
+            Path(path).read_bytes()
+        ).decode("ascii")
+    return path
 
 
 def _deserialize_request_metrics(data: dict | None) -> RequestMetrics | None:
@@ -614,25 +625,27 @@ class DiffusionServer:
             )
             return
 
-        if self._input_role == RoleType.PROMPT_ENCODER and req.image_path:
+        if self._input_role == RoleType.PROMPT_ENCODER and needs_image_encoder(
+            req.image_path, req.encode_target
+        ):
             # HTTP uploads belong to the head's filesystem, not the GPU workers'.
-            paths = (
-                req.image_path
-                if isinstance(req.image_path, (list, tuple))
-                else [req.image_path]
-            )
             try:
-                req.image_path = [
-                    "data:application/octet-stream;base64,"
-                    + base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                    if isinstance(path, str) and os.path.isfile(path)
-                    else path
-                    for path in paths
-                ]
+                if req.image_path:
+                    paths = (
+                        req.image_path
+                        if isinstance(req.image_path, (list, tuple))
+                        else [req.image_path]
+                    )
+                    req.image_path = [_inline_local_file(path) for path in paths]
+                if req.encode_target:
+                    req.encode_target = {
+                        stream: _inline_local_file(path)
+                        for stream, path in req.encode_target.items()
+                    }
                 payload = pickle.dumps(reqs)
             except OSError as error:
                 self._complete_with_error(
-                    request_id, f"Cannot read reference image: {error}"
+                    request_id, f"Cannot read request image: {error}"
                 )
                 return
 
@@ -911,6 +924,8 @@ class DiffusionServer:
             restore_extra_tensors(encoded, tensor_fields, scalar_fields)
             for key in [k for k in scalar_fields if k.startswith("_extra_")]:
                 encoded[key[len("_extra_") :]] = scalar_fields.pop(key)
+            # What remains are Req tensor fields (e.g. prompt_embeds).
+            encoded.update(tensor_fields)
             output_batch = OutputBatch(
                 encoded=encoded or None, error=scalar_fields.get("error")
             )
@@ -1185,6 +1200,19 @@ class DiffusionServer:
             )
             return
 
+        if bool(msg.get("encode_only", False)) != self._encode_only:
+            # Mismatched workers would stage for a denoiser that does not exist,
+            # or answer with extras the head treats as errors.
+            logger.error(
+                "DiffusionServer transfer: %s at %s has --disagg-encode-only=%s "
+                "but the head has %s; pass it to both. Dropping registration",
+                role.value,
+                work_endpoint,
+                bool(msg.get("encode_only", False)),
+                self._encode_only,
+            )
+            return
+
         info = {
             "session_id": msg.get("session_id", ""),
             "pool_ptr": msg.get("pool_ptr", 0),
@@ -1223,8 +1251,9 @@ class DiffusionServer:
         if old_transfer is not None:
             self._recycle_prealloc_slot(old_transfer, role)
         next_role = self._role_order[self._role_order.index(role) + 1]
-        if role == RoleType.PROMPT_ENCODER and not msg.get("scalar_fields", {}).get(
-            "image_path"
+        scalar_fields = msg.get("scalar_fields", {})
+        if role == RoleType.PROMPT_ENCODER and not needs_image_encoder(
+            scalar_fields.get("image_path"), scalar_fields.get("encode_target")
         ):
             next_role = RoleType.DENOISER
 

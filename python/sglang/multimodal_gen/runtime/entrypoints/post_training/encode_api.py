@@ -33,6 +33,7 @@ async def encode(request: EncodeRequest):
     sampling_kwargs = dict(
         prompt=request.prompt,
         image_path=request.image_path,
+        encode_target=request.target,
         width=request.width,
         height=request.height,
         save_output=False,

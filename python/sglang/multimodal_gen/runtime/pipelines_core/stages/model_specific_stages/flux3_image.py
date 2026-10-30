@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding impo
     ConditionEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.target_encoding import (
+    TargetEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -632,27 +635,40 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
         return batch
 
 
-class Flux3ImageTargetEncodeStage(Flux3ImageConditionEncodeStage):
-    """Encode the request image, fit to the request size, as a training target."""
+class Flux3ImageTargetEncodeStage(TargetEncodingStage):
+    """The target's VAE tokens, with the ids the denoiser gives generated image tokens."""
 
-    @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        paths = _image_paths(batch)
-        if paths is None:
-            return batch
-        if len(paths) != 1:
-            raise ValueError(f"FLUX.3 takes one target image, got {len(paths)}")
+    def __init__(self, vae, package_config) -> None:
+        super().__init__()
+        self.vae = vae
+        self.package_config = package_config
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "vae",
+                phase="target_encode",
+                target_dtype=precision_to_dtype(self.package_config.vae.dtype),
+                memory_intensive=True,
+                skip_empty_cache_on_release=True,
+            )
+        ]
+
+    def prepare_visual(self, path: str, batch: Req) -> Image.Image:
         latent_shape(batch.height, batch.width)
-        image = ImageOps.fit(
-            ImageOps.exif_transpose(_open_reference(paths[0])).convert("RGB"),
-            (batch.width, batch.height),
-            Image.Resampling.LANCZOS,
-        )
+        return super().prepare_visual(path, batch)
+
+    def encode_visual(
+        self, image: Image.Image, batch: Req, server_args: ServerArgs
+    ) -> dict[str, Tensor]:
         with (
             self.use_declared_component(
                 component_name="vae",
                 module=self.vae,
-                phase="condition_encode",
+                phase="target_encode",
             ),
             use_vae_fast_path(self.vae, batch.quality != "exact"),
         ):
@@ -660,11 +676,10 @@ class Flux3ImageTargetEncodeStage(Flux3ImageConditionEncodeStage):
                 tokens, ids = vae_encode(
                     self.vae, _to_tensor(image).to(get_local_torch_device())
                 )
-        batch.extra["flux3_target"] = (
-            tokens,
-            scaled_ids(ids, self.package_config.dit.image_rope_scale),
-        )
-        return batch
+        return {
+            "latents": tokens,
+            "latent_ids": scaled_ids(ids, self.package_config.dit.image_rope_scale),
+        }
 
 
 class _CFGParallelModel:

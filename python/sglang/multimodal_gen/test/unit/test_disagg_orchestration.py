@@ -5,6 +5,7 @@ import base64
 import json
 import pickle
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,9 +16,13 @@ from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
+    SchedulerDisaggMixin,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     pack_tensors,
     send_tensors,
+    unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
@@ -303,7 +308,10 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
 
 @pytest.mark.parametrize("split", [False, True])
 def test_encode_only_returns_last_encoder_outputs(split):
-    """Without denoisers, the last encoder hop answers the client and frees its slot."""
+    """Without denoisers, the last encoder hop answers the client and frees its slot.
+
+    A training target alone routes the request through the image encoder, and
+    a worker without --disagg-encode-only cannot register."""
     context = zmq.Context()
     sockets = []
 
@@ -353,25 +361,31 @@ def test_encode_only_returns_last_encoder_outputs(split):
         result = {role: socket(zmq.PUSH) for role in roles}
         for role, sock in result.items():
             sock.connect(server._pools[role].result_endpoint)
-            sock.send_multipart(
-                encode_transfer_msg(
-                    dict(
-                        msg_type="transfer_register",
-                        role=role.value,
-                        work_endpoint=endpoints[role],
-                        session_id=role.value,
-                        pool_ptr=1000,
+            for encode_only in (False, True):
+                sock.send_multipart(
+                    encode_transfer_msg(
+                        dict(
+                            msg_type="transfer_register",
+                            role=role.value,
+                            work_endpoint=endpoints[role],
+                            session_id=f"{role.value}-{encode_only}",
+                            pool_ptr=1000,
+                            encode_only=encode_only,
+                        )
                     )
                 )
-            )
         deadline = time.monotonic() + 5
         while not all(server._pools[role].peers for role in roles):
             assert time.monotonic() < deadline
             time.sleep(0.01)
+        # Registrations arrive in order, so the mismatched one was already dropped.
+        assert [server._pools[role].peers[0]["session_id"] for role in roles] == [
+            f"{role.value}-True" for role in roles
+        ]
         client = socket(zmq.REQ)
         client.connect(frontend)
-        image_path = ["reference.png"] if split else None
-        client.send_pyobj([Req(request_id="0", prompt="test", image_path=image_path)])
+        target = {"visual": "target.png"}
+        client.send_pyobj([Req(request_id="0", prompt="test", encode_target=target)])
         work[roles[0]].recv_multipart()
         if split:
             sender, receiver = roles
@@ -382,7 +396,7 @@ def test_encode_only_returns_last_encoder_outputs(split):
                         request_id="0",
                         data_size=64,
                         manifest={},
-                        scalar_fields={"image_path": image_path},
+                        scalar_fields={"encode_target": target},
                     )
                 )
             )
@@ -403,7 +417,8 @@ def test_encode_only_returns_last_encoder_outputs(split):
                 encode_transfer_msg(dict(msg_type="transfer_pushed", request_id="0"))
             )
             assert decode_transfer_msg(work[receiver].recv_multipart())
-        tensor_fields, scalar_fields = {}, {"request_id": "0"}
+        tensor_fields = {"prompt_embeds": [torch.zeros(5, 2)]}
+        scalar_fields = {"request_id": "0"}
         extract_extra_tensors(
             {"text": [(torch.ones(2, 3), torch.arange(4))], "crop": [1, 2]},
             tensor_fields,
@@ -415,6 +430,9 @@ def test_encode_only_returns_last_encoder_outputs(split):
         torch.testing.assert_close(output.encoded["text"][0][0], torch.ones(2, 3))
         torch.testing.assert_close(output.encoded["text"][0][1], torch.arange(4))
         assert output.encoded["crop"] == [1, 2]
+        torch.testing.assert_close(
+            output.encoded["prompt_embeds"][0], torch.zeros(5, 2)
+        )
         deadline = time.monotonic() + 5
         while server._tracker.get("0") is not None:
             assert time.monotonic() < deadline
@@ -427,6 +445,45 @@ def test_encode_only_returns_last_encoder_outputs(split):
         server.stop()
         for sock in sockets:
             sock.close(linger=0)
+        context.destroy(linger=0)
+
+
+def test_encode_only_worker_returns_tensors_and_extras_not_request_scalars():
+    """A worker answers with the Req tensors and extras a denoiser would get,
+    and fails a target its pipeline cannot encode instead of dropping it."""
+    context = zmq.Context()
+    pull, push = context.socket(zmq.PULL), context.socket(zmq.PUSH)
+    port = pull.bind_to_random_port("tcp://127.0.0.1")
+    push.connect(f"tcp://127.0.0.1:{port}")
+    pull.setsockopt(zmq.RCVTIMEO, 5000)
+    worker = SimpleNamespace(
+        _pool_result_push=push,
+        worker=SimpleNamespace(pipeline=SimpleNamespace(pipeline_name="Pipe")),
+    )
+
+    def send(req):
+        SchedulerDisaggMixin._disagg_send_encoded(worker, req, "0")
+        return unpack_tensors(pull.recv_multipart(), device="cpu")
+
+    try:
+        req = Req(request_id="0", prompt="p", encode_target={"visual": "x" * 64})
+        req.prompt_embeds = [torch.ones(3, 2)]
+        req.extra["encode_target"] = {"visual": {"latents": torch.zeros(4, 2)}}
+        tensor_fields, scalar_fields = send(req)
+        assert "prompt_embeds" in tensor_fields
+        assert set(scalar_fields) == {
+            "request_id",
+            "_extra_tensor_tree_encode_target",
+        }
+
+        req.extra.clear()
+        _, scalar_fields = send(req)
+        assert scalar_fields["_disagg_error"] == (
+            "Pipe does not encode training targets"
+        )
+    finally:
+        pull.close(linger=0)
+        push.close(linger=0)
         context.destroy(linger=0)
 
 

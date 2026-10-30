@@ -247,20 +247,28 @@ output pixels with `quality=exact`. Cross-node execution has not been validated.
 ### Encode-only serving {#encode-only}
 
 Pass `--disagg-encode-only` to the head and to every encoder worker to return
-encoder outputs instead of images. The last encoder role on a request's path
-(`encoder`, `prompt_encoder` for text-only requests, or `image_encoder` for
-requests with images) returns its request extras through the head, so the head
-needs no `--denoiser-urls` or `--decoder-urls`. `POST /encode` accepts `prompt`,
-optional `image_path`, `width`, `height`, and `extra_sampling_params`, and
+encoder outputs instead of images; the head refuses a worker whose setting
+differs. The last encoder role on a request's path (`encoder`, `prompt_encoder`
+for text-only requests, or `image_encoder` for requests with images or
+targets) returns what a denoiser would receive, the request's tensors and
+extras, through the head, so the head needs no `--denoiser-urls` or
+`--decoder-urls`.
+
+`POST /encode` accepts `prompt`, optional `image_path` (conditions, as in
+generation), `target`, `width`, `height`, and `extra_sampling_params`, and
 returns msgpack with `request_id` and `encoded`, whose tensors use the
 `/rollout/generate` serialization. Use `/model_info` and `/server_info` to key
 caches of encoded outputs.
 
-For FLUX.3 Image, the prompt encoder returns only the prompt branch of
-`flux3_text`, and the image encoder treats the request image as a training
-target: it fits the image to `width`x`height` (resize and center crop) and
-returns `flux3_target`, the VAE latent tokens with the position ids the denoiser
-uses for generated image tokens.
+`target` maps a latent stream to a path or data URI, e.g.
+`{"visual": "data:image/png;base64,..."}`: the image the denoiser would
+generate, fit to `width`x`height` (resize and center crop) and returned as
+`encoded["encode_target"]["visual"]`, a dict with `latents` in the denoiser's
+layout plus model-specific fields. A pipeline supports targets by adding a
+`TargetEncodingStage` to its image encoder role; others fail target requests.
+FLUX.3 Image supports them, returning `latents` (VAE tokens) and `latent_ids`
+(the ids the denoiser gives generated image tokens); its prompt encoder returns
+only the prompt branch of `flux3_text`.
 
 ## Multiple Instances per Role
 

@@ -117,7 +117,10 @@ class RolloutResponse(BaseModel):
 
 class EncodeRequest(BaseModel):
     prompt: str
+    # Conditions, as in generation (e.g. edit references).
     image_path: Optional[list[str]] = None
+    # Training targets by latent stream, e.g. {"visual": path or data URI}.
+    target: Optional[dict[str, str]] = None
     width: Optional[int] = None
     height: Optional[int] = None
     extra_sampling_params: Optional[dict[str, Any]] = None

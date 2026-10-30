@@ -297,6 +297,13 @@ class SamplingParams:
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
 
+    # Encode-only training targets, by latent stream (e.g. {"visual": path}).
+    # Unlike image_path, a target is what the denoiser would generate, not a
+    # condition on it.
+    encode_target: dict[str, str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
+
     # Text inputs
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}

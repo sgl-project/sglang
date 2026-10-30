@@ -112,7 +112,8 @@ class TestFlux3PackedConditioning(unittest.TestCase):
 
     def test_training_target_matches_the_denoised_image_stream(self):
         """An encode-only target is fit to the request size and carries the ids
-        the denoiser gives its image tokens, so a trainer can use it as x0."""
+        the denoiser gives its image tokens, so a trainer can use it as x0.
+        Requests without a target pass through; other streams are rejected."""
 
         class _VAE(torch.nn.Module):
             def __init__(self):
@@ -131,7 +132,11 @@ class TestFlux3PackedConditioning(unittest.TestCase):
             path = os.path.join(directory, "target.png")
             Image.new("RGB", (1000, 300), (255, 0, 0)).save(path)
             batch = SimpleNamespace(
-                image_path=[path], width=64, height=32, quality="exact", extra={}
+                encode_target={"visual": path},
+                width=64,
+                height=32,
+                quality="exact",
+                extra={},
             )
             with mock.patch(
                 "sglang.multimodal_gen.runtime.pipelines_core.stages."
@@ -139,7 +144,16 @@ class TestFlux3PackedConditioning(unittest.TestCase):
                 return_value=torch.device("cpu"),
             ):
                 stage.forward(batch, server_args=None)
-        tokens, ids = batch.extra["flux3_target"]
+            untargeted = SimpleNamespace(encode_target=None, extra={})
+            stage.forward(untargeted, server_args=None)
+            self.assertEqual(untargeted.extra, {})
+            with self.assertRaisesRegex(ValueError, "audio"):
+                stage.forward(
+                    SimpleNamespace(encode_target={"audio": path}, extra={}),
+                    server_args=None,
+                )
+        target = batch.extra["encode_target"]["visual"]
+        tokens, ids = target["latents"], target["latent_ids"]
         self.assertEqual(tuple(tokens.shape), (8, 12))
         torch.testing.assert_close(tokens[:, 0], torch.ones(8))
         (_, expected_ids), _ = noise_tokens(32, 64, 0, config, torch.device("cpu"))
