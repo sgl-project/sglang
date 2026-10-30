@@ -1102,9 +1102,13 @@ def _deterministic_attention_backend(view: Any) -> dict:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
+    # Views without the per-phase fields (e.g. partial views in tests) mean unset.
+    prefill_backend = getattr(view, "prefill_attention_backend", None)
+    decode_backend = getattr(view, "decode_attention_backend", None)
+
     decode_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
     decode_note = ""
-    if view.decode_attention_backend == "aiter":
+    if decode_backend == "aiter":
         # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
         # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch
         # size, and speculative decoding would run AITER's unverified verify kernels.
@@ -1125,13 +1129,13 @@ def _deterministic_attention_backend(view: Any) -> dict:
     for flag, backend, choices, note in (
         (
             "--prefill-attention-backend",
-            view.prefill_attention_backend,
+            prefill_backend,
             DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
             "",
         ),
         (
             "--decode-attention-backend",
-            view.decode_attention_backend,
+            decode_backend,
             decode_choices,
             decode_note,
         ),
