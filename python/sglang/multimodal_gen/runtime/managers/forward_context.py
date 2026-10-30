@@ -22,6 +22,8 @@ class ForwardContext:
     current_timestep: int
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
+    # A persistent CFG residual must be anchored to real DiT features.
+    force_spectrum_real: bool = False
     _trtllm_gen_sequence_metadata_cache: dict[
         tuple[int, int, int, int],
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -69,7 +71,11 @@ def get_forward_context_or_none() -> "ForwardContext | None":
 
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    force_spectrum_real: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -81,6 +87,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        force_spectrum_real=force_spectrum_real,
     )
 
     try:
