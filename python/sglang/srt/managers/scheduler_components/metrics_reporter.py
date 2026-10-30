@@ -568,7 +568,7 @@ class SchedulerMetricsReporter:
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
-        intermediate_size = float(intermediate_size)
+        intermediate_size = float(intermediate_size) / max(1, get_parallel().tp_size)
 
         dtype_num_bytes = getattr(model_config.dtype, "itemsize", None)
         if dtype_num_bytes is None:
@@ -655,7 +655,7 @@ class SchedulerMetricsReporter:
         # prefix KV once per chunk -- not once per query-key pair.
         prefix_kv_tokens = float(sum(batch.prefix_lens))
         read_bytes = (
-            tokens * self._weight_read_bytes_per_token
+            self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._prefill_attn_act_read_per_token
             + prefix_kv_tokens * self._kv_cache_bytes_per_token
@@ -680,7 +680,7 @@ class SchedulerMetricsReporter:
             + self._attn_dot_flops_coeff * total_context
         )
         read_bytes = (
-            tokens * self._weight_read_bytes_per_token
+            self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._decode_q_read_bytes_per_token
             + total_context * self._kv_cache_bytes_per_token
