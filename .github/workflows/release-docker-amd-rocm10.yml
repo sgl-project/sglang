@@ -12,6 +12,7 @@ on:
           - publish
           - publish-gfx1250
           - publish-gfx1250-rocm101
+          - gfx1250-build-only
       gpu_arch:
         description: 'Select which ROCm 10 GPU arch to build'
         required: false
@@ -135,7 +136,7 @@ jobs:
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
 
   publish-gfx1250-rocm101:
-    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250-rocm101')
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250-rocm101' || inputs.job_select == 'gfx1250-build-only')
     runs-on: amd-docker-scale
     environment: 'prod'
     steps:
@@ -216,7 +217,7 @@ jobs:
   # separate job: no MI450 runner pool consumes the image, so a bring-up build
   # failure must not gate the released gfx942/gfx950 images.
   publish-gfx1250:
-    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250')
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250' || inputs.job_select == 'gfx1250-build-only')
     runs-on: amd-docker-scale
     environment: 'prod'
     steps:
