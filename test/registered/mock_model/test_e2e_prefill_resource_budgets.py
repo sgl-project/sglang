@@ -131,7 +131,7 @@ class TestPrefillResourceBudgetConsensus(CustomTestCase):
         mp.spawn(_consensus_worker, args=(get_open_port(),), nprocs=2, join=True)
 
 
-class _MixedPrefillTP:
+class _PrefillResourceTP:
     RESERVE_TOKENS = 0
     ENGINE_KWARGS = dict(
         model_path=MOCK_MODEL_PATH,
@@ -164,6 +164,8 @@ class _MixedPrefillTP:
         ):
             super().setUpClass()
 
+
+class _MixedPrefillTP(_PrefillResourceTP):
     def test_warm_head_can_share_the_continuation_budget(self):
         self.server.execute_script(
             _script_mixed_fcfs, args=(self.RESERVE_TOKENS > 0, False)
@@ -183,6 +185,127 @@ class TestMixedPrefillTPDefault(_MixedPrefillTP, ScriptedTestCase):
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA GPUs")
 class TestMixedPrefillTPWarmReservation(_MixedPrefillTP, ScriptedTestCase):
     RESERVE_TOKENS = 32
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA GPUs")
+class TestPrefillTPInputBudget(_PrefillResourceTP, ScriptedTestCase):
+    RESERVE_TOKENS = 32
+    ENGINE_KWARGS = dict(
+        _PrefillResourceTP.ENGINE_KWARGS,
+        max_prefill_tokens=32,
+        # A first cold chunk still uses the native chunk budget. Keep the
+        # canary's write-entry capacity large enough for that existing path.
+        max_running_requests=64,
+        page_size=1,
+        enable_mixed_chunk=False,
+    )
+
+    def test_warm_reservation_uses_the_smaller_input_budget(self):
+        self.server.execute_script(_script_smaller_input_budget)
+
+
+def _script_smaller_input_budget(t: ScriptedContext):
+    assert t.scheduler.max_prefill_tokens == 32
+    assert t.scheduler.chunked_prefill_size == 64
+    yield from warmup_radix(t, [11] * 16)
+    continuation = t.start_req(
+        prompt_len=256, prompt_token=7, max_new_tokens=8, ignore_eos=True
+    )
+    yield from advance_to_nth_chunk(continuation, 1)
+    warm = t.start_req(
+        prompt_len=32, prompt_token=11, max_new_tokens=8, ignore_eos=True
+    )
+
+    hook = t._scheduler_hook
+    original = hook.on_run_batch
+    original_decision = t.scheduler.is_disable_overlap_for_batch
+    original_process = t.scheduler.process_batch_result
+    batches = []
+    decisions = []
+    events = []
+
+    def decide(batch, last_batch):
+        disabled = original_decision(batch, last_batch)
+        if batch is not None and last_batch is not None:
+            consecutive = (
+                batch.forward_mode.is_extend() and last_batch.forward_mode.is_extend()
+            )
+            tokens = (batch.extend_num_tokens or 0) + (
+                last_batch.extend_num_tokens or 0
+            )
+            decisions.append((consecutive, tokens, bool(disabled)))
+            events.append(("decision", bool(disabled)))
+        return disabled
+
+    def process(batch, result):
+        events.append(("process",))
+        return original_process(batch, result)
+
+    def capture(batch):
+        events.append(("run",))
+        if batch.forward_mode.is_extend():
+            batches.append(
+                (
+                    batch.extend_num_tokens,
+                    dict(
+                        zip(
+                            (req.rid for req in batch.reqs),
+                            batch.extend_lens,
+                            strict=True,
+                        )
+                    ),
+                    t.scheduler.chunked_req.rid
+                    if t.scheduler.chunked_req is not None
+                    else None,
+                )
+            )
+        original(batch)
+
+    with (
+        patch.object(hook, "on_run_batch", side_effect=capture),
+        patch.object(t.scheduler, "is_disable_overlap_for_batch", side_effect=decide),
+        patch.object(t.scheduler, "process_batch_result", side_effect=process),
+    ):
+        for _ in range(DEFAULT_MAX_STEPS):
+            if batches:
+                break
+            yield
+        else:
+            raise AssertionError("no continuation batch was scheduled")
+
+        # Check the actual forward batch while the warm head is waiting.
+        # Removing the clamp gives the continuation 48 tokens and leaves no
+        # input for the warm head.
+        tokens, extend_lens, chunked_rid = batches[0]
+        assert tokens == 32, batches
+        assert extend_lens == {continuation.rid: 16, warm.rid: 16}, batches
+        assert chunked_rid == continuation.rid, batches
+        assert warm.req.num_matched_prefix_tokens == 16
+
+        yield from run_until_finished(continuation)
+        yield from run_until_finished(warm)
+
+    # The real loop must keep equality overlapped, drain above the token
+    # threshold, and preserve decode overlap. Observe the result/run order
+    # while calling the original scheduler methods on the original batches.
+    assert (True, 96, False) in decisions, decisions
+    assert any(
+        extend and tokens > 96 and disabled for extend, tokens, disabled in decisions
+    )
+    assert any(not extend and not disabled for extend, _, disabled in decisions)
+    for index, event in enumerate(events):
+        if event[0] == "decision":
+            expected = ("process", "run") if event[1] else ("run", "process")
+            assert tuple(x[0] for x in events[index + 1 : index + 3]) == expected, (
+                events
+            )
+
+    for _ in range(8):
+        if t.scheduler.is_fully_idle():
+            break
+        yield
+    assert t.scheduler.is_fully_idle()
+    t.scheduler.invariant_checker.self_check_during_busy()
 
 
 def _script_mixed_fcfs(t: ScriptedContext, reserve_enabled: bool, cold_first: bool):
