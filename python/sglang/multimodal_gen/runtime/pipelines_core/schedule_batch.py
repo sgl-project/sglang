@@ -211,6 +211,12 @@ class Req:
     condition_inputs: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
+    report_progress: bool = False
+    # the client can cancel it by request id, see managers/request_cancel.py
+    cancellable: bool = False
+
+    # request ids merged into this dynamic batch
+    merged_request_ids: list[str] | None = None
 
     # STA parameters
     STA_param: list | None = None
@@ -348,6 +354,11 @@ class Req:
             return None
         return f"{int(width)}x{int(height)}"
 
+    def client_request_ids(self) -> list[str]:
+        if self.merged_request_ids:
+            return self.merged_request_ids
+        return [self.request_id] if self.request_id else []
+
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
@@ -483,7 +494,11 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    # the client cancelled the request; error tells which one
+    cancelled: bool = False
     output_file_paths: list[str] | None = None
+    # encoded image per output when the request sets return_image_bytes
+    output_image_bytes: list[bytes | None] | None = None
     # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
     # plus range_m/intensity/validity arrays when the client asked for frames.
     lidar: dict[str, Any] | None = None
@@ -505,6 +520,7 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.output_image_bytes = None
         self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None

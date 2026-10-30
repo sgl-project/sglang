@@ -130,30 +130,47 @@ class LayerWiseLoadCounter:
         self.futures.clear()
 
 
+class TransferReady(NamedTuple):
+    events: list[torch.cuda.Event]
+
+    def synchronize(self) -> None:
+        for event in self.events:
+            event.synchronize()
+
+    def wait(self, stream: torch.cuda.Stream) -> None:
+        for event in self.events:
+            stream.wait_event(event)
+
+
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
+
+    Out-of-tree linkers are constructed per worker as
+    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
+    and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
+    ``wait_until(layer)``. Report completion only after device copies finish.
+    """
 
     layer_done_counter: object
     pools: dict[PoolName, object]
-    # The stream the forward writes the device pools on; None when the current
-    # stream is the pages' only writer.
+    # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
-    def record_offload_ready(self) -> list[torch.cuda.Event]:
-        """Record the events an offload waits on before it reads device pages.
+    def record_transfer_ready(self) -> TransferReady:
+        """Record what a transfer waits on before it touches device pages.
 
-        The current stream has computed which pages to offload, and the forward
-        stream may still be writing them: prefill read-done lets the scheduler's
-        stream run ahead of the forward that fills a stashed chunk.
+        The current stream computed the page indices; under read-done the
+        forward in flight may still use those pages, including freed ones.
         """
         indices_ready = device_module.Event()
         indices_ready.record()
         events = [indices_ready]
         if self.forward_stream is not None:
-            kv_written = device_module.Event()
-            kv_written.record(self.forward_stream)
-            events.append(kv_written)
-        return events
+            forward_done = device_module.Event()
+            forward_done.record(self.forward_stream)
+            events.append(forward_done)
+        return TransferReady(events)
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -191,8 +208,14 @@ class UnifiedCacheLinker(ABC):
         """Cancel a load that has not started yet."""
 
     @abstractmethod
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
-        """Queue every transfer for atomic persistence."""
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: Optional[str] = None
+    ) -> bool:
+        """Queue every transfer for atomic persistence.
+
+        ``session_id`` names the session whose insert produced the transfers,
+        when known; backends may attribute the stored objects to it.
+        """
 
     @abstractmethod
     def num_completed_offloads(self) -> int:
@@ -439,10 +462,6 @@ class UnifiedCacheLinkerWrapper:
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
         # it from an uninitialized FULL-to-SWA mapping when the tail is inserted.
         if self._skip_swa:
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
             req.kv.set_evicted_seqlen(
                 ComponentType.SWA,
                 max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
@@ -500,7 +519,9 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
-            queued = self.cache_linker.offload(transfers)
+            queued = self.cache_linker.offload(
+                transfers, session_id=getattr(cache, "insert_session_id", None)
+            )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise

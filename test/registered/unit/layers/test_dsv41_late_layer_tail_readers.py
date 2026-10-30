@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
@@ -17,7 +18,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4Metadata,
     late_layer_whole_extend,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
@@ -35,7 +35,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
 
@@ -273,7 +273,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
-def _prefill_graph_replay(*, any_context, seq_len):
+def _prefill_graph_replay(*, ratios, seq_len):
     """The backend's default replayed-context limit and the widths a replay gives
     the full-row and tail metadata, for one request of ``seq_len`` tokens."""
     seen = {}
@@ -286,25 +286,16 @@ def _prefill_graph_replay(*, any_context, seq_len):
 
     backend = object.__new__(DeepseekV4AttnBackend)
     backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
-    backend.low_ratios = (1, 2)
-    backend.prefill_candidates = object.__new__(SparseTableBackend)
+    backend.low_ratios = tuple(ratio for ratio in ratios if ratio in (1, 2))
+    backend.has_c4 = 4 in ratios
+    backend.has_c128 = 128 in ratios
     backend._build_forward_metadata = build_full
+    backend._prefill_graph_translates_swa_loc = lambda metadata: False
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
-    backend._prefill_graph_replays_any_context = lambda: any_context
     capture = object.__new__(DSV4Metadata)
     capture.prefill_graph_tail = True
-    with (
-        patch.object(
-            deepseek_v4_backend,
-            "get_parallel",
-            return_value=SimpleNamespace(attn_cp_size=1),
-        ),
-        patch.object(
-            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=None
-        ),
-        patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"),
-    ):
+    with patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"):
         seen["limit"] = backend.prefill_cuda_graph_default_max_seq_len
         DeepseekV4AttnBackend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             backend,
@@ -317,18 +308,16 @@ def _prefill_graph_replay(*, any_context, seq_len):
 
 
 class TestPrefillGraphReplayContext(CustomTestCase):
-    """DeepSeek-V4.1's prefill graph replays past its captured indexer width only
-    when the replay is exact, and then its metadata spans the live context."""
+    """DeepSeek-V4.1's prefill graph replays any context, its metadata spanning the
+    live context; with c4/c128 compress metadata the width stays fixed."""
 
     def test_limit_and_metadata_width(self):
-        for any_context, seq_len, expected in (
-            (True, 155648 + 1024, {"limit": None, "full": 156672, "tail": 156672}),
-            (False, 8192 + 1024, {"limit": 16384, "full": 16384, "tail": 16384}),
-        ):
-            with self.subTest(any_context=any_context):
+        seq_len = 155648 + 1024
+        for ratios, width in (((1, 2), seq_len), ((4, 128), 1 << 20)):
+            with self.subTest(ratios=ratios):
                 self.assertEqual(
-                    _prefill_graph_replay(any_context=any_context, seq_len=seq_len),
-                    expected,
+                    _prefill_graph_replay(ratios=ratios, seq_len=seq_len),
+                    {"limit": None, "full": width, "tail": width},
                 )
 
 
@@ -336,7 +325,7 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
     """An eager low-ratio break inside the prefill graph's late-layer tail must read
     the hoisted rows of the tail, not rows rebuilt from the whole extend."""
 
-    def _run(self, hoisted_req, hoisted_pos, positions):
+    def _run(self, hoisted_req, hoisted_pos, positions, q_lora=None):
         backend = object.__new__(deepseek_v4_backend.DeepseekV4AttnBackend)
         backend.tail_source_kv_layer_id = None
         backend.forward_metadata = SimpleNamespace(
@@ -363,12 +352,13 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
             backend.forward_low_ratio_sources(
                 layer=layer,
                 x=torch.zeros(positions.shape[0], 4),
-                q_lora=torch.zeros(positions.shape[0], 4),
+                q_lora=torch.zeros(positions.shape[0], 4) if q_lora is None else q_lora,
                 positions=positions,
                 forward_batch=forward_batch,
             )
         compress_args = backend._low_ratio_compress.call_args.args
         index_args = backend._low_ratio_index_topk.call_args.args
+        self.index_q_lora = index_args[2]
         return compress_args[2], compress_args[3], index_args[3], index_args[4]
 
     def test_tail_break_uses_live_prefix_of_hoisted_rows(self):
@@ -381,6 +371,17 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(pos.tolist(), [2, 3, 3, 4, 5])
         self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
+
+    def test_dp_padding_cuts_a_quantized_q_lora_by_rows(self):
+        """HIP's quantized q_lora raises a TypeError on a plain slice; DP padding past the
+        hoisted rows must cut it field by field."""
+        q_lora = Mxfp8Activation(
+            q=torch.arange(320).view(5, 64), scale=torch.arange(10).view(5, 2)
+        )
+        positions = torch.tensor([2, 3, 3, 0, 0])
+        self._run(torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3]), positions, q_lora)
+        self.assertTrue(torch.equal(self.index_q_lora.q, q_lora.q[:3]))
+        self.assertTrue(torch.equal(self.index_q_lora.scale, q_lora.scale[:3]))
 
 
 if __name__ == "__main__":

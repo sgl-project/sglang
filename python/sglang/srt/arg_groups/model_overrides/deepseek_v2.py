@@ -24,8 +24,10 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    # The DCP paths: trtllm on CUDA, triton on ROCm.
+    backend = "triton" if get_platform().is_hip else "trtllm"
     overrides = {
-        name: "trtllm"
+        name: backend
         for name in ("dsa_prefill_backend", "dsa_decode_backend")
         if getattr(cfg, name) is None
     }
