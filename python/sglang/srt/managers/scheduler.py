@@ -655,6 +655,14 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+        # Prefill read-done lets the schedule stream run ahead of the forward that
+        # writes a stashed chunk. The cache controller's fence streams above order
+        # its copies behind that forward; the decode offload controller has none.
+        self.tp_worker.model_runner.kv_offload_fenced_on_forward_stream = (
+            self.enable_hierarchical_cache
+            and self.tree_cache.cache_controller is not None
+            and self.decode_offload_manager is None
+        )
 
         # Init running status
         self.init_running_status()
