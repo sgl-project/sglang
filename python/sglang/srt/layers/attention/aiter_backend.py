@@ -192,6 +192,20 @@ def _kv_cache_is_vectorized_5d(pool) -> bool:
     return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
 
+def _dspark_mha_draft_uses_unified_attention(
+    *,
+    is_draft_worker: bool,
+    is_dspark: bool,
+    use_mla: bool,
+    kv_cache_is_vectorized_5d: bool,
+) -> bool:
+    # A DSpark MHA draft verifies a few rows against the full prefix, the split-KV
+    # shape unified_attention serves; its 4D view cannot address a SHUFFLE 5D pool.
+    return (
+        is_draft_worker and is_dspark and not use_mla and not kv_cache_is_vectorized_5d
+    )
+
+
 def _require_untranslated_storage(*pools) -> None:
     """This backend reads a pool's K/V as dense ``(pages, page_size, H, D)``
     caches, gathers their indices straight from the request table, and maps
@@ -562,9 +576,16 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True
+        elif envs.SGLANG_USE_AITER_UNIFIED_ATTN.is_set():
+            self.use_triton_unified_attention = envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
         else:
-            self.use_triton_unified_attention = get_bool_env_var(
-                "SGLANG_USE_AITER_UNIFIED_ATTN"
+            self.use_triton_unified_attention = (
+                _dspark_mha_draft_uses_unified_attention(
+                    is_draft_worker=model_runner.is_draft_worker,
+                    is_dspark=model_runner.spec_algorithm.is_dspark(),
+                    use_mla=self.use_mla,
+                    kv_cache_is_vectorized_5d=self.kv_cache_is_vectorized_5d,
+                )
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the

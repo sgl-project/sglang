@@ -127,5 +127,24 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
         )
 
 
+class TestDSparkDraftUnifiedAttention(CustomTestCase):
+    def test_only_dspark_mha_draft_on_4d_pool_routes_to_unified(self):
+        """A target model, an MLA self-draft, another algorithm's draft or a SHUFFLE
+        5D pool must keep its own AITER path; only the DSpark MHA draft switches."""
+        route = aiter_backend._dspark_mha_draft_uses_unified_attention
+        dspark_draft = dict(
+            is_draft_worker=True,
+            is_dspark=True,
+            use_mla=False,
+            kv_cache_is_vectorized_5d=False,
+        )
+        self.assertTrue(route(**dspark_draft))
+        for field in dspark_draft:
+            with self.subTest(flipped=field):
+                self.assertFalse(
+                    route(**{**dspark_draft, field: not dspark_draft[field]})
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
