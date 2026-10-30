@@ -37,11 +37,13 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import unread_capture_sizes
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -413,6 +415,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     tokens_per_request=self.captured_req_width,
                 )
             )
+        self._capture_monokernel_steps_once()
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
@@ -770,6 +773,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_attn_tp_gather:
             return [num_tokens]
         return None
+
+    def _capture_monokernel_steps_once(self) -> None:
+        """An AMD monokernel step runs none of SGLang's attention, so each of its
+        graphs is captured once, and its replay skips the variant choice, which reads
+        the batch's lengths on the host (a speculative verify keeps no host copy, so
+        the read waits for the draft to finish)."""
+        if (
+            self.attention_graph_variants is None
+            or self.attention_variant_sizes is not None
+        ):
+            return
+        routed = unread_capture_sizes(
+            self.model_runner.model,
+            StepMetadata.ATTENTION_GRAPH_VARIANT,
+            forward_mode=self.capture_forward_mode,
+            capture_bs=self.capture_bs,
+            tokens_per_request=self.captured_req_width,
+        )
+        if routed:
+            self.attention_variant_sizes = frozenset(self.capture_bs) - routed
 
     def _resolve_attention_variant(
         self, forward_batch: ForwardBatch, capture_batch_size: int
