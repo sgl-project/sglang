@@ -272,8 +272,9 @@ def npu_format_cast(
             ``customize_dtype=torch.float8_e4m3fn``,
             ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
             kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
-            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
-            ND fallback would corrupt results.
+            is skipped to preserve those callers' explicit unpack/NZ contract.
+            This does not imply that every FP4 GMM requires NZ; W4A4 uses a
+            separate packed-byte storage contract.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -297,9 +298,8 @@ def npu_format_cast(
     if tensor.device.type == "meta":
         return tensor
 
-    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
-    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
-    # silent ND fallback would corrupt results.
+    # Forward explicit packed-FP4 unpack kwargs without the _is_nz_aligned
+    # fallback: these callers must not silently lose their requested layout.
     if customize_dtype is not None or input_dtype is not None:
         return torch.ops.npu.npu_format_cast(
             tensor,

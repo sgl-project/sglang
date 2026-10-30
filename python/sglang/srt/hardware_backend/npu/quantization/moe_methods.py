@@ -80,23 +80,45 @@ def reshape_w4a8_mxfp_weight_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     return scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
 
 
+def prepare_mxfp4_moe_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    customize_dtype,
+    npu_format=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare single-level MXFP4 weights with an explicit storage-cast policy.
+
+    W4A4 keeps packed byte storage (customize_dtype=None) and passes the FP4
+    interpretation to its GMM operators. W4A8 supplies its unpack/cast dtype;
+    do not apply that conversion to W4A4 merely because both use FP4 weights.
+    """
+    scale = reshape_w4a8_mxfp_weight_scale_for_npu(weight_scale)
+    cast_args = {}
+    if customize_dtype is not None:
+        cast_args = {
+            "customize_dtype": customize_dtype,
+            "input_dtype": _get_float4_e2m1fn_x2_dtype(),
+        }
+    if npu_format is None:
+        weight = npu_format_cast(weight, **cast_args)
+    else:
+        weight = npu_format_cast(weight, npu_format, **cast_args)
+    return weight.transpose(-1, -2), scale
+
+
 def prepare_w4a8_mxfp_weight(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
     npu_format=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Convert W4A8 MXFP weights and scales to the shared A5 GMM layout."""
-    cast_args = {
-        "customize_dtype": torch.float8_e4m3fn,
-        "input_dtype": _get_float4_e2m1fn_x2_dtype(),
-    }
-    if npu_format is None:
-        weight = npu_format_cast(weight, **cast_args)
-    else:
-        weight = npu_format_cast(weight, npu_format, **cast_args)
-    return weight.transpose(-1, -2), reshape_w4a8_mxfp_weight_scale_for_npu(
-        weight_scale
+    """Preserve the W4A8 cast contract for its online and checkpoint callers."""
+    return prepare_mxfp4_moe_weight(
+        weight,
+        weight_scale,
+        customize_dtype=torch.float8_e4m3fn,
+        npu_format=npu_format,
     )
 
 
@@ -508,11 +530,9 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             )
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = reshape_w4a8_mxfp_weight_scale_for_npu(weight_scale.data)
-        # Preserve the existing W4A4 cast until its packed-FP4 ND/NZ contract
-        # is validated on Ascend 950; W4A8's cast kwargs are not interchangeable.
-        weight.data = npu_format_cast(weight.data).transpose(-1, -2)
-        weight_scale.data = scale
+        weight.data, weight_scale.data = prepare_mxfp4_moe_weight(
+            weight.data, weight_scale.data, customize_dtype=None
+        )
 
         # There is no FP4 dispatch path, including under DeepEP low latency.
         # Keep BF16 dispatch and quantize immediately before each GMM.

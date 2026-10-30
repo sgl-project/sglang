@@ -180,6 +180,11 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                             moe_methods, "npu_format_cast", side_effect=lambda x: x
                         ),
                         patch.object(
+                            moe_methods,
+                            "prepare_mxfp4_moe_weight",
+                            wraps=moe_methods.prepare_mxfp4_moe_weight,
+                        ) as prepare,
+                        patch.object(
                             method,
                             "_quantize_weight_online",
                             return_value=(
@@ -192,6 +197,12 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                     ):
                         method.process_weights_after_loading(layer, prefix)
                     self.assertEqual(quantize.call_count, int(online))
+                    prepare.assert_called_once()
+                    self.assertEqual(
+                        prepare.call_args.kwargs, {"customize_dtype": None}
+                    )
+                    self.assertEqual(prepare.call_args.args[0].dtype, torch.uint8)
+                    self.assertEqual(prepare.call_args.args[1].ndim, 3)
                     weight = getattr(layer, f"{prefix}_weight")
                     scale = getattr(layer, f"{prefix}_weight_scale")
                     self.assertTrue(torch.equal(weight, packed.transpose(1, 2)))
@@ -206,6 +217,65 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                         )
                     else:
                         layer.dispatcher.set_quant_config.assert_not_called()
+
+    def test_shared_preparation_preserves_scheme_cast_policy(self):
+        weight = torch.arange(2 * 96 * 64).to(torch.uint8).reshape(2, 96, 64)
+        scale = torch.arange(2 * 96 * 4).to(torch.uint8).reshape(2, 96, 4)
+        for w4a8 in (False, True):
+            for npu_format in (None, object()):
+                with (
+                    self.subTest(w4a8=w4a8, explicit_format=npu_format is not None),
+                    patch.object(
+                        moe_methods, "npu_format_cast", return_value=weight
+                    ) as cast,
+                    patch.object(
+                        moe_methods, "_get_float4_e2m1fn_x2_dtype", return_value=296
+                    ),
+                ):
+                    if w4a8:
+                        actual_weight, actual_scale = (
+                            moe_methods.prepare_w4a8_mxfp_weight(
+                                weight, scale, npu_format=npu_format
+                            )
+                        )
+                        expected_kwargs = {
+                            "customize_dtype": torch.float8_e4m3fn,
+                            "input_dtype": 296,
+                        }
+                    else:
+                        actual_weight, actual_scale = (
+                            moe_methods.prepare_mxfp4_moe_weight(
+                                weight,
+                                scale,
+                                customize_dtype=None,
+                                npu_format=npu_format,
+                            )
+                        )
+                        expected_kwargs = {}
+                    positional = (
+                        (weight,) if npu_format is None else (weight, npu_format)
+                    )
+                    cast.assert_called_once_with(*positional, **expected_kwargs)
+                    torch.testing.assert_close(actual_weight, weight.transpose(1, 2))
+                    torch.testing.assert_close(
+                        actual_scale, scale.reshape(2, 96, 2, 2).transpose(1, 2)
+                    )
+                    self.assertEqual(actual_weight.data_ptr(), weight.data_ptr())
+                    self.assertEqual(actual_scale.data_ptr(), scale.data_ptr())
+
+    def test_shared_preparation_rejects_odd_scales_before_cast(self):
+        weight = torch.zeros(2, 64, 48, dtype=torch.uint8)
+        scale = torch.zeros(2, 64, 3, dtype=torch.uint8)
+        for customize_dtype in (None, torch.float8_e4m3fn):
+            with (
+                self.subTest(dtype=customize_dtype),
+                patch.object(moe_methods, "npu_format_cast") as cast,
+            ):
+                with self.assertRaisesRegex(ValueError, "divisible by 2"):
+                    moe_methods.prepare_mxfp4_moe_weight(
+                        weight, scale, customize_dtype=customize_dtype
+                    )
+                cast.assert_not_called()
 
     def test_online_method_stays_on_the_unquant_fused_moe_base(self):
         """FusedMoE picks its w1/w3 shard order from this base class.
