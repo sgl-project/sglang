@@ -900,19 +900,6 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            extend_kwargs = {
-                "softmax_scale": layer.scaling,
-                "causal": causal_arg,
-                "window_size": window_size,
-                "softcap": layer.logit_cap,
-                "k_descale": k_descale,
-                "v_descale": v_descale,
-                "return_softmax_lse": use_cascade_attn,
-                **kwargs,
-            }
-            if bidirectional_block_ids is not None:
-                extend_kwargs["bidirectional_block_ids"] = bidirectional_block_ids
-
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -922,6 +909,20 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=None,
                 max_seqlen_q=max_seqlen_q,
+                softmax_scale=layer.scaling,
+                causal=causal_arg,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                # Only Gemma-3 image batches set this; omitting it otherwise keeps
+                # sgl-kernel-xpu builds without the kwarg working.
+                **(
+                    {"bidirectional_block_ids": bidirectional_block_ids}
+                    if bidirectional_block_ids is not None
+                    else {}
+                ),
+                k_descale=k_descale,
+                v_descale=v_descale,
+                return_softmax_lse=use_cascade_attn,
                 # `out` is injected via out_kwargs only on the graph path (buffer
                 # present, non-cascade); the eager path omits it for flash_attn
                 # builds that lack the kwarg. Piecewise XPU graph for prefill
@@ -937,7 +938,7 @@ class XPUAttentionBackend(AttentionBackend):
                     if not use_cascade_attn and forward_batch._attn_output is not None
                     else {}
                 ),
-                **extend_kwargs,
+                **kwargs,
             )
 
             if use_cascade_attn:

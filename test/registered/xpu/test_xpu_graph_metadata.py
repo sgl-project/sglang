@@ -256,7 +256,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                     ),
                     self.assertRaisesRegex(
                         ValueError,
-                        "Full prefill CUDA/XPU graph does not support models with "
+                        "Full prefill XPU graph does not support models with "
                         "attention_chunk_size or use_irope",
                     ),
                 ):
