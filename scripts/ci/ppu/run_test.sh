@@ -4,7 +4,8 @@ set -euo pipefail
 fail() { printf 'PPU CI: %s\n' "$*" >&2; exit 2; }
 
 for name in PPU_CI_RUNTIME_IMAGE PPU_CI_SOURCE_SHA PPU_CI_WHEEL_DIR PPU_CI_ARTIFACT_DIR \
-    PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
+    PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH \
+    PPU_CI_MLA_MODEL_PATH PPU_CI_SMALL_MODEL_PATH PPU_CI_EVAL_CACHE; do
     [[ -n "${!name:-}" ]] || fail "Set $name explicitly"
 done
 device=${PPU_CI_DEVICE:-${NVIDIA_VISIBLE_DEVICES:-}}
@@ -55,7 +56,16 @@ def validate_symlinks(root):
 
 try:
     repo = Path(sys.argv[1])
-    names = ["WHEEL_DIR", "ARTIFACT_DIR", "TARGET_MODEL_PATH", "EAGLE3_MODEL_PATH", "DFLASH_MODEL_PATH", "EVAL_CACHE"]
+    names = [
+        "WHEEL_DIR",
+        "ARTIFACT_DIR",
+        "TARGET_MODEL_PATH",
+        "EAGLE3_MODEL_PATH",
+        "DFLASH_MODEL_PATH",
+        "MLA_MODEL_PATH",
+        "SMALL_MODEL_PATH",
+        "EVAL_CACHE",
+    ]
     paths = []
     for name in names:
         raw = os.environ["PPU_CI_" + name]
@@ -70,14 +80,17 @@ try:
             fail("Docker mount paths must not contain commas")
         if "\n" in str(path) or "\r" in str(path):
             fail("Docker mount paths must not contain newlines")
-    wheels, artifacts, target, eagle3, dflash, cache = paths
+    wheels, artifacts, target, eagle3, dflash, mla, small, cache = paths
     if below(wheels, repo) or below(artifacts, repo):
         fail("Wheels and artifacts must be outside source")
-    if any(below(artifacts, path) for path in [wheels, target, eagle3, dflash, cache]):
+    if any(
+        below(artifacts, path)
+        for path in [wheels, target, eagle3, dflash, mla, small, cache]
+    ):
         fail("Artifacts must not be inside read-only inputs")
-    for root in [target, eagle3, dflash, cache]:
+    for root in [target, eagle3, dflash, mla, small, cache]:
         validate_symlinks(root)
-    for model in [target, eagle3, dflash]:
+    for model in [target, eagle3, dflash, mla, small]:
         if not (model / "config.json").is_file():
             fail("Missing model config.json: " + str(model))
     for name in ["test.jsonl", "test.jsonl.sha256"]:
@@ -228,7 +241,9 @@ docker create --name "$container" --runtime=runc --shm-size=16g \
     --mount "type=bind,source=${inputs[2]},target=/models/target,readonly" \
     --mount "type=bind,source=${inputs[3]},target=/models/eagle3,readonly" \
     --mount "type=bind,source=${inputs[4]},target=/models/dflash,readonly" \
-    --mount "type=bind,source=${inputs[5]},target=/eval-cache,readonly" \
+    --mount "type=bind,source=${inputs[5]},target=/models/mla,readonly" \
+    --mount "type=bind,source=${inputs[6]},target=/models/small,readonly" \
+    --mount "type=bind,source=${inputs[7]},target=/eval-cache,readonly" \
     --mount "type=bind,source=$private,target=/artifacts" \
     --env NVIDIA_VISIBLE_DEVICES=void --env CUDA_VISIBLE_DEVICES=0 \
     --env PPU_CI_SOURCE_SHA="$PPU_CI_SOURCE_SHA" \
@@ -236,6 +251,10 @@ docker create --name "$container" --runtime=runc --shm-size=16g \
     --env PPU_CI_TARGET_MODEL_PATH=/models/target \
     --env PPU_CI_EAGLE3_MODEL_PATH=/models/eagle3 \
     --env PPU_CI_DFLASH_MODEL_PATH=/models/dflash \
+    --env PPU_CI_MLA_MODEL_PATH=/models/mla \
+    --env PPU_CI_SMALL_MODEL_PATH=/models/small \
+    --env SGLANG_TEST_FA3_MODEL=/models/target \
+    --env SGLANG_TEST_MLA_MODEL=/models/mla \
     --env PPU_CI_EVAL_CACHE=/eval-cache --env SGLANG_IS_IN_CI=1 \
     --entrypoint bash "$image_id" /source/scripts/ci/ppu/build_and_test.sh test \
     9>&- >"$private/container-id.txt"

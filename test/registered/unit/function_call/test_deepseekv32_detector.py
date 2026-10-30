@@ -1,10 +1,10 @@
-"""Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
+"""Unit tests for DeepSeekV32Detector DSML streaming — no server, no model loading."""
 
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,7 +14,7 @@ DSML = "｜DSML｜"
 
 
 def _wrapped(invoke: str) -> str:
-    return f"<{DSML}tool_calls>\n{invoke}\n</{DSML}tool_calls>"
+    return f"<{DSML}function_calls>\n{invoke}\n</{DSML}function_calls>"
 
 
 def _invoke(name: str, params: str = "") -> str:
@@ -31,7 +31,7 @@ def _weather_call(city: str = "SF") -> str:
     return _wrapped(_invoke("get_weather", _param("city", "true", city)))
 
 
-class TestDeepSeekV4Streaming(unittest.TestCase):
+class TestDeepSeekV32Streaming(unittest.TestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -50,7 +50,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
     def _feed(self, chunks):
         """Returns (normal_text, calls) accumulated over the chunks."""
-        detector = DeepSeekV4Detector()
+        detector = DeepSeekV32Detector()
         normal, calls = "", []
         for chunk in chunks:
             result = detector.parse_streaming_increment(chunk, self.tools)
@@ -66,11 +66,11 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
         self.assertEqual([c.name for c in calls if c.name], ["get_weather"])
         self.assertEqual(
-            normal, DeepSeekV4Detector().detect_and_parse(text, self.tools).normal_text
+            normal, DeepSeekV32Detector().detect_and_parse(text, self.tools).normal_text
         )
 
     def test_preamble_before_bare_invoke_without_wrapper(self):
-        """The bare `<｜DSML｜invoke …>` form has no tool_calls wrapper to walk
+        """The bare `<｜DSML｜invoke …>` form has no function_calls wrapper to walk
         back to, so the preamble is computed from the invoke itself."""
         text = "Checking.\n" + _invoke("get_weather", _param("city", "true", "SF"))
         normal, calls = self._feed([text])
@@ -85,9 +85,9 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertNotIn(DSML, normal)
 
     def test_streaming_waits_for_complete_invoke(self):
-        detector = DeepSeekV4Detector()
+        detector = DeepSeekV32Detector()
         partial = detector.parse_streaming_increment(
-            f'<{DSML}tool_calls>\n<{DSML}invoke name="get_weather">\n'
+            f'<{DSML}function_calls>\n<{DSML}invoke name="get_weather">\n'
             f'<{DSML}parameter name="city" string="false">{{"a"',
             self.tools,
         )
@@ -95,7 +95,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(partial.calls, [])
 
         complete = detector.parse_streaming_increment(
-            f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>",
+            f"</{DSML}parameter></{DSML}invoke></{DSML}function_calls>",
             self.tools,
         )
         self.assertEqual(len(complete.calls), 1)
@@ -132,7 +132,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
         for value in values:
             text = _wrapped(_invoke("create_tasks", _param("tasks", "false", value)))
-            expected = DeepSeekV4Detector().detect_and_parse(text, tools).calls[0]
+            expected = DeepSeekV32Detector().detect_and_parse(text, tools).calls[0]
             for width in range(1, len(text) + 1):
                 with self.subTest(value=value, width=width):
                     chunks = [
@@ -207,7 +207,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
                     [("get_weather", '{"city": "SF"}')],
                 )
 
-        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        result = DeepSeekV32Detector().detect_and_parse(text, self.tools)
         self.assertEqual(
             [(call.name, call.parameters) for call in result.calls],
             [("get_weather", '{"city": "SF"}')],
@@ -257,7 +257,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(calls[0].parameters, '{"city": "NaN"}')
 
     def test_malformed_first_invoke_does_not_create_flush_state(self):
-        detector = DeepSeekV4Detector()
+        detector = DeepSeekV32Detector()
 
         result = detector.parse_streaming_increment(
             _wrapped(_invoke("get_weather", '{"city": }')), self.tools
@@ -301,14 +301,14 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
     def test_malformed_invoke_fails_closed_at_every_chunk_width(self):
         """Whatever the delta boundaries, a malformed invoke yields the prose,
-        no call, and no DSML, including the trailing tool_calls close."""
+        no call, and no DSML, including the trailing function_calls close."""
         text = "Checking.\n\n" + _wrapped(
             _invoke("get_weather", f'<{DSML}parameter name="city" string="true">SF')
         )
 
         for width in range(1, len(text) + 1):
             with self.subTest(width=width):
-                parser = FunctionCallParser(self.tools, "deepseekv4")
+                parser = FunctionCallParser(self.tools, "deepseekv32")
                 normal, calls = "", []
                 for index in range(0, len(text), width):
                     chunk_normal, chunk_calls = parser.parse_stream_chunk(
@@ -330,7 +330,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
             + _invoke("get_weather", _param("city", "true", "NY"))
         )
 
-        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        result = DeepSeekV32Detector().detect_and_parse(text, self.tools)
 
         self.assertEqual(result.normal_text, "Checking.")
         self.assertEqual(
@@ -340,18 +340,18 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
     def test_non_streaming_drops_unclosed_invoke_in_closed_wrapper(self):
         text = (
-            f"<{DSML}tool_calls>\n"
+            f"<{DSML}function_calls>\n"
             f'<{DSML}invoke name="get_weather">\n{{"city": "SF"}}\n'
-            f"</{DSML}tool_calls>"
+            f"</{DSML}function_calls>"
         )
 
-        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        result = DeepSeekV32Detector().detect_and_parse(text, self.tools)
 
         self.assertEqual(result.calls, [])
         self.assertNotIn(DSML, result.normal_text)
 
     def test_non_streaming_parses_bare_invoke_without_wrapper(self):
-        result = DeepSeekV4Detector().detect_and_parse(
+        result = DeepSeekV32Detector().detect_and_parse(
             "Checking.\n\n" + _invoke("get_weather", '{"city": "SF"}'), self.tools
         )
 
@@ -362,7 +362,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         )
 
     def test_non_streaming_malformed_bare_invoke_fails_closed(self):
-        result = DeepSeekV4Detector().detect_and_parse(
+        result = DeepSeekV32Detector().detect_and_parse(
             _invoke("get_weather", '{"city": }'), self.tools
         )
 
@@ -370,10 +370,10 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertNotIn(DSML, result.normal_text)
 
     def test_stream_end_drops_incomplete_invoke(self):
-        parser = FunctionCallParser(self.tools, "deepseekv4")
+        parser = FunctionCallParser(self.tools, "deepseekv32")
         normal, calls = parser.parse_stream_chunk(
             "Checking.\n\n"
-            f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+            f'<{DSML}function_calls><{DSML}invoke name="get_weather">'
             f'<{DSML}parameter name="city" string="true">SF'
         )
 
@@ -381,7 +381,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(parser.parse_stream_end(), ("Checking.", []))
 
     def _feed_with_tools(self, chunks, tools):
-        detector = DeepSeekV4Detector()
+        detector = DeepSeekV32Detector()
         normal, calls = "", []
         for chunk in chunks:
             result = detector.parse_streaming_increment(chunk, tools)
@@ -389,9 +389,9 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
             calls.extend(result.calls)
         return normal, calls
 
-    def test_non_streaming_parses_every_tool_calls_section(self):
-        """A turn with two tool_calls sections must yield both calls."""
-        result = DeepSeekV4Detector().detect_and_parse(
+    def test_non_streaming_parses_every_function_calls_section(self):
+        """A turn with two function_calls sections must yield both calls."""
+        result = DeepSeekV32Detector().detect_and_parse(
             f"{_weather_call('SF')}\n{_weather_call('NY')}", self.tools
         )
 
@@ -400,10 +400,10 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
     def test_unexpected_parse_error_fails_closed(self):
         """An unexpected parse error keeps the prose, drops the DSML and the
         call, and the dropped buffer must not come back on the next delta."""
-        detector = DeepSeekV4Detector()
+        detector = DeepSeekV32Detector()
 
         with patch.object(
-            DeepSeekV4Detector,
+            DeepSeekV32Detector,
             "_parse_parameters_from_xml",
             side_effect=RuntimeError("boom"),
         ):
