@@ -4031,8 +4031,8 @@ class Scheduler(
             # only finished requests to running_batch.
             reqs_to_exclude.add(self.chunked_req)
 
-            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
-            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV, so nothing to stash.
             if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 

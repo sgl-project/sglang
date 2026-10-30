@@ -369,6 +369,26 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(adder.can_run_list, [])
 
+    def test_continuation_parks_when_mixed_decode_exhausts_chunk_budget(self):
+        """With more mixed decode rows than the chunk holds, the chunk budget is
+        not positive; the continuation must not get an empty or negative chunk."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 1000
+        for decode_tokens in (16, 28):
+            with self.subTest(decode_tokens=decode_tokens):
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    rem_chunk_tokens=16,
+                    num_mixed_decode_tokens=decode_tokens,
+                )
+                req = self.create_shared_req("continuation")
+                before = adder.memory_budget.total_offset
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(adder.can_run_list, [])
+                self.assertIsNone(req.extend_end)
+                self.assertEqual(adder.memory_budget.total_offset, before)
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without
