@@ -244,6 +244,44 @@ def _split_hicache_size(
     )
 
 
+def _swa_host_shares(
+    hicache_size: int, full_kv_pool: Any, swa_kv_pool: Any, swa_host_ratio: float
+) -> Optional[tuple[float, float]]:
+    """Host shares sized as if the device pool had used swa_host_ratio, or None.
+
+    None means the stock, device-ratio-proportional split applies: the ratio is
+    unset, the pools already carry an explicit host_capacity_bytes, or the device
+    pool already holds at least that much sliding window.
+    """
+    if not swa_host_ratio > 0:
+        return None
+    if any(
+        getattr(p, "host_capacity_bytes", None) is not None
+        for p in (full_kv_pool, swa_kv_pool)
+    ):
+        return None
+    device_ratio = swa_kv_pool.size / full_kv_pool.size
+    if not swa_host_ratio > device_ratio:
+        return None
+
+    def per_token(pool: Any) -> float:
+        # from the allocated rows, so a post-capture resize of .size does not skew it
+        return sum(pool.get_kv_size_bytes()) / pool.k_buffer[0].shape[0]
+
+    full_bytes = per_token(full_kv_pool) * full_kv_pool.size
+    swa_bytes = per_token(swa_kv_pool) * full_kv_pool.size * swa_host_ratio
+    total = full_bytes + swa_bytes
+    logger.info(
+        "HiCache SWA host split: host ratio %.4f over device ratio %.4f; host "
+        "tiers %.1f%% full / %.1f%% sliding window of --hicache-size",
+        swa_host_ratio,
+        device_ratio,
+        100 * full_bytes / total,
+        100 * swa_bytes / total,
+    )
+    return hicache_size * full_bytes / total, hicache_size * swa_bytes / total
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -569,7 +607,13 @@ def build_hybrid_swa_stack(
     kv_host_size = swa_host_size = None
     memory = get_memory()
     if memory.hicache_size > 0:
-        kv_host_size, swa_host_size = _split_hicache_size(
+        shares = _swa_host_shares(
+            memory.hicache_size,
+            full_kv_pool,
+            swa_kv_pool,
+            getattr(memory, "hicache_swa_host_ratio", 0.0),
+        )
+        kv_host_size, swa_host_size = shares or _split_hicache_size(
             memory.hicache_size, (full_kv_pool, swa_kv_pool)
         )
 
