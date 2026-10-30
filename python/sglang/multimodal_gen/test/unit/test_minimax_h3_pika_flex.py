@@ -485,15 +485,18 @@ def test_output_duration_requires_released_integer_seconds(duration):
         _plan(_pika_request(duration_seconds=duration))
 
 
-@pytest.mark.parametrize("duration,frames", [(5, 124), (6, 158), (15, 362)])
-def test_warmup_frames_recover_requested_duration(duration, frames):
+@pytest.mark.parametrize(
+    "duration,frames,aligned",
+    [(5, 120, 124), (5, 124, 124), (6, 158, 158), (15, 362, 362)],
+)
+def test_warmup_frames_recover_requested_duration(duration, frames, aligned):
     """17n+5 alignment is not inverted by dividing aligned frames by 24."""
     target = PikaH3FlexSamplingParams._synthetic_warmup_target(
         SimpleNamespace(width=832, height=480),
         SimpleNamespace(warmup_resolutions=["832x480"], warmup_num_frames=frames),
     )
     assert target["duration_seconds"] == duration
-    assert _plan(_pika_request(**target)).shape["frame_count"] == frames
+    assert _plan(_pika_request(**target)).shape["frame_count"] == aligned
 
 
 @pytest.mark.parametrize("variant", ["FL2VA", "Ref2VA"])

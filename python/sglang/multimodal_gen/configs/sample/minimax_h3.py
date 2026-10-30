@@ -444,10 +444,12 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
         # division recovers the requested integer duration (rounding does not).
         duration = frames // 24 if frames else policy.duration_seconds[0]
         if not policy.duration_seconds[0] <= duration <= policy.duration_seconds[1] or (
-            frames and minimax_h3_align_frame_count(duration * 24) != frames
+            frames
+            and frames
+            not in (duration * 24, minimax_h3_align_frame_count(duration * 24))
         ):
             raise ValueError(
-                "Pika H3 Flex warmup frames must match an aligned whole-second duration from 5 to 15"
+                "Pika H3 Flex warmup frames must represent a whole-second duration from 5 to 15"
             )
         for tier, max_pixels in policy.max_pixels.items():
             for aspect_ratio in policy.aspect_ratios:
