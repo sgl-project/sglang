@@ -114,6 +114,20 @@ class Mm(msgspec.Struct):
         "skip reading media on a hot metadata-cache hit; only enable it when "
         "the caller guarantees that hashes identify immutable media bytes.",
     ] = False
+    trust_caller_mm_hashes: A[
+        bool,
+        "Trust caller-provided per-image hashes (GenerateReqInput.mm_hashes) "
+        "as the multimodal items' prefix-cache identity instead of the "
+        "content-based hash. This exists for external KV routers that "
+        "compute their own content-addressed hash and need sglang's "
+        "prefix-cache key to align. Only enable when the caller guarantees "
+        "that declared hashes identify the actual image content: with this "
+        "flag on, any client can alias one image's cached KV onto a "
+        "different image's content, which is both a correctness bug and a "
+        "cross-tenant disclosure risk. When unset (default), caller "
+        "mm_hashes are ignored and sglang hashes the processor feature "
+        "tensor as before.",
+    ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
