@@ -5048,6 +5048,14 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
+                    # aiter's gfx950 Gluon kernel needs Q and KV in one dtype; with
+                    # a bf16 Q and an FP8 cache this falls back to the Triton kernel,
+                    # which at page size 1 walks the KV one token per tile. Quantize
+                    # Q as forward_decode does.
+                    q_descale = None
+                    if self.kv_cache_dtype == fp8_dtype:
+                        q_unified, q_descale = self._quantize_q_fp8(q_unified)
+
                     unified_attention(
                         q=q_unified,
                         k=k_unified,
@@ -5062,7 +5070,7 @@ class AiterAttnBackend(AttentionBackend):
                         window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
-                        q_descale=None,
+                        q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
