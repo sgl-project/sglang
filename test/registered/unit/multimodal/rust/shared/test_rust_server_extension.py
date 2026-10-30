@@ -625,6 +625,25 @@ class TestRustServerExtension(CustomTestCase):
                 self.assertEqual(warning.call_args.args[3], dist_init_addr)
         self.assertEqual(all_gather_object.call_count, 4)
 
+    def test_gather_server_endpoints_skips_collective_on_elastic_ep_joiner(self):
+        """Elastic-EP joiners skip the endpoint collective because serving ranks
+        do not re-enter the startup world_group collective."""
+        all_gather_object = Mock()
+        parallel = SimpleNamespace(
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=True)),
+            ),
+            patch.object(server_module, "get_parallel", return_value=parallel),
+        ):
+            table = RustServer.gather_server_endpoints(hosts_listener=True)
+            self.assertEqual(table, [])
+            self.assertEqual(all_gather_object.call_count, 0)
+
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts

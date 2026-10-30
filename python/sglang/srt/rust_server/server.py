@@ -198,6 +198,16 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        try:
+            is_joiner = getattr(get_exec().moe, "is_ep_joiner", False)
+        except Exception:
+            is_joiner = False
+        if is_joiner:
+            logger.info(
+                "SGLANG_RUST_SERVER: elastic-EP joiner rank skips endpoint collective"
+            )
+            return []
+
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another
