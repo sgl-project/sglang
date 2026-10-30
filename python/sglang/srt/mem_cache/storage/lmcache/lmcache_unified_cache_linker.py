@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from itertools import chain, islice
+from itertools import chain
 from typing import Any, Optional
 
 import torch
@@ -122,6 +122,8 @@ class LMCacheUnifiedCacheLinker(UnifiedCacheLinker):
         self._pending_stores: deque[_PendingStore] = deque()
         self._completed_stores: deque[bool] = deque()
         self._offload_sequence = 0
+        # Cache one path so a directly following child avoids a root traversal.
+        self._cached_prefixes: dict[int, list[int]] = {}
 
     def support_prefetch(self) -> bool:
         return True
@@ -293,7 +295,7 @@ class LMCacheUnifiedCacheLinker(UnifiedCacheLinker):
     ) -> bool:
         del session_id
         chunk_size = self.connector.chunk_size
-        collected = self._collect_prefix(node_id, alignment=chunk_size)
+        collected = self._collect_prefix(node_id)
         if collected is None:
             return False
         by_pool = {transfer.name: transfer for transfer in transfers}
@@ -301,7 +303,7 @@ class LMCacheUnifiedCacheLinker(UnifiedCacheLinker):
         if full is None or full.device_indices is None:
             return False
         store_start = collected.node_start // chunk_size * chunk_size
-        aligned_end = len(collected.token_ids)
+        aligned_end = len(collected.token_ids) // chunk_size * chunk_size
         if aligned_end <= store_start:
             return False
 
@@ -396,44 +398,51 @@ class LMCacheUnifiedCacheLinker(UnifiedCacheLinker):
         self._prefetches.clear()
         self._completed_stores.clear()
         self.layer_done_counter.reset()
+        self._cached_prefixes.clear()
 
     def close(self) -> None:
         self.reset()
         self.connector.close()
 
-    def _collect_prefix(
-        self, node_id: int, *, alignment: int
-    ) -> Optional[_CollectedPrefix]:
-        chunks = []
-        leaf = None
-        node_len = 0
-        total_len = 0
-        current = node_id
-        while not self.cache.tree_core.is_root(current):
-            snapshot = self.cache.tree_core.snapshot_buffer_backup(
-                current, pass_prefix_keys=False
-            )
-            if snapshot is None or snapshot.key.is_bigram:
-                return None
-            if leaf is None:
-                leaf = snapshot
-                node_len = len(snapshot.key)
-            token_ids = snapshot.key.raw_token_ids()
-            chunks.append(token_ids)
-            total_len += len(token_ids)
-            current = snapshot.parent_node_id
-
-        if leaf is None or not leaf.hash_values:
+    def _collect_prefix(self, node_id: int) -> Optional[_CollectedPrefix]:
+        current_node = self.cache.tree_core.snapshot_buffer_backup(
+            node_id, pass_prefix_keys=False
+        )
+        if (
+            current_node is None
+            or current_node.key.is_bigram
+            or not current_node.hash_values
+        ):
             return None
-        chunks.reverse()
-        aligned_len = total_len // alignment * alignment
-        token_ids = list(islice(chain.from_iterable(chunks), aligned_len))
+
+        node_tokens = list(current_node.key.raw_token_ids())
+        cached_tokens = self._cached_prefixes.pop(current_node.parent_node_id, None)
+        if cached_tokens is not None:
+            prefix_token_ids = cached_tokens + node_tokens
+        else:
+            chunks = [node_tokens]
+            current = current_node.parent_node_id
+            while not self.cache.tree_core.is_root(current):
+                snapshot = self.cache.tree_core.snapshot_buffer_backup(
+                    current, pass_prefix_keys=False
+                )
+                if snapshot is None or snapshot.key.is_bigram:
+                    return None
+                chunks.append(snapshot.key.raw_token_ids())
+                current = snapshot.parent_node_id
+            chunks.reverse()
+            prefix_token_ids = list(chain.from_iterable(chunks))
+
+        # TODO: Use a bounded prefix cache to support interleaved requests.
+        self._cached_prefixes.clear()
+        self._cached_prefixes[node_id] = prefix_token_ids
+        total_len = len(prefix_token_ids)
         return _CollectedPrefix(
-            token_ids=token_ids,
-            node_start=total_len - node_len,
-            extra_key=leaf.key.extra_key,
-            cache_salt=leaf.key.cache_salt,
-            terminal_hash=leaf.hash_values[-1],
+            token_ids=prefix_token_ids,
+            node_start=total_len - len(node_tokens),
+            extra_key=current_node.key.extra_key,
+            cache_salt=current_node.key.cache_salt,
+            terminal_hash=current_node.hash_values[-1],
         )
 
     def _finish_lookup(self, rid: str, operation: Any) -> None:
