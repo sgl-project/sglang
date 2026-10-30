@@ -30,7 +30,7 @@ import threading
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 import msgspec
 import psutil
@@ -160,7 +160,9 @@ def _extract_field_by_index(
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
-def _extract_output_ids_by_indices(output: Any, indices: List[int]) -> Dict[str, Any]:
+def _extract_output_ids_by_indices(
+    output: Union[BatchTokenIDOutput, BatchStrOutput], indices: List[int]
+) -> Dict[str, Any]:
     """The flat output ids columns of the rows at indices, in that order."""
     flat, offsets = flatten_output_ids(row_output_ids(output, i) for i in indices)
     return {"output_ids_flat": flat, "output_ids_offsets": offsets}
