@@ -394,7 +394,7 @@ class _GenerationStreamAccumulator:
     has_detokenize_header: bool = False
     # OutputSink.DETOKENIZER only: by row index, a finished row's
     # http_worker_ipc, sent as a sparse http_worker_ipcs; see BatchTokenIDOutput.
-    finished_http_worker_ipcs: dict = field(default_factory=dict)
+    finished_row_ipcs: dict = field(default_factory=dict)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     request_stats: list = field(default_factory=list)
@@ -585,7 +585,7 @@ class _GenerationStreamAccumulator:
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
             if self.output_sink is OutputSink.DETOKENIZER:
-                self.finished_http_worker_ipcs[len(self.rids) - 1] = req.http_worker_ipc
+                self.finished_row_ipcs[len(self.rids) - 1] = req.http_worker_ipc
         else:
             self.weight_versions.append(None)
 
@@ -758,8 +758,10 @@ class _GenerationStreamAccumulator:
         return BatchTokenIDOutput(
             rids=self.rids,
             http_worker_ipcs=(
-                [self.finished_http_worker_ipcs.get(i) for i in range(len(self.rids))]
-                if self.finished_http_worker_ipcs
+                # OutputSink.DETOKENIZER: finished rows only.
+                [self.finished_row_ipcs.get(i) for i in range(len(self.rids))]
+                if self.finished_row_ipcs
+                # OutputSink.TOKENIZER: every row; None under the other sinks.
                 else self.http_worker_ipcs
             ),
             spec_verify_ct=self.spec_verify_ct,

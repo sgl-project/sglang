@@ -1646,10 +1646,8 @@ def build_flat_top_logprobs_arrays(
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # http_worker_ipcs: by row, the route the row carries, else None to use its
-    # stored DetokenizeHeader's; None when no row carries one. Filled on every row
-    # under OutputSink.TOKENIZER (no detokenizer keeps a header), on finished rows
-    # under OutputSink.DETOKENIZER (they route even with no stored state), and
-    # never under OutputSink.RUST.
+    # stored DetokenizeHeader's; None when no row carries one. Every row under
+    # OutputSink.TOKENIZER, finished rows under DETOKENIZER, none under RUST.
 
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
