@@ -16,7 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, print_warning_once
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 try:
@@ -34,6 +34,7 @@ GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
 GLM_VIDEO_PATCH_SIZE = 14
 GLM_VIDEO_MERGE_SIZE = 2
 GLM_VIDEO_PATCH_EXPAND_FACTOR = 4
+GLM_VIDEO_FRAME_PIXELS_PER_TOKEN = (GLM_VIDEO_PATCH_SIZE * GLM_VIDEO_MERGE_SIZE) ** 2
 
 
 def _glm_video_metadata(total_num_frames, fps, duration, frames_indices):
@@ -116,6 +117,8 @@ def glm_processor_video_config(processor):
         for key in GLM_MEDIA_CONFIG_KEYS
         if (value := getattr(processor, key, None)) is not None
     }
+    if (max_duration := getattr(processor, "max_duration", None) or 0) > 0:
+        config["_max_duration"] = max_duration
     budget = _glm_processor_resize_budget(processor)
     if budget is not None:
         config["_presize_budget"] = budget
@@ -155,9 +158,72 @@ def _glm_effective_presize_budget(video_config, effective_max_image_tokens):
     return config
 
 
+def _glm_video_budget_ceiling(defaults, key):
+    if defaults.get(key) is not None:
+        return defaults[key]
+    if key == "fps":
+        return GLM_VIDEO_DEFAULT_FPS
+    if key == "max_frames":
+        # HF samplers without max_frames (GLM-4.1V/4.6V) stop at max_duration * fps.
+        if max_duration := defaults.get("_max_duration"):
+            return int(max_duration * defaults.get("fps", GLM_VIDEO_DEFAULT_FPS))
+        return GLM_VIDEO_DEFAULT_MAX_FRAMES
+    return None
+
+
+def _clamp_glm_video_request_config(defaults, request):
+    """Let request knobs lower the deployment budget, never raise it.
+
+    Omitted keys stay unset so an injected max_frames does not bypass the HF sampler.
+    """
+    merged = {**defaults, **request}
+    if defaults.get("max_tokens_per_frame") is not None:
+        merged["_server_max_tokens_per_frame"] = True
+    for key in GLM_MEDIA_CONFIG_KEYS:
+        if key not in request:
+            continue
+        number = float if key == "fps" else int
+        try:
+            value = number(request[key])
+            valid = value > 0 and (number is int or math.isfinite(value))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise ValueError(f"GLM video {key} must be a positive finite number")
+        ceiling = _glm_video_budget_ceiling(defaults, key)
+        if ceiling is not None and value > number(ceiling):
+            print_warning_once(
+                f"GLM video request {key} is clamped to the deployment limit "
+                f"{ceiling}; raise it with --mm-process-config."
+            )
+            value = number(ceiling)
+        merged[key] = value
+    return merged
+
+
+def _glm_video_config_for_decode(video_config, frame_count):
+    """Drop a request per-frame cap whose total pixels exceed the shared presize budget.
+
+    ``frame_count`` is the full clip, not a DP shard. A server-configured cap stays.
+    """
+    config = dict(video_config or {})
+    cap = config.get("max_tokens_per_frame")
+    budget = config.get("_presize_budget")
+    if cap is None or not budget or config.get("_server_max_tokens_per_frame"):
+        return config
+    # Per-frame resize counts 28x28 px per token; presize max_pixels spans all frames.
+    frame_pixels = int(cap) * GLM_VIDEO_FRAME_PIXELS_PER_TOKEN
+    if frame_pixels * int(frame_count) > budget["max_pixels"]:
+        config.pop("max_tokens_per_frame", None)
+    return config
+
+
 def _merge_glm_video_configs(default_config, item_configs):
     defaults = dict(default_config or {})
-    return [{**defaults, **dict(config or {})} for config in item_configs]
+    return [
+        _clamp_glm_video_request_config(defaults, dict(config or {}))
+        for config in item_configs
+    ]
 
 
 def _hf_sample_frame_indices(
@@ -250,7 +316,7 @@ def _resize_frames_to_max_tokens(frames, max_tokens_per_frame):
         frames = torch.from_numpy(np.asarray(frames))
     nchw = frames.permute(0, 3, 1, 2)
     _, _, height, width = nchw.shape
-    pixels_per_token = (GLM_VIDEO_PATCH_SIZE * GLM_VIDEO_MERGE_SIZE) ** 2
+    pixels_per_token = GLM_VIDEO_FRAME_PIXELS_PER_TOKEN
     factor = GLM_VIDEO_PATCH_SIZE * GLM_VIDEO_MERGE_SIZE * GLM_VIDEO_PATCH_EXPAND_FACTOR
     max_pixels = max(
         int(max_tokens_per_frame) * pixels_per_token,
@@ -388,11 +454,14 @@ def _pre_resize_frames_for_processor(
     return nchw.permute(0, 2, 3, 1).contiguous()
 
 
-def glm_decode_frames_at(vr, indices, video_config=None):
+def glm_decode_frames_at(vr, indices, video_config=None, budget_frame_count=None):
+    """Decode ``indices`` and resize under the shared token budget."""
     indices = list(indices)
     if not indices:
         return None
-    video_config = video_config or {}
+    if budget_frame_count is None:
+        budget_frame_count = len(indices)
+    video_config = _glm_video_config_for_decode(video_config, budget_frame_count)
     if hasattr(vr, "get_frames_as_tensor"):
         frames = vr.get_frames_as_tensor(indices)
     else:

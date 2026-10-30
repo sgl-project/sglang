@@ -1,4 +1,6 @@
+import gc
 import json
+import traceback
 import unittest
 from io import BytesIO
 from typing import Optional
@@ -37,9 +39,9 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_cuda_ci(est_time=232, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=213, stage="base-b", runner_config="1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -77,8 +79,32 @@ class VLMInputTestBase:
             cls.model_path, trust_remote_code=True
         )
         _fix_added_tokens_encoding(cls.processor.tokenizer)
-        cls._init_visual()
+        cls._init_visual_with_cleanup()
         cls._start_engine()
+
+    @classmethod
+    def _init_visual_with_cleanup(cls):
+        try:
+            cls._init_visual()
+        except BaseException as exc:
+            # Failed initializers can retain the parent model in their traceback
+            # while CustomTestCase runs tearDownClass. Drop those local references
+            # including chained errors from model loaders, so teardown can free
+            # the modules already moved to the device.
+            pending = [exc]
+            seen = set()
+            while pending:
+                error = pending.pop()
+                if id(error) in seen:
+                    continue
+                seen.add(id(error))
+                traceback.clear_frames(error.__traceback__)
+                pending.extend(
+                    cause
+                    for cause in (error.__cause__, error.__context__)
+                    if cause is not None
+                )
+            raise
 
     @classmethod
     def _init_visual(cls):
@@ -103,9 +129,18 @@ class VLMInputTestBase:
     @classmethod
     def tearDownClass(cls):
         # CustomTestCase runs tearDownClass even when setUpClass raised.
-        if cls.engine is not None:
-            cls.engine.shutdown()
+        try:
+            if cls.engine is not None:
+                cls.engine.shutdown()
+        finally:
             cls.engine = None
+            # These vision modules belong to the test process, independently of
+            # the engine. Release them even if engine shutdown fails.
+            for name in tuple(vars(cls)):
+                if isinstance(getattr(cls, name), torch.nn.Module):
+                    setattr(cls, name, None)
+            gc.collect()
+            empty_gpu_cache()
 
     def verify_response(self, output):
         # The goal is to check that the model roughly understands:
@@ -221,6 +256,49 @@ class VLMInputTestBase:
 class TestQwenVLUnderstandsImage(VLMInputTestBase, CustomTestCase):
     model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
     chat_template = "qwen2-vl"
+
+    def test_colliding_low_hash_bits_do_not_reuse_image_kv(self):
+        prompt = self.processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "Name the image's color in one word."},
+                    ],
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        red = Image.new("RGB", (224, 224), "red")
+        blue = Image.new("RGB", (224, 224), "blue")
+        params = dict(temperature=0.0, max_new_tokens=16)
+        # these distinct caller hashes collapse to the same legacy 30-bit pad
+        self.engine.flush_cache()
+        cold_blue = self.engine.generate(
+            prompt=prompt,
+            image_data=[blue],
+            mm_hashes=["40000007"],
+            sampling_params=params,
+        )
+        self.engine.flush_cache()
+        red_output = self.engine.generate(
+            prompt=prompt, image_data=[red], mm_hashes=["7"], sampling_params=params
+        )
+        warm_blue = self.engine.generate(
+            prompt=prompt,
+            image_data=[blue],
+            mm_hashes=["40000007"],
+            sampling_params=params,
+        )
+        self.assertIn("red", red_output["text"].lower())
+        self.assertIn("blue", cold_blue["text"].lower())
+        self.assertEqual(warm_blue["text"], cold_blue["text"])
+        self.assertLess(
+            warm_blue["meta_info"]["cached_tokens"],
+            warm_blue["meta_info"]["prompt_tokens"] - 1,
+        )
 
     @classmethod
     def _init_visual(cls):
@@ -435,7 +513,7 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, CustomTestCase):
         cls.processor = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
-        cls._init_visual()
+        cls._init_visual_with_cleanup()
         cls._start_engine()
 
     @classmethod
@@ -627,7 +705,7 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, CustomTestCase):
 
         cls.processor.tokenizer = get_tokenizer(cls.model_path, trust_remote_code=True)
         _fix_added_tokens_encoding(cls.processor.tokenizer)
-        cls._init_visual()
+        cls._init_visual_with_cleanup()
         cls._start_engine()
 
     @classmethod

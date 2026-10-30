@@ -18,7 +18,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -28,7 +28,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_kv_layers
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -50,7 +50,10 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
+_has_fused_qk_norm_rope = False
 if _use_aiter:
+    from aiter import dtypes as aiter_dtypes
+
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 
@@ -58,11 +61,103 @@ if _use_aiter:
         logger.info("aiter fused_qk_norm_mrope_3d kernel available")
     except ImportError:
         pass
+    try:
+        from aiter import fused_qk_norm_rope_cache_pts_quant_shuffle
+
+        _has_fused_qk_norm_rope = True
+        logger.info("aiter fused_qk_norm_rope kernel available")
+    except ImportError:
+        pass
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
+
+
+def aiter_fused_qk_norm_rope_set_kv(
+    qkv: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    rotary_emb: RotaryEmbedding,
+    positions: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> torch.Tensor:
+    """QK-norm + RoPE (1D, or 3D mRoPE for MRotaryEmbedding) + KV cache write in
+    one aiter HIP kernel.
+
+    ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV
+    projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,
+    head_dim) pool buffers, in ``qkv``'s dtype or ``aiter.dtypes.fp8``. An fp8
+    cache stores k / k_scale and v / v_scale; other caches ignore the scales.
+    ``k_scale`` / ``v_scale`` must be CPU tensors: the kernel reads them on the
+    host. Returns q as (num_tokens, num_heads * head_dim).
+    """
+    num_tokens = qkv.shape[0]
+    q_out = torch.empty(
+        num_tokens, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device
+    )
+    kernel_kwargs = dict(
+        qkv=qkv.view(num_tokens, -1, head_dim),
+        qw=q_norm.weight,
+        kw=k_norm.weight,
+        cos_sin=rotary_emb.cos_sin_cache_as(qkv.dtype),
+        positions=positions,
+        num_tokens=num_tokens,
+        num_heads_q=num_heads,
+        num_heads_k=num_kv_heads,
+        num_heads_v=num_kv_heads,
+        head_size=head_dim,
+        is_neox_style=rotary_emb.is_neox_style,
+        eps=q_norm.variance_epsilon,
+        q_out=q_out,
+        # The kernel reads cache strides as (block, token, head); an NHD buffer
+        # is one-slot blocks addressed with block_size=0.
+        k_cache=k_cache.unsqueeze(1),
+        v_cache=v_cache.unsqueeze(1),
+        slot_mapping=out_cache_loc,
+        per_tensor_k_scale=k_scale,
+        per_tensor_v_scale=v_scale,
+        k_out=None,
+        v_out=None,
+        return_kv=False,
+        use_shuffle_layout=False,
+        block_size=0,
+        x=0,
+    )
+    if isinstance(rotary_emb, MRotaryEmbedding):
+        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            **kernel_kwargs,
+            mrope_section_=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+        )
+    else:
+        fused_qk_norm_rope_cache_pts_quant_shuffle(**kernel_kwargs)
+    return q_out.view(num_tokens, -1)
+
+
+def _host_kv_scale(scale, scale_float) -> float:
+    """Host value of a RadixAttention per-tensor KV scale. ``BaseKVCacheMethod``
+    pairs its device scale with a float, ``load_kv_cache_scales`` sets a plain
+    float, and without a scale the pool writes unscaled."""
+    if scale is None:
+        return 1.0
+    if scale_float is not None:
+        return float(scale_float)
+    if isinstance(scale, (int, float)):
+        return float(scale)
+    # Reading it here would be a device-to-host sync, which graph capture forbids.
+    raise ValueError(
+        f"the fused KV write needs a host copy of the KV scale, got a "
+        f"{type(scale).__name__} without one"
+    )
 
 
 class Qwen3Attention(nn.Module):
@@ -161,13 +256,33 @@ class Qwen3Attention(nn.Module):
             and isinstance(self.rotary_emb, MRotaryEmbedding)
             and getattr(self.rotary_emb, "mrope_section", None) is not None
         )
-        if self.use_fused_qk_norm_mrope:
-            # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
-            # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph capture.
-            # Explicit device='cpu' is required because SGLang constructs models inside
-            # a `with torch.device('cuda'):` context that changes the default device.
-            self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
-            self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+        # The 1D kernel is instantiated for these head sizes, indexes
+        # cos_sin_cache as [pos, rotary_dim] and takes one eps for both norms;
+        # scaled-RoPE subclasses stay on the unfused path.
+        self.use_fused_qk_norm_rope = (
+            _has_fused_qk_norm_rope
+            and type(self.rotary_emb) is RotaryEmbedding
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.head_dim in (64, 128, 256, 512)
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        )
+        # Built on first use: the KV scales are set after __init__, by
+        # process_weights_after_loading or load_kv_cache_scales.
+        self._fused_kv_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def _aiter_fused_kv_scales(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(k_scale, v_scale) for the fused KV write as CPU float32 tensors. The
+        kernel reads them on the host at launch, so a device tensor would sync
+        and break graph capture, and a captured graph keeps the values it was
+        captured with."""
+        if self._fused_kv_scales is None:
+            k_scale = _host_kv_scale(self.attn.k_scale, self.attn.k_scale_float)
+            v_scale = _host_kv_scale(self.attn.v_scale, self.attn.v_scale_float)
+            self._fused_kv_scales = (
+                torch.tensor(k_scale, dtype=torch.float32, device="cpu"),
+                torch.tensor(v_scale, dtype=torch.float32, device="cpu"),
+            )
+        return self._fused_kv_scales
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -203,66 +318,26 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
-    def forward_prepare_aiter_fused_mrope(
-        self, positions, hidden_states, forward_batch
+    def forward_prepare_aiter_fused(
+        self, positions, hidden_states, forward_batch, k_cache, v_cache
     ):
-        """Fused QK-norm + 3D mRoPE + KV cache write for decode (ROCm/aiter).
-
-        The fused HIP kernel replaces split → QK norm → mRoPE → cache write,
-        so KV is already in the paged cache when this returns.
-        Returns (q, None, None); caller must pass save_kv_cache=False to attn.
-        """
+        """Decode-only fused path; KV is already in the paged cache when this
+        returns, so the caller must pass save_kv_cache=False to attn."""
         qkv, _ = self.qkv_proj(hidden_states)
-        num_tokens = qkv.shape[0]
-
-        qkv_3d = qkv.view(num_tokens, -1, self.head_dim)
-
-        token_to_kv_pool = get_token_to_kv_pool()
-        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
-        slot_mapping = forward_batch.out_cache_loc
-
-        cos_sin = self.rotary_emb.cos_sin_cache
-        if cos_sin.dtype != qkv.dtype:
-            cos_sin = cos_sin.to(dtype=qkv.dtype)
-
-        q_out = torch.empty(
-            num_tokens,
-            self.num_heads,
-            self.head_dim,
-            dtype=qkv.dtype,
-            device=qkv.device,
-        )
-
-        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-            qkv_3d,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            cos_sin,
+        q = aiter_fused_qk_norm_rope_set_kv(
+            qkv,
+            self.q_norm,
+            self.k_norm,
+            self.rotary_emb,
             positions,
-            num_tokens,
-            self.num_heads,
-            self.num_kv_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            self.rotary_emb.is_neox_style,
-            self.rotary_emb.mrope_section,
-            self.rotary_emb.mrope_interleaved,
-            self.q_norm.variance_epsilon,
-            q_out,
             k_cache,
             v_cache,
-            slot_mapping,
-            self._fused_k_scale,
-            self._fused_v_scale,
-            None,
-            None,
-            False,
-            False,
-            0,
-            0,
+            forward_batch.out_cache_loc,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            *self._aiter_fused_kv_scales(),
         )
-
-        q = q_out.reshape(num_tokens, -1)
         return q, None, None
 
     def forward(
@@ -275,15 +350,23 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
-        use_aiter_fused = (
-            self.use_fused_qk_norm_mrope
+        use_aiter_fused = False
+        can_try_aiter_fused = (
+            (self.use_fused_qk_norm_mrope or self.use_fused_qk_norm_rope)
             and forward_batch.forward_mode.is_decode()
             and get_exec().deterministic.rl_on_policy_target is None
         )
+        if can_try_aiter_fused:
+            k_cache, v_cache = get_kv_layers().read(self.attn.layer_id).kv()
+            # The fused write targets the NHD layout, in the activation dtype or
+            # the one fp8 dtype the kernel quantizes to.
+            use_aiter_fused = k_cache.dim() == 3 and (
+                k_cache.dtype in (hidden_states.dtype, aiter_dtypes.fp8)
+            )
 
         if use_aiter_fused:
-            q, k, v = self.forward_prepare_aiter_fused_mrope(
-                positions, hidden_states, forward_batch
+            q, k, v = self.forward_prepare_aiter_fused(
+                positions, hidden_states, forward_batch, k_cache, v_cache
             )
             save_kv_cache = False
         elif not _is_npu:

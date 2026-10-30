@@ -7,14 +7,14 @@ from sglang.kernels.ops.attention.dsv4.packed_main_kv import (
     flash_c2_prefill_pack_main_kv_fp4,
     pack_dsv41_main_kv_fp4,
 )
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
-    quantize_dsv41_packed_main_kv,
-)
 from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     PackedMainKVView,
     make_dsv41_packed_main_kv_spec,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+    quantize_dsv41_packed_main_kv,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")

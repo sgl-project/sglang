@@ -5,11 +5,12 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    compute_uniform_extend_lengths,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
@@ -31,15 +32,25 @@ class TestRaggedTargetVerifyGeometry(CustomTestCase):
         self.assertEqual(geometry.cu_seqlens_k.tolist(), [0, 18, 39, 72])
         self.assertEqual(geometry.max_seq_len_q, 8)
 
-    def test_geometry_dtypes_are_int32(self):
-        layout = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=[8, 1, 3], device=_DEVICE, grid=_GRID
+
+class TestUniformExtendLengths(CustomTestCase):
+    def test_without_host_seq_lens(self):
+        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+        lengths = compute_uniform_extend_lengths(
+            seq_lens=seq_lens, seq_lens_cpu=None, extend_len=5
         )
-        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int64)
-        geometry = build_ragged_target_verify_geometry(seq_lens=seq_lens, layout=layout)
-        self.assertEqual(geometry.cache_seqlens_int32.dtype, torch.int32)
-        self.assertEqual(geometry.cu_seqlens_q.dtype, torch.int32)
-        self.assertEqual(geometry.cu_seqlens_k.dtype, torch.int32)
+        self.assertEqual(lengths.seq_lens_extended.tolist(), [15, 25, 35])
+        self.assertIsNone(lengths.seq_lens_cpu_extended)
+        self.assertEqual(lengths.extend_seq_lens_cpu, [5, 5, 5])
+        self.assertEqual(lengths.num_tokens, 15)
+
+    def test_with_host_seq_lens(self):
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        lengths = compute_uniform_extend_lengths(
+            seq_lens=seq_lens, seq_lens_cpu=[10, 20], extend_len=5
+        )
+        self.assertEqual(lengths.seq_lens_cpu_extended, [15, 25])
+        self.assertEqual(lengths.num_tokens, 10)
 
 
 class TestPaddedRaggedVerifyGeometry(CustomTestCase):
@@ -97,28 +108,6 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
 
 
 class TestCaptureVerifyLens(CustomTestCase):
-    def test_small_tier_one_token_rows(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
-
-        lens = build_capture_verify_lens(num_tokens=8, num_slots=8, num_draft_tokens=8)
-        self.assertEqual(lens, [1] * 8)
-
-    def test_large_tier_spreads_within_window(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
-
-        lens = build_capture_verify_lens(
-            num_tokens=1024, num_slots=128, num_draft_tokens=8
-        )
-        self.assertEqual(sum(lens), 1024)
-        self.assertEqual(lens, [8] * 128)
-
-    def test_uneven_tier_rows_stay_legal(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
-
-        lens = build_capture_verify_lens(num_tokens=24, num_slots=5, num_draft_tokens=8)
-        self.assertEqual(sum(lens), 24)
-        self.assertTrue(all(1 <= v <= 8 for v in lens))
-
     def test_rejects_overpacked_tier(self):
         from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
 

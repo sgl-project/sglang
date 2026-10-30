@@ -214,6 +214,8 @@ class SchedulerMlxOverlapMixin:
                 mx.synchronize()
                 break
 
+            self.increment_scheduler_iterations()
+
             self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()

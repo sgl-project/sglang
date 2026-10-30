@@ -111,7 +111,7 @@ def test_prologue_decode_tau_fold(t):
 def test_rel_logits_proj_prescale_tau(t):
     """RelLogitsProj's operand-side tau fold (r*tau before the einsum) must
     match the legacy output-side scale within bf16 rounding."""
-    from sglang.kernels.ops.attention.log_scaling_tau import apply_log_scaling_tau
+    from sglang.kernels.ops.elementwise.row_scale import apply_log_scaling_tau
     from sglang.srt.models.inkling_common.attn import RelLogitsProj
 
     torch.manual_seed(t)
@@ -164,7 +164,7 @@ def test_rel_logits_proj_strided_dispatch(t):
     assert torch.equal(out, ref)
 
     # The tau path on the same strided layout (prescale compacts first).
-    from sglang.kernels.ops.attention.log_scaling_tau import apply_log_scaling_tau
+    from sglang.kernels.ops.elementwise.row_scale import apply_log_scaling_tau
 
     tau = 1.0 + 0.1 * torch.rand(t, device="cuda", dtype=torch.float32)
     ref_tau = apply_log_scaling_tau(ref, tau.view(-1, 1, 1))

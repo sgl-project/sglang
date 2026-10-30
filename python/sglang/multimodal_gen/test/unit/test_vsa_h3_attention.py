@@ -328,3 +328,42 @@ def test_metadata_tile_geometry_accounts_every_row() -> None:
     assert meta.num_video_tiles == video_tiles
     assert meta.variable_block_sizes.numel() == meta.num_prefix_tiles + video_tiles
     assert VSA_H3_TILE_ELEMS == 64
+
+
+def test_pointer_load_path_selection() -> None:
+    """sm80 (A100) takes the raw-pointer kernel; Hopper and newer take the TMA
+    descriptor kernel."""
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels import (
+        _use_pointer_loads,
+    )
+
+    assert _use_pointer_loads((8, 0))
+    assert not _use_pointer_loads((9, 0))
+    assert not _use_pointer_loads((10, 0))
+    assert not _use_pointer_loads((10, 3))
+    assert not _use_pointer_loads((12, 0))
+
+
+def test_vsa_h3_module_imports_without_sm100_symbol() -> None:
+    """The module must import without sglang.kernels.ops.diffusion
+    vsa_block_sparse_sm100 (absent on stacks that do not ship the sm100 tcgen05
+    kernel): the dependency is imported lazily inside the sm100 branch only."""
+    import importlib
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        vsa_h3_kernels,
+    )
+
+    importlib.reload(vsa_h3_kernels)
+    assert hasattr(vsa_h3_kernels, "vsa_h3_block_sparse_attn_forward")
+
+
+def test_vsa_h3_backend_resolver_allows_sm80() -> None:
+    """The resolver gate must admit A100, which the pointer kernel serves."""
+    from sglang.multimodal_gen.runtime.platforms.cuda import (
+        _VideoSparseAttentionH3BackendResolver,
+    )
+
+    caps = _VideoSparseAttentionH3BackendResolver.supported_capabilities
+    assert (8, 0) in caps
+    assert {(9, 0), (10, 0), (10, 3)} <= caps

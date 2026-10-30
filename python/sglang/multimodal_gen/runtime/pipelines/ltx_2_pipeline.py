@@ -546,7 +546,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
         self._ensure_on_gpu("transformer")
         self._ensure_on_gpu("transformer_2")
         logger.info(
-            "Using resident LTX-2.3 two-stage transformers mode (both DiTs stay on GPU)"
+            "Using resident LTX-2 two-stage transformers mode (both DiTs stay on GPU)"
         )
         self.manager._active_phase = "stage1"
         self.manager._sync_refinement_stage_transformer("stage1")
@@ -607,14 +607,15 @@ class LTX2TwoStageResidencyController:
 
     @property
     def should_use_premerged(self) -> bool:
-        """Whether to keep a pre-merged stage-2 DiT for LTX-2.3 two-stage.
+        """Whether to keep a second DiT with the distilled LoRA merged in for stage 2.
 
-        We only enable this optimization for resident native LTX-2.3 two-stage
-        and when users did not explicitly provide a stage-1 LoRA path
+        Resident mode keeps both DiTs on the GPU, so stage 2 runs merged weights
+        like the official two-stage pipelines instead of a per-layer dynamic LoRA;
+        it needs the distilled LoRA and no user-provided stage-1 LoRA
         """
         return (
             self.mode == "resident"
-            and self.pipeline._should_merge_stage2_distilled_lora(self.server_args)
+            and self.pipeline._distilled_lora_path is not None
             and self.pipeline._stage1_lora_path is None
         )
 

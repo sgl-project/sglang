@@ -9,12 +9,12 @@ from sglang.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _BonusTokenVerifyInput(SpecInput):
@@ -24,7 +24,7 @@ class _BonusTokenVerifyInput(SpecInput):
         self.num_tokens_per_req = 7
 
 
-class _KVIndexTranslator:
+class _RunnerIds:
     is_translating = False
 
     def pack_read_stream(
@@ -76,7 +76,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.window_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
     backend.mask_indptr = torch.zeros(batch_size + 1, dtype=torch.int64)
     backend.cuda_graph_kv_indices = torch.zeros(256, dtype=torch.int64)
-    backend.kv_index_translator = _KVIndexTranslator()
+    backend.runner_ids = _RunnerIds()
     backend.sliding_window_size = None
     backend.use_sliding_window_kv_pool = False
     backend._verify_mask = None
@@ -97,7 +97,7 @@ def _make_forward_batch(batch_size, spec_info):
         forward_mode=ForwardMode.TARGET_VERIFY,
         out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
         # A static pool's reads never touch the plan.
-        kv_loc_plan=None,
+        iteration_ids=None,
     )
 
 
@@ -168,9 +168,12 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
     backend.use_dense_fp8_chunked_prefill = False
     backend.allow_bidirectional_attention_in_extend = False
     backend.page_size = 1
+    backend.use_sliding_window_kv_pool = False
+    layer_kv = SimpleNamespace(
+        key=lambda: torch.zeros((1, 1, 4)), value=lambda: torch.zeros((1, 1, 4))
+    )
     backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda _layer_id: torch.zeros((1, 1, 4)),
-        get_value_buffer=lambda _layer_id: torch.zeros((1, 1, 4)),
+        layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
     )
     backend.forward_metadata = ForwardMetadata(
         attn_logits=None,

@@ -29,7 +29,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -61,7 +60,10 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.multi_gate import (
     create_multi_gate_mm_indices,
     multi_gate_triton_kernel,
@@ -300,6 +302,13 @@ class BailingMoESparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+        routing_method_type = None
+        if self.norm_topk_prob:
+            if self.use_grouped_topk and self.correction_bias is not None:
+                routing_method_type = RoutingMethodType.DeepSeekV3
+            elif not self.use_grouped_topk and self.correction_bias is None:
+                routing_method_type = RoutingMethodType.RenormalizeNaive
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
             top_k=self.top_k,
@@ -308,7 +317,15 @@ class BailingMoESparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=routing_method_type,
             prefix=add_prefix("experts", prefix),
+        )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
         # shared expert
         if config.num_shared_experts is not None:
@@ -474,10 +491,6 @@ class BailingMoESparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 dynamic_expert_bias=dynamic_expert_bias,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

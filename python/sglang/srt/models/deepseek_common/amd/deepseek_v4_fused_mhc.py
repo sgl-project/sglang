@@ -11,8 +11,6 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
-from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -170,7 +168,10 @@ def _get_fused_hc_post_pre_buffers(
             num_ksplit, num_tokens, dtype=torch.float32, device=device
         ),
     }
-    _FUSED_HC_POST_PRE_CACHE[key] = bufs
+    # Cache only small batches: a caller that runs this path for every prefill
+    # size (gfx1250) would otherwise keep one buffer set per num_tokens forever.
+    if num_tokens <= _FUSED_HC_POST_PRE_M_THRESHOLD:
+        _FUSED_HC_POST_PRE_CACHE[key] = bufs
     return bufs
 
 
@@ -570,83 +571,6 @@ def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
     return all_reduce_mhc_post(
         x, state.residual, state.post, state.comb, get_parallel().tp_group.ca_comm
     )
-
-
-def forward_hc_pre_from_prev_fused_boundary(
-    layer,
-    positions: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    input_ids: torch.Tensor,
-    forward_batch,
-    input_ids_global: torch.Tensor,
-    prev_pre: Optional[torch.Tensor],
-    pending_post: Optional[Tuple[torch.Tensor, ...]],
-    defer_post: bool,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
-    """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
-    pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
-    comb); with defer_post this layer's is returned the same way and hidden_states is None."""
-    if pending_post is None:
-        pending_post = (None, hidden_states, None, None)
-    residual, x, attn_coefficients = hc_boundary(
-        layer,
-        *pending_post,
-        prev_pre,
-        layer.hc_attn_fn,
-        layer.hc_attn_scale,
-        layer.hc_attn_base,
-    )
-    # the boundary's reduce + sinkhorn rides in the norm launch
-    x, x_quant = layer._input_norm(
-        x, allow_aiter_quant=False, coefficients=attn_coefficients
-    )
-    with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
-        mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
-        x = layer.self_attn(
-            x=x,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-            defer_all_reduce=mhc is not None,
-        )
-    if mhc is not None:
-        # wo_b honors the deferred reduce under attention_mhc_fusion's gates;
-        # fail loud rather than fall back to an unfused reduce.
-        assert isinstance(x, AttnOutput)
-        residual = apply_attention_mhc(x.partial, mhc)
-        x = None
-    residual, x, ffn_coefficients = hc_boundary(
-        layer,
-        x,
-        residual,
-        attn_coefficients.post if x is not None else None,
-        attn_coefficients.comb if x is not None else None,
-        attn_coefficients.pre,
-        layer.hc_ffn_fn,
-        layer.hc_ffn_scale,
-        layer.hc_ffn_base,
-    )
-    x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
-    mhc = moe_mhc_fusion(layer, residual, ffn_coefficients, forward_batch)
-    x = layer._run_moe_ffn_dp_sync(
-        x,
-        forward_batch,
-        input_ids=input_ids,
-        input_ids_global=input_ids_global,
-        return_moe_output=mhc is not None,
-    )
-    ffn_pre, ffn_post, ffn_comb = ffn_coefficients.tensors()
-    if mhc is not None:
-        # The MoE TP path honors the deferred output under moe_mhc_fusion's gates;
-        # fail loud rather than fall back to an unfused reduce. The fused post
-        # carries the reduce, so take the merged rows without one.
-        assert isinstance(x, MoEOutput)
-        # Reduction already applied post. The next boundary consumes this
-        # materialized residual, including when it would normally defer post.
-        return apply_moe_mhc(x.get_merged(), mhc), ffn_pre, None
-    if defer_post:
-        return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
-    return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None
 
 
 def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):

@@ -71,6 +71,9 @@ def topk_softmax_pack(
     pack id = -1 (the padded-region sentinel). ``topk_weights``/``topk_indices``
     are written exactly like the AOT kernel (indices NOT masked here — the
     regular python post-process handles them).
+
+    The real-row count may be a scalar or a one-element vector. A scalar is
+    viewed as the vector expected by the native launcher without copying it.
     """
     assert gating_output.dim() == 2
     num_experts = gating_output.shape[-1]
@@ -80,6 +83,8 @@ def topk_softmax_pack(
     )
     if gating_output.shape[0] == 0:
         return
+    if num_token_non_padded is not None and num_token_non_padded.dim() == 0:
+        num_token_non_padded = num_token_non_padded.view(1)
     _jit_topk_softmax_pack_op(
         topk_weights,
         topk_indices,

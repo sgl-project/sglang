@@ -30,11 +30,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
-from sglang.multimodal_gen.runtime.utils.vision import resize
+from sglang.multimodal_gen.runtime.utils.vision import preprocess_image, resize
 
 
 def _calculate_dimensions(target_area, ratio):
@@ -676,7 +677,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         vae_image_sizes = []
         for img in batch.condition_image:
             width, height = self.calculate_vae_image_size(img, img.width, img.height)
-            new_images.append(vae_image_processor.preprocess(img, height, width))
+            new_images.append(
+                preprocess_image(
+                    img, device=get_local_torch_device(), size=(width, height)
+                )
+            )
             vae_image_sizes.append((width, height))
         batch.vae_image = new_images
         batch.vae_image_sizes = vae_image_sizes
@@ -801,12 +806,17 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             [noisy_img_complex, img_complex[noisy_img_seq_len:, :]], dim=0
         ).to(device=device)
 
+        # one tensor for both CFG branches, so the DiT's modulation cache hits
+        additional_t_cond = batch.extra.get("qwen_layered_t_cond")
+        if additional_t_cond is None:
+            additional_t_cond = torch.zeros(1, device=device, dtype=torch.long)
+            batch.extra["qwen_layered_t_cond"] = additional_t_cond
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "img_shapes": img_shapes,
             "freqs_cis": (img_cache, txt_cache),
             "freqs_complex": (img_complex, txt_complex),
-            "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+            "additional_t_cond": additional_t_cond,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
         return cond_kwargs

@@ -34,6 +34,7 @@ def build_attention(model, variant, *, width=32, head_dim=8, quant_config=None):
         intermediate_size=2 * width,
         hidden_act="silu",
         num_hidden_layers=2,
+        full_attention_interval=4,
         attn_output_gate=variant[1] if model == "qwen" else False,
         qk_norm_type="per_head",
         sparse_attention_config=dict(

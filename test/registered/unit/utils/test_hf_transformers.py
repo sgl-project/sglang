@@ -5,12 +5,18 @@ context length, GGUF detection, etc.) that don't require actual model files.
 """
 
 import inspect
+import io
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import torch
+from PIL import Image
 from transformers import PretrainedConfig
+from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.utils.hf_transformers.processor as processor_utils
@@ -27,13 +33,16 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
+from sglang.srt.utils.hf_transformers.config import (
+    _apply_gemma4_attention_overrides,
+    get_config,
+)
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +117,36 @@ class TestGetProcessor(CustomTestCase):
                 )
                 self.assertIs(processor.image_processor, pil_processor)
 
+    def test_minimax_m3_vl_does_not_load_bundled_processor(self):
+        """MiniMax-M3.1-Flash bundles a MiniMaxVLProcessor that lacks the replace hooks
+        and breaks on video; its bundled code must not load, also on backend reload."""
+        config = SimpleNamespace(model_type="minimax_m3_vl", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_image_processor = MagicMock()
+        m31_processor = MagicMock(return_value=loaded_processor)
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+            _get_minimax_m31_processor=m31_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", trust_remote_code=True, image_processor_backend="pil"
+            )
+
+        m31_processor.assert_called_once()
+        auto_processor.from_pretrained.assert_not_called()
+        auto_image_processor.from_pretrained.assert_called_once_with(
+            "test-model", trust_remote_code=False, revision=None, backend="pil"
+        )
+
     def test_resolves_model_name_before_loading_config(self):
         remote_model = "s3://bucket/model"
         local_model = "/cache/model"
@@ -140,6 +179,41 @@ class TestGetProcessor(CustomTestCase):
             revision=None,
         )
 
+    def test_unlimited_ocr_loads_for_both_model_type_spellings(self):
+        """baidu/Unlimited-OCR was re-saved with model_type "unlimited_ocr"; that
+        checkpoint must still build its sub-configs and get SGLang's processor,
+        not a bare tokenizer."""
+        from sglang.srt.configs.unlimited_ocr import UnlimitedOCRHFProcessor
+
+        for model_type in ("unlimited-ocr", "unlimited_ocr"):
+            with (
+                self.subTest(model_type=model_type),
+                tempfile.TemporaryDirectory() as d,
+            ):
+                with open(f"{d}/config.json", "w") as f:
+                    json.dump(
+                        {
+                            "model_type": model_type,
+                            "architectures": ["UnlimitedOCRForCausalLM"],
+                            "language_config": {"vocab_size": 1234},
+                        },
+                        f,
+                    )
+                config = get_config(d, trust_remote_code=False)
+                self.assertEqual(config.text_config.vocab_size, 1234)
+
+                loaded_processor = MagicMock()
+                loaded_processor.tokenizer.chat_template = "template"
+                with patch.object(
+                    UnlimitedOCRHFProcessor,
+                    "from_pretrained",
+                    return_value=loaded_processor,
+                ) as from_pretrained:
+                    processor = processor_utils.get_processor(d)
+
+                self.assertIs(processor, loaded_processor)
+                from_pretrained.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # _patch_image_processor_kwargs
@@ -166,6 +240,38 @@ class TestImageProcessorKwargsPatch(CustomTestCase):
         self.assertEqual(first, {"images": "first", "accepted": True})
         self.assertEqual(second, {"images": "second", "accepted": False})
         self.assertEqual(signature.call_count, 1)
+
+
+class TestPilImageProcessorTensorPatch(CustomTestCase):
+    def test_grayscale_jpeg_tensor_matches_pil_rgb(self):
+        """A grayscale JPEG tensor should match the PIL RGB backend output."""
+        image = Image.new("L", (56, 56), 128)
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG")
+        decoded = Image.open(io.BytesIO(encoded.getvalue()))
+        gray_tensor = torch.from_numpy(np.array(decoded)).unsqueeze(0)
+        self.assertEqual(gray_tensor.shape[0], 1)
+        backend = PilBackend()
+
+        actual = backend.process_image(gray_tensor, do_convert_rgb=True)
+        expected = backend.process_image(decoded.convert("RGB"), do_convert_rgb=True)
+
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_rgb_conversion_flag_and_channel_layout(self):
+        """Only requested RGB conversion may expand a grayscale tensor."""
+        backend = PilBackend()
+        gray = torch.full((1, 16, 16), 128, dtype=torch.uint8)
+        self.assertEqual(
+            backend.process_image(gray, do_convert_rgb=False).shape, (1, 16, 16)
+        )
+        self.assertEqual(backend.process_image(gray, True).shape, (3, 16, 16))
+
+        rgb_hwc = torch.zeros((1, 16, 3), dtype=torch.uint8)
+        self.assertEqual(
+            backend.process_image(rgb_hwc, True, "channels_last").shape,
+            (3, 1, 16),
+        )
 
 
 # ---------------------------------------------------------------------------

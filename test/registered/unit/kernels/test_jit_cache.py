@@ -19,7 +19,7 @@ from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -139,8 +139,18 @@ def test_anchor_roots_are_symlink_resolved(tmp_path, monkeypatch):
         {"cpp_wrappers": (("run", "Other::run"),)},
         {"include_paths": ("/opt/extra",)},
         {"header_only": False, "cpp_files": ("/tmp/x.cpp",), "cpp_wrappers": ()},
+        {"cuda_files": ("/tmp/x.cuh",), "cuda_units": (("UNIT=1",),)},
     ],
-    ids=["args", "cuda_cflags", "cflags", "ldflags", "wrappers", "includes", "mode"],
+    ids=[
+        "args",
+        "cuda_cflags",
+        "cflags",
+        "ldflags",
+        "wrappers",
+        "includes",
+        "mode",
+        "units",
+    ],
 )
 def test_build_key_separates_every_build_input(overrides):
     """Two builds differing in any of these must never share a directory.
@@ -471,6 +481,27 @@ def test_header_only_module_compiles_through_a_generated_wrapper(tmp_path):
     # kernel in tree happens to drag it in transitively, so dropping this would
     # only break whichever future kernel does not.
     assert "#include <tvm/ffi/function.h>" in generated
+
+
+def test_cuda_units_compile_the_sources_again_with_their_macros(tmp_path):
+    source = str(tmp_path / "kernel.cuh")
+    spec = _spec(
+        cuda_files=(source,),
+        cpp_wrappers=(),
+        cuda_wrappers=(("run", "K::run"),),
+        cuda_units=(("UNIT=A(1) A(2)",), ("UNIT=A(3)", "FLAG")),
+    )
+    units = spec.translation_units()
+    assert [unit.filename for unit in units] == [
+        "cuda.cu",
+        "cuda_unit0.cu",
+        "cuda_unit1.cu",
+    ]
+    # Units only instantiate: the generated wrapper alone exports.
+    assert units[1].source == f'#define UNIT A(1) A(2)\n#include "{source}"\n'
+    assert units[2].source == f'#define UNIT A(3)\n#define FLAG\n#include "{source}"\n'
+    link = next(line for line in ninja.generate(spec).splitlines() if ": link " in line)
+    assert link.endswith("cuda_0.o cuda_unit0_1.o cuda_unit1_2.o")
 
 
 def test_non_header_only_module_compiles_its_sources_in_place(tmp_path):

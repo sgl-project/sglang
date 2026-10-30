@@ -13,7 +13,7 @@ from sglang.srt.models.qwen4_exp import _build_qwen4_exp_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 HC_COUNT = 3
 HIDDEN = 4

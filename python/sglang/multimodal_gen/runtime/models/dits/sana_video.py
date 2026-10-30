@@ -10,9 +10,9 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 
 from sglang.kernels.ops.diffusion import (
+    SANA_VIDEO_LINEAR_ATTENTION,
     BitExactFusionGate,
     fused_interleaved_rope_fp64,
-    mark_sana_video_linear_attention_site,
     tensors_equal,
     try_sana_video_linear_attention,
 )
@@ -65,39 +65,21 @@ def apply_interleaved_rotary_emb_pair(
     freqs_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply paired interleaved RoPE, with a bit-exact eager fallback."""
-    verified = _SANA_VIDEO_ROPE.verified
-    if (
-        not _SANA_VIDEO_ROPE.disabled
-        and _is_cuda
-        and query.is_cuda
-        and query.dtype is torch.bfloat16
-        and (verified or _SANA_VIDEO_ROPE.can_attempt_once())
-    ):
-        try:
-            fused = fused_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin)
-        except Exception as exc:
-            _SANA_VIDEO_ROPE.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return fused
-            eager = (
-                apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
-                apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
-            )
-            return _SANA_VIDEO_ROPE.accept_or_fallback(
-                fused,
-                eager,
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "SANA-Video fused RoPE is not bit-exact on this platform; "
-                    "falling back to eager"
-                ),
-            )
-    return (
-        apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
-        apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
-    )
+
+    def reference():
+        return (
+            apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+            apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+        )
+
+    if _is_cuda and query.is_cuda and query.dtype is torch.bfloat16:
+        return _SANA_VIDEO_ROPE.run(
+            lambda: fused_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin),
+            reference,
+            equal=tensors_equal,
+            logger=logger,
+        )
+    return reference()
 
 
 class SanaVideoRotaryPosEmbed(nn.Module):
@@ -252,7 +234,7 @@ class SanaVideoLinearAttention(nn.Module):
         self.to_out = nn.ModuleList(
             [nn.Linear(self.inner_dim, query_dim, bias=True), nn.Identity()]
         )
-        mark_sana_video_linear_attention_site(self)
+        SANA_VIDEO_LINEAR_ATTENTION.mark(self)
 
     def forward(
         self,

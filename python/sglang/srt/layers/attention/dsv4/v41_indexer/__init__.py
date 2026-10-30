@@ -59,18 +59,7 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
-    from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_parallel
-
-    return (
-        is_sm100_or_newer()
-        and has_dense_fp4_indexer()
-        and (
-            get_parallel().attn_cp_size > 1
-            or not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
-        )
-    )
+    return is_sm100_or_newer() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
@@ -123,13 +112,12 @@ def make_candidate_indexer(
 
     sparse_table = SparseTableBackend(
         token_to_kv_pool=token_to_kv_pool,
-        req_to_token=req_to_token,
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
     )
-    # A CP rank's rows are an interleaved subset of the batch; the torch prefill
-    # env keeps the sparse table on decode only.
+    # A CP rank's rows are an interleaved subset of the batch, and without the dense
+    # fp4 indexer prefill scores on torch: both keep the sparse table on decode only.
     if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
         return dense_blocks, sparse_table
     return sparse_table, sparse_table

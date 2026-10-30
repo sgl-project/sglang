@@ -222,7 +222,7 @@ jobs:
             exit 0
           fi
 
-          STAGING_DIR="$(mktemp -d)"
+          STAGING_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/log-staging.XXXXXX")"
           trap 'rm -rf "$STAGING_DIR"' EXIT
           for log_file in "${LOG_FILES[@]}"; do
             cp -a "$LOG_DIR/$log_file" "$STAGING_DIR/$log_file" || true

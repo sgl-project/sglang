@@ -11,6 +11,9 @@ the cached configuration describes the wrong checkpoint:
 
 So the key is the path the record carried when the cache was filled, and these
 cases pin both movements against it, on a raw record and on a resolved one.
+
+An override that turns the hybrid SWA pool off changes `is_hybrid_swa`, so the
+key also carries `disable_hybrid_swa_memory`.
 """
 
 import json
@@ -28,7 +31,7 @@ from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _MINI_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
@@ -70,11 +73,11 @@ class TestTheModelConfigCache(CustomTestCase):
         for name, was_none in saved_none_flags.items():
             getattr(type(envs), name)._set_to_none = was_none
 
-    def _checkpoint(self) -> str:
+    def _checkpoint(self, **config_extra) -> str:
         directory = tempfile.mkdtemp(prefix="model_config_cache_")
         self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
         with open(os.path.join(directory, "config.json"), "w") as handle:
-            json.dump(_MINI_CONFIG, handle)
+            json.dump({**_MINI_CONFIG, **config_extra}, handle)
         return directory
 
     def _pulled_to(self, directory: str) -> None:
@@ -161,6 +164,20 @@ class TestTheModelConfigCache(CustomTestCase):
         rebuilt = model_config_of(server_args)
         self.assertEqual(rebuilt.model_path, second_checkpoint)
         self.assertIs(model_config_of(server_args), rebuilt)
+
+    def test_a_declared_hybrid_swa_opt_out_rebuilds_the_configuration(self):
+        checkpoint = self._checkpoint(
+            layer_types=["sliding_attention", "full_attention"], sliding_window=64
+        )
+        server_args = ServerArgs(model_path=checkpoint, device="cuda")
+        self.assertTrue(model_config_of(server_args).is_hybrid_swa)
+
+        declare_resolution(
+            server_args,
+            "test_a_declared_hybrid_swa_opt_out_rebuilds_the_configuration",
+            disable_hybrid_swa_memory=True,
+        )
+        self.assertFalse(model_config_of(server_args).is_hybrid_swa)
 
     def test_a_supplied_configuration_is_handed_back(self):
         """A configuration nothing in here built carries no key, so nothing

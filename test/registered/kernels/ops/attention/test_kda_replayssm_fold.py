@@ -35,10 +35,10 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (  # noqa: E402
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (  # noqa: E402
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (  # noqa: E402
+from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (  # noqa: E402
     commit_kda_replayssm_spec,
 )
 

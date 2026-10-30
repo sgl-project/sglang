@@ -192,14 +192,17 @@ def _write_dsv4_tables(
 
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
+    req_pool_indices_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> None:
     """Post-alloc_decode hook for DSV4. Spreads new C128 KV slot ids into
     the per-req sidecar on DSV4NPUReqToTokenPool.
 
-    ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
-    ``token_per_req``); the new compressed tokens go at positions
+    ``req_pool_indices_cpu`` must be the batch's host mirror — reading the
+    device tensor here D2H-syncs with the in-flight forward. ``seq_lens_cpu``
+    is the POST-decode seq len (already incremented by ``token_per_req``);
+    the new compressed tokens go at positions
     ``[(old_seq) // ratio, (new_seq) // ratio)``.
     """
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
@@ -213,7 +216,6 @@ def maybe_write_dsv4_decode(
         return
 
     prefix_lens_cpu = (seq_lens_cpu - token_per_req).clamp(min=0)
-    req_pool_indices_cpu = batch.req_pool_indices.cpu()
 
     _write_per_req_slice(
         req_to_token_pool.write_c128,
@@ -223,6 +225,29 @@ def maybe_write_dsv4_decode(
         bundle.out_c128_loc,
         ratio=128,
     )
+
+
+def _compact_c4_loc(out_full_loc: torch.Tensor, upper: int) -> torch.Tensor:
+    """C4 slots of the group-closing full slots, compacted in order and
+    zero-padded to ``upper``.
+
+    Equivalent to
+    ``out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4``
+    followed by the verify consumers' zero padding, but without boolean
+    indexing: ``x[mask]`` lowers to aclnnNonzeroV2, a host-synchronizing op
+    that stalls the draft->verify transition until the draft kernels drain.
+    All ops below are asynchronous device kernels.
+    """
+    if upper <= 0:
+        return out_full_loc.new_zeros((0,))
+    valid = (out_full_loc >= 0) & ((out_full_loc % 4) == 3)
+    # Compact destination per row; invalid rows dump into a trash slot at
+    # ``upper`` (their values are arbitrary — duplicate scatter into the
+    # trash slot is fine) which the slice below drops.
+    dest = valid.cumsum(0).sub_(1).masked_fill_(~valid, upper)
+    buf = out_full_loc.new_zeros((upper + 1,))
+    buf.scatter_(0, dest, out_full_loc // 4)
+    return buf[:upper]
 
 
 def maybe_build_dsv4_verify_bundle(
@@ -269,7 +294,12 @@ def maybe_build_dsv4_verify_bundle(
         return torch.cat(chunks) if chunks else table.new_empty((0,))
 
     out_full_loc = batch.out_cache_loc
-    out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
+    # Fixed upper bound — the padding size the verify consumers already use
+    # (ascend_dsv4_backend: ``max(1, min(t, t // ratio + bs))``), so the padded
+    # result is byte-identical to what they built from the compact tensor.
+    t = out_full_loc.numel()
+    c4_upper = min(t, t // 4 + len(req_indices))
+    out_c4_loc = _compact_c4_loc(out_full_loc, c4_upper)
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,
         out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(

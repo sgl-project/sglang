@@ -396,16 +396,15 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
 
-        total_iterations = len(block_sizes) * len(timesteps)
-        batch.record_stage_iterations(total_iterations, total_iterations)
-
         start_index = 0
         self._validate_block_prompt_count(batch, block_sizes)
 
         def prepare_context_input(current_latents):
             return current_latents
 
-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
+        with self.progress_bar(
+            total=len(block_sizes) * len(timesteps), batch=batch
+        ) as progress_bar:
             for block_index, current_num_frames in enumerate(block_sizes):
                 self._set_rope_temporal_offset(
                     batch, self._shot_index(batch, block_index)

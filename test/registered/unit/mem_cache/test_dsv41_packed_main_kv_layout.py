@@ -6,10 +6,8 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
-    dequantize_dsv41_packed_main_kv,
+from sglang.kernels.ops.quantization.fp4_fake_quant import (
     fake_quant_compressed_kv,
-    quantize_dsv41_packed_main_kv,
 )
 from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     DSV41_MAIN_KV_LAYOUT,
@@ -18,6 +16,10 @@ from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     resolve_dsv41_main_kv_layout_specs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+    dequantize_dsv41_packed_main_kv,
+    quantize_dsv41_packed_main_kv,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

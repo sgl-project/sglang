@@ -140,7 +140,7 @@ struct FP8WoAGroupMajorQuantUE8M0Kernel {
     using namespace host;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     auto TSize = SymbolicSize{"num_tokens"};
     auto GSize = SymbolicSize{"num_outer_groups"};
     auto DSize = SymbolicSize{"hidden_dim"};

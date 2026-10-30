@@ -14,8 +14,8 @@ from sglang.test.test_utils import (
     run_bench_serving,
 )
 
-register_cuda_ci(est_time=490, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=430, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=270, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=430, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestLoRALatency(CustomTestCase):

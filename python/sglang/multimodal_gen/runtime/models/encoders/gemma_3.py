@@ -282,17 +282,6 @@ class Gemma3Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # Local Attention not support attention mask, we use global attention instead.
-        # self.attn = LocalAttention(
-        #     self.num_heads,
-        #     self.head_dim,
-        #     self.num_kv_heads,
-        #     softmax_scale=self.scaling,
-        #     causal=True,
-        #     supported_attention_backends=config._supported_attention_backends,
-        #     window_size=self.window_size,
-        # )
-
         # Gemma3 adds normalization for q and k
         self.q_norm = Gemma3RMSNorm(
             dim=self.head_dim, eps=config.text_config.rms_norm_eps

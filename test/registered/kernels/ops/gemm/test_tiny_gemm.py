@@ -13,7 +13,7 @@ from sglang.kernels.jit.utils import (
 from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=300, stage="nightly", runner_config="1-gpu-large")
 
 # One kernel is built per m in [1, MAX_M], so hold max_m fixed across the sweep:
@@ -32,6 +32,8 @@ TINY_GEMM_CASES = get_ci_test_range(
         (384, 7168, 1, torch.float32),
         (384, 7168, 4, torch.float32),
         (896, 7168, 8, torch.float32),
+        (144, 7168, 2, torch.float32),
+        (1536, 128, 7, torch.bfloat16),
         (1536, 128, 16, torch.bfloat16),
     ],
 )
@@ -50,6 +52,22 @@ def test_tiny_gemm(n, k, num_tokens, out_dtype):
     out = tiny_gemm_bf16(x, w, out_dtype=out_dtype, max_m=MAX_M)
     ref = torch.nn.functional.linear(x, w)
     torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 16])
+def test_tiny_gemm_fp32_weights(num_tokens):
+    """FP32 router weights are read in FP32: a BF16 read misses FP64 by ~1e-3."""
+    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+        pytest.skip("SM90+ required")
+
+    torch.manual_seed(42)
+    # Beam's router gate: 256 experts over a 5120 hidden size.
+    w = torch.randn(256, 5120, device="cuda") / 5120**0.5
+    x = torch.randn(num_tokens, 5120, dtype=torch.bfloat16, device="cuda")
+    out = tiny_gemm_bf16(x, w, out_dtype=torch.float32, max_m=MAX_M)
+    ref = (x.double() @ w.double().T).float()
+    torch.testing.assert_close(out, ref, atol=2e-6, rtol=2e-5)
 
 
 if __name__ == "__main__":

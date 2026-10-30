@@ -112,6 +112,7 @@ class SchedulerMultiplexMixin:
         logger.debug("Starting event loop for pd multiplexing...")
 
         while True:
+            self.increment_scheduler_iterations()
             with torch.cuda.stream(decode_stream):
                 self.ingest_requests()
                 running_batch = self.running_batch

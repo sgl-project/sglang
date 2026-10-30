@@ -181,10 +181,16 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             ComponentUse(stage_name, "delight_vae", phase="decode"),
         ]
 
-    @staticmethod
-    def _unwrap_mesh(mesh: Any) -> Any:
-        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_uv_wrap
+    def _unwrap_mesh(self, mesh: Any) -> Any:
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
+            mesh_simplify,
+            mesh_uv_wrap,
+        )
 
+        # xatlas time grows superlinearly with face count; the raw shape mesh
+        # has ~650k faces at the default octree resolution.
+        if self.config.paint_use_remesh:
+            mesh = mesh_simplify(mesh)
         return mesh_uv_wrap(mesh)
 
     @staticmethod

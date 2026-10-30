@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
@@ -26,6 +26,9 @@ class PoolEntry:
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
+    # Controller ids -> the device pool's rows, for a sub-pool whose ids map
+    # through its allocator (`KVStorage.host_ids`); None when they index it.
+    device_translate: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
 class HostPoolGroup:
@@ -109,10 +112,40 @@ class HostPoolGroup:
             if pool_names is not None and entry.name not in pool_names:
                 continue
             host = entry.host_pool
+            # Checks that the host pool stores whole page envelopes and has a
+            # peer-write gate installed; such a pool moves its pages when it
+            # compacts, and the gate holds that off while a peer may write.
+            if host.stores_page_envelope and host.peer_writes_gated:
+                # Device and host each expose one region of whole page
+                # envelopes, so a host page holds a device page's exact bytes.
+                infos = entry.device_pool.get_contiguous_buf_infos()
+                host_info = host.peer_write_buf_info()
+                if (
+                    # Rejects an entry with packed draft device pools, because a
+                    # page-envelope host pool holds no draft KV.
+                    entry.packed_draft_device_pools
+                    # Rejects a device pool that registers more or fewer than
+                    # one buffer region.
+                    or len(infos[0]) != 1
+                    # Rejects a device page envelope whose size differs from
+                    # this pool's host page size.
+                    or infos[2] != [host_info[2]]
+                    # Rejects a device region that an earlier pool in this call
+                    # already paired with a different host region.
+                    or host_by_device_ptr.get(infos[0][0], host_info) != host_info
+                ):
+                    raise ValueError(
+                        "Host receive requires one page-envelope region per pool "
+                        "with matching device and host page bytes"
+                    )
+                for combined, values in zip(device_infos, infos, strict=True):
+                    combined.extend(values)
+                host_by_device_ptr[infos[0][0]] = host_info
+                continue
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
             for pool in pools:
                 dense_mha = (
-                    isinstance(pool, MHATokenToKVPool)
+                    isinstance(pool, MHAKVView)
                     and pool.kv_cache_layout == "nhd"
                     and pool.v_head_dim == pool.head_dim
                 )
@@ -178,13 +211,16 @@ class HostPoolGroup:
         *,
         pool: PoolName | None = None,
         reclaim: Callable[[int], Any] | None = None,
+        start_owner: int | None = None,
     ) -> torch.Tensor | None:
         """Allocate from one pool, optionally reclaiming once before retrying."""
         host_pool = self.get_entry(pool).host_pool
-        indices = host_pool.alloc(need_size)
+        # Only KV-sharded host pools take start_owner.
+        kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        indices = host_pool.alloc(need_size, **kwargs)
         if indices is None and reclaim is not None:
             reclaim(need_size)
-            indices = host_pool.alloc(need_size)
+            indices = host_pool.alloc(need_size, **kwargs)
         return indices
 
     def free(self, indices: torch.Tensor, *, pool: PoolName | None = None) -> int:

@@ -224,7 +224,6 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
         )
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
-        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
 
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
@@ -249,7 +248,6 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
         )
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
-        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(num_experts, hidden_size, dtype=torch.int32),
@@ -273,6 +271,9 @@ class GPTQIntelAMXMoEScheme(GPTQMoESchemeBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.kernel.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)

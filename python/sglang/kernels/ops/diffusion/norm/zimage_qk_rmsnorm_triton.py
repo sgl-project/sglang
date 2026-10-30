@@ -8,6 +8,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 
 @triton.jit
@@ -132,6 +133,7 @@ def can_use_qk_rmsnorm_native(
     )
 
 
+@replay_launches
 def zimage_qk_rmsnorm_native(
     x: torch.Tensor,
     weight: torch.Tensor,

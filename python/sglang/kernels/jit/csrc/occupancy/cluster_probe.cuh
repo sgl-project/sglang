@@ -30,24 +30,26 @@ uint32_t get_max_active_clusters(uint32_t cluster_size, uint32_t num_waves) {
   const auto smem = (std::min(budget - std::min(budget, reserved), static_cast<uint32_t>(smem_per_block))) & ~1023u;
   const auto num_warps = std::max(1u, std::min(1024u, static_cast<uint32_t>(max_threads_per_sm) / num_waves) / 32);
 
-  // Widths above 8 are non-portable and the query rejects them without this.
-  CHECK_CUDA(cudaFuncSetAttribute(
-      reinterpret_cast<const void*>(dummy_probe_kernel), cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-  CHECK_CUDA(cudaFuncSetAttribute(
-      reinterpret_cast<const void*>(dummy_probe_kernel),
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem)));
-
-  cudaLaunchConfig_t config = {};  // stream/dynamicSmemBytes must not be garbage
-  config.gridDim = dim3{cluster_size, 1024u};
-  config.blockDim = dim3{32, num_warps};
+  const auto kernel = reinterpret_cast<const void*>(dummy_probe_kernel);
+  if (cluster_size > 8) {
+    // Widths above 8 are non-portable and the query rejects them without this.
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+  }
+  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  int probed_occupancy = 0;
+  const auto block_size = 32 * num_warps;
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&probed_occupancy, dummy_probe_kernel, block_size, smem));
+  CHECK_HOST(probed_occupancy == static_cast<int>(num_waves));
+  cudaLaunchConfig_t config = {};
+  config.gridDim = dim3{cluster_size};
+  config.blockDim = dim3{block_size};
   config.dynamicSmemBytes = smem;
   config.numAttrs = 1;
   cudaLaunchAttribute attr = {};
   attr.id = cudaLaunchAttributeClusterDimension;
   attr.val.clusterDim = {cluster_size, 1, 1};
   config.attrs = &attr;
-  CHECK_CUDA(cudaOccupancyMaxActiveClusters(&num_clusters, dummy_probe_kernel, &config));
+  CHECK_CUDA(cudaOccupancyMaxActiveClusters(&num_clusters, kernel, &config));
   return num_clusters;
 #endif
 }

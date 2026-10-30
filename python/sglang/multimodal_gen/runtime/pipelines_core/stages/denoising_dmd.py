@@ -25,12 +25,6 @@ logger = init_logger(__name__)
 
 
 class DmdDenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        # a fixed distilled schedule: the same count at any requested step count
-        return len(self.server_args.pipeline_config.dmd_denoising_steps)
-
     """
     Denoising stage for DMD.
     """
@@ -86,6 +80,12 @@ class DmdDenoisingStage(DenoisingStage):
             dtype=torch.long,
             device=get_local_torch_device(),
         )
+        # host copy for expert selection: a device read per step blocks the host
+        timesteps_host = [
+            int(step) for step in server_args.pipeline_config.dmd_denoising_steps
+        ]
+        # NaN flags stay on the device and are read once after the loop
+        latents_have_nan = torch.zeros((), dtype=torch.bool, device=latents.device)
 
         # prepare image_kwargs
         image_embeds = batch.image_embeds
@@ -115,10 +115,9 @@ class DmdDenoisingStage(DenoisingStage):
                     perf_dump_path_provided=batch.perf_dump_path is not None,
                     record_as_step=True,
                 ):
-                    t_int = int(t.item())
                     if self.transformer_2 is not None:
                         current_model, _ = self._select_and_manage_model(
-                            t_int=t_int,
+                            t_int=timesteps_host[i],
                             boundary_timestep=self._handle_boundary_ratio(
                                 server_args, batch, scheduler
                             ),
@@ -140,9 +139,7 @@ class DmdDenoisingStage(DenoisingStage):
                             ],
                             dim=2,
                         ).to(target_dtype)
-                    assert not torch.isnan(latent_model_input).any(), (
-                        "latent_model_input contains nan"
-                    )
+                    latents_have_nan |= torch.isnan(latent_model_input).any()
 
                     # Prepare inputs for transformer
                     t_expand = t.repeat(latent_model_input.shape[0])
@@ -214,6 +211,7 @@ class DmdDenoisingStage(DenoisingStage):
 
                     self.step_profile()
 
+        assert not latents_have_nan.cpu(), "latent_model_input contains nan"
         denoising_loop_end_time = time.time()
         if len(timesteps) > 0:
             self.log_info(

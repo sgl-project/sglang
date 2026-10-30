@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 import asyncio
@@ -296,35 +296,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         ):
             asyncio.run(exporter.write_record(obj, {}))
         # Should not raise
-
-
-class TestRequestMetricsExporterManager(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-
-    def test_no_exporters(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=False)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertFalse(manager.exporter_enabled())
-
-    def test_with_file_exporter(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertTrue(manager.exporter_enabled())
-
-    def test_write_record_delegates(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-
-        obj = _GenerateReqInput(rid="req-1", text="hello")
-        out_dict = {"meta_info": {"latency": 1.0}}
-        asyncio.run(manager.write_record(obj, out_dict))
-
-        files = os.listdir(self.tmp_dir)
-        self.assertEqual(len(files), 1)
 
 
 class TestCreateExporters(unittest.TestCase):

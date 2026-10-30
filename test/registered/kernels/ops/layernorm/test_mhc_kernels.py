@@ -8,7 +8,7 @@ import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 
 @pytest.fixture
@@ -298,7 +298,7 @@ def test_hopper_combine_norm(num_tokens):
         norm,
     )
     actual = model_mhc.combine(hc, model_mhc.HcState(x, pre))
-    expected = norm(mhc.hc_combine(x.flatten(1), pre, 4, x.dtype))
+    expected = norm(mhc.mhc_combine(x.flatten(1), pre, 4, x.dtype))
     torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=1e-5)
 
 
@@ -367,7 +367,6 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     base = torch.zeros(24, device="cuda")
     layer = _hopper_mhc_layer(norm, w, scale, base)
     layer._can_fuse_attn_mhc = layer._can_fuse_ffn_mhc = True
-    layer.local_boundary = layer.next_boundary = object()
     with (
         override_platform(is_sm100=True, is_sm90=False),
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
@@ -381,7 +380,6 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     assert layer.attn_hc.bf16_parts is None
     assert "_can_fuse_attn_mhc" not in layer.__dict__
     assert "_can_fuse_ffn_mhc" not in layer.__dict__
-    assert layer.local_boundary is None and layer.next_boundary is None
 
 
 @pytest.mark.parametrize(

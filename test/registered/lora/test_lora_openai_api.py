@@ -33,6 +33,7 @@ class MockTokenizerManager:
     def __init__(self, enable_lora=False):
         self.server_args = MagicMock(spec=ServerArgs)
         self.server_args.enable_lora = enable_lora
+        self.served_model_name = "test-model"
 
 
 class ConcreteServingBase(OpenAIServingBase):

@@ -26,18 +26,21 @@ stale capacity is silent over-/under-admission, not a crash.
 
 import random
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _build(lazy: bool):
     # Function-scope import: the fixture is a TestCase subclass, and a
     # module-scope binding would make pytest collect its tests AGAIN here.
-    from test_multi_ended_allocator import (
-        TestUnifiedSWATokenToKVPoolAllocator as _SwaFixture,
-    )
+    from test_multi_ended_allocator import TestWindowChainAllocator as _SwaFixture
 
     inst = _SwaFixture([m for m in dir(_SwaFixture) if m.startswith("test_")][0])
     pool, allocator, kvcache = inst._build()
@@ -51,7 +54,8 @@ class TestCapacityMemoCoherence(unittest.TestCase):
     def _assert_memos_fresh(self, allocator):
         """Every memoized capacity view must equal a fresh recompute."""
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator._policy._compute_available_size(allocator),
         )
         for band in (
             allocator.full_attn_allocator,
@@ -155,10 +159,10 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         (the span flips transparency, walling off their gaps) keep serving
         pre-move values. Exercised on a hand-wired end+float+end chain so no
         end-pool descriptor write can mask a missing span bump."""
-        from test_multi_ended_allocator import TestFloatMultiEndedAllocator
+        from test_multi_ended_allocator import TestFloatBand
 
-        inst = TestFloatMultiEndedAllocator(
-            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        inst = TestFloatBand(
+            [m for m in dir(TestFloatBand) if m.startswith("test_")][0]
         )
         _pool, sa, fla, da, _kv = inst._build_tri()
         self.assertEqual(fla._hole_pages(), 0)  # hole-free extension path
@@ -183,7 +187,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertLessEqual(fla.available_size(), float_cached)
 
 
-class TestTriCapacityMemoCoherence(unittest.TestCase):
+class TestTriCapacityMemoCoherence(CustomTestCase):
     """Tri-composite twins of the 2-pool cases: the joint view walks THREE
     bands (mamba end, swa float, full end), so a mutation on ANY of them must
     invalidate the composite memo -- including the two only the tri has, a
@@ -200,7 +204,8 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
 
     def _assert_memos_fresh(self, allocator):
         self.assertEqual(
-            allocator.available_size(), allocator._compute_available_size()
+            allocator.available_size(),
+            allocator._policy._compute_available_size(allocator),
         )
         for band in (
             allocator.full_attn_allocator,
@@ -213,6 +218,50 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 msg=f"stale available_size memo on {band.sub_pool_name!r}",
             )
         self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_joint_capacity_boundary_after_fragmentation(self):
+        """Equal FULL/SWA demand must fit exactly at the advertised boundary.
+
+        State allocations move a differently aligned peer, and SWA retirement
+        creates reusable holes. The cached joint capacity must still fund an
+        actual reservation, while the next page must exceed it.
+        """
+        from test_unified_tri_pool import TestUnifiedTriPool
+
+        fixture = TestUnifiedTriPool("test_chain_wiring_and_float_swa")
+        for page_size in (1, 4, 128):
+            for lazy in (False, True):
+                with self.subTest(page_size=page_size, lazy=lazy):
+                    _, allocator, _, _ = fixture._build(
+                        n_full=256 * page_size,
+                        n_swa=128 * page_size,
+                        n_state=32,
+                        page_size=page_size,
+                        lazy_compaction=lazy,
+                    )
+
+                    def check_boundary():
+                        capacity = allocator.available_size()
+                        self.assertTrue(allocator.can_reserve(capacity, capacity))
+                        self.assertFalse(
+                            allocator.can_reserve(
+                                capacity + page_size, capacity + page_size
+                            )
+                        )
+
+                    check_boundary()  # empty float is frontier-transparent
+                    states = allocator.mamba_allocator.alloc(3)
+                    self.assertIsNotNone(states)
+                    check_boundary()
+                    tokens = allocator.alloc(8 * page_size)
+                    self.assertIsNotNone(tokens)
+                    check_boundary()  # float now splits the available band
+                    allocator.free_swa(tokens[2 * page_size : 5 * page_size])
+                    check_boundary()  # interior holes are reusable
+                    allocator.free(tokens)
+                    check_boundary()  # float parks again
+                    allocator.mamba_allocator.free(states)
+                    check_boundary()
 
     def test_memos_track_tri_mutation_kinds(self):
         for lazy in (False, True):
@@ -241,6 +290,81 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 allocator.clear()
                 ma.clear()
                 self._assert_memos_fresh(allocator)
+
+
+# The paging kernels are Triton; neither the epoch nor the memos depend on the
+# ids they write, so they are stood in for on CPU.
+_PAGING_KERNELS = "sglang.srt.mem_cache.kv.alloc.chain"
+
+
+class _NoOpKernel:
+    def __getitem__(self, grid):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        pass
+
+
+@contextmanager
+def _stub_paging_kernels():
+    with (
+        patch(f"{_PAGING_KERNELS}.alloc_extend_kernel", _NoOpKernel()),
+        patch(f"{_PAGING_KERNELS}.alloc_decode_kernel", _NoOpKernel()),
+    ):
+        yield
+
+
+def _ids(*values):
+    return torch.tensor(values, dtype=torch.int64)
+
+
+class TestPagedStepKeepsTheEpoch(unittest.TestCase):
+    def test_a_decode_within_its_pages_keeps_the_capacity_memos(self):
+        """BUG REGRESSION. A paged decode that took no new page rebound the
+        owner's free virtual ids anyway, which moves the capacity epoch: every
+        capacity memo of the chain was dropped and recomputed at each such
+        step. A decode within its pages keeps the epoch, and the next capacity
+        query is served from the memos; a decode that opens a page moves it."""
+        from sglang.test.unified_allocator_fixtures import (
+            build_swa_pool,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        page = 4
+        allocator = build_swa_pool(page_size=page)
+        owner = allocator.full_attn_allocator
+        with _stub_paging_kernels():
+            # One request of 2 tokens: its first page holds 2 of 4.
+            out = allocator.alloc_extend(
+                _ids(0), _ids(0), _ids(2), _ids(2), _ids(-1), 2
+            )
+            self.assertIsNotNone(out)
+            allocator.available_size()
+            epoch = owner._chain_capacity_epoch()
+            for seq_len in (3, 4):
+                out = allocator.alloc_decode(_ids(seq_len), _ids(seq_len), _ids(0))
+                self.assertIsNotNone(out)
+                self.assertEqual(owner._chain_capacity_epoch(), epoch)
+            with (
+                patch.object(
+                    allocator._policy,
+                    "_compute_available_size",
+                    wraps=allocator._policy._compute_available_size,
+                ) as joint,
+                patch.object(
+                    owner, "_available_tokens", wraps=owner._available_tokens
+                ) as own,
+            ):
+                allocator.available_size()
+                owner.available_size()
+            joint.assert_not_called()
+            own.assert_not_called()
+            # The fifth token opens the request's second page.
+            out = allocator.alloc_decode(_ids(5), _ids(5), _ids(0))
+            self.assertIsNotNone(out)
+            self.assertGreater(owner._chain_capacity_epoch(), epoch)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
 
 
 if __name__ == "__main__":

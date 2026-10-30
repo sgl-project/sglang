@@ -755,9 +755,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     bs=2,
                     actual_seq_lengths_q_pa=cu_seqlens_q,
                     actual_seq_lengths_kv=seqused_kv,
-                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                    max_seqlen_q=2,
-                    is_nextn=False,
                 )
 
                 metadata_op = getattr(custom_ops, metadata_op_name)
@@ -772,11 +769,12 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q_cpu = cu_seqlens_q.clone()
         seqused_kv_cpu = seqused_kv.clone()
 
+        metadata_op = MagicMock()
         with (
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
+            patch("torch.ops.npu", MagicMock(), create=True),
             patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
-                return_value=(MagicMock(), MagicMock()),
+                return_value=(metadata_op, MagicMock()),
             ),
         ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
@@ -796,12 +794,8 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 bs=2,
                 actual_seq_lengths_q_pa=cu_seqlens_q,
                 actual_seq_lengths_kv=seqused_kv,
-                block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                max_seqlen_q=2,
-                is_nextn=False,
             )
 
-        metadata_op = npu_ops.sparse_attn_sharedkv_metadata_host
         metadata_op.assert_called_once()
         self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
         self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)

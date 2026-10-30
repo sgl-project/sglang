@@ -9,11 +9,12 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.minimax_qknorm_rope import (
     minimax_qknorm_rope,
     minimax_qknorm_rope_grouped,
+    minimax_qknorm_rope_grouped_fp8,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 HEAD_DIM, ROTARY_DIM, BASE, EPS, MAXPOS = 128, 64, 5_000_000, 1e-6, 131072
@@ -143,6 +144,51 @@ def benchmark_combined(T: int, impl: str):
     )
 
 
+# --- FP8 Q epilogue: the grouped launch also writes FP8 main Q and index Q ---
+F_NQ, F_NK, F_NIQ = 8, 1, 4
+F_OFF_IQ = F_NQ + 2 * F_NK
+
+
+def _fp8_cast_after(qkv, groups, cache, positions):
+    minimax_qknorm_rope_grouped(qkv, groups, cache, positions, EPS)
+    rows = qkv.view(qkv.shape[0], -1, HEAD_DIM)
+    q = rows[:, :F_NQ].to(torch.float8_e4m3fn)
+    return q, rows[:, F_OFF_IQ : F_OFF_IQ + F_NIQ].to(torch.float8_e4m3fn)
+
+
+def _fp8_epilogue(qkv, groups, cache, positions):
+    q = qkv.new_empty(qkv.shape[0], F_NQ, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    idx_q = qkv.new_empty(qkv.shape[0], F_NIQ, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    minimax_qknorm_rope_grouped_fp8(
+        qkv, groups, cache, positions, EPS, fp8_a=q, group_a=0, fp8_b=idx_q, group_b=2
+    )
+    return q, idx_q
+
+
+F_FN_MAP = {"fp8_epilogue": _fp8_epilogue, "cast_after": _fp8_cast_after}
+
+
+@marker.parametrize("T", [1, 16, 64, 256, 1024, 8192], [64, 1024])
+@marker.benchmark("impl", ["fp8_epilogue", "cast_after"])
+def benchmark_fp8_epilogue(T: int, impl: str):
+    cache = _cache()
+    ws = [(torch.randn(HEAD_DIM, device="cuda") * 0.1).bfloat16() for _ in range(4)]
+    groups = list(
+        zip(ws, (0, F_NQ, F_OFF_IQ, F_OFF_IQ + F_NIQ), (F_NQ, F_NK, F_NIQ, 1))
+    )
+    total_heads = F_OFF_IQ + F_NIQ + 1
+    qkv = torch.randn(T, total_heads * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    positions = torch.randint(0, MAXPOS, (T,), device="cuda", dtype=torch.int64)
+    return marker.do_bench(
+        F_FN_MAP[impl],
+        input_args=(qkv, groups, cache, positions),
+        # qkv is normed in place; clone it per replay so each one starts fresh.
+        graph_clone_args=(0,),
+        memory_args=(qkv,),
+    )
+
+
 if __name__ == "__main__":
     benchmark.run()
     benchmark_combined.run()
+    benchmark_fp8_epilogue.run()

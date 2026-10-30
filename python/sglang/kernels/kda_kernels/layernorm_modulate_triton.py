@@ -53,6 +53,7 @@ from sglang.kernels.numerics import (
     div_rn_f32,
     round_bf16_to_fp32,
 )
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max, fp8_min
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
@@ -509,6 +510,7 @@ def try_fused_fp32_layernorm_bf16(
     return output
 
 
+@replay_launches
 def fused_layernorm_modulate_raw(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:

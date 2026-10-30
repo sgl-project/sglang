@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/cpu.py
 
+import gc
 import platform
 from functools import lru_cache
 from typing import Any
@@ -32,6 +33,14 @@ class CpuPlatform(Platform):
         return torch.device("cpu")
 
     @classmethod
+    def synchronize(cls) -> None:
+        torch.cpu.synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        gc.collect()
+
+    @classmethod
     def get_torch_distributed_backend_str(cls) -> str:
         return "gloo"
 
@@ -59,10 +68,6 @@ class CpuPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
 
         return psutil.virtual_memory().total
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        return True
 
     @classmethod
     def get_current_memory_usage(

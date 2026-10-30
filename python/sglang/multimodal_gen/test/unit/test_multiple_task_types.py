@@ -5,6 +5,7 @@ import argparse
 import io
 import pickle
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -16,7 +17,10 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    MAX_FRAME_INTERPOLATION_EXP,
+    SamplingParams,
+)
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.configs.task_type import ModelTaskType as Task
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, utils, video_api
@@ -204,9 +208,7 @@ def http_client(monkeypatch, tmp_path, request):
 
     async def generate(client, req, **kwargs):
         admitted.append(req)
-        path = req.output_file_path()
-        Image.new("RGB", (64, 64)).save(path)
-        return [path], OutputBatch()
+        return [req.output_file_path()], OutputBatch(output_image_bytes=[png_bytes()])
 
     async def upload(paths):
         return [None] * len(paths)
@@ -359,6 +361,85 @@ def test_http_rejects_invalid_tasks_before_model_execution(http_client):
         response = client.post("/v1/" + endpoint, json={"prompt": "invalid", **payload})
         assert response.status_code == 400, response.text
     assert admitted == []
+
+
+@pytest.mark.parametrize("multipart", [False, True])
+@pytest.mark.parametrize("exp", [-1, 0, MAX_FRAME_INTERPOLATION_EXP + 1])
+def test_http_rejects_out_of_range_frame_interpolation_exp(http_client, multipart, exp):
+    """Output frames grow as 2**exp; exp < 1 or a huge exp must not reach RIFE."""
+    client, admitted, _ = http_client
+    payload = {
+        "prompt": "video",
+        "size": "64x64",
+        "enable_frame_interpolation": True,
+        "frame_interpolation_exp": exp,
+    }
+    if multipart:
+        response = client.post(
+            "/v1/videos", files={k: (None, str(v)) for k, v in payload.items()}
+        )
+    else:
+        response = client.post("/v1/videos", json=payload)
+    assert response.status_code == 400, response.text
+    assert "frame_interpolation_exp" in response.text
+    assert admitted == []
+
+
+@pytest.mark.parametrize(
+    "endpoint,field",
+    [
+        ("images/generations", "upscaling_model_path"),
+        ("videos", "upscaling_model_path"),
+        ("videos", "frame_interpolation_model_path"),
+    ],
+)
+def test_http_rejects_url_postprocess_model_paths(http_client, endpoint, field):
+    """A client-supplied URL must not make the server fetch it (SSRF)."""
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/" + endpoint,
+        json={"prompt": "p", "size": "64x64", field: "http://169.254.169.254/x.pth"},
+    )
+    assert response.status_code == 400, response.text
+    assert field in response.text
+    assert admitted == []
+
+
+def test_http_cloud_upload_failure_is_502_and_temp_output_is_removed(
+    http_client, monkeypatch, tmp_path
+):
+    """A failed upload is a server error, and with no output_path the generated
+    file must not outlive the request in a leaked temp directory."""
+    client, admitted, _ = http_client
+    image_api.get_global_server_args().output_path = None
+    monkeypatch.setattr(image_api.cloud_storage, "enabled", True)
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+    monkeypatch.setattr(utils.tempfile, "tempdir", str(temp_root))
+    response = client.post(
+        "/v1/images/generations",
+        json={"prompt": "p", "size": "64x64", "response_format": "url"},
+    )
+    assert response.status_code == 502, response.text
+    generated = Path(admitted[0].output_file_path())
+    assert temp_root in generated.parents
+    assert not generated.exists()
+    assert not any(temp_root.iterdir())
+
+
+def test_http_accepts_max_frame_interpolation_exp(http_client):
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/videos",
+        json={
+            "prompt": "video",
+            "size": "64x64",
+            "enable_frame_interpolation": True,
+            "frame_interpolation_exp": MAX_FRAME_INTERPOLATION_EXP,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert admitted[-1].frame_interpolation_exp == MAX_FRAME_INTERPOLATION_EXP
 
 
 @pytest.mark.parametrize("multipart", [False, True])

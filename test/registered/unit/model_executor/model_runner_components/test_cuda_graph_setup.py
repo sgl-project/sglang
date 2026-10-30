@@ -12,7 +12,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
@@ -100,7 +100,7 @@ def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog)
         gpu_id = 0
         is_draft_worker = True
         spec_algorithm = SimpleNamespace(is_speculative=lambda: True)
-        server_args = SimpleNamespace(model_impl="auto")
+        server_args = SimpleNamespace(model_impl="auto", dllm_algorithm=None)
         req_to_token_pool = SimpleNamespace(size=32)
 
         def decode_num_tokens_per_req(self):

@@ -33,11 +33,6 @@ class StageValidators:
         return isinstance(value, int | float) and value >= 0
 
     @staticmethod
-    def positive_float(value: Any) -> bool:
-        """Check if value is a positive float."""
-        return isinstance(value, int | float) and value > 0
-
-    @staticmethod
     def non_negative_float(value: Any) -> bool:
         """Check if value is a non-negative float."""
         return isinstance(value, int | float) and value >= 0
@@ -73,41 +68,9 @@ class StageValidators:
         return not torch.isnan(value).any().item()
 
     @staticmethod
-    def tensor_shape_matches(value: Any, expected_shape: tuple) -> bool:
-        """Check if tensor shape matches expected shape (None for any size) and no NaN values."""
-        if not isinstance(value, torch.Tensor):
-            return False
-        if len(value.shape) != len(expected_shape):
-            return False
-        for actual, expected in zip(value.shape, expected_shape, strict=True):
-            if expected is not None and actual != expected:
-                return False
-        return not torch.isnan(value).any().item()
-
-    @staticmethod
     def list_not_empty(value: Any) -> bool:
         """Check if value is a non-empty list."""
         return isinstance(value, list) and len(value) > 0
-
-    @staticmethod
-    def list_length(value: Any, length: int) -> bool:
-        """Check if list has specific length."""
-        return isinstance(value, list) and len(value) == length
-
-    @staticmethod
-    def list_min_length(value: Any, min_length: int) -> bool:
-        """Check if list has at least min_length items."""
-        return isinstance(value, list) and len(value) >= min_length
-
-    @staticmethod
-    def string_not_empty(value: Any) -> bool:
-        """Check if value is a non-empty string."""
-        return isinstance(value, str) and len(value.strip()) > 0
-
-    @staticmethod
-    def string_not_none(value: Any) -> bool:
-        """Check if value is a non-empty string."""
-        return isinstance(value, str) and len(value) > 0
 
     @staticmethod
     def string_or_list_strings(value: Any) -> bool:

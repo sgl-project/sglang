@@ -78,6 +78,9 @@ jobs:
           node docs/scripts/check_cookbook_configs.mjs
           node --test docs/scripts/tests/*.test.mjs
 
+      - name: Test PR title check
+        run: node --test .github/scripts/pr-title.test.cjs
+
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 

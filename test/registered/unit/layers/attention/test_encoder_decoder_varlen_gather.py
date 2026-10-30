@@ -22,7 +22,7 @@ with patch.dict(
     from sglang.srt.layers.attention import xpu_backend
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestEncoderDecoderForward(unittest.TestCase):
@@ -219,6 +219,22 @@ class TestEncoderDecoderForward(unittest.TestCase):
             md.page_table.tolist(),
             [[3, 4, 5, 6], [105, 106, 107, 108]],
         )
+
+
+class TestPageSize1GraphCompat(unittest.TestCase):
+    """MHA page_size 1 runs sgl_kernel's gather + varlen path, which reads a
+    device scalar per call, so it must refuse graph capture -- but only then."""
+
+    def test_rejects_graph_capture(self):
+        with self.assertRaisesRegex(ValueError, "requires CUDA graph disabled"):
+            xpu_backend._check_page_size_1_graph_compat(
+                use_mla=False, graphs_disabled=False
+            )
+
+    def test_default_xpu_config_still_starts(self):
+        # Graphs are off by default on XPU; refusing here would break every
+        # default page_size 1 launch (all-SWA models need page_size 1).
+        xpu_backend._check_page_size_1_graph_compat(use_mla=False, graphs_disabled=True)
 
 
 if __name__ == "__main__":

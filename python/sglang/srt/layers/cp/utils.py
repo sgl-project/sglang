@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -36,10 +38,130 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.runtime_context import get_parallel, get_schedule, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def get_cp_sharded_padded(value):
+    """Convert a global KV count to local storage for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value // strategy.cp_size
+
+
+def from_cp_sharded(value):
+    """Convert a local KV count back to global for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value * strategy.cp_size
+
+
+def get_cp_sharded_padded_cache_indices(value):
+    """Recover complete reserved local pages from actual cache-group rows."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    # The interval starts at a group boundary; its last group may be partial.
+    representatives = value[:: c * p]
+    pages = (
+        get_cp_sharded_padded_cache_transfer_indices(representatives.to(torch.int64))
+        // p
+    )
+    local = pages[:, None] * p + torch.arange(p, device=value.device)
+    return torch.where(
+        representatives[:, None] > 0,
+        local.to(value.dtype),
+        representatives[:, None],
+    ).reshape(-1)
+
+
+def from_cp_sharded_expanded_indices(value):
+    """Expand complete local pages into every CP column in cache-row order."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    pages = value[::p] // p
+    columns = torch.arange(c, device=value.device)
+    offsets = torch.arange(p, device=value.device)
+    return (
+        ((pages[:, None, None] - 1) * c + 1 + columns[None, :, None]) * p
+        + offsets[None, None, :]
+    ).reshape(-1)
+
+
+def _ceil_group_count(value, group_size):
+    """Count complete groups needed to cover a token endpoint."""
+    return (value + group_size - 1) // group_size
+
+
+def get_cp_sharded_padded_allocation_tokens(value, *, prefix_tokens):
+    """Convert raw request tokens to fresh KV capacity for sharded CP storage."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return (
+        _ceil_group_count(prefix_tokens + value, group_size) * group_size
+        - _ceil_group_count(prefix_tokens, group_size) * group_size
+    )
+
+
+def get_cp_sharded_padded_cache_transfer_indices(value):
+    """Project cache rows to local rows, preserving shape, dtype and sentinels."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    shifted = value.to(torch.int64) + (c - 1) * p
+    local = (shifted // (c * p)) * p + shifted % p
+    return torch.where(value > 0, local.to(value.dtype), value)
+
+
+def get_cp_sharded_padded_allocation_lengths(value):
+    """Convert request endpoints to reserved local capacity for allocation."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return _ceil_group_count(value, group_size) * page_size
+
+
+def get_cp_sharded_padded_allocation_size(value, *, prefix_lens, extend_lens):
+    """Count fresh local rows from the existing CPU request endpoints."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    seq_lens = prefix_lens + extend_lens
+    group_size = strategy.cp_size * page_size
+    pages = _ceil_group_count(seq_lens, group_size) - _ceil_group_count(
+        prefix_lens, group_size
+    )
+    return int(pages.sum()) * page_size
+
+
+def get_cp_sharded_padded_chunk_tokens(value, *, prefix_tokens):
+    """Align a chunk to complete fresh groups, retaining its reserved prefix tail."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    tail = _ceil_group_count(prefix_tokens, group_size) * group_size - prefix_tokens
+    groups = max(0, int((value - tail) // group_size))
+    return min(max(value, 0), tail + groups * group_size)
+
+
+def get_cp_sharded_padded_available_tokens(value, *, reserved_tokens=0):
+    """Adapt free capacity before the existing chunk headroom subtraction.
+
+    The resource group is C times the strategy's physical token page size.
+    Without a prefix, allow at most one partial group's tail. A request-aware
+    geometry entry bounds that allowance by the actual reserved tail.
+    """
+    strategy = get_cp_strategy()
+    if value < 0:
+        return value
+    group_size = strategy.cp_size * get_schedule().page_size
+    return (
+        reserved_tokens
+        + max(0, (value - reserved_tokens) // group_size) * group_size
+        + group_size
+        - 1
+    )
 
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:

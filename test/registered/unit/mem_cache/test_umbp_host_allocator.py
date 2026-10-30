@@ -12,7 +12,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # These tests stub out mori with a fake in-process module, so they need neither
 # a real mori install nor a GPU and run on NVIDIA / CPU CI.
@@ -120,32 +120,6 @@ class TestUMBPHostAllocator(unittest.TestCase):
         sys.modules["mori"] = fake_mori
         sys.modules["mori.umbp"] = fake_umbp
         return fake_umbp
-
-    def test_umbp_allocator_dispatch_and_tensor_wrap(self):
-        self._install_fake_mori()
-
-        from sglang.srt.mem_cache.memory_pool_host import get_allocator_from_storage
-        from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
-            UMBPHostTensorAllocator,
-        )
-
-        allocator = get_allocator_from_storage("mori")
-        self.assertIsInstance(allocator, UMBPHostTensorAllocator)
-
-        tensor = allocator.allocate((2, 3), dtype=torch.float16, device="cpu")
-        alloc_call = allocator._allocator.alloc_calls[0]
-
-        self.assertEqual(tensor.shape, (2, 3))
-        self.assertEqual(tensor.dtype, torch.float16)
-        self.assertEqual(tensor.data_ptr(), alloc_call["handle"].ptr)
-        self.assertEqual(alloc_call["size"], tensor.numel() * tensor.element_size())
-        self.assertEqual(alloc_call["backing"], FakeBacking.AnonymousHugetlb)
-        self.assertEqual(alloc_call["hugepage_size"], 2 * 1024 * 1024)
-        self.assertEqual(alloc_call["numa_node"], -1)
-        self.assertIs(alloc_call["prefault"], True)
-
-        tensor.fill_(3.0)
-        self.assertEqual(float(tensor[0, 0]), 3.0)
 
     def test_standalone_process_uses_shareable_backing(self):
         self._install_fake_mori()

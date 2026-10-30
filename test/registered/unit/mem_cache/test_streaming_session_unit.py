@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeAllocator(BaseTokenToKVPoolAllocator):
@@ -64,6 +64,7 @@ class _FakeInnerCache:
     def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
+        self.logical_page_size = allocator.page_size
         self.page_size = page_size
         self.match_results = list(match_results or [])
         self.session = StreamingSession(self)

@@ -10,7 +10,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +72,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
-            if getattr(req, "pd_rebootstrap_in_progress", False):
-                req.pd_rebootstrap_in_progress = False
             pre_lens.append(pre_len)
 
         # Set fields
@@ -81,15 +79,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
         # input_ids from the relay.
         self.input_ids = None
-        self.req_pool_indices = torch.tensor(
+        self.req_pool_indices = async_h2d(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens = async_h2d(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+        self.orig_seq_lens = async_h2d(seq_lens, dtype=torch.int32, device=self.device)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
@@ -134,21 +130,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
-                    # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
+                    # Use request_finish (not finish_outside_step) so that process_batch_result_prebuilt
                     # handles the release via update_finish_state -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    req.to_finish = FINISH_ABORT(
-                        error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+                    req.request_finish(
+                        FINISH_ABORT(error_message, HTTPStatus.INTERNAL_SERVER_ERROR)
                     )
                 req.grammar.finished = req.finished()
-        # Non-blocking H2D: with overlap this runs on the schedule stream after
-        # its wait on the in-flight forward, so a blocking copy would stall the
-        # host until that forward ends and leave the GPU idle.
-        last_tokens_tensor = torch.tensor(
-            last_tokens,
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
+        last_tokens_tensor = async_h2d(
+            last_tokens, dtype=torch.int64, device=self.device
+        )
 
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
