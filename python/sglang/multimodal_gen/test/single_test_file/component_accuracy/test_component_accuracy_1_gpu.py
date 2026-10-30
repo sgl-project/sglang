@@ -1,5 +1,9 @@
 import pytest
+import torch
 
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.pika_h3 import (
+    check_pika_adapter_accuracy,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.suite import (
     ComponentAccuracySuite,
     VAEChannelsLast3DParitySuite,
@@ -23,3 +27,10 @@ class TestComponentAccuracy1GPU(ComponentAccuracySuite):
 )
 class TestVAEChannelsLast3DParity1GPU(VAEChannelsLast3DParitySuite):
     """1-GPU VAE guard for channels_last_3d drift."""
+
+
+@pytest.mark.parametrize("variant", ["fl2va", "ref2va"])
+def test_pika_h3_flex_adapter_accuracy(variant):
+    if not torch.cuda.is_available():
+        pytest.skip("Pika BF16 component accuracy requires a CUDA GPU")
+    check_pika_adapter_accuracy(variant)
