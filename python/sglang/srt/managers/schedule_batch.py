@@ -1882,6 +1882,12 @@ class Req(ReqDllmMixin):
             max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
+    @property
+    def output_rolled_back(self) -> bool:
+        """Whether an output id already sent was taken back to be replayed, as a PD
+        rebootstrap does with the last one."""
+        return self.pd_rebootstrap_forced_output_id is not None
+
     def take_detokenize_header_due(self) -> bool:
         """Whether this output carries the DetokenizeHeader: only the first does."""
         due = not self.detokenize_header_sent

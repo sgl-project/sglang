@@ -74,7 +74,7 @@ class _FakeReq:
             SimpleNamespace(to_json=lambda: {"type": "stop"}) if finished else None
         )
         self.finished_output = False
-        self.pd_rebootstrap_forced_output_id = None
+        self.output_rolled_back = False
         self.finished_len = None
         self.beam_group = None
         self.stream = False

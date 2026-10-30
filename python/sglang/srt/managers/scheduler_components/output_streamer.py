@@ -251,9 +251,8 @@ class SchedulerOutputStreamer:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
-            if req.pd_rebootstrap_forced_output_id is not None and not req.finished():
-                # A PD rebootstrap popped the last output id, which the client already
-                # has, and replays it; nothing is new until the replay re-adds it.
+            if req.output_rolled_back and not req.finished():
+                # Nothing is new until the taken-back ids are replayed.
                 continue
 
             acc.accept(req=req)
@@ -444,10 +443,6 @@ class _GenerationStreamAccumulator:
     decode_latencies: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.output_sink is OutputSink.TOKENIZER:
-            # The tokenizer-side router reads this list on every batch, idle
-            # ones included.
-            self.has_http_worker_ipc = True
         if self.output_sink is OutputSink.RUST:
             self.prompt_tokens = []
             self.cached_tokens = []
@@ -764,8 +759,12 @@ class _GenerationStreamAccumulator:
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
+            # The tokenizer-side router reads the list on every TOKENIZER batch,
+            # idle ones included.
             http_worker_ipcs=(
-                self.http_worker_ipcs if self.has_http_worker_ipc else None
+                self.http_worker_ipcs
+                if self.output_sink is OutputSink.TOKENIZER or self.has_http_worker_ipc
+                else None
             ),
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
