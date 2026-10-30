@@ -170,6 +170,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",
     ] = None
+    speculative_draft_kv_bundling: A[
+        bool,
+        "Keep a DFLASH or DSPARK draft's KV only as the sliding window before each Mamba checkpoint the radix cache keeps, and evict each window with its checkpoint. Requires a draft whose layers are all sliding-window and a Mamba-hybrid target without sliding-window layers. The draft pool is sized from the Mamba cache instead of one slot per target token.",
+    ] = False
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import is_swa_draft_only
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
@@ -59,7 +60,14 @@ def _leaf_bytes(pool) -> int:
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
-def _draft_bytes(target, draft) -> int:
+def _draft_bytes(params: CacheInitParams, target, draft) -> int:
+    if is_swa_draft_only(params.token_to_kv_pool_allocator):
+        # Matches how attach_draft_swa_host_pool sizes the draft-only SWA host pool.
+        draft = draft.swa_kv_pool
+        window = -(-params.swa_retain_window // params.page_size) * params.page_size
+        state_slots = params.token_to_kv_pool_allocator.state.pool.size
+        slots = min(state_slots * window, target.size)
+        return _pool_bytes(draft) * slots // draft.size
     if draft.layer_router.sub_pool(
         IdSpaceKind.SLIDING_WINDOW
     ) is not None or isinstance(draft, DeepSeekV4TokenToKVPool):
@@ -91,7 +99,7 @@ def _estimate_hicache_bytes(
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
-    return total + sum(_draft_bytes(pool, draft) for draft in drafts)
+    return total + sum(_draft_bytes(params, pool, draft) for draft in drafts)
 
 
 @contextmanager

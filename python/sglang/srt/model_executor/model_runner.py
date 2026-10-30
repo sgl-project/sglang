@@ -1023,7 +1023,7 @@ class ModelRunner:
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self.kv_cache_configurator.bundles_draft_kv:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
 

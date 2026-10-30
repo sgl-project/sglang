@@ -2,6 +2,7 @@
 
 import unittest
 
+import test_unified_radix_cache_checkpoint_window
 import test_unified_radix_cache_core
 import test_unified_radix_cache_hicache
 import test_unified_radix_cache_insert_walk
@@ -15,6 +16,7 @@ from sglang.test.kits.unified_radix_cache import fixtures
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 
 _SHARED_SUITES = (
+    test_unified_radix_cache_checkpoint_window,
     test_unified_radix_cache_core,
     test_unified_radix_cache_hicache,
     test_unified_radix_cache_insert_walk,

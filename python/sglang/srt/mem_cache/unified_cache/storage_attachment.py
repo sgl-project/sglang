@@ -62,8 +62,11 @@ class StorageAttachment:
         cache = self._cache
 
         # Validate first: a rejected request must have no side effects.
-        invalid = self._validate_policies(
-            hicache_storage_prefetch_policy, hicache_write_policy
+        invalid = (
+            self._validate_policies(
+                hicache_storage_prefetch_policy, hicache_write_policy
+            )
+            or self.unsupported_reason()
         )
         if invalid is not None:
             return False, invalid
@@ -356,6 +359,12 @@ class StorageAttachment:
                 sorted(labels.keys()),
             )
         return existing_collector
+
+    def unsupported_reason(self) -> Optional[str]:
+        """Why this cache cannot take a storage backend, or None."""
+        if self._cache.swa_checkpoint_windows:
+            return "SWA checkpoint windows do not support a HiCache storage backend."
+        return None
 
     # ---- Internals ----
 

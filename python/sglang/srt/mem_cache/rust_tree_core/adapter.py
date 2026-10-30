@@ -488,6 +488,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 # fused draft's front rows included.
                 swa_sliding_window_size=window,
                 swa_req_ring=not params.swa_gates_prefix_match,
+                swa_checkpoint_windows=params.swa_checkpoint_windows,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(

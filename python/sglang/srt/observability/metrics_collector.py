@@ -2540,6 +2540,13 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.swa_checkpoint_evictions = Counter(
+            name="sglang:swa_checkpoint_evictions_total",
+            documentation="Device Mamba checkpoints evicted, with their SWA "
+            "windows, because the SWA pool ran short (checkpoint windows only).",
+            labelnames=labels.keys(),
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="GPU-stream span of a merged host-to-device load-back "
@@ -2615,6 +2622,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_swa_checkpoint_evictions(self, num_checkpoints: int) -> None:
+        self.swa_checkpoint_evictions.labels(**self.labels).inc(num_checkpoints)
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)

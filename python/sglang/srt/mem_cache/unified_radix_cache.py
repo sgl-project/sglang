@@ -230,6 +230,23 @@ class UnifiedRadixCache(BasePrefixCache):
         assert params.tree_slots is not None
         self.tree_components = params.tree_components
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.swa_checkpoint_windows = params.swa_checkpoint_windows
+        if self.swa_checkpoint_windows:
+            components = self.tree_components
+            assert (
+                ComponentType.SWA in components
+                and ComponentType.MAMBA in components
+                and components.index(ComponentType.SWA)
+                < components.index(ComponentType.MAMBA)
+            ), "checkpoint windows need the SWA component ordered before Mamba"
+            if self.enable_session_radix_cache:
+                raise ValueError(
+                    "SWA checkpoint windows do not support the session radix cache."
+                )
+            if params.token_to_kv_pool_allocator.storage is not None:
+                raise ValueError(
+                    "SWA checkpoint windows do not support unified memory."
+                )
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -437,6 +454,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self.swa_checkpoint_windows:
+            raise ValueError(
+                "SWA checkpoint windows do not support the external cache linker."
+            )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -483,6 +504,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
+        if self.host_memory_mode == "buffer_only" and self.swa_checkpoint_windows:
+            raise ValueError(
+                "SWA checkpoint windows do not support "
+                "--hicache-host-memory-mode buffer_only."
+            )
         if self.host_memory_mode == "buffer_only":
             supported = {
                 ComponentType.FULL,
@@ -513,6 +539,9 @@ class UnifiedRadixCache(BasePrefixCache):
         prefetch_timeout_per_ki_token = 0.25
         hicache_storage_pass_prefix_keys = False
         if storage_backend is not None:
+            unsupported = self._storage_attachment.unsupported_reason()
+            if unsupported is not None:
+                raise ValueError(unsupported)
             (
                 storage_extra_config,
                 storage_prefetch_threshold,
@@ -803,7 +832,41 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
 
+        swa_target = available_size_targets.get(self.slot_id(TREE_WINDOW))
+        if (
+            self.swa_checkpoint_windows
+            and swa_target is not None
+            and self._component_available_size(self.slot_id(TREE_WINDOW))
+            < swa_target[1]
+        ):
+            self._evict_checkpoints_for_swa(result, swa_target)
         return result
+
+    def _evict_checkpoints_for_swa(
+        self, result: EvictResult, swa_target: tuple[ComponentType, int]
+    ) -> None:
+        """Evict Mamba checkpoints with their windows until the allocation has enough free SWA slots."""
+        mamba_evictable = self.mamba_evictable_size()
+        if mamba_evictable == 0:
+            return
+        # Evicting every window would still leave too few free SWA slots, so evict nothing.
+        if (
+            self._component_available_size(self.slot_id(TREE_WINDOW))
+            + self.swa_evictable_size()
+            < swa_target[1]
+        ):
+            return
+        checkpoint_result = self._evict(
+            EvictParams(mamba_num=mamba_evictable),
+            {self.slot_id(TREE_STATE): swa_target},
+        )
+        result.num_tokens_evicted += checkpoint_result.num_tokens_evicted
+        result.swa_num_tokens_evicted += checkpoint_result.swa_num_tokens_evicted
+        result.mamba_num_evicted += checkpoint_result.mamba_num_evicted
+        if self.metrics_collector is not None and checkpoint_result.mamba_num_evicted:
+            self.metrics_collector.increment_swa_checkpoint_evictions(
+                checkpoint_result.mamba_num_evicted
+            )
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:

@@ -444,6 +444,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.checkpoint_windows = params.swa_checkpoint_windows
+        self.checkpoint_window_tokens = None
+        if params.swa_checkpoint_windows:
+            window = components[self._family_slot_ids[TREE_WINDOW]].sliding_window_size
+            self.checkpoint_window_tokens = (
+                -(-window // self.page_size) * self.page_size
+            )
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
         )
@@ -535,6 +542,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Full KV on both tiers -> redundant host copy, reclaimed first by
         # write_back; insertion-ordered dict keeps victims TP-deterministic.
         self.full_host_duplicates: dict[NodeId, UnifiedTreeNode] = {}
+        # Device and host queues of unlocked nodes whose SWA KV is outside every window, oldest first.
+        self.swa_uncovered: tuple[dict[NodeId, UnifiedTreeNode], ...] = ({}, {})
         # Rolling digest of reclaim victim ids, cross-checked across TP ranks.
         self.write_back_duplicate_reclaim_digest: int = 0
 
@@ -2079,7 +2088,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node,
                 comp,
                 target=EvictLayer.ALL,
-                tracker=None,
+                tracker=tracker,
                 device_frees=device_frees,
                 host_frees=host_frees,
                 cache_actions=cache_actions,
@@ -2247,7 +2256,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
-        had_host_copy = node.component_data[comp.component_type].host_value is not None
+        cd = node.component_data[comp.component_type]
+        had_device_value = cd.value is not None
+        had_host_copy = cd.host_value is not None
         device_freed, host_freed = comp.evict_component(
             node,
             target=target,
@@ -2278,6 +2289,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 lru = lru_lists[ct]
                 if lru.in_list(node):
                     lru.remove_node(node)
+        for layer, had_value, value in (
+            (EvictLayer.DEVICE, had_device_value, cd.value),
+            (EvictLayer.HOST, had_host_copy, cd.host_value),
+        ):
+            if had_value and value is None:
+                for peer in self.components:
+                    if peer is not comp:
+                        peer.on_peer_value_freed(
+                            node,
+                            ct,
+                            layer,
+                            device_frees,
+                            host_frees,
+                            cache_actions,
+                            tracker,
+                        )
         return device_freed, host_freed
 
     def _iteratively_delete_tombstone_leaf(
@@ -2987,11 +3014,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.lru_lists[component_type].insert_mru(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.
-        ledger = self.components_by_type[component_type].reclaimable_value_len(node)
+        component = self.components_by_type[component_type]
+        ledger = component.reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[component_type] += ledger
         else:
             self.component_evictable_size_[component_type] += ledger
+        component.on_device_value_set(node)
 
     def adjust_component_size(
         self, node_id: NodeId, component_type: ComponentType, delta: int
@@ -3156,6 +3185,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
 
+        for component in self.components:
+            component.validate_component_state(all_node_set, E)
         if self.enable_session_radix_cache:
             for component in self.components:
                 component.validate_session_state(all_node_set, E)

@@ -221,6 +221,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 cfg.speculative_algorithm,
             )
 
+    if cfg.speculative_draft_kv_bundling:
+        _validate_draft_kv_bundling(cfg)
+
     if cfg.speculative_draft_sink_size is not None:
         sink_size = int(cfg.speculative_draft_sink_size)
         if sink_size < 0:
@@ -285,6 +288,30 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # itself: handed the stand-in, its `declare_resolution` calls would
             # stash on that instead.
             algo.handle_server_args(server_args)
+
+
+def _validate_draft_kv_bundling(cfg) -> None:
+    """Reject the settings --speculative-draft-kv-bundling does not support yet."""
+    if cfg.speculative_algorithm not in ("DFLASH", "DSPARK"):
+        raise ValueError(
+            "--speculative-draft-kv-bundling requires --speculative-algorithm "
+            "DFLASH or DSPARK."
+        )
+    if current_platform.is_out_of_tree() or not cfg.device.startswith("cuda"):
+        raise ValueError(
+            "--speculative-draft-kv-bundling supports CUDA and ROCm devices only."
+        )
+    for setting, active in (
+        ("--enable-unified-memory", cfg.enable_unified_memory),
+        ("--enable-hisparse", cfg.enable_hisparse),
+        ("--enable-int8-mamba-checkpoint", cfg.enable_int8_mamba_checkpoint),
+        ("PD disaggregation", cfg.disaggregation_mode != "null"),
+        ("--dcp-size", cfg.dcp_size > 1),
+    ):
+        if active:
+            raise ValueError(
+                f"--speculative-draft-kv-bundling does not support {setting} yet."
+            )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:

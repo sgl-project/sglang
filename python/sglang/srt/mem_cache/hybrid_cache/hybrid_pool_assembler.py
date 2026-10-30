@@ -2070,6 +2070,51 @@ def validate_fused_hicache_draft(
         raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
 
 
+def attach_draft_swa_host_pool(*, cache: Any, draft_kv_pool: Any) -> None:
+    """Give a draft's SWA pool a host pool, registered as the SWA pool of a target without one."""
+    draft_pool = draft_kv_pool.swa_kv_pool
+    controller = cache.cache_controller
+    host_pool_group = controller.mem_pool_host
+    # Draft layer i loads with target transfer layer i.
+    assert draft_pool.layer_num <= controller.transfer_layer_id_max
+    page_size = controller.page_size
+    window_tokens = -(-cache.sliding_window_size // page_size) * page_size
+    host_mamba_slots = host_pool_group.get_pool(PoolName.MAMBA).size
+    host_tokens = min(host_mamba_slots * window_tokens, host_pool_group.logical_size)
+    host_pool = _build_mha_mla_host_pool(
+        pool=draft_pool,
+        host_to_device_ratio=host_tokens / draft_pool.size,
+        page_size=page_size,
+        layout=get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        pool_label="swa",
+    )
+    controller.register_host_pool_entry(
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=host_pool,
+            device_pool=draft_pool,
+            layer_mapping={i: i for i in range(draft_pool.layer_num)},
+            transfer_layer_id_max=draft_pool.layer_num,
+            host_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            **_swa_allocation_callbacks(
+                cache.token_to_kv_pool_allocator.swa_attn_allocator
+            ),
+        )
+    )
+    cache_attr, component_attr = _COMPONENT_HOST_ATTR[ComponentType.SWA]
+    setattr(cache, cache_attr, host_pool)
+    setattr(cache.components[ComponentType.SWA], component_attr, host_pool)
+    cache.tree_core.has_swa_host_pool = True
+    logger.info(
+        "Draft SWA host pool: %d tokens (%d host Mamba slots x %d-token windows)",
+        host_pool.size,
+        host_mamba_slots,
+        window_tokens,
+    )
+
+
 def build_hicache_draft_sidecars(
     *,
     draft_device_pools: tuple[Any, ...],
@@ -2768,6 +2813,8 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.allocator.swa import is_swa_draft_only
+
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         storage = params.token_to_kv_pool_allocator.storage
@@ -2790,6 +2837,8 @@ def attach_hybrid_pool_to_unified_cache(
             )
         else:
             components = set(cache.components.keys())
+            if is_swa_draft_only(params.token_to_kv_pool_allocator):
+                components.discard(ComponentType.SWA)
             strategy = _select_strategy(kvcache, components)
             result = strategy.build(
                 cache=cache,

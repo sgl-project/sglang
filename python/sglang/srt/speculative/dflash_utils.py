@@ -19,6 +19,8 @@ from sglang.srt.layers.sampler import (
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
@@ -428,6 +430,44 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
 
     # HF sliding windows include the current token; SGLang stores window_left.
     return int(sliding_window) - 1
+
+
+def draft_swa_write_loc(pool, cache_loc: torch.Tensor) -> Optional[torch.Tensor]:
+    """SWA slots for a draft's writes, or None when its pool has no SWA side or takes physical ids."""
+    if isinstance(pool, SWAKVPool) and not pool.requires_physical_write_loc:
+        return pool.translate_loc_from_full_to_swa(cache_loc)
+    return None
+
+
+def draft_kv_write_loc(pool, cache_loc: torch.Tensor) -> KVWriteLoc:
+    """Write loc for a draft pool, with SWA slots when its layers use the SWA side."""
+    return KVWriteLoc(
+        cache_loc, swa_loc=draft_swa_write_loc(pool, cache_loc), physical=True
+    )
+
+
+def draft_kv_write_loc_2d(pool, cache_loc_2d: torch.Tensor):
+    """The prefix-valid counterpart of draft_kv_write_loc."""
+    swa_loc_2d = draft_swa_write_loc(pool, cache_loc_2d)
+    if swa_loc_2d is None:
+        return cache_loc_2d
+    return KVWriteLoc(loc=cache_loc_2d, swa_loc=swa_loc_2d)
+
+
+def draft_kv_bundle_window(draft_hf_config: Any) -> int:
+    """How many tokens before the committed length a bundled draft reads."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        raise ValueError(
+            "--speculative-draft-kv-bundling requires a draft whose layers are all "
+            f"sliding-window, got layer_types={layer_types}."
+        )
+    window = get_dflash_attention_sliding_window_size(draft_hf_config)
+    spec = get_spec()
+    # A DFLASH compact draft cache reads at most --speculative-draft-window-size tokens back.
+    if spec.speculative_algorithm == "DFLASH" and spec.speculative_draft_window_size:
+        return min(int(spec.speculative_draft_window_size), window)
+    return window
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:

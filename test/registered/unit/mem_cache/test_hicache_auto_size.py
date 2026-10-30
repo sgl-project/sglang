@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -138,6 +139,45 @@ class TestHiCacheAutoSize(CustomTestCase):
             page_size=2,
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
+
+    def test_draft_only_swa_side_holds_one_window_per_mamba_slot(self):
+        target = _leaf(
+            Mock(
+                spec=MHATokenToKVPool,
+                size=128,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=(2048, 2048)),
+            )
+        )
+        draft = _leaf(
+            Mock(
+                spec=MHATokenToKVPool,
+                size=32,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=(256, 256)),
+            )
+        )
+        mamba_pool = Mock(
+            size=4, host_capacity_bytes=None, get_kv_size_bytes=Mock(return_value=100)
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=True),
+            token_to_kv_pool_allocator=Mock(
+                spec=SWATokenToKVPoolAllocator,
+                target_swa=False,
+                get_kvcache=Mock(return_value=target),
+                state=SimpleNamespace(pool=mamba_pool),
+            ),
+            page_size=4,
+            sliding_window_size=10,
+        )
+        plan = Mock(
+            mode="sidecar", device_pools=(Mock(spec=SWAKVPool, swa_kv_pool=draft),)
+        )
+        self.assertEqual(
+            sizing._estimate_hicache_bytes(params, plan), 4096 + 100 + 4 * 12 * 16
+        )
 
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the
