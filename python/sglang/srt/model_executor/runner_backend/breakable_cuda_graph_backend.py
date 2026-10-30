@@ -126,6 +126,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
+        # Drain any work still in flight from the last warmup (and from
+        # ``post_warmup_hook``) before entering capture, then align the TP ranks
+        # so no rank starts capturing while another is still finishing warmup.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         size = shape_key.size
         if self._shared_output_buffer is None:
