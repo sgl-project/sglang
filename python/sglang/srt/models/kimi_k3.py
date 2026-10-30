@@ -3747,6 +3747,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         max_frames = envs.SGLANG_K3_VISION_MAX_FRAMES_PER_BATCH.get()
         encode_owned = None
         if max_frames > 0:
+            # Every vision-DP rank must reject an invalid request before peers
+            # enter a gather or broadcast, including ranks with no owned item.
+            if any(not 1 <= int(grid[0]) <= max_frames for grid in grid_thw_list):
+                raise ValueError("A temporal item does not fit the vision frame budget")
 
             def encode_owned(indices):
                 outputs = []
