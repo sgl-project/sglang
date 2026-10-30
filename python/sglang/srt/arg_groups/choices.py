@@ -89,6 +89,7 @@ ATTENTION_BACKEND_CHOICES = [
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
     "minicpm_flashinfer",
+    "cudnn",  # cuDNN attention backend (requires cuDNN 9.15+ and flashinfer with cuDNN support)
     # AMD specific
     "aiter",
     "wave",
