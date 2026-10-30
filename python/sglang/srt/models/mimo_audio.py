@@ -1338,7 +1338,10 @@ class AudioEncoderMixin:
                 allow_patterns=["audio_tokenizer/*"],
             )
         audio_tokenizer_path = os.path.join(model_path, "audio_tokenizer")
-        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dev_str = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
+        if dev_str != "cpu":
+            dev_str = dev_str + ":" + str(torch.accelerator.current_device_index())
+        dev = torch.device(dev_str)
         self.audio_tokenizer = self._load_mimo_audio_tokenizer(
             audio_tokenizer_path, dev
         )
