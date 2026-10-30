@@ -40,12 +40,44 @@ class TestAscendPageDcpSend(CustomTestCase):
         mgr.is_hybrid_mla_backend = True
         mgr.kv_args = SimpleNamespace(
             kv_data_ptrs=[1_000, 2_000, 3_000, 4_000, 5_000],
+            kv_layer_ids=[3, 3, 3, 16, 16],
+            kv_item_lens=[20, 8, 4, 20, 8],
+            page_size=2,
             num_draft_entries=2,
             state_types=[StateType.MAMBA, StateType.DSA],
         )
         mgr._dcp_remote_decode_layout = [False, False, True, False, False]
         self.assertEqual(
             mgr._get_dcp_remote_decode_layout(), [False, False, True, True, True]
+        )
+        mgr._transfer_data = Mock(return_value=0)
+        self.assertEqual(
+            mgr.send_kvcache_dcp(
+                "decode",
+                np.array([5, 6, 7], dtype=np.int32),
+                [10_000, 20_000, 30_000, 40_000, 50_000],
+                np.array([10, 11], dtype=np.int32),
+                dcp_token_item_lens=[10, 4, 2, 10, 4],
+                dst_dcp_size=2,
+                dst_dcp_rank=1,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=6,
+                executor=None,
+                dst_layer_ids=mgr.kv_args.kv_layer_ids,
+                dst_kv_item_lens=[20, 8, 8, 40, 16],
+            ),
+            0,
+        )
+        mgr._transfer_data.assert_called_once_with(
+            "decode",
+            [
+                (1_120, 10_200, 20),
+                (2_048, 20_080, 8),
+                (3_020, 30_080, 12),
+                (4_100, 40_400, 60),
+                (5_040, 50_160, 24),
+            ],
         )
         mgr._dcp_remote_decode_layout = []
         with self.assertRaisesRegex(RuntimeError, "layout does not match"):
@@ -108,6 +140,9 @@ class TestAscendPageDcpSend(CustomTestCase):
         )
         # Hybrid MLA must work without a layout hook on the public pool wrapper.
         mgr._dcp_remote_decode_layout = []
+        mgr._get_dcp_remote_decode_layout = Mock(
+            side_effect=AssertionError("dense MLA must select target/draft directly")
+        )
         mgr.get_mla_kv_ptrs_with_pp = Mock(side_effect=AssertionError("legacy pairing"))
         mgr._transfer_data = Mock(return_value=0)
         kwargs = dict(
@@ -175,6 +210,15 @@ class TestAscendPageDcpSend(CustomTestCase):
                     for name in ("dst_layer_ids", "dst_kv_ptrs", "dst_kv_item_lens"):
                         kwargs[name].pop(6)
                 with self.assertRaises(RuntimeError):
+                    mgr.send_kvcache_dcp(**kwargs)
+                mgr._transfer_data.assert_not_called()
+
+    def test_hybrid_rejects_invalid_draft_entry_count(self):
+        for num_draft in (-1, 3):
+            with self.subTest(num_draft=num_draft):
+                mgr, kwargs, _ = self._hybrid_case([7], False)
+                mgr.kv_args.num_draft_entries = num_draft
+                with self.assertRaisesRegex(RuntimeError, "metadata is inconsistent"):
                     mgr.send_kvcache_dcp(**kwargs)
                 mgr._transfer_data.assert_not_called()
 

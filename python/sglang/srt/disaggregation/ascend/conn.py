@@ -156,18 +156,12 @@ class AscendKVManager(MooncakeKVManager):
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
 
     def _get_dcp_remote_decode_layout(self) -> List[bool]:
-        num_draft = self.kv_args.num_draft_entries
-        if self.is_hybrid_mla_backend and StateType.DSA not in self.kv_args.state_types:
-            # Dense hybrid MLA keeps target KV followed by replicated draft KV.
-            # DSA index buffers retain their per-entry pool layout below.
-            num_target = len(self.kv_args.kv_data_ptrs) - num_draft
-            return [False] * num_target + [True] * num_draft
-
         layout = self._dcp_remote_decode_layout
         if layout is None or len(layout) != len(self.kv_args.kv_data_ptrs):
             raise RuntimeError(
                 "Ascend PD DCP layout does not match its source KV entries"
             )
+        num_draft = self.kv_args.num_draft_entries
         if num_draft:
             # Remote decode draft KV uses global slots regardless of the local
             # prefill pool's worker role.
@@ -179,7 +173,8 @@ class AscendKVManager(MooncakeKVManager):
     ) -> List[int]:
         if not self._uses_page_interleaved_dcp():
             return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
-        self._get_dcp_remote_decode_layout()
+        if not self.is_hybrid_mla_backend or StateType.DSA in self.kv_args.state_types:
+            self._get_dcp_remote_decode_layout()
         page_size = self.kv_args.page_size
         token_item_lens = []
         for entry, item_len in enumerate(self.kv_args.kv_item_lens):
@@ -477,14 +472,20 @@ class AscendKVManager(MooncakeKVManager):
                     self.kv_args.kv_item_lens, dst_kv_item_lens
                 )
 
-        layout = self._get_dcp_remote_decode_layout()
         num_entries = len(src_kv_ptrs)
-        if not (
-            len(dst_kv_ptrs)
-            == len(self.kv_args.kv_item_lens)
-            == len(dcp_token_item_lens)
-            == len(layout)
-            == num_entries
+        num_target = num_entries - self.kv_args.num_draft_entries
+        is_dense_hybrid_mla = (
+            self.is_hybrid_mla_backend and StateType.DSA not in self.kv_args.state_types
+        )
+        layout = None if is_dense_hybrid_mla else self._get_dcp_remote_decode_layout()
+        if (
+            not (
+                len(dst_kv_ptrs)
+                == len(self.kv_args.kv_item_lens)
+                == len(dcp_token_item_lens)
+                == num_entries
+            )
+            or not 0 <= num_target <= num_entries
         ):
             raise RuntimeError("Ascend PD DCP KV entry metadata is inconsistent")
         if dst_kv_item_lens and len(dst_kv_item_lens) != num_entries:
@@ -502,7 +503,10 @@ class AscendKVManager(MooncakeKVManager):
         )
 
         transfer_blocks: List[Tuple[int, int, int]] = []
-        for entry, uses_global_slots in enumerate(layout):
+        for entry in range(num_entries):
+            # Dense MLA uses the target/draft boundary directly, as Mooncake does.
+            # DSA keeps its per-buffer index-cache layout.
+            uses_global_slots = entry >= num_target if layout is None else layout[entry]
             page_bytes = self.kv_args.kv_item_lens[entry]
             if page_bytes != dcp_token_item_lens[entry] * self.kv_args.page_size:
                 raise RuntimeError(
