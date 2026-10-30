@@ -514,9 +514,9 @@ class BeamAttention(nn.Module):
         self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
         # MergedColumnParallelLinear shards each projection independently, but
         # does not replicate KV heads.
-        # TODO(ischencheng): pack NVFP4's BF16 attention too after a B300 accuracy run.
-        self.use_packed_projection = config.num_key_value_heads >= self.tp_size and (
-            get_beam_quantization(quant_config) in ("bf16", "fp8")
+        self.use_packed_projection = (
+            config.num_key_value_heads >= self.tp_size
+            and _packs_attention_projection(quant_config, prefix)
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -1273,6 +1273,25 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
     return None
 
 
+def _packs_attention_projection(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    quant_scheme = get_beam_quantization(quant_config)
+    if quant_scheme == "bf16":
+        return True
+    # Unquantized shards of a quantized checkpoint (NVFP4 attention, FP8 ignores)
+    # stay split; packing changes their BF16 GEMM rounding at small M.
+    # TODO(ischencheng): pack them too after a B300 accuracy run.
+    return quant_scheme == "fp8" and not any(
+        should_ignore_layer(
+            add_prefix(proj, prefix),
+            ignore=quant_config.ignore,
+            fused_mapping=quant_config.packed_modules_mapping,
+        )
+        for proj in ("q_proj", "k_proj", "v_proj", "gate_proj")
+    )
+
+
 def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ...]:
     return {
         "bf16": ("auto", "triton"),
@@ -1399,7 +1418,7 @@ class BeamForCausalLM(nn.Module):
         )
         params = dict(self.named_parameters())
         # Select by the actual destination parameter so PP shards and the
-        # replicated-KV/NVFP4 fallback retain their existing loaders.
+        # split-projection fallback retain their existing loaders.
         attention_shards = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "gate_proj": 3}
         loaded = set()
         for name, weight in weights:

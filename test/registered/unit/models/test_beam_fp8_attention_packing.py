@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -16,12 +17,11 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.beam import BeamAttention, BeamForCausalLM
 from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
-# Compressed-tensors picks the FP8 scheme from the device capability.
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 TP_SIZE, TP_RANK = 8, 5
 HEADS, KV_HEADS, HEAD_DIM, HIDDEN = 16, 8, 8, 64
@@ -58,6 +58,10 @@ class TestBeamFp8AttentionPacking(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
+        # Compressed-tensors checks FP8 support against the device capability.
+        capability = patch("torch.cuda.get_device_capability", return_value=(9, 0))
+        capability.start()
+        self.addCleanup(capability.stop)
         server = ServerArgs(model_path="dummy", device="cpu", tp_size=TP_SIZE)
         publish(server, role="test", ranks=SpawnRanks(world_rank=TP_RANK))
         self.config = BeamConfig(
@@ -119,20 +123,23 @@ class TestBeamFp8AttentionPacking(CustomTestCase):
             torch.equal(packed.weight_scale.float(), torch.cat(expected_scale).float())
         )
 
-    def test_packed_projection_follows_per_shard_ignores(self):
-        ignored = [
-            f"model.layers.2.self_attn.{p}"
-            for p in ("q_proj", "k_proj", "v_proj", "gate_proj")
-        ]
-        quant_config = fp8_dynamic(ignored)
-        _, kept = self.build(1, quant_config)
-        _, skipped = self.build(2, quant_config)
-        self.assertIsInstance(
-            kept.qkv_gate_proj.quant_method, CompressedTensorsLinearMethod
+    def test_unquantized_attention_shards_stay_split(self):
+        def ignored(layer, projections):
+            return [f"model.layers.{layer}.self_attn.{p}" for p in projections]
+
+        quant_config = fp8_dynamic(
+            ignored(2, ("gate_proj",))
+            + ignored(3, ("q_proj", "k_proj", "v_proj", "gate_proj"))
         )
+        _, gate_only = self.build(2, quant_config)
+        self.assertFalse(gate_only.use_packed_projection)
         self.assertIsInstance(
-            skipped.qkv_gate_proj.quant_method, UnquantizedLinearMethod
+            gate_only.qkv_proj.quant_method, CompressedTensorsLinearMethod
         )
+        self.assertIsInstance(gate_only.gate_proj.quant_method, UnquantizedLinearMethod)
+        _, whole = self.build(3, quant_config)
+        self.assertFalse(whole.use_packed_projection)
+        self.assertIsInstance(whole.qkv_proj.quant_method, UnquantizedLinearMethod)
 
         nvfp4 = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
