@@ -175,13 +175,12 @@ def init_parallel_runtime(
         _prewarm_tp_lm_head_all_to_all()
 
     # EPLB uses the default process group, not the TP/EP coordinators.
-    # Limit warmup to static, single-node full-EP layouts for now.
+    # Limit warmup to static full-EP layouts for now.
     if (
         device == "cuda"
         and backend == "nccl"
         and get_exec().moe.enable_eplb
         and get_exec().moe.elastic_ep_backend is None
-        and parallel.nnodes == 1
         and parallel.pp_size == 1
         and parallel.moe_ep_size == parallel.tp_size > 1
     ):
@@ -391,12 +390,14 @@ def _prewarm_eplb_p2p() -> None:
         )
     for work in dist.batch_isend_irecv(ops):
         work.wait()
+    # The rebalance also all-reduces the recorded expert counts on this group.
+    dist.all_reduce(send.view(torch.int32))
     current_platform.synchronize()
     del ops, send, recv
     current_platform.empty_cache()
     free_after, _ = torch.cuda.mem_get_info()
     logger.info(
-        "EPLB default-group P2P warmup completed in %.3fs "
+        "EPLB default-group P2P and all-reduce warmup completed in %.3fs "
         "(world_size=%d, free memory delta=%.2f MiB)",
         time.perf_counter() - warmup_start,
         world_size,
@@ -408,8 +409,8 @@ def _prewarm_tp_lm_head_all_to_all() -> None:
     """Materialize PyNCCL P2P resources before model-memory accounting."""
     warmup_start = time.perf_counter()
     tp_group = get_tp_group()
-    pynccl_comm = tp_group.pynccl_comm
-    if pynccl_comm is None or not pynccl_comm.available:
+    pynccl_comm = tp_group.get_available_pynccl_comm()
+    if pynccl_comm is None:
         raise RuntimeError(
             "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
             "communicator for CUDA graph capture."

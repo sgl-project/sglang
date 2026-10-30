@@ -20,6 +20,9 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_all_layer_staged_lf_page_unified as jit_transfer_hicache_all_layer_staged_lf_page_unified,
+)
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hicache import (
@@ -27,6 +30,9 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
+)
+from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_one_layer_page_unified_lf as jit_transfer_hicache_one_layer_page_unified_lf,
 )
 from sglang.srt.mem_cache.device_pool_info import (
     KVScaleLayout,
@@ -148,9 +154,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         start_layer: int,
         end_layer: int,
         draft_buffer_infos: Sequence[MHABufferInfo] = (),
-        write_back_staging: tuple[torch.Tensor, torch.Tensor] | None = None,
+        write_back_staging: torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | None = None,
         pool_label: str = "kv",
         head_group_num: int = 1,
+        page_unified_layout: PageUnifiedLayout | None = None,
+        host_token_capacity: int | None = None,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -206,6 +216,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self._buffer_infos = infos
         self.head_group_num = head_group_num
         self.page_size = page_size
+        self.page_unified_layout = page_unified_layout
         super().__init__(
             dtype=self.dtype,
             device_capacity_tokens=device_capacity_tokens,
@@ -220,6 +231,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=device,
             allocator_type=allocator_type,
             pool_label=pool_label,
+            host_token_capacity=host_token_capacity,
         )
         self.device_k_buffers = tuple(b for info in infos for b in info.buffers.k)
         self.device_v_buffers = tuple(b for info in infos for b in info.buffers.v)
@@ -294,7 +306,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
 
     def get_hybrid_pool_buffer(self):
-        # Expose the K/V host tensors required for zero-copy I/O registration.
+        # Expose the host tensors required for zero-copy I/O registration.
+        if self.layout == "page_unified":
+            return [self.kv_buffer]
         return [self.k_buffer, self.v_buffer]
 
     def get_ksize_per_token(self):
@@ -324,7 +338,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.head_dim,
             )
         elif self.layout == "page_unified":
-            self.page_unified_layout = PageUnifiedLayout(
+            self.page_unified_layout = self.page_unified_layout or PageUnifiedLayout(
                 page_size=self.page_size,
                 layer_num=self.layer_num,
                 head_num=self.head_num,
@@ -362,13 +376,16 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
         self.staging_v_buffer = None
+        self.staging_buffer = None
         self.can_use_write_back_jit = False
+        if not current_platform.capabilities.hicache_device_kernels:
+            return
+        if self.layout == "page_unified":
+            self._require_packed_device_rows("page_unified staged write-back")
+            self._init_page_unified_staging(write_back_staging)
+            return
         # The staged kernel reads whole device pages, so it needs packed rows.
-        if (
-            self.layout != "page_first"
-            or not self.device_rows_packed
-            or not current_platform.capabilities.hicache_device_kernels
-        ):
+        if self.layout != "page_first" or not self.device_rows_packed:
             return
         page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         staging = prepare_mha_write_back_staging(
@@ -489,6 +506,17 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
                     )
+            elif self.layout == "page_unified":
+                # Both directions read one byte order, so a loaded page is the
+                # page the write-back left, whichever side produced it.
+                jit_transfer_hicache_one_layer_page_unified_lf(
+                    device_k,
+                    device_v,
+                    self.kv_buffer,
+                    host_indices,
+                    device_indices,
+                    host_layer_id,
+                )
             elif self.layout == "page_head":
                 self._require_packed_device_rows("transfer_kv_per_layer_ph_lf")
                 transfer_kv_per_layer_ph_lf(
@@ -653,6 +681,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
                     )
+            elif self.layout == "page_unified":
+                jit_transfer_hicache_all_layer_staged_lf_page_unified(
+                    device_k_data_ptrs,
+                    device_v_data_ptrs,
+                    self._page_ids(device_indices),
+                    self._page_ids(host_indices),
+                    self.staging_buffer,
+                    self.kv_buffer,
+                )
             elif self.layout == "page_head":
                 self._require_packed_device_rows("transfer_kv_all_layer_lf_ph")
                 transfer_kv_all_layer_lf_ph(
@@ -709,7 +746,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        if self.layout == "layer_first":
+        if self.layout == "page_unified":
+            page_id = index // self.page_size
+            data_page = self.kv_buffer[page_id : page_id + 1]
+        elif self.layout == "layer_first":
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
@@ -731,7 +771,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        if self.layout == "layer_first":
+        if self.layout == "page_unified":
+            page_id = index // self.page_size
+            self.kv_buffer[page_id : page_id + 1] = data_page.reshape(
+                self.page_unified_layout.page_dims(1)
+            )
+        elif self.layout == "layer_first":
             self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
                 data_page.reshape(
                     2,

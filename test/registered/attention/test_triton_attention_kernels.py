@@ -29,7 +29,7 @@ from sglang.test.kernels.extend_attention import redundant_attention
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 

@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=72, stage="base-b", runner_config="1-gpu-large")
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 # Default --mamba-track-interval: the grid on which decode checkpoints the
