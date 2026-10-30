@@ -69,6 +69,10 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
+    CanaryInfoTokenizerManagerHook,
+    ReqStateCanaryInfo,
+)
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -204,7 +208,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
+from sglang.srt.utils.weight_versions import (
+    add_weight_versions_to_meta_info,
+    weight_version_spans_to_json,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -331,6 +338,7 @@ class ReqState:
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
+    canary_info: Optional[ReqStateCanaryInfo] = None
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
     output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
@@ -489,6 +497,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     tokenized_generate_req_type = TokenizedGenerateReqInput
     batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+    canary_info_hook: Optional[CanaryInfoTokenizerManagerHook] = None
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -603,6 +612,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+        self.init_canary_info_hook()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -886,6 +896,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
+
+    def init_canary_info_hook(self):
+        self.canary_info_hook = CanaryInfoTokenizerManagerHook.maybe_create()
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -1811,6 +1824,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
+            if (hook := self.canary_info_hook) is not None:
+                hook.on_request_dispatched(
+                    rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
+                )
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
@@ -1858,6 +1875,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            if (hook := self.canary_info_hook) is not None:
+                for tokenized_obj in tokenized_objs:
+                    hook.on_request_dispatched(
+                        rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
+                    )
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
                 tokenized_obj.wrap_pickle_fields()
@@ -2536,6 +2558,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logger.warning(f"Received output for {rid=} before its request stats.")
                 continue
 
+            if (hook := self.canary_info_hook) is not None and isinstance(
+                recv_obj, (BatchStrOutput, BatchTokenIDOutput)
+            ):
+                hook.on_batch_output(
+                    state=state,
+                    recv_obj=recv_obj,
+                    customized_info=customized_info,
+                    index=i,
+                )
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -2596,6 +2628,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         meta_info,
                         spans,
                         num_output_tokens=recv_obj.completion_tokens[i],
+                    )
+                if recv_obj.prefill_weight_versions and (
+                    prefill_spans := recv_obj.prefill_weight_versions[i]
+                ):
+                    meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
+                        prefill_spans
                     )
                 meta_info["cached_tokens_details"] = request_stats.cached_tokens_details
                 if customized_info is not None:
@@ -3597,6 +3635,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info,
                 recv_obj.weight_versions,
                 num_output_tokens=len(state.output_ids),
+            )
+        if prefill_spans := recv_obj.prefill_weight_versions:
+            meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
+                prefill_spans
             )
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
