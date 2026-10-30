@@ -12,6 +12,9 @@ from .decode_attention_sm100 import swapab_attention as _swapab_attention
 # router row cap
 MAX_BATCH = 16
 
+# d rows one PV step covers: 4 warps x one 16-row MFMA tile
+PV_TILE = gl.constexpr(64)
+
 
 @gluon.jit
 def _load_v4_hip(
@@ -240,25 +243,33 @@ def partial_gluon(
     prob = gl.exp(scores - mx[None, :])
     denom = gl.sum(prob, 0)
     hi = prob.to(gl.bfloat16)
+    hs = gl.arange(0, H, gl.SliceLayout(0, mp))
     kv_t = kv_smem.permute((1, 0))
-    value = gl.amd.cdna4.mfma(
-        kv_t.load(gl.DotOperandLayout(0, mf, 4)),
-        gl.convert_layout(hi, gl.DotOperandLayout(1, mf, 4), assert_trivial=True),
-        gl.zeros((512, H), gl.float32, mf),
-    )
+    hi_op = gl.convert_layout(hi, gl.DotOperandLayout(1, mf, 4), assert_trivial=True)
     if COMPENSATE:
         lo = (prob - hi.to(gl.float32)).to(gl.bfloat16)
+        lo_op = gl.convert_layout(
+            lo, gl.DotOperandLayout(1, mf, 4), assert_trivial=True
+        )
+    d = gl.arange(0, PV_TILE, gl.SliceLayout(1, mf))
+    h = gl.arange(0, H, gl.SliceLayout(0, mf))
+    for i in gl.static_range(512 // PV_TILE):
+        kv_tile = kv_t.slice(i * PV_TILE, PV_TILE, 0).load(
+            gl.DotOperandLayout(0, mf, 4)
+        )
         value = gl.amd.cdna4.mfma(
-            kv_t.load(gl.DotOperandLayout(0, mf, 4)),
-            gl.convert_layout(lo, gl.DotOperandLayout(1, mf, 4), assert_trivial=True),
+            kv_tile, hi_op, gl.zeros((PV_TILE, H), gl.float32, mf)
+        )
+        if COMPENSATE:
+            value = gl.amd.cdna4.mfma(kv_tile, lo_op, value)
+        gl.store(
+            PART + ((b * NT + t) * H + h[None, :]) * 512 + i * PV_TILE + d[:, None],
             value,
         )
-    d = gl.arange(0, 512, gl.SliceLayout(1, mf))
-    h = gl.arange(0, H, gl.SliceLayout(0, mf))
-    gl.store(PART + ((b * NT + t) * H + h[None, :]) * 512 + d[:, None], value)
-    hs = gl.arange(0, H, gl.SliceLayout(0, mp))
-    gl.store(MAX + (b * NT + t) * H + hs, mx)
-    gl.store(SUM + (b * NT + t) * H + hs, denom)
+        # MAX and SUM store after tile 0: before PV or after the loop is slower
+        if i == 0:
+            gl.store(MAX + (b * NT + t) * H + hs, mx)
+            gl.store(SUM + (b * NT + t) * H + hs, denom)
 
 
 @triton.jit
