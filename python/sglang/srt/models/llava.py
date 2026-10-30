@@ -793,10 +793,18 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        # LLaVA feeds the LLM per-token tower states, which HF never post-norms. Only the
+        # CLIP tower has the layer; other towers would reject the kwarg.
+        tower_kwargs = (
+            {"require_post_norm": False}
+            if isinstance(self.vision_config, CLIPVisionConfig)
+            else {}
+        )
         self.vision_tower = vision_model_cls(
             self.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("vision_tower", prefix),
+            **tower_kwargs,
         )
 
         if "unpad" in getattr(self.config, "mm_patch_merge_type", ""):

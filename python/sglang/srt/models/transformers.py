@@ -674,9 +674,12 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
-        # The module whose forward yields LM hidden states; multimodal
-        # subclasses may point it at a nested text decoder instead.
-        self._text_backbone: nn.Module = self.model
+        # A nested *ForCausalLM's lm_head loads into the top-level head; drop it before
+        # _init_parameters gives it an untied vocab x hidden tensor nothing reads.
+        nested_lm = _nested_causal_lm(self.model)
+        if nested_lm is not None:
+            nested_lm.lm_head = PPMissingLayer()
+            self._register_missing_prefix("model.language_model.lm_head")
 
         self.vocab_size = getattr(
             self.text_config,
@@ -714,6 +717,12 @@ class TransformersBase(nn.Module):
     def _can_torch_compile(self) -> bool:
         """Whether this model instance is safe to wrap with torch.compile."""
         return self._compile_compatible
+
+    # A property, not an attribute: assigning a module registers it as a second child,
+    # duplicating every backbone tensor in state_dict() and breaking sharded_state loads.
+    @property
+    def _text_backbone(self) -> nn.Module:
+        return self.model
 
     def _init_parameters(self, module: nn.Module):
         """Materialize any parameters still on the meta device."""
@@ -1413,10 +1422,8 @@ class MultiModalMixin:
         # BLIP-2 style: the top-level HF forward re-runs the image encoder and
         # requires pixel_values on every step, so drive the nested decoder
         # directly and merge image features here (general_mm_embed_routine).
-        self._nested_language_model = _nested_causal_lm(self.model)
         self._text_backbone_adapter: Optional[_TextBackboneAdapter] = None
-        if self._nested_language_model is not None:
-            self._text_backbone = self._nested_language_model.model
+        if _nested_causal_lm(self.model) is not None:
             self._text_backbone_adapter = _TextBackboneAdapter(self)
             # Right operand wins on equal keys; the base mapper flattens
             # "language_model.model." for v5 VLMs, which is wrong here.
@@ -1426,6 +1433,14 @@ class MultiModalMixin:
                     "language_model.lm_head.": "lm_head.",
                 }
             )
+
+    @property
+    def _text_backbone(self) -> nn.Module:
+        if self._text_backbone_adapter is not None:
+            # The decoder _nested_causal_lm matched; a property for the same reason as
+            # TransformersBase._text_backbone.
+            return self.model.language_model.model
+        return super()._text_backbone
 
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
