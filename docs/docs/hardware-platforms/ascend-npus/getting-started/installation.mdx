@@ -539,6 +539,9 @@ python3 -m sglang.launch_server \
   </Tab>
 </Tabs>
 
+The example above uses `meta-llama/Llama-3.1-8B-Instruct`. To run another model, change the `--model-path` value and
+make sure it is listed in [Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models).
+
 #### PD Disaggregation Scene
 
 PD disaggregation requires the prefill server, the decode server, and the router to communicate with one another.
@@ -727,6 +730,9 @@ python3 -m sglang.launch_server \
   </Tab>
 </Tabs>
 
+The example above uses `Qwen/Qwen3-VL-30B-A3B-Instruct`. For other multimodal models, see the multimodal section of
+[Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models#multimodal-language-models).
+
 ## Testing the Service
 
 Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
@@ -826,3 +832,9 @@ The launch commands in this guide pass a Hugging Face model ID (e.g., `meta-llam
 
 When running in Docker, the `drun` alias mounts `~/.cache/` from the host, so weights already in the host's Hugging
 Face cache are visible inside the container.
+
+## Next Steps
+
+For mainstream models, we provide step-by-step deployment tutorials and tuned, best-practice launch scripts — see
+[Model Tutorials](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials) and
+[Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices).
