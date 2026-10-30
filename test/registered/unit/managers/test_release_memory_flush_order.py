@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,17 +44,17 @@ class TestReleaseMemoryFlushOrder(CustomTestCase):
             running_batch=SimpleNamespace(reqs=[]),
             disaggregation_mode=DisaggregationMode.NULL,
         )
-        manager = SchedulerWeightUpdaterManager(
-            tp_worker=None,
-            draft_worker=None,
-            tp_cpu_group=None,
-            memory_saver_adapter=Mock(),
-            flush_cache=lambda empty_cache=False: Scheduler.flush_cache(
-                scheduler, empty_cache=False
-            ),
-            is_fully_idle=scheduler.is_fully_idle,
-            scheduler=scheduler,
-        )
+        with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
+            manager = SchedulerWeightUpdaterManager(
+                tp_worker=None,
+                draft_worker=None,
+                memory_saver_adapter=Mock(),
+                flush_cache=lambda empty_cache=False: Scheduler.flush_cache(
+                    scheduler, empty_cache=False
+                ),
+                is_fully_idle=scheduler.is_fully_idle,
+                scheduler=scheduler,
+            )
         scheduler.weight_updater = manager
         return scheduler, manager
 
