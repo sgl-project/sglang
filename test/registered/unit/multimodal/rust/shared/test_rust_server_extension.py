@@ -186,6 +186,7 @@ def build_rust_frame_metadata_fixture() -> dict:
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: storage_attached,
             )
         reqs = {
@@ -622,7 +623,7 @@ class TestRustServerExtension(CustomTestCase):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts
         and marked as outside the stream; without the Rust server it still
-        goes to the tokenizer socket."""
+        goes to the tokenizer socket, with the request's detokenizer state released."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
@@ -633,7 +634,9 @@ class TestRustServerExtension(CustomTestCase):
         )
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
-        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
+        scheduler = SimpleNamespace(
+            rust_server=server, ipc_channels=Mock(), output_streamer=Mock()
+        )
         Scheduler.send_abort_output(scheduler, abort, req)
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
@@ -644,12 +647,14 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertEqual(cols, [b""])
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req
         )
+        scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
     def test_customized_info_goes_out_as_python_responses_render_it(self):
         """The egress sends customized_info as the JSON Python's responses
