@@ -97,6 +97,39 @@ def _localized(name: str, space: IdSpace, localize) -> IdSpace:
     return msgspec.structs.replace(space, write=lambda ids: to_space(localize(ids)))
 
 
+def _target_swa_space(token_to_kv_pool_allocator) -> IdSpace:
+    """The id space of a draft pool whose rows are the target's sliding-window
+    ids: the target's own SWA space (same key and write), so a plan translates
+    the window once for the target's SWA layers and the draft alike."""
+    if (
+        token_to_kv_pool_allocator is None
+        or not token_to_kv_pool_allocator.has_window_pool
+    ):
+        raise ValueError(
+            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV: the draft pool follows the "
+            "target's SWA ids, but the target allocator "
+            f"({type(token_to_kv_pool_allocator).__name__}) has no SWA pool."
+        )
+    if token_to_kv_pool_allocator.hands_out_virtual_ids or getattr(
+        token_to_kv_pool_allocator, "swa_req_ring", False
+    ):
+        raise ValueError(
+            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV needs the paged full->SWA "
+            "mapping; the per-request SWA ring and the unified pool have none."
+        )
+    space = (
+        token_to_kv_pool_allocator.get_kvcache()
+        .id_spaces()
+        .get(IdSpaceKind.SLIDING_WINDOW)
+    )
+    if space is None:
+        raise ValueError(
+            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV: the target pool has no paged "
+            "sliding-window sub-pool."
+        )
+    return space
+
+
 class ReadTable(msgspec.Struct, frozen=True):
     """What one batch gathers from, and how its entries become the ids a
     kernel reads: lane ``b``'s entry ``j`` is ``ids[row_ids[b] * row_stride +
@@ -186,7 +219,11 @@ class RunnerIds:
             self._full_v2p_table = None
             self._translate_full = None
             self.defer_read_translate = False
-            self._spaces = token_to_kv_pool.id_spaces()
+            self._spaces = (
+                {IdSpaceKind.FULL: _target_swa_space(token_to_kv_pool_allocator)}
+                if getattr(token_to_kv_pool, "follows_target_swa_ids", False)
+                else token_to_kv_pool.id_spaces()
+            )
             parallel = get_parallel()
             if _is_npu and parallel.dcp_enabled and not is_draft_worker:
                 # An NPU DCP target writes its rank's share of the window in

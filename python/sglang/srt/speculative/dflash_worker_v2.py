@@ -1286,6 +1286,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Write the draft-local compact req->token rows: the committed suffix
         window at [0, draft_prefix_len) plus the verify block slots after it."""
         suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        full_to_swa = self._draft_kv_full_to_swa_mapping()
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -1296,6 +1297,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 batch_size=bs,
                 block_size=block_size,
+                full_to_swa=full_to_swa,
             )
         else:
             suffix_cache_loc = self._gather_req_to_token_segments(
@@ -1304,6 +1306,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 start=suffix_start,
                 lengths=draft_prefix_lens,
             )
+            if full_to_swa is not None:
+                suffix_cache_loc = full_to_swa[suffix_cache_loc]
+                verify_out_cache_loc_2d = full_to_swa[verify_out_cache_loc_2d]
             assign_req_to_token_pool_func(
                 req_pool_indices,
                 self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -1324,6 +1329,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
             )
+
+    def _draft_kv_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
+        """The target's full->SWA id table when the draft pool's rows are the
+        target's sliding-window ids (SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV), else
+        None. Its compact rows must name those ids, like its writes do."""
+        if not self.draft_model_runner.token_to_kv_pool.follows_target_swa_ids:
+            return None
+        assert self.use_compact_draft_cache, (
+            "a draft pool on the target's SWA ids needs the compact window"
+        )
+        return self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
 
     def _maybe_merge_trained_mask_embedding(self) -> None:
         """Merge a trained mask embedding (mask_embedding.pt) into the target table.

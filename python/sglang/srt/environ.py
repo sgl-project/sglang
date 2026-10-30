@@ -662,6 +662,11 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
+    # sliding-window slots (pool and HiCache host pool sized like the target's
+    # SWA pool) instead of its full-attention slots. Needs draft window <= the
+    # target's sliding window; ignored (with the reason logged) where it does not apply.
+    SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
 
     # ===================================================================
     # Scheduler token budgeting and admission
