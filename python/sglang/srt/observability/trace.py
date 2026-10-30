@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
@@ -39,6 +39,8 @@ tracer: Optional[trace.Tracer] = None
 global_trace_modules: Optional[List[str]] = None
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
+# Bounds what a caller can attach to every root span.
+_TRACED_HEADER_MAX_LEN = 1024
 
 try:
     from opentelemetry import context, propagate, trace
@@ -71,8 +73,26 @@ except ImportError:
     logger.debug("opentelemetry package is not installed, tracing disabled")
 
 
-def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
-    return {h: headers[h] for h in TRACE_HEADERS if h in headers}
+def _traced_request_headers() -> Tuple[str, ...]:
+    return tuple(name.lower() for name in envs.SGLANG_TRACE_REQUEST_HEADERS.get())
+
+
+def extract_trace_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    names = (*TRACE_HEADERS, *_traced_request_headers())
+    return {h: headers[h] for h in names if h in headers}
+
+
+def _request_header_attributes(
+    headers: Optional[Mapping[str, str]],
+) -> Dict[str, str]:
+    if not headers:
+        return {}
+    by_name = {name.lower(): value for name, value in headers.items()}
+    return {
+        f"http.request.header.{name}": by_name[name][:_TRACED_HEADER_MAX_LEN]
+        for name in _traced_request_headers()
+        if by_name.get(name)
+    }
 
 
 def get_global_trace_level() -> int:
@@ -321,6 +341,32 @@ def trace_set_thread_info(
         _on_thread_info_set(threads_info[pid])
 
 
+def start_root_span(
+    *,
+    rid: str,
+    role: str,
+    module_name: str,
+    bootstrap_room: Optional[int],
+    external_trace_header: Optional[Dict[str, str]],
+    ts: int,
+) -> trace.span.Span:
+    external_trace_context = _trace_context_propagator.extract(
+        external_trace_header or {}
+    )
+
+    role = "" if role == "unified" else role
+    attrs = {"rid": rid, "module": f"sglang::{module_name}"}
+    if bootstrap_room:
+        attrs["bootstrap_room"] = str(hex(bootstrap_room))
+    attrs.update(_request_header_attributes(external_trace_header))
+    return tracer.start_span(
+        name=f"{role} Req" if role else "Req",
+        start_time=ts,
+        context=external_trace_context,
+        attributes=attrs,
+    )
+
+
 class TraceReqContext:
     def __init__(
         self,
@@ -381,29 +427,30 @@ class TraceReqContext:
             cur_slice_stack=[],
         )
 
-        thread_name = f"{thread_info.thread_label}"
-        if thread_info.tp_rank is not None:
-            thread_name += f" [TP {thread_info.tp_rank}] "
-        if thread_info.pp_rank is not None:
-            thread_name += f" [PP {thread_info.pp_rank}] "
-        if thread_info.dp_rank is not None:
-            thread_name += f" [DP {thread_info.dp_rank}] "
-        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+        ranks = {
+            label: rank
+            for label, rank in (
+                ("TP", thread_info.tp_rank),
+                ("PP", thread_info.pp_rank),
+                ("DP", thread_info.dp_rank),
+            )
+            if rank is not None
+        }
+        thread_name = " ".join(
+            [
+                thread_info.thread_label,
+                *(f"[{label} {rank}]" for label, rank in ranks.items()),
+            ]
+        )
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
             context=self.root_span_context,
         )
-
-        rank_attrs = {}
-        if thread_info.tp_rank is not None:
-            rank_attrs["tp_rank"] = thread_info.tp_rank
-        if thread_info.pp_rank is not None:
-            rank_attrs["pp_rank"] = thread_info.pp_rank
-        if thread_info.dp_rank is not None:
-            rank_attrs["dp_rank"] = thread_info.dp_rank
-        if rank_attrs:
-            thread_context.thread_span.set_attributes(rank_attrs)
+        if ranks:
+            thread_context.thread_span.set_attributes(
+                {f"{label.lower()}_rank": rank for label, rank in ranks.items()}
+            )
 
         thread_context.thread_span.set_attributes(
             {
@@ -554,26 +601,15 @@ class TraceReqContext:
 
         # create req context and root span
         self.start_time_ns = ts
-
-        external_trace_context = _trace_context_propagator.extract(
-            self.external_trace_header or {}
+        self.root_span = start_root_span(
+            rid=self.rid,
+            role=self.role,
+            module_name=self.module_name,
+            bootstrap_room=self.bootstrap_room,
+            external_trace_header=self.external_trace_header,
+            ts=ts,
         )
-
-        # Drop the worker_id added by MultiTokenizer
-        orig_rid = self.rid.split("_")[-1]
-        role = "" if self.role == "unified" else self.role
-        attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}"}
-        if self.bootstrap_room:
-            attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
-        root_span = tracer.start_span(
-            name=f"{role} Req {orig_rid[:8]}",
-            start_time=ts,
-            context=external_trace_context,
-            attributes=attrs,
-        )
-
-        self.root_span = root_span
-        self.root_span_context = trace.set_span_in_context(root_span)
+        self.root_span_context = trace.set_span_in_context(self.root_span)
 
         # create thread context and thread span
         self.thread_context = self.__create_thread_context(ts)
