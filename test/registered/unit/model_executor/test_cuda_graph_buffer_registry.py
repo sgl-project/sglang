@@ -8,6 +8,8 @@ Covers:
     buffers, non-slot fields carried from template.
   * ``post_fill`` hook runs after the grouped copy.
   * Missing FB attributes are silently skipped.
+  * ``GraphBuffer`` declarations, staging, refresh-mode checks, capture
+    reseeding and the pointer tripwire.
 
 The registry is GPU-agnostic — tests run on CPU. The PaddingPolicy /
 foreach_copy / view-slicing logic is fully exercised without any CUDA
@@ -18,14 +20,17 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 from typing import Optional
+from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
+    GraphBuffer,
     GraphSlot,
     PaddingPolicy,
+    RefreshMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -1546,6 +1551,144 @@ class TestComputedSlots(unittest.TestCase):
                 torch.tensor([4], dtype=torch.int32),
             )
         )
+
+
+def _graph_buffer(
+    name="lens",
+    *,
+    refresh=RefreshMode.BEFORE_REPLAY,
+    padding_policy=PaddingPolicy.ZERO,
+    capture_value=0,
+    pad_value=None,
+    shape=(4,),
+):
+    return GraphBuffer(
+        name=name,
+        shape=shape,
+        dtype=torch.int64,
+        capture_value=capture_value,
+        padding_policy=padding_policy,
+        refresh=refresh,
+        pad_value=pad_value,
+    )
+
+
+def _buffer_registry() -> CudaGraphBufferRegistry:
+    return CudaGraphBufferRegistry(
+        device=torch.device("cpu"), max_bs=4, max_num_tokens=8
+    )
+
+
+class TestGraphBuffers(unittest.TestCase):
+    def test_declaration_rejects_fb_only_padding_policies(self):
+        for policy in (PaddingPolicy.FOREACH_COPY, PaddingPolicy.FILL_ONCE):
+            with self.assertRaises(ValueError):
+                _graph_buffer(padding_policy=policy)
+        with self.assertRaises(ValueError):
+            _graph_buffer(padding_policy=PaddingPolicy.FILL_SENTINEL)
+        with self.assertRaises(ValueError):
+            _graph_buffer(shape=())
+
+    def test_register_seeds_capture_value_and_binds_owner(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        tensor = reg.register_buffer(_graph_buffer(capture_value=7), owner=owner)
+        self.assertIs(owner.lens, tensor)
+        self.assertEqual(tensor.tolist(), [7, 7, 7, 7])
+        with self.assertRaises(ValueError):
+            reg.register_buffer(_graph_buffer(), owner=owner)
+
+    def test_stage_pads_rows_past_the_source(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        reg.register_buffer(_graph_buffer("zero"), owner=owner)
+        reg.register_buffer(
+            _graph_buffer(
+                "sentinel", padding_policy=PaddingPolicy.FILL_SENTINEL, pad_value=-1
+            ),
+            owner=owner,
+        )
+        reg.register_buffer(
+            _graph_buffer(
+                "keep", padding_policy=PaddingPolicy.KEEP_PAD, capture_value=9
+            ),
+            owner=owner,
+        )
+        for name in ("zero", "sentinel", "keep"):
+            reg.stage_fill(name, 5)
+            reg.stage(name, torch.tensor([1, 2]))
+        self.assertEqual(owner.zero.tolist(), [1, 2, 0, 0])
+        self.assertEqual(owner.sentinel.tolist(), [1, 2, -1, -1])
+        self.assertEqual(owner.keep.tolist(), [1, 2, 5, 5])
+
+        reg.stage_fill("zero", 3, num_rows=1)
+        self.assertEqual(owner.zero.tolist(), [3, 0, 0, 0])
+
+    def test_only_before_replay_buffers_are_staged(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        for refresh in (RefreshMode.STATIC, RefreshMode.IN_GRAPH):
+            name = refresh.value
+            reg.register_buffer(_graph_buffer(name, refresh=refresh), owner=owner)
+            with self.assertRaises(RuntimeError):
+                reg.stage_fill(name, 1)
+            with self.assertRaises(RuntimeError):
+                reg.stage(name, torch.ones(2, dtype=torch.int64))
+
+    def test_no_staging_or_registration_while_capturing(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        reg.register_buffer(_graph_buffer(), owner=owner)
+        target = (
+            "sglang.srt.model_executor.cuda_graph_buffer_registry."
+            "is_device_stream_capturing"
+        )
+        with mock.patch(target, return_value=True):
+            with self.assertRaises(RuntimeError):
+                reg.stage_fill("lens", 1)
+            with self.assertRaises(RuntimeError):
+                reg.register_buffer(_graph_buffer("late"), owner=owner)
+
+    def test_prepare_capture_reseeds_host_owned_buffers(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        reg.register_buffer(_graph_buffer(capture_value=2), owner=owner)
+        reg.register_buffer(
+            _graph_buffer("out", refresh=RefreshMode.IN_GRAPH), owner=owner
+        )
+        reg.stage("lens", torch.tensor([5, 6, 7, 8]))
+        owner.out.copy_(torch.tensor([1, 2, 3, 4]))
+        reg.prepare_capture()
+        self.assertEqual(owner.lens.tolist(), [2, 2, 2, 2])
+        self.assertEqual(owner.out.tolist(), [1, 2, 3, 4])
+
+    def test_repeated_stage_fill_writes_once_until_restaged(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        reg.register_buffer(_graph_buffer(capture_value=2), owner=owner)
+        reg.stage_fill("lens", 7, num_rows=2)
+        owner.lens[0] = 9
+        reg.stage_fill("lens", 7, num_rows=2)
+        self.assertEqual(owner.lens.tolist(), [9, 7, 0, 0])
+
+        reg.prepare_capture()
+        reg.stage_fill("lens", 7, num_rows=2)
+        self.assertEqual(owner.lens.tolist(), [7, 7, 0, 0])
+
+        reg.stage("lens", torch.tensor([1]))
+        reg.stage_fill("lens", 7, num_rows=2)
+        self.assertEqual(owner.lens.tolist(), [7, 7, 0, 0])
+
+    def test_check_pointers_catches_a_rebound_buffer(self):
+        reg = _buffer_registry()
+        owner = SimpleNamespace()
+        tensor = reg.register_buffer(_graph_buffer(), owner=owner)
+        reg.check_pointers()
+        owner.lens = tensor.clone()
+        with self.assertRaises(RuntimeError):
+            reg.check_pointers()
+        with self.assertRaises(RuntimeError):
+            reg.prepare_capture()
 
 
 if __name__ == "__main__":

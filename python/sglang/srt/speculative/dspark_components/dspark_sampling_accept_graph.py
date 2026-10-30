@@ -39,6 +39,11 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    GraphBuffer,
+    PaddingPolicy,
+    RefreshMode,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
@@ -152,7 +157,17 @@ class DsparkSamplingAcceptGraph:
         self._block_verification = block_verification
         self._rejection_noise = rejection_noise
         # The region always commits; padded rows are gated by verify_lens.
-        self._gate = torch.ones((1,), dtype=torch.int32, device=device)
+        epilogue.graph_buffers.register_buffer(
+            GraphBuffer(
+                name="_gate",
+                shape=(1,),
+                dtype=torch.int32,
+                capture_value=1,
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                refresh=RefreshMode.STATIC,
+            ),
+            owner=self,
+        )
         self._graphs: dict[Hashable, torch.cuda.CUDAGraph] = {}
         self._warmed_up: set[Hashable] = set()
         self._pool = None
@@ -217,6 +232,7 @@ class DsparkSamplingAcceptGraph:
             graph = self._capture(key, region)
             if graph is None:
                 return
+        self._epilogue.graph_buffers.check_pointers()
         graph.replay()
         self.num_replays += 1
 

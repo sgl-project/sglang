@@ -11,23 +11,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""FB-shared slot registry for the CUDA graph forward paths.
+"""Graph-read buffer registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
 used by capture / replay. It replaces the hand-written per-runner buffer
 population logic with a single ``GraphSlot``-driven registry while adopting
 the storage allocated by ``DecodeInputBuffers`` / ``PrefillInputBuffers``.
 
-Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
-on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
-slots (FB attribute name maps 1:1 to slot name).
+It also owns graph-read buffers that mirror no FB field (``GraphBuffer``): each
+declares its capture value, padding policy and refresh mode, is written through
+the registry, and is bound to one owner attribute that must never be rebound.
+Backend-private buffers not yet migrated stay on ``AttentionBackend.cuda_graph_*``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -37,6 +38,7 @@ from sglang.srt.model_executor.input_buffers import (
     share_input_buffer,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import is_device_stream_capturing
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -297,6 +299,70 @@ class GraphSlot:
             tail.zero_()
 
 
+class RefreshMode(Enum):
+    """Who writes a ``GraphBuffer`` after its capture value is seeded.
+
+    STATIC        — Nobody.
+    BEFORE_REPLAY — The host, through ``stage`` / ``stage_fill``, never while
+                    capturing.
+    IN_GRAPH      — Only device work; ``prepare_capture`` leaves it alone.
+    """
+
+    STATIC = "static"
+    BEFORE_REPLAY = "before_replay"
+    IN_GRAPH = "in_graph"
+
+
+_GRAPH_BUFFER_PADDING_POLICIES = (
+    PaddingPolicy.KEEP_PAD,
+    PaddingPolicy.ZERO,
+    PaddingPolicy.FILL_SENTINEL,
+)
+
+
+@dataclass
+class GraphBuffer:
+    """A graph-read buffer bound to ``owner.<name>``. ``padding_policy`` covers the
+    rows past the staged ones: ZERO, FILL_SENTINEL or KEEP_PAD (never read)."""
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+    capture_value: Union[bool, int, float]
+    padding_policy: PaddingPolicy
+    refresh: RefreshMode
+    pad_value: Optional[Any] = None
+
+    tensor: Optional[torch.Tensor] = field(default=None, repr=False)
+    owner: Optional[Any] = field(default=None, repr=False)
+    staged_fill: Optional[Tuple[Any, Optional[int]]] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if len(self.shape) == 0:
+            raise ValueError(f"GraphBuffer {self.name!r}: shape needs a row axis")
+        if self.padding_policy not in _GRAPH_BUFFER_PADDING_POLICIES:
+            raise ValueError(
+                f"GraphBuffer {self.name!r}: padding_policy must be one of "
+                f"{[p.name for p in _GRAPH_BUFFER_PADDING_POLICIES]}, got "
+                f"{self.padding_policy.name}"
+            )
+        if (
+            self.padding_policy is PaddingPolicy.FILL_SENTINEL
+            and self.pad_value is None
+        ):
+            raise ValueError(
+                f"GraphBuffer {self.name!r}: FILL_SENTINEL requires pad_value"
+            )
+
+    def pad_rows_from(self, num_rows: int) -> None:
+        if num_rows >= self.tensor.shape[0]:
+            return
+        if self.padding_policy is PaddingPolicy.ZERO:
+            self.tensor[num_rows:].zero_()
+        elif self.padding_policy is PaddingPolicy.FILL_SENTINEL:
+            self.tensor[num_rows:].fill_(self.pad_value)
+
+
 class CudaGraphBufferRegistry:
     """FB → graph-resident buffer mirror, shared across eager / capture / replay.
 
@@ -308,9 +374,11 @@ class CudaGraphBufferRegistry:
     current stream; cross-stream correctness (stream handoff) is handled by
     the runners, not here.
 
-    Backend-private buffers (kernel workspace, derived page tables) are
-    NOT managed here — backends keep them on ``self.cuda_graph_*`` and
-    allocate via ``AttentionBackend.init_cuda_graph_state(...)``.
+    Graph-read buffers that mirror no FB field register as ``GraphBuffer``s and
+    are written through ``stage`` / ``stage_fill``. The runner that captures
+    their graphs between steps calls ``prepare_capture`` first and
+    ``check_pointers`` before each replay. Backend-private buffers not yet
+    migrated stay on ``self.cuda_graph_*``.
 
     Usage::
 
@@ -336,13 +404,14 @@ class CudaGraphBufferRegistry:
         max_num_tokens: int,
         share_pool: bool = False,
     ) -> None:
-        self.device = device
+        self.device = torch.device(device)
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
         # Coalesce allocated slot buffers through the global pool; only applies
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        self._buffers: Dict[str, GraphBuffer] = {}
 
     # ---- registration ------------------------------------------------------
 
@@ -360,6 +429,8 @@ class CudaGraphBufferRegistry:
         Returns the slot for caller convenience. Re-registering an existing
         name raises.
         """
+        if slot.name in self._buffers:
+            raise ValueError(f"GraphSlot {slot.name!r} is a registered graph buffer.")
         if slot.name in self._slots:
             raise ValueError(
                 f"GraphSlot {slot.name!r} already registered; "
@@ -411,6 +482,86 @@ class CudaGraphBufferRegistry:
 
     def slot_names(self) -> List[str]:
         return [name for name, s in self._slots.items() if s.enabled]
+
+    def register_buffer(self, spec: GraphBuffer, *, owner: Any) -> torch.Tensor:
+        if spec.name in self._buffers or spec.name in self._slots:
+            raise ValueError(f"Graph buffer {spec.name!r} already registered.")
+        if is_device_stream_capturing(self.device):
+            raise RuntimeError(
+                f"Graph buffer {spec.name!r} registered during graph capture; "
+                "register it at init or warmup so capture and replay share it."
+            )
+        spec.tensor = torch.full(
+            spec.shape, spec.capture_value, dtype=spec.dtype, device=self.device
+        )
+        spec.owner = owner
+        setattr(owner, spec.name, spec.tensor)
+        self._buffers[spec.name] = spec
+        return spec.tensor
+
+    def has_buffer(self, name: str) -> bool:
+        return name in self._buffers
+
+    def get_buffer(self, name: str) -> GraphBuffer:
+        return self._buffers[name]
+
+    def buffer_names(self) -> List[str]:
+        return list(self._buffers)
+
+    def _stageable(self, name: str) -> GraphBuffer:
+        spec = self._buffers[name]
+        if spec.refresh is not RefreshMode.BEFORE_REPLAY:
+            raise RuntimeError(
+                f"Graph buffer {name!r} is {spec.refresh.name}; only BEFORE_REPLAY "
+                "buffers are staged by the host."
+            )
+        if is_device_stream_capturing(self.device):
+            raise RuntimeError(
+                f"Graph buffer {name!r} staged during graph capture; the graph "
+                "would replay the staging instead of reading the staged value."
+            )
+        return spec
+
+    def stage(self, name: str, src: torch.Tensor) -> None:
+        spec = self._stageable(name)
+        num_rows = src.shape[0]
+        spec.tensor[:num_rows].copy_(src)
+        spec.pad_rows_from(num_rows)
+        spec.staged_fill = None
+
+    def stage_fill(
+        self, name: str, value: Union[bool, int, float], num_rows: Optional[int] = None
+    ) -> None:
+        """Fill the leading ``num_rows`` rows (all when None) and pad the rest;
+        a repeat of the buffer's last staging writes nothing."""
+        spec = self._buffers[name]
+        if spec.staged_fill == (value, num_rows):
+            return
+        self._stageable(name)
+        if num_rows is None:
+            spec.tensor.fill_(value)
+        else:
+            spec.tensor[:num_rows].fill_(value)
+            spec.pad_rows_from(num_rows)
+        spec.staged_fill = (value, num_rows)
+
+    # ---- capture / replay lifecycle ----------------------------------------
+
+    def prepare_capture(self) -> None:
+        self.check_pointers()
+        for spec in self._buffers.values():
+            if spec.refresh is not RefreshMode.IN_GRAPH:
+                spec.tensor.fill_(spec.capture_value)
+                spec.staged_fill = None
+
+    def check_pointers(self) -> None:
+        for spec in self._buffers.values():
+            if getattr(spec.owner, spec.name) is not spec.tensor:
+                raise RuntimeError(
+                    f"Graph buffer {spec.name!r} was rebound on "
+                    f"{type(spec.owner).__name__}; captured graphs read the "
+                    "registered tensor, so write through the registry instead."
+                )
 
     # ---- per-iter ----------------------------------------------------------
 
