@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     DetokenizeReleaseReq,
     FreezeGCReq,
+    row_output_ids,
     sock_recv,
     sock_send,
 )
@@ -287,7 +288,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if s is not None:
                 s.append_row(
                     rid=rid,
-                    output_ids=recv_obj.output_ids[i],
+                    output_ids=row_output_ids(recv_obj, i),
                     completion_tokens=recv_obj.completion_tokens[i],
                     is_beam=beam_outputs is not None and beam_outputs[i] is not None,
                     vocab_size=vocab_size,
@@ -419,7 +420,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             http_worker_ipcs=self._route_rows(recv_obj, headers),
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=recv_obj.output_ids,
+            output_ids_flat=recv_obj.output_ids_flat,
+            output_ids_offsets=recv_obj.output_ids_offsets,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
             request_stats=recv_obj.request_stats,

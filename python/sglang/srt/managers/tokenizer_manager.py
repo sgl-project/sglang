@@ -111,6 +111,7 @@ from sglang.srt.managers.io_struct import (
     async_sock_send,
     build_flat_top_logprobs_arrays,
     flat_top_logprobs_layout,
+    row_output_ids,
     sock_send,
     unwrap_from_pickle,
 )
@@ -2648,7 +2649,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
                 delta_text = recv_obj.output_strs[i]
-                delta_output_ids = list(recv_obj.output_ids[i])
+                delta_output_ids = list(row_output_ids(recv_obj, i))
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -2695,7 +2696,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
-                delta_output_ids = list(recv_obj.output_ids[i])
+                delta_output_ids = list(row_output_ids(recv_obj, i))
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 

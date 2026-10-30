@@ -18,6 +18,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     DetokenizeReleaseReq,
+    flatten_output_ids,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -60,12 +61,16 @@ def _output(sent, rows, *, ipc="worker-a"):
         sent[rid] = (0 if header is not None else sent.get(rid, 0)) + len(ids)
         completion_tokens.append(sent[rid])
     headers = [header for _, _, header, _ in rows]
+    output_ids_flat, output_ids_offsets = flatten_output_ids(
+        ids for _, ids, _, _ in rows
+    )
     return BatchTokenIDOutput(
         rids=[rid for rid, _, _, _ in rows],
         finished_reasons=[
             {"type": "length"} if finished else None for *_, finished in rows
         ],
-        output_ids=[array("q", ids) for _, ids, _, _ in rows],
+        output_ids_flat=output_ids_flat,
+        output_ids_offsets=output_ids_offsets,
         detokenize_headers=headers if any(headers) else None,
         http_worker_ipcs=(
             [ipc if finished else None for *_, finished in rows]

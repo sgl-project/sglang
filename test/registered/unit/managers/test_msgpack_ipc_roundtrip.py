@@ -37,8 +37,10 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     UpdateWeightFromDiskReqInput,
     VertexGenerateReqInput,
+    flatten_output_ids,
     msgpack_decode,
     msgpack_encode,
+    row_output_ids,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
@@ -63,6 +65,14 @@ def _double_hop(obj):
     # MultiTokenizerRouter and the DP controller re-encode already-decoded
     # structs, so a single hop cannot catch re-encode bugs.
     return msgpack_decode(msgpack_encode(msgpack_decode(msgpack_encode(obj))))
+
+
+def _batch_output(cls, **fields):
+    """A cls with every required field empty, then fields."""
+    empty = {f.name: [] for f in msgspec.structs.fields(cls) if f.required}
+    if "output_ids_flat" in empty:
+        empty["output_ids_flat"] = array("q")
+    return cls(**{**empty, **fields})
 
 
 def _contains_dataclass(obj) -> bool:
@@ -320,10 +330,7 @@ class TestRequestStatsRoundTrip(CustomTestCase):
             # Embedding rows always carry their stats.
             request_stats = [stats, stats if cls is BatchEmbeddingOutput else None]
             with self.subTest(type=cls.__name__):
-                required = {
-                    f.name: [] for f in msgspec.structs.fields(cls) if f.required
-                }
-                obj = cls(**{**required, "rids": ["a", "b"]})
+                obj = _batch_output(cls, rids=["a", "b"])
                 obj.request_stats = request_stats
 
                 decoded = _double_hop(obj)
@@ -344,10 +351,7 @@ class TestDetokenizeRoundTrip(CustomTestCase):
             no_stop_trim=True,
             http_worker_ipc="ipc:///tmp/tokenizer-0",
         )
-        required = {
-            f.name: [] for f in msgspec.structs.fields(BatchTokenIDOutput) if f.required
-        }
-        obj = BatchTokenIDOutput(**{**required, "rids": ["a", "b"]})
+        obj = _batch_output(BatchTokenIDOutput, rids=["a", "b"])
         obj.detokenize_headers = [header, None]
         obj.http_worker_ipcs = [None, "ipc:///tmp/tokenizer-1"]
 
@@ -357,6 +361,25 @@ class TestDetokenizeRoundTrip(CustomTestCase):
         self.assertIsInstance(decoded.detokenize_headers[0], DetokenizeHeader)
         self.assertIsInstance(decoded.detokenize_headers[0].prompt_tail_ids, array)
         self.assertEqual(decoded.http_worker_ipcs, [None, "ipc:///tmp/tokenizer-1"])
+
+    def test_output_ids_columns_round_trip(self):
+        rows = [[151644, 872], [], [-101, 2**40]]
+        flat, offsets = flatten_output_ids(rows)
+        for cls in (BatchTokenIDOutput, BatchStrOutput):
+            with self.subTest(type=cls.__name__):
+                obj = _batch_output(
+                    cls,
+                    rids=["a", "b", "c"],
+                    output_ids_flat=flat,
+                    output_ids_offsets=offsets,
+                )
+
+                decoded = _double_hop(obj)
+
+                self.assertIsInstance(decoded.output_ids_flat, array)
+                self.assertEqual(
+                    [list(row_output_ids(decoded, i)) for i in range(3)], rows
+                )
 
 
 if __name__ == "__main__":
