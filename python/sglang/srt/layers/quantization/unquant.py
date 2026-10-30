@@ -757,6 +757,9 @@ def _empty_xpu_moe_expert_weight(
 _FUSED_EXPERT_WEIGHT_NAMES = ("w13_weight", "w2_weight")
 _TRTLLM_BF16_EPILOGUE_TILE_M = 128
 _TRTLLM_BF16_BLOCK_K = 128
+# Experts converted per launch; bounds the temporary each launch gathers into
+# (128 MiB for 32 Qwen3.5-35B-A3B w13 experts).
+_TRTLLM_BF16_EXPERTS_PER_CHUNK = 32
 
 
 def _fused_expert_weight_name(weight_name: str) -> Optional[str]:
@@ -1037,64 +1040,58 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
     ) -> None:
         """Canonical -> block layout, in place, for one fused expert weight."""
-        from flashinfer.fused_moe.core import convert_to_block_layout
+        num_experts, rows, _ = param.data.shape
+        tiles = param.data.view(torch.uint8)
+        # Keyed on tile shape, identical for every expert.
+        permute_indices = self._trtllm_bf16_row_permutation(
+            layer, param_name, tiles[0]
+        ).to(tiles.device)
+        # flashinfer's convert_to_block_layout per expert: an [M, K] byte tile
+        # becomes [K // _TRTLLM_BF16_BLOCK_K, M, _TRTLLM_BF16_BLOCK_K].
+        row_major = tiles.view(num_experts, rows, -1, _TRTLLM_BF16_BLOCK_K)
+        block_major = tiles.view(num_experts, -1, rows, _TRTLLM_BF16_BLOCK_K)
+        for start in range(0, num_experts, _TRTLLM_BF16_EXPERTS_PER_CHUNK):
+            end = min(start + _TRTLLM_BF16_EXPERTS_PER_CHUNK, num_experts)
+            # The row gather copies, so the chunk is read before it is overwritten.
+            permuted = row_major[start:end, permute_indices]
+            block_major[start:end] = permuted.transpose(1, 2)
 
-        canonical_expert_shape = param.data[0].shape
-        blocked_expert_shape = None
-        for i in range(layer.num_local_experts):
-            permute_indices = self._trtllm_bf16_row_permutation(
-                layer, param_name, param.data[i].view(torch.uint8)
-            )
-            tile = (
-                param.data[i]
-                .clone()
-                .view(torch.uint8)[permute_indices.to(param.data.device)]
-                .contiguous()
-            )
-            tile = convert_to_block_layout(tile, _TRTLLM_BF16_BLOCK_K)
-            blocked_expert_shape = tile.view(torch.bfloat16).shape
-            param.data[i] = (
-                tile.view(torch.bfloat16).contiguous().reshape(canonical_expert_shape)
-            )
-
-        param.data = param.data.reshape(layer.num_local_experts, *blocked_expert_shape)
+        param.data = block_major.view(torch.bfloat16)
 
     def _restore_trtllm_bf16_canonical_layout(
         self, layer: torch.nn.Module, param: torch.nn.Parameter, param_name: str
     ) -> None:
         """Undo the block/row permutations in place, preserving untouched experts."""
-        canonical_shape = self._canonical_expert_weight_shape(layer, param_name)
-        blocked_expert_shape = tuple(param.data[0].shape)
-        param.data = param.data.reshape(canonical_shape)
-
-        inverse_indices = None
-        for i in range(layer.num_local_experts):
-            blocked = param.data[i].reshape(blocked_expert_shape).view(torch.uint8)
-            rows = blocked.shape[1]
-            tile = blocked.permute(1, 0, 2).contiguous().reshape(rows, -1)
-            if inverse_indices is None:
-                # Keyed on tile shape, identical for every expert: invert once.
-                permute_indices = self._trtllm_bf16_row_permutation(
-                    layer, param_name, tile
-                ).to(tile.device)
-                # argsort only inverts a bijection. It is one today; fail loudly
-                # rather than silently scrambling rows if that ever changes.
-                if not torch.equal(
-                    permute_indices.sort().values,
-                    torch.arange(permute_indices.numel(), device=tile.device),
-                ):
-                    raise RuntimeError(
-                        f"flashinfer TRT-LLM row permutation for {param_name} is "
-                        "not a bijection, so the block layout cannot be undone "
-                        "for a weight update."
-                    )
-                inverse_indices = torch.argsort(permute_indices)
-            param.data[i] = (
-                tile[inverse_indices]
-                .contiguous()
-                .view(torch.bfloat16)
-                .reshape(canonical_shape[1:])
+        canonical = param.data.view(
+            self._canonical_expert_weight_shape(layer, param_name)
+        )
+        num_experts, rows, _ = canonical.shape
+        tiles = canonical.view(torch.uint8)
+        row_major = tiles.view(num_experts, rows, -1, _TRTLLM_BF16_BLOCK_K)
+        block_major = tiles.view(num_experts, -1, rows, _TRTLLM_BF16_BLOCK_K)
+        # Keyed on tile shape, identical for every expert: invert once.
+        permute_indices = self._trtllm_bf16_row_permutation(
+            layer, param_name, tiles[0]
+        ).to(tiles.device)
+        # argsort only inverts a bijection. It is one today; fail loudly
+        # rather than silently scrambling rows if that ever changes.
+        if not torch.equal(
+            permute_indices.sort().values,
+            torch.arange(permute_indices.numel(), device=tiles.device),
+        ):
+            raise RuntimeError(
+                f"flashinfer TRT-LLM row permutation for {param_name} is "
+                "not a bijection, so the block layout cannot be undone "
+                "for a weight update."
             )
+        inverse_indices = torch.argsort(permute_indices)
+        for start in range(0, num_experts, _TRTLLM_BF16_EXPERTS_PER_CHUNK):
+            end = min(start + _TRTLLM_BF16_EXPERTS_PER_CHUNK, num_experts)
+            permuted = block_major[start:end].transpose(1, 2)
+            # The row gather copies, so the chunk is read before it is overwritten.
+            row_major[start:end] = permuted[:, inverse_indices]
+
+        param.data = canonical
 
     def _canonical_expert_weight_shape(
         self, layer: torch.nn.Module, param_name: str
