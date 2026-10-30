@@ -25,10 +25,21 @@ AUTO_BACKEND = "auto"
 TORCH_IPC_BACKEND = "torch_ipc"
 VMM_FD_BACKEND = "vmm_fd"
 
-# vmm_fd packs the daemon's storages into allocations of at most this size (a
-# larger storage gets an allocation of its own). Packing fills one allocation
-# at a time and frees the originals it replaced before creating the next one,
-# so the extra memory needed while packing is about one allocation.
+# vmm_fd packs the daemon's storages into allocations of at most this size; a
+# slot larger than that (one storage, or overlapping storages that share one)
+# gets an allocation of its own. Packing fills one allocation at a time, then
+# drops its references to the originals it copied and calls empty_cache(). The
+# caching allocator returns memory only in whole segments, and a segment can
+# also hold storages that a later allocation packs or other tensors that are
+# still alive, so some copied originals stay reserved until the rest of their
+# segment is freed. The extra memory needed while packing is the allocation
+# being filled, up to about max(this cap, the largest slot), plus those
+# originals.
+#
+# The cap trades that transient against attach time: on every fetch, each
+# allocation is exported by the daemon, then received, imported and mapped by
+# the engine. A smaller cap tends to mean more allocations and a slower
+# attach, a larger cap a larger packing transient. 1 GiB sits in between.
 VMM_FD_MAX_ALLOC_BYTES = 1 << 30
 
 _FD_INDEX_STRUCT = struct.Struct("<Q")
@@ -204,9 +215,9 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
 
     Daemon (``for_export`` + ``prepare_export``): copy every storage into a
     few large ``cuMemCreate`` allocations that can be exported as POSIX fds
-    (layout in ``vmm_layout``) and repoint the daemon's own tensors at the
-    copies. Each ``fetch_state`` gets the layout, then one freshly exported fd
-    per allocation over ``SCM_RIGHTS``.
+    (layout in ``vmm_layout``), dropping its reference to each original once
+    it is copied. Each ``fetch_state`` gets the layout, then one freshly
+    exported fd per allocation over ``SCM_RIGHTS``.
 
     Engine (``recv_fetch_state_response`` + ``import_tensor``): reserve one
     virtual address range, import and map every allocation into it, and build
