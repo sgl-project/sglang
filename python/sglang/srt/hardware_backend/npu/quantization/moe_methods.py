@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
     _require_e8m0_dtype,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    prepare_mxfp4_moe_weight,
     prepare_w4a8_mxfp_weight,
 )
 
@@ -446,11 +447,9 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             )
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = reshape_w4a8_mxfp_weight_scale_for_npu(weight_scale.data)
-        # Preserve the existing W4A4 cast until its packed-FP4 ND/NZ contract
-        # is validated on Ascend 950; W4A8's cast kwargs are not interchangeable.
-        weight.data = npu_format_cast(weight.data).transpose(-1, -2)
-        weight_scale.data = scale
+        weight.data, weight_scale.data = prepare_mxfp4_moe_weight(
+            weight.data, weight_scale.data, customize_dtype=None
+        )
 
         # There is no FP4 dispatch path, including under DeepEP low latency.
         # Keep BF16 dispatch and quantize immediately before each GMM.

@@ -53,6 +53,36 @@ def reshape_w4a8_mxfp_weight_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     return scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
 
 
+def prepare_mxfp4_moe_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    customize_dtype,
+    npu_format=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare single-level MXFP4 weights with an explicit storage-cast policy.
+
+    W4A4 keeps packed byte storage (customize_dtype=None) and passes the FP4
+    interpretation to its GMM operators. W4A8 supplies its unpack/cast dtype;
+    do not apply that conversion to W4A4 merely because both use FP4 weights.
+    """
+    scale = reshape_w4a8_mxfp_weight_scale_for_npu(weight_scale)
+    cast_args = {}
+    if customize_dtype is not None:
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+        cast_args = {
+            "customize_dtype": customize_dtype,
+            "input_dtype": fp4_dtype,
+        }
+    if npu_format is None:
+        weight = npu_format_cast(weight, **cast_args)
+    else:
+        weight = npu_format_cast(weight, npu_format, **cast_args)
+    return weight.transpose(-1, -2), scale
+
+
 def prepare_w4a8_mxfp_weight(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -64,24 +94,15 @@ def prepare_w4a8_mxfp_weight(
     Scales are either raw E8M0 bytes (ModelSlim / DeepSeek-V4) or float32
     checkpoint values (HF), which need decoding before the shared packing.
     """
-    fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-    if fp4_dtype is None:
-        raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
-
     if weight.dtype == torch.int8:
         weight = weight.view(torch.uint8)
-    cast_args = {
-        "customize_dtype": torch.float8_e4m3fn,
-        "input_dtype": fp4_dtype,
-    }
-    if npu_format is None:
-        weight = npu_format_cast(weight, **cast_args)
-    else:
-        weight = npu_format_cast(weight, npu_format, **cast_args)
     if weight_scale.dtype == torch.float32:
         weight_scale = _decode_fp32_mxfp_scale(weight_scale)
-    return weight.transpose(-1, -2), reshape_w4a8_mxfp_weight_scale_for_npu(
-        weight_scale
+    return prepare_mxfp4_moe_weight(
+        weight,
+        weight_scale,
+        customize_dtype=torch.float8_e4m3fn,
+        npu_format=npu_format,
     )
 
 
