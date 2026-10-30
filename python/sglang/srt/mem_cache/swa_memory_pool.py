@@ -324,8 +324,13 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
         else:
+            # Pass the layer, not None: layer_id_override already carries the
+            # sub-pool-local index for the buffers, while a quantized pool reads
+            # its per-layer global KV scales at layer.layer_id. With None the
+            # pool falls back to the override for both and a hybrid model reads
+            # the scale of whatever global layer happens to share that index.
             pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
