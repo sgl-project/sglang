@@ -238,6 +238,13 @@ class UnifiedTreeCoreInterface(ABC):
         """
         return None
 
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the rotation base plus the node's first
+        position-page, i.e. the owner of its first page modulo the shard
+        size; None when sharding is off. Concrete for the same reason as
+        ``rotation_base_of``."""
+        return None
+
     @abstractmethod
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -741,7 +748,7 @@ class UnifiedTreeCoreInterface(ABC):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -753,7 +760,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 

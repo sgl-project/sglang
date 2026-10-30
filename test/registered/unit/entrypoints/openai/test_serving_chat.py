@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
+import copy
 import gc
 import json
 import unittest
@@ -25,6 +26,8 @@ from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
+from xgrammar import Grammar
+from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
@@ -48,8 +51,10 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.python_chat_template import GLM53, install_python_chat_template
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
+    GRAMMAR_AT_ANSWER,
     GRAMMAR_FROM_START,
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
@@ -58,12 +63,13 @@ from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    get_request_reasoning_in_grammar,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=79, suite="base-a-test-cpu")
 
 # Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
 _ALL_CHAT_ENCODING_SPECS = ("dsv41", "dsv4", "dsv32", "inkling", "kimi_k3")
@@ -174,6 +180,7 @@ class _MockTokenizerManager:
             return_input_ids=False,
             return_output_ids=False,
             incremental_streaming_output=False,
+            grammar_backend="xgrammar",
         )
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
@@ -1024,17 +1031,20 @@ class ServingChatTestCase(CustomTestCase):
         self.tm.tokenizer.decode.assert_not_called()
 
     def _use_delimited_response_template(
-        self, reasoning_parser, template=_DELIMITED_RESPONSE_TEMPLATE
+        self,
+        reasoning_parser,
+        template=_DELIMITED_RESPONSE_TEMPLATE,
+        tool_call_parser="beam",
     ):
         self.tm.tokenizer.response_template = template
         self.tm.tokenizer.encode.side_effect = lambda text, **_: (
             [7] if text == "</call>" else [1, 2, 3] if text else []
         )
         self.tm.model_config.is_multimodal = True
-        self.chat.tool_call_parser = "response_template"
+        self.chat.tool_call_parser = tool_call_parser
         self.chat.reasoning_parser = reasoning_parser
         self.chat._reasoning_detector = (
-            ResponseTemplateReasoningDetector(response_template=template)
+            ReasoningParser.DetectorMap[reasoning_parser](response_template=template)
             if reasoning_parser
             else None
         )
@@ -1058,10 +1068,14 @@ class ServingChatTestCase(CustomTestCase):
             "index": 0,
         }
 
-    def _convert_rendered_as(self, prompt, request):
+    def _convert_rendered_as(self, prompt, request=None, **fields):
+        if request is None:
+            fields.setdefault("messages", [{"role": "user", "content": "Weather?"}])
+            request = ChatCompletionRequest(model="x", **fields)
+        # The engine, and so the response parsers, read the rendered prompt.
         rendered = MessageProcessingResult(
             prompt=prompt,
-            prompt_ids=[],
+            prompt_ids=prompt,
             image_data=None,
             audio_data=None,
             video_data=None,
@@ -1075,9 +1089,8 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_response_template_parser_context_records_grammar_start(self):
         """JSON-schema output starts after the reasoning only when the grammar
-        backend waits for it, which a pattern-only reasoning closer cannot."""
-        named = {"type": "function", "function": {"name": "get_weather"}}
-        required = {"tools": [_WEATHER_TOOL], "tool_choice": "required"}
+        backend waits for it, which a pattern-only reasoning closer cannot; a
+        JSON answer then starts at the answer opener."""
         pattern_closed = {
             **_DELIMITED_RESPONSE_TEMPLATE,
             "fields": {
@@ -1085,22 +1098,22 @@ class ServingChatTestCase(CustomTestCase):
                 "thinking": {"open": "<think>", "close_pattern": "</think>"},
             },
         }
+        json_object = {"response_format": {"type": "json_object"}}
         cases = {
-            "auto tool choice": ("response_template", {"tools": [_WEATHER_TOOL]}, None),
-            "named tool after reasoning": (
-                "response_template",
-                {"tools": [_WEATHER_TOOL], "tool_choice": named},
-                GRAMMAR_AFTER_REASONING,
-            ),
+            "auto tool choice": ("beam", {"tools": [_WEATHER_TOOL]}, None),
             "response_format after reasoning": (
-                "response_template",
-                {"response_format": {"type": "json_object"}},
-                GRAMMAR_AFTER_REASONING,
+                "beam",
+                json_object,
+                GRAMMAR_AT_ANSWER,
             ),
-            "required tool without reasoning": (None, required, GRAMMAR_FROM_START),
-            "required tool, reasoning without an end token": (
-                "response_template",
-                required,
+            "response_format without reasoning": (
+                None,
+                {"tools": [_WEATHER_TOOL], **json_object},
+                GRAMMAR_FROM_START,
+            ),
+            "response_format, reasoning without an end token": (
+                "beam",
+                json_object,
                 GRAMMAR_FROM_START,
                 pattern_closed,
             ),
@@ -1108,15 +1121,432 @@ class ServingChatTestCase(CustomTestCase):
         for name, (reasoning_parser, fields, grammar_start, *template) in cases.items():
             with self.subTest(name):
                 self._use_delimited_response_template(reasoning_parser, *template)
-                _, request = self._convert_rendered_as(
-                    "<assistant>",
-                    ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Weather?"}],
-                        **fields,
+                _, request = self._convert_rendered_as("<assistant>", **fields)
+                self.assertEqual(request._response_parser_grammar_start, grammar_start)
+
+    def test_call_ended_by_another_stop_token_is_complete(self):
+        """A complete call ended by a stop token other than its closer must not be
+        dropped."""
+        text = '<think>Plan</think><call:get_weather>{"city": "Paris"}'
+        stopped = self._stopped_on_token(text, 2)
+        cut_off = copy.deepcopy(stopped)
+        cut_off["meta_info"]["finish_reason"] = {"type": "length", "length": 9}
+        weather = [("get_weather", {"city": "Paris"})]
+        for parser, tool_choice, output, expected in (
+            ("beam", "required", stopped, weather),
+            ("beam", "required", cut_off, []),
+            ("response_template", "auto", stopped, []),
+        ):
+            self._use_delimited_response_template(parser, tool_call_parser=parser)
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    choice=tool_choice, stream=stream, incremental=incremental
+                ):
+                    self.assertEqual(
+                        self._served(
+                            output,
+                            stream,
+                            incremental=incremental,
+                            tools=[_WEATHER_TOOL],
+                            tool_choice=tool_choice,
+                        ),
+                        ("Plan", "", expected),
+                    )
+
+    def test_tool_call_is_parsed_under_delimited_template(self):
+        """A call must not be lost when it ends on the tool closer that detokenization
+        keeps."""
+        for reasoning_parser, constraint in (
+            (None, {"tool_choice": "required"}),
+            ("beam", {"tool_choice": "required"}),
+            ("beam", {"response_format": {"type": "json_object"}}),
+        ):
+            self._use_delimited_response_template(reasoning_parser)
+            reasoning = "Check the forecast." if reasoning_parser else ""
+            city = "a</call>b" if reasoning_parser else "Paris"
+            call = "<call:get_weather>" + json.dumps({"city": city}) + "</call>"
+            text = (f"<think>{reasoning}</think>" if reasoning else "") + call
+            for stream in (False, True):
+                with self.subTest(parser=reasoning_parser, stream=stream, **constraint):
+                    self.assertEqual(
+                        self._served(
+                            self._stopped_on_token(text, 7),
+                            stream,
+                            tools=[_WEATHER_TOOL],
+                            **constraint,
+                        ),
+                        (reasoning, "", [("get_weather", {"city": city})]),
+                    )
+
+    def test_kept_tool_closer_after_json_answer_is_trimmed(self):
+        """A kept tool closer must not leak into a JSON answer, whichever increment
+        brings it."""
+        self._use_delimited_response_template("beam")
+        output = self._stopped_on_token('<think>Plan</think><answer>{"a": 1}</call>', 7)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.assertEqual(
+                    self._served(
+                        output,
+                        stream,
+                        tools=[_WEATHER_TOOL],
+                        response_format={"type": "json_object"},
+                    ),
+                    ("Plan", '{"a": 1}', []),
+                )
+
+    def test_tool_markup_inside_an_answer_is_answer_data(self):
+        """Tool markup inside a text or JSON answer must stay in the answer, never
+        become a call, whether the opener arrives split or together with the
+        answer and whether or not the reasoning is separated. A call instead of
+        the answer stays a call."""
+        self._use_delimited_response_template("beam")
+        markup = '<call:get_weather>{"city": "Paris"}'
+        payload = json.dumps({"note": markup + "</call>"})
+        json_object = {"response_format": {"type": "json_object"}}
+        call = self._stopped_on_token("<think>Plan</think>" + markup + "</call>", 7)
+        for answer, response_format in (
+            ("A call looks like " + markup + " and that is all.", {}),
+            (payload, json_object),
+        ):
+            answered = "<think>Plan</think><answer>" + answer
+            output = self._stopped_on_token(answered, 2)
+            fields = {"tools": [_WEATHER_TOOL], **response_format}
+            for separate in (True, False):
+                reasoning = "Plan" if separate else ""
+                cases = (
+                    (output, (reasoning, answer if separate else answered, [])),
+                    (
+                        call,
+                        (
+                            reasoning,
+                            "" if separate else "<think>Plan</think>",
+                            [("get_weather", {"city": "Paris"})],
+                        ),
                     ),
                 )
-                self.assertEqual(request._response_parser_grammar_start, grammar_start)
+                for served_output, expected in cases:
+                    for stream, incremental in ((False, False), (True, True)):
+                        with self.subTest(
+                            text=served_output["text"],
+                            separate=separate,
+                            stream=stream,
+                            incremental=incremental,
+                        ):
+                            served = self._served(
+                                served_output,
+                                stream,
+                                incremental=incremental,
+                                separate_reasoning=separate,
+                                **fields,
+                            )
+                            self.assertEqual(served, expected)
+        fields = {"tools": [_WEATHER_TOOL], **json_object}
+        output = self._stopped_on_token("<think>Plan</think><answer>" + payload, 2)
+        adapted, request = self._convert_rendered_as(
+            "<assistant>", stream=True, **fields
+        )
+        self.assertEqual(
+            self._chat_outcome(adapted, request, output),
+            ([], "Plan", payload, ["stop"]),
+        )
+
+    def test_markup_inside_reasoning_is_reasoning(self):
+        """Answer or call markup quoted inside the reasoning must neither end call
+        parsing nor become a call, whether or not the reasoning is separated;
+        unseparated output keeps the reasoning as it was written."""
+        self._use_delimited_response_template("beam")
+        call = '<call:get_weather>{"city": "Paris"}'
+        quoted_answer = "<think>The marker is <answer>. Use the tool.</think>"
+        quoted_call = "<think>Calls look like " + call + "</think><answer>Sunny."
+        cases = (
+            (
+                self._stopped_on_token(quoted_answer + call + "</call>", 7),
+                (
+                    "The marker is <answer>. Use the tool.",
+                    "",
+                    [("get_weather", {"city": "Paris"})],
+                ),
+                ("", quoted_answer, [("get_weather", {"city": "Paris"})]),
+            ),
+            (
+                self._stopped_on_token(quoted_call, 2),
+                ("Calls look like " + call, "Sunny.", []),
+                ("", quoted_call, []),
+            ),
+        )
+        for output, separated, unseparated in cases:
+            for separate, expected in ((True, separated), (False, unseparated)):
+                for stream, incremental in ((False, False), (True, True)):
+                    with self.subTest(
+                        text=output["text"],
+                        separate=separate,
+                        stream=stream,
+                        incremental=incremental,
+                    ):
+                        served = self._served(
+                            output,
+                            stream,
+                            incremental=incremental,
+                            tools=[_WEATHER_TOOL],
+                            separate_reasoning=separate,
+                        )
+                        self.assertEqual(served, expected)
+
+    def _served(
+        self, output, stream, *, incremental=True, prompt="<assistant>", **fields
+    ):
+        output = copy.deepcopy(output)
+        adapted, request = self._convert_rendered_as(prompt, stream=stream, **fields)
+        if not stream:
+            choice = self.chat._build_chat_response(request, [output], 0).choices[0]
+            message = choice.message
+            calls = [
+                (call.function.name, json.loads(call.function.arguments))
+                for call in message.tool_calls or []
+            ]
+            served = message.reasoning_content or "", message.content or "", calls
+            finishes = [choice.finish_reason]
+        else:
+
+            async def generate():
+                text = output["text"].removesuffix("</call>")
+                unfinished = {**output["meta_info"], "finish_reason": None}
+                for index, char in enumerate(text):
+                    yield {
+                        **output,
+                        "text": char if incremental else text[: index + 1],
+                        "meta_info": unfinished,
+                    }
+                yield {
+                    **output,
+                    "text": output["text"][len(text) :]
+                    if incremental
+                    else output["text"],
+                }
+
+            self.tm.generate_request = Mock(return_value=generate())
+            with get_context().override_server_args(
+                incremental_streaming_output=incremental
+            ):
+                choices = [
+                    choice
+                    for chunk in self._parse_chunks(
+                        self._run_chat_stream(adapted, request)
+                    )
+                    for choice in chunk.get("choices", [])
+                ]
+            deltas = [choice.get("delta") or {} for choice in choices]
+            streamed = [
+                call["function"]
+                for delta in deltas
+                for call in delta.get("tool_calls") or []
+            ]
+            name = "".join(call.get("name") or "" for call in streamed)
+            arguments = "".join(call.get("arguments") or "" for call in streamed)
+            served = (
+                "".join(delta.get("reasoning_content") or "" for delta in deltas),
+                "".join(delta.get("content") or "" for delta in deltas),
+                [(name, json.loads(arguments))] if arguments else [],
+            )
+            finishes = [
+                choice["finish_reason"]
+                for choice in choices
+                if choice.get("finish_reason")
+            ]
+        expected_finish = (
+            "tool_calls" if served[2] else output["meta_info"]["finish_reason"]["type"]
+        )
+        self.assertEqual(finishes, [expected_finish])
+        return served
+
+    def test_markers_in_call_arguments_under_json_answer_stay_arguments(self):
+        """Answer or thinking markers in call arguments must not open a region before a
+        JSON answer."""
+        self._use_delimited_response_template("beam")
+        for city in ("<answer>Paris", "<think>Plan</think>"):
+            call = "<call:get_weather>" + json.dumps({"city": city}) + "</call>"
+            for text, reasoning in ((call, ""), ("<think>Hm</think>" + call, "Hm")):
+                for stream in (False, True):
+                    with self.subTest(text=text, stream=stream):
+                        served = self._served(
+                            self._stopped_on_token(text, 7),
+                            stream,
+                            tools=[_WEATHER_TOOL],
+                            response_format={"type": "json_object"},
+                        )
+
+                        self.assertEqual(
+                            served, (reasoning, "", [("get_weather", {"city": city})])
+                        )
+
+    def test_kept_tool_closer_after_answer_is_trimmed(self):
+        """A kept tool closer that stopped an answer must not leak into its content."""
+        self._use_delimited_response_template("beam")
+        function = {**_WEATHER_TOOL["function"], "strict": True}
+        answer = "<think>Hm</think><answer>Sunny.</call>"
+        for text, no_stop_trim, served in (
+            (answer, False, ("Hm", "Sunny.", [])),
+            (answer, True, ("Hm", "Sunny.</call>", [])),
+        ):
+            for stream in (False, True):
+                with self.subTest(text=text, no_stop_trim=no_stop_trim, stream=stream):
+                    self.assertEqual(
+                        self._served(
+                            self._stopped_on_token(text, 7),
+                            stream,
+                            tools=[{**_WEATHER_TOOL, "function": function}],
+                            no_stop_trim=no_stop_trim,
+                        ),
+                        served,
+                    )
+
+    def test_json_answer_keeps_the_answer_framing(self):
+        """JSON output must not skip the answer opener or admit an answer closer after
+        the JSON, while a forced tool array stays bare JSON."""
+        self._use_delimited_response_template("beam")
+        answer, call = '<answer>{"a": 1}', '<call:get_weather>{"city": "Paris"}</call>'
+        for prompt, from_start, texts in (
+            (
+                "<assistant>",
+                True,
+                {
+                    answer: False,
+                    "<think>Plan</think>" + answer: True,
+                    "<think>Plan</think>" + answer + "</answer>": False,
+                    '<think>Plan</think><answer>{"a": "</answer>"}': True,
+                    call: False,
+                    "<answer>no": False,
+                    '{"a": 1}': False,
+                },
+            ),
+            (
+                "<assistant><think>So",
+                False,
+                {answer: True, call: True, '{"a": 1}': False},
+            ),
+        ):
+            adapted, _ = self._convert_rendered_as(
+                prompt, tools=[_WEATHER_TOOL], response_format={"type": "json_object"}
+            )
+            params = adapted.sampling_params
+
+            self.assertNotIn("json_schema", params)
+            self.assertIs(
+                get_request_reasoning_in_grammar(params.get("custom_params")),
+                from_start,
+            )
+            grammar = Grammar.from_structural_tag(params["structural_tag"])
+            for text, expected in texts.items():
+                with self.subTest(prompt=prompt, text=text):
+                    self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+
+        # A forced tool-call array is not an answer; a native call must not
+        # replace it. No grammar writes this JSON dialect, so forced calls take
+        # the array.
+        fields = _DELIMITED_RESPONSE_TEMPLATE["fields"]
+        self._use_delimited_response_template(
+            "beam",
+            {
+                **_DELIMITED_RESPONSE_TEMPLATE,
+                "fields": {
+                    **fields,
+                    "tool_calls": {
+                        **fields["tool_calls"],
+                        "content_args": {"unquoted_keys": True},
+                    },
+                },
+            },
+        )
+        adapted, request = self._convert_rendered_as(
+            "<assistant>", tools=[_WEATHER_TOOL], tool_choice="required"
+        )
+
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        self.assertIn("json_schema", adapted.sampling_params)
+        self.assertEqual(
+            request._response_parser_grammar_start, GRAMMAR_AFTER_REASONING
+        )
+
+    def test_json_answer_admits_only_calls_the_tool_parser_reads(self):
+        """Before a JSON answer, the grammar must not admit calls the tool parser cannot
+        read, and calls must keep the strictness and count the tools ask for."""
+        self._use_delimited_response_template("beam")
+        strict = copy.deepcopy(_WEATHER_TOOL)
+        strict["function"]["strict"] = True
+        weather = {"tools": [_WEATHER_TOOL]}
+        single = {"tools": [_WEATHER_TOOL], "parallel_tool_calls": False}
+        call = '<call:get_weather>{"city": "Paris"}</call>'
+        answer = '<answer>{"a": 1}'
+        for parser, fields, text, admitted in (
+            ("beam", weather, call, True),
+            ("beam", weather, answer, True),
+            ("hermes", weather, call, False),
+            ("hermes", weather, answer, True),
+            ("beam", {"tools": [strict]}, call, True),
+            ("beam", {"tools": [strict]}, call.replace('"Paris"', "1"), False),
+            ("beam", single, call, True),
+            ("beam", single, call + call, False),
+        ):
+            self.chat.tool_call_parser = parser
+            adapted, _ = self._convert_rendered_as(
+                "<assistant>", response_format={"type": "json_object"}, **fields
+            )
+            grammar = Grammar.from_structural_tag(
+                adapted.sampling_params["structural_tag"]
+            )
+            with self.subTest(parser=parser, fields=fields, text=text):
+                self.assertIs(
+                    _is_grammar_accept_string(grammar, "<think>Hm</think>" + text),
+                    admitted,
+                )
+
+    def test_other_output_constraints_reject_constrained_automatic_calls(self):
+        """A client grammar must not silently drop the strictness or count of the tag it
+        replaces."""
+        self._use_delimited_response_template("beam")
+        strict = copy.deepcopy(_WEATHER_TOOL)
+        strict["function"]["strict"] = True
+        structural_tag = {
+            "type": "structural_tag",
+            "format": {"type": "regex", "pattern": ".*"},
+        }
+        for tool, fields in (
+            (strict, {"regex": ".*"}),
+            (_WEATHER_TOOL, {"parallel_tool_calls": False, "ebnf": 'root ::= "x"'}),
+            (strict, {"response_format": structural_tag}),
+        ):
+            with self.subTest(fields=fields, strict=tool["function"].get("strict")):
+                with self.assertRaisesRegex(ValueError, "another output constraint"):
+                    self._convert_rendered_as("<assistant>", tools=[tool], **fields)
+
+    def test_automatic_calls_need_a_grammar_from_the_message_start(self):
+        """Grammar-held automatic calls must not go unenforced when output may skip the
+        reasoning."""
+        template = copy.deepcopy(_DELIMITED_RESPONSE_TEMPLATE)
+        template["fields"]["thinking"] = {
+            "open_pattern": r"<think>\s*",
+            "close": "</think>",
+        }
+        self._use_delimited_response_template("beam", template)
+        strict = {**_WEATHER_TOOL, "function": {**_WEATHER_TOOL["function"]}}
+        strict["function"]["strict"] = True
+        for prompt, rejected in (
+            ("<assistant>", True),
+            ("<assistant><think>So", False),
+        ):
+            with self.subTest(prompt=prompt):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=[strict],
+                )
+                if rejected:
+                    with self.assertRaisesRegex(ValueError, "skip the reasoning"):
+                        self._convert_rendered_as(prompt, request)
+                    continue
+                adapted, _ = self._convert_rendered_as(prompt, request)
+                self.assertIn("structural_tag", adapted.sampling_params)
 
     def _chat_outcome(self, adapted, request, output):
         """(calls, reasoning, content, finish reasons) as a client reconstructs them."""
@@ -1167,7 +1597,9 @@ class ServingChatTestCase(CustomTestCase):
         ends on the tool closer that detokenization keeps."""
         payload = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
         for reasoning_parser in (None, "response_template"):
-            self._use_delimited_response_template(reasoning_parser)
+            self._use_delimited_response_template(
+                reasoning_parser, tool_call_parser="response_template"
+            )
             reasoning = "Check the forecast." if reasoning_parser else ""
             text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
             text += "</call>"
@@ -1199,7 +1631,9 @@ class ServingChatTestCase(CustomTestCase):
         intact; template tool syntax inside its strings is never a call."""
         payload = '{"example": "<call:get_weather>{}</call>"}'
         for reasoning_parser in (None, "response_template"):
-            self._use_delimited_response_template(reasoning_parser)
+            self._use_delimited_response_template(
+                reasoning_parser, tool_call_parser="response_template"
+            )
             reasoning = "Plan" if reasoning_parser else ""
             text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
             for stream in (False, True):
@@ -1243,17 +1677,11 @@ class ServingChatTestCase(CustomTestCase):
             "regex": {"regex": regex},
             "ebnf": {"ebnf": ebnf},
         }
-        self._use_delimited_response_template("response_template")
+        self._use_delimited_response_template("beam")
         for name, fields in constraints.items():
             with self.subTest(name):
                 _, request = self._convert_rendered_as(
-                    "<assistant>",
-                    ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Weather?"}],
-                        tools=[_WEATHER_TOOL],
-                        **fields,
-                    ),
+                    "<assistant>", tools=[_WEATHER_TOOL], **fields
                 )
                 output = self._stopped_on_token("<think>Plan</think>" + native, 7)
                 choice = self.chat._build_chat_response(request, [output], 0).choices[0]
@@ -1791,6 +2219,157 @@ class ServingChatTestCase(CustomTestCase):
             ],
             [8, 9],
         )
+
+    def test_template_tool_call_grammar_covers_skipped_reasoning(self):
+        """Output from the message start must open with the reasoning, and calls
+        after it take the tool-call grammar."""
+        self.tm._config_overrides.update(
+            {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        call = (
+            " to=get_weather<|channel|>analysis <|constrain|>xml<|message|>"
+            '<rfl:parameter name="city">\nParis\n</rfl:parameter>'
+        )
+        full_call = "<|start|>assistant" + call
+        thought = "<|channel|>analysis<|message|>Plan<|end|>"
+        for prompt, from_start, texts in (
+            (
+                "<|start|>assistant",
+                True,
+                {call: False, thought + full_call: True, " " + "Paris": False},
+            ),
+            (
+                "<|start|>assistant<|channel|>analysis<|message|>So",
+                False,
+                # The reasoning closer already wrote <|start|>assistant.
+                {call: True, full_call: False},
+            ),
+        ):
+            with self.subTest(prompt=prompt):
+                adapted, _ = self._convert_rendered_as(
+                    prompt,
+                    ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[_WEATHER_TOOL],
+                        tool_choice="required",
+                    ),
+                )
+                params = adapted.sampling_params
+
+                self.assertIs(adapted.require_reasoning, True)
+                self.assertIs(
+                    get_request_reasoning_in_grammar(params.get("custom_params")),
+                    from_start,
+                )
+                grammar = Grammar.from_structural_tag(params["structural_tag"])
+                for text, expected in texts.items():
+                    self.assertIs(
+                        _is_grammar_accept_string(grammar, text), expected, text
+                    )
+
+    def test_template_turn_grammar_frames_unconstrained_turns(self):
+        """Beam holds every turn nothing else constrains to the template's framing,
+        opening with the reasoning; other template parsers leave it unconstrained."""
+        self.tm._config_overrides.update(
+            {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        thought = "<|channel|>analysis<|message|>Plan<|end|>"
+        answer = "<|start|>assistant<|channel|>final<|message|>Sunny<|return|>"
+        call = (
+            "<|start|>assistant to=get_weather<|channel|>analysis <|constrain|>xml"
+            '<|message|><rfl:parameter name="city">\nParis\n</rfl:parameter><|call|>'
+        )
+        for fields, calls in (
+            ({}, False),
+            ({"tools": [_WEATHER_TOOL], "tool_choice": "none"}, False),
+            ({"tools": [_WEATHER_TOOL]}, True),
+        ):
+            with self.subTest(fields=fields):
+                adapted, _ = self._convert_rendered_as("<|start|>assistant", **fields)
+                grammar = Grammar.from_structural_tag(
+                    adapted.sampling_params["structural_tag"]
+                )
+                self.assertTrue(_is_grammar_accept_string(grammar, thought + answer))
+                self.assertIs(_is_grammar_accept_string(grammar, thought + call), calls)
+                self.assertFalse(_is_grammar_accept_string(grammar, answer))
+                self.assertFalse(_is_grammar_accept_string(grammar, "Sunny"))
+
+        adapted, _ = self._convert_rendered_as(
+            "<|start|>assistant", tools=[_WEATHER_TOOL], regex=".*"
+        )
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        with envs.SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR.override(False):
+            adapted, _ = self._convert_rendered_as("<|start|>assistant")
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        self.tm._config_overrides["grammar_backend"] = "llguidance"
+        adapted, _ = self._convert_rendered_as("<|start|>assistant")
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+        del self.tm._config_overrides["grammar_backend"]
+
+        self._use_delimited_response_template(
+            "response_template", tool_call_parser="response_template"
+        )
+        adapted, _ = self._convert_rendered_as("<assistant>", tools=[_WEATHER_TOOL])
+        self.assertNotIn("structural_tag", adapted.sampling_params)
+
+    def test_template_turn_grammar_continues_the_final_answer(self):
+        """A continued final message resumes inside the answer, whose grammar
+        covers only the rest of it."""
+        self.tm._config_overrides.update(
+            {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        tokenizer = self.tm.tokenizer
+        tokenizer.encode.side_effect = lambda text, **_: [text]
+        for prompt, resumed in (
+            ("<|start|>assistant", "<|channel|>final<|message|>The capital is "),
+            ("<|start|>assistant<|channel|>analysis<|message|>", "The capital is "),
+        ):
+            with self.subTest(prompt=prompt):
+                tokenizer.decode.return_value = prompt
+                self.assertEqual(
+                    self.chat._append_assistant_prefix_to_prompt_ids(
+                        [0], "The capital is "
+                    ),
+                    [0, resumed],
+                )
+
+        prompt = "<|start|>assistant<|channel|>final<|message|>The capital is "
+        continued = {
+            "messages": [
+                {"role": "user", "content": "Capital?"},
+                {"role": "assistant", "content": "The capital is "},
+            ],
+            "continue_final_message": True,
+        }
+        adapted, _ = self._convert_rendered_as(prompt, **continued)
+        grammar = Grammar.from_structural_tag(adapted.sampling_params["structural_tag"])
+        self.assertFalse(adapted.require_reasoning)
+        self.assertTrue(_is_grammar_accept_string(grammar, "Paris.<|return|>"))
+        self.assertFalse(
+            _is_grammar_accept_string(
+                grammar, "Paris.<|end|><|start|>assistant<|channel|>final<|message|>"
+            )
+        )
+        # With tools, the rest of the answer is still served as generated.
+        for separate in (True, False):
+            for stream, incremental in ((False, False), (True, True)):
+                with self.subTest(
+                    separate=separate, stream=stream, incremental=incremental
+                ):
+                    served = self._served(
+                        self._stopped_on_token("Paris.", 2),
+                        stream,
+                        incremental=incremental,
+                        prompt=prompt,
+                        tools=[_WEATHER_TOOL],
+                        separate_reasoning=separate,
+                        **continued,
+                    )
+                    self.assertEqual(served, ("", "Paris.", []))
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None
@@ -3412,6 +3991,66 @@ class ServingChatTestCase(CustomTestCase):
         # The HF chat-template path keeps the wrap-into-content behaviour.
         self.chat.chat_encoding_spec = None
         self.assertFalse(self.chat.supports_native_reasoning_history())
+
+    def test_response_template_messages_thinking_replay(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+        from sglang.srt.parser.beam import BeamReasoningDetector
+
+        request = AnthropicMessagesRequest(
+            model="x",
+            max_tokens=32,
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Consider the question."},
+                        {"type": "text", "text": "Hello."},
+                    ],
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+        reads, content_only = (
+            "{{ messages[1].reasoning_content }}",
+            "{{ messages[1].content }}",
+        )
+        cases = [
+            (reads, None, None, True),
+            ("{{ messages[1]['reasoning_content'] }}", None, None, True),
+            ("{{ messages[1].get('reasoning_content') }}", None, None, True),
+            (content_only, None, None, False),
+            ("{# reasoning_content #}" + content_only, None, None, False),
+            (content_only, reads, None, True),
+            (reads, content_only, None, False),
+            (reads, None, "chatml", False),
+        ]
+        for template, default, conversation, native in cases:
+            with self.subTest(
+                template=template, default=default, conversation=conversation
+            ):
+                self.tm.tokenizer.chat_template = template
+                self.template_manager.chat_template_name = conversation
+                defaults = None if default is None else {"chat_template": default}
+                with get_context().override_server_args(
+                    default_chat_template_kwargs=defaults
+                ):
+                    chat = OpenAIServingChat(self.tm, self.template_manager)
+                chat.chat_encoding_spec = None
+                chat._reasoning_detector = BeamReasoningDetector()
+                converted = AnthropicServing(chat)._convert_to_chat_completion_request(
+                    request
+                )
+                assistant = converted.messages[1]
+                if native:
+                    self.assertEqual(
+                        assistant.reasoning_content, "Consider the question."
+                    )
+                    self.assertEqual(assistant.content, "Hello.")
+                else:
+                    self.assertIsNone(assistant.reasoning_content)
+                    self.assertIn("Consider the question.", assistant.content[0].text)
 
     # ------------- dsv4 task -------------
     def test_dsv4_task_field_schema(self):

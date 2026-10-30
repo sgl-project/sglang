@@ -62,6 +62,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE,
     SpeculativeAlgorithm.EAGLE3,
+    SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
@@ -1269,17 +1270,16 @@ class SchedulerMetricsReporter:
             mem_pool = lora_manager.memory_pool
             slots_total = mem_pool.max_loras_per_batch
 
-            # Calculate active adapters from running batch
-            # This gives a true measure of current load for autoscaling purposes
+            # Count active adapters, not idle adapters cached in the pool.
             active_lora_ids = set()
 
-            # For PP mode, check all running micro batches
+            # Include prefills not yet merged into their running microbatches.
             if get_parallel().pp_size > 1:
-                for batch in self.scheduler.running_mbs:
-                    if batch and hasattr(batch, "reqs"):
-                        for req in batch.reqs:
-                            if hasattr(req, "lora_id") and req.lora_id is not None:
-                                active_lora_ids.add(req.lora_id)
+                active_lora_ids.update(
+                    req.lora_id
+                    for req in self.scheduler._get_all_pp_reqs()
+                    if req.lora_id is not None
+                )
             # For normal mode, check running_batch
             elif self.scheduler.running_batch:
                 if hasattr(self.scheduler.running_batch, "reqs"):
