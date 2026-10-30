@@ -413,8 +413,8 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
     if (j == 0) p.o[((bos + t) * H + hv) * V + col] = f32_to_bf16(o_sum);
     if constexpr (kSnap) {
       if (widx >= 0) {
-        float* sp = p.snap + widx * p.stride_snap_row + t * p.stride_snap_step +
-                    (static_cast<int64_t>(hv) * V + col) * K + r0;
+        float* sp =
+            p.snap + widx * p.stride_snap_row + t * p.stride_snap_step + (static_cast<int64_t>(hv) * V + col) * K + r0;
 #pragma unroll
         for (int i = 0; i < KR; i += 4)
           store_as<float4>(sp + i, make_float4(h[i], h[i + 1], h[i + 2], h[i + 3]));
