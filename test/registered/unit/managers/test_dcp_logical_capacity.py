@@ -77,6 +77,7 @@ def make_unified_mamba_allocator(*, n_full_tokens, n_mamba_slots):
 def make_worker(dcp_size):
     kv = NS(size=PHYSICAL, mem_usage=8.89)
     runner = ModelRunner.__new__(ModelRunner)
+    runner.enable_hisparse = False
     runner.server_args = NS(dcp_size=dcp_size)
     runner.kv_cache_configurator = make_configurator()
     runner.is_hybrid_swa = False

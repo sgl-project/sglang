@@ -1518,9 +1518,14 @@ class ModelRunner:
     @property
     def logical_max_total_num_tokens(self):
         """Request-token capacity in logical tokens, not per-rank DCP rows."""
+        capacity = (
+            self.max_token_pool_size
+            if self.enable_hisparse
+            else self.max_total_num_tokens
+        )
         return self.req_to_token_pool.schedulable_token_capacity(
             self.kv_cache_configurator.logical_token_capacity(
-                max_total_num_tokens=self.max_total_num_tokens
+                max_total_num_tokens=capacity
             )
         )
 
