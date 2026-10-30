@@ -224,7 +224,7 @@ struct Kernel {
     auto S = SymbolicSize{"seq"};
     auto H = SymbolicSize{"heads"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     auto Bx = SymbolicSize{"input_batch_stride"};
     auto Tx = SymbolicSize{"input_token_stride"};
     TensorMatcher({B, S, H, kHeadDim})
@@ -289,7 +289,7 @@ struct Kernel {
     auto Bvo = SymbolicSize{"v_out_batch_stride"}, Tvo = SymbolicSize{"v_out_token_stride"};
     auto Bv = SymbolicSize{"v_src_batch_stride"}, Tv = SymbolicSize{"v_src_token_stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     // TensorMatcher is not copyable, so verify inside the lambda; the member
     // template call on a dependent expression needs `template`.
     const auto verify_rows = [&](const tvm::ffi::TensorView& t, auto& rows, auto& batch_stride, auto& token_stride) {

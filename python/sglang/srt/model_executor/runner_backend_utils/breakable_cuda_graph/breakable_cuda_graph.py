@@ -38,7 +38,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_musa, is_xpu
 
 _is_xpu = is_xpu()
 
@@ -88,11 +88,11 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.Stream) -> bool:
-    # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
-    # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
-    # CUDA runtime directly via cuda-python: torch.cuda.is_current_stream_capturing()
-    # has proven unreliable there, so we preserve the original behavior.
-    if is_hip() or _is_xpu:
+    # On ROCm/HIP, MUSA, and XPU, cuda-python is unavailable or unnecessary, so
+    # use the portable device API. On NVIDIA, keep querying the CUDA runtime
+    # directly via cuda-python because torch.cuda.is_current_stream_capturing()
+    # has proven unreliable there.
+    if is_hip() or is_musa() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
@@ -157,18 +157,23 @@ def _uninstall_wait_stream_hook():
 
 
 def _weak_ref_if_tensor(x):
-    """Return a weak-ref view for nonempty accelerator tensors; recurse into
-    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
-    Weak-ref'ing captured args lets the shared mempool reclaim per-layer
-    intermediates between segments — storage stays alive for each segment
-    CUDAGraph's lifetime via its pool use_count.
+    """Keep captured argument metadata without owning accelerator storage.
 
-    weak_ref_tensors is imported lazily because it hard-raises on
-    platforms without a CUDA/HIP/NPU backend; we only reach this code during
-    an active Breakable capture, which runs only on those backends."""
+    Empty accelerator tensors need only shape/stride metadata. Nonempty ones
+    use weak references so the shared graph pool can reuse their storage
+    between segments. CPU tensors and non-tensors keep their identity;
+    tuples and lists are processed recursively.
+    """
     if torch.is_tensor(x):
-        if x.numel() == 0 or x.device.type == "cpu":
+        if x.device.type == "cpu":
             return x
+        if x.numel() == 0:
+            # NoPE MLA's empty Q/K RoPE views otherwise pin the full projection
+            # allocations for every layer and captured bucket.
+            return torch.empty_strided(
+                x.shape, x.stride(), dtype=x.dtype, device=x.device
+            )
+        # Import lazily: this module requires a CUDA/HIP/NPU backend.
         from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
             weak_ref_tensors,
         )
