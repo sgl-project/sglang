@@ -34,6 +34,22 @@ def _is_scattered_a2a_backend() -> bool:
 _READBACK_CHUNK_TOKENS = 4096
 
 
+def _host_dtype(hf_text_config) -> torch.dtype:
+    """int16 when every routed expert id (and the -1 padding mark) fits."""
+    # Configs name the routed expert count differently; an unknown count keeps int32.
+    num_experts = next(
+        (
+            getattr(hf_text_config, name)
+            for name in ("n_routed_experts", "num_experts", "num_local_experts")
+            if isinstance(getattr(hf_text_config, name, None), int)
+        ),
+        None,
+    )
+    if num_experts is not None and num_experts <= torch.iinfo(torch.int16).max:
+        return torch.int16
+    return torch.int32
+
+
 def _routed_layer_ids(hf_text_config) -> list[int]:
     if isinstance(hf_text_config, NemotronHConfig):
         return hf_text_config.moe_layer_ids
@@ -126,6 +142,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
             allocate_host_cache=_is_output_rank(),
+            host_dtype=_host_dtype(model_config.hf_text_config),
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -191,13 +208,15 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         )
         out = torch.empty(
             (len(cache_pool_idx), self.num_model_layers, self.topk_size),
-            dtype=self.host_cache.buffer.dtype,
+            dtype=torch.int32,
         )
         out.index_fill_(1, self._unrouted_layer_index, 0)
         for start in range(0, len(cache_pool_idx), _READBACK_CHUNK_TOKENS):
             chunk = cache_pool_idx[start : start + _READBACK_CHUNK_TOKENS]
             out[start : start + len(chunk)].index_copy_(
-                1, self._routed_layer_index, self.host_cache.buffer[chunk]
+                1,
+                self._routed_layer_index,
+                self.host_cache.buffer[chunk].to(torch.int32),
             )
         return out
 

@@ -1,5 +1,5 @@
 """RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
-and routed-layer host storage."""
+and host storage (routed layers only, int16 ids)."""
 
 import unittest
 from types import SimpleNamespace
@@ -191,7 +191,7 @@ class TestRoutedLayerHostStorage(CustomTestCase):
                 device="cpu",
             )
 
-    def _run_forward(self, cap, routed_layers):
+    def _run_forward(self, cap, routed_layers, topk=None, no_copy_to_cpu=False):
         with (
             mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=False),
             mock.patch.object(
@@ -199,16 +199,21 @@ class TestRoutedLayerHostStorage(CustomTestCase):
             ),
         ):
             for layer_id in routed_layers:
-                topk = torch.randint(
-                    0, 64, (len(self.OUT_CACHE_LOC), self.K), dtype=torch.int32
+                layer_topk = (
+                    torch.randint(
+                        0, 64, (len(self.OUT_CACHE_LOC), self.K), dtype=torch.int32
+                    )
+                    if topk is None
+                    else topk
                 )
-                cap.capture(layer_id=layer_id, topk_indices=topk)
+                cap.capture(layer_id=layer_id, topk_indices=layer_topk)
             return cap.on_forward_end(
                 SimpleNamespace(
                     out_cache_loc=self.OUT_CACHE_LOC, out_cache_loc_virtual=None
                 ),
                 can_run_graph=False,
                 cuda_graph_batch=None,
+                no_copy_to_cpu=no_copy_to_cpu,
             )
 
     def _read(self, cap):
@@ -260,6 +265,42 @@ class TestRoutedLayerHostStorage(CustomTestCase):
         self.assertIsNone(self._run_forward(cap, config.moe_layer_ids))
         with self.assertRaises(RuntimeError):
             self._read(cap)
+
+    def test_expert_ids_round_trip_through_int16(self):
+        """The highest expert id and the -1 padding mark survive int16 storage."""
+        num_layers = 3
+        config = SimpleNamespace(
+            num_hidden_layers=num_layers, num_experts_per_tok=self.K, num_experts=896
+        )
+        topk = torch.tensor(
+            [[0, 1], [895, -1], [-1, -1], [17, 894], [2, 3]], dtype=torch.int32
+        )
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                cap = self._capturer(config)
+                self.assertEqual(cap.host_cache.buffer.dtype, torch.int16)
+                output = self._run_forward(
+                    cap, range(num_layers), topk=topk, no_copy_to_cpu=overlap
+                )
+                if overlap:
+                    # The D2H copy moves the narrowed ids.
+                    self.assertEqual(output.topk.dtype, torch.int16)
+                    output.map_device_tensors(lambda t: t.cpu())
+                    output.finalize()
+                out = self._read(cap)
+                self.assertEqual(out.dtype, torch.int32)
+                self.assertTrue(
+                    torch.equal(out, topk[1:4, None].expand(-1, num_layers, -1))
+                )
+
+    def test_ids_that_may_not_fit_int16_stay_int32(self):
+        for experts in ({"n_routed_experts": 32768}, {}):
+            with self.subTest(**experts):
+                config = SimpleNamespace(
+                    num_hidden_layers=3, num_experts_per_tok=self.K, **experts
+                )
+                cap = self._capturer(config)
+                self.assertEqual(cap.host_cache.buffer.dtype, torch.int32)
 
 
 if __name__ == "__main__":
