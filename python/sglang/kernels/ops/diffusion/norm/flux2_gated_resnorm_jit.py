@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,7 +22,7 @@ def _blackwell_or_newer(device: torch.device) -> bool:
     return (
         torch.version.cuda is not None
         and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device)[0] >= 10
+        and cuda_capability(device)[0] >= 10
     )
 
 

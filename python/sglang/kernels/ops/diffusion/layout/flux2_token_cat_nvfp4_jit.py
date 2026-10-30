@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -63,7 +64,7 @@ def try_flux2_token_cat_nvfp4(
         or _env_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH")
         or _env_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
         or _env_enabled("FLASHINFER_NVFP4_4OVER6")
-        or torch.cuda.get_device_capability(attention.device) != (10, 3)
+        or cuda_capability(attention.device) != (10, 3)
     ):
         return None
     if not (

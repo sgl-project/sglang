@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, get_jit_cuda_arch, load_jit
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -138,7 +139,7 @@ def _is_sm100_or_newer(x: torch.Tensor) -> bool:
     if not x.is_cuda:
         return False
     try:
-        return torch.cuda.get_device_capability(x.device)[0] >= 10
+        return cuda_capability(x.device)[0] >= 10
     except RuntimeError:
         return False
 
@@ -147,7 +148,7 @@ def _is_sm90(x: torch.Tensor) -> bool:
     if not x.is_cuda or torch.version.hip is not None:
         return False
     try:
-        return torch.cuda.get_device_capability(x.device) == (9, 0)
+        return cuda_capability(x.device) == (9, 0)
     except RuntimeError:
         return False
 

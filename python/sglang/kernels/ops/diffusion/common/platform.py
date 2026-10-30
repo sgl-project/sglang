@@ -23,11 +23,34 @@ kernel module imports upward.
 
 from __future__ import annotations
 
+import functools
 from typing import Callable, TypeVar
 
 import torch
 
 F = TypeVar("F", bound=Callable)
+
+
+@functools.lru_cache(maxsize=None)
+def _capability(index: int) -> tuple[int, int]:
+    return torch.cuda.get_device_capability(index)
+
+
+def cuda_capability(device: torch.device | int | None = None) -> tuple[int, int]:
+    """``torch.cuda.get_device_capability(device)``, queried once per device.
+
+    Kernel guards ask on every call; the query costs ~2 us and its answer never
+    changes. Compiled code keeps the torch call, which Dynamo folds to a constant.
+    """
+    if torch.compiler.is_compiling():
+        return torch.cuda.get_device_capability(device)
+    if isinstance(device, torch.device) and device.type == "cuda":
+        device = device.index
+    if device is None:
+        device = torch.cuda.current_device()
+    if not isinstance(device, int):
+        return torch.cuda.get_device_capability(device)  # raises as torch does
+    return _capability(device)
 
 
 def is_cuda_sm_at_least(
@@ -41,7 +64,7 @@ def is_cuda_sm_at_least(
     return (
         torch.version.cuda is not None
         and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device) >= min_sm
+        and cuda_capability(device) >= min_sm
     )
 
 

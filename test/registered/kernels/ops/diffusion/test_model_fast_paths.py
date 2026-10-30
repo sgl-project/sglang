@@ -2710,5 +2710,25 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         assert gone() is None
 
 
+def test_kernel_guards_query_the_device_capability_once(monkeypatch):
+    from sglang.kernels.kda_kernels import (
+        ltx2_qknorm_split_rope_jit,
+        norm_scale_shift_jit,
+    )
+    from sglang.kernels.ops.diffusion.common.platform import cuda_capability
+
+    x = torch.empty(1, device="cuda")
+    expected = torch.cuda.get_device_capability(x.device)
+    assert cuda_capability(x.device) == expected
+
+    def query_again(*args, **kwargs):
+        raise AssertionError("device capability queried again")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", query_again)
+    assert cuda_capability(x.device) == cuda_capability() == expected
+    assert norm_scale_shift_jit._blackwell_or_newer(x.device) == (expected[0] >= 10)
+    assert ltx2_qknorm_split_rope_jit._is_sm100_or_newer(x) == (expected[0] >= 10)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

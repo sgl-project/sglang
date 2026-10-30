@@ -15,6 +15,7 @@ import torch
 from flashinfer import SfLayout, nvfp4_quantize
 from flashinfer.prims_ts import gemm as prims_ts_gemm
 
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 from sglang.kernels.ops.diffusion.gemm.flux3_prims_ts_config import (
     delta_kwargs,
     flux3_prims_ts_config,
@@ -189,7 +190,7 @@ def _prepared_qkv(
     head_dim = q_norm_weight.numel()
     if separate_qkv_output:
         if config is None:
-            major, minor = torch.cuda.get_device_capability(weight_packed.device)
+            major, minor = cuda_capability(weight_packed.device)
             config = prims_ts_gemm.PrimsTsGemmConfig(
                 arch=major * 10 + minor,
                 operand_format="nvfp4_e2m1",

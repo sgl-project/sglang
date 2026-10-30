@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,22 +22,18 @@ def _aligned(t: torch.Tensor) -> bool:
 
 
 def _blackwell_or_newer(device: torch.device) -> bool:
-    return (
-        torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 10
-    )
+    return torch.cuda.is_available() and cuda_capability(device)[0] >= 10
 
 
 def _sm103(device: torch.device) -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(device) == (
+    return torch.cuda.is_available() and cuda_capability(device) == (
         10,
         3,
     )
 
 
 def _blackwell_sm10x(device: torch.device) -> bool:
-    return (
-        torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] == 10
-    )
+    return torch.cuda.is_available() and cuda_capability(device)[0] == 10
 
 
 def _nss_activation(t, like=None) -> bool:

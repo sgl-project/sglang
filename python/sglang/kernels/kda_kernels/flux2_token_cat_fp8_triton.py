@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -93,7 +94,7 @@ def try_flux2_token_cat_fp8(
         return None
     if (
         torch.cuda.is_current_stream_capturing()
-        or torch.cuda.get_device_capability(attention.device)[0] < 10
+        or cuda_capability(attention.device)[0] < 10
     ):
         return None
     if not (

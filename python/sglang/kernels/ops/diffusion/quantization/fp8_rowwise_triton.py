@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
+
 
 def can_use_fp8_rowwise(x: torch.Tensor) -> bool:
     return (
@@ -14,7 +16,7 @@ def can_use_fp8_rowwise(x: torch.Tensor) -> bool:
         and x.ndim == 2
         and x.is_contiguous()
         and 0 < x.shape[1] <= 16384
-        and torch.cuda.get_device_capability(x.device) >= (8, 9)
+        and cuda_capability(x.device) >= (8, 9)
     )
 
 

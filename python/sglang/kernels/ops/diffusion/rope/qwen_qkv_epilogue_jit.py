@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.diffusion.common.platform import cuda_capability
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -87,7 +88,7 @@ def try_fused_qwen_qkv_epilogue(
         and _qkv_tensor(txt_v, txt_q)
         and img_q.shape[2] == txt_q.shape[2]
         and torch.version.cuda is not None
-        and torch.cuda.get_device_capability(img_q.device)[0] >= 9
+        and cuda_capability(img_q.device)[0] >= 9
     ):
         return None
 
