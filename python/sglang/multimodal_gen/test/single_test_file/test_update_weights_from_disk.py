@@ -26,29 +26,26 @@ encoder are still the same.
 To strictly verify the correctness of the refit API, we compare the checksum in
 SHA-256 on the disk and the server.
 
-NOTE and TODO: In the refit a specific module test, we update the transformer
-module and keep other modules the same. As described above, the vae's weights
-are perturbed. If we add vae as a target module in the future, ideally speaking,
-we should assert that the refitted vae's checksum is the same as directly
-computed from the perturbed vae weights in the disk. However, since there is
-complex weight-name remapping and QKV merge during model loading, it is not easy
-to compare the server-disk checksum for vae and text encoder directly. Therefore,
-if the target module is vae, we only verify that the refitted vae's checksum is
-different from the base model's vae's checksum.
+For the VAE, compare every checkpoint tensor against the live module through
+the existing per-tensor checksum checker, including persistent buffers such as
+FLUX.2 BatchNorm statistics. The supported VAE fixtures use state-dict names
+directly; floating checkpoint tensors are cast to the explicitly configured
+bf16 VAE precision before hashing, while integer buffers keep their dtype.
+Runtime-generated buffers absent from the checkpoint are not expected entries.
 
-It should be good issue to solve for the community to adds comparison the server-disk
-checksum for vae and text encoder in this test.
+Text-encoder disk/server parity remains a follow-up: its checkpoint names and
+separate Q/K/V tensors must be reconciled with the fused runtime parameters.
 
 =============================================================================
 
 Test organization:
 
-5 test cases in 2 classes;
+6 test cases in 2 classes;
 two model pairs are tested locally, one in CI.
 
 =============================================================================
 
-Class 1: TestUpdateWeightsFromDisk                  (4 tests) — API contract, checksum & rollback
+Class 1: TestUpdateWeightsFromDisk                  (5 tests) — API contract, checksum & rollback
 Class 2: TestUpdateWeightsFromDiskWithOffload       (1 test) — Offload-aware update + checksum
 
 -----------------------------------------------------------------------------
@@ -67,15 +64,16 @@ base model first so behavior is order-independent and updates are real
 
     base model -> perturbed model with flush_cache=True.
     Verifies after-update transformer checksum == perturbed model's
-    transformer disk checksum
+    transformer disk checksum, plus VAE per-tensor disk/server parity.
 
 
   • test_update_weights_specific_modules
 
-    base -> perturbed with flush_cache=False. Updates only transformer as
-    target_modules. Verifies that:
+    base -> perturbed with flush_cache=False. Updates either transformer or VAE
+    as target_modules. Verifies that:
     (1) targeted module's in-memory checksum changed;
-    (2) non-targeted modules' in-memory checksums are unchanged.
+    (2) non-targeted modules' in-memory checksums are unchanged;
+    (3) VAE tensors match the selected checkpoint, including buffers.
 
   • test_update_weights_rejects_invalid_requests
 
@@ -114,7 +112,8 @@ and update prefetched GPU tensors without shape mismatch.
 
     Server with --dit-layerwise-offload (base). Load perturbed checkpoint;
     must succeed (200, success=True), no "Shape mismatch". server's transformer checksum
-    matches perturbed model's transformer disk checksum.
+    matches perturbed model's transformer disk checksum, and VAE tensors match
+    the checkpoint. This fixture offloads the DiT, not the VAE.
 """
 
 from __future__ import annotations
@@ -129,6 +128,7 @@ from collections.abc import Callable
 
 import pytest
 import requests
+import torch
 from safetensors.torch import load_file, save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -137,6 +137,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     compute_weights_checksum,
     safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
+    build_named_tensor_sha256,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -158,6 +161,7 @@ logger = init_logger(__name__)
 _TRANSFORMER_MODULE = "transformer"
 _VAE_MODULE = "vae"
 _TEXT_ENCODER_MODULE_PREFIX = "text_encoder"
+_VAE_PRECISION = "bf16"
 
 
 # Modules whose weights differ between the base model and the perturbed
@@ -205,16 +209,7 @@ _ACTIVE_MODEL_PAIRS = _resolve_active_model_pairs()
 _PAIR_IDS = [p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS]
 
 
-@functools.lru_cache(maxsize=None)
-def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
-    """Compute SHA-256 checksum from safetensors files on disk.
-
-    Uses the same compute_weights_checksum function as the server,
-    so the checksums are directly comparable.
-
-    Results are cached (keyed on model_path and module_name) because the
-    same disk checksum is requested multiple times across tests.
-    """
+def _iter_weights_from_disk(model_path: str, module_name: str):
     local_path = maybe_download_model(model_path)
     weights_dir = os.path.join(local_path, module_name)
     assert os.path.exists(weights_dir), (
@@ -224,7 +219,25 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     safetensors_files = _list_safetensors_files(weights_dir)
     assert safetensors_files, f"No safetensors files in {weights_dir}"
 
-    return compute_weights_checksum(safetensors_weights_iterator(safetensors_files))
+    return safetensors_weights_iterator(safetensors_files)
+
+
+@functools.lru_cache(maxsize=None)
+def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
+    """Compute and cache the aggregate checksum of a checkpoint module."""
+    return compute_weights_checksum(_iter_weights_from_disk(model_path, module_name))
+
+
+@functools.lru_cache(maxsize=None)
+def _compute_vae_checksums_from_disk(model_path: str) -> dict[str, str]:
+    """Hash VAE checkpoint state in the fixture's explicit bf16 precision."""
+    return build_named_tensor_sha256(
+        (
+            name,
+            tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor,
+        )
+        for name, tensor in _iter_weights_from_disk(model_path, _VAE_MODULE)
+    )
 
 
 def _clone_model_with_modified_module(
@@ -343,6 +356,24 @@ class _UpdateWeightsApiMixin:
             f"  expected({expected_model}): {expected_cs}\n"
             f"  server: {server_cs}"
         )
+        self._assert_vae_matches_model(base_url, expected_model)
+
+    def _assert_vae_matches_model(self, base_url: str, expected_model: str) -> None:
+        response = requests.post(
+            f"{base_url}/update_weights_from_tensor_checker",
+            json={
+                "target_module": _VAE_MODULE,
+                "expected_named_tensors_sha256": _compute_vae_checksums_from_disk(
+                    expected_model
+                ),
+            },
+            timeout=_CHECKSUM_TIMEOUT_SECONDS,
+        )
+        assert response.status_code == 200, (
+            f"VAE checkpoint parity failed: {response.status_code} {response.text}"
+        )
+        result = response.json()
+        assert result.get("success", False), result.get("message", result)
 
 
 class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
@@ -360,7 +391,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             model=default_model,
             port=port,
             wait_deadline=wait_deadline,
-            extra_args="--num-gpus 1",
+            extra_args=f"--num-gpus 1 --vae-precision {_VAE_PRECISION}",
         )
 
         # Ensure models are local before spawning threads that need the paths.
@@ -434,7 +465,10 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
 
         self._assert_server_matches_model(base_url, perturbed_model_dir)
 
-    def test_update_weights_specific_modules(self, diffusion_server_no_offload):
+    @pytest.mark.parametrize("target_module", _DIFFERING_MODULES)
+    def test_update_weights_specific_modules(
+        self, diffusion_server_no_offload, target_module
+    ):
         ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
         base_url = f"http://localhost:{ctx.port}"
 
@@ -444,7 +478,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             base_url, module_names=_DIFFERING_MODULES
         )
 
-        target_modules = [_TRANSFORMER_MODULE]
+        target_modules = [target_module]
         result, status_code = self._update_weights(
             base_url,
             perturbed_model_dir,
@@ -475,6 +509,10 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
                 f"  before: {before_checksums.get(name)}\n"
                 f"  after:  {cs}"
             )
+        self._assert_vae_matches_model(
+            base_url,
+            perturbed_model_dir if target_module == _VAE_MODULE else default_model,
+        )
 
     def test_update_weights_rejects_invalid_requests(self, diffusion_server_no_offload):
         ctx, _, perturbed_model_dir, _ = diffusion_server_no_offload
@@ -566,6 +604,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             f"Expected vae to be the explicit failure point, got: {message}"
         )
         rolled_back_checksums = self._get_weights_checksum(base_url)
+        self._assert_server_matches_model(base_url, perturbed_model_dir)
 
         # 1) transformer: server == perturbed != base
         transformer_base = base_checksums.get(_TRANSFORMER_MODULE)
@@ -618,7 +657,10 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
             model=default_model,
             port=port,
             wait_deadline=wait_deadline,
-            extra_args="--num-gpus 1 --dit-layerwise-offload true",
+            extra_args=(
+                "--num-gpus 1 --dit-layerwise-offload true "
+                f"--vae-precision {_VAE_PRECISION}"
+            ),
         )
 
         ctx = manager.start()
