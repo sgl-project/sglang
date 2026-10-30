@@ -7,6 +7,7 @@ import numpy as np
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -50,12 +51,20 @@ class TestAscendPageDcpSend(CustomTestCase):
         self.assertEqual(
             mgr._get_dcp_remote_decode_layout(), [False, False, True, True, True]
         )
-        mgr._transfer_data = Mock(return_value=0)
+        dst_ptrs = [10_000, 20_000, 30_000, 40_000, 50_000]
+        writes = Mock(return_value=0)
+        attach_mooncake_transport(
+            mgr,
+            engine_writes(writes),
+            kv=mgr.kv_args.kv_data_ptrs,
+            peer_kv=dst_ptrs,
+            sessions=("decode",),
+        )
         self.assertEqual(
             mgr.send_kvcache_dcp(
                 "decode",
                 np.array([5, 6, 7], dtype=np.int32),
-                [10_000, 20_000, 30_000, 40_000, 50_000],
+                dst_ptrs,
                 np.array([10, 11], dtype=np.int32),
                 dcp_token_item_lens=[10, 4, 2, 10, 4],
                 dst_dcp_size=2,
@@ -69,7 +78,7 @@ class TestAscendPageDcpSend(CustomTestCase):
             ),
             0,
         )
-        mgr._transfer_data.assert_called_once_with(
+        writes.assert_called_once_with(
             "decode",
             [
                 (1_120, 10_200, 20),
@@ -95,7 +104,13 @@ class TestAscendPageDcpSend(CustomTestCase):
             num_draft_entries=0,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
-        mgr._transfer_data = Mock(return_value=0)
+        attach_mooncake_transport(
+            mgr,
+            engine_writes(Mock(return_value=0)),
+            kv=mgr.kv_args.kv_data_ptrs,
+            peer_kv=[10_000, 20_000, 30_000],
+            sessions=("decode",),
+        )
 
         with self.assertRaisesRegex(RuntimeError, "destination geometry"):
             mgr.send_kvcache_dcp(
@@ -144,7 +159,14 @@ class TestAscendPageDcpSend(CustomTestCase):
             side_effect=AssertionError("dense MLA must select target/draft directly")
         )
         mgr.get_mla_kv_ptrs_with_pp = Mock(side_effect=AssertionError("legacy pairing"))
-        mgr._transfer_data = Mock(return_value=0)
+        writes = Mock(return_value=0)
+        attach_mooncake_transport(
+            mgr,
+            engine_writes(writes),
+            kv=src_ptrs,
+            peer_kv=dst_ptrs,
+            sessions=("decode",),
+        )
         kwargs = dict(
             mooncake_session_id="decode",
             prefill_kv_indices=np.array([5, 6, 7], dtype=np.int32),
@@ -177,7 +199,7 @@ class TestAscendPageDcpSend(CustomTestCase):
                         3 * width,
                     )
                 )
-        return mgr, kwargs, expected
+        return mgr, kwargs, expected, writes
 
     def test_hybrid_pairs_pages_by_layer_without_group_counts(self):
         for stage_ids in ([3, 7, 11, 15], [3, 7], [11, 15], [7, 11, 15], []):
@@ -186,7 +208,9 @@ class TestAscendPageDcpSend(CustomTestCase):
                     with self.subTest(
                         stage_ids=stage_ids, draft=with_draft, widths=with_widths
                     ):
-                        mgr, kwargs, expected = self._hybrid_case(stage_ids, with_draft)
+                        mgr, kwargs, expected, writes = self._hybrid_case(
+                            stage_ids, with_draft
+                        )
                         self.assertEqual(
                             mgr.prepare_dcp_token_item_lens(
                                 kwargs["dst_kv_item_lens"], kwargs["dst_dcp_size"]
@@ -196,13 +220,16 @@ class TestAscendPageDcpSend(CustomTestCase):
                         if not with_widths:
                             kwargs.pop("dst_kv_item_lens")
                         self.assertEqual(mgr.send_kvcache_dcp(**kwargs), 0)
-                        mgr._transfer_data.assert_called_once_with("decode", expected)
+                        if expected:
+                            writes.assert_called_once_with("decode", expected)
+                        else:
+                            writes.assert_not_called()
                         mgr.get_mla_kv_ptrs_with_pp.assert_not_called()
 
     def test_hybrid_rejects_incomplete_layer_metadata_before_transfer(self):
         for missing_metadata in (False, True):
             with self.subTest(missing_metadata=missing_metadata):
-                mgr, kwargs, _ = self._hybrid_case([11, 15], True)
+                mgr, kwargs, _, writes = self._hybrid_case([11, 15], True)
                 if missing_metadata:
                     kwargs["dst_layer_ids"] = []
                 else:
@@ -211,16 +238,16 @@ class TestAscendPageDcpSend(CustomTestCase):
                         kwargs[name].pop(6)
                 with self.assertRaises(RuntimeError):
                     mgr.send_kvcache_dcp(**kwargs)
-                mgr._transfer_data.assert_not_called()
+                writes.assert_not_called()
 
     def test_hybrid_rejects_invalid_draft_entry_count(self):
         for num_draft in (-1, 3):
             with self.subTest(num_draft=num_draft):
-                mgr, kwargs, _ = self._hybrid_case([7], False)
+                mgr, kwargs, _, writes = self._hybrid_case([7], False)
                 mgr.kv_args.num_draft_entries = num_draft
                 with self.assertRaisesRegex(RuntimeError, "metadata is inconsistent"):
                     mgr.send_kvcache_dcp(**kwargs)
-                mgr._transfer_data.assert_not_called()
+                writes.assert_not_called()
 
 
 if __name__ == "__main__":
