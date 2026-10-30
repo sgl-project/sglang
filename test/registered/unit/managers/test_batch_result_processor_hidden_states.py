@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -181,6 +182,8 @@ class _PrefillReq:
 
 
 class _DecodeReq:
+    request_finish = Req.request_finish
+
     def __init__(self):
         self.return_hidden_states = "last"
         self.hidden_states = []
