@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -1656,7 +1656,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=cons.tree_core.empty_match_result.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=ReqKvInfo(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         surfaced_swa_hit = req.swa_host_hit_length

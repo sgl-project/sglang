@@ -3593,6 +3593,33 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     return result
 
 
+def build_model_info_fields(model_config, server_args) -> Dict[str, Any]:
+    """The `/model_info` fields that describe the loaded model: its
+    modalities, `model_type`, `architectures` and, when the model has an
+    embedding spec, its resolved embedding plan.
+
+    Shared by the HTTP server and the Rust frontend's launch configuration.
+    """
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+
+    result = {
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
+        # "hf_config": model_config.hf_config.to_dict(),
+    }
+    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+    if embedding_model_spec is not None:
+        result["embedding"] = resolved_embedding_plan(
+            embedding_model_spec,
+            config=resolving_view(server_args),
+            model_config=model_config,
+        )
+    return result
+
+
 def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
     """Expose GetServerInfo only, without constructing a TokenizerManager.
 

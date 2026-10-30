@@ -1393,16 +1393,22 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if not mtp_excluded:
             return quant_config
 
+        apply_ptpc = should_apply_glm_nextn_moe_ptpc(
+            quant_config, config.num_hidden_layers
+        )
+        routed_experts_prefix = "model.decoder.mlp.experts."
         names = set(quant_config.exclude_layers)
         for name in mtp_excluded:
-            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+            mapped = self._map_mtp_ckpt_name(name, layer_prefix)
+            # Keep checkpoint excludes for the loader, but let the converted
+            # runtime experts use the PTPC scheme below.
+            if apply_ptpc and mapped.startswith(routed_experts_prefix):
+                continue
+            names.add(mapped)
 
-        # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
-        # do not match. So that module needs its own entry: bf16 as in the
-        # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
-        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
-        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+        # Match the runtime scheme to the weight-loader cast; otherwise keep
+        # the checkpoint's BF16 routed experts excluded.
+        if apply_ptpc:
             mtp_layer_quant_config = quant_config.quant_config.setdefault(
                 "layer_quant_config", {}
             )

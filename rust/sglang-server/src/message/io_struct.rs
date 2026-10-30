@@ -4,12 +4,13 @@
 //! and `rmp_serde`'s default struct-as-array encoding reproduces it.
 
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
 use super::types::{Tagged, control_messages, wire_struct};
 use crate::utils::error::Error;
+use crate::utils::serialize::parse_int_opt;
 
 wire_struct! {
     /// The scheduler's `TokenizedGenerateReqInput`. Keep in lockstep with the
@@ -114,6 +115,50 @@ control_messages! {
         hicache_storage_prefetch_policy: Option<String>,
         hicache_write_policy: Option<String>,
     }
+
+    /// `/start_profile` and `/stop_profile`'s control request, built only by
+    /// [`ProfileReq::start`] / [`ProfileReq::stop`]. The frontend fans it out
+    /// to every DP rank's scheduler, and each broadcasts it from its TP rank
+    /// 0, so every rank starts (or stops) its profiler.
+    ProfileReq {
+        /// Python's `ProfileReqType` value: 1 starts, 2 stops.
+        req_type: u8,
+        output_dir: Option<String>,
+        start_step: Option<i64>,
+        num_steps: Option<i64>,
+        activities: Option<Vec<String>>,
+        profile_by_stage: bool,
+        with_stack: Option<bool>,
+        record_shapes: Option<bool>,
+        profile_id: Option<String>,
+        merge_profiles: bool,
+        profile_prefix: Option<String>,
+        profile_stages: Option<Vec<String>>,
+        detailed_annotations: bool,
+    }
+}
+
+/// The client-settable fields of a profiling start: Python's `ProfileReq`
+/// body for `/start_profile`, every field optional and defaulted as Python
+/// defaults it. `start_step`/`num_steps` also accept a numeric string, as
+/// Python's request validation does.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProfileOptions {
+    pub(crate) output_dir: Option<String>,
+    #[serde(deserialize_with = "parse_int_opt")]
+    pub(crate) start_step: Option<i64>,
+    #[serde(deserialize_with = "parse_int_opt")]
+    pub(crate) num_steps: Option<i64>,
+    pub(crate) activities: Option<Vec<String>>,
+    pub(crate) profile_by_stage: bool,
+    pub(crate) with_stack: Option<bool>,
+    pub(crate) record_shapes: Option<bool>,
+    pub(crate) profile_id: Option<String>,
+    pub(crate) merge_profiles: bool,
+    pub(crate) profile_prefix: Option<String>,
+    pub(crate) profile_stages: Option<Vec<String>>,
+    pub(crate) detailed_annotations: bool,
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -236,6 +281,51 @@ impl CheckWeightsReqInput {
     }
 }
 
+impl ProfileReq {
+    /// Start profiling with `options` (Python's `ProfileReqType.START_PROFILE`).
+    pub fn start(rid: String, options: ProfileOptions) -> Self {
+        let ProfileOptions {
+            output_dir,
+            start_step,
+            num_steps,
+            activities,
+            profile_by_stage,
+            with_stack,
+            record_shapes,
+            profile_id,
+            merge_profiles,
+            profile_prefix,
+            profile_stages,
+            detailed_annotations,
+        } = options;
+        Self {
+            rid,
+            req_type: 1,
+            output_dir,
+            start_step,
+            num_steps,
+            activities,
+            profile_by_stage,
+            with_stack,
+            record_shapes,
+            profile_id,
+            merge_profiles,
+            profile_prefix,
+            profile_stages,
+            detailed_annotations,
+        }
+    }
+
+    /// Stop profiling: Python's `ProfileReq(req_type=STOP_PROFILE)`, every
+    /// other field at its default.
+    pub fn stop(rid: String) -> Self {
+        Self {
+            req_type: 2,
+            ..Self::start(rid, ProfileOptions::default())
+        }
+    }
+}
+
 impl AbortReq {
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
@@ -313,6 +403,61 @@ mod tests {
         assert_eq!(arr[4].as_bool(), Some(true));
         assert_eq!(arr[5][0].as_str(), Some("lm_head"));
         assert_eq!(arr[6].as_str(), Some("target"));
+    }
+
+    /// `ProfileReq` decodes positionally into Python's 15-field struct: a
+    /// shift would hand the scheduler e.g. `num_steps` as `start_step`.
+    #[test]
+    fn profile_req_msgpack_shape() {
+        let start = ProfileReq::start(
+            "7".into(),
+            ProfileOptions {
+                output_dir: Some("/traces".into()),
+                start_step: Some(3),
+                num_steps: Some(5),
+                activities: Some(vec!["CPU".into(), "GPU".into()]),
+                profile_by_stage: true,
+                with_stack: Some(false),
+                record_shapes: Some(true),
+                profile_id: Some("id".into()),
+                merge_profiles: true,
+                profile_prefix: Some("pre".into()),
+                profile_stages: Some(vec!["decode".into()]),
+                detailed_annotations: true,
+            },
+        );
+        let val = rmpv::decode::read_value(&mut &start.encode().unwrap()[..]).unwrap();
+        let expected = rmpv::Value::Array(vec![
+            "ProfileReq".into(),
+            "7".into(),
+            rmpv::Value::Nil,
+            1.into(),
+            "/traces".into(),
+            3.into(),
+            5.into(),
+            rmpv::Value::Array(vec!["CPU".into(), "GPU".into()]),
+            true.into(),
+            false.into(),
+            true.into(),
+            "id".into(),
+            true.into(),
+            "pre".into(),
+            rmpv::Value::Array(vec!["decode".into()]),
+            true.into(),
+        ]);
+        assert_eq!(val, expected);
+
+        let stop = ProfileReq::stop("8".into());
+        let val = rmpv::decode::read_value(&mut &stop.encode().unwrap()[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(arr.len(), 16);
+        assert_eq!(arr[3].as_u64(), Some(2), "req_type STOP_PROFILE");
+        for i in [4, 5, 6, 7, 9, 10, 11, 13, 14] {
+            assert!(arr[i].is_nil(), "idx {i} must be a nil default");
+        }
+        for i in [8, 12, 15] {
+            assert_eq!(arr[i].as_bool(), Some(false), "idx {i} must be false");
+        }
     }
 
     /// The header must be positionally aligned: `input_embeds` (idx 5) /

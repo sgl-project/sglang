@@ -1882,9 +1882,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     ([[7, 8, 9]], expected),
                 )
 
-    def test_rebootstrap_replay_keeps_one_sampling_mask_row_per_token(self):
-        """A PD rebootstrap that replays an already-emitted token keeps that token's
-        sampling-mask row instead of adding the prefill worker's fresh one."""
+    def test_rebootstrap_commit_keeps_emitted_output(self):
+        """A PD rebootstrap with output keeps its output ids and their sampling-mask
+        rows; the prefill worker's fresh token and row are dropped."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -1908,7 +1908,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
             queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
             queue.metadata_buffers = buffers
-            # Retracting popped token 6 from output_ids; its row is still queued.
             sampling_mask_rows = SamplingMaskRows()
             sampling_mask_rows.append(
                 np.array([5, 1], np.int32), np.array([-0.5, -2.25], np.float32)
@@ -1920,8 +1919,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 rid="r0",
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,
-                output_ids=[5],
-                pd_rebootstrap_forced_output_id=6,
+                output_ids=[5, 6],
                 return_logprob=False,
                 return_sampling_mask=True,
                 sampling_logprobs_mode="support",

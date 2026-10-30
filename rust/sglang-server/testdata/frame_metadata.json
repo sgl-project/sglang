@@ -20,10 +20,12 @@
             "end": 3
           }
         ],
+        "cached_tokens_details": null,
         "image_tokens": 8
       },
       "running": {
         "weight_version": "launch",
+        "cached_tokens_details": null,
         "audio_tokens": 2
       }
     }
@@ -43,10 +45,130 @@
             "start": 0,
             "end": 2
           }
-        ]
+        ],
+        "cached_tokens_details": null
       },
       "plain": {
-        "weight_version": "launch"
+        "weight_version": "launch",
+        "cached_tokens_details": null
+      }
+    }
+  },
+  "host_tier": {
+    "header": "dc001a96a46d697373a6646576696365a4686f7374a773746f72616765a7756e73706c6974a573686f72749682a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680196101010101010960101010101019600040605030596000000000000909090909090909090909090909090909090c40096930000009304000093020400930101039300000093040000",
+    "data": "010000000000000001000000000000000100000000000000010000000000000001000000000000000100000000000000",
+    "decode_latencies": {},
+    "meta_info": {
+      "miss": {
+        "weight_version": "launch",
+        "cached_tokens_details": null
+      },
+      "device": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 4,
+          "host": 0
+        }
+      },
+      "host": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 2,
+          "host": 4
+        }
+      },
+      "storage": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 1,
+          "host": 1,
+          "storage": 3
+        }
+      },
+      "unsplit": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 3,
+          "host": 0
+        }
+      },
+      "short": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 4,
+          "host": 0
+        }
+      }
+    },
+    "cached_tokens_total": {
+      "miss": {},
+      "device": {
+        "device": 4
+      },
+      "host": {
+        "device": 2,
+        "host": 4
+      },
+      "storage": {
+        "device": 1,
+        "host": 1,
+        "storage": 3
+      },
+      "unsplit": {
+        "device": 3
+      },
+      "short": {
+        "device": 4
+      }
+    }
+  },
+  "storage_tier": {
+    "header": "dc001b94a46d697373a6646576696365a773746f72616765a7756e73706c69749482a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e6774680182a474797065a66c656e677468a66c656e677468019410101010940101010194000408029400000000909090909090909090909090909090909090c4009493000000930400009302020493000000ab4869436163686546696c65",
+    "data": "0100000000000000010000000000000001000000000000000100000000000000",
+    "decode_latencies": {},
+    "meta_info": {
+      "miss": {
+        "weight_version": "launch",
+        "cached_tokens_details": null
+      },
+      "device": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 4,
+          "host": 0,
+          "storage": 0,
+          "storage_backend": "HiCacheFile"
+        }
+      },
+      "storage": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 2,
+          "host": 2,
+          "storage": 4,
+          "storage_backend": "HiCacheFile"
+        }
+      },
+      "unsplit": {
+        "weight_version": "launch",
+        "cached_tokens_details": {
+          "device": 2,
+          "host": 0
+        }
+      }
+    },
+    "cached_tokens_total": {
+      "miss": {},
+      "device": {
+        "device": 4
+      },
+      "storage": {
+        "device": 2,
+        "host": 2,
+        "storage": 4
+      },
+      "unsplit": {
+        "device": 2
       }
     }
   },

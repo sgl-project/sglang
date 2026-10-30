@@ -914,9 +914,10 @@ class MambaPool:
                 # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
                 # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
                 # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
-                # with no numerical change: both the conv kernel write (idempotent
-                # overlapping stores) and `fused_conv_window_scatter_with_mask`
-                # consume the view through its strides.
+                # with no numerical change: both the conv kernel write (one tile
+                # store per row for width-4 chains, idempotent overlapping stores
+                # otherwise) and `fused_conv_window_scatter_with_mask` consume the
+                # view through its strides.
                 #
                 # Dedup the sliding-window conv-intermediate only when it is safe:
                 # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree

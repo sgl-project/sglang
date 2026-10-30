@@ -217,6 +217,7 @@ const SCHEMA_META_INFO_KEYS: &[&str] = &[
     "image_tokens",
     "audio_tokens",
     "video_tokens",
+    "cached_tokens_details",
 ];
 
 /// A repeated key has been logged once.
@@ -425,8 +426,9 @@ fn native_core_error(error: CoreError, stream: bool) -> Response {
 /// restart. The deep-probe handler is built once with
 /// `SGLANG_HEALTH_CHECK_TIMEOUT` frozen in and serves `/health_generate`
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
-/// Python) decides whether `/health` shares it or, after startup warmup, is a
-/// plain 200 (routing the request proves the frontend is up).
+/// Python) decides whether `/health` shares it or is a plain 200 once startup
+/// warmup finishes and a multimodal model's MM processor is installed (routing
+/// the request proves the frontend is up).
 fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
@@ -443,7 +445,7 @@ fn health_routes() -> Router<Arc<AppState>> {
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.core.is_ready() {
+    if state.core.is_serving() {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -865,10 +867,9 @@ fn e2e_latency(timing: &RequestTiming) -> f64 {
 }
 
 /// One incremental streaming frame's output: this step's delta with the
-/// cumulative token count in `meta_info` (matching Python).
-fn delta_output(mut delta: CoreOutput, accumulated: &CoreOutput) -> CoreOutput {
-    delta.completion_tokens = accumulated.completion_tokens;
-    delta
+/// cumulative counts in `meta_info` (see [`CoreOutput::with_cumulative_counts`]).
+fn delta_output(delta: CoreOutput, accumulated: &CoreOutput) -> CoreOutput {
+    delta.with_cumulative_counts(accumulated)
 }
 
 /// The SSE `data` text of one `api.v1` item (a frame or an error).
@@ -953,6 +954,7 @@ mod tests {
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
@@ -969,6 +971,54 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// The generation-free `/health` of a multimodal model answers 503 until
+    /// its MM processor is installed, even with startup warmup skipped, since
+    /// a generation sent earlier would wait in admission.
+    #[tokio::test]
+    async fn generation_free_health_waits_for_the_mm_processor() {
+        struct NoMedia;
+        impl crate::multi_modality::worker::MmProcessor for NoMedia {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<
+                crate::multi_modality::worker::MmProcessOutput,
+                crate::multi_modality::worker::MediaError,
+            > {
+                unreachable!("no request carries media")
+            }
+        }
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                flume::unbounded().0,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: true,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+
+        let response = health_without_generation(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.core.set_mm_processor(Arc::new(NoMedia)));
+        let response = health_without_generation(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A healthy `/health_generate` carries the configured metadata headers;
@@ -997,6 +1047,7 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
@@ -1038,6 +1089,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
@@ -1120,6 +1172,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
@@ -1346,6 +1399,7 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
@@ -1701,6 +1755,7 @@ mod tests {
             image_tokens: Some(1),
             audio_tokens: Some(1),
             video_tokens: Some(1),
+            cached_tokens_details: Some(Default::default()),
         };
         let keys: Vec<String> = serde_json::to_value(&every)
             .unwrap()
@@ -2085,18 +2140,43 @@ mod tests {
     }
 
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
-    /// but `meta_info.completion_tokens` stays cumulative (matching Python).
+    /// but `meta_info.completion_tokens` stays cumulative (matching Python), and
+    /// so does the cached-token split, which a scheduler abort does not carry.
     #[tokio::test]
     async fn incremental_emits_deltas_with_cumulative_count() {
+        use crate::message::response::{CachedTokensDetails, ChunkExtras};
+
         let (tx, rx) = mpsc::channel(8);
         let calls = vec![timed_call(10, rx)];
         let stream = generation_event_stream(calls, true, true);
         futures::pin_mut!(stream);
+        let with_extras = |item: ResponseItem, extras: ChunkExtras| {
+            let (ResponseItem::Frame(mut chunk) | ResponseItem::Done(mut chunk)) = item else {
+                unreachable!()
+            };
+            chunk.cached_tokens = 3;
+            chunk.extras = Some(Box::new(extras));
+            chunk
+        };
+        let split = serde_json::json!({"device": 1, "host": 2});
 
-        tx.send(frame(10, "Hello")).await.unwrap();
+        let hello = with_extras(
+            frame(10, "Hello"),
+            ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 1,
+                    host: 2,
+                    storage: None,
+                    storage_backend: None,
+                }),
+                ..Default::default()
+            },
+        );
+        tx.send(ResponseItem::Frame(hello)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "Hello");
         assert_eq!(v["meta_info"]["completion_tokens"], 1);
+        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
         assert!(v["meta_info"].get("e2e_latency").is_none());
 
         tx.send(frame(10, " world")).await.unwrap();
@@ -2108,11 +2188,19 @@ mod tests {
         );
         assert!(v["meta_info"].get("e2e_latency").is_none());
 
-        tx.send(done(10, "!")).await.unwrap();
+        let aborted = with_extras(
+            done(10, "!"),
+            ChunkExtras {
+                abort_output: true,
+                ..Default::default()
+            },
+        );
+        tx.send(ResponseItem::Done(aborted)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");

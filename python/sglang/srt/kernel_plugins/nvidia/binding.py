@@ -39,6 +39,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 )
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
@@ -105,8 +106,15 @@ class KvPoolView:
     """The running forward's KV pool, under the pool's own names: its layout and
     per-layer key buffers (a pool offers the ones of its kind)."""
 
-    def __init__(self, pool: Any):
+    def __init__(self, pool: Any, seal_cache: Optional[Callable] = None):
         self.pool = pool
+        self._seal_cache = seal_cache
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        value = self.pool.get_key_buffer(layer_id)
+        if self._seal_cache is not None:
+            self._seal_cache(layer_id, value)
+        return value
 
     @property
     def uniform_fp8(self) -> bool:
@@ -143,10 +151,14 @@ class ForwardView:
     """The running forward's attention data, read from its attention backend; built
     at capture for a graph step, so its tensors are the ones the graph replays."""
 
-    def __init__(self, backend: Any):
+    def __init__(self, backend: Any, seal_cache: Optional[Callable] = None):
         self._backend = backend
         self.metadata = backend.forward_metadata
-        self.kv_pool = KvPoolView(backend.token_to_kv_pool)
+        self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+
+    @property
+    def use_fused_topk(self) -> bool:
+        return bool(getattr(self._backend, "use_fused_topk", False))
 
     @property
     def trtllm_attn(self) -> bool:
@@ -181,12 +193,13 @@ class MegakernelBinding:
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
         self._sealed: dict[str, tuple] = {}
+        self._cache_sources: dict[int, tuple] = {}
 
     def forward_view(self) -> ForwardView:
         """The view of the forward running now (a target step or a draft step)."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        view = ForwardView(get_attn_backend())
+        view = ForwardView(get_attn_backend(), self._seal_cache)
         self._seal("kv_pool", view.kv_pool.pool)
         return view
 
@@ -210,6 +223,22 @@ class MegakernelBinding:
                     f"megakernel binding: {name} was reallocated after its first read"
                 )
 
+        for layer_id, identity in self._cache_sources.items():
+            value = self._current_pool().get_key_buffer(layer_id)
+            if _identity(value) != identity:
+                raise RuntimeError(
+                    f"megakernel binding: kv_cache[{layer_id}] was reallocated "
+                    "after its first read"
+                )
+
+    def _seal_cache(self, layer_id: int, value: torch.Tensor) -> None:
+        identity = _identity(value)
+        if self._cache_sources.setdefault(layer_id, identity) != identity:
+            raise RuntimeError(
+                f"megakernel binding: kv_cache[{layer_id}] was reallocated "
+                "after its first read"
+            )
+
     def _seal(self, name: str, value: Any) -> None:
         self._sealed.setdefault(name, _identity(value))
 
@@ -226,7 +255,7 @@ class MegakernelBinding:
 
 def _identity(value: Any) -> tuple:
     if isinstance(value, torch.Tensor):
-        return (value.data_ptr(), tuple(value.shape), value.dtype)
+        return (value.data_ptr(), tuple(value.shape), value.dtype, value.stride())
     return (id(value),)
 
 
@@ -383,6 +412,9 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_nvidia_megakernel:
         return
+    archs = model_config_of(server_args).hf_config.architectures
+    if msa_serves(archs) and not cfg.enable_amd_monokernel:
+        return  # handle_monokernel checks the MSA plugin's spec
     reasons = plugin_reasons()
     if not reasons:
         model_config = model_config_of(server_args)
@@ -417,7 +449,7 @@ def install_megakernel(
     is_draft: bool,
 ) -> None:
     """Build the model's spec and install its forward; runs before KV cache sizing."""
-    if not megakernel_enabled():
+    if not megakernel_enabled() or msa_serves(hf_config.architectures):
         return
     spec = _find_spec_on_every_rank(hf_config=hf_config, is_draft=is_draft)
     if spec is None:

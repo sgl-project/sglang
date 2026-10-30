@@ -19,7 +19,7 @@ import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -185,7 +185,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,
                         update_spec_correct_drafts_histogram=Mock(),
-                        kv=types.SimpleNamespace(kv_committed_len=0),
+                        kv=ReqKvInfo(),
                     )
                     for length in (100, 200, 300)
                 ]

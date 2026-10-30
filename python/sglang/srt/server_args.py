@@ -34,7 +34,7 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
-    DeprecatedStoreConstAction,
+    DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
@@ -422,18 +422,17 @@ class ServerArgs:
             help="Deprecated. Use --attn-dp-size <dp-size> instead of "
             "--dp-size <dp-size> --enable-dp-attention.",
         )
-        # amd was the only monokernel backend the flag could name.
         parser.add_argument(
             "--monokernel-backend",
-            action=DeprecatedStoreConstAction,
-            dest="enable_amd_monokernel",
-            nargs=None,
-            choices=["amd"],
-            const_value=True,
-            default=False,
-            new_flag="--enable-amd-monokernel",
+            action=DeprecatedChoiceToFlagAction,
+            dest="monokernel_backend",
+            flags={
+                "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
+                "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
+            },
             help="Deprecated. Use --enable-amd-monokernel instead of "
-            "--monokernel-backend amd.",
+            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
+            "--monokernel-backend msa.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
