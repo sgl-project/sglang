@@ -346,17 +346,18 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
                 set_last_time=lambda: None,
             ),
         )
+        request_stats = SimpleNamespace(
+            prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
+        )
         for j, count in enumerate(completion_tokens):
             last = j == len(completion_tokens) - 1
             state.finished = last and finish_type is not None
             recv = SimpleNamespace(
                 finished_reasons=[{"type": finish_type} if state.finished else None],
-                prompt_tokens=[100],
-                cached_tokens=[0],
             )
             if count is not None:
                 recv.completion_tokens = [count]
-            TokenizerManager.collect_metrics(manager, state, recv, 0)
+            TokenizerManager.collect_metrics(manager, state, recv, 0, request_stats)
         return collector
 
     def _itl_samples(self, collector):

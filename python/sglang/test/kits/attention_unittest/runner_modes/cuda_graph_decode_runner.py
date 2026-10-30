@@ -287,6 +287,7 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
     fb_view = SimpleNamespace(
         batch_size=capture_batch_size,
         forward_mode=batch.forward_mode,
+        ragged_verify_layout=None,
         actual_forward_mode=batch.forward_mode,
         input_ids=batch.input_ids,
         positions=getattr(batch, "positions", None),
