@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -19,7 +20,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProcessor:
@@ -45,6 +46,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=metrics_reporter,
@@ -181,6 +183,8 @@ class _PrefillReq:
 
 
 class _DecodeReq:
+    request_finish = Req.request_finish
+
     def __init__(self):
         self.return_hidden_states = "last"
         self.hidden_states = []
@@ -243,6 +247,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
+                    kv_weight_version_record=None,
                     logits_output=SimpleNamespace(
                         hidden_states=hidden_states,
                         customized_info=None,
@@ -298,6 +303,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             routed_experts_output=None,
             indexer_topk_output=None,
             logits_output=None,
+            kv_weight_version_record=None,
             next_token_ids=torch.zeros(1, dtype=torch.int64),
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
@@ -351,6 +357,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
             auxiliary_host_output=None,
             routed_experts_output=None,
             indexer_topk_output=None,
+            kv_weight_version_record=None,
             logits_output=SimpleNamespace(
                 hidden_states=None, customized_info=None, sampling_mask_output=None
             ),
@@ -478,7 +485,9 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         def result(hidden_states):
             return GenerationBatchResult(
                 logits_output=SimpleNamespace(
-                    hidden_states=hidden_states, sampling_mask_output=None
+                    hidden_states=hidden_states,
+                    customized_info=None,
+                    sampling_mask_output=None,
                 ),
                 speculative_num_draft_tokens=4,
             )

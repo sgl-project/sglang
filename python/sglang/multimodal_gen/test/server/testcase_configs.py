@@ -341,6 +341,9 @@ class DiffusionTestCase:
     perf_repeat_requests: int = 1
     perf_warmup_requests: int = 0
     run_consistency_check: bool = True
+    # Sent first after the server warmup and checked against its own golden: the
+    # request that inherits whatever state the warmup leaves behind.
+    lead_sampling_params: DiffusionSamplingParams | None = None
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     expected_model_id: str | None = None
@@ -356,6 +359,15 @@ class DiffusionTestCase:
     reference_quality: str | None = None
     # ... and must change once the server's LoRA adapter is deactivated
     run_lora_effect_check: bool = False
+
+    def lead_case(self) -> DiffusionTestCase:
+        """The lead request as a case named "<id>_lead" (its golden's name)."""
+        return replace(
+            self,
+            id=f"{self.id}_lead",
+            sampling_params=self.lead_sampling_params,
+            lead_sampling_params=None,
+        )
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
