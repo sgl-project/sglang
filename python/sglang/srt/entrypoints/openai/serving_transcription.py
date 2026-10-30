@@ -755,6 +755,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     is_last=is_last,
                     raw_request=raw_request,
                     routing_key=self.extract_routing_key(raw_request),
+                    rendered_text=adapted_request.text,
                 )
 
                 if delta:
