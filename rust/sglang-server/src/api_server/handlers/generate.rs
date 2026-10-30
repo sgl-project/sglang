@@ -19,16 +19,44 @@ use super::handle::{
 use crate::api_server::core::{CoreError, CoreEvent, RequestMetrics, prefetch};
 
 impl CoreHandle {
-    pub(crate) async fn generate(
-        &self,
-        mut request: GenerateRequest,
-    ) -> Result<CoreCall, CoreError> {
-        let created_at = Instant::now();
-        self.set_default_priority(&mut request);
-        let mut generation = self
+    pub(crate) async fn generate(&self, request: GenerateRequest) -> Result<CoreCall, CoreError> {
+        let generation = self
             .inner
             .generations
             .register(request.rid.clone(), self.inner.abort_tx.clone());
+        self.generate_registered(request, generation).await
+    }
+
+    /// Register a generation under the public ID `rid` before its request
+    /// exists, so an explicit cancellation in the meantime is kept for
+    /// [`Self::generate_pending`].
+    pub(crate) fn hold_generation(&self, rid: &str) -> PendingGeneration {
+        PendingGeneration(
+            self.inner
+                .generations
+                .register(Rid::from_client(rid), self.inner.abort_tx.clone()),
+        )
+    }
+
+    /// [`Self::generate`] for a request held by [`Self::hold_generation`]
+    /// and claimed by it ([`PendingGeneration::claim`]): a cancellation that
+    /// selected the hold ends the call without starting the request.
+    pub(crate) async fn generate_pending(
+        &self,
+        request: GenerateRequest,
+        pending: PendingGeneration,
+    ) -> Result<CoreCall, CoreError> {
+        debug_assert!(pending.0.rid == request.rid, "the request claims its hold");
+        self.generate_registered(request, pending.0).await
+    }
+
+    async fn generate_registered(
+        &self,
+        mut request: GenerateRequest,
+        mut generation: Generation,
+    ) -> Result<CoreCall, CoreError> {
+        let created_at = Instant::now();
+        self.set_default_priority(&mut request);
         tokio::select! {
             biased;
             cancellation = generation.cancelled() => {
@@ -374,12 +402,21 @@ type Entries = HashMap<String, HashMap<Rid, Entry>>;
 
 /// How an explicit cancellation ends the calls it selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AbortEnding {
+pub enum AbortEnding {
     /// A cancelled error, as the gRPC `Abort` RPC reports it.
     CancelledError,
     /// A terminal output whose finish reason is the abort, as Python's
     /// `/abort_request` ends a request.
     AbortFinishReason,
+}
+
+/// An explicit cancellation of a generation not yet started: how it ends the
+/// generation, and whether it aborted all generations rather than naming
+/// this one's ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Aborted {
+    pub ending: AbortEnding,
+    pub abort_all: bool,
 }
 
 /// How a call learns to end from an explicit cancellation.
@@ -402,7 +439,8 @@ pub(super) struct Generations(Arc<Mutex<Entries>>);
 
 struct Entry {
     admission: RequestAdmission,
-    cancelled: oneshot::Sender<Cancellation>,
+    /// The cancellation, and whether it was an abort of all generations.
+    cancelled: oneshot::Sender<(Cancellation, bool)>,
 }
 
 impl Generations {
@@ -427,6 +465,7 @@ impl Generations {
             admission,
             cancellation,
             observed: None,
+            abort_all: false,
             abort_tx,
             armed: true,
         }
@@ -440,13 +479,27 @@ impl Generations {
     ) -> bool {
         // Detach a snapshot under the lock, then notify outside it. Completion
         // and a new request reusing the same public ID cannot remove each other.
-        let selected = {
-            let mut entries = self.0.lock().unwrap();
-            match rid {
-                Some(rid) => entries.remove(rid).into_iter().collect::<Vec<_>>(),
-                None => std::mem::take(&mut *entries).into_values().collect(),
-            }
-        };
+        Self::notify(self.detach(rid), rid.is_none(), ending, abort_tx)
+    }
+
+    /// The entries an abort of `rid`, or of all, selects, taken out of the
+    /// index.
+    fn detach(&self, rid: Option<&str>) -> Vec<HashMap<Rid, Entry>> {
+        let mut entries = self.0.lock().unwrap();
+        match rid {
+            Some(rid) => entries.remove(rid).into_iter().collect(),
+            None => std::mem::take(&mut *entries).into_values().collect(),
+        }
+    }
+
+    /// End the `selected` entries' generations as `ending` says;
+    /// `abort_all` if the abort selected every generation.
+    fn notify(
+        selected: Vec<HashMap<Rid, Entry>>,
+        abort_all: bool,
+        ending: AbortEnding,
+        abort_tx: &flume::Sender<AbortSource>,
+    ) -> bool {
         let mut matched = false;
         for entries in selected {
             for (rid, entry) in entries {
@@ -461,16 +514,16 @@ impl Generations {
                         // abort, and notify before the abort can tear down
                         // the response sink the call may be polling.
                         let requires_abort = entry.admission.cancel_requires_abort();
-                        let _ = entry.cancelled.send(Cancellation::Error);
+                        let _ = entry.cancelled.send((Cancellation::Error, abort_all));
                         if requires_abort {
                             let _ = abort_tx.send(AbortSource::Guard(rid));
                         }
                     }
                     AbortEnding::AbortFinishReason => {
                         if entry.admission.cancel_if_pending() {
-                            let _ = entry.cancelled.send(Cancellation::Unstarted);
+                            let _ = entry.cancelled.send((Cancellation::Unstarted, abort_all));
                         } else if entry.admission.is_accepted() {
-                            let _ = entry.cancelled.send(Cancellation::Scheduler);
+                            let _ = entry.cancelled.send((Cancellation::Scheduler, abort_all));
                             let _ = abort_tx.send(AbortSource::Request(rid));
                         }
                     }
@@ -497,35 +550,44 @@ pub(super) struct Generation {
     registry: Generations,
     rid: Rid,
     pub(super) admission: RequestAdmission,
-    cancellation: oneshot::Receiver<Cancellation>,
+    cancellation: oneshot::Receiver<(Cancellation, bool)>,
     /// The cancellation once observed. Preparation, submission and the
     /// response stream may each observe it, and a oneshot receiver must not
     /// be polled again after consuming its notification.
     observed: Option<Cancellation>,
+    /// Whether the observed cancellation was an abort of all generations.
+    abort_all: bool,
     abort_tx: flume::Sender<AbortSource>,
     armed: bool,
 }
 
 impl Generation {
     pub(super) async fn cancelled(&mut self) -> Cancellation {
-        match self.observed {
-            Some(cancellation) => cancellation,
-            None => *self.observed.insert(
-                (&mut self.cancellation)
-                    .await
-                    .unwrap_or(Cancellation::Error),
-            ),
+        if let Some(cancellation) = self.observed {
+            return cancellation;
         }
+        let received = (&mut self.cancellation).await;
+        self.observe(received.ok())
+    }
+
+    fn observe(&mut self, received: Option<(Cancellation, bool)>) -> Cancellation {
+        let (cancellation, abort_all) = received.unwrap_or((Cancellation::Error, false));
+        self.abort_all = abort_all;
+        *self.observed.insert(cancellation)
     }
 
     /// The cancellation, if it has already happened.
     pub(super) fn try_cancelled(&mut self) -> Option<Cancellation> {
         if self.observed.is_none() {
-            self.observed = match self.cancellation.try_recv() {
-                Ok(cancellation) => Some(cancellation),
-                Err(oneshot::error::TryRecvError::Closed) => Some(Cancellation::Error),
-                Err(oneshot::error::TryRecvError::Empty) => None,
-            };
+            match self.cancellation.try_recv() {
+                Ok(received) => {
+                    self.observe(Some(received));
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.observe(None);
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
         }
         self.observed
     }
@@ -544,6 +606,55 @@ impl Drop for Generation {
             if self.admission.cancel_requires_abort() {
                 let _ = self.abort_tx.send(AbortSource::Guard(self.rid.clone()));
             }
+        }
+    }
+}
+
+/// A generation registered for explicit cancellation before its request
+/// exists ([`CoreHandle::hold_generation`]). Dropping it unregisters it.
+pub(crate) struct PendingGeneration(Generation);
+
+impl PendingGeneration {
+    /// Make this the generation of `request`, which arrived for it. The
+    /// request takes the held internal rid rather than the entry moving to
+    /// the request's, so an abort that has already detached the entry still
+    /// names the rid that is submitted. A request under another public ID
+    /// cannot be reached by aborts naming the held one: it registers afresh,
+    /// keeping a cancellation that already selected the hold.
+    pub(crate) fn claim(self, request: &mut GenerateRequest) -> Self {
+        let mut held = self.0;
+        if held.rid.client_facing() == request.rid.client_facing() {
+            request.rid = held.rid.clone();
+            return Self(held);
+        }
+        tracing::warn!(
+            held = held.rid.client_facing(),
+            rid = request.rid.client_facing(),
+            "a request held before /generate arrived under another rid; later aborts of the \
+             held rid do not reach it"
+        );
+        let (cancellation, abort_all) = (held.try_cancelled(), held.abort_all);
+        let mut fresh = held
+            .registry
+            .register(request.rid.clone(), held.abort_tx.clone());
+        drop(held);
+        if let Some(cancellation) = cancellation {
+            fresh.admission.cancel_if_pending();
+            fresh.observed = Some(cancellation);
+            fresh.abort_all = abort_all;
+        }
+        Self(fresh)
+    }
+
+    /// Resolves once an explicit cancellation selects the generation.
+    pub(crate) async fn cancelled(&mut self) -> Aborted {
+        let ending = match self.0.cancelled().await {
+            Cancellation::Error => AbortEnding::CancelledError,
+            Cancellation::Unstarted | Cancellation::Scheduler => AbortEnding::AbortFinishReason,
+        };
+        Aborted {
+            ending,
+            abort_all: self.0.abort_all,
         }
     }
 }
@@ -1122,6 +1233,50 @@ mod tests {
             matches!(abort_rx.recv().unwrap(), AbortSource::Guard(rid) if rid.client_facing() == "raced")
         );
         assert!(aborter.join().unwrap());
+    }
+
+    /// A claimed hold's request is submitted under the held internal rid, so
+    /// an abort that detached the held entry before the request was admitted
+    /// still names the submitted request once it notifies. A request under
+    /// another public ID keeps a cancellation the hold already saw.
+    #[tokio::test]
+    async fn a_claimed_hold_keeps_the_rid_a_detached_abort_names() {
+        for ending in [AbortFinishReason, CancelledError] {
+            let harness = Harness::unbounded(8);
+            let pending = harness.handle.hold_generation("held");
+            let detached = harness.handle.inner.generations.detach(Some("held"));
+            let mut request = public_request("held");
+            let pending = pending.claim(&mut request);
+            let handle = harness.handle.clone();
+            let call = tokio::spawn(async move { handle.generate_pending(request, pending).await });
+            let submitted = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            assert!(Generations::notify(
+                detached,
+                false,
+                ending,
+                &harness.handle.inner.abort_tx
+            ));
+            let aborted = harness
+                .abort_rx
+                .try_recv()
+                .expect("the abort reaches the runtime");
+            assert_eq!(aborted.rid(), &submitted.rid, "{ending:?}");
+            call.abort();
+        }
+
+        let harness = Harness::unbounded(8);
+        let pending = harness.handle.hold_generation("held");
+        assert!(harness.handle.abort(Some("held"), AbortFinishReason));
+        let mut request = public_request("other");
+        let pending = pending.claim(&mut request);
+        assert_eq!(request.rid.client_facing(), "other");
+        let mut call = harness
+            .handle
+            .generate_pending(request, pending)
+            .await
+            .unwrap();
+        assert!(harness.intake_rx.try_recv().is_err());
+        assert!(matches!(call.recv().await, Some(CoreEvent::Finished(_))));
     }
 
     /// An `/abort_request` that ends a call before Intake claims it records

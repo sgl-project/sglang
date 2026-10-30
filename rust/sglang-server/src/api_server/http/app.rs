@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 
 use super::generate_hook::GenerateHook;
-use super::{hicache, info, loads, metrics, native_api, openai};
+use super::{hicache, info, loads, metrics, native_api, openai, pre_generate};
 use crate::HttpLayer;
 use crate::api_server::core::FLUSH_INTERVAL;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
@@ -126,12 +126,13 @@ pub async fn serve(
     // a configured `api_key` does NOT protect these routes.
     //
     // No body limit, matching the Python server.
+    let core = state.core.clone();
     let mut app = router
         .with_state(state)
         .merge(hicache::routes(hicache_manager))
         .layer(axum::extract::DefaultBodyLimit::disable());
     if let Some(http_layer) = http_layer {
-        app = http_layer(app);
+        app = pre_generate::apply(app, &http_layer, core);
     }
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its

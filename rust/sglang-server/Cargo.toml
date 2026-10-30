@@ -17,6 +17,10 @@ name = "sglang_server"
 # rlib:   so optional standalone bins / integration tests can link the core.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# `pre_generate::test_support`: the app an HTTP layer's tests serve it from.
+test-support = []
+
 [dependencies]
 async-stream = { workspace = true }
 bytes = { workspace = true }

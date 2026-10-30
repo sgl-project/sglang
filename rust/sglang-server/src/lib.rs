@@ -17,10 +17,14 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
     GenerateTerminal,
 };
+pub use api_server::http::pre_generate::abortable_before_generate;
+#[cfg(feature = "test-support")]
+pub use api_server::http::pre_generate::test_support;
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RustServerServerArgs, ServerArgs,
