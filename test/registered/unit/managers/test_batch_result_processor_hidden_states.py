@@ -1,6 +1,6 @@
 import unittest
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -11,7 +11,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -82,6 +82,8 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 ("float", None),
             )
         ]
+        for req in reqs:
+            req.request_finish = MethodType(Req.request_finish, req)
         batch = SimpleNamespace(
             reqs=reqs,
             return_logprob=False,
@@ -242,6 +244,8 @@ class _PrefillReq:
 
 
 class _DecodeReq:
+    request_finish = Req.request_finish
+
     def __init__(self):
         self.return_hidden_states = "last"
         self.hidden_states = []
