@@ -1,15 +1,19 @@
 import ast
 import threading
 import warnings
+from functools import lru_cache
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
+from jsonschema import Draft202012Validator
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+_MAX_CACHED_SCHEMA_BYTES = 64 * 1024
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -172,6 +176,29 @@ def normalize_json_schema_types(schema: Any) -> None:
     ):
         if key in schema:
             normalize_json_schema_types(schema[key])
+
+
+@lru_cache(maxsize=1024)
+def _check_json_schema_cached(schema_json: bytes) -> None:
+    Draft202012Validator.check_schema(orjson.loads(schema_json))
+
+
+def check_json_schema(schema: Any) -> None:
+    # Meta-validation re-resolves the meta-schema on every call and dominates
+    # request validation for many-tool clients; their tool sets barely change.
+    try:
+        schema_json = orjson.dumps(schema, option=orjson.OPT_SORT_KEYS)
+    except TypeError:
+        Draft202012Validator.check_schema(schema)
+        return
+    # Serialization can turn tuples into arrays and non-finite numbers into null.
+    if (
+        len(schema_json) > _MAX_CACHED_SCHEMA_BYTES
+        or orjson.loads(schema_json) != schema
+    ):
+        Draft202012Validator.check_schema(schema)
+        return
+    _check_json_schema_cached(schema_json)
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
