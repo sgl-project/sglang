@@ -390,6 +390,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.enable_mfu_metrics = False
         reporter.scheduler_status_logger = None
         reporter.forward_ct_decode = 0
+        reporter._decode_window_start_ct = 0
         reporter.decode_log_interval = 1
         reporter.last_decode_stats_tic = 0.0
         reporter.num_generated_tokens = 0
