@@ -560,9 +560,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 (bs,), dtype=torch.int32, device=device
             )
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
+            assert bs > 0 and num_tokens > 0 and num_tokens % bs == 0
+            num_tokens_per_req = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
+            metadata.sum_seq_lens_q = num_tokens
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 bs * num_tokens_per_req + 1,
@@ -631,9 +632,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(metadata.global_seq_lens_k)
             seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
         elif metadata.seq_lens_k is not None:
@@ -691,9 +689,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             local_seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.global_seq_lens_k.copy_(seq_lens)
             metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))

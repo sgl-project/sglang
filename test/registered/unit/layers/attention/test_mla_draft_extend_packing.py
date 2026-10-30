@@ -1,6 +1,7 @@
 import unittest
 from itertools import product
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -12,6 +13,38 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMLADraftExtendPacking(unittest.TestCase):
+    def test_graph_metadata_preserves_widened_draft_window(self):
+        for dcp in (False, True):
+            with self.subTest(dcp=dcp), patch(
+                "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=dcp),
+            ):
+                backend = TRTLLMMLABackend.__new__(TRTLLMMLABackend)
+                backend.num_draft_tokens = 4
+                backend.max_context_len = 16
+                backend.decode_cuda_graph_metadata = {}
+                backend.decode_cuda_graph_kv_indices = torch.zeros(2, 16)
+                backend._calc_padded_blocks = lambda length: length
+                backend._get_dcp_local_max_seq_len = lambda length: length
+                backend._get_dcp_local_seq_lens = lambda lengths: lengths
+                backend._fill_dcp_block_kv_indices = Mock()
+                backend.kv_index_translator = SimpleNamespace(
+                    is_translating=True, copy_page_table=Mock()
+                )
+                lengths = torch.tensor([9, 13], dtype=torch.int32)
+                mode = ForwardMode.DRAFT_EXTEND_V2
+                backend._init_cuda_graph_metadata(2, 12, mode, lengths, "cpu")
+                metadata = backend.forward_decode_metadata
+                for current_lengths in (lengths, lengths + 2):
+                    backend._apply_cuda_graph_metadata(
+                        None, 2, torch.arange(2), current_lengths, mode
+                    )
+                    self.assertEqual(metadata.max_seq_len_q, 6)
+                    self.assertEqual(metadata.sum_seq_lens_q, 12)
+                    self.assertEqual(metadata.cu_seqlens_q.tolist(), [0, 6, 12])
+                    self.assertEqual(metadata.seq_lens_q.tolist(), [6, 6])
+                    torch.testing.assert_close(metadata.seq_lens_k, current_lengths)
+
     def test_query_rows_stay_with_their_request(self):
         for lengths, buffer_width in product(
             ([1, 3], [3, 1], [2, 4], [1, 4], [2, 2], [4]), (None, 4)
