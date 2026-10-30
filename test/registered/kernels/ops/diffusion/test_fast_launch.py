@@ -24,9 +24,20 @@ from sglang.kernels.ops.diffusion.activation.silu_mul_bitexact import (
 )
 from sglang.kernels.ops.diffusion.common import fast_launch
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+from sglang.kernels.ops.diffusion.layout.ulysses_qkv_triton import (
+    pack_qkv_destination_major,
+)
+from sglang.kernels.ops.diffusion.modulate.head_gate_triton import head_gate_mul
+from sglang.kernels.ops.diffusion.modulate.ltx2_ada_values_triton import (
+    ltx2_ada_values9,
+)
 from sglang.kernels.ops.diffusion.norm.native_bf16_rmsnorm_triton import (
     rmsnorm_scale,
     rmsnorm_tanh_residual,
+)
+from sglang.kernels.ops.diffusion.norm.rmsnorm_scale_shift_bitexact import (
+    fused_rmsnorm_scale_shift_bitexact,
+    fused_scale_residual_rmsnorm_scale_shift_bitexact,
 )
 from sglang.kernels.ops.diffusion.norm.zimage_qk_rmsnorm_triton import (
     zimage_qk_rmsnorm_native,
@@ -103,6 +114,31 @@ WRAPPERS = {
     "rope_rotate_half": lambda: (
         fused_rope_rotate_half_bitexact,
         (_bf16(2, 64, 8, 128), _bf16(128, 64), _bf16(128, 64)),
+    ),
+    "head_gate_mul": lambda: (head_gate_mul, (_bf16(1, 64, 8, 128), _bf16(1, 64, 8))),
+    "rmsnorm_scale_shift": lambda: (
+        fused_rmsnorm_scale_shift_bitexact,
+        (_bf16(1, 64, 4096), _bf16(4096), _bf16(1, 1, 4096), _bf16(1, 1, 4096), EPS),
+    ),
+    "scale_residual_rmsnorm_scale_shift": lambda: (
+        fused_scale_residual_rmsnorm_scale_shift_bitexact,
+        (
+            _bf16(1, 64, 4096),
+            _bf16(1, 64, 4096),
+            _bf16(1, 1, 4096),
+            _bf16(4096),
+            _bf16(1, 1, 4096),
+            _bf16(1, 1, 4096),
+            EPS,
+        ),
+    ),
+    "pack_qkv_destination_major": lambda: (
+        pack_qkv_destination_major,
+        (_bf16(64, 8, 128), _bf16(64, 8, 128), _bf16(64, 8, 128), 2),
+    ),
+    "ltx2_ada_values9": lambda: (
+        ltx2_ada_values9,
+        (_bf16(9, 2048), _bf16(1, 64, 9 * 2048)),
     ),
 }
 

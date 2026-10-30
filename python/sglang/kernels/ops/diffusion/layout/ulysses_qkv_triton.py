@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+
 _MAX_INT32 = 2**31 - 1
 
 # Devices with a Triton backend for this kernel. "cuda" also covers ROCm.
@@ -63,6 +65,7 @@ def _pack_qkv_destination_major_kernel(
     tl.store(output_ptr + output_base + 2 * head_size, v, mask=mask)
 
 
+@replay_launches
 def pack_qkv_destination_major(
     q: torch.Tensor,
     k: torch.Tensor,
