@@ -158,8 +158,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         # Warm up kernels and one-time setup before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
-        warmup_output = None
         for _ in range(2 if profiler is not None else 1):
+            warmup_output = None
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():

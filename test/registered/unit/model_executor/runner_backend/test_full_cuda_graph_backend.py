@@ -21,6 +21,7 @@ profiler stepping) is pure-Python and runs on CPU.
 
 import contextlib
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -218,6 +219,26 @@ class TestCaptureOneWithProfiling(CustomTestCase):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 
         return profiler, forward_fn
+
+    def test_releases_warmup_output_before_next_forward(self):
+        runner = _make_runner(
+            enable_profile=True, profiler=SimpleNamespace(step=lambda: None)
+        )
+        backend = _make_backend(runner)
+        backend._reuse_output_buffer = True
+        outputs = []
+
+        def forward():
+            if outputs:
+                self.assertIsNone(outputs[-1]())
+            output = torch.ones(4, 2)
+            outputs.append(weakref.ref(output))
+            return output
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(ShapeKey(size=4), forward)
+        self.assertEqual(len(outputs), 3)
+        self.assertEqual(backend._output_buffer.shape, (4, 2))
 
     def test_steps_twice_in_warmup_and_once_after_capture(self):
         profiler, forward_fn = self._run(
