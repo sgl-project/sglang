@@ -41,22 +41,7 @@ class _NpuDetailAccumulator(_NpuAccumulatorMixin, distribution._DetailAccumulato
 class NpuExpertDistributionAccumulator(
     _NpuAccumulatorMixin, distribution._StatAccumulator
 ):
-    """Reduce window totals for EPLB policies that only consume summed loads."""
-
-    def _get_physical_count_for_dump(self, output_mode):
-        counts = super()._get_physical_count_for_dump(output_mode)
-        moe = distribution.get_exec().moe
-        if (
-            moe.enable_eplb
-            and not moe.elastic_ep_backend
-            and output_mode == "object"
-            and moe.eplb_algorithm in ("auto", "deepseek", "deepseek_hierarchical")
-        ):
-            # These policies sum the time dimension before planning. Aggregate
-            # before mapping/all_reduce; keep int64 to avoid window-sum overflow.
-            # File dumps and policies using per-step loads retain the full window.
-            return counts.sum(dim=0, keepdim=True)
-        return counts
+    pass
 
 
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
