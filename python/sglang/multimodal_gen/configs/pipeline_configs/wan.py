@@ -77,6 +77,11 @@ class WanT2V480PConfig(PipelineConfig):
     """Base configuration for Wan T2V 1.3B pipeline architecture."""
 
     task_type: ModelTaskType = ModelTaskType.T2V
+    # A frozen CFG delta drifts with every reused step and with the guidance
+    # scale. Reusing it for the last 5 of 50 steps keeps Wan2.1-T2V-1.3B above
+    # 40 dB mean frame PSNR at guidance 3 and 5; a 0.3 gate (35 steps) drops to
+    # 23-31 dB.
+    cfg_gate_max_reused_steps: int | None = 5
     # WanConfig-specific parameters with defaults
     # DiT
     dit_config: DiTConfig = field(default_factory=WanVideoConfig)
