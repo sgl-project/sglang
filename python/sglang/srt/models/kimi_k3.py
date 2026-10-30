@@ -190,6 +190,55 @@ def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
     return name
 
 
+class _LayerwiseParams:
+    """``dict(model.named_parameters())`` for load_weights' ``in`` and ``[]``,
+    indexed one decoder layer at a time on first use, since a weight-update call
+    touches one or two layers. Other names use the whole-model index, built once
+    if one comes. A parameter shared with an earlier module answers only to its
+    first name, as in the whole-model index."""
+
+    def __init__(self, model: nn.Module, shared_names: frozenset[str]):
+        self._model = model
+        self._shared_names = shared_names
+        self._layers: dict[int, dict[str, nn.Parameter]] = {}
+        self._all: Optional[dict[str, nn.Parameter]] = None
+
+    @staticmethod
+    def shared_names(model: nn.Module) -> frozenset[str]:
+        """The names whole-model duplicate removal drops."""
+        return frozenset(
+            name for name, _ in model.named_parameters(remove_duplicate=False)
+        ) - {name for name, _ in model.named_parameters()}
+
+    def _index(self, name: str) -> dict[str, nn.Parameter]:
+        layer_id = get_layer_id(name)
+        layers = self._model.model.layers
+        if (
+            layer_id is not None
+            and layer_id < len(layers)
+            and name.startswith(f"model.layers.{layer_id}.")
+        ):
+            params = self._layers.get(layer_id)
+            if params is None:
+                params = self._layers[layer_id] = {
+                    param_name: param
+                    for param_name, param in layers[layer_id].named_parameters(
+                        prefix=f"model.layers.{layer_id}"
+                    )
+                    if param_name not in self._shared_names
+                }
+            return params
+        if self._all is None:
+            self._all = dict(self._model.named_parameters())
+        return self._all
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._index(name)
+
+    def __getitem__(self, name: str) -> nn.Parameter:
+        return self._index(name)[name]
+
+
 def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     """Return a dense weight with serialized block-FP8 scales applied."""
     weight = module.weight.data
@@ -3190,6 +3239,30 @@ class KimiK3LinearForCausalLM(nn.Module):
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
 
+    @cached_property
+    def _expert_params_lookup(self) -> dict[str, tuple[str, str, int, str]]:
+        """load_weights' expert entries keyed by the ``experts.<id>.<proj>.``
+        fragment (see _EXPERT_WEIGHT_NAME); a function of the config, so built
+        once rather than on each call of a weight update."""
+        if self.config.is_moe:
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="w1",
+                ckpt_down_proj_name="w2",
+                ckpt_up_proj_name="w3",
+                num_experts=self.config.num_experts,
+            )
+        else:
+            expert_params_mapping = []
+        lookup = {entry[1]: entry for entry in expert_params_mapping}
+        assert all(_EXPERT_WEIGHT_NAME.fullmatch(key) for key in lookup), (
+            "ckpt expert names diverged from _EXPERT_WEIGHT_NAME; no expert would load"
+        )
+        return lookup
+
+    @cached_property
+    def _shared_param_names(self) -> frozenset[str]:
+        return _LayerwiseParams.shared_names(self)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
@@ -3230,23 +3303,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             (".qkv_conv1d", ".v_conv1d", 2),
         ]
 
-        if self.config.is_moe:
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
-                num_experts=self.config.num_experts,
-            )
-        else:
-            expert_params_mapping = []
-
-        params_dict = dict(self.named_parameters())
+        params_dict = _LayerwiseParams(self, self._shared_param_names)
         loaded_params: set[str] = set()
-        # Keyed by the `experts.<id>.<proj>.` fragment (see _EXPERT_WEIGHT_NAME).
-        expert_params_lookup = {entry[1]: entry for entry in expert_params_mapping}
-        assert all(
-            _EXPERT_WEIGHT_NAME.fullmatch(key) for key in expert_params_lookup
-        ), "ckpt expert names diverged from _EXPERT_WEIGHT_NAME; no expert would load"
+        expert_params_lookup = self._expert_params_lookup
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
@@ -3932,17 +3991,19 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if mapper is not None:
             weights = mapper.apply(weights)
 
-        vision_params = (
-            None
-            if self.config.language_only
-            else dict(self.named_parameters(remove_duplicate=False))
-        )
+        # Indexed at the first vision tensor: most weight-update calls carry none.
+        vision_params = None
 
         def stream_language_weights():
+            nonlocal vision_params
             for name, loaded_weight in weights:
                 if "vision_tower" in name or "mm_projector" in name:
-                    if vision_params is None:
+                    if self.config.language_only:
                         continue
+                    if vision_params is None:
+                        vision_params = dict(
+                            self.named_parameters(remove_duplicate=False)
+                        )
                     if name not in vision_params:
                         logger.warning("Unmapped vision weight: %s", name)
                         continue
