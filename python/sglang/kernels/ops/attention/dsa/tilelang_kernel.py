@@ -745,17 +745,24 @@ def sparse_mla_fwd_decode_partial(
 
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
+                # Masked slots load zeros. CUDA-graph padding rows write row 0,
+                # and a non-finite value there turns -inf + q·k and 0 * v into
+                # NaN for every later request.
                 for bi_i, d_i in T.Parallel(BI, D):
                     idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
-                    ]
+                    KV_shared[bi_i, d_i] = T.if_then_else(
+                        idx >= 0,
+                        KV[b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i],
+                        T.cast(0, dtype),
+                    )
                 if has_tail:
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                        K_tail_shared[bi_i, d_i] = KV[
-                            b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
-                        ]
+                        K_tail_shared[bi_i, d_i] = T.if_then_else(
+                            idx >= 0,
+                            KV[b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i],
+                            T.cast(0, dtype),
+                        )
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
