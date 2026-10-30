@@ -117,6 +117,8 @@ export const config = {
         "--model {{MODEL_NAME}}",
         "--device xpu",
         "--attention-backend intel_xpu",
+        "--tp 1",
+        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
