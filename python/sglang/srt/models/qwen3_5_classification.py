@@ -88,7 +88,8 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
 
 
 class Qwen3_5ForSequenceClassification(Qwen3_5VLForSequenceClassification):
-    """The Transformers name, which quantized (AWQ/GPTQ) exports declare."""
+    """Alias under the Transformers class name; checkpoints re-saved through
+    Transformers (e.g. by AWQ/GPTQ tools) declare it in `architectures`."""
 
     pass
 
