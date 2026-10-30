@@ -7,6 +7,7 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -22,7 +23,7 @@ def _prefill_batch():
     )
 
 
-class TestProfileByStageWithoutNumSteps(unittest.TestCase):
+class TestProfileByStageWithoutNumSteps(CustomTestCase):
     def test_omitted_num_steps_counts_prefill_without_raising(self):
         manager = SchedulerProfilerManager.__new__(SchedulerProfilerManager)
         manager.profile_in_progress = False
