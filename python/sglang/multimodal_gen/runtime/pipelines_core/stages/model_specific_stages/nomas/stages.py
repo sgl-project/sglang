@@ -89,8 +89,10 @@ class NomasInputValidationStage(RealtimeInputValidationStage):
         sp_size = get_ulysses_ctx()[0]
         # A flush chunk never reaches the DiT, so its single latent frame is exempt.
         for segment in [] if flush else plan:
-            tokens = (segment.end - segment.start) * (batch.height // 32) * (
-                batch.width // 32
+            tokens = (
+                (segment.end - segment.start)
+                * (batch.height // 32)
+                * (batch.width // 32)
             )
             if tokens % sp_size:
                 raise ValueError(
