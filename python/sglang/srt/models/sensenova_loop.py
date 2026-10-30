@@ -124,14 +124,6 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
-        if self.pp_group.world_size != 1:
-            raise ValueError(
-                "SenseNova Loop currently requires pipeline parallel size 1"
-            )
-        if quant_config is not None:
-            raise ValueError(
-                "SenseNova Loop currently supports unquantized weights only"
-            )
         self.embed_tokens = self._build_embed_tokens(config)
         physical_layers = {}
         alt_stream = get_stream("alt")
@@ -238,14 +230,6 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
         pp_proxy_tensors: PPProxyTensors | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if pp_proxy_tensors is not None:
-            raise ValueError(
-                "SenseNova Loop does not support pipeline parallel tensors"
-            )
-        if input_deepstack_embeds is not None and input_deepstack_embeds.numel() > 0:
-            raise ValueError(
-                "SenseNova Loop does not support visual DeepStack embeddings"
-            )
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
@@ -278,16 +262,6 @@ class SenseNovaLoopForConditionalGeneration(qwen3_5.Qwen3_5ForConditionalGenerat
             quant_config=quant_config,
             prefix=prefix,
             language_model_cls=SenseNovaLoopModel,
-        )
-
-    def set_dflash_layers_to_capture(self, layer_ids):
-        raise NotImplementedError(
-            "SenseNova Loop speculative decoding is not supported"
-        )
-
-    def set_eagle3_layers_to_capture(self, layer_ids=None):
-        raise NotImplementedError(
-            "SenseNova Loop speculative decoding is not supported"
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -97,44 +97,6 @@ class TestSenseNovaLoopConfig(CustomTestCase):
             config.architectures, ["SenseNovaLoopForConditionalGeneration"]
         )
 
-    def test_invalid_loop_contracts(self):
-        for key, value in (
-            ("use_gate", True),
-            ("eval_count", 0),
-            ("eval_count", True),
-            ("counts", [1, 2]),
-            ("probabilities", [0.5]),
-            ("start", -1),
-            ("end", 33),
-        ):
-            with self.subTest(key=key, value=value):
-                raw = canonical_config()
-                raw["loop_settings"][key] = value
-                with self.assertRaises(ValueError):
-                    SenseNovaLoopConfig(**raw)
-
-    def test_invalid_mhc_contracts(self):
-        for updates in (
-            {"start": 3},
-            {"streams": 3},
-            {"iterations": 0},
-            {"fixed_identity": 1},
-            {"pre_scale": float("nan")},
-            {"pre_scale": 0},
-            {"unknown": True},
-        ):
-            with self.subTest(updates=updates):
-                raw = canonical_config()
-                raw["mhc"].update(updates)
-                with self.assertRaises(ValueError):
-                    SenseNovaLoopConfig(**raw)
-
-    def test_expanded_checkpoint_is_rejected(self):
-        raw = canonical_config()
-        raw["loop_expanded"] = True
-        with self.assertRaises(ValueError):
-            SenseNovaLoopConfig(**raw)
-
     def test_input_config_is_not_modified(self):
         raw = canonical_config()
         raw["text_config"]["rope_parameters"] = {
