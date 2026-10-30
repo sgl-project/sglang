@@ -10,9 +10,7 @@ from sglang.kernels.ops.attention.dsa.litetopk_prefill.fp4_indexer import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(
-    est_time=60, stage="base-b-kernel-benchmark", runner_config="4-gpu-b200"
-)
+register_cuda_ci(est_time=60, stage="nightly", runner_config="4-gpu-b200")
 
 
 def make_inputs(heads, rows, ctx, ratio):

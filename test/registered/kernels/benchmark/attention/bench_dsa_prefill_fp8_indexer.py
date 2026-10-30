@@ -20,9 +20,7 @@ from test_dsa_prefill_fp8_indexer import (  # noqa: E402
     make_ragged,
 )
 
-register_cuda_ci(
-    est_time=120, stage="base-b-kernel-benchmark", runner_config="4-gpu-b200"
-)
+register_cuda_ci(est_time=120, stage="nightly", runner_config="4-gpu-b200")
 
 K = 1024
 CELLS = {
