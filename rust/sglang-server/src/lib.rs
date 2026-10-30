@@ -17,18 +17,23 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::http::generate_hook::{
+    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook,
+};
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
-    RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
+    ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::MmData;
+pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
-pub use multi_modality::worker::{MmProcessOutput, MmProcessor};
+pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
+pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
 pub use sglang_mm::pipeline::{Tensor, TensorData};
 
 use std::sync::Arc;
@@ -38,7 +43,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
-use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
+use crate::utils::startup::{advertise_listener_ports, grpc_listen_addr, listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
@@ -151,7 +156,7 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 }
 
 /// Wraps the HTTP app before it serves: an embedding package's own middleware
-/// or routes ([`Server::start_with_http_layer`]). It wraps every route but the
+/// or routes ([`Server::start_with_extensions`]). It wraps every route but the
 /// PD bootstrap registry's, inside the access log.
 pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
 
@@ -187,13 +192,14 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
     ) -> PyResult<Self> {
-        Self::start_with_http_layer(
+        Self::start_with_extensions(
             server_args,
             port_offset,
             to_scheduler_cap,
             from_scheduler_cap,
             stage_channel_cap,
             cores,
+            None,
             None,
         )
     }
@@ -262,6 +268,12 @@ impl Server {
         self.push_frame(py, crate::message::response::frame_error(rid, message))
     }
 
+    /// Acknowledge health probes the scheduler skipped while busy, after the
+    /// step that followed them. Blocks for backpressure; `False` only on shutdown.
+    pub fn push_health_ack(&self, py: Python<'_>) -> bool {
+        self.push_frame(py, crate::message::response::frame_health_ack())
+    }
+
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the
     /// resolved processor config; see `RustMmProcessor.resolve_spec` and
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
@@ -281,10 +293,12 @@ impl Server {
 }
 
 impl Server {
-    /// [`Server::start`], with `http_layer` wrapping the HTTP app (see
-    /// [`HttpLayer`]).
+    /// [`Server::start`] with a model package's extensions, the boot of the
+    /// package's own server class: `http_layer` wraps the HTTP app (see
+    /// [`HttpLayer`]), and `generate_hook` adds the package's keys to native
+    /// `/generate` frames (see [`GenerateHook`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn start_with_http_layer(
+    pub fn start_with_extensions(
         server_args: ServerArgs,
         port_offset: Option<u16>,
         to_scheduler_cap: usize,
@@ -292,6 +306,7 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
         http_layer: Option<HttpLayer>,
+        generate_hook: Option<Arc<dyn GenerateHook>>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -304,6 +319,7 @@ impl Server {
             .map_err(|e| value_error("bad listen address", e))?;
         let grpc_addr = grpc_listen_addr(&server_args, port_offset)
             .map_err(|e| value_error("bad gRPC listen address", e))?;
+        let server_args = advertise_listener_ports(server_args, http_addr, grpc_addr);
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
@@ -314,8 +330,10 @@ impl Server {
                 from_scheduler_cap,
                 stage_channel_cap,
                 cores,
+                metrics_listener: port_offset.unwrap_or(0) == 0,
             },
             server_args: std::sync::Arc::new(server_args),
+            generate_hook,
         };
         let rt =
             runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;
@@ -357,6 +375,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DisaggregationMode>()?;
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
+    m.add_class::<MetricsConfig>()?;
     m.add_class::<ServerArgs>()?;
     m.add_class::<MmFamily>()?;
     m.add_class::<MmResample>()?;
