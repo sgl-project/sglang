@@ -386,19 +386,29 @@ class SanaCrossAttention(nn.Module):
             [nn.Linear(inner_dim, query_dim, bias=True), nn.Identity()]
         )
 
+    def project_kv(self, encoder_hidden_states):
+        B, T, _ = encoder_hidden_states.shape
+        kv, _ = self.to_kv(encoder_hidden_states)
+        key, value = kv.split([self.inner_dim, self.inner_dim], dim=-1)
+        key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        return key, value
+
     def forward(
-        self, hidden_states, encoder_hidden_states, encoder_attention_mask=None
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        encoder_attention_mask=None,
+        context_kv=None,
     ):
         B, S, _ = hidden_states.shape
         T = encoder_hidden_states.shape[1]
 
         query = _mps_safe_linear(self.to_q, hidden_states)
-        kv, _ = self.to_kv(encoder_hidden_states)
-        key, value = kv.split([self.inner_dim, self.inner_dim], dim=-1)
-
+        key, value = (
+            self.project_kv(encoder_hidden_states) if context_kv is None else context_kv
+        )
         query = query.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        key = key.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        value = value.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_mask = None
         if encoder_attention_mask is not None:
@@ -457,6 +467,7 @@ class SanaTransformerBlock(nn.Module):
         height,
         width,
         encoder_attention_mask=None,
+        context_kv=None,
     ):
         batch_size = hidden_states.shape[0]
 
@@ -470,7 +481,7 @@ class SanaTransformerBlock(nn.Module):
         hidden_states = sana_residual_gate_add(hidden_states, attn_output, gate_msa)
 
         attn_output = self.attn2(
-            hidden_states, encoder_hidden_states, encoder_attention_mask
+            hidden_states, encoder_hidden_states, encoder_attention_mask, context_kv
         )
         hidden_states = hidden_states + attn_output
 
@@ -554,6 +565,24 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["transformer_blocks"]
 
+    def _context_kvs(self, encoder_hidden_states):
+        """Every block's cross-attn K/V, projected once per request.
+
+        Done here rather than inside the (compiled) blocks. Under layerwise
+        offload the block weights are not resident yet, so the blocks project
+        inline instead.
+        """
+        if self.layerwise_offload_managers:
+            return [None] * len(self.transformer_blocks)
+        return self._cached_per_request(
+            "sana_cross_attn_kv",
+            (encoder_hidden_states,),
+            lambda: [
+                block.attn2.project_kv(encoder_hidden_states)
+                for block in self.transformer_blocks
+            ],
+        )
+
     def _project_text(self, x, batch_size, hidden_dim):
         if x.device.type == "mps":
             x = _mps_safe_linear(self.caption_projection.linear_1, x)
@@ -616,7 +645,8 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             # every block's cross-attention reads the mask as bool: cast it once
             encoder_attention_mask = encoder_attention_mask.bool()
 
-        for block in self.transformer_blocks:
+        context_kvs = self._context_kvs(encoder_hidden_states)
+        for block, context_kv in zip(self.transformer_blocks, context_kvs):
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -624,6 +654,7 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 post_patch_height,
                 post_patch_width,
                 encoder_attention_mask=encoder_attention_mask,
+                context_kv=context_kv,
             )
         hidden_states = self.norm_out(
             hidden_states, embedded_timestep, self.scale_shift_table

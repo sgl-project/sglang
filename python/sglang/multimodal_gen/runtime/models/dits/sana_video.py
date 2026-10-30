@@ -306,18 +306,26 @@ class SanaVideoCrossAttention(nn.Module):
             [nn.Linear(self.inner_dim, query_dim, bias=True), nn.Identity()]
         )
 
+    def project_kv(
+        self, encoder_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key_value, _ = self.to_kv(encoder_hidden_states)
+        key, value = key_value.split(self.inner_dim, dim=-1)
+        return self.norm_k(key), value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_attention_mask: torch.Tensor | None,
+        context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size, query_length, _ = hidden_states.shape
         key_length = encoder_hidden_states.shape[1]
         query = self.norm_q(self.to_q(hidden_states))
-        key_value, _ = self.to_kv(encoder_hidden_states)
-        key, value = key_value.split(self.inner_dim, dim=-1)
-        key = self.norm_k(key)
+        key, value = (
+            self.project_kv(encoder_hidden_states) if context_kv is None else context_kv
+        )
 
         query = query.view(
             batch_size, query_length, self.num_heads, self.head_dim
@@ -385,6 +393,7 @@ class SanaVideoTransformerBlock(nn.Module):
         height: int,
         width: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -401,7 +410,7 @@ class SanaVideoTransformerBlock(nn.Module):
             gate_msa,
         )
         hidden_states = hidden_states + self.attn2(
-            hidden_states, encoder_hidden_states, encoder_attention_mask
+            hidden_states, encoder_hidden_states, encoder_attention_mask, context_kv
         )
 
         norm_hidden_states = sana_ln_modulate(
@@ -544,7 +553,20 @@ class SanaVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ),
         )
 
-        for block in self.transformer_blocks:
+        # Every block's cross-attn K/V once per request, outside the compiled
+        # blocks. Under layerwise offload the blocks project inline instead.
+        if self.layerwise_offload_managers:
+            context_kvs = [None] * len(self.transformer_blocks)
+        else:
+            context_kvs = self._cached_per_request(
+                "sana_video_cross_attn_kv",
+                (encoder_hidden_states,),
+                lambda: [
+                    block.attn2.project_kv(encoder_hidden_states)
+                    for block in self.transformer_blocks
+                ],
+            )
+        for block, context_kv in zip(self.transformer_blocks, context_kvs):
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -554,6 +576,7 @@ class SanaVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 post_patch_height,
                 post_patch_width,
                 rotary_emb,
+                context_kv,
             )
 
         hidden_states = self.norm_out(
