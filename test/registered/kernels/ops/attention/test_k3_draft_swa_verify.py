@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-HQ, HKV, D, L, WINDOW, PAGE = 4, 1, 128, 8, 4096, 64
+D, L, WINDOW, PAGE = 128, 8, 4096, 64
 SLOTS = 200000
 TOL = 2e-2
 BATCHES = [
@@ -36,25 +36,28 @@ BATCHES = [
 
 
 class TestK3DraftSwaVerify(CustomTestCase):
+    hq, hkv, dtype, tol = 4, 1, torch.bfloat16, TOL
+
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(0)
-        cls.kbuf = torch.randn(SLOTS, HKV, D, device="cuda", dtype=torch.bfloat16)
-        cls.vbuf = torch.randn(SLOTS, HKV, D, device="cuda", dtype=torch.bfloat16)
+        cls.kbuf = torch.randn(SLOTS, cls.hkv, D, device="cuda").to(cls.dtype)
+        cls.vbuf = torch.randn(SLOTS, cls.hkv, D, device="cuda").to(cls.dtype)
 
     def _case(self, seqs):
+        hq, hkv = self.hq, self.hkv
         bs, t = len(seqs), len(seqs) * L
-        qkv = torch.randn(t, (HQ + 2 * HKV) * D, device="cuda", dtype=torch.bfloat16)
-        q, k, v = qkv.split([HQ * D, HKV * D, HKV * D], dim=-1)
+        qkv = torch.randn(t, (hq + 2 * hkv) * D, device="cuda", dtype=torch.bfloat16)
+        q, k, v = qkv.split([hq * D, hkv * D, hkv * D], dim=-1)
         prefix = [min(s, WINDOW) for s in seqs]
         kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
         kv_indptr[1:] = torch.cumsum(torch.tensor(prefix, device="cuda"), 0)
         kv_indices = torch.randperm(SLOTS, device="cuda")[: sum(prefix)].long()
         qo_indptr = torch.arange(0, (bs + 1) * L, L, dtype=torch.int32, device="cuda")
         return (
-            q.view(t, HQ, D),
-            k.view(t, HKV, D),
-            v.view(t, HKV, D),
+            q.view(t, hq, D),
+            k.view(t, hkv, D),
+            v.view(t, hkv, D),
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -97,15 +100,20 @@ class TestK3DraftSwaVerify(CustomTestCase):
                 )  # fmt: skip
             )
             err = self._ref(q, k, v, qo, kvp, kvi) - self._fused(q, k, v, qo, kvp, kvi)
-            self.assertLess(err.abs().max().item(), TOL, seqs[:4])
+            self.assertLess(err.abs().max().item(), self.tol, seqs[:4])
 
     def test_split_count_does_not_change_output(self):
-        for bs in (1, 4, 8):
-            q, k, v, qo, kvp, kvi = self._case([9000] * bs)
+        for seqs in ([9000], [9000] * 4, [9000] * 8, [100, 9000, 700, 1]):
+            q, k, v, qo, kvp, kvi = self._case(seqs)
             ref = self._ref(q, k, v, qo, kvp, kvi)
-            for n_splits in (8, 16, 32, 64):
+            for n_splits in (4, 8, 16, 32, 64):
                 out = self._fused(q, k, v, qo, kvp, kvi, n_splits)
-                self.assertLess((ref - out).abs().max().item(), TOL, (bs, n_splits))
+                err = (ref - out).abs().max().item()
+                self.assertLess(err, self.tol, (seqs, n_splits))
+
+
+class TestK3DraftSwaVerifyFp8(TestK3DraftSwaVerify):
+    hq, hkv, dtype, tol = 32, 8, torch.float8_e4m3fn, 4e-2
 
 
 if __name__ == "__main__":

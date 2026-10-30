@@ -10,6 +10,8 @@ with P window keys sees prefix key n iff ``P + l <= n + W``, block key j iff
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -18,6 +20,11 @@ from sglang.srt.utils import is_hip
 
 _IS_HIP = is_hip()
 _AMD_KW = {"waves_per_eu": 2, "matrix_instr_nonkdim": 16} if _IS_HIP else {}
+
+
+@triton.jit
+def _split_len(P, N_SPLITS: tl.constexpr, BLOCK_N: tl.constexpr):
+    return tl.cdiv(tl.cdiv(P, N_SPLITS), BLOCK_N) * BLOCK_N
 
 
 @triton.jit
@@ -76,7 +83,7 @@ def _draft_swa_stage1(
     kv_start = tl.load(kv_indptr + b)
     P = tl.load(kv_indptr + b + 1) - kv_start
 
-    per_split = tl.cdiv(tl.cdiv(P, N_SPLITS), BLOCK_N) * BLOCK_N
+    per_split = _split_len(P, N_SPLITS, BLOCK_N)
     n_lo = per_split * s
     n_hi = tl.minimum(n_lo + per_split, P)
     if SLIDING_WINDOW > 0:
@@ -169,16 +176,17 @@ def _draft_swa_stage1(
     has = l_i > 0.0
     out = acc / tl.where(has, l_i, 1.0)[:, None]
     lse = tl.where(has, m_i + tl.log(tl.where(has, l_i, 1.0)), float("-inf"))
-    tl.store(
-        Att_Out
-        + b * stride_ob
-        + row_h[:, None] * stride_oh
-        + s * stride_os
-        + row_l[:, None] * stride_ol
-        + offs_dv[None, :],
-        out,
-        mask=mask_r[:, None],
-    )
+    if (s == N_SPLITS) or (n_hi > n_lo):
+        tl.store(
+            Att_Out
+            + b * stride_ob
+            + row_h[:, None] * stride_oh
+            + s * stride_os
+            + row_l[:, None] * stride_ol
+            + offs_dv[None, :],
+            out,
+            mask=mask_r[:, None],
+        )
     tl.store(
         Att_Lse + b * stride_lb + row_h * stride_lh + s * stride_ls + row_l,
         lse,
@@ -187,11 +195,41 @@ def _draft_swa_stage1(
 
 
 @triton.jit
+def _merge_splits(
+    o,
+    base_lse,
+    base_ao,
+    stride_ls,
+    stride_os,
+    mask_l,
+    m_safe,
+    n_act,
+    NS: tl.constexpr,
+    SKIP_EMPTY: tl.constexpr,
+):
+    for si in tl.static_range(NS):
+        live = True
+        if SKIP_EMPTY:
+            live = (si < n_act) or (si == NS - 1)
+        if live:
+            lse_s = tl.load(base_lse + si * stride_ls, mask=mask_l, other=float("-inf"))
+            w_s = tl.exp(lse_s - m_safe)
+            ao_s = tl.load(
+                base_ao + si * stride_os,
+                mask=mask_l[:, None] & (lse_s > float("-inf"))[:, None],
+                other=0.0,
+            )
+            o += ao_s * w_s[:, None]
+    return o
+
+
+@triton.jit
 def _draft_swa_stage2(
     Att_Out,
     Att_Lse,
     O,
     qo_indptr,
+    kv_indptr,
     stride_ob,
     stride_oh,
     stride_os,
@@ -205,6 +243,7 @@ def _draft_swa_stage2(
     NS: tl.constexpr,  # N_SPLITS + 1 (last = block-block part)
     NS_PAD: tl.constexpr,
     DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -214,13 +253,17 @@ def _draft_swa_stage2(
     q_start = tl.load(qo_indptr + b)
     l_ext = tl.load(qo_indptr + b + 1) - q_start
     mask_l = offs_l < l_ext
+    P = tl.load(kv_indptr + b + 1) - tl.load(kv_indptr + b)
+    per_split = _split_len(P, NS - 1, BLOCK_N)
+    n_act = tl.minimum(tl.cdiv(P, tl.maximum(per_split, 1)), NS - 1)
     lse = tl.load(
         Att_Lse
         + b * stride_lb
         + h * stride_lh
         + offs_s[:, None] * stride_ls
         + offs_l[None, :],
-        mask=(offs_s[:, None] < NS) & mask_l[None, :],
+        mask=((offs_s[:, None] < n_act) | (offs_s[:, None] == NS - 1))
+        & mask_l[None, :],
         other=float("-inf"),
     )
     m = tl.max(lse, 0)
@@ -235,15 +278,14 @@ def _draft_swa_stage2(
         + offs_l[:, None] * stride_ol
         + offs_dv[None, :]
     )
-    for si in range(NS):
-        lse_s = tl.load(base_lse + si * stride_ls, mask=mask_l, other=float("-inf"))
-        w_s = tl.exp(lse_s - m_safe)
-        ao_s = tl.load(
-            base_ao + si * stride_os,
-            mask=mask_l[:, None] & (lse_s > float("-inf"))[:, None],
-            other=0.0,
+    if n_act == NS - 1:
+        o = _merge_splits(
+            o, base_lse, base_ao, stride_ls, stride_os, mask_l, m_safe, n_act, NS, False
         )
-        o += ao_s * w_s[:, None]
+    else:
+        o = _merge_splits(
+            o, base_lse, base_ao, stride_ls, stride_os, mask_l, m_safe, n_act, NS, True
+        )
     o = o / tl.where(den > 0, den, 1.0)[:, None]
     tl.store(
         O
@@ -309,7 +351,7 @@ def can_handle(
         return False
     if k_buffer.stride(-1) != 1 or v_buffer.stride(-1) != 1:
         return False
-    if k_buffer.dtype not in (torch.bfloat16, torch.float16):
+    if k_buffer.dtype not in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
         return False
     try:
         mle = int(max_len_extend)
@@ -336,8 +378,8 @@ def draft_swa_verify_fwd(
     sliding_window_size,
     max_bs,
     n_splits=None,
-    block_n=64,
-    num_warps=4,
+    block_n=128,
+    num_warps=None,
 ):
     """q: [T, Hq, D]; k/v: [T, Hkv, D] (may be strided column slices);
     o: [T, Hq, Dv] output. kv_indptr/kv_indices describe the (window) prefix.
@@ -347,7 +389,10 @@ def draft_swa_verify_fwd(
     g = hq // hkv
     l_pad = triton.next_power_of_2(int(max_len_extend))
     if n_splits is None:
-        n_splits = 16 if bs <= 8 else 8
+        programs = bs * hkv * (2 if l_pad > 8 else 1)
+        n_splits = min(16, max(4, 1 << max(0, round(math.log2(512 / programs)))))
+    if num_warps is None:
+        num_warps = 2 if g * l_pad <= 32 else 4
     max_bs = max(int(max_bs or bs), bs)
     att_out, att_lse = _scratch(max_bs, hq, n_splits + 1, l_pad, dv, q.device)
     sw = (
@@ -401,6 +446,7 @@ def draft_swa_verify_fwd(
         att_lse,
         o,
         qo_indptr,
+        kv_indptr,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -414,7 +460,8 @@ def draft_swa_verify_fwd(
         NS=n_splits + 1,
         NS_PAD=triton.next_power_of_2(n_splits + 1),
         DV=dv,
-        num_warps=2,
+        BLOCK_N=block_n,
+        num_warps=2 if l_pad <= 8 else 4,
         num_stages=1,
     )
     return o
