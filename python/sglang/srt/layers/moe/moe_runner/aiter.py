@@ -484,13 +484,6 @@ def pre_permute_standard_to_aiter(
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
-        # A caller-published destination (e.g. K3's joint all-reduce buffer)
-        # saves the copy out of fused_moe's own output.
-        output=(
-            zero_copy_context.get_moe_output(hidden_states)
-            if is_gfx95_supported()
-            else None
-        ),
     )
 
 
