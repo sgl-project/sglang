@@ -20,7 +20,7 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps the existing deployment settings; **High Throughput** removes all speculative decoding parameters. Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps unified memory disabled; **High Throughput** removes all speculative decoding parameters and enables unified memory on NVIDIA GPUs (B300, GB300, B200, and H200). Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
@@ -30,6 +30,8 @@ import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+The **Unified Memory** control has **Enable** and **Disable** options. It initially inherits the current Deployment command and resets to that command when you change the Deployment selection. **Enable** is unavailable on MI355X and Xeon because their `aiter` and `intel_amx` attention backends do not support the unified KV layout.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
