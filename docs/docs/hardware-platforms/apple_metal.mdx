@@ -100,7 +100,7 @@ The MLX backend supports two quantization paths on Apple Silicon:
 
 ## Memory
 
-MLX keeps freed GPU buffers in a cache for reuse and does not return them to the OS. By default the cache may grow to the whole Metal working set, so a burst of long prompts can leave the server holding most of unified memory and push the rest of the system into swap. Set `SGLANG_MLX_CACHE_LIMIT_GB` to bound it:
+MLX keeps freed GPU buffers in a cache for reuse and does not return them to the OS. Set `SGLANG_MLX_CACHE_LIMIT_GB` to cap the cache, in GB, before the model loads; `0` disables it:
 
 ```bash
 SGLANG_MLX_CACHE_LIMIT_GB=2 python -m sglang.launch_server --model-path mlx-community/Qwen3-4B-4bit
@@ -108,7 +108,7 @@ SGLANG_MLX_CACHE_LIMIT_GB=2 python -m sglang.launch_server --model-path mlx-comm
 
 On an M4 Pro with 24 GB running Qwen3 4B 4bit, a 2 GB cap held the cache at 2.05 GiB through 1K to 6K token prompts and a burst of 8 concurrent 2K prompts. It cut peak scheduler footprint from 18.4 GB to 14.3 GB and swapouts during long prompts by 93%, with identical outputs. The cap bounds only the cache; request KV buffers kept for reuse count as active memory and stay allocated.
 
-Set `SGLANG_MLX_MEMORY_LOG=1` to log active, cache, and peak memory at request lifecycle points.
+Set `SGLANG_MLX_MEMORY_LOG=1` to log active, cache, and peak memory, plus idle request KV buffers, at startup, prefill, extend, request release, and each `mx.clear_cache()`. The startup line also prints the cache limit in effect.
 
 ## Benchmarking with Requests
 

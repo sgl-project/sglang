@@ -1696,10 +1696,16 @@ class MlxModelRunner:
             return
         gib = 1024**3
         idle_kv = sum(a.nbytes for a in self.cache_state_arrays(self._cache_pool))
+        cache = f"cache={mx.get_cache_memory() / gib:.2f} GiB"
+        if event == "startup":
+            # MLX has no getter; set_cache_limit returns the previous limit.
+            limit = mx.set_cache_limit(0)
+            mx.set_cache_limit(limit)
+            cache += f" (limit={limit / gib:.2f} GiB)"
         logger.info(
             f"MLX memory [{event}]: "
             f"active={mx.get_active_memory() / gib:.2f} GiB, "
-            f"cache={mx.get_cache_memory() / gib:.2f} GiB, "
+            f"{cache}, "
             f"peak={mx.get_peak_memory() / gib:.2f} GiB, "
             f"requests={len(self._req_caches)}, "
             f"idle_kv_lists={len(self._cache_pool)}, "

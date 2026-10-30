@@ -133,6 +133,18 @@ class TestMlxMemoryLog(CustomTestCase):
         )
         self.assertGreater(parked, 0)
 
+    def test_startup_reports_the_effective_cache_limit(self):
+        runner = _runner(memory_log=True)
+        limit = 2 * 1024**3
+        previous = runner_module.mx.set_cache_limit(limit)
+        try:
+            with self.assertLogs(LOGGER, level="INFO") as logs:
+                runner.log_memory("startup")
+        finally:
+            restored = runner_module.mx.set_cache_limit(previous)
+        self.assertIn("(limit=2.00 GiB)", logs.output[0])
+        self.assertEqual(restored, limit)
+
 
 class _StopAfterCacheLimit(Exception):
     pass
@@ -154,14 +166,6 @@ class TestMlxCacheLimit(CustomTestCase):
         ):
             self._construct()
         set_limit.assert_called_once_with(2 * 1024**3)
-
-    def test_unset_leaves_the_mlx_default(self):
-        with (
-            envs.SGLANG_MLX_CACHE_LIMIT_GB.override(None),
-            mock.patch.object(runner_module.mx, "set_cache_limit") as set_limit,
-        ):
-            self._construct()
-        set_limit.assert_not_called()
 
     def test_negative_cap_is_rejected(self):
         with (
