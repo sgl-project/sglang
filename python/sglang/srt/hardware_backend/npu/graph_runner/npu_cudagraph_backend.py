@@ -25,7 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.hardware_backend.npu.eplb_statistics import (
-    isolate_npu_draft_recording,
+    isolate_draft_expert_recording,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
@@ -92,7 +92,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     # Capture can call the model directly, bypassing ModelRunner.forward.
     # Disable draft hooks during warmup and capture to keep them out of the graph.
-    @isolate_npu_draft_recording
+    @isolate_draft_expert_recording
     def capture_one(
         self,
         shape_key: ShapeKey,

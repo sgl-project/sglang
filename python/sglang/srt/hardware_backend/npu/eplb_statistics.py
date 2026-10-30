@@ -34,7 +34,7 @@ from sglang.srt.hardware_backend.npu.eplb import (
 from sglang.srt.runtime_context import get_exec
 
 
-def isolate_npu_draft_recording(forward):
+def isolate_draft_expert_recording(forward):
     """Disable draft hooks and let the NPU recorder skip reset/append."""
 
     @wraps(forward)
