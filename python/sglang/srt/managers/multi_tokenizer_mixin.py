@@ -190,16 +190,8 @@ def _handle_output_by_index(output, i):
                 output, "spec_cap_lens_histogram", i
             ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            decode_ids=_extract_field_by_index(output, "decode_ids", i),
-            read_offsets=_extract_field_by_index(output, "read_offsets", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
-            skip_special_tokens=_extract_field_by_index(
-                output, "skip_special_tokens", i
-            ),
-            spaces_between_special_tokens=_extract_field_by_index(
-                output, "spaces_between_special_tokens", i
-            ),
-            no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
+            detokenize_headers=_extract_field_by_index(output, "detokenize_headers", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             request_stats=_extract_field_by_index(output, "request_stats", i),
@@ -555,7 +547,7 @@ class MultiHttpWorkerDetokenizerMixin:
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
                     _send_output_to_tokenizer_workers(
-                        output, recv_obj.http_worker_ipcs, self.socket_mapping
+                        output, output.http_worker_ipcs, self.socket_mapping
                     )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
@@ -704,11 +696,10 @@ class MultiTokenizerRouter:
 class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
-    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
-    ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
-    always land on the same detokenizer and ``detokenize_state_table`` stays consistent.
-    With a single tokenizer worker no ``http_worker_ipc`` is stamped, and the
-    ``rid`` is hashed instead.
+    Each request is pinned to a worker by hashing its ``rid`` with ``zlib.crc32``
+    (deterministic across runs), so all outputs of a rid land on the same
+    detokenizer and ``detokenize_state_table`` stays consistent. The route cannot
+    be the key: only some outputs of a request carry its ``http_worker_ipc``.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -726,23 +717,17 @@ class MultiDetokenizerRouter:
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
-    def _pick_for(self, http_worker_ipc: Optional[str], rid: str) -> str:
-        return self._pick(rid if http_worker_ipc is None else http_worker_ipc)
-
     def _send_batch(self, recv_obj: BaseBatchReq) -> None:
-        ipcs = recv_obj.http_worker_ipcs
-        assert ipcs is not None and len(ipcs) == len(recv_obj.rids), (
-            f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
-        )
-        targets = [self._pick_for(ipc, rid) for ipc, rid in zip(ipcs, recv_obj.rids)]
+        targets = [self._pick(rid) for rid in recv_obj.rids]
 
         grouped = _split_batch_by_key(recv_obj, targets)
         if grouped is None:
+            ipcs = recv_obj.http_worker_ipcs
             for index, target in enumerate(targets):
                 one = _handle_output_by_index(recv_obj, index)
                 if one is recv_obj:
                     raise TypeError(f"Cannot split {type(recv_obj)}")
-                one.http_worker_ipcs = [ipcs[index]]
+                one.http_worker_ipcs = None if ipcs is None else [ipcs[index]]
                 self._send(target, one)
             return
 
@@ -761,12 +746,10 @@ class MultiDetokenizerRouter:
 
             # Single request: route like the batch items of the same rid.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None or recv_obj.rid is not None
-                ), f"Single req {type(recv_obj).__name__} has no routing key"
-                self._send(
-                    self._pick_for(recv_obj.http_worker_ipc, recv_obj.rid), recv_obj
+                assert recv_obj.rid is not None, (
+                    f"Single req {type(recv_obj).__name__} has no rid"
                 )
+                self._send(self._pick(recv_obj.rid), recv_obj)
                 continue
 
             # Batch request.
