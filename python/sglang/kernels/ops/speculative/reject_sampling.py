@@ -33,6 +33,8 @@ def speculative_sampling_classic_kernel(
     BLOCK_V: tl.constexpr,
     BLOCK_VERIFICATION: tl.constexpr = False,
     BLOCK_REDUCE: tl.constexpr = 4096,
+    # The draft is a point mass on each proposed token (a top-1 chain); DraftProbs is unread.
+    ONE_HOT_DRAFT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
@@ -137,12 +139,15 @@ def speculative_sampling_classic_kernel(
                 + cur_prob_row * stride_tp_s
                 + draft_token * stride_tp_v
             )
-            q = tl.load(
-                DraftProbs
-                + pid * stride_dp_b
-                + cur_prob_row * stride_dp_s
-                + draft_token * stride_dp_v
-            )
+            if ONE_HOT_DRAFT:
+                q = 1.0
+            else:
+                q = tl.load(
+                    DraftProbs
+                    + pid * stride_dp_b
+                    + cur_prob_row * stride_dp_s
+                    + draft_token * stride_dp_v
+                )
             coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
             # A proposal token must have positive probability under its draft distribution.
             q_is_prob = (q > 0.0) & (q <= 1.0)
@@ -171,6 +176,10 @@ def speculative_sampling_classic_kernel(
     # DraftProbs, but the all-accepted branch samples pure target p and never
     # dereferences this pointer; on rejection cur_prob_row <= num_steps - 1.
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
+    # On rejection the residual removes the rejected draft token (slot cur_prob_row + 1).
+    rejected_token = tl.load(
+        cand_ptr_base + tl.minimum(cur_prob_row + 1, NUM_SLOTS - 1) * stride_cand_s
+    )
 
     # Reuse the selected prefix mass as the correction normalizer.
     if norm_sum < 0.0:
@@ -186,8 +195,11 @@ def speculative_sampling_classic_kernel(
             if all_drafts_accepted:
                 val = p_val
             else:
-                q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                if ONE_HOT_DRAFT:
+                    q_val = (v_offsets == rejected_token).to(tl.float32)
+                else:
+                    q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                    q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Treat any non-probability q (NaN, +-inf, negative) as 0: the
                 # residual falls back to p. A comparison against NaN is false, so
                 # the range test rejects it along with the infinities.
@@ -216,8 +228,11 @@ def speculative_sampling_classic_kernel(
             if all_drafts_accepted:
                 val = p_val
             else:
-                q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                if ONE_HOT_DRAFT:
+                    q_val = (v_offsets == rejected_token).to(tl.float32)
+                else:
+                    q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                    q_val = tl.load(q_ptr, mask=mask, other=0.0)
                 # Same guard as pass 1.
                 q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
                 diff = residual_scale * p_val - q_val
@@ -292,4 +307,65 @@ def chain_speculative_sampling_triton(
         BLOCK_VERIFICATION=block_verification,
         BLOCK_REDUCE=block_reduce,
         num_warps=num_warps,
+    )
+
+
+def chain_speculative_sampling_target_only_triton(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    uniform_samples,
+    uniform_samples_for_final_sampling,
+    target_probs,
+    draft_probs,  # not used: the draft is a point mass on each proposed token
+    threshold_single,
+    threshold_acc,
+    deterministic,  # not used
+):
+    """Lossless sampled verification of a top-1 draft chain against target probs.
+
+    A deterministic draft proposes each token with probability 1, so classic
+    speculative sampling with a one-hot proposal accepts token ``t`` with
+    probability ``p(t)`` and resamples a rejection from ``p`` with ``t`` removed.
+    Needs no draft distribution, so it also serves reduced-vocab drafts.
+    """
+    if threshold_single != 1.0 or threshold_acc != 1.0:
+        raise ValueError(
+            "Target-only chain sampling supports only exact verification "
+            "(speculative accept thresholds of 1.0)."
+        )
+    batch_size, num_slots = candidates.shape
+    vocab_size = target_probs.shape[-1]
+    speculative_sampling_classic_kernel[(batch_size,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        target_probs,
+        candidates.stride(0),
+        candidates.stride(1),
+        retrive_index.stride(0),
+        retrive_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        NUM_SLOTS=num_slots,
+        VOCAB_SIZE=vocab_size,
+        BLOCK_V=4096,
+        BLOCK_REDUCE=min(triton.next_power_of_2(vocab_size), 32768),
+        ONE_HOT_DRAFT=True,
+        num_warps=4,
     )

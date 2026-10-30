@@ -54,8 +54,8 @@ def _normalize_kernel(
 def _prepare_probs(probs: torch.Tensor) -> torch.Tensor:
     if probs.ndim != 2:
         raise ValueError(f"probs must be 2D, got shape={tuple(probs.shape)}")
-    if not probs.is_cuda:
-        raise ValueError("renorm kernels require a CUDA/HIP tensor")
+    if not (probs.is_cuda or probs.is_xpu):
+        raise ValueError("renorm kernels require a CUDA/HIP/XPU tensor")
     return probs.float().contiguous()
 
 
