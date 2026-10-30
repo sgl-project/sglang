@@ -2,6 +2,7 @@ import functools
 import json
 import unittest
 import warnings
+from unittest.mock import patch
 
 import xgrammar as xgr
 
@@ -2333,6 +2334,187 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertGreater(len(all_calls), 0)
 
     # ==================== Parameter Type Tests ====================
+
+    def _check_structured_union_value(
+        self, schema, raw_value, expected, definitions=None
+    ):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="record",
+                    parameters={
+                        "type": "object",
+                        "properties": {"value": schema},
+                        "$defs": definitions or {},
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call><function=record><parameter=value>"
+            f"{raw_value}</parameter></function></tool_call>"
+        )
+        for chunk_size in (0, 1, 7):
+            with self.subTest(
+                schema=schema, raw_value=raw_value, chunk_size=chunk_size
+            ):
+                detector = Qwen3CoderDetector()
+                if chunk_size == 0:
+                    calls = detector.detect_and_parse(text, tools).calls
+                else:
+                    calls = []
+                    for offset in range(0, len(text), chunk_size):
+                        calls.extend(
+                            detector.parse_streaming_increment(
+                                text[offset : offset + chunk_size], tools
+                            ).calls
+                        )
+                arguments = json.loads("".join(call.parameters for call in calls))
+                self.assertEqual(arguments, {"value": expected})
+
+    def test_structured_string_unions_preserve_objects_and_arrays(self):
+        """Object/array alternatives must survive one arguments decode in either mode."""
+        for value in ({"city": "Paris"}, [{"city": "Paris"}]):
+            object_schema = {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }
+            structured = (
+                object_schema
+                if isinstance(value, dict)
+                else {"type": "array", "items": object_schema}
+            )
+            for keyword in ("anyOf", "oneOf"):
+                for branches in (
+                    [{"type": "string"}, structured],
+                    [structured, {"type": "string"}],
+                ):
+                    self._check_structured_union_value(
+                        {keyword: branches}, json.dumps(value), value
+                    )
+
+    def test_union_plain_text_skips_json_decoding(self):
+        """Plain union strings must not pay for a failed JSON decode."""
+        detector = Qwen3CoderDetector()
+        for alternative in ("object", "null"):
+            schema = {"anyOf": [{"type": "string"}, {"type": alternative}]}
+            with patch(
+                "sglang.srt.function_call.qwen3_coder_detector.json.loads"
+            ) as loads:
+                raw = "  Paris, France  "
+                self.assertEqual(
+                    detector._convert_param_value(
+                        raw, "value", {"value": schema}, "record"
+                    ),
+                    raw,
+                )
+                loads.assert_not_called()
+        for raw, expected in (("  {}", {}), ("  []", [])):
+            self._check_structured_union_value(
+                {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]},
+                raw,
+                expected,
+            )
+
+    def test_structured_union_conversion_preserves_string_values(self):
+        """Structured decoding must not reinterpret plain strings or scalar unions."""
+        union = {"anyOf": [{"type": "string"}, {"type": "object"}]}
+        for schema, raw in (
+            ({"type": "string"}, '{"city":"Paris"}'),
+            (union, "Paris, France"),
+            (union, '{"city":'),
+            (union, '"Paris"'),
+            ({"anyOf": [{"type": "number"}, {"type": "string"}]}, "250"),
+            ({"anyOf": [{"type": "boolean"}, {"type": "string"}]}, "true"),
+        ):
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_union_nonfinite_numbers_remain_strings(self):
+        """Nested non-finite numbers must not produce invalid argument JSON."""
+        schema = {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]}
+        for number in ("NaN", "Infinity", "-Infinity", "1e309", "-1e309"):
+            for raw in (f'{{"number":{number}}}', f"[{number}]"):
+                self._check_structured_union_value(schema, raw, raw)
+        self._check_structured_union_value(
+            schema, '[1.5,1e3,"NaN","Infinity"]', [1.5, 1000.0, "NaN", "Infinity"]
+        )
+
+    def test_union_validation_errors_preserve_tool_calls(self):
+        """Invalid or recursive schemas must preserve strings in both parse modes."""
+        for branch in (
+            {"$id": "urn:recursive", "$ref": "urn:recursive"},
+            {"type": "map"},
+            {"type": "array", "items": [{"type": "string"}]},
+        ):
+            schema = {"anyOf": [{"type": "string"}, branch]}
+            raw = '["Paris"]' if branch.get("type") == "array" else "{}"
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_structured_union_conversion_requires_schema_match(self):
+        """A decoded structure must satisfy constraints, including oneOf exclusivity."""
+        object_schema = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        }
+        for schema, raw in (
+            ({"anyOf": [{"type": "string"}, object_schema]}, '{"country":"France"}'),
+            ({"anyOf": [{"type": "string"}, object_schema]}, '{"city":123}'),
+            (
+                {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ]
+                },
+                "[123]",
+            ),
+            (
+                {"oneOf": [{"type": "string"}, object_schema, {"type": "object"}]},
+                '{"city":"Paris"}',
+            ),
+            ({"anyOf": [{"type": "string"}, {"$ref": "#/$defs/missing"}]}, "{}"),
+        ):
+            self._check_structured_union_value(schema, raw, raw)
+
+    def test_union_references_use_enclosing_schema(self):
+        """Root definitions must resolve without losing their validation constraints."""
+        definitions = {
+            "City": {"type": "string"},
+            "Location": {
+                "type": "object",
+                "properties": {"city": {"$ref": "#/$defs/City"}},
+                "required": ["city"],
+            },
+        }
+        for keyword in ("anyOf", "oneOf"):
+            schema = {keyword: [{"type": "string"}, {"$ref": "#/$defs/Location"}]}
+            for raw, expected in (
+                ('{"city":"Paris"}', {"city": "Paris"}),
+                ('{"city":123}', '{"city":123}'),
+                ('{"country":"France"}', '{"country":"France"}'),
+            ):
+                self._check_structured_union_value(schema, raw, expected, definitions)
+
+    def test_union_schema_references_never_fetch(self):
+        """Unresolved external references must not trigger network access."""
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("Unexpected schema fetch"),
+        ) as urlopen:
+            self._check_structured_union_value(
+                {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"$ref": "https://example.invalid/schema"},
+                    ]
+                },
+                "{}",
+                "{}",
+            )
+            urlopen.assert_not_called()
 
     def test_integer_parameter_conversion(self):
         """
