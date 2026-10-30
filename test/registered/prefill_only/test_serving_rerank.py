@@ -1,7 +1,18 @@
 import asyncio
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import WhitespaceSplit
+from transformers import Mistral3Config, PreTrainedTokenizerFast
+
+from sglang.srt.configs.embedding_model_spec import (
+    RerankInputFormat,
+    resolve_embedding_model_spec,
+)
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
 from sglang.srt.managers.tokenizer_manager_score_mixin import ScoreResult
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -27,6 +38,9 @@ except ModuleNotFoundError as e:
 
 
 class _DummyModelConfig:
+    embedding_model_spec = resolve_embedding_model_spec(
+        [], is_embedding_requested=False, is_embedding_gemma=False
+    )
     # Keep consistent with TokenizerManager.model_config usage
     is_generation = False
 
@@ -49,6 +63,72 @@ class _DummyTokenizerManager:
 class TestOpenAIServingRerankUnit(unittest.TestCase):
     def setUp(self):
         self.handler = OpenAIServingRerank(_DummyTokenizerManager())
+
+    def test_query_document_chat_format_preserves_roles_and_images(self):
+        backend = Tokenizer(
+            WordLevel(
+                {"query": 0, "document": 1, "q": 2, "d": 3, "[IMG]": 4, "[UNK]": 5},
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        tokenizer.chat_template = """{%- for message in messages -%}
+{{ message.role }} {{ ' ' }}
+{%- for part in message.content -%}
+{{ part.text if part.type == 'text' else '[IMG]' }} {{ ' ' }}
+{%- endfor -%}
+{%- endfor -%}"""
+        tm = _DummyTokenizerManager()
+        tm.tokenizer = tokenizer
+        config = Mistral3Config(
+            architectures=["Mistral3ForSequenceClassification"],
+            text_config={
+                "model_type": "ministral3",
+                "is_causal": False,
+                "pooling": "avg",
+            },
+            vision_config={"model_type": "pixtral"},
+            is_causal=False,
+            pooling="avg",
+            num_labels=1,
+        )
+        tm.model_config = SimpleNamespace(
+            is_generation=False,
+            embedding_model_spec=resolve_embedding_model_spec(
+                config.architectures,
+                is_embedding_requested=False,
+                is_embedding_gemma=False,
+                hf_config=config,
+            ),
+        )
+        handler = OpenAIServingRerank(tm)
+        document = [
+            {"type": "text", "text": "d"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/doc.png"}},
+        ]
+        request = V1RerankReqInput(query="q", documents=[document, "d"])
+        adapted, _ = handler._convert_to_internal_request(request)
+        self.assertEqual(adapted.input_ids, [[0, 2, 1, 3, 4], [0, 2, 1, 3]])
+        self.assertEqual(adapted.image_data, [["https://example.com/doc.png"], None])
+        adapted.normalize_batch_and_arguments()
+        self.assertEqual(adapted.batch_size, 2)
+        result = handler._build_rerank_response([2.0, 1.0], request)
+        returned = result[0].model_dump()["document"]
+        self.assertEqual(len(returned), 2)
+        self.assertEqual(returned[0]["text"], "d")
+        self.assertEqual(returned[1]["image_url"]["url"], "https://example.com/doc.png")
+
+        tm.model_config.embedding_model_spec = replace(
+            tm.model_config.embedding_model_spec,
+            rerank_input_format=RerankInputFormat.DEFAULT,
+        )
+        other_handler = OpenAIServingRerank(tm)
+        adapted, _ = other_handler._convert_to_internal_request(
+            V1RerankReqInput(query="q", documents=["d"])
+        )
+        self.assertTrue(adapted.is_cross_encoder_request)
+        self.assertEqual(adapted.text, [["q", "d"]])
 
     def test_convert_to_internal_request_cross_encoder_pairs(self):
         req = V1RerankReqInput(

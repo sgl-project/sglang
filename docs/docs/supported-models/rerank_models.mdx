@@ -33,6 +33,12 @@ Some models may require `--trust-remote-code`.
       <td>Currently only support <code>attention-backend</code> <code>triton</code> and <code>torch_native</code>. High-performance cross-encoder reranker model from BAAI. Suitable for reranking search results based on semantic relevance.</td>
     </tr>
     <tr>
+      <td><strong>Nemotron 3.5 Rerank (Mistral3ForSequenceClassification)</strong></td>
+      <td><code>nvidia/Nemotron-3.5-Rerank-8B-BF16</code></td>
+      <td>Checkpoint template</td>
+      <td>Bidirectional cross-encoder for text, images, and combined documents. Returns raw relevance scores; higher is more relevant. Embedding mode is enabled automatically.</td>
+    </tr>
+    <tr>
       <td><strong>Qwen3-Reranker (decoder-only yes/no)</strong></td>
       <td><code>Qwen/Qwen3-Reranker-8B</code></td>
       <td><code>examples/chat_template/qwen3_reranker.jinja</code></td>
@@ -47,6 +53,50 @@ Some models may require `--trust-remote-code`.
   </tbody>
 </table>
 
+
+## Nemotron 3.5 multimodal reranking
+
+The native implementation enables embedding mode automatically and uses the checkpoint's query/document template. Prefix caching and chunked prefill are disabled because its attention is bidirectional. No custom template or remote model code is required.
+
+Launch on an NVIDIA GPU with enough memory for the BF16 checkpoint:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path nvidia/Nemotron-3.5-Rerank-8B-BF16 \
+  --context-length 32768 --port 30000
+```
+
+Each document can be a string or a list of text and image content parts:
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/rerank",
+    json={
+        "query": "What is NVIDIA NeMo Framework?",
+        "documents": [
+            "NeMo Framework supports developing LLMs and multimodal models.",
+            [
+                {"type": "text", "text": "NeMo Framework architecture"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://docs.nvidia.com/nemo-framework/user-guide/24.07/_images/nemo-llm-mm-stack.png"
+                    },
+                },
+            ],
+            "A biological model for DNA and protein sequences.",
+        ],
+        "return_documents": False,
+    },
+    timeout=120,
+)
+response.raise_for_status()
+print(response.json())
+```
+
+The response is sorted by descending raw score. Scores are not probabilities and can be negative. Image URLs and base64 data URLs are supported; video inputs are rejected.
 
 ## Cross-Encoder Rerank (embedding runner)
 

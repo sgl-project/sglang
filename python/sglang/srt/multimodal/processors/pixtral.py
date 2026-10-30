@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.mistral3_reranker import Mistral3ForSequenceClassification
 from sglang.srt.models.pixtral import (
     PixtralForConditionalGeneration,
     PixtralVisionModel,
@@ -23,7 +24,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 class PixtralProcessor(BaseMultimodalProcessor):
-    models = [PixtralVisionModel, PixtralForConditionalGeneration]
+    models = [
+        PixtralVisionModel,
+        PixtralForConditionalGeneration,
+        Mistral3ForSequenceClassification,
+    ]
     gpu_image_decode = False  # Pixtral processes loaded image as PIL image explicitly
 
     PAD_TOKEN = "<pad>"
