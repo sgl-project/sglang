@@ -491,6 +491,7 @@ class TestBlock32Ue8m0DeepGemmSelection(CustomTestCase):
         method.convert_mxfp8_to_block = False
         method.use_mxfp8 = False
         method.use_marlin = False
+        method.use_npu_block_fp8 = False
         method.block_fp8_as_mxfp8 = False
         method.w8a8_block_fp8_linear = runner
         layer.quant_method = method
