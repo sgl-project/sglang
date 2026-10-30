@@ -15,9 +15,12 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestMLADraftExtendPacking(unittest.TestCase):
     def test_graph_metadata_preserves_widened_draft_window(self):
         for dcp in (False, True):
-            with self.subTest(dcp=dcp), patch(
-                "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
-                return_value=SimpleNamespace(dcp_enabled=dcp),
+            with (
+                self.subTest(dcp=dcp),
+                patch(
+                    "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=dcp),
+                ),
             ):
                 backend = TRTLLMMLABackend.__new__(TRTLLMMLABackend)
                 backend.num_draft_tokens = 4
