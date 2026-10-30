@@ -1258,7 +1258,10 @@ class SamplingParams:
         add_argument(
             "--num-profiled-timesteps",
             type=int,
-            help="Number of timesteps to profile after warmup",
+            help=(
+                "Number of denoising timesteps to profile after one warmup step; "
+                "-1 profiles all steps. Warmup is skipped when profiling every step"
+            ),
         )
         add_argument(
             "--profile-all-stages",
