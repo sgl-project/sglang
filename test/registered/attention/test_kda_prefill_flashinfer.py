@@ -224,7 +224,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
         batch.mamba_prefill_track_mask_cpu = tracked
         batch.mamba_track_seqlens_cpu = list(extend_lens)
         fixture.actual_module.attn.lower_bound = -5.0
-        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        cache = fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0)
         initial_conv, initial_ssm = cache.conv[0].clone(), cache.temporal.clone()
 
         triton_output = run_kda_fixture_eager(fixture)
