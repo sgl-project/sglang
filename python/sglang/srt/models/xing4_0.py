@@ -14,8 +14,9 @@
 """Xing4_0 model for SGLang.
 
 Adapts the Xing4_0 architecture (MLA attention + MoE + mHC residual streams)
-on top of sglang's DeepSeek-V2 building blocks.  The mHC module uses sglang's
-fused TileLang kernels (``mhc_pre`` / ``mhc_post``) for performance.
+on top of sglang's DeepSeek-V2 building blocks.  The mHC residual streams are
+wired through sglang's layer-boundary machinery (``MHCState``, see the usage
+in glm5_next) on top of the fused kernels ``hc_pre`` / ``hc_post``.
 
 The Xing4_0 checkpoint stores the
 mHC operands (``hc_fn`` / ``hc_scale`` / ``hc_base``) directly, so no
@@ -25,33 +26,26 @@ tensors are the exact fp32 op operands consumed by the fused kernels.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 from contextlib import nullcontext
 
 import torch
 from torch import nn
 
-# Register mhc_pre / mhc_post as torch custom ops with fake (meta) implementations
-# so that torch.compile can trace through the mHC module. Without registration,
-# dynamo tries to execute the real kernel with FakeTensors and fails because the
-# TVM/TileLang C-extension calls attempt to access the data pointer of FakeTensors.
-from sglang.kernels.ops.layernorm.mhc import mhc_post as _mhc_post_orig
-from sglang.kernels.ops.layernorm.mhc import mhc_pre as _mhc_pre_orig
+from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
+from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.configs.xing4_0 import Xing4_0Config
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layer_boundary import (
-    AttentionInputs,
-    SumGroup,
+    MHCState,
     append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
-from sglang.srt.layers.layer_boundary.ops import attn_tp_all_reduce, sum_output
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -67,120 +61,21 @@ from sglang.srt.models import deepseek_v2
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, make_layers
-from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
-
-
-def _mhc_pre_fake(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    n_splits: int,
-    n_splits_pre: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fake (meta) implementation of mhc_pre for torch.compile tracing."""
-    num_tokens, hc_mult, hidden_size = residual.shape
-    post_mix = torch.empty(
-        num_tokens, hc_mult, 1, dtype=torch.float32, device=residual.device
-    )
-    comb_mix = torch.empty(
-        num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=residual.device
-    )
-    layer_input = torch.empty(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
-    )
-    return (post_mix, comb_mix, layer_input)
-
-
-@register_custom_op(
-    op_name="xing4_0_mhc_pre",
-    mutates_args=[],
-    fake_impl=_mhc_pre_fake,
-)
-def mhc_pre(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-    n_splits: int,
-    n_splits_pre: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _is_npu:
-        hc_mult = residual.shape[1]
-        if hc_sinkhorn_eps != hc_pre_eps:
-            raise ValueError(
-                "The AscendC hc_pre kernel uses one hc_eps for both pre and "
-                "Sinkhorn; hc_pre_eps and hc_sinkhorn_eps must match."
-            )
-        if hc_post_mult_value != 2.0:
-            raise ValueError("The AscendC hc_pre kernel requires post multiplier 2.0.")
-        layer_input, post_mix, comb_mix = torch.ops.npu.hc_pre(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            hc_mult=hc_mult,
-            hc_sinkhorn_iters=sinkhorn_repeat,
-            norm_eps=rms_eps,
-            hc_eps=hc_pre_eps,
-        )
-        return post_mix.unsqueeze(-1), comb_mix, layer_input
-
-    return _mhc_pre_orig(
-        residual=residual,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_pre_eps,
-        hc_sinkhorn_eps=hc_sinkhorn_eps,
-        hc_post_mult_value=hc_post_mult_value,
-        sinkhorn_repeat=sinkhorn_repeat,
-        n_splits=n_splits,
-        n_splits_pre=n_splits_pre,
-    )
-
-
-@register_custom_op(
-    op_name="xing4_0_mhc_post",
-    mutates_args=[],
-    out_shape="residual",
-)
-def mhc_post(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post_layer_mix: torch.Tensor,
-    comb_res_mix: torch.Tensor,
-) -> torch.Tensor:
-    if _is_npu:
-        return torch.ops.npu.hc_post(
-            x, residual, post_layer_mix.squeeze(-1), comb_res_mix
-        )
-
-    return _mhc_post_orig(x, residual, post_layer_mix, comb_res_mix)
-
-
-logger = logging.getLogger(__name__)
 
 
 class mHCModule(nn.Module):
     """mHC (Manifold-constrained Hyper-Connection) module.
 
-    Backed by sglang's fused TileLang kernels (``mhc_pre`` / ``mhc_post``).
+    Backed by sglang's fused TileLang kernels through the ``hc_pre`` /
+    ``hc_post`` wrappers in ``sglang.kernels`` (the layer-boundary
+    ``MHCState`` drives them; see glm5_next for the reference wiring).  On
+    Ascend the module calls the ``torch.ops.npu.hc_pre`` / ``hc_post``
+    AscendC ops registered by the NPU environment instead, mirroring how
+    deepseek_v4 selects its NPU mHC ops at the model layer.
 
     The Xing4_0 checkpoint stores the fp32 op operands directly as
     ``hc_fn`` / ``hc_scale`` / ``hc_base`` parameters (they are exactly the
@@ -200,7 +95,6 @@ class mHCModule(nn.Module):
         self.norm_eps = 1e-6
         self.pre_eps = getattr(config, "hc_eps", 1e-6)
         self.post_mult_value = 2.0
-        self.sinkhorn_eps = getattr(config, "hc_eps", 1e-6)
         # splitk GEMM parallelism. hc_hidden_size = n * hidden_size = 4 * 3584
         # = 14336. 14336 / n_splits_pre must be divisible by hidden_block(256).
         self.n_splits_pre = 8
@@ -232,109 +126,117 @@ class mHCModule(nn.Module):
         self.base_fp32 = self.hc_base.detach().to(torch.float32).contiguous()
         self._finalized = True
 
-    def forward(self, hidden_states: torch.Tensor):
-        """Compute mHC pre-mixing: aggregate n-stream -> 1-stream.
+    def hc_pre(
+        self,
+        hidden_states: torch.Tensor,
+        out_norm_weight: torch.Tensor | None,
+        out_norm_eps: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """``MHCState`` read adapter: mix the n residual streams into the
+        sub-layer input (and its norm, fused into the kernel when possible).
 
         Args:
-            hidden_states: [S, B, n*C] n-stream hidden states.
+            hidden_states: [T, n*C] n-stream residual.
+            out_norm_weight / out_norm_eps: the sub-layer input RMSNorm.
         Returns:
-            aggregated: [S, B, C] single-stream input for the sub-layer.
-            comb_mix: [S*B, n*n] residual mixing matrix.
-            post_mix: [S*B, n] stream expansion weights.
+            (layer_input [T, C], h_res [T, n*n], h_post [T, n], norm_fused).
         """
-        S, B, _ = hidden_states.shape
-        n = self.n
-        C = self.hidden_size
-
         if not self._finalized:
             self.finalize()
 
-        # Flatten to [S*B, n, C] and ensure bf16 (kernel requirement).
-        residual = hidden_states.reshape(S * B, n, C)
-        if residual.dtype != torch.bfloat16:
-            residual = residual.to(torch.bfloat16)
-
-        num_tokens = residual.shape[0]
-        if num_tokens == 0:
-            layer_input = torch.empty(
-                0, C, dtype=torch.bfloat16, device=residual.device
-            )
-            post_mix = torch.empty(0, n, dtype=torch.float32, device=residual.device)
-            comb_mix = torch.empty(
-                0, n * n, dtype=torch.float32, device=residual.device
-            )
-        else:
-            post_mix, comb_mix, layer_input = mhc_pre(
-                residual=residual,
-                fn=self.fn_fp32,
-                hc_scale=self.scale_fp32,
-                hc_base=self.base_fp32,
-                rms_eps=self.norm_eps,
-                hc_pre_eps=self.pre_eps,
-                hc_sinkhorn_eps=self.sinkhorn_eps,
-                hc_post_mult_value=self.post_mult_value,
-                sinkhorn_repeat=self.sinkhorn_iterations,
-                n_splits=1,
-                n_splits_pre=self.n_splits_pre,
-            )
-
-        aggregated = layer_input.view(S, B, C)
-        comb_mix = comb_mix.transpose(-1, -2).contiguous()
-        return aggregated, comb_mix, post_mix
-
-    def fused_h_res_h_post_bda_inference(
-        self,
-        h_res: torch.Tensor,
-        original_residual: torch.Tensor,
-        h_post: torch.Tensor,
-        layer_output_with_bias,
-    ) -> torch.Tensor:
-        """Fused residual mixing + post expansion + bias-dropout-add.
-
-        Args:
-            h_res: comb_mix [S*B, n*n] from forward().
-            original_residual: [S, B, n*C] - n-stream input before aggregation.
-            h_post: post_mix [S*B, n] from forward().
-            layer_output_with_bias: (x [S, B, C], bias None).
-        Returns:
-            output: [S, B, n*C] - updated n-stream residual.
-        """
-        x, _ = layer_output_with_bias
-
-        S, B, _ = x.shape
+        s = hidden_states.shape[0]
         n = self.n
         C = self.hidden_size
 
-        x_flat = x.reshape(S * B, C)
-        if x_flat.dtype != torch.bfloat16:
-            x_flat = x_flat.to(torch.bfloat16)
-        residual_flat = original_residual.reshape(S * B, n, C)
-        if residual_flat.dtype != torch.bfloat16:
-            residual_flat = residual_flat.to(torch.bfloat16)
+        if _is_npu:
+            if s == 0:
+                layer_input = torch.empty(
+                    0, C, dtype=hidden_states.dtype, device=hidden_states.device
+                )
+                h_res = torch.empty(
+                    0, n * n, dtype=torch.float32, device=hidden_states.device
+                )
+                h_post = torch.empty(
+                    0, n, dtype=torch.float32, device=hidden_states.device
+                )
+                return layer_input, h_res, h_post, False
+            # The AscendC op takes the streams 3D, uses one hc_eps for both
+            # the pre mix and Sinkhorn, and does not fold the out norm;
+            # MHCState applies the norm (norm_fused=False).
+            residual = hidden_states.view(s, n, C)
+            if residual.dtype != torch.bfloat16:
+                residual = residual.to(torch.bfloat16)
+            layer_input, h_post, comb_mix = torch.ops.npu.hc_pre(
+                residual,
+                self.fn_fp32,
+                self.scale_fp32,
+                self.base_fp32,
+                hc_mult=n,
+                hc_sinkhorn_iters=self.sinkhorn_iterations,
+                norm_eps=self.norm_eps,
+                hc_eps=self.pre_eps,
+            )
+            comb_mix = comb_mix.transpose(-1, -2).contiguous()
+            return layer_input, comb_mix.reshape(s, n * n), h_post, False
 
-        # comb_mix is stored flattened [S*B, n*n]; view as 3D for mhc_post.
-        comb_res_mix = h_res.view(S * B, n, n)
+        layer_input, h_res, h_post, norm_fused = _hc_pre_fn(
+            x=hidden_states,
+            hc_fn=self.fn_fp32,
+            hc_scale=self.scale_fp32,
+            hc_base=self.base_fp32,
+            hc_mult=n,
+            rms_eps=self.norm_eps,
+            hc_eps=self.pre_eps,
+            sinkhorn_iters=self.sinkhorn_iterations,
+            post_mult_value=self.post_mult_value,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+            n_splits_pre=self.n_splits_pre,
+        )
+        # The checkpoint's hc_fn was trained with the residual mixing matrix
+        # transposed relative to the kernels' convention; without this
+        # transpose the model's outputs are gibberish.
+        h_res = h_res.view(s, n, n).transpose(1, 2).contiguous().reshape(s, n * n)
+        return layer_input, h_res, h_post, norm_fused
 
-        if x_flat.shape[0] == 0:
-            out = torch.empty_like(residual_flat)
-        else:
-            out = mhc_post(x_flat, residual_flat, h_post, comb_res_mix)
+    def hc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        h_res: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
+        """``MHCState`` update adapter: write the sub-layer output back into
+        the n residual streams.
 
-        return out.view(S, B, n * C)
-
-
-def input_expand(x: torch.Tensor, n: int) -> torch.Tensor:
-    s, b, C = x.shape
-    expanded = x.unsqueeze(2).expand(s, b, n, C).contiguous()
-    return expanded.view(s, b, n * C)
-
-
-def output_contract(x: torch.Tensor, n: int) -> torch.Tensor:
-    s, b, nC = x.shape
-    C = nC // n
-    x_streams = x.view(s, b, n, C)
-    contracted = x_streams.mean(dim=2)
-    return contracted
+        Args:
+            x: [T, C] sub-layer output.
+            residual: [T, n*C] n-stream residual before the sub-layer.
+            h_res: [T, n*n] residual mixing matrix (already transposed).
+            h_post: [T, n] stream expansion weights.
+        Returns:
+            The updated n-stream residual [T, n*C].
+        """
+        n = self.n
+        s = x.shape[0]
+        if _is_npu:
+            if s == 0:
+                return residual
+            C = x.shape[1]
+            out = torch.ops.npu.hc_post(
+                x,
+                residual.view(s, n, C),
+                h_post,
+                h_res.view(s, n, n),
+            )
+            return out.reshape(s, -1)
+        return _hc_post_fn(
+            x=x,
+            residual=residual,
+            h_post=h_post,
+            h_res=h_res,
+            hc_mult=n,
+        )
 
 
 class Xing4_0DecoderLayer(nn.Module):
@@ -428,24 +330,32 @@ class Xing4_0DecoderLayer(nn.Module):
 
         self.n = getattr(config, "hc_mult", 1)
         self.enable_mhc = self.n > 1
+        mhc = None
         if self.enable_mhc:
             self.attn_hc = mHCModule(config, config.num_hidden_layers)
             self.ffn_hc = mHCModule(config, config.num_hidden_layers)
+            mhc = MHCState(
+                hc_mult=self.n,
+                hc_attn_pre=self.attn_hc.hc_pre,
+                hc_ffn_pre=self.ffn_hc.hc_pre,
+                hc_post=self.attn_hc.hc_post,
+                # The last layer's write-back also contracts the n streams
+                # into the hidden states the layer stack hands on.
+                is_last_layer=layer_id == config.num_hidden_layers - 1,
+            ).residual_ops()
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1)
 
+        attn, ffn = self.stage_facts(config, layer_id, mhc=mhc)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(),
+                attn,
                 self.input_layernorm,
                 {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
             ),
             (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
+                ffn,
                 self.post_attention_layernorm,
             ),
         )
@@ -462,119 +372,6 @@ class Xing4_0DecoderLayer(nn.Module):
         captured_last_layer_outputs: list[torch.Tensor] | None = None,
         next_full_attention_layer_id: int | None = None,
     ) -> torch.Tensor:
-        if self.enable_mhc:
-            S = hidden_states.shape[0]
-            B = hidden_states.shape[1]
-            C = self.hidden_size
-
-            origin_hidden_states = hidden_states
-            aggregated_hidden_states, attention_res_weights, attention_post_weights = (
-                self.attn_hc(origin_hidden_states)
-            )
-
-            hidden_states = aggregated_hidden_states.reshape(-1, C)
-
-            # The legacy ``prepare_attn`` entry (invoked here with
-            # residual=None) applied the input RMSNorm on the residual-is-None
-            # path before publishing the attention inputs, so the mHC branch
-            # always ran MLA on normed rows.  Keep that norm now that this path
-            # bypasses the stage boundary.
-            hidden_states = self.input_layernorm(hidden_states)
-
-            # Hand the aggregated input to the MLA attention's qkv-latent hook
-            # (the new-architecture replacement for the old ``prepare_attn``
-            # bookkeeping).  The aggregation above always produces full rows on
-            # this rank, so the input is marked pre-gathered even when the
-            # forward runs with attn-TP input scattering enabled.
-            get_attn_tp_context().set_attn_inputs(
-                AttentionInputs(
-                    hidden_states,
-                    forward_batch,
-                    self.self_attn.prepare_qkv_latent,
-                    is_pre_gathered=True,
-                )
-            )
-
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-                hidden_states = self.self_attn(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    zero_allocator=zero_allocator,
-                    llama_4_scaling=llama_4_scaling,
-                    input_on_attn_tp_slices=False,
-                    prev_topk_indices=prev_topk_indices,
-                )
-            if isinstance(hidden_states, tuple):
-                hidden_states, topk_indices = hidden_states
-            else:
-                topk_indices = None
-
-            get_attn_tp_context().clear_attn_inputs()
-
-            # Complete the attention output's partial sum over the attention-TP
-            # group (o_proj is built with reduce_results=False): the fused
-            # mhc_post mixing below consumes the full contribution, so this
-            # layer never defers the reduction to a stage boundary.
-            hidden_states = attn_tp_all_reduce(
-                hidden_states, forward_batch, may_quantize=False
-            )
-
-            hidden_states = hidden_states.reshape(S, B, C)
-
-            if (
-                isinstance(self.self_attn, deepseek_v2.DeepseekV2AttentionMLA)
-                and hidden_states.dtype == torch.float16
-            ):
-                hidden_states *= 1.0 / self.routed_scaling_factor
-
-            hidden_states = self.attn_hc.fused_h_res_h_post_bda_inference(
-                h_res=attention_res_weights,
-                original_residual=origin_hidden_states,
-                h_post=attention_post_weights,
-                layer_output_with_bias=(hidden_states, None),
-            )
-
-            origin_hidden_states = hidden_states
-            aggregated_hidden_states, mlp_res_weights, mlp_post_weights = self.ffn_hc(
-                origin_hidden_states
-            )
-
-            hidden_states = aggregated_hidden_states.reshape(-1, C)
-            hidden_states = self.post_attention_layernorm(hidden_states)
-
-            with get_forward().scoped(mlp_reduce_scatter=False):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-            # Complete the MLP output's partial sum over the TP group (the MLP
-            # and MoE are built with reduce_results=False): the fused mhc_post
-            # mixing below consumes the full contribution, so this branch
-            # never defers the reduction to a stage boundary.
-            hidden_states = sum_output(
-                hidden_states, SumGroup.TP, forward_batch, may_quantize=False
-            )
-
-            hidden_states = hidden_states.reshape(S, B, C)
-
-            if (
-                isinstance(self.mlp, deepseek_v2.DeepseekV2MLP)
-                and hidden_states.dtype == torch.float16
-            ):
-                hidden_states *= 1.0 / self.routed_scaling_factor
-
-            hidden_states = self.ffn_hc.fused_h_res_h_post_bda_inference(
-                h_res=mlp_res_weights,
-                original_residual=origin_hidden_states,
-                h_post=mlp_post_weights,
-                layer_output_with_bias=(hidden_states, None),
-            )
-
-            return hidden_states, topk_indices
-
         hidden_states_orig = residual_access.buffer(hidden_states)
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
@@ -662,15 +459,34 @@ class Xing4_0DecoderLayer(nn.Module):
         )
 
     @classmethod
-    def stage_facts(cls, config, layer_id: int):
+    def stage_facts(cls, config, layer_id: int, *, mhc=None):
         """The stages a layer of this class declares, from the config alone:
         the model's shared declaration function, which the layer declares
-        with too (see make_layers)."""
+        with too (see make_layers).  With ``mhc`` (the layer's MHCState
+        residual ops) the stages read and write hyper-connection streams
+        instead of a plain residual; ``mhc=None`` for a layer that is not
+        built falls back to the class-level MHCState facts."""
+        residual = mhc
+        if residual is None and getattr(config, "hc_mult", 1) > 1:
+            residual = MHCState.facts()
+        if residual is None:
+            return (
+                declare_attn(),
+                declare_ffn(
+                    sparse=cls._config_is_layer_sparse(config, layer_id),
+                    next_layer_sparse=cls._config_is_layer_sparse(config, layer_id + 1),
+                ),
+            )
         return (
-            declare_attn(),
+            declare_attn(
+                read=residual.attn_readout,
+                update=residual.attn_update,
+            ),
             declare_ffn(
                 sparse=cls._config_is_layer_sparse(config, layer_id),
                 next_layer_sparse=cls._config_is_layer_sparse(config, layer_id + 1),
+                read=residual.ffn_readout,
+                update=residual.ffn_update,
             ),
         )
 
@@ -770,8 +586,6 @@ class Xing4_0Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        self.hc_mult = getattr(config, "hc_mult", 1)
-
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -797,26 +611,12 @@ class Xing4_0Model(nn.Module):
             residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            if self.hc_mult > 1:
-                # mHC layers carry their own multi-stream residual between
-                # layers and never touch the ordinary residual stream.  Start a
-                # fresh stream so the terminal complete_output/final_norm (or
-                # to_pp) steps pass the tensors through untouched; receiving
-                # via attn_boundary.from_pp would instead write the incoming
-                # tensor into the stream and trip its output checks.
-                hidden_states = pp_proxy_tensors["hidden_states"]
-                residual_batch.start(forward_batch)
-            else:
-                hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
-                    pp_proxy_tensors, forward_batch
-                )
-
-        n_streams = self.hc_mult
-        if n_streams > 1:
-            S = hidden_states.shape[0]
-            C = hidden_states.shape[1]
-            hidden_states = hidden_states.reshape(S, 1, C)
-            hidden_states = input_expand(hidden_states, n_streams)
+            # With mHC the producer's residual stream already holds the n
+            # hyper-connection streams; from_pp reconstructs that stream as
+            # declared, so no stream-width special-casing is needed here.
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         from sglang.srt.utils import BumpAllocator
 
@@ -843,11 +643,9 @@ class Xing4_0Model(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
+        # The last layer's mHC write-back contracted the n streams back into
+        # plain hidden states (see MHCState(is_last_layer=...)).
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
-
-        if n_streams > 1:
-            hidden_states = output_contract(hidden_states, n_streams)
-            hidden_states = hidden_states.reshape(S, C)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = residual_batch.final_norm(
@@ -975,27 +773,17 @@ class Xing4_0ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         from sglang.srt.model_loader.weight_utils import default_weight_loader
 
         for name, loaded_weight in hc_weights:
-            param = None
-            target_name = name
-
             if name in params_dict:
                 param = params_dict[name]
             elif f"model.{name}" in params_dict:
                 param = params_dict[f"model.{name}"]
-                target_name = f"model.{name}"
             elif name.startswith("model.") and name[6:] in params_dict:
                 param = params_dict[name[6:]]
-                target_name = name[6:]
-
-            if param is None:
-                logger.warning("Skip %s, not found in params_dict", name)
-                continue
+            else:
+                raise ValueError(f"mHC weight {name!r} not found in params_dict")
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            try:
-                weight_loader(param, loaded_weight)
-            except Exception as e:
-                logger.warning("Failed to load %s -> %s: %s", name, target_name, e)
+            weight_loader(param, loaded_weight)
 
         self.do_load_weights(processed_weights)
 

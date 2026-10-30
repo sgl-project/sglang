@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -45,17 +45,21 @@ class TestXing4_0(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
             num_examples=100,
             num_threads=128,
+            temperature=1.0,
+            top_p=0.95,
+            # Xing4_0's chat template reads ``enable_thinking``; turn it off
+            # so the answer is emitted directly within the max-token budget.
+            chat_template_kwargs={"enable_thinking": False},
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
-        # Conservative floor: catches load/correctness regressions (broken
-        # weights, misplaced reductions); tighten once a reference score
-        # is established.
-        self.assertGreater(metrics["score"], 0.3)
+        # Reference score on this harness (chat API, enable_thinking=False,
+        # temperature=1.0, top_p=0.95): 0.84 on 100 examples. The floor leaves
+        # headroom for sampling variance while still catching load or
+        # correctness regressions (broken weights, misplaced reductions).
+        self.assertGreater(metrics["score"], 0.7)
 
 
 if __name__ == "__main__":

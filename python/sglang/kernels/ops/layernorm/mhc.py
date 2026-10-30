@@ -1968,6 +1968,7 @@ def _mhc_pre_dispatch(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if _use_aiter_mhc():
@@ -2012,6 +2013,7 @@ def _mhc_pre_dispatch(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        n_splits_pre=n_splits_pre,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
     )
@@ -2055,7 +2057,12 @@ def hc_pre(
     hc_norm_weight: torch.Tensor | None = None,
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float | None = None,
+    n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Split-K parallelism of the TileLang mhc_pre GEMM: the split size must
+    keep (hc_mult * hidden_size) // n_splits_pre divisible by the kernel's
+    hidden_block, e.g. n_splits_pre=8 for hc_hidden_size=14336 (14336/8=1792,
+    a multiple of 256; the default 32 would give 448, which is not)."""
     s, total = x.shape
     hidden_size = total // hc_mult
     if x.numel() == 0:
@@ -2080,6 +2087,7 @@ def hc_pre(
         sinkhorn_repeat=sinkhorn_iters,
         norm_weight=out_norm_weight,
         norm_eps=out_norm_eps,
+        n_splits_pre=n_splits_pre,
     )
     return (
         layer_input,

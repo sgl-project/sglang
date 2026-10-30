@@ -1586,23 +1586,23 @@ class _PoolsideV1Detector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
-class Xing4_0Detector(BaseReasoningFormatDetector):
+class Xing4_0Detector(Qwen3Detector):
     """Detector for Xing4_0 models.
 
-    Xing4_0 models use<think> and </think> as reasoning markers.
-    The chat template injects these markers into the prompt via ``enable_thinking`` parameter.
+    Xing4_0 reuses Qwen3's reasoning markers, injected into the prompt via
+    the template's ``enable_thinking`` parameter, and emits Qwen3-compatible
+    tool-call tokens, so Qwen3Detector's parsing rules apply unchanged.
 
     When ``enable_thinking=True``:
-      The model generates reasoning content followed by </think> and then the answer.
-      Format: "reasoning content</think>answer"
+      The model generates reasoning content followed by the close marker and
+      then the answer.
 
     When ``enable_thinking=False``:
       The model generates the answer directly without any markers.
-      Format: "answer"
 
     ``force_nonempty_content=True`` acts as a safety net: if the model omits
-    the ``</think>`` close tag, the accumulated reasoning is reclassified as
-    normal text so the answer is never lost in the text field.
+    the close tag, the accumulated reasoning is reclassified as normal text
+    so the answer is never lost in the text field.
     """
 
     def __init__(
@@ -1614,13 +1614,10 @@ class Xing4_0Detector(BaseReasoningFormatDetector):
         force_nonempty_content: bool = True,
     ):
         super().__init__(
-            "<think>",
-            "</think>",
-            force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
-            reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
         )
 
