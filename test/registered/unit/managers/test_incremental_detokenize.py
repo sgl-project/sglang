@@ -241,7 +241,7 @@ class TestDetokenizeState(CustomTestCase):
             ],
         )
 
-    def test_one_rid_on_two_tokenizer_workers_finishes_on_both(self):
+    def test_a_finished_row_routes_by_its_ipc_not_the_stored_headers(self):
         """With one rid in flight on two tokenizer workers, the finished row reaches
         the worker it carries, not the stored header's."""
         detok = _detokenizer()
@@ -258,6 +258,15 @@ class TestDetokenizeState(CustomTestCase):
             [(worker, finished) for worker, _, _, finished in delivered],
             [("worker-a", False), ("worker-b", False), ("worker-a", True)],
         )
+
+    def test_header_prompt_tail_is_clamped_to_the_vocab(self):
+        """Multimodal placeholder ids in the prompt tail (negative or past the
+        vocab) decode as 0, which tiktoken-style tokenizers accept."""
+        table = DetokenizeStateTable(capacity=1)
+
+        s = table.start(rid="r", header=_header([-101, 3, 12]), vocab_size=10)
+
+        self.assertEqual(s.decode_ids, [0, 3, 0])
 
     def test_a_row_that_does_not_continue_the_received_ids_raises_an_alarm(self):
         """completion_tokens must equal the ids received plus the row's own; a break warns

@@ -478,7 +478,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 "sglang.srt.managers.multi_tokenizer_mixin.sock_recv",
                 side_effect=[
                     ConfigureLoggingReq(log_level="debug"),
-                    AbortReq(rid="rid-0"),
+                    AbortReq(rid="rid-0", http_worker_ipc="worker-a"),
                     EOFError("end of input"),
                 ],
             ),

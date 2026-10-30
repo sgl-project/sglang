@@ -179,6 +179,26 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
         )
         self.assertTrue(all(s.text is not None for s in packed.sequences))
 
+    def test_beam_row_without_detokenize_state_is_skipped(self):
+        """A row whose detokenize state is gone has no header; its beams get no
+        text instead of failing the whole batch."""
+        for disable_batch_decode in (True, False):
+            with self.subTest(disable_batch_decode=disable_batch_decode):
+                group = _mixed_group(stop_wins=True)
+                packed = pack_beam_search_output(SimpleNamespace(beam_group=group))
+                recv_obj = SimpleNamespace(
+                    beam_search_output=[packed],
+                    finished_reasons=[{"type": "stop", "matched": STOP_ID}],
+                )
+                decode_beam_search_output(
+                    recv_obj,
+                    [None],
+                    tokenizer=_IdTokenizer(),
+                    disable_batch_decode=disable_batch_decode,
+                    trim_matched_stop=_trim,
+                )
+                self.assertTrue(all(s.text is None for s in packed.sequences))
+
 
 if __name__ == "__main__":
     unittest.main()

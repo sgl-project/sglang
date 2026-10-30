@@ -981,6 +981,24 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         self.assertIsNone(outputs[0].http_worker_ipcs)
         self.assertEqual(outputs[1].http_worker_ipcs, [None, "worker-b"])
 
+    def test_rust_sink_builds_no_header_and_no_route(self):
+        """The Rust frontend keeps its own request state: no header is built or
+        marked sent, and no row carries a route, finished or not."""
+        accumulator = _accumulator(output_sink=OutputSink.RUST)
+        running, done = self._req("running"), self._req("done", ipc="worker-b")
+        for req in (running, done):
+            req.output_ids.append(7)
+        done.finished_reason = FINISH_LENGTH(length=1)
+
+        for req in (running, done):
+            accumulator.accept(req=req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertFalse(running.detokenize_header_sent)
+        self.assertFalse(done.detokenize_header_sent)
+        self.assertIsNone(payload.detokenize_headers)
+        self.assertIsNone(payload.http_worker_ipcs)
+
     def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
         """Without a detokenizer the tokenizer-side router routes each row by
         its http_worker_ipc, and nothing would keep a header."""

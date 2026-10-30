@@ -24,7 +24,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ChecksumInfo,
     CheckWeightsReqOutput,
-    DetokenizeReleaseReq,
     DumperControlReqInput,
     DumperControlReqOutput,
     ExpertWeightPointer,
@@ -337,7 +336,7 @@ class TestRequestStatsRoundTrip(CustomTestCase):
 
 
 class TestDetokenizeRoundTrip(CustomTestCase):
-    def test_header_and_release_round_trip(self):
+    def test_header_and_row_routes_round_trip(self):
         header = DetokenizeHeader(
             prompt_tail_ids=array("q", [151644, 872, 198]),
             skip_special_tokens=False,
@@ -358,8 +357,6 @@ class TestDetokenizeRoundTrip(CustomTestCase):
         self.assertIsInstance(decoded.detokenize_headers[0], DetokenizeHeader)
         self.assertIsInstance(decoded.detokenize_headers[0].prompt_tail_ids, array)
         self.assertEqual(decoded.http_worker_ipcs, [None, "ipc:///tmp/tokenizer-1"])
-        release = DetokenizeReleaseReq(rid="a")
-        self.assertEqual(_double_hop(release), release)
 
 
 if __name__ == "__main__":
