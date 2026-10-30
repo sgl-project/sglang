@@ -455,6 +455,35 @@ cat /proc/sys/vm/swappiness # shows 10
 
 ### Running Service For Large Language Models
 
+Pick a deployment mode based on your workload:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "50%"}} />
+    <col style={{width: "32%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Characteristics</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended scenarios</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>PD mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefill and decode in one server: single process, no router, requests go straight to the server; heavy prefill batches share hardware with decode and can raise inter-token latency</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Getting started, small to medium scale, no strict inter-token-latency requirement</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>PD disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dedicated prefill and decode pools behind a router, KV cache transferred over the network (requires <a href="#memfabric-hybrid">MemFabric-Hybrid</a>); each phase scales and tunes independently, at the cost of more components and nodes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Large scale, long prompts, high concurrency, where stable inter-token latency matters</td>
+    </tr>
+  </tbody>
+</table>
+
 #### PD Mixed Scene
 
 <Tabs>
