@@ -1157,7 +1157,10 @@ class SetupContractTest(unittest.TestCase):
                     inputs["command"],
                     f"bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh {lane}",
                 )
-                self.assertTrue(mounts[1].endswith(f"/{lane}:/ppu-pr-cache"))
+                self.assertEqual(
+                    mounts[1],
+                    "/wl_nas/pr-ci/cache/shared:/ppu-pr-cache",
+                )
                 export = next(s for s in job["steps"] if s.get("id") == "export")
                 self.assertEqual(export["if"], "always()")
                 self.assertNotIn("continue-on-error", export)

@@ -1089,6 +1089,11 @@ class E2EWorkflowTest(unittest.TestCase):
         self.assertEqual(action["with"]["node_selector"], "board-type=ZW-M890P")
         self.assertEqual(action["with"]["nproc_per_node"], 8)
         self.assertEqual(action["with"]["cleanup_policy"], "always")
+        mounts = action["with"]["host_volumes"].split(",")
+        self.assertEqual(
+            mounts[1],
+            "/wl_nas/pr-ci/cache/shared:/ppu-pr-cache",
+        )
         self.assertIn("|| 0", action["with"]["nnodes"])
         self.assertNotIn("GH_TOKEN", action["with"]["extra_env"])
         self.assertFalse(any("continue-on-error" in s for s in steps))

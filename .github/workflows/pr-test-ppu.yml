@@ -367,7 +367,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh smoke
-          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/smoke:/ppu-pr-cache
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/shared:/ppu-pr-cache
           extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=false,PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             host_ipc: true
@@ -481,7 +481,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh body
-          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/body:/ppu-pr-cache
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/shared:/ppu-pr-cache
           extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=${{ needs.check-changes.outputs.ppu_kernel }},PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             host_ipc: true
@@ -596,7 +596,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh multi
-          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/multi:/ppu-pr-cache
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/shared:/ppu-pr-cache
           extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=false,PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             host_ipc: true
