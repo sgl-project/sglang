@@ -168,16 +168,29 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_overlap = True
         self.forward_stream = object()
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
+        self._batched_page_indices = Mock(return_value=None)
         self.send_kv_chunk = Mock()
 
 
+def _early_send_req(prefix_len, start_send_idx=0):
+    return SimpleNamespace(
+        pending_bootstrap=False,
+        prefix_len=prefix_len,
+        host_hit_length=0,
+        early_send_prefix_end=None,
+        start_send_idx=start_send_idx,
+        disagg_kv_sender=SimpleNamespace(_early_send_wait_event=None),
+    )
+
+
 def test_early_send_wait_event_comes_from_the_scheduler_device_module():
-    """The early-send event is created on the scheduler's device.
+    """One early-send event, created on the scheduler's device, covers the batch.
 
     forward_stream is built from that same device, and an event of one accelerator
     cannot record against another's stream. Resolving the module from the process
     default instead reinstates that mismatch whenever --device names something
-    other than the default accelerator.
+    other than the default accelerator. Requests with nothing to early-send
+    (already sent, or a prefix ending inside a page) get neither event nor send.
     """
     recorded = []
 
@@ -186,21 +199,39 @@ def test_early_send_wait_event_comes_from_the_scheduler_device_module():
             recorded.append(stream)
 
     scheduler = _EarlySendScheduler(SimpleNamespace(Event=_Event))
-    req = SimpleNamespace(
-        pending_bootstrap=False,
-        prefix_len=8,
-        host_hit_length=0,
-        early_send_prefix_end=None,
-        start_send_idx=0,
-        disagg_kv_sender=SimpleNamespace(_early_send_wait_event=None),
-    )
+    reqs = [
+        _early_send_req(8),
+        _early_send_req(8, start_send_idx=8),
+        _early_send_req(6),
+        _early_send_req(16, start_send_idx=4),
+    ]
 
     with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
-        scheduler.maybe_send_cached_prefix_chunk(req)
+        scheduler.send_cached_prefix_chunks(reqs)
 
-    assert isinstance(req.disagg_kv_sender._early_send_wait_event, _Event)
     assert recorded == [scheduler.forward_stream]
-    scheduler.send_kv_chunk.assert_called_once()
+    event = reqs[0].disagg_kv_sender._early_send_wait_event
+    assert isinstance(event, _Event)
+    assert reqs[3].disagg_kv_sender._early_send_wait_event is event
+    assert reqs[1].disagg_kv_sender._early_send_wait_event is None
+    assert reqs[2].disagg_kv_sender._early_send_wait_event is None
+    scheduler._batched_page_indices.assert_called_once_with([reqs[0], reqs[3]], [8, 16])
+    assert [c.args[0] for c in scheduler.send_kv_chunk.call_args_list] == [
+        reqs[0],
+        reqs[3],
+    ]
+    assert [c.kwargs["end_idx"] for c in scheduler.send_kv_chunk.call_args_list] == [
+        8,
+        16,
+    ]
+
+
+def test_early_send_skips_a_batch_with_a_pending_load_back():
+    scheduler = _EarlySendScheduler(SimpleNamespace(Event=Mock()))
+    with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
+        scheduler.send_cached_prefix_chunks([_early_send_req(8)], allow_send=False)
+    scheduler.device_module.Event.assert_not_called()
+    scheduler.send_kv_chunk.assert_not_called()
 
 
 if __name__ == "__main__":

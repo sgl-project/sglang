@@ -77,6 +77,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -84,6 +85,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_num,
     release_kv_cache,
     suffix_page_indices,
+    to_host_nonblocking,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -117,6 +119,14 @@ logger = logging.getLogger(__name__)
 PREFILL_INPUT_POLL_INTERVAL_S = 0.0001
 
 _is_npu = is_npu()
+
+
+def _defers_send_indices(req: Req) -> bool:
+    # The schedule stream may wait on the in-flight forward. Senders that take
+    # host indices still being copied wait for them on their transfer worker
+    # instead of the scheduler; under KV sharding the worker also applies the
+    # page filter, and the CP filter is positional.
+    return getattr(req.disagg_kv_sender, "supports_host_tensor_indices", False)
 
 
 def should_force_retry(req: Req) -> bool:
@@ -1011,6 +1021,10 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        # Last-chunk sends run after the loop so their page ids are read back in
+        # one copy. Each still follows its own request's cache insert, which
+        # rewrites only that request's row.
+        last_chunk_reqs: List[Req] = []
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -1113,8 +1127,9 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     req.disagg_kv_sender.mark_prefill_complete()
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
-                req.time_stats.set_prefill_transfer_queue_entry_time()
+                    last_chunk_reqs.append(req)
+                else:
+                    req.time_stats.set_prefill_transfer_queue_entry_time()
 
             else:
                 # being chunked reqs' prefill is not finished
@@ -1167,6 +1182,8 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        self._send_last_kv_chunks(last_chunk_reqs)
 
         if auxiliary_output is not None:
             self.batch_result_processor.consume_auxiliary_output(
@@ -1511,35 +1528,23 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-    def maybe_send_cached_prefix_chunk(
-        self: Scheduler, req: Req, allow_send: bool = True
+    def send_cached_prefix_chunks(
+        self: Scheduler, reqs: List[Req], allow_send: bool = True
     ) -> None:
+        """Early-send each request's device-resident cached prefix.
+
+        The page ids of every eligible request are read back together, and
+        one forward-stream event covers the batch, instead of one gather, host
+        copy and event per request.
+        """
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
-
-        # Staging sends into positional grid slots, so the early-send boundary
-        # must stay stable across the request's batches: snapshot the at-rest
-        # prefix on the first batch. Non-staging reads the live prefix.
-        if self.enable_staging and req.early_send_prefix_end is None:
-            req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
-
-        # allow_send=False: a HiCache load-back from this build may still be writing
-        # pages matched as device prefix; the post-forward send covers them (#44070).
-        if req.pending_bootstrap or not allow_send:
-            return
-
-        # Device-resident prefix only; page-aligned so start_send_idx stays exact.
-        cached_end = (
-            req.early_send_prefix_end
-            if self.enable_staging
-            else req.prefix_len - req.host_hit_length
-        )
-        if cached_end <= req.start_send_idx:
-            return
-        if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
-            # DCP radix hits can end on a logical cache-page boundary that is
-            # not a complete physical DCP page. The regular final send covers
-            # the full range; only skip this optional early-send optimization.
+        sends = [
+            (req, end)
+            for req in reqs
+            if (end := self._cached_prefix_send_end(req, allow_send)) is not None
+        ]
+        if not sends:
             return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
@@ -1549,15 +1554,125 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_overlap:
             ev = self.device_module.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+            for req, _ in sends:
+                req.disagg_kv_sender._early_send_wait_event = ev
+        page_indices = (
+            self._batched_page_indices(
+                [req for req, _ in sends], [end for _, end in sends]
+            )
+            if len(sends) > 1
+            else None
+        )
+        for i, (req, end) in enumerate(sends):
+            if page_indices is None:
+                self.send_kv_chunk(req, last_chunk=False, end_idx=end)
+            else:
+                self.send_kv_chunk(
+                    req, last_chunk=False, end_idx=end, page_indices=page_indices[i]
+                )
+
+    def _cached_prefix_send_end(
+        self: Scheduler, req: Req, allow_send: bool
+    ) -> Optional[int]:
+        """End of the cached prefix ``req`` can early-send now, or None."""
+        # Staging sends into positional grid slots, so the early-send boundary
+        # must stay stable across the request's batches: snapshot the at-rest
+        # prefix on the first batch. Non-staging reads the live prefix.
+        if self.enable_staging and req.early_send_prefix_end is None:
+            req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
+
+        # allow_send=False: a HiCache load-back from this build may still be writing
+        # pages matched as device prefix; the post-forward send covers them (#44070).
+        if req.pending_bootstrap or not allow_send:
+            return None
+
+        # Device-resident prefix only; page-aligned so start_send_idx stays exact.
+        cached_end = (
+            req.early_send_prefix_end
+            if self.enable_staging
+            else req.prefix_len - req.host_hit_length
+        )
+        if cached_end <= req.start_send_idx:
+            return None
+        if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
+            # DCP radix hits can end on a logical cache-page boundary that is
+            # not a complete physical DCP page. The regular final send covers
+            # the full range; only skip this optional early-send optimization.
+            return None
+        return cached_end
+
+    def _send_last_kv_chunks(self: Scheduler, reqs: List[Req]) -> None:
+        page_indices = (
+            self._batched_page_indices(
+                reqs, [min(req.extend_end, len(req.origin_input_ids)) for req in reqs]
+            )
+            if len(reqs) > 1
+            else None
+        )
+        for i, req in enumerate(reqs):
+            if page_indices is None:
+                self.send_kv_chunk(req, last_chunk=True)
+            else:
+                self.send_kv_chunk(req, last_chunk=True, page_indices=page_indices[i])
+            req.time_stats.set_prefill_transfer_queue_entry_time()
+
+    def _batched_page_indices(
+        self: Scheduler, reqs: List[Req], ends: List[int]
+    ) -> Optional[List[np.ndarray]]:
+        """Page ids of each request's next send ``[start_send_idx, end)``, read
+        back in one gather and one host copy.
+
+        Returns None where each send must compute its own: a single request,
+        multi-segment sends (staging, a sender transfer cap), transfer ids that
+        differ from req_to_token (virtual-id pools, rank-local CP storage), and
+        a batch mixing deferred and blocking readback. Under deferral the copy
+        is left in flight; each send's indices event, recorded later on the
+        same stream, covers it.
+        """
+        if len(reqs) < 2 or self.enable_staging or is_cp_sharded_padded():
+            return None
+        allocator = self.token_to_kv_pool_allocator
+        if (
+            type(allocator).translate_kv_indices_for_transfer
+            is not BaseTokenToKVPoolAllocator.translate_kv_indices_for_transfer
+        ):
+            return None
+        if any(
+            req.disagg_kv_sender.get_max_transfer_tokens() is not None for req in reqs
+        ):
+            return None
+        defer = _defers_send_indices(reqs[0])
+        if any(_defers_send_indices(req) != defer for req in reqs[1:]):
+            return None
+        page_size = allocator.page_size
+        req_to_token = self.req_to_token_pool.req_to_token
+        # Same positions as kv_indices[::page_size] over [start_send_idx, end).
+        cols = [
+            np.arange(req.start_send_idx, max(end, req.start_send_idx), page_size)
+            for req, end in zip(reqs, ends)
+        ]
+        rows = [
+            np.full(len(col), int(req.kv.req_pool_idx), dtype=np.int64)
+            for req, col in zip(reqs, cols)
+        ]
+        index = torch.from_numpy(np.stack([np.concatenate(rows), np.concatenate(cols)]))
+        if req_to_token.is_cuda:
+            # A pageable source would make the upload wait for the stream.
+            index = index.pin_memory().to(req_to_token.device, non_blocking=True)
+        else:
+            index = index.to(req_to_token.device)
+        pages = req_to_token[index[0], index[1]] // page_size
+        pages = to_host_nonblocking(pages) if defer else pages.cpu().numpy()
+        return np.split(pages, np.cumsum([len(col) for col in cols])[:-1])
 
     def send_kv_chunk(
         self,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        page_indices: Optional[np.ndarray] = None,
     ) -> None:
+        """``page_indices``: this send's page ids from _batched_page_indices."""
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
@@ -1577,13 +1692,16 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req, last_chunk=last_chunk, end_idx=end_idx, page_indices=page_indices
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        page_indices: Optional[np.ndarray] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1617,13 +1735,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
-        # The schedule stream may wait on the in-flight forward. Senders that
-        # take host indices still being copied wait for them on their transfer
-        # worker instead of the scheduler; under KV sharding the worker also
-        # applies the page filter, and the CP filter is positional.
-        defer_indices = getattr(
-            req.disagg_kv_sender, "supports_host_tensor_indices", False
-        )
+        defer_indices = _defers_send_indices(req)
 
         state_indices: Optional[List] = None
         if last_chunk:
@@ -1809,26 +1921,31 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        precomputed = page_indices
+        assert precomputed is None or len(segments) == 1
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            raw_kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            if is_cp_sharded_padded():
-                raw_kv_indices = get_cp_sharded_padded_cache_transfer_indices(
-                    raw_kv_indices
-                )
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    raw_kv_indices
-                )
-            )
             sender = req.disagg_kv_sender
-            page_indices = kv_to_page_indices(
-                kv_indices, page_size, non_blocking=defer_indices
-            )
+            if precomputed is not None:
+                page_indices = precomputed
+            else:
+                raw_kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory: req_to_token holds VIRTUAL ids; the transfer
+                # needs physical ones. Per segment, since each is its own gather.
+                if is_cp_sharded_padded():
+                    raw_kv_indices = get_cp_sharded_padded_cache_transfer_indices(
+                        raw_kv_indices
+                    )
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        raw_kv_indices
+                    )
+                )
+                page_indices = kv_to_page_indices(
+                    kv_indices, page_size, non_blocking=defer_indices
+                )
             indices_event = None
             if defer_indices:
                 # Recorded after this segment's copy and the state payload
