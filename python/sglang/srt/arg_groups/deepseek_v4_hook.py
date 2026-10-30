@@ -42,6 +42,11 @@ def _attention_is_tensor_parallel(cfg) -> bool:
     return attn_tp_size > 1
 
 
+def _lora_requested(cfg) -> bool:
+    # --lora-paths becomes enable_lora only later, in check_lora_server_args
+    return bool(cfg.enable_lora) or (cfg.enable_lora is None and bool(cfg.lora_paths))
+
+
 def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
     from sglang.srt.utils.common import is_sm100_supported
 
@@ -55,6 +60,9 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         # MegaAttention pads each rank to a 64-head tile under attention TP.
         or (cfg.disaggregation_mode == "null" and _attention_is_tensor_parallel(cfg))
         or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
+        # MegaAttention runs wo_a inside its kernel from a base-only copy, so
+        # attention adapters would be skipped.
+        or _lora_requested(cfg)
     ):
         return "flashmla"
     return "flashmla_mega"
@@ -349,6 +357,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
+        (
+            "LoRA with --dsv4-attn-backend flashmla_mega",
+            cfg.dsv4_attn_backend == "flashmla_mega" and _lora_requested(cfg),
+        ),
     )
     for feature, enabled in unsupported:
         if enabled:
