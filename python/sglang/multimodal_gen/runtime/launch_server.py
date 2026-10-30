@@ -236,6 +236,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         "sglang-diffusionWorker-",
         on_ready=lambda data: _record_bound_scheduler_port(server_args, data),
     )
+    if 0 in (server_args.scheduler_ports or ()):
+        shutdown_scheduler_processes(None, processes, request_shutdown=False)
+        raise RuntimeError(
+            f"Scheduler ports {server_args.scheduler_ports}: a DP replica did not "
+            "report the port it bound."
+        )
 
     logger.debug("All workers are ready")
     logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())

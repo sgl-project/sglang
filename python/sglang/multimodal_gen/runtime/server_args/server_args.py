@@ -1608,6 +1608,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Either use a different port or disable --strict-ports."
             )
 
+    def _scheduler_port_is_ephemeral(self) -> bool:
+        # Remote clients, disagg peers and other nodes dial a port they were told;
+        # otherwise only this launch talks to the ingress and learns its bound port.
+        return (
+            not self.is_arg_explicitly_set("scheduler_port")
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.disagg_mode
+            and self.nnodes == 1
+        )
+
     def _adjust_network_ports(self):
         # standalone roles only need an HTTP port when exposing metrics
         needs_http = self.enable_metrics or self.disagg_role in (
@@ -1642,20 +1652,25 @@ class ServerArgs(DisaggServerArgsMixin):
             if needs_http:
                 self.port = self.settle_port(self.port)
                 settled_ports.add(self.port)
-            initial_scheduler_port = self.scheduler_port + (
-                random.randint(0, 100) if self.scheduler_port == 5555 else 0
-            )
-            self.scheduler_port = self.settle_port(
-                initial_scheduler_port, avoid=settled_ports
-            )
-            settled_ports.add(self.scheduler_port)
-            self.scheduler_ports = [self.scheduler_port]
-            for _ in range((self.dp_size or 1) - 1):
-                port = self.settle_port(
-                    self.scheduler_ports[-1] + 1, avoid=settled_ports
+            if self._scheduler_port_is_ephemeral():
+                # Port 0 has each scheduler take a free port at bind time; probing
+                # one here first would let a concurrent launch take it in between.
+                self.scheduler_ports = [0] * (self.dp_size or 1)
+            else:
+                initial_scheduler_port = self.scheduler_port + (
+                    random.randint(0, 100) if self.scheduler_port == 5555 else 0
                 )
-                settled_ports.add(port)
-                self.scheduler_ports.append(port)
+                self.scheduler_port = self.settle_port(
+                    initial_scheduler_port, avoid=settled_ports
+                )
+                settled_ports.add(self.scheduler_port)
+                self.scheduler_ports = [self.scheduler_port]
+                for _ in range((self.dp_size or 1) - 1):
+                    port = self.settle_port(
+                        self.scheduler_ports[-1] + 1, avoid=settled_ports
+                    )
+                    settled_ports.add(port)
+                    self.scheduler_ports.append(port)
             if self.master_port is not None:
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports

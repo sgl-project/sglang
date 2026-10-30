@@ -234,6 +234,23 @@ class TestLaunchServerShutdown(unittest.TestCase):
         self.assertFalse(process.terminated)
         self.assertFalse(process.killed)
 
+    def test_launch_stops_when_a_replica_never_reports_its_port(self):
+        # Clients would otherwise dial the port-0 placeholder.
+        workers = [_FakeProcess()]
+        server_args = SimpleNamespace(
+            enable_metrics=False, num_gpus=1, nnodes=1, node_rank=0, scheduler_ports=[0]
+        )
+        with (
+            patch.object(ls, "apply_plugin_hooks"),
+            patch.object(ls, "configure_logger"),
+            patch.object(ls.ServerArgsPayload, "capture"),
+            patch.object(ls, "_start_scheduler_processes", return_value=workers),
+            patch.object(ls, "shutdown_scheduler_processes") as shutdown,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not report"):
+                ls.launch_server(server_args)
+        shutdown.assert_called_once_with(None, workers, request_shutdown=False)
+
 
 if __name__ == "__main__":
     unittest.main()
