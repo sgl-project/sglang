@@ -30,7 +30,9 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
-from sglang.kernels.ops.activation.softcap import softcap_to_float32_logits
+from sglang.kernels.ops.activation.softcap import (
+    softcap_to_float32_logits,
+)
 from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
