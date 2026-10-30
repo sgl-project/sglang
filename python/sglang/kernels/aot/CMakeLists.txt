@@ -20,7 +20,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+# Torch 2.14 headers reject anything below C++20 with a hard #error.
+set(SGL_KERNEL_CXX_STANDARD "20" CACHE STRING "C++ standard used for host and CUDA compilation")
 set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
@@ -66,8 +67,8 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
-    URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
+    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
 )
 FetchContent_Populate(repo-triton)
 
@@ -82,8 +83,8 @@ FetchContent_Populate(repo-flashinfer)
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/f89bc2306632d1ec5f97b014dded4254f5b4a907.tar.gz
-    URL_HASH SHA256=418b5681584dc3efff496a1cab5ffd58d2728d89dcfe0ea16e6985d6ef35c68c
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/141fa063d57c27d77af3aa8adf1b69330dc2bc10.tar.gz
+    URL_HASH SHA256=16d797e00e875af6740002a9aba22072510651bf3f9932c6b6f6ea9b44012ef0
 )
 FetchContent_Populate(repo-flash-attention)
 

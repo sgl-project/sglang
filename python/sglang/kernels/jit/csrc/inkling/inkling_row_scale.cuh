@@ -97,7 +97,7 @@ void row_scale(tvm::ffi::TensorView x, tvm::ffi::TensorView tau, tvm::ffi::Tenso
   auto R = SymbolicSize{"rows"};
   auto N = SymbolicSize{"inner"};
   auto dev = SymbolicDevice{};
-  dev.set_options<kDLCUDA>();
+  dev.set_options<kDLGPU>();
   TensorMatcher({R}).with_dtype<fp32_t>().with_device(dev).verify(tau);
   row_scale_launch<kUsePDL, true>(x, static_cast<const fp32_t*>(tau.data_ptr()), out, R, N, dev);
 }
@@ -109,7 +109,7 @@ void row_compact(tvm::ffi::TensorView x, tvm::ffi::TensorView out) {
   auto R = SymbolicSize{"rows"};
   auto N = SymbolicSize{"inner"};
   auto dev = SymbolicDevice{};
-  dev.set_options<kDLCUDA>();
+  dev.set_options<kDLGPU>();
   row_scale_launch<kUsePDL, false>(x, nullptr, out, R, N, dev);
 }
 

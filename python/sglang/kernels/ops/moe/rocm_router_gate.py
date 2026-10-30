@@ -224,11 +224,13 @@ def _router_gate_kernel(
     stride_pm,
     stride_om,
     routed_scaling_factor,
+    shared_id_base,
     SPLIT_K: tl.constexpr,
     WRITE_LOGITS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RENORM: tl.constexpr,
     TOPK: tl.constexpr,
+    NUM_SHARED: tl.constexpr,
 ):
     row = tl.program_id(0)
     weights, ids = _gate_row(
@@ -247,7 +249,12 @@ def _router_gate_kernel(
         TOPK,
     )
     lane = tl.arange(0, 64)
-    out_mask = lane < TOPK
+    if NUM_SHARED > 0:
+        # fused_append_shared_experts: shared slot s holds id shared_id_base + s, weight 1.0
+        is_shared = lane >= TOPK
+        weights = tl.where(is_shared, 1.0, weights)
+        ids = tl.where(is_shared, shared_id_base + lane - TOPK, ids)
+    out_mask = lane < TOPK + NUM_SHARED
     tl.store(weights_ptr + row * stride_om + lane, weights, mask=out_mask)
     tl.store(ids_ptr + row * stride_om + lane, ids, mask=out_mask)
 
@@ -260,12 +267,15 @@ def rocm_router_gate(
     routed_scaling_factor: Optional[float],
     *,
     partials: Optional[torch.Tensor] = None,
+    num_shared: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """aiter topk_gating(..., score_func="sqrtsoftplus") for 384 experts: fp32 weights and int32
     ids [M, topk]; with partials their fixed-order sum is gated and written into
-    gating_output."""
+    gating_output. num_shared > 0 appends fused_append_shared_experts(..., scale_factor=1.0,
+    N=384) columns: ids and weights become [M, topk + num_shared]."""
     M, num_experts = gating_output.shape
     assert num_experts == _GATE_NUM_EXPERTS and 0 < topk <= _MAX_TOPK
+    assert 0 <= num_shared <= _WARP - topk
     assert gating_output.stride(1) == 1
     if partials is not None:
         assert (
@@ -282,8 +292,9 @@ def rocm_router_gate(
         assert (
             correction_bias.shape == (num_experts,) and correction_bias.is_contiguous()
         )
-    weights = torch.empty((M, topk), dtype=torch.float32, device=gating_output.device)
-    ids = torch.empty((M, topk), dtype=torch.int32, device=gating_output.device)
+    width = topk + num_shared
+    weights = torch.empty((M, width), dtype=torch.float32, device=gating_output.device)
+    ids = torch.empty((M, width), dtype=torch.int32, device=gating_output.device)
     if M == 0:
         return weights, ids
     _router_gate_kernel[(M,)](
@@ -297,11 +308,13 @@ def rocm_router_gate(
         stride_pm,
         weights.stride(0),
         float(1.0 if routed_scaling_factor is None else routed_scaling_factor),
+        num_experts,
         SPLIT_K=split_k,
         WRITE_LOGITS=split_k > 0,
         HAS_BIAS=correction_bias is not None,
         RENORM=bool(renormalize),
         TOPK=topk,
+        NUM_SHARED=num_shared,
         num_warps=1,
     )
     return weights, ids

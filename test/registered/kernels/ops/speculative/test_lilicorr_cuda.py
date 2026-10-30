@@ -12,7 +12,7 @@ from sglang.kernels.ops.speculative.lilicorr import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="extra-a", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="LiLiCorr Triton kernels require CUDA"
@@ -111,6 +111,29 @@ def test_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
 
     torch.testing.assert_close(actual.cpu(), expected)
     assert actual[:, 0].cpu().equal(tokens[:, 0, 0].cpu())
+
+
+@pytest.mark.parametrize("nan_rows", ["all", "mixed"])
+def test_greedy_path_matches_the_reference_on_nan_scores(nan_rows):
+    torch.manual_seed(5)
+    bs, slots, topk = 3, 6, 8
+    log_start = torch.randn(bs, topk, device="cuda")
+    log_pair = torch.randn(bs, slots - 1, topk, topk, device="cuda")
+    if nan_rows == "all":
+        log_start[0] = float("nan")
+        log_pair[0] = float("nan")
+    else:
+        log_pair[torch.rand_like(log_pair) < 0.3] = float("nan")
+    candidate_tokens = torch.arange(bs * slots * topk, device="cuda").view(
+        bs, slots, topk
+    )
+    state = _greedy_state(bs, slots, candidate_tokens.device)
+
+    tokens, q = lilicorr_sample_path(log_start, log_pair, candidate_tokens, **state)
+    ref_tokens, ref_q = _walk_reference(log_start, log_pair, candidate_tokens, **state)
+
+    assert torch.equal(tokens.cpu(), ref_tokens)
+    assert torch.equal(q.cpu(), ref_q)
 
 
 def _sampled_inputs(bs, slots, k, *, seed=0):

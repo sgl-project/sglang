@@ -6,6 +6,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    is_one_nvlink_clique,
+)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -475,6 +478,36 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
 
+        # Determine GPUs per node for MNNVL topology detection
+        gpus_per_node = None
+        node_pg = cpu_group if cpu_group is not None else group
+        if node_pg is not None:
+            gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
+
+        # Fabric handles are only importable within one NVLink clique, and
+        # is_mnnvl_fabric_supported() is per-GPU, so gate cross-node groups here.
+        if (
+            backend == "mnnvl"
+            and gpus_per_node is not None
+            and gpus_per_node < world_size
+            and not is_one_nvlink_clique(
+                group=node_pg,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+        ):
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                "FlashInfer AllReduce fusion disabled: the %d ranks of this group are "
+                "not confirmed to share one NVLink clique (they span cliques, or the "
+                "NVML fabric query failed), which the MNNVL backend requires. On SLURM "
+                "this usually means the job was placed across topology blocks; set "
+                "--segment equal to --nodes.",
+                world_size,
+            )
+            self.workspace = None
+            self.initialized = False
+            return
+
         if not _preflight_check_workspace_memory(
             world_size=world_size,
             max_token_num=max_token_num,
@@ -487,11 +520,6 @@ class FlashInferWorkspaceManager:
             self.initialized = False
             return
 
-        # Determine GPUs per node for MNNVL topology detection
-        gpus_per_node = None
-        node_pg = cpu_group if cpu_group is not None else group
-        if node_pg is not None:
-            gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
         comm_backend = None
         if (
             _TorchDistBackend is not None
@@ -941,7 +969,7 @@ def can_use_flashinfer_allreduce(
 
     # Size checks stay last: they read the token dim, which is symbolic under
     # Dynamo, so statically-off configs must short-circuit before reaching them
-    # (same ordering rule as apply_flashinfer_allreduce_fusion).
+    # (same ordering rule as flashinfer_ar_fusion_applies).
     token_num, hidden_dim = input_.shape
 
     # MNNVL hard-fails instead of falling back when the width is not float4-aligned

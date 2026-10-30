@@ -2,9 +2,10 @@
 
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
+use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
 use crate::utils::shm::{shm_path, unique_name};
@@ -102,16 +103,21 @@ fn ids_len(req: &SchedulerRequest) -> usize {
 /// further chunk can be delivered, and tell the scheduler to stop generating.
 ///
 /// Neither releases anything, and nothing needs them to. Release ordering used
-/// to be the delicate part here — `AbortGuard::drop` releasing a rid right
+/// to be the delicate part here — `CoreCall::drop` releasing a rid right
 /// after enqueuing the abort ordered the SEND, not the EFFECT, so a retry of
 /// the same rid could `Register` ahead of the stale abort and be torn down by
 /// it. `Rid::from_client` removes the premise: a retry carries a different
 /// `Rid`, so no abort in flight can name it.
+///
+/// A dropped tokenize or detokenize call (`Local`) never reached the
+/// scheduler, so it only deregisters: thousands of cancelled items must not
+/// queue scheduler aborts ahead of generation requests.
 #[test]
 fn every_abort_source_deregisters_and_stops_the_scheduler() {
-    for source in [
-        AbortSource::Guard("x".into()),
-        AbortSource::Detok("x".into()),
+    for (source, scheduler_aborts) in [
+        (AbortSource::Guard("x".into()), 1),
+        (AbortSource::Detok("x".into()), 1),
+        (AbortSource::Local("x".into()), 0),
     ] {
         let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
         let (to_scheduler_tx, consumer) = to_scheduler(16);
@@ -140,8 +146,8 @@ fn every_abort_source_deregisters_and_stops_the_scheduler() {
         );
         assert_eq!(
             consumer.drain(8).len(),
-            1,
-            "{source:?} must push an AbortReq so the scheduler stops",
+            scheduler_aborts,
+            "{source:?}: AbortReqs pushed to the scheduler",
         );
     }
 }
@@ -165,6 +171,7 @@ fn test_limits() -> Limits {
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         enable_return_hidden_states: false,
+        default_priority: None,
     }
 }
 
@@ -180,6 +187,28 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
             sampling_params,
             ..Default::default()
         })),
+    }
+}
+
+/// An unset priority takes the configured default; an explicit one is kept
+/// (Python `_set_default_priority`).
+#[test]
+fn unset_priority_takes_the_default() {
+    let limits = Limits {
+        default_priority: Some(0),
+        ..test_limits()
+    };
+    for (sent, want) in [(None, Some(0)), (Some(-2), Some(-2))] {
+        let mut req = generate_req(1, SamplingParams::default());
+        let RequestKind::Generate(g) = &mut req.kind else {
+            unreachable!()
+        };
+        g.priority = sent;
+        validate(&mut req, &limits).unwrap();
+        let RequestKind::Generate(g) = &req.kind else {
+            unreachable!()
+        };
+        assert_eq!(g.priority, want);
     }
 }
 
@@ -202,7 +231,7 @@ fn total_tokens_over_context_is_rejected() {
     };
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
     let msg = err.to_string();
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(msg.contains("total of 103 tokens"), "{msg}");
     assert!(msg.contains("3 tokens from the input"), "{msg}");
     assert!(msg.contains("100 tokens for the completion"), "{msg}");
@@ -210,6 +239,43 @@ fn total_tokens_over_context_is_rejected() {
     g.sampling_params.max_new_tokens = Some(7);
     assert!(check_total_tokens(&mut g, &limits).is_ok());
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
+}
+
+/// A launcher whose default for an omitted `max_new_tokens` is `None` (no
+/// limit) under `--context-length` lets a prompt near the window through
+/// untouched; the scheduler clamps the output to the room the window leaves.
+/// A client-sent 128 or context-length value is a 400; the same values marked
+/// defaulted are left to the scheduler's clamp.
+#[test]
+fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
+    let limits = Limits {
+        context_len: 1000,
+        ..test_limits()
+    };
+    let request = |max_new_tokens| GenerateRequest {
+        input_ids: Some(vec![1; 990]),
+        sampling_params: SamplingParams {
+            max_new_tokens,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut g = request(None);
+    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert_eq!(
+        g.sampling_params.max_new_tokens, None,
+        "left to the scheduler"
+    );
+    for max_new_tokens in [Some(128), Some(1000)] {
+        let err = check_total_tokens(&mut request(max_new_tokens), &limits).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{max_new_tokens:?}");
+        let mut g = GenerateRequest {
+            max_new_tokens_defaulted: true,
+            ..request(max_new_tokens)
+        };
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, max_new_tokens);
+    }
 }
 
 /// The reserved slots (eagle draft tokens) count as input, so a request can be
@@ -269,6 +335,43 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
 }
 
+/// A `max_new_tokens` the client did not send (a preferred value or the schema
+/// default) is neither rejected nor clamped here, whatever its size: it reaches
+/// the scheduler as is, which clamps it. The input alone is still checked.
+#[test]
+fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
+    for allow_auto_truncate in [false, true] {
+        let limits = Limits {
+            context_len: 10,
+            allow_auto_truncate,
+            ..test_limits()
+        };
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]),
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(10), // the whole window
+                ..Default::default()
+            },
+            max_new_tokens_defaulted: true,
+            ..Default::default()
+        };
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, Some(10), "untouched");
+    }
+
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1; 10]),
+        max_new_tokens_defaulted: true,
+        ..Default::default()
+    };
+    let limits = Limits {
+        context_len: 10,
+        ..test_limits()
+    };
+    let err = check_total_tokens(&mut g, &limits).unwrap_err();
+    assert!(err.to_string().contains("longer than the model's context"));
+}
+
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
 /// alone must still fit. Gating the whole function on `max_new_tokens` let an
 /// over-long prompt through to the scheduler with no error at all.
@@ -291,7 +394,7 @@ fn input_length_is_checked_unconditionally() {
     for max_new_tokens in [None, Some(1)] {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
             .expect_err("input == context_len must be rejected (Python uses >=)");
-        assert_eq!(err.http_status(), 400);
+        assert!(matches!(err, Error::Validation(_)));
         assert!(err.to_string().contains("longer than the model's context"));
     }
     // One token shorter fits, with or without a cap.
@@ -338,7 +441,7 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     };
     let err = check_total_tokens(&mut g, &limits)
         .expect_err("a clamp that inverts min/max must 400, not ride the wire");
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("min_new_tokens"), "{err}");
 
     // A clamp that keeps the invariant still clamps.
@@ -362,7 +465,7 @@ fn hidden_states_gated_on_server_support() {
     };
     let disabled = test_limits();
     let err = validate(&mut req(true), &disabled).unwrap_err();
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(
         err.to_string().contains("--enable-return-hidden-states"),
         "message must name the flag: {err}"
@@ -380,19 +483,18 @@ fn hidden_states_gated_on_server_support() {
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
 /// to the channel, after registration -- so it must be deregistered, not leaked.
+/// The same `max_new_tokens` as a default reaches the scheduler unchanged.
 #[test]
-fn over_context_request_deregisters_and_never_reaches_the_channel() {
+fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
         context_len: 4,
         ..test_limits()
     });
-    intake.drive(generate_req(
-        33,
-        SamplingParams {
-            max_new_tokens: Some(64),
-            ..Default::default()
-        },
-    ));
+    let sampling_params = SamplingParams {
+        max_new_tokens: Some(64),
+        ..Default::default()
+    };
+    intake.drive(generate_req(33, sampling_params.clone()));
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "33"),
         "registered before the check",
@@ -405,6 +507,18 @@ fn over_context_request_deregisters_and_never_reaches_the_channel() {
         consumer.drain(16).is_empty(),
         "must not reach the scheduler"
     );
+
+    let mut req = generate_req(34, sampling_params);
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.max_new_tokens_defaulted = true;
+    intake.drive(req);
+    let pushed = consumer.drain(16);
+    assert_eq!(pushed.len(), 1, "must reach the scheduler");
+    let header = rmpv::decode::read_value(&mut &pushed[0].header[..]).unwrap();
+    let sampling_params = header.as_array().unwrap()[8].as_array().unwrap();
+    assert_eq!(sampling_params[0].as_i64(), Some(64), "max_new_tokens");
 }
 
 /// A `Detokenize` request terminates at the detok stage, and the shard must
@@ -423,6 +537,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_channel() {
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Detokenize {
             token_ids: vec![7, 8, 9],
+            skip_special_tokens: false,
         },
     });
     assert!(
@@ -432,10 +547,10 @@ fn detokenize_flows_register_then_decode_and_skips_the_channel() {
     assert!(
         matches!(
             detok_rx.try_recv(),
-            Ok(DetokMsg::Decode { rid, token_ids })
+            Ok(DetokMsg::Decode { rid, token_ids, skip_special_tokens: false })
                 if rid.as_str() == "41" && token_ids == [7, 8, 9]
         ),
-        "the decode job follows, ids intact",
+        "the decode job follows, ids and flag intact",
     );
     assert!(
         consumer.drain(16).is_empty(),
@@ -461,15 +576,81 @@ fn detokenize_negative_ids_reject_before_registration() {
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Detokenize {
             token_ids: vec![1, -1],
+            skip_special_tokens: true,
         },
     });
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("sink must receive the validation error");
     };
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("out of range"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
     assert!(consumer.drain(16).is_empty());
+}
+
+/// A `Tokenize` request goes to the tokenizer pool, which answers it through
+/// its own sink: no detok shard hears of it and nothing reaches the
+/// scheduler channel. Without a tokenizer (`skip_tokenizer_init`) it is a
+/// validation error instead.
+#[test]
+fn tokenize_goes_to_the_pool_without_detok_registration() {
+    for skip_tokenizer_init in [false, true] {
+        let (tok_tx, tok_rx) = flume::unbounded();
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (to_scheduler_tx, consumer) = to_scheduler(16);
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let mut intake = Intake::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: tok_tx,
+                detokenizer_tx: vec![detok_tx],
+            },
+            to_scheduler_tx,
+            Limits {
+                skip_tokenizer_init,
+                ..test_limits()
+            },
+            test_mm(flume::unbounded().0, true /* enabled */),
+            sd_rx,
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        intake.drive(Request {
+            rid: "45".into(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Tokenize(TokenizeInput::Text {
+                text: "hi".into(),
+                add_special_tokens: false,
+            }),
+        });
+        if skip_tokenizer_init {
+            let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+                panic!("sink must receive the validation error");
+            };
+            assert!(matches!(err, Error::Validation(_)));
+            assert!(tok_rx.try_recv().is_err(), "the pool never sees it");
+        } else {
+            let pooled = tok_rx.try_recv().expect("handed to the tokenizer pool");
+            assert_eq!(pooled.rid.as_str(), "45");
+            assert!(matches!(
+                pooled.kind,
+                RequestKind::Tokenize(TokenizeInput::Text {
+                    add_special_tokens: false,
+                    ..
+                })
+            ));
+            assert!(rx.try_recv().is_err(), "no response until the pool answers");
+        }
+        assert!(detok_rx.try_recv().is_err(), "no detok registration");
+        assert!(
+            consumer.drain(16).is_empty(),
+            "must never reach the scheduler"
+        );
+    }
 }
 
 /// A dropped channel push is survivable, and this pins WHY. The channel is bounded,
@@ -480,9 +661,9 @@ fn detokenize_negative_ids_reject_before_registration() {
 /// The detok entry is dropped either way — that is the half that must not
 /// depend on the channel.
 ///
-/// Channel capacity 1: the first abort pushes, the second finds it full.
+/// Request-ring capacity does not limit the reserved abort lane.
 #[test]
-fn abort_deregisters_even_when_the_channel_push_is_dropped() {
+fn abort_deregisters_and_bypasses_request_ring_capacity() {
     let (tok_tx, _tok_rx) = flume::unbounded();
     let (detok_tx, detok_rx) = flume::unbounded();
     let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
@@ -492,7 +673,7 @@ fn abort_deregisters_even_when_the_channel_push_is_dropped() {
         tokenizer_tx: tok_tx,
         detokenizer_tx: vec![detok_tx],
     };
-    let (producer, _consumer) = to_scheduler(1);
+    let (producer, consumer) = to_scheduler(1);
     let (_tm_tx, tm_rx) = flume::unbounded();
     let (sd_tx, sd_rx) = flume::unbounded::<()>();
     std::mem::forget(sd_tx);
@@ -516,6 +697,7 @@ fn abort_deregisters_even_when_the_channel_push_is_dropped() {
             "{expected}: the detok entry must be dropped even when the to_scheduler channel is full",
         );
     }
+    assert_eq!(consumer.drain(8).len(), 2, "both aborts must be delivered");
 }
 
 /// The rid keys the detok table and rides on every chunk of every decode step,
@@ -525,7 +707,7 @@ fn oversized_rid_is_rejected() {
     let mut req = generate_req(51, SamplingParams::default());
     req.rid = "x".repeat(MAX_RID_LEN + 1).into();
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
-    assert_eq!(err.http_status(), 400);
+    assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("over the"), "{err}");
 
     // A uuid-sized rid — what Python mints — is nowhere near the cap.
@@ -780,7 +962,7 @@ fn mm_pool_gone_deregisters() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("expected a terminal error frame");
     };
-    assert_eq!(err.http_status(), 500, "{err}");
+    assert!(matches!(err, Error::Internal(_)), "{err}");
     assert!(err.to_string().contains("mm worker pool gone"), "{err}");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
     assert!(matches!(
@@ -1087,7 +1269,9 @@ fn mm_failure_rejects_returned_request() {
 
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     req.state
-        .apply(Event::Error(Error::Encode("bad image".into())))
+        .apply(Event::Error(Error::Encode(MediaError::Client(
+            "bad image".into(),
+        ))))
         .unwrap();
     intake.drive(req);
     assert!(
@@ -1140,7 +1324,7 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("expected a terminal error frame");
     };
-    assert_eq!(err.http_status(), 400, "{err}");
+    assert!(matches!(err, Error::Validation(_)), "{err}");
     assert!(err.to_string().contains("must provide input_ids"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "rejected before registration");
     assert!(mm_rx.try_recv().is_err(), "never reaches the mm pool");

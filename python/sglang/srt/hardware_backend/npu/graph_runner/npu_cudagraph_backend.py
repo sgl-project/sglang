@@ -28,6 +28,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -54,7 +55,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver

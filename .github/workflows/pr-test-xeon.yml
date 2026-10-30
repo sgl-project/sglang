@@ -6,8 +6,17 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      extra_only:
+        description: "Run only the extra Intel CPU suite"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
+      extra_only:
+        description: "Run only the extra Intel CPU suite"
+        type: boolean
+        default: false
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -20,7 +29,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xeon-${{ inputs.ref || github.ref }}
+  group: pr-test-xeon-${{ inputs.extra_only && 'extra' || 'base' }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -68,6 +77,7 @@ jobs:
               - "test/**/!(*.md)"
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xeon.yml"
+              - ".github/workflows/pr-test-extra.yml"
               - "docker/xeon.Dockerfile"
 
   # ==================== PR Gate ==================== #
@@ -75,6 +85,9 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      # Extra is called by the NVIDIA/shared Extra workflow; Base is unchanged.
+      require-label: ${{ inputs.extra_only == true && 'run-ci-nv-extra' || '' }}
     secrets: inherit
 
   build-test:
@@ -85,39 +98,14 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          # GNR runs only the TP suite (needs >=6 NUMA nodes for --tp 6),
-          # full machine, no partitioning. 4 files: 3 TP + autoround.
-          - runner: xeon-gnr
-            role: gnr
-            suite: "stage-a-tp-test-cpu-intel"
-            name: gnr
-
-          # Three SPR boxes each run ONE full-machine container taking one
-          # partition of a 3-way split over the merged non-TP pool
-          # (base-b non-TP + base-c). Single container per box (no socket
-          # split): sglang auto-computes mem_fraction_static from host memory
-          # and does not honor cgroup limits, so two parallel containers on
-          # one box exhaust host RAM and OOM (tracked upstream). One container
-          # per box keeps each server within the box's memory budget.
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr1
-            part_id: 0
-            part_size: 3
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr2
-            part_id: 1
-            part_size: 3
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr3
-            part_id: 2
-            part_size: 3
+        # Extra runs only on SPR; GNR remains dedicated to the base TP suite.
+        # Base uses two SPR jobs (four partitions); extra uses one (two partitions).
+        include: >-
+          ${{ fromJSON(inputs.extra_only &&
+          '[{"runner":"xeon-spr","role":"spr","suite":"extra-test-cpu-intel","name":"spr1","part_lo":0,"part_hi":1,"part_size":2}]' ||
+          '[{"runner":"xeon-gnr","role":"gnr","suite":"stage-a-tp-test-cpu-intel","name":"gnr"},
+          {"runner":"xeon-spr","role":"spr","suite":"stage-a-test-cpu-intel,stage-b-test-cpu-intel","name":"spr1","part_lo":0,"part_hi":1,"part_size":4},
+          {"runner":"xeon-spr","role":"spr","suite":"stage-a-test-cpu-intel,stage-b-test-cpu-intel","name":"spr2","part_lo":2,"part_hi":3,"part_size":4}]') }}
     steps:
       - name: Cleanup workspace
         run: |
@@ -169,43 +157,70 @@ jobs:
         timeout-minutes: 120
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --timeout-from-est-time"
+            bash -c "source /opt/.venv/bin/activate && hf auth login --token \$HF_TOKEN && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --timeout-from-est-time"
 
-      # ============ SPR: single full-machine container, one partition ====== #
-      - name: Run container (SPR)
-        if: matrix.role == 'spr'
-        run: |
-          docker rm -f ci_sglang_${{ matrix.name }} || true
-          docker run -dt \
-            -v ${{ github.workspace }}:/sglang-checkout/ --shm-size=64g \
-            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-            -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
-            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
-            --name ci_sglang_${{ matrix.name }} \
-            sglang_xeon
-
-      - name: Check AMX support (SPR)
-        if: matrix.role == 'spr'
-        timeout-minutes: 5
-        run: |
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
-
-      - name: Run unit tests (SPR)
+      # ========= SPR: two socket-pinned containers, run in parallel ======== #
+      - name: Run unit tests (SPR, two sockets in parallel)
         if: matrix.role == 'spr'
         timeout-minutes: 120
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time"
+          set -uo pipefail
+          HF_TOKEN_VAL="$(cat ~/huggingface_token.txt)"
+
+          # One socket-pinned container. Physical cores only (0-31 = socket0,
+          # 32-63 = socket1); logical/HT siblings (64-127) are never bound.
+          # --memory caps the cgroup so sglang sizes KV against one socket, and
+          # --cpuset-mems keeps allocations on the local memory bank.
+          # $1 socket id, $2 cpuset-cpus, $3 cpuset-mems, $4 partition id
+          run_socket () {
+            local sid=$1 cpus=$2 mems=$3 pid=$4
+            local cname=ci_sglang_${{ matrix.name }}_s${sid}
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            docker run -dt \
+              --cpuset-cpus="$cpus" --cpuset-mems="$mems" --memory=240g \
+              -v ${{ github.workspace }}:/sglang-checkout/ --shm-size=32g \
+              -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+              -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
+              -e HF_TOKEN="$HF_TOKEN_VAL" \
+              -e SGLANG_CPU_OMP_THREADS_BIND="$cpus" \
+              --name "$cname" \
+              sglang_xeon
+            docker exec -w /sglang-checkout/ "$cname" bash -c \
+              "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\")' && \
+               hf auth login --token \$HF_TOKEN && \
+               cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --auto-partition-id $pid --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time"
+          }
+
+          # socket0 -> part_lo, socket1 -> part_hi; run concurrently, wait both.
+          run_socket 0 "0-31"  0 ${{ matrix.part_lo }} > s0.log 2>&1 &
+          P0=$!
+          run_socket 1 "32-63" 1 ${{ matrix.part_hi }} > s1.log 2>&1 &
+          P1=$!
+
+          rc=0
+          wait $P0 || rc=1
+          wait $P1 || rc=1
+
+          echo "==================== socket0 (partition ${{ matrix.part_lo }}) ===================="
+          cat s0.log || true
+          echo "==================== socket1 (partition ${{ matrix.part_hi }}) ===================="
+          cat s1.log || true
+          exit $rc
 
       # ============================ Common ================================= #
       - name: Change permission
         if: always()
         timeout-minutes: 2
         run: |
-          docker exec -u root ci_sglang_${{ matrix.name }} bash -c "rm -rf /tmp/ci-home && chown -R $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true" 2>/dev/null || true
+          # GNR has one container (ci_sglang_<name>); SPR has two socket
+          # containers (ci_sglang_<name>_s0/_s1). Chown from whichever exist.
+          for c in ci_sglang_${{ matrix.name }} ci_sglang_${{ matrix.name }}_s0 ci_sglang_${{ matrix.name }}_s1; do
+            docker exec -u root "$c" bash -c "rm -rf /tmp/ci-home && chown -R $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true" 2>/dev/null || true
+          done
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f ci_sglang_${{ matrix.name }} || true
+          for c in ci_sglang_${{ matrix.name }} ci_sglang_${{ matrix.name }}_s0 ci_sglang_${{ matrix.name }}_s1; do
+            docker rm -f "$c" || true
+          done

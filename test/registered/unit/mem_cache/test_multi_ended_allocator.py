@@ -18,9 +18,20 @@ Data copies go through a fake kvcache and the view math is pure torch, so the
 suite runs on CPU apart from the cases that skip themselves without CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from types import SimpleNamespace
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import index_slots
+from sglang.test.unified_allocator_fixtures import (
+    arena_of,
+    chain_snapshot,
+    stand_in_views,
+    token_ends,
+)
+
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 import contextlib
 import random
@@ -29,29 +40,31 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.unified_sub_pool import (
-    FloatMultiEndedAllocator,
-    MultiEndedAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
+from sglang.srt.mem_cache.kv.alloc.band import (
+    Band,
+    FloatBand,
+)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
-    UnifiedKVPool,
     UnifiedMambaSlotAllocator,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 
 _DEV = "cpu"
@@ -84,11 +97,26 @@ class _FakeKVCache:
     """Tracks, per physical slot, the virtual id whose data lives there, so a
     test can assert the data followed a compaction move."""
 
-    def __init__(self, max_slots: int):
+    def __init__(self, source, name=None):
+        # A bare size for a pool no arena moves; else the band of ``source``
+        # (a test arena) whose unit moves this buffer follows.
+        if name is None:
+            size = source
+        else:
+            size = source.num_entries(name)
+            source.follow(name, self)
         # buf[p] == virtual id currently stored at physical slot p (-1 if free).
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
 
-    def move_kv_cache(self, dst_loc: torch.Tensor, src_loc: torch.Tensor):
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
+    def move_units(
+        self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
+        slots = torch.arange(page_size, device=dst_pages.device)
+        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
+        src_loc = (src_pages[:, None] * page_size + slots).flatten()
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
@@ -122,35 +150,35 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         entry_max = max(full.entry_bytes(), mamba.entry_bytes())
         total = full.entry_bytes() * 64 + mamba.entry_bytes() * 16
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
         for s in (full, mamba):
-            min_idx = pool.min_slot_index(s.name)
+            min_idx = pool.first_entry(s.name)
             # real data of every pool begins at bytes >= entry_max
             self.assertGreaterEqual(min_idx * s.entry_bytes(), entry_max)
-            self.assertGreater(pool.max_slots(s.name), min_idx)
+            self.assertGreater(pool.num_entries(s.name), min_idx)
 
     def test_mha_view_roundtrip(self):
         full = _make_mha_spec("full", "up", layer_num=3, head_num=2, head_dim=4)
         swa = _make_mha_spec("swa", "down", layer_num=2, head_num=2, head_dim=4)
         total = full.entry_bytes() * 32 + swa.entry_bytes() * 32
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device=_DEV,
             enable_memory_saver=False,
         )
-        k_full, v_full = pool.mha_views_for("full")
-        k_swa, v_swa = pool.mha_views_for("swa")
+        k_full, v_full = pool.spec("full").views(pool)
+        k_swa, v_swa = pool.spec("swa").views(pool)
         self.assertEqual(len(k_full), 3)
         self.assertEqual(len(k_swa), 2)
         # "full" and "swa" share the buffer from byte 0 and grow toward each
         # other, so a low "swa" slot would byte-overlap "full" slot 5.
-        swa_slot = pool.max_slots("swa") - 1
+        swa_slot = pool.num_entries("swa") - 1
         for lyr in range(3):
             k_full[lyr][5] = float(lyr + 1)
             v_full[lyr][5] = float(-(lyr + 1))
@@ -168,14 +196,14 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=3)
         total = full.entry_bytes() * 16 + mamba.entry_bytes() * 8
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
-        max_slots = pool.max_slots("mamba")
+        conv_views, temporal_view = pool.spec("mamba").views(pool)
+        max_slots = pool.num_entries("mamba")
         self.assertEqual(len(conv_views), 1)
         self.assertEqual(tuple(conv_views[0].shape), (3, max_slots, 4, 3))
         self.assertEqual(tuple(temporal_view.shape), (3, max_slots, 2, 2, 2))
@@ -186,7 +214,7 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         self.assertTrue(torch.all(temporal_view[2, 6] == -1.25))
 
 
-class TestMultiEndedAllocator(unittest.TestCase):
+class TestBand(unittest.TestCase):
     def setUp(self):
         # The code under test reads its config from the bags.
         reset_context()
@@ -197,24 +225,22 @@ class TestMultiEndedAllocator(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
+        full_alloc = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=mamba_kv,
-            unified_buffer=pool,
+        mamba_alloc = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -223,12 +249,12 @@ class TestMultiEndedAllocator(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return pool, full_alloc, mamba_alloc, full_kv, mamba_kv
 
-    def _check_invariants(self, alloc: MultiEndedAllocator, kv: _FakeKVCache):
-        v2p = alloc.virtual_to_physical
-        p2v = alloc.physical_to_virtual
+    def _check_invariants(self, alloc: Band, kv: _FakeKVCache):
+        v2p = alloc.ids.virtual_to_physical
+        p2v = alloc.ids.physical_to_virtual
         # live virtual ids = those with v2p != -1, excluding the reserved id 0.
         live_v = [
-            v for v in range(1, alloc.num_virtual_ids) if int(v2p[v].item()) != -1
+            v for v in range(1, alloc.ids.num_virtual_ids) if int(v2p[v].item()) != -1
         ]
         # mutual-inverse on the live set
         for v in live_v:
@@ -252,7 +278,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         self.assertEqual(free_set & set(live_v), set())
 
-    def _alloc(self, alloc: MultiEndedAllocator, kv: _FakeKVCache, n: int):
+    def _alloc(self, alloc: Band, kv: _FakeKVCache, n: int):
         avail = alloc.available_size()
         v = alloc.alloc(n)
         if n > avail:
@@ -261,12 +287,12 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self.assertIsNotNone(v)
         self.assertEqual(int(v.numel()), n)
         # stamp the data marker at each new physical slot
-        p = alloc.virtual_to_physical[v]
+        p = alloc.ids.virtual_to_physical[v]
         kv.buf[p] = v
         return v
 
-    def _free(self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v: torch.Tensor):
-        p = alloc.virtual_to_physical[v]
+    def _free(self, alloc: Band, kv: _FakeKVCache, v: torch.Tensor):
+        p = alloc.ids.virtual_to_physical[v]
         kv.buf[p] = -1  # the freed virtual id's data is gone
         alloc.free(v)
 
@@ -282,7 +308,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self._check_invariants(full_alloc, full_kv)
         # `a` and `c` virtual ids unchanged; their physical slots may have moved.
         for v in a.tolist() + c.tolist():
-            self.assertNotEqual(int(full_alloc.virtual_to_physical[v].item()), -1)
+            self.assertNotEqual(int(full_alloc.ids.virtual_to_physical[v].item()), -1)
         # free the boundary batch (no relocation needed)
         self._free(full_alloc, full_kv, c)
         self._check_invariants(full_alloc, full_kv)
@@ -343,25 +369,23 @@ class TestMultiEndedAllocator(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
+        full_alloc = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             lazy_compaction=True,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=mamba_kv,
-            unified_buffer=pool,
+        mamba_alloc = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -413,13 +437,13 @@ class TestMultiEndedAllocator(unittest.TestCase):
         v = self._alloc(full_alloc, full_kv, 5)
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
         ptr_before = buf.data_ptr()
-        ret = full_alloc.translate_kv_loc(v, out=buf)
+        ret = full_alloc.ids.translate(v, out=buf)
         self.assertIs(ret, buf, "must return the `out=` buffer, not a fresh tensor")
         self.assertEqual(
             buf.data_ptr(), ptr_before, "out= buffer's data_ptr must be stable"
         )
         # Result matches v2p directly (page_size == 1 here)
-        expected = full_alloc.virtual_to_physical[v]
+        expected = full_alloc.ids.virtual_to_physical[v]
         self.assertTrue(bool((buf == expected).all().item()))
 
     def test_translate_kv_loc_out_guards(self):
@@ -430,11 +454,11 @@ class TestMultiEndedAllocator(unittest.TestCase):
         with self.subTest(guard="dtype"):
             wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
             with self.assertRaises(AssertionError):
-                full_alloc.translate_kv_loc(v, out=wrong_dtype)
+                full_alloc.ids.translate(v, out=wrong_dtype)
         with self.subTest(guard="shape"):
             wrong_shape = torch.empty((v.numel() + 1,), dtype=torch.int64, device=_DEV)
             with self.assertRaises(AssertionError):
-                full_alloc.translate_kv_loc(v, out=wrong_shape)
+                full_alloc.ids.translate(v, out=wrong_shape)
 
     # `index_select(v2p, 0, virt, out=out)` rejects aliasing between `index`
     # and `out`, so the in-place form must gather into a temporary first.
@@ -444,11 +468,11 @@ class TestMultiEndedAllocator(unittest.TestCase):
         _, full_alloc, _, full_kv, _ = self._build_pair()
         v_orig = self._alloc(full_alloc, full_kv, 5).clone()
         # Save the expected output (no-out form) before mutating `buf`.
-        expected = full_alloc.translate_kv_loc(v_orig)
+        expected = full_alloc.ids.translate(v_orig)
         # Now exercise the aliasing form: buf serves as BOTH input and out.
         buf = v_orig.clone()
         ptr_before = buf.data_ptr()
-        ret = full_alloc.translate_kv_loc(buf, out=buf)
+        ret = full_alloc.ids.translate(buf, out=buf)
         self.assertIs(ret, buf)
         self.assertEqual(
             buf.data_ptr(),
@@ -470,9 +494,9 @@ class TestMultiEndedAllocator(unittest.TestCase):
         # Inject a tombstone directly, not through `free` (which would also
         # touch p2v and run compaction).
         v_tombstoned = int(v[2].item())
-        full_alloc.virtual_to_physical[v_tombstoned] = -1
+        full_alloc.ids.virtual_to_physical[v_tombstoned] = -1
         # No-out form: result must clamp.
-        out = full_alloc.translate_kv_loc(v)
+        out = full_alloc.ids.translate(v)
         self.assertTrue(
             bool((out >= 0).all().item()),
             f"translate_kv_loc must clamp tombstoned entries to >=0, got {out.tolist()}",
@@ -484,7 +508,7 @@ class TestMultiEndedAllocator(unittest.TestCase):
         )
         # out= form (the captured-graph path) must clamp in place too.
         buf = torch.empty_like(v)
-        ret = full_alloc.translate_kv_loc(v, out=buf)
+        ret = full_alloc.ids.translate(v, out=buf)
         self.assertIs(ret, buf)
         self.assertTrue(
             bool((buf >= 0).all().item()),
@@ -499,8 +523,8 @@ class TestMultiEndedAllocator(unittest.TestCase):
         _, full_alloc, _, full_kv, _ = self._build_pair()
         zeros = torch.zeros(4, dtype=torch.int64)
 
-        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
-        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+        self.assertEqual(int(full_alloc.ids.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.ids.translate(zeros), zeros))
 
         # Churn: allocate, free interior (forces compaction moves), re-allocate.
         a = self._alloc(full_alloc, full_kv, 6)
@@ -510,8 +534,41 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self._free(full_alloc, full_kv, b)
         self._free(full_alloc, full_kv, c)
 
-        self.assertEqual(int(full_alloc.virtual_to_physical[0].item()), 0)
-        self.assertTrue(torch.equal(full_alloc.translate_kv_loc(zeros), zeros))
+        self.assertEqual(int(full_alloc.ids.virtual_to_physical[0].item()), 0)
+        self.assertTrue(torch.equal(full_alloc.ids.translate(zeros), zeros))
+
+    def test_set_capacity_keeps_tables_and_shrinks_the_active_range(self):
+        """Post-capture sizing shrinks a captured allocator in place: the
+        v2p/p2v tables the graphs captured keep their storage, and every
+        capacity-derived range follows the new slot count on both ends."""
+        pool, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
+        for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
+            with self.subTest(sub_pool=alloc.sub_pool_name):
+                v2p, p2v = alloc.ids.virtual_to_physical, alloc.ids.physical_to_virtual
+                new_slots = pool.num_entries(alloc.sub_pool_name) // 2
+                alloc._set_capacity(new_slots)
+                self.assertIs(alloc.ids.virtual_to_physical, v2p)
+                self.assertIs(alloc.ids.physical_to_virtual, p2v)
+                self.assertEqual(alloc.max_slots, new_slots)
+                self.assertEqual(alloc.num_pages, new_slots)
+                self.assertEqual(alloc.ids.num_virtual_ids, new_slots)
+                self.assertEqual(
+                    alloc.free_virtual_ids.tolist(),
+                    list(range(alloc.min_page_index, new_slots)),
+                )
+        # Each side still fills its whole range, and only inside the new bounds.
+        for alloc, kv in ((full_alloc, full_kv), (mamba_alloc, mamba_kv)):
+            with self.subTest(sub_pool=alloc.sub_pool_name):
+                n = alloc.available_size()
+                self.assertGreater(n, 0)
+                v = self._alloc(alloc, kv, n)
+                p = alloc.ids.virtual_to_physical[v]
+                self.assertGreaterEqual(int(p.min()), alloc.min_slot_index)
+                self.assertLess(int(p.max()), alloc.max_slots)
+                self.assertIsNone(alloc.alloc(1))
+                self._check_invariants(alloc, kv)
+                self._free(alloc, kv, v)
+                self._check_invariants(alloc, kv)
 
 
 # ---------------------------------------------------------------------------
@@ -520,20 +577,20 @@ class TestMultiEndedAllocator(unittest.TestCase):
 
 
 class _FakeUnifiedSWAKVPool:
-    """Minimal stand-in for `UnifiedSWAKVPool`: a real one would construct
-    `UnifiedMHATokenToKVPool`, which is heavier than these tests need."""
+    """Minimal stand-in for a full + window unified pool: a real one would
+    construct `MHAView` views, heavier than these tests need."""
 
     class _SubKV(_FakeKVCache):
-        def __init__(self, max_slots):
-            super().__init__(max_slots)
+        def __init__(self, arena, name):
+            super().__init__(arena, name)
             self.allocator = None
 
         def attach_allocator(self, allocator):
             self.allocator = allocator
 
-    def __init__(self, shared_pool: UnifiedKVPool):
-        self.full_kv_pool = self._SubKV(shared_pool.max_slots("full"))
-        self.swa_kv_pool = self._SubKV(shared_pool.max_slots("swa"))
+    def __init__(self, shared_pool):
+        self.full_kv_pool = self._SubKV(shared_pool, "full")
+        self.swa_kv_pool = self._SubKV(shared_pool, "swa")
         self._full_allocator = None
         self._swa_allocator = None
 
@@ -542,7 +599,7 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
-class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
+class TestWindowChainAllocator(unittest.TestCase):
     """The SWA composite: joint byte-budget, slot-conservation, `free_swa`
     tombstone semantics, and divergent compaction of the two sub-pools."""
 
@@ -582,7 +639,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             n_full_slots * full_spec.entry_bytes()
             + n_swa_slots * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
@@ -590,9 +647,11 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             page_size=page_size,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
+            arena=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full_slots,
             swa_max_total_num_tokens=n_swa_slots,
@@ -610,7 +669,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         allocator.lazy_compaction = True
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.lazy_compaction = True
-            sub_pool.disagg_move_gate = lambda: False
+            sub_pool.pin_sources = (lambda: True,)
         live = allocator.alloc(16)
         self.assertIsNotNone(live)
         allocator.free(live[4:8])
@@ -621,7 +680,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                 allocator.full_attn_allocator,
                 allocator.swa_attn_allocator,
             ):
-                sub_pool.disagg_move_gate = lambda: compacted
+                sub_pool.pin_sources = (lambda: not compacted,)
             for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
                 max_full = min(12, full_evictable) // page_size
                 max_swa = min(8, swa_evictable) // page_size
@@ -631,7 +690,9 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                             (full * page_size, swa * page_size)
                             for swa in range(max_swa + 1)
                             for full in range(max_full + 1)
-                            if allocator._fits_page_demand(
+                            if ends_fit(
+                                chain_snapshot(allocator),
+                                token_ends(allocator),
                                 full_pages,
                                 swa_pages,
                                 full_reclaim_pages=full,
@@ -653,6 +714,55 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                                 ),
                                 feasible[0] if feasible else None,
                             )
+                            # ``prefer_swa`` flips the lexicographic order:
+                            # least FULL reclaim first, then least SWA.
+                            self.assertEqual(
+                                allocator.reclaim_plan(
+                                    full_pages * page_size,
+                                    swa_pages * page_size,
+                                    full_evictable_tokens=full_evictable,
+                                    swa_evictable_tokens=swa_evictable,
+                                    prefer_swa=True,
+                                ),
+                                min(feasible) if feasible else None,
+                            )
+
+    def test_evict_to_free_tokens_prefers_swa_reclaim_on_storage_or_decode(self):
+        """The default quota order spends FULL prefix to keep the sliding
+        window. With a HiCache storage backend attached, or while serving as
+        the decode side of a PD pair, the FULL prefix is the one worth keeping,
+        so the allocator asks the planner for SWA-first quotas. Hierarchical
+        cache alone (no storage backend) keeps the default. Pins the planner
+        argument per configuration, so a predicate that degrades to one branch
+        is caught."""
+        _, allocator, _ = self._build(page_size=4)
+        tree_cache = MagicMock()
+        tree_cache.supports_prefix_sharing.return_value = True
+        tree_cache.full_evictable_size.return_value = 8
+        tree_cache.swa_evictable_size.return_value = 8
+        allocator.reclaim_plan = MagicMock(return_value=(0, 0))
+        cases = (
+            ({}, None, False),
+            ({"enable_hierarchical_cache": True}, None, False),
+            (
+                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
+                None,
+                True,
+            ),
+            ({}, "decode", True),
+        )
+        for memory, role, prefer_swa in cases:
+            with self.subTest(memory=memory, role=role):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(get_memory().override(**memory))
+                    if role is not None:
+                        stack.enter_context(
+                            get_disagg().override(disaggregation_mode=role)
+                        )
+                    allocator.evict_to_free_tokens(tree_cache, 4)
+                self.assertEqual(
+                    allocator.reclaim_plan.call_args.kwargs["prefer_swa"], prefer_swa
+                )
 
     def test_restore_swa_without_allocating_more_full(self):
         _, allocator, _ = self._build(page_size=4)
@@ -670,7 +780,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             )
         )
         self.assertTrue(
-            bool((allocator.swa_attn_allocator.translate_kv_loc(indices) > 0).all())
+            bool((allocator.swa_attn_allocator.ids.translate(indices) > 0).all())
         )
 
     def test_empty_pool_reservation_matches_packed_byte_boundary(self):
@@ -686,7 +796,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         swa_allocator = allocator.swa_attn_allocator
         swa_pages = 2
         full_pages = (
-            allocator._empty_shared_gap_bytes
+            allocator._policy._empty_shared_gap_bytes
             - swa_pages * swa_allocator.entry_bytes_per_page
         ) // full_allocator.entry_bytes_per_page
         packed_bytes = (
@@ -700,10 +810,10 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertLessEqual(
             swa_pages, swa_allocator.num_pages - swa_allocator.min_page_index
         )
-        self.assertLessEqual(packed_bytes, allocator._empty_shared_gap_bytes)
+        self.assertLessEqual(packed_bytes, allocator._policy._empty_shared_gap_bytes)
         self.assertGreater(
             packed_bytes + full_allocator.entry_bytes_per_page,
-            allocator._empty_shared_gap_bytes,
+            allocator._policy._empty_shared_gap_bytes,
         )
         self.assertTrue(
             allocator.can_reserve(
@@ -746,9 +856,11 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         ) * full_allocator.entry_bytes_per_page + (
             reservation_swa_with_tail // page_size
         ) * swa_allocator.entry_bytes_per_page
-        self.assertLessEqual(reservation_bytes, allocator._empty_shared_gap_bytes)
+        self.assertLessEqual(
+            reservation_bytes, allocator._policy._empty_shared_gap_bytes
+        )
         self.assertGreater(
-            reservation_bytes_with_tail, allocator._empty_shared_gap_bytes
+            reservation_bytes_with_tail, allocator._policy._empty_shared_gap_bytes
         )
         self.assertTrue(
             allocator.can_reserve(
@@ -770,8 +882,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         v = allocator.alloc(n)
         if v is None:
             return None
-        full_phys = allocator.full_attn_allocator.virtual_to_physical[v]
-        swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+        full_phys = allocator.full_attn_allocator.ids.virtual_to_physical[v]
+        swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
         kvcache.full_kv_pool.buf[full_phys] = v
         kvcache.swa_kv_pool.buf[swa_phys] = v
         return v
@@ -779,8 +891,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
     def _free(self, allocator, kvcache, v):
         """Erase markers on both sub-pools (mirroring compaction's
         no-data-at-a-freed-slot invariant), then call the composite's free."""
-        full_phys = allocator.full_attn_allocator.virtual_to_physical[v]
-        swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+        full_phys = allocator.full_attn_allocator.ids.virtual_to_physical[v]
+        swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
         # erase only the LIVE swa entries (`free_swa` may have already
         # tombstoned some of `v`).
         valid_swa = swa_phys[swa_phys >= 0]
@@ -791,9 +903,11 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
     def _check_sub_pool_invariants(self, sub, kv):
         """Per-sub-pool: v2p/p2v mutual inverse on the live set, hole-free
         allocated band, data followed relocations."""
-        v2p = sub.virtual_to_physical
-        p2v = sub.physical_to_virtual
-        live_v = [v for v in range(1, sub.num_virtual_ids) if int(v2p[v].item()) != -1]
+        v2p = sub.ids.virtual_to_physical
+        p2v = sub.ids.physical_to_virtual
+        live_v = [
+            v for v in range(1, sub.ids.num_virtual_ids) if int(v2p[v].item()) != -1
+        ]
         for v in live_v:
             p = int(v2p[v].item())
             self.assertEqual(int(p2v[p].item()), v)
@@ -813,8 +927,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         v = allocator.alloc(3)
         self.assertIsNotNone(v)
         self.assertEqual(int(v.numel()), 3)
-        full_v2p = allocator.full_attn_allocator.virtual_to_physical
-        swa_v2p = allocator.swa_attn_allocator.virtual_to_physical
+        full_v2p = allocator.full_attn_allocator.ids.virtual_to_physical
+        swa_v2p = allocator.swa_attn_allocator.ids.virtual_to_physical
         for vi in v.tolist():
             self.assertGreaterEqual(int(full_v2p[vi].item()), 0)
             self.assertGreaterEqual(int(swa_v2p[vi].item()), 0)
@@ -833,10 +947,11 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self._free(allocator, kvcache, v)
         for vi in v.tolist():
             self.assertEqual(
-                int(allocator.full_attn_allocator.virtual_to_physical[vi].item()), -1
+                int(allocator.full_attn_allocator.ids.virtual_to_physical[vi].item()),
+                -1,
             )
             self.assertEqual(
-                int(allocator.swa_attn_allocator.virtual_to_physical[vi].item()), -1
+                int(allocator.swa_attn_allocator.ids.virtual_to_physical[vi].item()), -1
             )
         free_full = set(
             int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
@@ -850,17 +965,17 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         # Tombstone the middle one. Erase its swa marker first (compaction
         # will run inside `free_swa`).
         target = v[1:2]
-        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        target_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[target]
         kvcache.swa_kv_pool.buf[target_swa] = -1
         allocator.free_swa(target)
         tgt = int(target.item())
         # full side still bound:
         self.assertGreaterEqual(
-            int(allocator.full_attn_allocator.virtual_to_physical[tgt].item()), 0
+            int(allocator.full_attn_allocator.ids.virtual_to_physical[tgt].item()), 0
         )
         # swa side tombstoned:
         self.assertEqual(
-            int(allocator.swa_attn_allocator.virtual_to_physical[tgt].item()), -1
+            int(allocator.swa_attn_allocator.ids.virtual_to_physical[tgt].item()), -1
         )
         # NOT recycled to the id-owner's free list yet:
         free_full = set(
@@ -869,7 +984,9 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertNotIn(tgt, free_full)
         # composite `free` of the same virtual still works (filters out
         # already-tombstoned on the swa side).
-        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        full_phys = int(
+            allocator.full_attn_allocator.ids.virtual_to_physical[tgt].item()
+        )
         kvcache.full_kv_pool.buf[full_phys] = -1
         allocator.free(target)
         # now in free list:
@@ -886,10 +1003,12 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         tgt = int(target.item())
         # Tombstone the swa side, erasing each marker before its release
         # (compaction runs inside both).
-        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        target_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[target]
         kvcache.swa_kv_pool.buf[target_swa] = -1
         allocator.free_swa(target)
-        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        full_phys = int(
+            allocator.full_attn_allocator.ids.virtual_to_physical[tgt].item()
+        )
         kvcache.full_kv_pool.buf[full_phys] = -1
 
         allocator.free_group_begin()
@@ -912,20 +1031,26 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         b = self._alloc(allocator, kvcache, 1)
         c = self._alloc(allocator, kvcache, 1)
         # Snapshot swa-side physical for c BEFORE we free_swa(b).
-        c_swa_before = int(allocator.swa_attn_allocator.virtual_to_physical[c].item())
-        c_full_before = int(allocator.full_attn_allocator.virtual_to_physical[c].item())
+        c_swa_before = int(
+            allocator.swa_attn_allocator.ids.virtual_to_physical[c].item()
+        )
+        c_full_before = int(
+            allocator.full_attn_allocator.ids.virtual_to_physical[c].item()
+        )
         # Tombstone b on swa only.
-        b_swa = allocator.swa_attn_allocator.virtual_to_physical[b]
+        b_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[b]
         kvcache.swa_kv_pool.buf[b_swa] = -1
         allocator.free_swa(b)
         # c's full-physical UNCHANGED (full side did not compact):
         self.assertEqual(
-            int(allocator.full_attn_allocator.virtual_to_physical[c].item()),
+            int(allocator.full_attn_allocator.ids.virtual_to_physical[c].item()),
             c_full_before,
         )
         # c's swa-physical MUST have moved: b is interior to swa's allocated
         # band, so freeing it relocates c into b's slot.
-        c_swa_after = int(allocator.swa_attn_allocator.virtual_to_physical[c].item())
+        c_swa_after = int(
+            allocator.swa_attn_allocator.ids.virtual_to_physical[c].item()
+        )
         self.assertNotEqual(c_swa_after, c_swa_before)
         # Per-sub-pool invariants still hold.
         self._check_sub_pool_invariants(
@@ -969,7 +1094,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
                 if kind != "live":
                     continue
                 # Tombstone all of v on swa only.
-                swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+                swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
                 kvcache.swa_kv_pool.buf[swa_phys] = -1
                 allocator.free_swa(v)
                 live[idx] = ("swa_tomb", v)
@@ -980,17 +1105,15 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             self._check_sub_pool_invariants(
                 allocator.swa_attn_allocator, kvcache.swa_kv_pool
             )
-            # The leak view is `_conserve_*`; public `*_available_size()` is
+            # The leak view is `conserve_*`; public `*_available_size()` is
             # `min(conserve, schedulable)` and can be strictly smaller.
             self.assertEqual(
-                allocator._conserve_full_available_size(),
-                allocator._full_max_total_num_tokens
-                - allocator.full_attn_allocator.allocated_count(),
+                allocator.conserve_full_available_size(),
+                allocator.size_full - allocator.full_attn_allocator.allocated_count(),
             )
             self.assertEqual(
-                allocator._conserve_swa_available_size(),
-                allocator._swa_max_total_num_tokens
-                - allocator.swa_attn_allocator.allocated_count(),
+                allocator.conserve_swa_available_size(),
+                allocator.size_swa - allocator.swa_attn_allocator.allocated_count(),
             )
         # Drain.
         for _, v in live:
@@ -1000,23 +1123,23 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 
     # -- `out=` parameter regression tests for the SWA composite --
 
-    def test_swa_translate_loc_from_full_to_swa_with_out_writes_inplace(self):
-        """Regression: `translate_loc_from_full_to_swa(v, out=buf)` must write
+    def test_window_id_space_write_with_out_writes_inplace(self):
+        """Regression: the window id space's `write(v, out=buf)` must write
         into `buf` and preserve its data_ptr; `out=` is int64, as every id is."""
         _, allocator, _ = self._build()
         v = allocator.alloc(4)
         self.assertIsNotNone(v)
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
         ptr_before = buf.data_ptr()
-        ret = allocator.translate_loc_from_full_to_swa(v, out=buf)
+        ret = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].write(v, out=buf)
         self.assertIs(ret, buf)
         self.assertEqual(buf.data_ptr(), ptr_before)
         # Byte-identical to the no-out form:
-        no_out = allocator.translate_loc_from_full_to_swa(v)
+        no_out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(no_out.dtype, torch.int64)
         self.assertTrue(bool((buf == no_out).all().item()))
 
-    def test_swa_translate_loc_from_full_to_swa_dtype_assertion(self):
+    def test_window_id_space_write_dtype_assertion(self):
         """Regression: a wrong-dtype `out=` (int32) must raise; the allocator
         emits int64 and consumers narrow at their own buffer."""
         _, allocator, _ = self._build()
@@ -1024,28 +1147,28 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertIsNotNone(v)
         wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
         with self.assertRaises(AssertionError):
-            allocator.translate_loc_from_full_to_swa(v, out=wrong_dtype)
+            allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].write(v, out=wrong_dtype)
 
     # SWA side of the tombstone clamp: a tombstoned `v2p_swa[v] == -1` would
     # make the captured kernel read `swa_k_buffer[-1]`.
-    def test_swa_translate_loc_from_full_to_swa_clamps_tombstoned(self):
+    def test_window_id_space_write_clamps_tombstoned(self):
         _, allocator, _ = self._build()
         v = allocator.alloc(4)
         self.assertIsNotNone(v)
         # Inject a tombstone on the swa side at one of the live virtual ids.
         v_tomb = int(v[1].item())
-        allocator.swa_attn_allocator.virtual_to_physical[v_tomb] = -1
+        allocator.swa_attn_allocator.ids.virtual_to_physical[v_tomb] = -1
         # No-out form: result must be int64 AND every entry >= 0.
-        out = allocator.translate_loc_from_full_to_swa(v)
+        out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(out.dtype, torch.int64)
         self.assertTrue(
             bool((out >= 0).all().item()),
-            "translate_loc_from_full_to_swa must clamp tombstoned to >=0",
+            "the window id space must clamp tombstoned to >=0",
         )
         self.assertEqual(int(out[1].item()), 0)
         # out= form must also clamp.
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
-        ret = allocator.translate_loc_from_full_to_swa(v, out=buf)
+        ret = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].write(v, out=buf)
         self.assertIs(ret, buf)
         self.assertTrue(bool((buf >= 0).all().item()))
         self.assertEqual(int(buf[1].item()), 0)
@@ -1060,7 +1183,10 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         def check():
             self.assertTrue(torch.equal(allocator.translate_kv_loc(zeros64), zeros64))
             self.assertTrue(
-                torch.equal(allocator.translate_loc_from_full_to_swa(zeros64), zeros64)
+                torch.equal(
+                    allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(zeros64),
+                    zeros64,
+                )
             )
 
         check()
@@ -1079,8 +1205,8 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPagedMultiEndedAllocator(unittest.TestCase):
-    """`MultiEndedAllocator(page_size=8)`: free-list, v2p/p2v and compaction are
+class TestPagedBand(unittest.TestCase):
+    """`Band(page_size=8)`: free-list, v2p/p2v and compaction are
     page-granular, while the external API stays in token ids as at page_size 1."""
 
     def setUp(self):
@@ -1115,25 +1241,24 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * self.PAGE_SIZE * full_spec.entry_bytes()
             + n_swa_pages * self.PAGE_SIZE * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=self.PAGE_SIZE,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        swa_kv = _FakeKVCache(pool.max_slots("swa"))
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
+        full_kv = _FakeKVCache(pool, "full")
+        swa_kv = _FakeKVCache(pool, "swa")
+        full_alloc = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             page_size=self.PAGE_SIZE,
         )
-        swa_alloc = MultiEndedAllocator(
-            kvcache=swa_kv,
-            unified_buffer=pool,
+        swa_alloc = Band(
+            arena=pool,
             sub_pool_name="swa",
             device=_DEV,
             is_id_owner=True,
@@ -1143,24 +1268,20 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         swa_alloc.bind_peer(full_alloc)
         return pool, full_alloc, swa_alloc, full_kv, swa_kv
 
-    def _stamp_tokens(
-        self, alloc: MultiEndedAllocator, kv: _FakeKVCache, v_tokens: torch.Tensor
-    ):
+    def _stamp_tokens(self, alloc: Band, kv: _FakeKVCache, v_tokens: torch.Tensor):
         """Stamp each returned token's own id into `kv.buf` at its physical token."""
         if v_tokens.numel() == 0:
             return
         ps = alloc.page_size
         virt_pages = v_tokens // ps
         offsets = v_tokens % ps
-        phys_pages = alloc.virtual_to_physical[virt_pages]
+        phys_pages = alloc.ids.virtual_to_physical[virt_pages]
         phys_tokens = phys_pages * ps + offsets
         kv.buf[phys_tokens] = v_tokens
 
-    def _check_invariants(
-        self, alloc: MultiEndedAllocator, kv: _FakeKVCache, stamped_tokens: dict
-    ):
-        v2p = alloc.virtual_to_physical
-        p2v = alloc.physical_to_virtual
+    def _check_invariants(self, alloc: Band, kv: _FakeKVCache, stamped_tokens: dict):
+        v2p = alloc.ids.virtual_to_physical
+        p2v = alloc.ids.physical_to_virtual
         ps = alloc.page_size
         # Live virtual pages (excluding the reserved padding page 0).
         live_v_pages = [
@@ -1256,10 +1377,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # `a` and `c` pages must still be live.
         for t in a.tolist():
             v_page = t // self.PAGE_SIZE
-            self.assertNotEqual(int(full_alloc.virtual_to_physical[v_page].item()), -1)
+            self.assertNotEqual(
+                int(full_alloc.ids.virtual_to_physical[v_page].item()), -1
+            )
         for t in c.tolist():
             v_page = t // self.PAGE_SIZE
-            self.assertNotEqual(int(full_alloc.virtual_to_physical[v_page].item()), -1)
+            self.assertNotEqual(
+                int(full_alloc.ids.virtual_to_physical[v_page].item()), -1
+            )
 
     # 5. Regression: `allocated_count()` reports TOKENS, not pages; the leak
     # invariant `available + evictable + ... == total` is all in tokens.
@@ -1289,9 +1414,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
     # 7. SWA composite joint byte-budget in page units.
     def test_paged_swa_joint_byte_budget(self):
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1314,16 +1437,19 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * self.PAGE_SIZE * full_spec.entry_bytes()
             + n_swa_pages * self.PAGE_SIZE * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=self.PAGE_SIZE,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
+            arena=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full_pages * self.PAGE_SIZE,
             swa_max_total_num_tokens=n_swa_pages * self.PAGE_SIZE,
@@ -1356,7 +1482,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 9. Regression: alloc_extend must bind v2p / p2v; an unbound page leaves
     # v2p at -1, and translate_kv_loc then emits negative (OOB) token ids.
     def test_paged_alloc_extend_binds_v2p_p2v(self):
-        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
+        from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1364,41 +1490,19 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         watermark_before = full_alloc.watermark_physical
         allocated_count_before = full_alloc.allocated_count()
 
-        # Stub the kernel: driving the real Triton one needs a GPU, and the
-        # binding contract holds regardless of what it writes to out_indices.
-        original_kernel = mea_mod.alloc_extend_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_extend_kernel = _NoOpKernelGrid()
-        try:
-            # bs=1, prefix=0, seq=2 pages worth, so num_new_pages=2.
-            prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEV)
-            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-            seq_lens = torch.tensor([2 * PS], dtype=torch.int64, device=_DEV)
-            seq_lens_cpu = torch.tensor([2 * PS], dtype=torch.int64)
-            last_loc = torch.tensor([-1], dtype=torch.int64, device=_DEV)
-
-            out = full_alloc.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                2 * PS,
-                num_new_pages=2,
-            )
-        finally:
-            mea_mod.alloc_extend_kernel = original_kernel
+        # The paging kernel is stubbed: driving the real Triton one needs a GPU,
+        # and the binding contract holds regardless of the token ids it writes.
+        # bs=1, prefix=0, seq=2 pages worth, so num_new_pages=2.
+        out = take_new_pages(
+            full_alloc,
+            2,
+            lambda free_pages: torch.empty(2 * PS, dtype=torch.int64, device=_DEV),
+            copy_new_pages=False,
+        )
 
         self.assertIsNotNone(out)
         consumed_pages = free_before[:2]
-        v2p_values = full_alloc.virtual_to_physical[consumed_pages]
+        v2p_values = full_alloc.ids.virtual_to_physical[consumed_pages]
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
             self.assertNotEqual(
                 p_page,
@@ -1408,7 +1512,9 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             )
         # And p2v_page must round-trip.
         for v_page, p_page in zip(consumed_pages.tolist(), v2p_values.tolist()):
-            self.assertEqual(int(full_alloc.physical_to_virtual[p_page].item()), v_page)
+            self.assertEqual(
+                int(full_alloc.ids.physical_to_virtual[p_page].item()), v_page
+            )
         # `allocated_count()` is in TOKENS (advances by 2 * PAGE_SIZE);
         # `_allocated_pages()` is the page count.
         self.assertEqual(
@@ -1432,7 +1538,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 10. Regression: alloc_decode must bind v2p / p2v when it wraps to a new
     # page; most decode steps reuse the prefix's tail page and bind nothing.
     def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
-        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
+        from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
+        from sglang.srt.utils.common import get_num_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1455,26 +1562,20 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
         )
 
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        # The paging kernel is stubbed; the binding contract does not depend
+        # on the token ids it writes.
+        out = take_new_pages(
+            full_alloc,
+            get_num_new_pages(seq_lens=seq_lens_cpu, page_size=PS, decode=True),
+            lambda free_pages: torch.empty(1, dtype=torch.int64, device=_DEV),
+            copy_new_pages=True,
+        )
 
         self.assertIsNotNone(out)
         # 1 virtual page consumed from the head of free_virtual_ids.
         consumed_page = int(free_before[0].item())
         # v2p_page must now map to a valid physical page (not -1).
-        p_page = int(full_alloc.virtual_to_physical[consumed_page].item())
+        p_page = int(full_alloc.ids.virtual_to_physical[consumed_page].item())
         self.assertNotEqual(
             p_page,
             -1,
@@ -1483,7 +1584,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         # p2v round-trip.
         self.assertEqual(
-            int(full_alloc.physical_to_virtual[p_page].item()), consumed_page
+            int(full_alloc.ids.physical_to_virtual[p_page].item()), consumed_page
         )
         # `allocated_count()` is in TOKENS (advances by PAGE_SIZE);
         # `_allocated_pages()` is the page count.
@@ -1508,7 +1609,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 11. Regression: alloc_decode with num_new_pages == 0 must not advance
     # the watermark or touch v2p / p2v.
     def test_paged_alloc_decode_no_op_when_no_new_page(self):
-        from sglang.srt.mem_cache.allocator import unified_sub_pool as mea_mod
+        from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
+        from sglang.srt.utils.common import get_num_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1528,20 +1630,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             device=_DEV,
         )
 
-        original_kernel = mea_mod.alloc_decode_kernel
-
-        class _NoOpKernelGrid:
-            def __getitem__(self, _grid):
-                return self
-
-            def __call__(self, *a, **kw):
-                pass
-
-        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
-        try:
-            out = full_alloc.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        finally:
-            mea_mod.alloc_decode_kernel = original_kernel
+        # The paging kernel is stubbed; the binding contract does not depend
+        # on the token ids it writes.
+        out = take_new_pages(
+            full_alloc,
+            get_num_new_pages(seq_lens=seq_lens_cpu, page_size=PS, decode=True),
+            lambda free_pages: torch.empty(1, dtype=torch.int64, device=_DEV),
+            copy_new_pages=True,
+        )
 
         self.assertIsNotNone(out)
         # Nothing should have moved -- no new page consumed.
@@ -1562,8 +1658,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # Compare with-out vs no-out.
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
         ptr_before = buf.data_ptr()
-        with_out = full_alloc.translate_kv_loc(v, out=buf)
-        no_out = full_alloc.translate_kv_loc(v)
+        with_out = full_alloc.ids.translate(v, out=buf)
+        no_out = full_alloc.ids.translate(v)
         self.assertIs(with_out, buf, "must return the out= buffer")
         self.assertEqual(
             buf.data_ptr(), ptr_before, "out= buffer's data_ptr must be stable"
@@ -1572,7 +1668,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # against the real v2p table.
         virt_pages = v // ps
         offsets = v % ps
-        phys_pages = full_alloc.virtual_to_physical[virt_pages]
+        phys_pages = full_alloc.ids.virtual_to_physical[virt_pages]
         expected = phys_pages * ps + offsets
         self.assertTrue(bool((buf == expected).all().item()))
         self.assertTrue(bool((with_out == no_out).all().item()))
@@ -1585,11 +1681,11 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         v_orig = full_alloc.alloc(2 * ps)
         self.assertIsNotNone(v_orig)
         # Expected (no-out form) computed BEFORE mutating buf.
-        expected = full_alloc.translate_kv_loc(v_orig)
+        expected = full_alloc.ids.translate(v_orig)
         # In-place form: buf serves as both input and out.
         buf = v_orig.clone()
         ptr_before = buf.data_ptr()
-        ret = full_alloc.translate_kv_loc(buf, out=buf)
+        ret = full_alloc.ids.translate(buf, out=buf)
         self.assertIs(ret, buf)
         self.assertEqual(buf.data_ptr(), ptr_before)
         self.assertTrue(
@@ -1607,9 +1703,9 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # Tombstone one page (any v2p_page entry) -> all ps tokens in that
         # page should clamp to 0 in the translate output.
         tomb_page = int((v[0] // ps).item())
-        full_alloc.virtual_to_physical[tomb_page] = -1
+        full_alloc.ids.virtual_to_physical[tomb_page] = -1
         # No-out form.
-        out = full_alloc.translate_kv_loc(v)
+        out = full_alloc.ids.translate(v)
         self.assertTrue(
             bool((out >= 0).all().item()),
             f"paged translate_kv_loc must clamp tombstoned to >=0; got {out.tolist()}",
@@ -1626,7 +1722,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         # out= form must also clamp.
         buf = torch.empty_like(v)
-        ret = full_alloc.translate_kv_loc(v, out=buf)
+        ret = full_alloc.ids.translate(v, out=buf)
         self.assertIs(ret, buf)
         self.assertTrue(
             bool((buf >= 0).all().item()),
@@ -1637,9 +1733,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
     # 14. Regression: the leak-invariant terms the scheduler checks are all in
     # TOKENS -- `full_available_size() + allocated_tokens == static_cap`.
     def test_paged_swa_full_available_size_in_tokens(self):
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1663,18 +1757,21 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * PS * full_spec.entry_bytes()
             + n_swa_pages * PS * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=PS,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         full_max = n_full_pages * PS
         swa_max = n_swa_pages * PS
-        allocator = UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
+            arena=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=full_max,
             swa_max_total_num_tokens=swa_max,
@@ -1684,8 +1781,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         # The leak invariant reads `_conserve_*`; public `*_available_size()`
         # is `min(conserve, schedulable)` and may be smaller.
-        self.assertEqual(allocator._conserve_full_available_size(), full_max)
-        self.assertEqual(allocator._conserve_swa_available_size(), swa_max)
+        self.assertEqual(allocator.conserve_full_available_size(), full_max)
+        self.assertEqual(allocator.conserve_swa_available_size(), swa_max)
 
         # Alloc 2 pages = 2*PS tokens.
         v = allocator.alloc(2 * PS)
@@ -1693,31 +1790,29 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
         # conserve view must drop by 2*PS TOKENS, not by 2 (pages).
         self.assertEqual(
-            allocator._conserve_full_available_size(),
+            allocator.conserve_full_available_size(),
             full_max - 2 * PS,
             "REGRESSION: the conserve view must drop by token-count, "
             "not page-count. A 'pool memory leak detected' crash is "
             "caused by a page-count drop here.",
         )
         self.assertEqual(
-            allocator._conserve_swa_available_size(),
+            allocator.conserve_swa_available_size(),
             swa_max - 2 * PS,
         )
 
         # No eviction yet, so total == conserve + allocated_tokens.
-        allocated_tokens = full_max - allocator._conserve_full_available_size()
+        allocated_tokens = full_max - allocator.conserve_full_available_size()
         self.assertEqual(allocated_tokens, 2 * PS)
         self.assertEqual(
-            allocated_tokens + allocator._conserve_full_available_size(),
+            allocated_tokens + allocator.conserve_full_available_size(),
             full_max,
         )
 
-    # 15. Regression: `UnifiedMambaTokenToKVPoolAllocator.size` must be TOTAL
+    # 15. Regression: a full + state chain's `size` must be TOTAL
     # TOKENS -- available + allocated, both in tokens, never a page count.
     def test_paged_mamba_size_in_tokens(self):
-        from sglang.srt.mem_cache.allocator.unified_mamba import (
-            UnifiedMambaTokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 
         # The mamba sub-allocator always uses page_size=1; only the full
         # sub-allocator takes self.PAGE_SIZE.
@@ -1744,26 +1839,33 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_full_pages * PS * full_spec.entry_bytes()
             + n_mamba_slots * mamba_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, mamba_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=PS,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv = _FakeKVCache(pool, "full")
         full_kv.attach_allocator = lambda allocator: None
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv = _FakeKVCache(pool, "mamba")
         mamba_kv.attach_allocator = lambda allocator: None
         # The physical-move contract for the mamba sub-pool (un-translated);
-        # _FakeKVCache already provides move_kv_cache, so nothing extra.
+        # _FakeKVCache already provides move_physical_pages, so nothing extra.
 
         class _FakeHybridLinearKVPool:
             full_kv_pool = full_kv
             mamba_pool = mamba_kv
 
-        allocator = UnifiedMambaTokenToKVPoolAllocator(
-            unified_buffer=pool,
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", state="mamba"),
+            arena=pool,
             kvcache=_FakeHybridLinearKVPool(),
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"),
+                _FakeHybridLinearKVPool(),
+                (_FakeHybridLinearKVPool()).mamba_pool,
+            ),
             device=_DEV,
             page_size=PS,
             need_sort=False,
@@ -1793,15 +1895,12 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # And .size matches this conserved sum.
         self.assertEqual(allocator.size, full_avail_before)
 
-    # 16. Regression: `_virt_tokens_to_phys_tokens` must do the page math --
-    # indexing the page-granular v2p with token ids gives OOB kernel inputs.
-    # A real `UnifiedSWAKVPool` cannot be built in this CPU shim, so the
-    # production instance methods are covered through the static helper.
+    # 16. Regression: the retraction copy's virtual -> physical token map must
+    # do the page math -- indexing the page-granular v2p with token ids gives
+    # OOB kernel inputs.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+        from sglang.srt.mem_cache.kv.alloc.interim import _virtual_tokens_to_physical
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1825,16 +1924,19 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             n_pages * PS * full_spec.entry_bytes()
             + n_pages * PS * swa_spec.entry_bytes()
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=PS,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
+        allocator = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
+            arena=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_pages * PS,
             swa_max_total_num_tokens=n_pages * PS,
@@ -1846,10 +1948,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         v_tokens = allocator.alloc(2 * PS)
         self.assertIsNotNone(v_tokens)
 
-        # The static helper does the page math: same as the instance methods.
-        swa_phys = UnifiedSWAKVPool._virt_tokens_to_phys_tokens(
-            v_tokens, allocator.swa_attn_allocator
-        )
+        swa_phys = _virtual_tokens_to_physical(v_tokens, allocator.swa_attn_allocator)
 
         self.assertTrue(
             bool((swa_phys >= 0).all().item()),
@@ -1863,7 +1962,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
         virt_pages_in = v_tokens // PS
         offsets_in = v_tokens % PS
-        swa_phys_pages_direct = allocator.swa_attn_allocator.virtual_to_physical[
+        swa_phys_pages_direct = allocator.swa_attn_allocator.ids.virtual_to_physical[
             virt_pages_in
         ]
         expected = swa_phys_pages_direct * PS + offsets_in
@@ -1873,16 +1972,13 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "v2p_page[virt_pages] * page_size + offsets.",
         )
 
-        # The composite emits KERNEL-FACING ids, not the physical token ids this
-        # helper returns; they coincide only at multiplier 1, which nothing uses.
-        swa_mult = allocator.swa_kernel_page_multiplier
-        self.assertEqual(swa_mult, 2 * swa_spec.layer_num)
-        composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)
-        expected_kernel = swa_phys_pages_direct * (PS * swa_mult) + offsets_in
+        # The composite emits the swa sub-pool's PHYSICAL token ids (the
+        # kernel-facing id space of the token-major views).
+        composite_out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v_tokens)
         self.assertTrue(
-            bool((composite_out.long() == expected_kernel.long()).all().item()),
-            "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
-            "sub-pool's kernel-facing ids (phys_page * ps * blocks_per_page + offset).",
+            bool((composite_out.long() == expected.long()).all().item()),
+            "REGRESSION: the window id space must emit the swa "
+            "sub-pool's physical token ids (phys_page * ps + offset).",
         )
 
 
@@ -1901,25 +1997,23 @@ class TestLazyCompaction(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        full_alloc = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
+        full_alloc = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             lazy_compaction=lazy,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=mamba_kv,
-            unified_buffer=pool,
+        mamba_alloc = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -1929,12 +2023,12 @@ class TestLazyCompaction(unittest.TestCase):
         mamba_alloc.bind_peer(full_alloc)
         return pool, full_alloc, full_kv
 
-    def _stamp_kv(self, kv: _FakeKVCache, alloc: MultiEndedAllocator, tokens) -> None:
+    def _stamp_kv(self, kv: _FakeKVCache, alloc: Band, tokens) -> None:
         """Write a marker into KV[phys] for each freshly-alloced virtual
         token id, so we can later check the data followed any relocation.
         """
         for v in tokens.tolist():
-            p = int(alloc.virtual_to_physical[v].item())
+            p = int(alloc.ids.virtual_to_physical[v].item())
             kv.buf[p] = int(v)
 
     def test_lazy_free_inward_walk(self):
@@ -2020,18 +2114,18 @@ class TestLazyCompaction(unittest.TestCase):
         self._stamp_kv(kv, fa, values)
         fa.free(values[1:5].clone())
 
-        physical_to_virtual = fa.physical_to_virtual
-        fa.physical_to_virtual = _RejectScalarIndexTensor(physical_to_virtual)
+        physical_to_virtual = fa.ids.physical_to_virtual
+        fa.ids.physical_to_virtual = _RejectScalarIndexTensor(physical_to_virtual)
         try:
             self.assertEqual(fa._flush(urgent=True), 4)
         finally:
-            fa.physical_to_virtual = physical_to_virtual
+            fa.ids.physical_to_virtual = physical_to_virtual
 
         for virtual in values.tolist():
-            physical = int(fa.virtual_to_physical[virtual].item())
+            physical = int(fa.ids.virtual_to_physical[virtual].item())
             if physical == -1:
                 continue
-            self.assertEqual(int(fa.physical_to_virtual[physical].item()), virtual)
+            self.assertEqual(int(fa.ids.physical_to_virtual[physical].item()), virtual)
             self.assertEqual(int(kv.buf[physical].item()), virtual)
 
     def _replay_sequence(self, ops, lazy: bool):
@@ -2047,7 +2141,7 @@ class TestLazyCompaction(unittest.TestCase):
                 if tokens is None:
                     continue
                 for v in tokens.tolist():
-                    p = int(fa.virtual_to_physical[v].item())
+                    p = int(fa.ids.virtual_to_physical[v].item())
                     kv.buf[p] = next_stamp
                     kv_stamps[v] = next_stamp
                     live.add(v)
@@ -2065,7 +2159,7 @@ class TestLazyCompaction(unittest.TestCase):
         # Read back the data for each live id.
         live_data = {}
         for v in live:
-            p = int(fa.virtual_to_physical[v].item())
+            p = int(fa.ids.virtual_to_physical[v].item())
             live_data[v] = int(kv.buf[p].item())
         return live, live_data, kv_stamps
 
@@ -2113,7 +2207,7 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(len(fa._free_phys_pages), 1)
         # `set_inflight_forward` takes the virtual `out_cache_loc` tensor, not a
         # materialized physical set; `_flush` translates it when it classifies.
-        topmost_phys = int(fa.virtual_to_physical[int(a[-1].item())].item())
+        topmost_phys = int(fa.ids.virtual_to_physical[int(a[-1].item())].item())
         oclv = a[-1:].clone()  # virtual id that translates to topmost_phys
         fa.set_inflight_forward(ev, oclv)
         # Non-urgent flush -> case A blocker at the top -> STOP.
@@ -2170,7 +2264,7 @@ class TestLazyCompaction(unittest.TestCase):
 
 
 class TestO3FusedAllocBind(unittest.TestCase):
-    """Fused take_physical_pages + bind via `_alloc_bind_fast_or_slow`.
+    """Fused take_physical_pages + bind via `place_pages`.
     GPU-only: the fused kernel is Triton."""
 
     def setUp(self):
@@ -2195,26 +2289,25 @@ class TestO3FusedAllocBind(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device="cuda",
             enable_memory_saver=False,
+            page_size=page_size,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
-        fa = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
+        fa = Band(
+            arena=pool,
             sub_pool_name="full",
             device="cuda",
             is_id_owner=True,
             page_size=page_size,
             lazy_compaction=lazy,
         )
-        ma = MultiEndedAllocator(
-            kvcache=mamba_kv,
-            unified_buffer=pool,
+        ma = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device="cuda",
             is_id_owner=True,
@@ -2225,78 +2318,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         ma.bind_peer(fa)
         return pool, fa, full_kv
 
-    def test_fast_path_when_no_holes(self):
-        """When `_free_phys_pages` is empty, the fused fast path fires."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # Sanity: empty holeset.
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        wm_before = fa.watermark_physical
-        # Pick virtual page ids the kernel will bind.
-        v_pages = torch.tensor([20, 21, 22, 23], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 4)
-        # Watermark advanced by N.
-        self.assertEqual(fa.watermark_physical, wm_before + 4)
-        # Returned phys ids match the grow-up arange [wm_before, wm_before+4).
-        expected_phys = torch.arange(
-            wm_before, wm_before + 4, dtype=torch.int64, device="cuda"
-        )
-        self.assertTrue(torch.equal(phys, expected_phys))
-        # v2p table: each virtual -> its physical.
-        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
-            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
-        # p2v table: each physical -> its virtual.
-        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
-        # live_page_count updated.
-        self.assertEqual(fa.live_page_count, 4)
-        # Another fast-path call accumulates.
-        v_pages2 = torch.tensor([24, 25], dtype=torch.int64, device="cuda")
-        fa._alloc_bind_fast_or_slow(v_pages2, 2)
-        self.assertEqual(fa.live_page_count, 6)
-
-    def test_slow_path_when_holes_exist(self):
-        """Greedy hole reuse: an existing hole must be drained before the
-        watermark extends, so the fast path must not fire."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # Build a hole by alloc-then-free-non-boundary.
-        a = fa.alloc(3)
-        self.assertEqual(fa.live_page_count, 3)
-        fa.free(a[0:1].clone())  # frees a non-boundary slot -> enters holeset
-        self.assertEqual(fa.live_page_count, 2)
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        # `_free_phys_pages` is a torch.Tensor; read the hole via `.tolist()`.
-        hole_pos = int(fa._free_phys_pages.tolist()[0])
-        wm_before = fa.watermark_physical
-        # Alloc 1 page via the helper. Slow path should drain the hole.
-        v_pages = torch.tensor([42], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 1)
-        # Hole drained, NOT a watermark extension.
-        self.assertEqual(int(phys[0].item()), hole_pos)
-        self.assertEqual(fa.watermark_physical, wm_before)
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        # v2p/p2v updated.
-        self.assertEqual(int(fa.virtual_to_physical[42].item()), hole_pos)
-        self.assertEqual(int(fa.physical_to_virtual[hole_pos].item()), 42)
-        # The slow path advances live_page_count via take_physical_pages.
-        self.assertEqual(fa.live_page_count, 3)
-
-    def test_fast_path_in_eager_mode(self):
-        """Eager mode never accumulates holes, so it always takes the fast path;
-        `live_page_count` is not maintained there and stays 0."""
-        _pool, fa, _kv = self._make_full(lazy=False)
-        self.assertFalse(fa.lazy_compaction)
-        self.assertEqual(fa.live_page_count, 0)
-        wm_before = fa.watermark_physical
-        v_pages = torch.tensor([30, 31, 32], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertEqual(fa.watermark_physical, wm_before + 3)
-        expected_phys = torch.arange(
-            wm_before, wm_before + 3, dtype=torch.int64, device="cuda"
-        )
-        self.assertTrue(torch.equal(phys, expected_phys))
-        # live_page_count UNCHANGED (eager mode invariant).
-        self.assertEqual(fa.live_page_count, 0)
-
     def test_index_space_overflow_returns_none(self):
         """When the requested allocation would overflow `num_pages`,
         the helper returns None and leaves the allocator unchanged."""
@@ -2306,21 +2327,11 @@ class TestO3FusedAllocBind(unittest.TestCase):
         wm_before = fa.watermark_physical
         # Only v_pages' numel matters to the helper.
         v_pages = torch.zeros(N, dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, N)
+        phys = fa.place_pages(v_pages, N)
         self.assertIsNone(phys)
         # Allocator state unchanged.
         self.assertEqual(fa.watermark_physical, wm_before)
         self.assertEqual(fa.live_page_count, 0)
-
-    def test_empty_alloc_returns_empty_tensor(self):
-        """N=0 returns an empty tensor (no kernel launch, no state change)."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        wm_before = fa.watermark_physical
-        v_pages = torch.empty(0, dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 0)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.numel(), 0)
-        self.assertEqual(fa.watermark_physical, wm_before)
 
     def test_fast_path_equivalent_to_slow_path(self):
         """On an empty holeset, the fast path must produce identical v2p / p2v /
@@ -2330,103 +2341,32 @@ class TestO3FusedAllocBind(unittest.TestCase):
         _pool_b, fa_b, _kv_b = self._make_full(lazy=True)
         v_pages = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64, device="cuda")
         # Fast path on fa_a.
-        phys_a = fa_a._alloc_bind_fast_or_slow(v_pages, 5)
+        phys_a = fa_a.place_pages(v_pages, 5)
         # Slow path on fa_b: directly call take_physical_pages + bind
         # (the unfused reference implementation).
         phys_b = fa_b.take_physical_pages(5)
-        fa_b.bind(v_pages, phys_b)
+        fa_b.ids.bind(v_pages, phys_b)
         # take_physical_pages already advances live_page_count (matching the
         # fused fast path), so no manual bump here.
         # Identical return tensors.
         self.assertTrue(torch.equal(phys_a, phys_b))
         # Identical v2p / p2v after the operation.
-        self.assertTrue(torch.equal(fa_a.virtual_to_physical, fa_b.virtual_to_physical))
-        self.assertTrue(torch.equal(fa_a.physical_to_virtual, fa_b.physical_to_virtual))
+        self.assertTrue(
+            torch.equal(fa_a.ids.virtual_to_physical, fa_b.ids.virtual_to_physical)
+        )
+        self.assertTrue(
+            torch.equal(fa_a.ids.physical_to_virtual, fa_b.ids.physical_to_virtual)
+        )
         # Identical watermark + live_page_count.
         self.assertEqual(fa_a.watermark_physical, fa_b.watermark_physical)
         self.assertEqual(fa_a.live_page_count, fa_b.live_page_count)
 
-    def test_page_size_gt_1(self):
-        """At page_size > 1 the kernel must scatter one v2p entry per PAGE,
-        not per token."""
-        _pool, fa, _kv = self._make_full(
-            lazy=True, n_full_slots=64, n_mamba_slots=16, page_size=4
-        )
-        self.assertEqual(fa.page_size, 4)
-        v_pages = torch.tensor([3, 4, 5], dtype=torch.int64, device="cuda")
-        wm_before = fa.watermark_physical
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.shape, (3,))
-        # Watermark advances by N PAGES (not N tokens).
-        self.assertEqual(fa.watermark_physical, wm_before + 3)
-        # v2p table updated at page granularity.
-        for v, p in zip(v_pages.tolist(), phys.tolist()):
-            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
 
-    def test_grow_down_fast_path(self):
-        """The mamba sub-pool is grow-down. Verifies fast-path arithmetic
-        in the descending direction."""
-        _pool, _fa, _kv = self._make_full(lazy=True)
-        # Build a grow-down allocator standalone for the test.
-        from sglang.srt.mem_cache.unified_memory_pool import (
-            UnifiedKVPool,
-        )
-
-        full = _make_mha_spec("full", "up", layer_num=2)
-        swa = _make_mha_spec("swa", "down", layer_num=2)  # grow-down
-        total = (full.entry_bytes() + swa.entry_bytes()) * 32
-        pool = UnifiedKVPool(
-            total_bytes=total,
-            sub_pool_specs=[full, swa],
-            device="cuda",
-            enable_memory_saver=False,
-        )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        swa_kv = _FakeKVCache(pool.max_slots("swa"))
-        fa = MultiEndedAllocator(
-            kvcache=full_kv,
-            unified_buffer=pool,
-            sub_pool_name="full",
-            device="cuda",
-            is_id_owner=True,
-            lazy_compaction=True,
-        )
-        sa = MultiEndedAllocator(
-            kvcache=swa_kv,
-            unified_buffer=pool,
-            sub_pool_name="swa",
-            device="cuda",
-            is_id_owner=False,  # non-owner, grow-down
-            lazy_compaction=True,
-        )
-        fa.bind_peer(sa)
-        sa.bind_peer(fa)
-        # Grow-down: watermark starts at num_pages - 1, decreases.
-        self.assertEqual(sa.grow_direction, "down")
-        wm_before = sa.watermark_physical
-        v_pages = torch.tensor([5, 6, 7], dtype=torch.int64, device="cuda")
-        phys = sa._alloc_bind_fast_or_slow(v_pages, 3)
-        # Grow-down: the kernel emits ASCENDING, matching
-        # `_take_physical_eager`'s `torch.arange(wm - N + 1, wm + 1)`.
-        expected = torch.tensor(
-            [wm_before - 2, wm_before - 1, wm_before],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        self.assertTrue(torch.equal(phys, expected))
-        # Watermark decreased by N.
-        self.assertEqual(sa.watermark_physical, wm_before - 3)
-        for v, p in zip(v_pages.tolist(), expected.tolist()):
-            self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
-            self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
-
-
-class TestSWACompositeKernelIdSurface(unittest.TestCase):
-    """The SWA composite's kernel-facing id surface. Attention backends probe for
-    `translate_kv_loc_for_kernel` / `full_v2p_page_table`, and every id must
-    follow `kernel_id(t) = v2p[t // ps] * (ps * mult) + t % ps`."""
+class TestWindowChainKernelIdSurface(unittest.TestCase):
+    """The SWA composite's id surface: both translates follow
+    `phys(t) = v2p[t // ps] * ps + t % ps` over their own side's v2p table,
+    and the raw v2p tables are exposed unwrapped.
+    """
 
     def setUp(self):
         # The code under test reads its config from the bags.
@@ -2457,7 +2397,7 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
         )
         n_full, n_swa = 64, 32  # tokens = 16 / 8 pages at PS=4
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device=_DEV,
@@ -2465,9 +2405,11 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             page_size=self.PS,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
-        return UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
+        return ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
+            arena=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -2476,63 +2418,64 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             forward_stream=None,
         )
 
-    def test_full_kernel_translate_matches_formula(self):
-        """Both sides scale by their OWN sub-pool's block count, and the full
-        kernel id follows v2p[t // ps] * (ps * mult) + t % ps."""
-        mult = 2 * self.FULL_L
+    def test_composite_exposes_raw_v2p_tables(self):
         a = self._build()
-        self.assertEqual(a.kernel_page_multiplier, 2 * self.FULL_L)
-        self.assertEqual(a.swa_kernel_page_multiplier, 2 * self.SWA_L)
+        self.assertIs(
+            a.full_v2p_page_table, a.full_attn_allocator.ids.virtual_to_physical
+        )
+        self.assertIs(
+            a.swa_v2p_page_table, a.swa_attn_allocator.ids.virtual_to_physical
+        )
+
+    def test_full_translate_matches_formula(self):
+        a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
-        v2p = a.full_attn_allocator.virtual_to_physical
-        expected = v2p[v // self.PS] * (self.PS * mult) + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc_for_kernel(v), expected))
-        # The PHYSICAL translate must stay unscaled -- compaction and the byte
-        # machinery depend on it staying in physical space.
-        phys = v2p[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_kv_loc(v), phys))
+        v2p = a.full_attn_allocator.ids.virtual_to_physical
+        expected = v2p[v // self.PS] * self.PS + v % self.PS
+        self.assertTrue(torch.equal(a.translate_kv_loc(v), expected))
 
-    def test_kernel_translate_accepts_an_int32_page_table(self):
-        """Regression: fa3 passes its own page table, which is int32 and 2-D, so
-        the gather must not require an int64 index."""
+    def test_translate_accepts_an_int32_page_table(self):
+        """fa3 translates its own page table, which is int32 and 2-D; a gather
+        that needs a 1-D int64 index would crash the scheduler there. Both page
+        sizes: at ps == 1 the index IS the caller's tensor, at ps > 1 it is
+        derived."""
         for ps in (1, 4):
             with self.subTest(page_size=ps):
                 self.PS = ps
-                mult = 2 * self.FULL_L
                 a = self._build()
                 v = a.alloc(4 * ps)
                 self.assertIsNotNone(v)
-                v2p = a.full_attn_allocator.virtual_to_physical
-                expected = v2p[v // ps] * (ps * mult) + v % ps
+                v2p = a.full_attn_allocator.ids.virtual_to_physical
+                expected = v2p[v // ps] * ps + v % ps
                 page_table = v.to(torch.int32).view(2, -1)
-                got = a.translate_kv_loc_for_kernel(page_table)
+                got = a.translate_kv_loc(page_table)
                 self.assertEqual(got.shape, page_table.shape)
                 self.assertTrue(torch.equal(got.reshape(-1), expected))
                 # `out=` takes the same int32 index; the buffer stays int64.
                 dst = torch.empty(page_table.shape, dtype=torch.int64, device=_DEV)
-                a.translate_kv_loc_for_kernel(page_table, out=dst)
+                a.translate_kv_loc(page_table, out=dst)
                 self.assertTrue(torch.equal(dst.reshape(-1), expected))
 
-    def test_swa_translate_scales_page_stride(self):
-        mult = 2 * self.SWA_L
+    def test_swa_translate_matches_formula(self):
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
-        v2p_swa = a.swa_attn_allocator.virtual_to_physical
-        expected = v2p_swa[v // self.PS] * (self.PS * mult) + v % self.PS
-        self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
+        v2p_swa = a.swa_attn_allocator.ids.virtual_to_physical
+        expected = v2p_swa[v // self.PS] * self.PS + v % self.PS
+        self.assertTrue(
+            torch.equal(a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v), expected)
+        )
 
     def test_swa_transfer_page_is_physical_not_kernel_scaled(self):
-        mult = 2 * self.SWA_L
         a = self._build()
         v = a.alloc(3 * self.PS)
         self.assertIsNotNone(v)
 
-        physical_pages = a.swa_attn_allocator.virtual_to_physical[
+        physical_pages = a.swa_attn_allocator.ids.virtual_to_physical[
             v[:: self.PS] // self.PS
         ]
-        physical_tokens = a.swa_attn_allocator.translate_kv_loc(v)
+        physical_tokens = a.swa_attn_allocator.ids.translate(v)
         transfer_tokens = a.translate_swa_indices_for_transfer(v)
         self.assertTrue(torch.equal(transfer_tokens, physical_tokens))
         self.assertEqual(
@@ -2540,29 +2483,29 @@ class TestSWACompositeKernelIdSurface(unittest.TestCase):
             physical_pages.tolist(),
         )
 
-        kernel_tokens = a.translate_loc_from_full_to_swa(v)
+        # The read path is physical too: the token-major entry leaves no
+        # per-page block scale for a kernel id to carry.
+        kernel_tokens = a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(
             kv_to_page_indices(kernel_tokens, self.PS).tolist(),
-            (physical_pages * mult).tolist(),
+            physical_pages.tolist(),
         )
 
-    def test_swa_kernel_tombstone_still_lands_on_sink(self):
-        """The scaled stride must not break the tombstone clamp: a tombstoned
-        page's ids (v2p == -1 -> -stride + offset, negative for every in-page
-        offset) still land on the sink, never negative."""
-        mult = 2 * self.SWA_L
+    def test_swa_tombstone_still_lands_on_sink(self):
+        """A tombstoned page's ids (v2p == -1 -> -ps + offset, negative for
+        every in-page offset) still land on the sink, never negative."""
         a = self._build()
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v)
         tomb_page = int(v[0].item()) // self.PS
-        a.swa_attn_allocator.virtual_to_physical[tomb_page] = -1
-        got = a.translate_loc_from_full_to_swa(v)
+        a.swa_attn_allocator.ids.virtual_to_physical[tomb_page] = -1
+        got = a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertTrue(bool((got >= 0).all().item()))
         in_tomb = v // self.PS == tomb_page
         self.assertTrue(bool((got[in_tomb] == 0).all().item()))
 
 
-class TestPs64MLACompositeFeasibility(unittest.TestCase):
+class TestPs64MLAChainFeasibility(unittest.TestCase):
     """MLA + mamba composite at page_size=64, the size flashmla snaps to. Large
     pages stress the sink-page floor, the per-layer-view tail pad and the
     page-granular alloc at once."""
@@ -2596,16 +2539,16 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         )
         n_full = 8 * self.PS  # 8 pages incl. the sink page
         total = n_full * full.entry_bytes() + 16 * mamba.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
             page_size=self.PS,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
+        full_kv = _FakeKVCache(pool, "full")
         full_kv.attach_allocator = lambda allocator: None
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv = _FakeKVCache(pool, "mamba")
         mamba_kv.attach_allocator = lambda allocator: None
         mamba_kv._copy_from_physical = lambda src, dst: None
 
@@ -2613,9 +2556,15 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
             full_kv_pool = full_kv
             mamba_pool = mamba_kv
 
-        return UnifiedMambaTokenToKVPoolAllocator(
-            unified_buffer=pool,
+        return ChainAllocator(
+            roles=ChainRoles(owner="full", state="mamba"),
+            arena=pool,
             kvcache=_FakeHybridLinearKVPool(),
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"),
+                _FakeHybridLinearKVPool(),
+                (_FakeHybridLinearKVPool()).mamba_pool,
+            ),
             device=_DEV,
             page_size=self.PS,
             need_sort=False,
@@ -2624,8 +2573,6 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
 
     def test_construction_alloc_and_kernel_formula(self):
         a = self._build()
-        # MLA: one latent row per layer, so the spec reports LAYERS blocks.
-        self.assertEqual(a.kernel_page_multiplier, self.LAYERS)
         v = a.alloc(2 * self.PS)
         self.assertIsNotNone(v, "2-page alloc infeasible at ps=64")
         # Page-aligned virtual run (page-granular allocator invariant).
@@ -2633,9 +2580,9 @@ class TestPs64MLACompositeFeasibility(unittest.TestCase):
         # The kernel translate follows the affine formula at ps=64, and every id
         # fits int32 (the canonical narrows on store).
         v2p = a.full_v2p_page_table
-        want = v2p[v // self.PS] * (self.PS * self.LAYERS) + v % self.PS
-        got = a.translate_kv_loc_for_kernel(v)
-        self.assertTrue(torch.equal(got, want), "kernel-facing formula broke at ps=64")
+        want = v2p[v // self.PS] * self.PS + v % self.PS
+        got = a.translate_kv_loc(v)
+        self.assertTrue(torch.equal(got, want), "physical-id formula broke at ps=64")
         self.assertTrue(bool((got < 2**31).all().item()))
 
 
@@ -2679,22 +2626,20 @@ class TestChainFrontierWalk(unittest.TestCase):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
         total = full.entry_bytes() * 64 + mamba.entry_bytes() * 16
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
         )
-        fa = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("full")),
-            unified_buffer=pool,
+        fa = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
         )
-        ma = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("mamba")),
-            unified_buffer=pool,
+        ma = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -2798,7 +2743,7 @@ class TestChainFrontierWalk(unittest.TestCase):
         self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
 
 
-class TestFloatMultiEndedAllocator(unittest.TestCase):
+class TestFloatBand(CustomTestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap extension, boundary absorption with park-on-empty transparency,
     and the on-demand movers `make_room` and `compact_holes`."""
@@ -2809,7 +2754,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _build_tri(self, n_state=8, n_float=32, n_full=32):
+    def _build_tri(self, n_state=8, n_float=32, n_full=32, device=_DEV):
         state = _make_mamba_spec("state", "up", layer_num=2)
         fl = _make_mha_spec("swa", "float", layer_num=2)
         full = _make_mha_spec("full", "down", layer_num=2)
@@ -2818,33 +2763,30 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             + fl.entry_bytes() * n_float
             + full.entry_bytes() * n_full
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, fl, state],
-            device=_DEV,
+            device=device,
             enable_memory_saver=False,
         )
-        sa = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("state")),
-            unified_buffer=pool,
+        sa = Band(
+            arena=pool,
             sub_pool_name="state",
-            device=_DEV,
+            device=device,
             is_id_owner=True,
         )
-        fkv = _FakeKVCache(pool.max_slots("swa"))
-        fla = FloatMultiEndedAllocator(
-            kvcache=fkv,
-            unified_buffer=pool,
+        fkv = _FakeKVCache(pool, "swa")
+        fla = FloatBand(
+            arena=pool,
             sub_pool_name="swa",
-            device=_DEV,
+            device=device,
             is_id_owner=True,
         )
-        dkv = _FakeKVCache(pool.max_slots("full"))
-        da = MultiEndedAllocator(
-            kvcache=dkv,
-            unified_buffer=pool,
+        dkv = _FakeKVCache(pool, "full")
+        da = Band(
+            arena=pool,
             sub_pool_name="full",
-            device=_DEV,
+            device=device,
             is_id_owner=True,
         )
         # Chain wiring state <-> float <-> full.
@@ -2855,13 +2797,13 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         return pool, sa, fla, da, fkv
 
     def _stamp(self, alloc, kv, v):
-        kv.buf[alloc.virtual_to_physical[v]] = v
+        kv.buf[alloc.ids.virtual_to_physical[v]] = v
 
     def _interior_block(self, fla, blocks):
         """The allocated block whose physical pages touch neither span
         boundary (robust to the extend-direction policy)."""
         for v in blocks:
-            pages = set(int(x) for x in fla.virtual_to_physical[v].tolist())
+            pages = set(int(x) for x in fla.ids.virtual_to_physical[v].tolist())
             if fla.low_wm_page not in pages and (fla.high_wm_page - 1) not in pages:
                 return v
         raise AssertionError("no interior block in layout")
@@ -2874,10 +2816,34 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         for h in holes:
             self.assertTrue(fla.low_wm_page < h < fla.high_wm_page - 1)
         for p in live:
-            v = int(fla.physical_to_virtual[p].item())
+            v = int(fla.ids.physical_to_virtual[p].item())
             self.assertNotEqual(v, -1, f"live page {p} unbound")
-            self.assertEqual(int(fla.virtual_to_physical[v].item()), p)
+            self.assertEqual(int(fla.ids.virtual_to_physical[v].item()), p)
             self.assertEqual(int(kv.buf[p].item()), v, f"data lost at {p}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA tombstone kernel")
+    def test_free_strided_page_ids_preserves_live_bindings(self):
+        """Retiring alternate pages must not accidentally retire their neighbours."""
+        _, _, allocator, _, _ = self._build_tri(device="cuda")
+        pages = allocator.alloc(8)
+        self.assertIsNotNone(pages)
+        freed = pages[::2]
+        self.assertFalse(freed.is_contiguous())
+        physical = allocator.ids.virtual_to_physical[freed].clone()
+        expected_v2p = allocator.ids.virtual_to_physical.clone()
+        expected_p2v = allocator.ids.physical_to_virtual.clone()
+        expected_v2p[freed] = -1
+        expected_p2v[physical] = -1
+
+        allocator.free(freed)
+        torch.testing.assert_close(allocator.ids.virtual_to_physical, expected_v2p)
+        torch.testing.assert_close(allocator.ids.physical_to_virtual, expected_p2v)
+        torch.testing.assert_close(
+            allocator._free_phys_pages.sort().values, physical.sort().values
+        )
+        self.assertEqual(allocator._live_pages(), 4)
+        allocator.free(pages[1::2])
+        self.assertTrue(allocator._is_frontier_transparent())
 
     def test_midpoint_initial_placement(self):
         _, _, fla, _, _ = self._build_tri()
@@ -3096,7 +3062,7 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.assertGreater(moved, 0)
         self._check_float_state(fla, kv)
 
-    def test_on_demand_movers_honor_move_gate(self):
+    def test_on_demand_movers_honor_pins(self):
         """`make_room` / `compact_holes` relocate live pages just as `_flush`
         does, so a closed move gate must stop them too: the shortfall ladder
         reaches `make_room` while a host transfer or RDMA still addresses the
@@ -3120,14 +3086,14 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
                 len(fla._inverse_history),
             )
 
-        fla.host_transfer_move_gate = lambda: False
+        fla.pin_sources = (lambda: True,)
         before = snapshot()
         self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
         self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
         self.assertEqual(snapshot(), before)
         self._check_float_state(fla, kv)
 
-        fla.host_transfer_move_gate = lambda: True
+        fla.pin_sources = ()
         self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
         self._check_float_state(fla, kv)
 
@@ -3157,16 +3123,15 @@ class TestDcpWidening(unittest.TestCase):
         """(full, mamba) as the composite wires them: only full shards."""
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=full.entry_bytes() * n_full_slots + mamba.entry_bytes() * 16,
             sub_pool_specs=[full, mamba],
             device=_DEV,
             enable_memory_saver=False,
             page_size=page_size,
         )
-        alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("full")),
-            unified_buffer=pool,
+        alloc = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
@@ -3174,9 +3139,8 @@ class TestDcpWidening(unittest.TestCase):
             shards_under_dcp=True,
         )
         # The peer stays slot-granular: mamba state is replicated, not sharded.
-        mamba = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("mamba")),
-            unified_buffer=pool,
+        mamba = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -3245,7 +3209,7 @@ class TestDcpWidening(unittest.TestCase):
             with self._dcp(dcp_size, rank):
                 owned = (i % dcp_size) == rank
                 self.assertEqual(int(owned.sum()), i.numel() // dcp_size)
-                phys = a.translate_kv_loc(i[owned] // dcp_size)
+                phys = a.ids.translate(i[owned] // dcp_size)
                 # Collapsed ids land inside this rank's physical rows,
                 # contiguously within each page, never on the reserved sink.
                 self.assertTrue(bool((phys > 0).all()))
@@ -3258,13 +3222,13 @@ class TestDcpWidening(unittest.TestCase):
             with self._dcp(dcp_size, rank):
                 a = self._build(page_size=2)
                 ids = a.alloc(2 * dcp_size * 3)
-                written = a.translate_write_loc_for_kernel(ids)
+                written = a.ids.translate_write(ids)
                 owned = (ids % dcp_size) == rank
                 # Owned ids agree with the read translate of the collapsed id...
                 self.assertTrue(
                     torch.equal(
                         written[owned],
-                        a.translate_kv_loc_for_kernel(ids[owned] // dcp_size),
+                        a.ids.translate(ids[owned] // dcp_size),
                     )
                 )
                 # ...and the rest go to the sink the write kernels skip.
@@ -3272,13 +3236,11 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(bool((written[owned] > 0).all()))
 
     def _build_composite(self, *, page_size, lazy_compaction=False):
-        from sglang.srt.mem_cache.allocator.unified_mamba import (
-            UnifiedMambaTokenToKVPoolAllocator,
-        )
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 
         full_spec = _make_mha_spec("full", "up", layer_num=2)
         mamba_spec = _make_mamba_spec("mamba", "down", layer_num=2)
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=16 * page_size * full_spec.entry_bytes()
             + 8 * mamba_spec.entry_bytes(),
             sub_pool_specs=[full_spec, mamba_spec],
@@ -3286,17 +3248,23 @@ class TestDcpWidening(unittest.TestCase):
             enable_memory_saver=False,
             page_size=page_size,
         )
-        full_kv = _FakeKVCache(pool.max_slots("full"))
-        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_kv = _FakeKVCache(pool, "full")
+        mamba_kv = _FakeKVCache(pool, "mamba")
         mamba_kv._copy_from_physical = lambda src, dst: None
 
         class _FakeHybridLinearKVPool:
             full_kv_pool = full_kv
             mamba_pool = mamba_kv
 
-        return UnifiedMambaTokenToKVPoolAllocator(
-            unified_buffer=pool,
+        return ChainAllocator(
+            roles=ChainRoles(owner="full", state="mamba"),
+            arena=pool,
             kvcache=_FakeHybridLinearKVPool(),
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"),
+                _FakeHybridLinearKVPool(),
+                (_FakeHybridLinearKVPool()).mamba_pool,
+            ),
             device=_DEV,
             page_size=page_size,
             need_sort=False,
@@ -3308,11 +3276,13 @@ class TestDcpWidening(unittest.TestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None
+        allocator.state = SimpleNamespace(slots=mamba_slot_allocator)
         cache.token_to_kv_pool_allocator = allocator
-        cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_slot_allocator)
+        cache.req_to_token_pool = MagicMock()
 
         tree_core = MagicMock()
         full_evictable = sum(int(indices.numel()) for indices in full_leaves)
@@ -3347,7 +3317,7 @@ class TestDcpWidening(unittest.TestCase):
         return cache, walk
 
     def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
-        """The planner charges `mamba_slot_full_token_cost()` against a budget
+        """Admission charges the state-slot cost against a budget
         fed by `available_size()`. Both are bytes/entry_bytes conversions, so
         both carry `dcp_size`; if only the budget widens, every Mamba state is
         under-reserved by that factor and a batch is admitted whose later
@@ -3355,7 +3325,7 @@ class TestDcpWidening(unittest.TestCase):
         for page_size in (1, 8):
             with self._dcp(1):
                 base = self._build_composite(page_size=page_size)
-                base_cost = base.mamba_slot_full_token_cost()
+                base_cost = base.admission_rules().state_slot_cost
                 base_avail = base.available_size()
                 self.assertGreater(base_cost, 0)
             for dcp_size in (2, 4):
@@ -3364,7 +3334,7 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertEqual(a.available_size(), base_avail * dcp_size)
                     mamba_bytes = a.mamba_allocator.entry_bytes_per_page
                     full_entry = a.full_attn_allocator.entry_bytes
-                    cost = a.mamba_slot_full_token_cost()
+                    cost = a.admission_rules().state_slot_cost
                     # A widened token is `full_entry / dcp_size` bytes, so the
                     # reservation covers the slot...
                     self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
@@ -3391,7 +3361,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertEqual(bound, expected)
                 self.assertLessEqual(
                     bound,
-                    missing_slots * allocator.mamba_slot_full_token_cost(),
+                    missing_slots * allocator.admission_rules().state_slot_cost,
                 )
 
     def test_allocation_flush_public_wrapper_is_urgent(self):
@@ -3452,7 +3422,7 @@ class TestDcpWidening(unittest.TestCase):
                 )
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
-                    max_size=allocator.size_mamba,
+                    max_size=allocator.mamba_allocator.max_slots - 1,
                     device=_DEV,
                 )
 
@@ -3511,7 +3481,7 @@ class TestDcpWidening(unittest.TestCase):
             )
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
-                max_size=allocator.size_mamba,
+                max_size=allocator.mamba_allocator.max_slots - 1,
                 device=_DEV,
             )
 
@@ -3542,8 +3512,8 @@ class TestDcpWidening(unittest.TestCase):
             allocator.free_group_end()
 
 
-class TestFusedWriteLocTranslate(unittest.TestCase):
-    """`write_loc_to_kernel_ids` must equal the arithmetic it stands for.
+class TestTranslateTokenIds(unittest.TestCase):
+    """`translate_token_ids` must equal the arithmetic it stands for.
 
     Nothing downstream can tell the two apart except by value, so the reference
     here is the definition rather than a recorded expectation. Triton truncates
@@ -3551,7 +3521,7 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
     tombstoned-page cases are the ones that matter.
     """
 
-    def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):
+    def _reference(self, loc, v2p, page_size, dcp_size, dcp_rank):
         out = []
         for raw in loc.tolist():
             if raw < 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
@@ -3560,11 +3530,11 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             collapsed = raw // dcp_size
             page = collapsed // page_size
             offset = collapsed % page_size if page_size > 1 else 0
-            out.append(max(int(v2p[page]) * stride + offset, 0))
+            out.append(max(int(v2p[page]) * page_size + offset, 0))
         return out
 
-    def _check(self, *, page_size, multiplier, dcp_size, dcp_rank, device):
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+    def _check(self, *, page_size, dcp_size, dcp_rank, device):
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         span = page_size * dcp_size
         locs = [0, 1, span - 1, span, 2 * span + 3, 5 * span + dcp_rank, -1]
@@ -3579,27 +3549,22 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             device=device,
         )
         v2p[min(3, num_pages - 1)] = -1
-        stride = page_size * multiplier
 
-        got = write_loc_to_kernel_ids(
+        got = translate_token_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
-            stride=stride,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
         )
-        want = self._reference(
-            loc.cpu(), v2p.cpu(), page_size, stride, dcp_size, dcp_rank
-        )
+        want = self._reference(loc.cpu(), v2p.cpu(), page_size, dcp_size, dcp_rank)
         self.assertEqual(got.tolist(), want, f"ps={page_size} dcp={dcp_size}")
         # `out=` must write in place and agree (the cuda-graph-stable path).
         dst = torch.full_like(loc, -7)
-        ret = write_loc_to_kernel_ids(
+        ret = translate_token_ids(
             loc=loc,
             v2p=v2p,
             page_size=page_size,
-            stride=stride,
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=dst,
@@ -3612,11 +3577,56 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
             for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
                 self._check(
                     page_size=page_size,
-                    multiplier=7,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                     device="cpu",
                 )
+
+    def test_matches_reference_on_a_strided_view(self):
+        """A column slice of a wider page table is what the SWA read path hands
+        down under cuda graphs, so its ids must equal the flat reference's."""
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        rows, cols, page_size = 3, 5, 4
+        v2p = torch.arange(32, dtype=torch.int64, device=_DEV)
+        backing = torch.full((rows, cols + 3), -1, dtype=torch.int64, device=_DEV)
+        view = backing[:, :cols]
+        view.copy_(torch.arange(rows * cols, dtype=torch.int64).reshape(rows, cols))
+        self.assertFalse(view.is_contiguous())
+
+        want = self._reference(view.reshape(-1).cpu(), v2p.cpu(), page_size, 1, 0)
+        got = translate_token_ids(loc=view, v2p=v2p, page_size=page_size)
+        self.assertEqual(got.shape, view.shape)
+        self.assertEqual(got.reshape(-1).tolist(), want)
+
+        # `out=` into a slice of a DIFFERENTLY strided backing: the ids land in
+        # the sliced columns and the rest of that buffer is left alone.
+        dst = torch.full((rows, cols + 7), -9, dtype=torch.int64, device=_DEV)
+        ret = translate_token_ids(
+            loc=view,
+            v2p=v2p,
+            page_size=page_size,
+            out=dst[:, :cols],
+        )
+        self.assertEqual(ret.data_ptr(), dst.data_ptr())
+        self.assertEqual(dst[:, :cols].reshape(-1).tolist(), want)
+        self.assertTrue(bool((dst[:, cols:] == -9).all()))
+
+    def test_out_width_needs_a_packed_loc(self):
+        """`out_width` addresses a packed lane range, so a strided loc would
+        write its tail zeros over live ids."""
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        v2p = torch.arange(16, dtype=torch.int64, device=_DEV)
+        loc = torch.arange(12, dtype=torch.int64, device=_DEV)[::2]
+        with self.assertRaises(AssertionError):
+            translate_token_ids(
+                loc=loc,
+                v2p=v2p,
+                page_size=1,
+                out=torch.zeros(10, dtype=torch.int64, device=_DEV),
+                out_width=10,
+            )
 
 
 if __name__ == "__main__":

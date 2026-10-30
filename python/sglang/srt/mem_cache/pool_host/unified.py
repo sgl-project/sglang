@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -120,6 +121,13 @@ class _SharedPageEnvelopeHostBacking:
                 int(device_total_bytes * host_to_device_ratio) + max(page_bytes),
                 *nominal_view_bytes,
             )
+        # Transfer backends register this backing in items of each sharing pool's
+        # page size, so keep it a whole number of pages of every pool.
+        page_multiple = math.lcm(*page_bytes)
+        if host_size == 0 and host_to_device_ratio == 0:
+            total_bytes -= total_bytes % page_multiple
+        else:
+            total_bytes += -total_bytes % page_multiple
         if total_bytes <= 0:
             raise ValueError(
                 f"Unified host backing size must be positive: {total_bytes}"
@@ -194,6 +202,20 @@ class _SharedPageEnvelopeHostBacking:
         self._layout_lease_state = self._LayoutLeaseState()
         self._compacting = False
         self._pending_transfer_events = {}
+        # A transfer peer writing physical pages it was given holds no lease:
+        # this predicate is False while such a write may be in flight, and
+        # allocation then refuses to compact.
+        self._peer_write_gate: Callable[[], bool] | None = None
+
+    def set_peer_write_gate(self, gate: Callable[[], bool]) -> None:
+        self._peer_write_gate = gate
+
+    @property
+    def peer_writes_gated(self) -> bool:
+        return self._peer_write_gate is not None
+
+    def _peer_writes_quiescent(self) -> bool:
+        return self._peer_write_gate is None or self._peer_write_gate()
 
     def retain(self, name: str) -> None:
         if name in self._users:
@@ -303,14 +325,29 @@ class _SharedPageEnvelopeHostBacking:
             extension_bytes += extension_pages * side.page_bytes
         return extension_bytes <= self._current_gap_bytes()
 
-    def _can_fit_packed(self, page_counts: dict[str, int]) -> bool:
+    def _can_fit_state(
+        self,
+        live_page_counts: dict[str, int],
+        free_logical_page_counts: dict[str, int],
+        request_page_counts: dict[str, int],
+    ) -> bool:
         used_bytes = 0
-        for name, page_count in page_counts.items():
-            side = self.sides[name]
-            if page_count > self._logical_free_page_count(side):
+        for name, page_count in request_page_counts.items():
+            if page_count > free_logical_page_counts[name]:
                 return False
-            used_bytes += (side.live_page_count + page_count) * side.page_bytes
+            side = self.sides[name]
+            used_bytes += (live_page_counts[name] + page_count) * side.page_bytes
         return used_bytes <= self._allocatable_bytes
+
+    def _can_fit_packed(self, page_counts: dict[str, int]) -> bool:
+        return self._can_fit_state(
+            {name: side.live_page_count for name, side in self.sides.items()},
+            {
+                name: self._logical_free_page_count(side)
+                for name, side in self.sides.items()
+            },
+            page_counts,
+        )
 
     def _begin_compaction(self) -> list:
         if self._layout_lease_state.depth:
@@ -497,6 +534,8 @@ class _SharedPageEnvelopeHostBacking:
             if not self._can_reserve_without_compaction(page_counts):
                 if not self._can_fit_packed(page_counts):
                     return None
+                if not self._peer_writes_quiescent():
+                    return None
                 self._compact()
             if not self._can_reserve_without_compaction(page_counts):
                 raise RuntimeError(
@@ -542,6 +581,48 @@ class _SharedPageEnvelopeHostBacking:
             for name, extents in logical_extents.items():
                 self.sides[name].free_logical_extents = extents
             return results
+
+    def can_fit_many_then(
+        self,
+        requests: Sequence[tuple[str, int]],
+        following_requests: Sequence[tuple[str, int]],
+        *,
+        empty: bool = False,
+    ) -> bool:
+        """Whether both allocation groups fit in order without mutating state."""
+        with self.lock:
+            _, first_page_counts = self._request_page_counts(requests)
+            _, following_page_counts = self._request_page_counts(following_requests)
+            if empty:
+                live_page_counts = {name: 0 for name in self.sides}
+                free_logical_page_counts = {
+                    name: side.page_num for name, side in self.sides.items()
+                }
+            else:
+                live_page_counts = {
+                    name: side.live_page_count for name, side in self.sides.items()
+                }
+                free_logical_page_counts = {
+                    name: self._logical_free_page_count(side)
+                    for name, side in self.sides.items()
+                }
+            if not self._can_fit_state(
+                live_page_counts, free_logical_page_counts, first_page_counts
+            ):
+                return False
+            live_after_first = {
+                name: live_page_counts[name] + first_page_counts[name]
+                for name in self.sides
+            }
+            free_after_first = {
+                name: free_logical_page_counts[name] - first_page_counts[name]
+                for name in self.sides
+            }
+            return self._can_fit_state(
+                live_after_first,
+                free_after_first,
+                following_page_counts,
+            )
 
     def free(self, name: str, indices: torch.Tensor) -> int:
         with self.lock:
@@ -609,6 +690,9 @@ class _SharedPageEnvelopeHostBacking:
 
 class UnifiedPageEnvelopeHostPool(HostKVCache):
     """Host mirror that transfers complete unified-memory page envelopes."""
+
+    stores_page_envelope = True
+    storage_format_tag = "unified-token-major"
 
     def __init__(
         self,
@@ -708,6 +792,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         layout: str,
         allocator_type: str,
         mtp_draft_device_pools: Sequence = (),
+        pool_names: Sequence[str] = ("full", "swa"),
         pin_memory: bool = True,
         device: str = "cpu",
     ) -> tuple[HostKVCache, HostKVCache]:
@@ -718,7 +803,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if len(device_pools) != 2:
             raise ValueError("A hybrid-SWA host pool pair requires exactly two pools.")
 
-        pool_names = ("full", "swa")
+        pool_names = tuple(pool_names)
         backing = _SharedPageEnvelopeHostBacking(
             device_pools=device_pools,
             pool_names=pool_names,
@@ -788,15 +873,13 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         host_indices = self._shared_backing.translate_indices(
             self.pool_label, host_indices
         )
-        # The L2 engine resolves device IDs using the per-layer HiCache contract.
-        # This pool copies whole envelopes, so discard the kernel-view page stride.
-        kernel_page_size = self.page_size * self.device_pool.kernel_page_blocks
-        device_indices = (
-            device_indices // kernel_page_size * self.page_size
-            + device_indices % self.page_size
-        )
         if io_backend == "kernel":
             if not host_indices.is_cuda:
+                if self._device_page_buffer.is_cuda:
+                    # The upload runs on the transfer stream; from pageable memory
+                    # it would block the caller until that stream's earlier copies
+                    # finish, so stage it through pinned memory.
+                    host_indices = host_indices.pin_memory()
                 host_indices = host_indices.to(
                     self._device_page_buffer.device, non_blocking=True
                 )
@@ -814,6 +897,27 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         raise ValueError(f"Unsupported io backend: {io_backend}")
+
+    def peer_write_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        # Physical ids stay valid only while the peer-write gate keeps the
+        # backing from compacting.
+        return self._shared_backing.translate_indices(self.pool_label, indices)
+
+    def set_peer_write_gate(self, gate) -> None:
+        self._shared_backing.set_peer_write_gate(gate)
+
+    @property
+    def peer_writes_gated(self) -> bool:
+        """Whether a peer-write gate keeps compaction from moving the pages
+        `peer_write_indices` names while a transfer peer may write them."""
+        return self._shared_backing.peer_writes_gated
+
+    def peer_write_buf_info(self) -> tuple[int, int, int]:
+        """(pointer, bytes, page bytes) of the region `peer_write_indices`
+        address: this pool's page view of the shared backing."""
+        side = self._shared_backing.sides[self.pool_label]
+        raw = self._shared_backing.raw
+        return raw.data_ptr(), raw.nbytes, side.page_bytes
 
     def destroy(self) -> None:
         if self._destroyed:

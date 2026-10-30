@@ -70,19 +70,18 @@ class Memory(msgspec.Struct):
     ] = False
     enable_page_major_kv_layout: A[
         bool,
-        "Enable the page-major KV layout: lay out the Mamba state and full/SWA "
-        "KV caches in a page-granularity envelope (page is the outermost axis, "
-        "layer-major within a page) instead of the default per-layer "
-        "(layer-major) layout. Requires the Triton attention / linear-attn / "
-        "Mamba backends.",
+        "Store the Mamba state and full/SWA KV caches as one entry per token "
+        "slot, holding every layer's state, in a single page-granular buffer "
+        "instead of one buffer per layer. Implied by --enable-unified-memory, "
+        "and currently supported only with it.",
     ] = False
     enable_unified_memory: A[
         bool,
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
-        "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends. Supported PD-disaggregation and speculative-decoding "
-        "configurations are validated at startup.",
+        "sub-pools. Requires stride-aware attention, linear-attention and Mamba "
+        "backends; the allowed backends and the supported PD-disaggregation and "
+        "speculative-decoding configurations are validated at startup.",
     ] = False
     enable_session_radix_cache: A[
         bool,
@@ -96,7 +95,10 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Hierarchical cache
     # -------------------------------------------------------------------------
-    enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_hierarchical_cache: A[
+        bool,
+        Arg(help="Enable hierarchical cache", aliases=["--enable-hicache"]),
+    ] = False
     hicache_host_memory_mode: A[
         str,
         Arg(
@@ -140,13 +142,14 @@ class Memory(msgspec.Struct):
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "page_unified",
             ],
         ),
     ] = "page_first"
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
@@ -161,6 +164,7 @@ class Memory(msgspec.Struct):
                 "mori",
                 "shm",
                 "tensorcast",
+                "seaweedfs",
             ],
         ),
     ] = None
@@ -200,6 +204,53 @@ class Memory(msgspec.Struct):
         ),
     ] = 8
 
+    hicache_storage_key_scheme: A[
+        str,
+        Arg(
+            help=(
+                "How L3 storage object keys encode what an object holds. "
+                "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
+                "so only a bit-identical topology can reuse the cache. "
+                "'unified': keys carry topology-free grid coordinates (a "
+                "namespace digest plus absolute layer and head-group indices), "
+                "so any topology whose shards tile the same grid shares one "
+                "cache. Implies --hicache-mem-layout page_unified and "
+                "--hicache-io-backend kernel. Currently supported by the file "
+                "backend for one chunk per page."
+            ),
+            choices=["rank-suffix", "unified"],
+        ),
+    ] = "rank-suffix"
+    hicache_storage_head_partition: A[
+        Optional[int],
+        Arg(
+            help=(
+                "KV heads per L3 chunk under --hicache-storage-key-scheme "
+                "unified. A FLEET-WIDE agreement, not a local tuning knob: it "
+                "fixes chunk boundaries, and the boundaries are part of the key "
+                "namespace. Set it to total_kv_heads divided by the lcm of the "
+                "attention-TP sizes in the fleet, so every member's local head "
+                "count is a whole number of chunks. Unset, each deployment keys "
+                "to its own head count and shares only with its own TP size. "
+                "MLA-family models replicate KV across ranks and ignore it."
+            ),
+        ),
+    ] = None
+    hicache_storage_layer_partition: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Layers per L3 chunk under --hicache-storage-key-scheme "
+                "unified; the pipeline-parallel counterpart of "
+                "--hicache-storage-head-partition and equally fleet-wide. Every "
+                "stage must START on a multiple of it; only the final stage may "
+                "end short, and that remainder forms the last chunk. Unset, "
+                "each stage stores its own layer range and shares only with an "
+                "identical split."
+            ),
+        ),
+    ] = None
+
     # -------------------------------------------------------------------------
     # Unified Radix Cache
     # -------------------------------------------------------------------------
@@ -211,9 +262,25 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            choices=["mooncake", "mori", "dynamic"],
         ),
     ] = "mooncake"
+    unified_cache_external_linker_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "JSON configuration for the selected linker backend. Built-in "
+                "backends accept storage options directly. The dynamic backend "
+                "requires linker (class name), linker_module_path (Python "
+                "module), and optional linker_extra_config (object). May be "
+                "supplied while the linker is disabled. For built-in backends, "
+                "replaces --hicache-storage-backend-extra-config when provided. "
+                "The fallback to that flag for external linkers is deprecated; "
+                "ordinary HiCache use of that flag is unaffected."
+            ),
+            type_parser=json.loads,
+        ),
+    ] = None
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",

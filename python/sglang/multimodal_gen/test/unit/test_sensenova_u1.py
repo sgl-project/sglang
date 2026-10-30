@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
+import math
 import time
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -31,14 +33,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+    modeling_fm_modules,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
     NEOVisionConfig,
-)
-from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.conversation import (
-    get_conv_template,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_chat import (
     NEOChatModel,
@@ -52,8 +54,6 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     _flash_or_sdpa,
     _sdpa_attn_func,
     create_block_causal_mask,
-    make_qwen3_rms_norm,
-    npu_fia_available,
     position_ids_from_indexes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -69,7 +69,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
-from sglang.srt.layers.layernorm import RMSNorm
 
 
 class _FakeSenseNovaModel:
@@ -170,33 +169,6 @@ class _WorkerBackedSchedulerClient:
 
     async def forward(self, batches):
         return next(self.worker.execute_forward_sequentially(batches))
-
-
-@pytest.mark.parametrize(
-    ("template_name", "expected_system_message"),
-    [
-        (
-            "Hermes-2",
-            "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, \u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd\u52a9\u624b\u3002",
-        ),
-        (
-            "internlm2-chat",
-            "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, \u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd\u52a9\u624b\u3002",
-        ),
-        (
-            "phi3-chat",
-            "\u4f60\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u8054\u5408\u5546\u6c64\u79d1\u6280\u5f00\u53d1\u7684\u4e66\u751f\u591a\u6a21\u6001\u5927\u6a21\u578b\uff0c\u82f1\u6587\u540d\u53ebInternVL, \u662f\u4e00\u4e2a\u6709\u7528\u65e0\u5bb3\u7684\u4eba\u5de5\u667a\u80fd\u52a9\u624b\u3002",
-        ),
-        (
-            "internvl2_5",
-            "\u4f60\u662f\u4e66\u751f\xb7\u4e07\u8c61\uff0c\u82f1\u6587\u540d\u662fInternVL\uff0c\u662f\u7531\u4e0a\u6d77\u4eba\u5de5\u667a\u80fd\u5b9e\u9a8c\u5ba4\u3001\u6e05\u534e\u5927\u5b66\u53ca\u591a\u5bb6\u5408\u4f5c\u5355\u4f4d\u8054\u5408\u5f00\u53d1\u7684\u591a\u6a21\u6001\u5927\u8bed\u8a00\u6a21\u578b\u3002",
-        ),
-    ],
-)
-def test_sensenova_u1_conversation_preserves_upstream_system_prompt(
-    template_name, expected_system_message
-):
-    assert get_conv_template(template_name).system_message == expected_system_message
 
 
 def _force_generator_fallback(monkeypatch, device_type):
@@ -368,24 +340,6 @@ def test_sensenova_u1_right_aligns_bnsd_prefix_for_npu_fia():
         [3, 4, 5, 6, 7],
     ]
     assert destination[:, :, 5:].eq(0).all()
-
-
-@pytest.mark.parametrize("available", [False, True])
-def test_sensenova_u1_npu_fia_checks_operator_availability(monkeypatch, available):
-    namespace = SimpleNamespace()
-    if available:
-        namespace.npu_fused_infer_attention_score = object()
-    monkeypatch.setattr(torch.ops, "npu", namespace, raising=False)
-
-    assert npu_fia_available() is available
-
-
-def test_sensenova_u1_shared_rmsnorm_uses_framework_dispatch():
-    norm = make_qwen3_rms_norm(64, eps=1e-6)
-
-    assert isinstance(norm, RMSNorm)
-    assert norm.cast_x_before_out_mul
-    assert norm._forward_method != norm.forward_native
 
 
 @torch.no_grad()
@@ -656,13 +610,6 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
 
     assert params.num_frames == 1
     assert params.data_type == DataType.IMAGE
-
-
-def test_sensenova_u1_scheduler_capabilities():
-    config = SenseNovaU1PipelineConfig()
-
-    assert config.supports_dynamic_batching()
-    assert config.supports_sequential_multi_output_inference()
 
 
 def _make_sensenova_u1_scheduler_request(
@@ -1299,7 +1246,12 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
         output_file_name="sample.png",
         trace_ctx=trace_ctx,
     )
-    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(),
+        disable_conditioning_cache=False,
+        conditioning_cache_max_size_mb=512,
+        use_fsdp_inference=False,
+    )
     pipeline = _SequentialTestPipeline(
         server_args, fail=fail, fail_request_ids=fail_request_ids
     )
@@ -1402,3 +1354,21 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+def test_sensenova_u1_timestep_frequencies_are_built_once():
+    """The host-built frequencies are uploaded once per device, not on each
+    denoising step (a pageable upload blocks the host)."""
+    modeling_fm_modules._timestep_freqs.cache_clear()
+    t = torch.tensor([0.25, 0.75])
+    half = 128
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+    )
+    args = t[:, None].float() * freqs[None]
+    expected = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    embed = modeling_fm_modules.TimestepEmbedder.timestep_embedding
+    with patch.object(modeling_fm_modules.torch, "exp", wraps=torch.exp) as exp:
+        for _ in range(3):
+            torch.testing.assert_close(embed(t, 2 * half), expected, atol=0, rtol=0)
+    assert exp.call_count == 1

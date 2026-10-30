@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -40,8 +41,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
 
 
 FORCE_RETRY_PROB = 0.1
@@ -245,6 +247,10 @@ class TestOptimisticPrefillL3BufferWriteThrough(
     retries wait for decode, so retries that recover the prefix from L3 run
     under real load; the gsm8k score is the correctness check."""
 
+    # 32 layers x K/V x 16 fragmented pages produce at most 1024 transfer blocks,
+    # keeping each synchronous batch within the TCP fallback admission budget.
+    extra_prefill_env = {"SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES": "16"}
+
     @classmethod
     def setUpClass(cls):
         cls.hicache_dir = tempfile.mkdtemp(prefix="sglang-hicache-")
@@ -424,6 +430,8 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             kvcache=pool,
             need_sort=False,
         )
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
         tree = UnifiedRadixCache(
             params=CacheInitParams(
                 disable=False,
@@ -431,7 +439,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
                 enable_mamba_extra_buffer=True,
-                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
             )
         )
         return tree, allocator, req_to_token_pool
@@ -447,13 +455,13 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             origin_input_ids=array("q", self.PROMPT),
             sampling_params=SamplingParams(max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         kv_indices = allocator.alloc(len(self.PROMPT))
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices
         )
         req.full_untruncated_fill_ids = array("q", self.PROMPT)
-        req.set_extend_range(0, len(self.PROMPT))
+        req.extend_end = len(self.PROMPT)
         req.kv.kv_committed_len = len(self.PROMPT)
         req.kv.kv_allocated_len = len(self.PROMPT)
         req.kv.mamba_last_track_seqlen = self.TRACK_SEQLEN

@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
+from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -195,7 +199,7 @@ class BaseTpWorker(ABC):
         refcounting."""
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[self.model_runner.tp_rank]
+            serialized_named_tensors[get_parallel().tp_rank]
         )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -250,12 +254,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.model_runner.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{get_parallel().tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
@@ -291,9 +295,11 @@ class TpModelWorker(BaseTpWorker):
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         random_seed: Optional[int] = None,
+        load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
     ):
         # Parse args
         self.server_args = server_args
+        self.load_group = load_group
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
@@ -366,18 +372,18 @@ class TpModelWorker(BaseTpWorker):
             # the set of ranks holding a draft worker. The draft worker is
             # constructed with pp_rank=0, so derive the caller's global rank
             # from the TP group rather than tp_size * pp_rank + tp_rank.
-            tp_group = self.model_runner.tp_group
+            tp_group = get_parallel().tp_group
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                tp_group.ranks[self.model_runner.tp_rank],
+                tp_group.ranks[tp_group.rank_in_group],
                 tp_group.cpu_group,
                 src=tp_group.ranks[0],
             )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [get_device().random_seed],
-                self.model_runner.tp_size * get_parallel().pp_rank
-                + self.model_runner.tp_rank,
+                get_parallel().tp_size * get_parallel().pp_rank
+                + get_parallel().tp_rank,
                 self.world_group.cpu_group,
                 src=self.world_group.ranks[0],
             )[0]
@@ -392,6 +398,8 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        *,
+        draft_parallel_layout: DraftParallelLayout | None = None,
     ):
         """Allocate KV cache pools only (no backends or cuda graphs)."""
         if req_to_token_pool is not None:
@@ -400,11 +408,15 @@ class TpModelWorker(BaseTpWorker):
         if token_to_kv_pool_allocator is not None:
             self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
             self.model_runner.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.model_runner.alloc_memory_pool(memory_pool_config)
+        self.model_runner.alloc_memory_pool(
+            memory_pool_config, draft_parallel_layout=draft_parallel_layout
+        )
         for mr in self.model_runner_list[1:]:
             mr.req_to_token_pool = self.req_to_token_pool
             mr.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
-            mr.alloc_memory_pool(memory_pool_config)
+            mr.alloc_memory_pool(
+                memory_pool_config, draft_parallel_layout=draft_parallel_layout
+            )
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
@@ -486,6 +498,7 @@ class TpModelWorker(BaseTpWorker):
             memory_pool_config=self.memory_pool_config,
             draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            load_group=self.load_group,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -506,6 +519,7 @@ class TpModelWorker(BaseTpWorker):
                     memory_pool_config=self.memory_pool_config,
                     draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
+                    load_group=self.load_group,
                 )
             )
 
@@ -541,6 +555,20 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        if is_cp_sharded_padded():
+            kv_capacity = from_cp_sharded(kv_capacity)
+        # Not an error: a deployment that never sends max-length requests may
+        # want a small pool. Checked here because this is the final served value.
+        if kv_capacity < self.model_config.context_len:
+            logger.warning(
+                "KV pool holds %d tokens, fewer than --context-length %d. One "
+                "full-length request cannot fit, so long requests will be "
+                "refused or truncated at serving time. Lower --context-length, "
+                "raise --mem-fraction-static, or free memory taken before the "
+                "pool is sized.",
+                kv_capacity,
+                self.model_config.context_len,
+            )
         max_req_len = min(
             self.model_config.context_len - 1,
             kv_capacity - 1,
@@ -604,26 +632,38 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
+        return_iteration_ids: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
+        folded = None
         if batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
             if get_exec().features.enable_encoder_swa_bounded_replay:
                 from sglang.srt.model_executor.encoder_swa_replay import (
+                    apply_folded_extend,
+                    fold_encoder_swa_replay,
                     run_encoder_swa_replay,
                 )
 
-                # Replay reads restored main/indexer KV before the normal extend.
-                run_encoder_swa_replay(self, batch)
+                if self.model_runner.attn_backend.folds_encoder_swa_replay:
+                    # Hits extend from their replay start, rebuilding the window in-pass.
+                    folded = fold_encoder_swa_replay(self, batch)
+                else:
+                    # Replay reads restored main/indexer KV before the normal extend.
+                    run_encoder_swa_replay(self, batch)
 
             forward_batch = ForwardBatch.init_new(
-                batch,
+                batch if folded is None else folded.batch,
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
+                pp_loras=pp_loras,
             )
+            if folded is not None:
+                apply_folded_extend(folded, forward_batch)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -643,13 +683,47 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if folded is not None:
+                from sglang.srt.model_executor.encoder_swa_replay import (
+                    drop_folded_rows,
+                )
+
+                tail = self.model_runner.attn_backend.tail_forward_metadata
+                drop_folded_rows(
+                    logits_output=logits_output,
+                    folded=folded,
+                    tail_lens=(
+                        None
+                        if tail is None
+                        else tail.late_layer_tail.extend_seq_lens_cpu
+                    ),
+                )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                iteration_ids=(
+                    None
+                    if not return_iteration_ids
+                    # A folded forward also wrote the replay rows; the caller's
+                    # plan covers the batch it scheduled.
+                    else forward_batch.iteration_ids
+                    if folded is None
+                    else self.model_runner.runner_ids.own_plan(batch)
+                ),
             )
+            if (
+                batch is not None
+                and (observer := self.model_runner.forward_observer) is not None
+            ):
+                batch_result.forward_auxiliary_output = observer.after_forward(
+                    batch,
+                    forward_batch,
+                    logits_output,
+                    can_run_graph=can_run_cuda_graph,
+                )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
