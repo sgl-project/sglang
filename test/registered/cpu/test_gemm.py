@@ -290,16 +290,18 @@ class TestGemm(CustomTestCase):
         torch.manual_seed(127)
         gptq_weight = torch.randint(-128, 128, (K // 8, N)).to(torch.int)
         gptq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
-        gptq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16) // 10
+        gptq_scales = (torch.rand(K // group_size, N) / 10 + 0.01).to(torch.bfloat16)
 
-        bf16_weight = unpack_and_dequant_gptq(gptq_weight, gptq_zero, gptq_scales)
+        reference_weight = unpack_and_dequant_gptq(
+            gptq_weight, gptq_zero, gptq_scales.float()
+        )
         if has_bias:
-            bias = torch.rand(bf16_weight.shape[0]).to(torch.float)
+            bias = torch.rand(reference_weight.shape[0]).to(torch.float)
         else:
             bias = None
-        x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
-        ref_res = torch.nn.functional.linear(
-            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
+        x = torch.rand(M, reference_weight.size(-1)).to(torch.bfloat16)
+        ref_res = torch.nn.functional.linear(x.float(), reference_weight, bias=bias).to(
+            torch.bfloat16
         )
 
         packed_weight, packed_zero, packed_scales = (
@@ -317,6 +319,57 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    @parametrize(
+        batch_size=[1, 32],
+        packed_zero=[0x77777777, -2004318072],
+        has_bias=[False, True],
+    )
+    def test_int4_gptq_symmetric_gemm(self, batch_size, packed_zero, has_bias):
+        """Symmetric GPTQ must use zero point eight for both checkpoint encodings."""
+        generator = torch.Generator().manual_seed(127)
+        input_size, output_size, group_size = 256, 32, 128
+        quantized_weight = torch.randint(
+            0, 16, (input_size, output_size), generator=generator, dtype=torch.int32
+        )
+        shifts = torch.arange(8, dtype=torch.int64).view(1, 8, 1) * 4
+        gptq_weight = (
+            (quantized_weight.reshape(input_size // 8, 8, output_size).long() << shifts)
+            .sum(dim=1)
+            .to(torch.int32)
+        )
+        gptq_zero = torch.full(
+            (input_size // group_size, output_size // 8),
+            packed_zero,
+            dtype=torch.int32,
+        )
+        original_zero = gptq_zero.clone()
+        scales = (
+            torch.rand(input_size // group_size, output_size, generator=generator) / 32
+            + 0.03125
+        ).to(torch.bfloat16)
+        expanded_scales = scales.float().repeat_interleave(group_size, dim=0)
+        reference_weight = (quantized_weight.float() - 8) * expanded_scales
+        inputs = torch.ones(batch_size, input_size, dtype=torch.bfloat16)
+        bias = torch.rand(output_size, generator=generator) if has_bias else None
+        reference = torch.nn.functional.linear(
+            inputs.float(), reference_weight.t(), bias
+        ).to(torch.bfloat16)
+
+        packed_weight, packed_zero_points, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                gptq_weight, gptq_zero, scales, 1, gptq_is_symmetric=True
+            )
+        )
+        torch.testing.assert_close(
+            packed_zero_points, torch.full_like(packed_zero_points, 8)
+        )
+        torch.testing.assert_close(gptq_zero, original_zero, rtol=0, atol=0)
+        actual = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            inputs, packed_weight, packed_zero_points, packed_scales, bias
+        )
+        atol = rtol = precision[reference.dtype]
+        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
