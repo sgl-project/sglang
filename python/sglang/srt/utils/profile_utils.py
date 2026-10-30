@@ -189,7 +189,9 @@ def _get_stage_from_forward_mode(forward_mode: ForwardMode):
 class _StageBasedTrigger:
     @dataclass
     class _StageConfig:
-        target_count: int
+        # None means no auto-stop: the stage profiles until the stage
+        # changes (or an explicit /stop_profile).
+        target_count: Optional[int]
 
     @dataclass
     class _RunningState:
@@ -204,7 +206,7 @@ class _StageBasedTrigger:
         # When a stage is in the dict, it means it is being or should be executed
         self.stage_configs: Dict[str, _StageBasedTrigger._StageConfig] = {}
 
-    def configure(self, num_steps: int, interesting_stages: List[str]):
+    def configure(self, num_steps: Optional[int], interesting_stages: List[str]):
         assert self.running_state is None
         self.stage_configs = {
             stage: self._StageConfig(target_count=num_steps)
@@ -217,13 +219,14 @@ class _StageBasedTrigger:
             s.curr_count += 1
 
         # Maybe stop
-        if ((s := self.running_state) is not None) and (
-            (s.curr_count > self.stage_configs[s.curr_stage].target_count)
-            or (stage != s.curr_stage)
-        ):
-            del self.stage_configs[s.curr_stage]
-            self.running_state = None
-            self.on_stop()
+        if (s := self.running_state) is not None:
+            target_count = self.stage_configs[s.curr_stage].target_count
+            if (target_count is not None and s.curr_count > target_count) or (
+                stage != s.curr_stage
+            ):
+                del self.stage_configs[s.curr_stage]
+                self.running_state = None
+                self.on_stop()
 
         # Maybe start
         if (self.running_state is None) and (stage in self.stage_configs):
