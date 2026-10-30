@@ -20,12 +20,12 @@ use tracing::{debug, info, warn};
 
 use crate::{
     app_context::AppContext,
+    completion::CompletionRequest,
     config::RoutingMode,
     core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
@@ -569,7 +569,7 @@ impl RouterTrait for RouterManager {
         // In non-IGW mode, pass through to router (router handles validation)
         let effective_model_id = if self.enable_igw {
             // Use provided model_id or fall back to body.model
-            let model = model_id.or(Some(&body.model));
+            let model = model_id.or(Some(body.model()));
             match self.resolve_model_id(model) {
                 Ok(id) => Some(id),
                 Err(err_response) => return *err_response,
@@ -588,7 +588,7 @@ impl RouterTrait for RouterManager {
         } else {
             (
                 StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
+                format!("Model '{}' not found or no router available", body.model()),
             )
                 .into_response()
         }
