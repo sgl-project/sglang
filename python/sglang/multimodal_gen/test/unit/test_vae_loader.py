@@ -692,7 +692,8 @@ class TestVAELoader(unittest.TestCase):
             (LTX2PipelineConfig, 2, "video_vae", False),
             (Cosmos3Config, 1, "vae", True),
             (Cosmos3Config, 1, "video_vae", True),
-            (Cosmos3Config, 2, "video_vae", False),
+            (Cosmos3Config, 2, "video_vae", True),
+            (Cosmos3Config, 4, "vae", True),
         ]
         with (
             patch.dict("os.environ", {}, clear=True),
@@ -713,6 +714,7 @@ class TestVAELoader(unittest.TestCase):
         cases = [
             (WanT2V480PConfig, 1, {"encoder", "quant_conv", "decoder.0"}),
             (Wan2_2_I2V_A14B_Config, 2, {"decoder.0"}),
+            (Cosmos3Config, 4, {"decoder.0"}),
             (QwenImagePipelineConfig, 2, {"encoder", "quant_conv", "decoder.0"}),
         ]
         for config_cls, num_gpus, expected in cases:

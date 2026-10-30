@@ -11,6 +11,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -222,9 +223,9 @@ class MindSporeForCausalLM(torch.nn.Module):
         def prepare_cache(cache_list, is_key_cache):
             for i in range(self.config.num_hidden_layers):
                 if is_key_cache:
-                    cache = get_token_to_kv_pool().get_key_buffer(i)
+                    cache = get_kv_layers().read(i).key()
                 else:
-                    cache = get_token_to_kv_pool().get_value_buffer(i)
+                    cache = get_kv_layers().read(i).value()
                 cache_ms = tensor_torch2ms(cache)
                 if self.use_mla and cache_ms.ndim == 3:
                     cache_ms = mint.unsqueeze(cache_ms, 2)

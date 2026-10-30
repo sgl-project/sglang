@@ -17,7 +17,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 
-register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

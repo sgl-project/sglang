@@ -21,8 +21,10 @@ the region (pynccl inside the graph), so TP ranks agree as in the eager path. Wi
 deferred context-KV commit, the verify graph already joined this step's projection, so
 the region stages the stores from it.
 
-The caller routes only all-sampled steps without top-k / top-p, logit adjustments,
-grammar or a simulated sampled bonus; everything else keeps the eager accept.
+The caller routes only all-sampled steps without top-k / top-p, logit adjustments or
+grammar; everything else keeps the eager accept. Under SGLANG_SIMULATE_ACC_LEN the region
+draws the bonus at the simulated row from the buffers the caller stages with
+begin_sim_bonus.
 """
 
 from __future__ import annotations
@@ -101,6 +103,10 @@ def sampling_accept_commit_lens(
         block_verification=block_verification,
         rejection_noise=rejection_noise,
     )
+    bonus_logits = io.logits
+    if epilogue.simulated_correct_len is not None:
+        bonus = epilogue.sim_bonus(io.logits, bs).to(bonus.dtype).view_as(bonus)
+        bonus_logits = None
     commit_lens = build_accept_outs(
         correct_len=correct_len,
         bonus=bonus,
@@ -112,7 +118,7 @@ def sampling_accept_commit_lens(
         tp_sync=tp_sync,
         sync_site=SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
         simulated_correct_len=epilogue.simulated_correct_len,
-        target_logits=io.logits,
+        target_logits=bonus_logits,
         out=epilogue.read_accept(bs),
         block_accept_lens_out=epilogue.read_block_accept_lens(bs),
     ).commit_lens

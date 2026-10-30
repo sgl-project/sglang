@@ -6,6 +6,10 @@ who runs what without talking to each other.
 """
 
 import json
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,7 +118,9 @@ def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_
     standalone_rel = "../single_test_file/test_disagg_server.py"
     executed_standalone = []
 
-    def fake_run_standalone_file(suite, rel, target_dir, extra_filter=None):
+    def fake_run_standalone_file(
+        suite, rel, target_dir, extra_filter=None, failure_summary=None
+    ):
         executed_standalone.append(rel)
         key = f"standalone:{rel}"
         return 0, [key], {key: "pass"}, {"used_fallback_estimate": False}
@@ -143,6 +149,120 @@ def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_
 
     assert executed_standalone == [standalone_rel]
     assert exit_code == 1
+
+
+@pytest.fixture
+def log_partition(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() - 1))
+    monkeypatch.setattr(run_suite, "get_case_est_time", lambda case: 1)
+    monkeypatch.setattr(
+        run_suite, "get_standalone_file_est_time", lambda suite, file: (1, False)
+    )
+    monkeypatch.setattr(
+        run_suite,
+        "_get_parametrized_files_for_case_ids",
+        lambda *args: [str(tmp_path / "test_generation.py")],
+    )
+    monkeypatch.setattr(
+        run_suite, "__file__", str(tmp_path / "runner" / "diffusion_suite_runner.py")
+    )
+
+    def run(case_source, standalone_source):
+        (tmp_path / "test_generation.py").write_text(textwrap.dedent(case_source))
+        (tmp_path / "test_standalone.py").write_text(textwrap.dedent(standalone_source))
+        args = SimpleNamespace(
+            suite="2-gpu",
+            partition_id=0,
+            total_partitions=1,
+            filter=None,
+            continue_on_error=False,
+        )
+        return run_suite._run_partition_assignment(
+            args,
+            tmp_path,
+            PartitionAssignment(
+                case_ids=["case0"], standalone_files=["test_standalone.py"]
+            ),
+        )
+
+    return run
+
+
+def test_failure_reasons_follow_successful_standalone_output(log_partition, capfd):
+    """A passing standalone run must not bury the earlier case's failure reasons."""
+    code = log_partition(
+        """
+        import pytest
+        @pytest.mark.parametrize('case', ['case0'])
+        def test_generation(case):
+            assert False, ('[performance] Validation failed for memory.\\n'
+                           'Actual: 102 MiB\\nExpected: 100 MiB\\nLimit: 101 MiB')
+        """,
+        """
+        def test_standalone():
+            print('STANDALONE_FINISHED')
+        """,
+    )
+    output = capfd.readouterr().out
+    assert code == 1
+    assert output.index("STANDALONE_FINISHED") < output.index(
+        "Failed cases and reasons"
+    )
+    tail = output.split("Failed cases and reasons", 1)[1]
+    assert "test_generation[case0]" in tail
+    assert "Actual: 102 MiB" in tail
+    assert "Expected: 100 MiB" in tail
+    assert "Limit: 101 MiB" in tail
+    assert output.count("Retry budget exhausted") == 1
+
+
+def test_final_reasons_exclude_recovered_cases(log_partition, monkeypatch, capfd):
+    """Recovered retries must not reappear as failures beside a later failing file."""
+    monkeypatch.setenv("SGLANG_DIFFUSION_RETRY_DEADLINE", str(time.time() + 600))
+    code = log_partition(
+        """
+        from pathlib import Path
+        import pytest
+        @pytest.mark.parametrize('case', ['case0'])
+        def test_generation(case):
+            marker = Path(__file__).with_suffix('.attempt')
+            if not marker.exists():
+                marker.touch()
+                assert False, '[performance] transient failure'
+        """,
+        """
+        def test_standalone():
+            assert False, 'standalone failure reason'
+        """,
+    )
+    output = capfd.readouterr().out
+    assert code == 1
+    assert "Recovered retryable failures on attempt 2" in output
+    tail = output.split("Failed cases and reasons", 1)[1]
+    assert "test_generation" not in tail
+    assert "test_standalone" in tail
+    assert "standalone failure reason" in tail
+
+
+def test_parent_progress_precedes_child_output():
+    """Buffered parent progress must appear before the child's direct byte output."""
+    runner_path = run_suite.run_pytest.__code__.co_filename
+    script = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+        spec = importlib.util.spec_from_file_location('pytest_runner', {runner_path!r})
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        print('PARENT_PROGRESS')
+        runner._run_pytest_attempt([sys.executable, '-c', "print('CHILD_OUTPUT')"])
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-E", "-c", script], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.index("PARENT_PROGRESS") < result.stdout.index("CHILD_OUTPUT")
 
 
 def test_two_gpu_cases_have_h100_full_test_time_estimates():

@@ -2,9 +2,10 @@
 
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
+use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
 use crate::utils::shm::{shm_path, unique_name};
@@ -621,10 +622,10 @@ fn tokenize_goes_to_the_pool_without_detok_registration() {
             rid: "45".into(),
             state: RequestState::Received,
             sink: ResponseSink::Local(tx),
-            kind: RequestKind::Tokenize {
+            kind: RequestKind::Tokenize(TokenizeInput::Text {
                 text: "hi".into(),
                 add_special_tokens: false,
-            },
+            }),
         });
         if skip_tokenizer_init {
             let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
@@ -637,10 +638,10 @@ fn tokenize_goes_to_the_pool_without_detok_registration() {
             assert_eq!(pooled.rid.as_str(), "45");
             assert!(matches!(
                 pooled.kind,
-                RequestKind::Tokenize {
+                RequestKind::Tokenize(TokenizeInput::Text {
                     add_special_tokens: false,
                     ..
-                }
+                })
             ));
             assert!(rx.try_recv().is_err(), "no response until the pool answers");
         }
@@ -1268,7 +1269,9 @@ fn mm_failure_rejects_returned_request() {
 
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     req.state
-        .apply(Event::Error(Error::Encode("bad image".into())))
+        .apply(Event::Error(Error::Encode(MediaError::Client(
+            "bad image".into(),
+        ))))
         .unwrap();
     intake.drive(req);
     assert!(

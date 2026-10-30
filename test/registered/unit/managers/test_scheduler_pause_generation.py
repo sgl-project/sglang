@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
@@ -91,6 +91,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
+        # Static pools: no unified KV storage behind the allocator.
+        scheduler.token_to_kv_pool_allocator.storage = None
         scheduler.max_total_num_tokens = 1000
         scheduler._get_token_info = MagicMock(
             return_value=PoolStats(
@@ -186,8 +188,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         controller.write.side_effect = write
 
         manager = object.__new__(DecodeKVCacheOffloadManager)
-        # Not a UnifiedSWAKVPool, so offloads carry no extra SWA pool transfers.
+        # No unified window sub-pool, so offloads carry no extra SWA pool transfers.
         manager.kv_cache = None
+        manager._unified_window = False
         manager.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(8).unsqueeze(0)
         )
@@ -219,6 +222,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.tree_cache.token_to_kv_pool_allocator = (
             scheduler.token_to_kv_pool_allocator
         )
+        scheduler.tree_cache.logical_page_size = 1
         scheduler.tree_cache.req_to_token_pool.free.side_effect = lambda released_req: (
             setattr(released_req.kv, "req_pool_idx", None)
         )
@@ -243,6 +247,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.update_running_batch(batch)
 
@@ -653,9 +658,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_called_once_with(
             req
         )
-        self.assertEqual(req.output_ids, [10, 11])
-        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
-        self.assertTrue(req.pd_rebootstrap_in_progress)
+        # Already-streamed output must not shrink while the prefill recomputes.
+        self.assertEqual(req.output_ids, [10, 11, 12])
         # Rebootstrap recomputes the KV from the prefill, so the retract must skip
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()

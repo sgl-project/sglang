@@ -18,7 +18,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 def _run_as_single_rank(test: unittest.TestCase) -> None:
@@ -167,6 +167,9 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
             queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+            queue.metadata_buffers.clear_slot = lambda idx: (
+                queue.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+            )
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
             queue._record_transfer_failure = MagicMock()
