@@ -3,7 +3,9 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200"],
+  supportedHardware: ["h200", "b200", "arc_b"],
+  hardware: [{ id: "arc_b", label: "BMG", vram: "", vendor: "intel" }],
+  runModes: (selection) => selection.hw === "arc_b" ? ["python"] : ["python", "docker"],
 
   variants: [
     { id: "3b", label: "3B", subtitle: "Dense" },
@@ -104,6 +106,21 @@ export const config = {
   },
 
   cells: [
+    ...[
+      { variant: "3b" },
+      { variant: "8b", mem: "--mem-fraction-static 0.8" },
+    ].map(({ variant, mem }) => ({
+      match: { hw: "arc_b", variant, quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device xpu",
+        "--attention-backend intel_xpu",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    })),
     {
       match: { hw: "h200", variant: "3b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
