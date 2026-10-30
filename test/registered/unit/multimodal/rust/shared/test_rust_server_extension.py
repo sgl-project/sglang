@@ -3,6 +3,7 @@
 import json
 import os
 import pickle
+import socket
 import threading
 import unittest
 from array import array
@@ -731,10 +732,10 @@ class TestRustServerExtension(CustomTestCase):
         def all_gather_object(obj):
             gathered.append(obj)
             return [
-                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
-                None,
+                (0, {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}),
+                (0, None),
                 obj,
-                None,
+                (0, None),
             ]
 
         with (
@@ -750,6 +751,7 @@ class TestRustServerExtension(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(
                     nnodes=1,
+                    node_rank=0,
                     pp_size=1,
                     tp_size=2,
                     tp_rank=0,
@@ -774,9 +776,11 @@ class TestRustServerExtension(CustomTestCase):
             others_only = RustServer.gather_server_endpoints(hosts_listener=False)
 
         self.assertEqual(
-            gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
+            gathered[0], (0, {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"})
         )
-        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        self.assertEqual(
+            gathered[1], (0, None), "a non-listener rank contributes nothing"
+        )
         self.assertEqual(
             others_only, [{"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}]
         )
@@ -788,37 +792,144 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
-    def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
-        """A multi-node launch whose listener is loopback warns, naming the
-        host and rendezvous address, unless the nodes rendezvous on loopback
-        too (several nodes emulated on one machine), and still gathers."""
-        all_gather_object = Mock(return_value=[None, None])
-        for dist_init_addr, warns in (
-            ("10.0.0.1:5000", True),
-            ("127.0.0.1:5000", False),
-            ("[::1]:5000", False),
-            (None, True),
+    def test_gather_server_endpoints_refuses_a_loopback_endpoint_across_nodes(self):
+        """When listeners span nodes, a loopback entry fails startup on every
+        rank, listener or not, naming the rank, endpoint and rendezvous
+        address, unless the nodes rendezvous on loopback too (emulated on one
+        machine). Listeners all on one node never dial each other across
+        machines, so plain multi-node TP with the default --host 127.0.0.1
+        still starts."""
+        loopback = {"dp_rank": 1, "endpoint": "http://127.0.0.1:30001"}
+        routable = {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
+        across_nodes = [(0, routable), (1, None), (1, loopback)]
+        for dist_init_addr, gathered, raises in (
+            ("10.0.0.1:5000", across_nodes, True),
+            ("node-0:5000", across_nodes, True),
+            (None, across_nodes, True),
+            ("127.0.0.1:5000", across_nodes, False),
+            ("[::1]:5000", across_nodes, False),
+            ("10.0.0.1:5000", [(0, routable), (1, None), (0, loopback)], False),
+            ("10.0.0.1:5000", [(0, loopback), (1, None)], False),
         ):
             parallel = SimpleNamespace(
                 nnodes=2,
+                node_rank=1,
                 dist_init_addr=dist_init_addr,
-                world_group=SimpleNamespace(all_gather_object=all_gather_object),
+                world_group=SimpleNamespace(
+                    all_gather_object=Mock(return_value=gathered)
+                ),
             )
             with (
                 patch.object(server_module, "get_parallel", return_value=parallel),
                 patch.object(
                     server_module,
                     "get_serving",
-                    return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+                    return_value=SimpleNamespace(host="10.0.0.2", port=30000),
                 ),
-                patch.object(server_module.logger, "warning") as warning,
             ):
-                RustServer.gather_server_endpoints(hosts_listener=False)
-            self.assertEqual(warning.called, warns, dist_init_addr)
-            if warns:
-                self.assertIn("127.0.0.1", warning.call_args.args[1])
-                self.assertEqual(warning.call_args.args[3], dist_init_addr)
-        self.assertEqual(all_gather_object.call_count, 4)
+                if not raises:
+                    table = RustServer.gather_server_endpoints(hosts_listener=False)
+                    self.assertEqual(
+                        table,
+                        sorted(
+                            (entry for _, entry in gathered if entry is not None),
+                            key=lambda entry: entry["dp_rank"],
+                        ),
+                        dist_init_addr,
+                    )
+                    continue
+                with self.assertRaises(ValueError, msg=dist_init_addr) as raised:
+                    RustServer.gather_server_endpoints(hosts_listener=False)
+            message = str(raised.exception)
+            self.assertIn("dp rank 1", message)
+            self.assertIn("http://127.0.0.1:30001", message)
+            self.assertIn(repr(dist_init_addr), message)
+            self.assertNotIn("10.0.0.1:30000", message)
+
+    def test_gather_server_endpoints_advertises_the_rendezvous_facing_address(self):
+        """A wildcard-bound listener on a multi-node launch advertises the local
+        address that routes to the rendezvous, probed in a family the bind
+        accepts (IPv4 for 0.0.0.0), rather than the default-route guess. A
+        loopback answer (the rendezvous name resolves to this machine, as a
+        hostname /etc/hosts maps to 127.0.1.1 does on the rendezvous node)
+        falls through to that guess. An explicit SGLANG_LOCAL_IP_NIC or
+        SGLANG_HOST_IP still wins over the probe."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj[1])
+            return [obj]
+
+        parallel = SimpleNamespace(
+            nnodes=2,
+            node_rank=0,
+            dist_init_addr="10.0.0.1:5000",
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("SGLANG_HOST_IP", "HOST_IP")
+        }
+        nic = Mock(return_value=None)  # SGLANG_LOCAL_IP_NIC unset
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            patch("sglang.srt.utils.network.get_local_ip_by_nic", nic),
+            # The default-route guess, e.g. a management interface.
+            patch(
+                "sglang.srt.utils.network.get_local_ip_by_remote",
+                return_value="192.168.0.5",
+            ),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            with patch(
+                "sglang.srt.utils.network.get_local_ip_towards",
+                return_value="10.0.0.2",
+            ) as towards:
+                RustServer.gather_server_endpoints(hosts_listener=True)
+                towards.assert_called_once_with("10.0.0.1:5000", socket.AF_INET)
+                nic.return_value = "10.1.0.7"
+                RustServer.gather_server_endpoints(hosts_listener=True)
+                nic.return_value = None
+                os.environ["SGLANG_HOST_IP"] = "10.0.0.9"
+                RustServer.gather_server_endpoints(hosts_listener=True)
+                del os.environ["SGLANG_HOST_IP"]
+                towards.assert_called_once()  # neither override probed
+            # The real probe: a loopback rendezvous answers with loopback.
+            parallel.dist_init_addr = "127.0.0.1:5000"
+            RustServer.gather_server_endpoints(hosts_listener=True)
+
+        self.assertEqual(
+            [entry["endpoint"] for entry in gathered],
+            [
+                "http://10.0.0.2:30000",
+                "http://10.1.0.7:30000",
+                "http://10.0.0.9:30000",
+                "http://192.168.0.5:30000",
+            ],
+        )
 
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a

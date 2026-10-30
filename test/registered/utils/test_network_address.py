@@ -3,7 +3,11 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_towards,
+    is_zmq_endpoint_ipv6,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -138,6 +142,18 @@ class TestNetworkAddressParse(unittest.TestCase):
     def test_roundtrip_hostname(self):
         na = NetworkAddress("my-host", 443)
         self.assertEqual(NetworkAddress.parse(na.to_host_port_str()), na)
+
+
+class TestGetLocalIpTowards(unittest.TestCase):
+    def test_probes_in_the_requested_family(self):
+        self.assertEqual(
+            get_local_ip_towards("127.0.0.1:5000", socket.AF_INET), "127.0.0.1"
+        )
+        # An IPv6 target has no IPv4 route, so an IPv4-only listener gets None.
+        self.assertIsNone(get_local_ip_towards("[::1]:5000", socket.AF_INET))
+
+    def test_unparsable_target_gives_none(self):
+        self.assertIsNone(get_local_ip_towards("no-port"))
 
 
 class TestNetworkAddressParseErrors(unittest.TestCase):
