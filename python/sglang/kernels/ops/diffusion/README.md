@@ -75,6 +75,14 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+SANA-Video's depthwise convolution/GLU fusion reuses input rows and avoids
+materializing the convolution output. It is enabled for large (`numel >= 2**24`)
+channels-last BF16 inputs with cuDNN enabled on SM120, after an exact comparison with the existing
+cuDNN convolution and rounded post-ops. Each shape/cuDNN-policy signature is
+verified before graph capture; an unverified capture or numerical mismatch uses
+the existing path. Autograd and `torch.compile` retain that path as well.
+SANA-WM uses a different convolution/bias rounding contract and is unchanged.
+
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
@@ -166,6 +174,7 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `bias_residual_add` | JIT CUDA | bit-exact `(y + bias[c]) + h` with aten's per-op bf16 rounding, for a conv that skipped its bias pass | channels_last-dense (`C % 8 == 0`) or NCHW/NCDHW contiguous (spatial `% 8 == 0`) bf16; `h` shares `y`'s layout (Qwen-Image 2.1 VAE residual blocks) |
+| `fused_depthwise_conv3x3_bias_glu` | KDA (Triton) | preserves separate BF16 convolution, bias, and SiLU rounding | channels-last BF16 CUDA depthwise 3x3, stride/padding one; SANA-Video inference on SM120, first-use verification per shape and cuDNN policy |
 | `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
 | `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
 | `indexed_gate_bf16` / `indexed_gate_fp32` (`_` in place) | Triton | bit-exact vs `x + gate[idx] * other`: bf16 rounds the product, fp32 keeps a separate FP32 multiply/add | bf16 rows, per-row index into a `[n, D]` gate table (MiniMax-H3) |
