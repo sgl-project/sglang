@@ -34,7 +34,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING</code></td>
-      <td>In DSA prefill, each attention-TP rank scores only its share <br/> of the indexer queries, and the top-k is all-gathered.<br/> Set to <code>false</code> to have every rank score every query: <br/> to bisect a prefill accuracy or hang issue, when attention TP <br/> spans nodes, or when prefills are short and the extra all-gather <br/> outweighs the saved scoring.</td>
+      <td>In DSA prefill, each attention-TP rank scores only its share <br/> of the indexer queries, and the top-k is all-gathered.<br/> Set to <code>false</code> to have every rank score every query: <br/> to debug prefill, or when prompts are short and the extra <br/> all-gather costs more than the work it saves.</td>
       <td><code>true</code></td>
     </tr>
     <tr>
