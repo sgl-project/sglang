@@ -389,6 +389,9 @@ class DecodeRequest:
     host_staged: bool = False
     # Queued for transfer but its destination not yet sent to any prefill rank.
     awaiting_publish: bool = False
+    # Overlap without the deferred publish: (ready event, send_metadata args,
+    # kwargs) until the forward in flight at allocation time is done.
+    pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -2019,12 +2022,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
             )
-        decode_req.kv_receiver.send_metadata(
-            page_indices,
-            decode_req.metadata_buffer_index,
-            state_indices,
-            **metadata_kwargs,
-        )
+        args = (page_indices, decode_req.metadata_buffer_index, state_indices)
+        if (
+            self.scheduler.enable_overlap
+            and not self._defer_publish
+            and metadata_kwargs.get("destination") != KVTransferDestination.HOST
+        ):
+            # A request that finished last step can still have its forward in
+            # flight, writing pages this request was just given. Prefill's RDMA
+            # into them follows no stream, so send once that forward is done.
+            # The deferred publish already waits on an allocation fenced behind
+            # that forward; this covers the inline publish (PP, staging,
+            # HiSparse, no WAR barrier), where the destination is sent at once.
+            ready = self.scheduler.device_module.Event()
+            ready.record(stream=self.scheduler.forward_stream)
+            decode_req.pending_metadata = (ready, args, metadata_kwargs)
+        else:
+            decode_req.kv_receiver.send_metadata(*args, **metadata_kwargs)
         if (
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
@@ -3145,9 +3159,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
                 )
-                # No prefill rank can write to a destination it was never sent.
+                # No prefill rank can write to a destination it was never sent,
+                # whether the publish was deferred or the send is still held.
                 deferrable = (
-                    deferred_release_enabled and not decode_req.awaiting_publish
+                    deferred_release_enabled
+                    and not decode_req.awaiting_publish
+                    and decode_req.pending_metadata is None
                 )
                 if deferrable and not decode_req.kv_receiver.abort_notified:
                     # A failure decode did not initiate (prefill fault, transport
@@ -3261,6 +3278,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        # Only requests still queued send a held destination: a failed or aborted
+        # one never tells prefill where to write.
+        for decode_req in self.queue:
+            pending = decode_req.pending_metadata
+            if pending is not None and pending[0].query():
+                decode_req.pending_metadata = None
+                decode_req.kv_receiver.send_metadata(*pending[1], **pending[2])
 
         if rids_to_check is not None:
             for rid, rid_failed in outcomes.items():

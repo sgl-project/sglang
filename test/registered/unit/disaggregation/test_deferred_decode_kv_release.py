@@ -531,6 +531,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         kv_receiver=receiver,
         metadata_buffer_index=idx,
         awaiting_publish=False,
+        pending_metadata=None,
     )
 
 
@@ -856,6 +857,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         hicache_restore_status=None,
         host_staged=False,
         awaiting_publish=False,
+        pending_metadata=None,
     )
 
 
@@ -932,6 +934,44 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [6])
         self.assertNotIn(10, mgr._deferred_abort_ack_tracker)
+
+    def test_held_destination_is_sent_only_by_queued_requests(self):
+        # Without the deferred publish, overlap holds a destination until the
+        # forward in flight at allocation is done. A request that fails meanwhile
+        # never sends it and is released at once; one that already sent it is
+        # deferred and awaits its drain acks.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        ready = SimpleNamespace(query=lambda: True)
+        held = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+        held.pending_metadata = (ready, ("held",), {})
+        sent = _make_failed_req(mgr, room=8, idx=4, abort_notified=False)
+        queued = _make_failed_req(mgr, room=9, idx=5, abort_notified=False)
+        queued.pending_metadata = (ready, ("queued",), {})
+        for entry in (held, sent, queued):
+            entry.kv_receiver.send_metadata = MagicMock()
+        held_receiver = held.kv_receiver  # the release path nulls entry.kv_receiver
+        q.queue = [held, sent, queued]
+        q._poll_with_metadata_gate = lambda: [
+            KVPoll.Failed,
+            KVPoll.Failed,
+            KVPoll.WaitingForInput,
+        ]
+
+        released = self._pop(q)
+
+        held_receiver.send_metadata.assert_not_called()
+        queued.kv_receiver.send_metadata.assert_called_once_with("queued")
+        self.assertIsNone(queued.pending_metadata)
+        self.assertEqual(q.queue, [queued])
+        self.assertEqual(released, [held])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3])
+        required_acks = {
+            entry.req.bootstrap_room: acks
+            for entry, _, _, _, acks in q._deferred_releases
+        }
+        self.assertEqual(required_acks, {8: 2})
 
     def test_backend_optout_keeps_immediate_release_and_sends_no_abort(self):
         mgr = _make_manager()

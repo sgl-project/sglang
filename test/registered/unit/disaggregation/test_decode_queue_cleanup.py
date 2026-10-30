@@ -131,6 +131,7 @@ def _gated_decode_req(poll, restore_status):
         kv_receiver=_GateReceiver(poll),
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
+        pending_metadata=None,
     )
 
 
@@ -366,6 +367,34 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(decode_req.awaiting_publish)
         self.assertEqual(queue._pending_publish, [])
         self.assertFalse(queue.has_published_destinations)
+
+    def test_inline_publish_holds_the_send_until_the_forward_is_done(self):
+        """Where the deferred publish is off (PP, staging, HiSparse, no WAR
+        barrier), overlap still reuses pages the in-flight forward may write, so
+        the inline publish records an event on the forward stream and holds the
+        send for the transfer queue."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        queue = self._deferring_queue([decode_req])
+        queue._defer_publish = False
+        recorded = []
+        ready = SimpleNamespace(record=lambda stream: recorded.append(stream))
+        queue.scheduler.enable_overlap = True
+        queue.scheduler.device_module = SimpleNamespace(Event=lambda: ready)
+        queue.scheduler.forward_stream = object()
+
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+
+        receiver.send_metadata.assert_not_called()
+        self.assertEqual(recorded, [queue.scheduler.forward_stream])
+        self.assertFalse(decode_req.awaiting_publish)
+        event, args, kwargs = decode_req.pending_metadata
+        self.assertIs(event, ready)
+        self.assertEqual(args[0].tolist(), [8, 9, 10, 11, 12])
+        self.assertEqual(args[1], decode_req.metadata_buffer_index)
+        self.assertEqual(kwargs, {"decode_prefix_len": 0})
+        self.assertEqual(decode_req.metadata_buffer_index, 0)
+        self.assertTrue(queue.has_published_destinations)
 
     def test_deferred_destination_closes_the_move_gate_until_queued(self):
         """A later allocation in the same pop must not let unified-memory compaction
