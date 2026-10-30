@@ -14,15 +14,7 @@ import msgspec
 import numpy as np
 import numpy.typing as npt
 import zmq
-from mori.io import (
-    BackendType,
-    EngineDesc,
-    IOEngine,
-    IOEngineConfig,
-    MemoryDesc,
-    PollCqMode,
-    RdmaBackendConfig,
-)
+from mori.io import EngineDesc, MemoryDesc
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -64,7 +56,6 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -389,7 +380,7 @@ class MoriKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        self.transport = MoriTransport(engine=self._init_engine())
+        self.init_engine()
         self._local_keys = BufferKeys.for_buffers(
             self.kv_args.kv_data_ptrs,
             self.kv_args.aux_data_ptrs,
@@ -449,51 +440,20 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
             self._start_heartbeat_checker_thread()
 
-    def _init_engine(self) -> IOEngine:
-        if self.kv_args.ib_device:
-            os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
-
+    def init_engine(self) -> None:
         self.local_ip = get_local_ip_auto()
-        config = IOEngineConfig(host=self.local_ip, port=0)
-
         engine_key = (
             f"io-{self.disaggregation_mode.value}-"
             f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
             f"pid{os.getpid()}-{self.local_ip}-"
             f"{uuid.uuid4().hex[:8]}"
         )
-
-        engine = run_with_deadline(
-            lambda: IOEngine(engine_key, config),
-            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
-            what=f"Mori IOEngine({engine_key!r}, host={self.local_ip!r})",
+        self.transport = MoriTransport.create(
+            engine_key=engine_key,
+            host=self.local_ip,
+            ib_device=self.kv_args.ib_device,
+            init_timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
         )
-        poll_mode = PollCqMode.POLLING
-
-        qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
-        post_batch_size = envs.SGLANG_MORI_POST_BATCH_SIZE.get()
-        num_worker_threads = envs.SGLANG_MORI_NUM_WORKERS.get()
-
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            False,
-        )
-        engine.create_backend(BackendType.RDMA, rdma_cfg)
-        actual_port = engine.get_engine_desc().port
-        assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
-        logger.debug(
-            "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
-            engine_key,
-            self.local_ip,
-            actual_port,
-            qp_per_transfer,
-            num_worker_threads,
-            poll_mode.name,
-        )
-        return engine
 
     def _register_local_buffers(self) -> None:
         keyed_ptrs = self._local_keys.pair(
