@@ -55,7 +55,6 @@ class TestKimiK3ModelSlimMLAFP8(CustomTestCase):
         "ASCEND_USE_FIA": "1",
         "SGLANG_USE_FIA_NZ": "1",
         "SGLANG_NPU_USE_MLAPO": "1",
-        "SGLANG_NPU_MODELSLIM_KV_QUANT_TYPE_OVERRIDE": "Q_FP8_DYNAMIC_KV_FP8",
     }
     other_args = [
         "--served-model-name",

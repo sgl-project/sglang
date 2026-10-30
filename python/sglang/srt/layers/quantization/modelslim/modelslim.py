@@ -100,7 +100,6 @@ class ModelSlimConfig(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.requested_kv_cache_dtype = "auto"
-        self.kv_quant_type_override = None
         keys = [k for k in quant_config if isinstance(k, str)]
         is_dsv4 = any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
@@ -205,17 +204,9 @@ class ModelSlimConfig(QuantizationConfig):
 
         self.quant_description = quant_config
 
-    def configure_kv_cache_quantization(self, dtype, *, override=None):
-        """Set this model's KV cache dtype and optional quantization format override."""
+    def configure_kv_cache_quantization(self, dtype):
+        """Set this model's requested KV cache dtype."""
         self.requested_kv_cache_dtype = dtype
-        self.kv_quant_type_override = (
-            (override.strip() or None) if override is not None else None
-        )
-        if self.kv_quant_type_override is not None:
-            logger.info(
-                "ModelSlim KV quant_type override: %s",
-                self.kv_quant_type_override,
-            )
 
     def get_modelslim_kv_cache_layout(self, model, *, use_mla_backend):
         """Return the layout of this worker's installed ModelSlim KV scheme."""
@@ -261,8 +252,8 @@ class ModelSlimConfig(QuantizationConfig):
                 resolved_prefix = candidate
                 has_layer_metadata = True
                 break
-        raw = self.quant_description.get(f"{resolved_prefix}.quant_type")
-        if raw == "FLOAT" or any(
+        quant_type = self.quant_description.get(f"{resolved_prefix}.quant_type")
+        if quant_type == "FLOAT" or any(
             fnmatchcase(resolved_prefix, ignored)
             or resolved_prefix.startswith(ignored + ".")
             for ignored in self.ignore
@@ -276,16 +267,14 @@ class ModelSlimConfig(QuantizationConfig):
         if not has_layer_metadata:
             raise ValueError(
                 f"{resolved_prefix}: ModelSlim quantized KV cache requires "
-                "a per-layer FA quantization declaration; an override does not "
-                "create quantized layers"
+                "a per-layer FA quantization declaration"
             )
-        effective = self.kv_quant_type_override or raw
         try:
-            scheme_class = self._kv_scheme_class(effective)
+            scheme_class = self._kv_scheme_class(quant_type)
         except ValueError as error:
             raise ValueError(
                 f"{resolved_prefix}: unsupported ModelSlim KV format "
-                f"(raw={raw!r}, effective={effective!r})"
+                f"(quant_type={quant_type!r})"
             ) from error
         return scheme_class(resolved_prefix, self.requested_kv_cache_dtype)
 

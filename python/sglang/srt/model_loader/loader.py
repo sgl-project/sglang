@@ -226,15 +226,7 @@ def _get_quantization_config(
                 and server_args.speculative_draft_kv_cache_dtype is not None
                 else server_args.kv_cache_dtype
             )
-            override = (
-                envs.SGLANG_NPU_MODELSLIM_KV_QUANT_TYPE_OVERRIDE.get()
-                if not model_config.is_draft_model
-                else None
-            )
-            quant_config.configure_kv_cache_quantization(
-                requested_dtype,
-                override=override,
-            )
+            quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
