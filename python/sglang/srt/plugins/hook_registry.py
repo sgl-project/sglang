@@ -30,7 +30,7 @@ import types
 from collections import defaultdict
 from collections.abc import Callable
 from enum import Enum
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +75,23 @@ class HookRegistry:
     engine starts serving requests.
     """
 
-    _hooks: dict[str, list[tuple[HookType, Callable, HookSource | None]]] = defaultdict(
-        list
+    _hooks: ClassVar[dict[str, list[tuple[HookType, Callable, HookSource | None]]]] = (
+        defaultdict(list)
     )
-    _patched: set[str] = set()
+    _patched: ClassVar[set[str]] = set()
+    # Number of hooks on a target when it was patched; later ones were registered too late.
+    _applied_count: ClassVar[dict[str, int]] = {}
+    _failed_targets: ClassVar[dict[str, BaseException]] = {}
+    # (target, index into _hooks[target]) of hooks registered with required=True.
+    _required: ClassVar[set[tuple[str, int]]] = set()
+
+    @classmethod
+    def applied_targets(cls) -> frozenset[str]:
+        return frozenset(cls._patched)
+
+    @classmethod
+    def failed_targets(cls) -> dict[str, BaseException]:
+        return dict(cls._failed_targets)
 
     @classmethod
     def register(
@@ -88,6 +101,7 @@ class HookRegistry:
         hook_type: HookType = HookType.AFTER,
         *,
         source: HookSource | None = None,
+        required: bool = False,
     ):
         """
         Register a hook on a target function, method, or class.
@@ -105,6 +119,8 @@ class HookRegistry:
             hook_type: Type of hook (default: AFTER).
             source: Optional source info. If None, auto-read from context var
                 set by ``load_plugins()``.
+            required: Optional required tag. If true, `load_plugins()` raises an exception
+                when the hook is not loaded; otherwise, a failure is only logged.
 
         Raises:
             TypeError: If a class is passed with a hook_type other than REPLACE.
@@ -134,6 +150,8 @@ class HookRegistry:
                     new_name,
                     _format_source(resolved_source),
                 )
+        if required:
+            cls._required.add((target, len(cls._hooks[target])))
         cls._hooks[target].append((hook_type, hook, resolved_source))
         logger.debug(
             "Registered %s hook on %s [%s]",
@@ -158,11 +176,21 @@ class HookRegistry:
         sorted_items = sorted(cls._hooks.items(), key=cls._target_sort_key)
         for target, hooks in sorted_items:
             if target in cls._patched:
+                # A target patched outside apply_hooks() has no count; count its hooks now.
+                late = len(hooks) - cls._applied_count.setdefault(target, len(hooks))
+                if late:
+                    cls._failed_targets[target] = RuntimeError(
+                        f"{late} hook(s) registered after {target} was already patched."
+                    )
+                    logger.warning("%s", cls._failed_targets[target])
                 continue
             try:
                 cls._apply_target(target, hooks)
                 cls._patched.add(target)
-            except Exception:
+                cls._applied_count[target] = len(hooks)
+                cls._failed_targets.pop(target, None)
+            except Exception as e:
+                cls._failed_targets[target] = e
                 logger.exception("Failed to apply hooks to %s", target)
 
     @staticmethod
@@ -315,6 +343,9 @@ class HookRegistry:
         """Reset all hooks and patches. Primarily for testing."""
         cls._hooks.clear()
         cls._patched.clear()
+        cls._applied_count.clear()
+        cls._failed_targets.clear()
+        cls._required.clear()
 
 
 def _propagate_patch(original: object, wrapped: object, source_module: object) -> int:
@@ -395,8 +426,7 @@ def _wrap_fn(original_fn: Callable, hook: Callable, hook_type: HookType) -> Call
 
 
 def plugin_hook(
-    target: str,
-    type: HookType = HookType.AFTER,
+    target: str, type: HookType = HookType.AFTER, required: bool = False
 ) -> Callable:
     """Decorator that registers a function or class as a hook on *target*.
 
@@ -422,7 +452,7 @@ def plugin_hook(
     """
 
     def decorator(hook: Callable) -> Callable:
-        HookRegistry.register(target, hook, type)
+        HookRegistry.register(target, hook, type, required=required)
         return hook
 
     return decorator

@@ -116,6 +116,8 @@ Anything your hardware needs in order to be correct belongs on the `Platform` su
 
 A plugin shipped in the selected platform's own distribution is treated as part of that platform's contract: a failure to load it, to run its callback, or to apply any hook it registered aborts startup rather than leaving the platform half-initialized. Plugins from any other installed package stay best-effort, so a broken third party cannot take the server down. An explicit `SGLANG_PLUGINS` allowlist can disable any general plugin, including one from the selected platform package; required hardware setup therefore belongs in `init_backend()`.
 
+SRT general plugins (`sglang.srt.plugins`) are best-effort by default: a failure to load one, to run its callback, or to apply one of its hooks is logged and startup continues. To make specific plugins required, list their entry-point names in `SGLANG_REQUIRED_PLUGINS`. Startup then aborts with an error naming the plugin and the cause when a listed plugin has no entry point, is excluded by `SGLANG_PLUGINS` or `SGLANG_PLATFORM`, fails to import, raises in its callback, or registers a hook that is never applied. A hook is never applied when its target fails to apply, or when it is registered after an earlier `apply_hooks()` call already patched that target. To make a single hook required instead of a whole plugin, see "Required hooks and hook status" under Registration API.
+
 ### Plugin Loading Flow
 
 Each runtime has a process-local hook registry. SRT retains its single
@@ -711,6 +713,10 @@ SGLang custom ops (e.g. the <code>inplace_all_reduce</code> collective) register
       <td><code>SGLANG_PLUGINS</code></td>
       <td>Comma-separated whitelist of general plugin names to load from either hook group. It also filters automatic SRT platform discovery when <code>SGLANG_PLATFORM</code> is unset; explicit platform selection ignores it.</td>
     </tr>
+    <tr>
+      <td><code>SGLANG_REQUIRED_PLUGINS</code></td>
+      <td>Comma-separated SRT general plugin names (<code>sglang.srt.plugins</code>) that must load. Startup aborts if a listed plugin is not installed, is filtered out by <code>SGLANG_PLUGINS</code> or <code>SGLANG_PLATFORM</code>, fails to import or run, or has a hook that cannot be applied. Empty by default: every general plugin stays best-effort.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -989,6 +995,38 @@ class MyScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         print("Enhanced scheduler initialized!")
 ```
+
+#### Required hooks and hook status
+
+In SRT, pass `required=True` to `HookRegistry.register()` or `@plugin_hook` to make one hook required, whether or not its plugin is listed in `SGLANG_REQUIRED_PLUGINS`:
+
+```python
+# --- Imperative API ---
+HookRegistry.register(
+    "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run",
+    my_timer,
+    HookType.AROUND,
+    required=True,
+)
+
+# --- Decorator API ---
+@plugin_hook(
+    "sglang.srt.managers.scheduler.Scheduler.get_next_batch_to_run",
+    type=HookType.AROUND,
+    required=True,
+)
+def my_timer(original_fn, *args, **kwargs):
+    ...
+```
+
+`load_plugins()` then aborts startup if the hook is never applied: its target fails to apply, or the hook is registered after an earlier `apply_hooks()` call already patched that target. The error names each plugin and target, and chains the original exceptions.
+
+To check which hooks took effect, read the hook status after `load_plugins()` has run, for example from one of your own hooks:
+
+- `HookRegistry.applied_targets()` returns the targets that were patched.
+- `HookRegistry.failed_targets()` returns a copy of `{target: exception}` for targets that failed to apply, or that received hooks after they were patched. A target in the second case also appears in `applied_targets()`, because its earlier hooks were applied.
+
+Read these instead of the private `HookRegistry` attributes, which can change between releases.
 
 ### Hook Target Resolution
 
