@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.utils import (
     register_moe_runner_backend_name,
     resolve_moe_runner_backend,
 )
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -106,7 +107,17 @@ class MoeRunner:
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
-            self.runner_core = DeepGemmRunnerCore(config)
+            if is_sail():
+                # SAIL's EP kernels live in a subclass so that the shared
+                # DeepGEMM runner stays free of them; the TP counterparts are
+                # registered as fused funcs by sail_deepgemm_moe.py instead.
+                from sglang.srt.layers.moe.moe_runner.sail_deepgemm_ep import (
+                    SailDeepGemmEpRunnerCore,
+                )
+
+                self.runner_core = SailDeepGemmEpRunnerCore(config)
+            else:
+                self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_humming():
             from sglang.srt.layers.moe.moe_runner.humming import HummingRunnerCore
 
