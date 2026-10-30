@@ -4,6 +4,10 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.diffusion.common import (
+    NPU_ROTARY_MUL_MAX_HEAD_SIZE,
+    NPU_ROTARY_MUL_MAX_NUM_HEADS,
+)
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -16,11 +20,6 @@ from .utils import (
 
 if current_platform.is_npu():
     import torch_npu
-
-    from sglang.kernels.ops.diffusion.common.fallback_npu import (
-        NPU_ROTARY_MUL_MAX_HEAD_SIZE,
-        NPU_ROTARY_MUL_MAX_NUM_HEADS,
-    )
 
 
 @CustomOp.register("rotary_embedding")
@@ -147,7 +146,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if self.use_precomputed_cache or query.dim() == 3 or key.dim() == 3:
             return self.forward_native(
                 query=query,
@@ -279,7 +277,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         support_cuda_style = (
             (cos_sin_cache is not None or cos is not None and sin is not None)
             and not self.use_precomputed_cache

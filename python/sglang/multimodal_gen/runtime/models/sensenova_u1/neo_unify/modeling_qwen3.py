@@ -24,6 +24,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
+from sglang.kernels.ops.diffusion.common import (
+    NPU_ROTARY_MUL_MAX_HEAD_SIZE,
+    NPU_ROTARY_MUL_MAX_NUM_HEADS,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
@@ -50,6 +54,8 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
 #                    debugging, even when flash-attn is available).
 _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
+
+_SENSENOVA_NPU_ROTARY_MUL_DISABLED = False
 
 
 def npu_fia_available() -> bool:
@@ -394,6 +400,58 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _can_use_sensenova_npu_fused_rope(q, k, cos, sin, unsqueeze_dim) -> bool:
+    if q.device.type != "npu":
+        return False
+
+    return (
+        q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == cos.dtype == sin.dtype
+        and q.device == k.device == cos.device == sin.device
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and unsqueeze_dim == 1
+        and q.ndim == k.ndim == 4
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and q.shape[1] < NPU_ROTARY_MUL_MAX_NUM_HEADS
+        and k.shape[1] < NPU_ROTARY_MUL_MAX_NUM_HEADS
+        and q.shape[-1] < NPU_ROTARY_MUL_MAX_HEAD_SIZE
+        and q.shape[-1] % 2 == 0
+        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
+    )
+
+
+def _sensenova_npu_rotary_mul(q, k, cos, sin):
+    global _SENSENOVA_NPU_ROTARY_MUL_DISABLED
+
+    if _SENSENOVA_NPU_ROTARY_MUL_DISABLED:
+        return None
+
+    try:
+        import torch_npu
+    except ImportError:
+        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        return None
+
+    if not hasattr(torch_npu, "npu_rotary_mul"):
+        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        return None
+
+    cos = cos.unsqueeze(1).contiguous()
+    sin = sin.unsqueeze(1).contiguous()
+    try:
+        return (
+            torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half"),
+            torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half"),
+        )
+    except (RuntimeError, TypeError):
+        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        return None
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -414,6 +472,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if _can_use_sensenova_npu_fused_rope(q, k, cos, sin, unsqueeze_dim):
+        npu_output = _sensenova_npu_rotary_mul(q, k, cos, sin)
+        if npu_output is not None:
+            return npu_output
+
     if (
         q.is_cuda
         and q.dtype is torch.bfloat16
@@ -1349,7 +1412,6 @@ class Qwen3Model(Qwen3PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-
         # assert position_ids is not None
         # assert cache_position is not None
         # assert past_key_values is not None

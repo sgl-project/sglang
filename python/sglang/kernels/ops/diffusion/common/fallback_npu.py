@@ -1,8 +1,10 @@
 import torch
 import torch_npu
 
-NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
-NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
+from sglang.kernels.ops.diffusion.common import (
+    NPU_ROTARY_MUL_MAX_HEAD_SIZE,
+    NPU_ROTARY_MUL_MAX_NUM_HEADS,
+)
 
 
 # TODO: remove this when triton ascend bug is fixed
