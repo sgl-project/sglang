@@ -88,6 +88,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
         return False
 
+    def translate_physical_full_to_swa(self, loc: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "This allocator cannot translate physical FULL ids to SWA ids."
+        )
+
     def state_id_spaces(self) -> Dict[str, IdSpace]:
         """The id space of each recurrent-state sub-pool whose slots this
         allocator hands out, keyed by sub-pool name. Empty when the slot ids the

@@ -186,6 +186,7 @@ def _make_model_runner(
     mr.pp_size = 1
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
+        draft_model_config=None,
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
@@ -1437,6 +1438,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             mr.spec_algorithm.is_dflash_family.return_value = True
             mr.dflash_draft_cell_size_per_token = draft_kv_per_token
             mr.spec_aux_config = SimpleNamespace(
+                draft_model_config=None,
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
             )
@@ -1816,7 +1818,7 @@ class TestSWAPoolFloor(CustomTestCase):
                         )
 
 
-class TestFusedDraftPricing(unittest.TestCase):
+class TestFusedDraftPricing(CustomTestCase):
     """A fused full-side entry (host + draft + pad) replaces both the
     per-token full term and the per-draft-layer approximation in every solve:
     charging both over-reserves, charging only the approximation under-reserves."""
@@ -1923,6 +1925,25 @@ class TestFusedDraftPricing(unittest.TestCase):
             fused._full_per_token * fused._full_layers_num
             + fused._swa_full_tokens_ratio * 4_321,
         )
+
+    def test_unified_swa_fusion_prices_the_allocated_entry(self):
+        mr, _ = self._make(fused_entry=None, draft_layers=2, enable_unified_memory=True)
+        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            fused = HybridSWAPoolConfigurator(mr)
+        available = 50_000_000
+        sizes = fused.calculate_pool_sizes(available, page_size=1)
+        full_entry = fused._full_per_token * fused._full_layers_num
+        self.assertEqual(
+            sizes.unified_memory_pool_bytes,
+            sizes.full_max_total_num_tokens * full_entry
+            + sizes.swa_max_total_num_tokens * 4_321,
+        )
+        self.assertLessEqual(sizes.unified_memory_pool_bytes, available)
 
 
 class TestDSV4LowRatioBudget(CustomTestCase):
