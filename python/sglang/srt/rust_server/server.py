@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import operator
 import os
 import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 import orjson
@@ -138,7 +139,8 @@ class RustServer:
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
         model package whose ``_start_multimodal`` starts its own pipeline
-        overrides this to return ``None``."""
+        overrides this to return ``None``; its server admits no generation
+        request until that pipeline starts."""
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
@@ -250,7 +252,7 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        launch_cores, server_cores = cls._partition_cores(
+        _, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
@@ -259,8 +261,9 @@ class RustServer:
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback. The listener answers as soon as the server is constructed,
-        # so refuse a model without one first.
+        # fallback. The listener answers as soon as the server is constructed
+        # (a multimodal one admits generation requests once `_start_multimodal`
+        # starts its pool), so refuse a model without one first.
         mm_spec = (
             cls._resolve_multimodal(scheduler)
             if scheduler.model_config.is_multimodal
@@ -284,14 +287,20 @@ class RustServer:
 
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
-            # thread still holds the full mask. Narrow it first so every MM thread
+            # thread holds the full mask. Narrow it while the MM threads are
             # created below (the Rust MM workers, and any a model package's
-            # `_start_multimodal` starts) stays off the scheduler's reserved
-            # cores, where MM preprocessing would preempt the scheduler loop and
-            # inflate inter-token latency.
+            # `_start_multimodal` starts) so they stay off the scheduler's
+            # reserved cores, where MM preprocessing would preempt the scheduler
+            # loop and inflate inter-token latency. Then give it back its own
+            # mask: the scheduler thread itself is not pinned, as in the Python
+            # frontend, so a busy neighbour on one core never holds it (and every
+            # TP rank waiting on it at the next collective) in that core's queue.
+            scheduler_cpus = None
             if server_cores is not None:
                 try:
+                    full_mask = os.sched_getaffinity(0)
                     os.sched_setaffinity(0, set(server_cores))
+                    scheduler_cpus = full_mask
                 except OSError as e:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
@@ -299,14 +308,8 @@ class RustServer:
             instance.mm_spec = mm_spec
             instance._start_multimodal(scheduler)
             instance._multimodal_enabled = True
-
-        # Narrow the scheduler thread only after the server threads are launched.
-        if launch_cores is not None:
-            try:
-                # pid 0 == this thread (the scheduler event-loop / launch thread).
-                os.sched_setaffinity(0, set(launch_cores))
-            except OSError as e:
-                logger.warning("rust server: cannot pin scheduler launch thread: %s", e)
+            if scheduler_cpus is not None:
+                os.sched_setaffinity(0, scheduler_cpus)
 
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
@@ -508,7 +511,11 @@ class RustServer:
         self.server.push_health_ack()
 
     def push_generation(
-        self, payload: BatchTokenIDOutput, decode_latencies: Dict[int, float]
+        self,
+        payload: BatchTokenIDOutput,
+        decode_latencies: Dict[int, float],
+        cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
+        storage_backend: Optional[str] = None,
     ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
@@ -524,10 +531,14 @@ class RustServer:
             and hidden ones), then the finished requests' weight-version
             spans, a multimodal model's media token counts,
             ``decode_latencies`` (by row: a finished non-streaming request's
-            decode latency in seconds), and the scheduler's
-            ``customized_info`` (per key, each request's values for its new
-            output tokens) as one JSON text, which the frontend accumulates
-            and reports in ``meta_info`` as Python's TokenizerManager does.
+            decode latency in seconds), the scheduler's ``customized_info``
+            (per key, each request's values for its new output tokens) as one
+            JSON text, which the frontend accumulates and reports in
+            ``meta_info`` as Python's TokenizerManager does,
+            ``cached_tokens_split`` (by row: the request's cached tokens per
+            cache tier, ``(device, host, storage)``, when the cache has more
+            tiers than the device) and, for the whole frame, the attached
+            ``storage_backend``.
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -540,7 +551,6 @@ class RustServer:
         buffers plus a per-position ``lens`` vector (0 = null position). Hidden
         states flatten to rows of floats (one row per output position).
         """
-        output_ids = payload.output_ids or []
         prompt_tokens = payload.prompt_tokens or []
 
         # Hot-path guard: almost no decode step wants logprobs / hidden states,
@@ -559,15 +569,14 @@ class RustServer:
         # Python-level pass over the batch costs inter-token latency: `rids` are
         # the plain rid strings (hashed to a routing key on the Rust side with a
         # per-process seed, off the GIL — not parsed; a rid is any string),
-        # `finished_reasons` already `dict | None`, and `output_ids` entries are
-        # always `array("q")` slices of `Req.output_ids` (never None), so both
-        # `map`s stay in C and their bytes go out as-is: one memcpy per request,
-        # no per-element repack. Measured at 256 single-token requests: 10 us,
-        # against 18 us for `array("i", chain.from_iterable(...))`.
+        # `finished_reasons` already `dict | None`, and the token ids already
+        # one flat `array("q")`, whose bytes go out as-is in one copy, with
+        # `tok_lens` taken from its row offsets in a C-level `map`.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
-        tok_lens = list(map(len, output_ids))
-        flat_ids = b"".join(map(array.tobytes, output_ids))
+        offsets = payload.output_ids_offsets
+        tok_lens = list(map(operator.sub, offsets[1:], offsets[:-1]))
+        flat_ids = payload.output_ids_flat.tobytes()
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
@@ -676,10 +685,11 @@ class RustServer:
 
         # After the extras: the finished requests' weight-version spans (None
         # for the others), a multimodal model's media token counts, the
-        # finished requests' decode latencies and the customized_info columns,
-        # each empty when nothing in the batch carries it. Only the latencies
-        # are built here, for finished rows; the header stops at its last
-        # non-empty column.
+        # finished requests' decode latencies, the customized_info columns and
+        # the cached tokens by tier, each empty when nothing in the batch
+        # carries it, then the frame's storage backend. Only the latencies are
+        # built here, for finished rows; the header stops at its last non-empty
+        # column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
@@ -694,6 +704,8 @@ class RustServer:
             latencies,
             [],  # abort_outputs, push_abort's column
             self._customized_info_json(payload.customized_info),
+            cached_tokens_split or [],
+            storage_backend,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()
