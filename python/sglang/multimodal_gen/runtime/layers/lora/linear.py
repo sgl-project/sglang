@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
     split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -228,6 +227,8 @@ class BaseLayerWithLoRA(nn.Module):
         # Layerwise rebinds Parameter.data; do not compile the merged path.
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(x)
+        if self._runtime_lora_scale() == 0.0:
+            return self.base_layer(x)
         if self.merged:
             out, output_bias = self.base_layer(x)
             return self._add_lora_output_offset(out), output_bias
@@ -240,9 +241,13 @@ class BaseLayerWithLoRA(nn.Module):
         if runtime_lora_scale == 0.0:
             return self.base_layer(x)
 
-        out, output_bias = self.base_layer(x)
-        out = self._add_lora_delta(out, x, runtime_lora_scale)
-        return self._add_lora_output_offset(out), output_bias
+        input_parallel = self.base_layer.parallel_input(x)
+        out, output_bias = self.base_layer.apply_quant_method(
+            input_parallel, self.base_layer.bias
+        )
+        out = self._add_lora_delta(out, input_parallel, runtime_lora_scale)
+        out = self._add_lora_output_offset(out)
+        return self.base_layer.collect_output(out), output_bias
 
     def _add_lora_delta(
         self, out: torch.Tensor, x: torch.Tensor, runtime_lora_scale: float
@@ -849,29 +854,17 @@ class BaseLayerWithLoRA(nn.Module):
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
-            return self.base_layer(input_)
+    def __init__(
+        self,
+        base_layer: ColumnParallelLinear,
+        lora_rank: int | None = None,
+        lora_alpha: int | None = None,
+        snapshot_base: bool = True,
+    ) -> None:
+        super().__init__(base_layer, lora_rank, lora_alpha, snapshot_base)
 
-        runtime_lora_scale = self._runtime_lora_scale()
-        if runtime_lora_scale == 0.0:
-            return self.base_layer(input_)
-
-        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
-        if not self.merged and not self.disable_lora:
-            output_parallel = self._add_lora_delta(
-                output_parallel, input_, runtime_lora_scale
-            )
-        output_parallel = self._add_lora_output_offset(output_parallel)
-        if self.base_layer.gather_output:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
-        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
-        return output, output_bias
+    def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
@@ -880,6 +873,10 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         end_idx = (tp_rank + 1) * shard_size
         B = B[start_idx:end_idx, :]
         return B
+
+    @torch.compiler.disable
+    def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
+        return super()._forward_with_delta(x)
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
