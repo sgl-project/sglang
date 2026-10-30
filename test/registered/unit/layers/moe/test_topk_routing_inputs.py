@@ -427,7 +427,11 @@ class TestTopKRoutingInputs(CustomTestCase):
         )
 
     def test_fp8_consumers_keep_lazy_padding_and_placement(self):
-        """Both FP8 formats consume physical IDs and ignore poisoned inactive scores."""
+        """Both FP8 formats consume physical IDs and ignore poisoned inactive scores.
+
+        A padding bound without a placement remap must stay on the in-kernel router;
+        materializing it costs a TopK and a mask launch per layer on every decode step.
+        """
         from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -439,12 +443,14 @@ class TestTopKRoutingInputs(CustomTestCase):
         provider.Fp8QuantizationType = IntEnum(
             "Fp8QuantizationType", {"DeepSeekFp8": 0, "MxFp8": 1}
         )
+        kernels = []
 
         def score_router(**kwargs):
             weights, ids = fused_topk_torch_native(**kwargs)
             return weights.to(score_dtype), ids
 
         def routed_kernel(*, topk_ids, output, routing_method_type, **kwargs):
+            kernels.append("routed")
             ids, weights = topk_ids
             self.assertEqual(routing_method_type, RoutingMethodType.TopK)
             self.assertEqual(kwargs["top_k"], ids.shape[1])
@@ -462,6 +468,7 @@ class TestTopKRoutingInputs(CustomTestCase):
         provider.trtllm_fp8_per_tensor_scale_routed_moe = routed_kernel
 
         def logits_kernel(*, routing_logits, output=None, **kwargs):
+            kernels.append("logits")
             weights, ids = routing_logits.float().softmax(-1).topk(2)
             weights = weights / weights.sum(-1, keepdim=True) * 2.5
             values = ((ids.float() + 1) * weights).sum(-1, keepdim=True)
@@ -511,6 +518,7 @@ class TestTopKRoutingInputs(CustomTestCase):
                                 apply_routed_scaling_factor_on_output=True,
                             )
                             router.topk_config.custom_routing_function = score_router
+                            kernels.clear()
                             with get_exec().moe.override(
                                 ep_dispatch_algorithm="static" if placement else None
                             ):
@@ -579,6 +587,17 @@ class TestTopKRoutingInputs(CustomTestCase):
                                 .expand_as(result)
                                 .clone()
                             )
+                            if not placement:
+                                # Padded rows are the caller's to drop.
+                                self.assertEqual(kernels, ["logits"])
+                                torch.testing.assert_close(
+                                    result[:real].float(),
+                                    expected[:real],
+                                    rtol=0.005,
+                                    atol=0.005,
+                                )
+                                continue
+                            self.assertEqual(kernels, ["routed"])
                             expected[real:] = 0
                             torch.testing.assert_close(
                                 result.float(), expected, rtol=0.005, atol=0.005
@@ -651,7 +670,8 @@ class TestTopKRoutingInputs(CustomTestCase):
                         self.assertIs(actual_weights, weights)
 
     def test_fp8_deferred_finalize_keeps_materialized_routes(self):
-        """Padding and placement retain the deferred GEMM2/score/permutation ABI."""
+        """Padding and placement retain the deferred GEMM2/score/permutation ABI;
+        only a placement remap moves the deferred path onto materialized routes."""
         from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -664,6 +684,7 @@ class TestTopKRoutingInputs(CustomTestCase):
             "Fp8QuantizationType", {"DeepSeekFp8": 0, "MxFp8": 1}
         )
         returned = []
+        kernels = []
 
         def deferred_result(ids, weights, kwargs):
             self.assertFalse(kwargs["do_finalize"])
@@ -678,6 +699,7 @@ class TestTopKRoutingInputs(CustomTestCase):
             return returned
 
         def routed_kernel(*, topk_ids, **kwargs):
+            kernels.append("routed")
             ids, weights = topk_ids
             expected_ids = [2, 0] if placement else [0, 1]
             self.assertEqual(ids[:real].tolist(), [expected_ids] * real)
@@ -686,6 +708,7 @@ class TestTopKRoutingInputs(CustomTestCase):
             return deferred_result(ids, weights, kwargs)
 
         def logits_kernel(*, routing_logits, **kwargs):
+            kernels.append("logits")
             self.assertIs(routing_logits, logits)
             self.assertEqual(
                 kwargs["routing_method_type"], RoutingMethodType.RenormalizeNaive
@@ -711,6 +734,7 @@ class TestTopKRoutingInputs(CustomTestCase):
         )
         for bound, placement in ((None, False), (2, False), (2, True), (0, True)):
             real = 4 if bound is None else bound
+            kernels.clear()
             with self.subTest(bound=bound, placement=placement):
                 hidden, logits = self.hidden.clone(), self.logits.clone()
                 hidden[real:] = logits[real:] = float("nan")
@@ -759,7 +783,9 @@ class TestTopKRoutingInputs(CustomTestCase):
                 self.assertIs(result.expert_weights, returned[1])
                 self.assertIs(result.expanded_idx_to_permuted_idx, returned[2])
                 self.assertEqual(result.top_k, 2)
-                self.assertTrue(bool((returned[2][real:] == -1).all()))
+                self.assertEqual(kernels, ["routed" if placement else "logits"])
+                if placement:
+                    self.assertTrue(bool((returned[2][real:] == -1).all()))
                 self.assertEqual(result.expert_weights.dtype, torch.float32)
                 self.assertTrue(
                     bool(torch.isfinite(result.expert_weights[:real]).all())
