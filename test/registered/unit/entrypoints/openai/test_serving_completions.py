@@ -310,7 +310,8 @@ class ServingCompletionTestCase(unittest.TestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
+        self.assertIsNone(error_chunk_data["error"]["code"])
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"
