@@ -251,9 +251,6 @@ class SchedulerOutputStreamer:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
-            if req.output_rolled_back and not req.finished():
-                # Nothing is new until the taken-back ids are replayed.
-                continue
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)

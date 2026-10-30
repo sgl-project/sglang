@@ -32,7 +32,6 @@ class _FakeReq:
         self.http_worker_ipc = None
         self.finished_reason = None
         self.finished_output = False
-        self.output_rolled_back = False
         self.finished_len = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
