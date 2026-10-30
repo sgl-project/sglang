@@ -82,7 +82,7 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, torch.nn.Module]:
-        model_dir = maybe_download_model(self.model_path)
+        model_dir = maybe_download_model(self.model_path, revision=server_args.revision)
         with open(os.path.join(model_dir, "config.json")) as config_file:
             hf_config = json.load(config_file)
 

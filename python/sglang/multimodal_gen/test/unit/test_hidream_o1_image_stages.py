@@ -273,6 +273,18 @@ class TestHiDreamO1Config(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be sharded"):
             config.validate_server_args(SimpleNamespace(sp_degree=2))
 
+    def test_breakable_cuda_graph_is_refused(self) -> None:
+        """BCG prompt padding misreads the token-id conditioning and breaks warmup."""
+        config = HiDreamO1ImagePipelineConfig()
+        with self.assertRaisesRegex(ValueError, "breakable-cuda-graph"):
+            config.validate_server_args(
+                SimpleNamespace(sp_degree=1, enable_breakable_cuda_graph=True)
+            )
+
+    def test_dynamic_batching_is_disabled(self) -> None:
+        """A merged multi-prompt batch fails every request in it."""
+        self.assertFalse(HiDreamO1ImagePipelineConfig().supports_dynamic_batching())
+
     def test_multi_prompt_is_refused(self) -> None:
         self.assertEqual(_resolve_single_prompt("a cat", field_name="prompt"), "a cat")
         self.assertEqual(

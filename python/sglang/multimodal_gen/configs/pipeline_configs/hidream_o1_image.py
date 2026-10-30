@@ -48,7 +48,21 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
                 "--ulysses-degree 1 --ring-degree 1 and use --tp-size or "
                 "--cfg-parallel-size for multi-GPU instead."
             )
+        if server_args.enable_breakable_cuda_graph:
+            # The denoising stage's prompt_embeds are token ids, which the BCG
+            # text-bucket padder would treat as length-1 embeddings and pad the
+            # [B, 1, S, S] mask into a shape the transformer rejects.
+            raise ValueError(
+                "HiDream-O1-Image conditions on token ids rather than text "
+                "embeddings, which the breakable CUDA graph prompt padding does "
+                "not support yet. Drop --enable-breakable-cuda-graph."
+            )
         super().validate_server_args(server_args)
+
+    def supports_dynamic_batching(self):
+        # The before-denoising stage builds one prompt's token sequence and
+        # mask per request, so a merged multi-prompt batch would fail as a whole.
+        return False
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         del device, rotary_emb, dtype
