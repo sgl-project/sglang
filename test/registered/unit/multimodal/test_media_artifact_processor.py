@@ -95,7 +95,7 @@ class TestMediaArtifactProcessor(CustomTestCase):
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
         )
         processor = MediaArtifactCacheMixin()
-        processor.gpu_image_decode = False
+        processor.device_image_decode = False
 
         with self.assertRaisesRegex(ValueError, "Could not decode image"):
             processor.decode_media_snapshot(

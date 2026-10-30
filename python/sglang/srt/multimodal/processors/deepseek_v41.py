@@ -34,7 +34,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
     models = [DeepseekV4ForCausalLM]
     preserve_processor_input_ids = True
     prefer_tokenized_input = True
-    gpu_image_decode = False
+    device_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.preprocess_backend = "cpu"

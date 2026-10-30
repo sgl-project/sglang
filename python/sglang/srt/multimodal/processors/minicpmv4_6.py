@@ -317,7 +317,7 @@ class MiniCPMV4_6MultimodalProcessor(BaseMultimodalProcessor):
 
     models = [MiniCPMV4_6ForConditionalGeneration]
     support_dynamic_frame_expansion = False
-    gpu_image_decode = False
+    device_image_decode = False
     video_image_id = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):

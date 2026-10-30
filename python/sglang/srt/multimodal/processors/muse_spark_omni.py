@@ -690,7 +690,7 @@ class MuseSpark1xOmniMultimodalProcessor(
     MediaArtifactCacheMixin, BaseMultimodalProcessor
 ):
     models = [MuseSparkForConditionalGeneration]
-    gpu_image_decode = False
+    device_image_decode = False
     # Decode on CPU even when optional GPU resizing is enabled. Decoder worker
     # threads otherwise create a context on the default GPU before the explicit
     # base_gpu_id preprocessing context is entered.

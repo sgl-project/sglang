@@ -180,7 +180,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
     """Native image/audio processor for dots.note.omni."""
 
     models: ClassVar[list] = [Dots3NoteForCausalLM]
-    gpu_image_decode = False
+    device_image_decode = False
 
     def __init__(self, hf_config, server_args, processor, transport_mode, **kwargs):
         self.image_start_token = hf_config.im_start_token

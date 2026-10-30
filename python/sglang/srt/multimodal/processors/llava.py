@@ -46,7 +46,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
     ]
-    gpu_image_decode = False  # Llava processes loaded image as PIL image explicitly
+    device_image_decode = False  # Llava processes loaded image as PIL image explicitly
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

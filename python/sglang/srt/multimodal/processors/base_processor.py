@@ -222,7 +222,7 @@ def _forget_parent_executor_wakeups():
 
 class BaseMultimodalProcessor(ABC):
     models = []
-    gpu_image_decode = True  # Enable GPU decoding by default
+    device_image_decode = True  # Allow device JPEG decoding by default.
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
@@ -247,6 +247,13 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "gpu_image_decode" in cls.__dict__:
+            raise TypeError(
+                f"{cls.__name__}: rename gpu_image_decode to device_image_decode"
+            )
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -485,7 +492,7 @@ class BaseMultimodalProcessor(ABC):
                 f"{type(self._processor).__module__}."
                 f"{type(self._processor).__qualname__}"
             ),
-            "gpu_image_decode": self.gpu_image_decode,
+            "device_image_decode": self.device_image_decode,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
@@ -988,7 +995,7 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(data, cls.device_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode

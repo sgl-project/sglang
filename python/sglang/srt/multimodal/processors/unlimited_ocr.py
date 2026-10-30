@@ -54,7 +54,7 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
     """Multimodal processor for UNLIMITED-OCR model."""
 
     models = [UnlimitedOCRForCausalLM]
-    gpu_image_decode = False
+    device_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         """Initialize UnlimitedOCRProcessor."""

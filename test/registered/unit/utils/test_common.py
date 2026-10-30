@@ -167,7 +167,7 @@ class TestLoadImage(CustomTestCase):
         idat_pos = broken_chunk_png.index(b"IDAT")
         broken_chunk_png[idat_pos - 1] -= 6
 
-        img = _load_image(image_bytes=valid_png, gpu_image_decode=False)
+        img = _load_image(image_bytes=valid_png, device_image_decode=False)
         self.assertEqual(img.size, (16, 16))
 
         cases = [
@@ -181,7 +181,7 @@ class TestLoadImage(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "Could not decode image"):
                     _load_image(
                         image_bytes=image_bytes,
-                        gpu_image_decode=False,
+                        device_image_decode=False,
                     )
 
 

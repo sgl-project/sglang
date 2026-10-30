@@ -68,7 +68,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
                 patch.object(jpeg, "decode_jpeg") as decode,
             ):
                 result = common._load_image(
-                    image_bytes=self.data, gpu_image_decode=mode
+                    image_bytes=self.data, device_image_decode=mode
                 )
                 self.assertIsInstance(result, Image.Image)
                 decode.assert_not_called()

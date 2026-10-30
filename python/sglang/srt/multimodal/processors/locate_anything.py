@@ -16,7 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 class LocateAnythingImageProcessor(SGLangBaseProcessor):
     models = [LocateAnythingForConditionalGeneration]
     # The LocateAnything HF processor is remote-code and does not support tensor inputs.
-    gpu_image_decode = False
+    device_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

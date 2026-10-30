@@ -329,12 +329,12 @@ class EncoderPreprocessor:
                             f"expected {content_hash}, got {snapshot.content_digest}"
                         )
                     data = snapshot.data
-                gpu_image_decode = (
+                device_image_decode = (
                     self.encoder_media_processor_config.image_decode_mode
                     if self.use_image_processor_gpu
                     else False
                 )
-                img, _ = load_image(data, gpu_image_decode)
+                img, _ = load_image(data, device_image_decode)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)

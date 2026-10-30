@@ -379,7 +379,7 @@ class KimiK3ImageProcessor(
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
     # image dependency is installed and otherwise falls back to PIL.
-    gpu_image_decode = "nvjpeg_fancy"
+    device_image_decode = "nvjpeg_fancy"
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2

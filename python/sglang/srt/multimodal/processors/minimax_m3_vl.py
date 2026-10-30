@@ -175,7 +175,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         MiniMaxM3SparseForConditionalGeneration,
     ]
 
-    gpu_image_decode = False
+    device_image_decode = False
 
     # M3's tokenizer has no pad_token.
     tokenizer_padding = False

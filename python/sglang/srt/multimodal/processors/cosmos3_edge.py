@@ -127,7 +127,7 @@ def _as_pil_image(image: Any) -> Image.Image:
 
 class Cosmos3EdgeProcessor(SGLangBaseProcessor):
     models = [Cosmos3EdgeForConditionalGeneration]
-    gpu_image_decode = False
+    device_image_decode = False
 
     @staticmethod
     def _get_processor_output_value(output, key: str):
