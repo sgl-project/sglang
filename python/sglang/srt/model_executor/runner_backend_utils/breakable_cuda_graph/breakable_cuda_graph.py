@@ -38,7 +38,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_musa, is_xpu
 
 _is_xpu = is_xpu()
 
@@ -88,11 +88,11 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.Stream) -> bool:
-    # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
-    # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
-    # CUDA runtime directly via cuda-python: torch.cuda.is_current_stream_capturing()
-    # has proven unreliable there, so we preserve the original behavior.
-    if is_hip() or _is_xpu:
+    # On ROCm/HIP, MUSA, and XPU, cuda-python is unavailable or unnecessary, so
+    # use the portable device API. On NVIDIA, keep querying the CUDA runtime
+    # directly via cuda-python because torch.cuda.is_current_stream_capturing()
+    # has proven unreliable there.
+    if is_hip() or is_musa() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
