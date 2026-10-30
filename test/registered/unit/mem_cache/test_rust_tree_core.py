@@ -17,8 +17,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
 )
+from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=17, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _tree_core():
@@ -29,7 +30,7 @@ def _tree_core():
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         ),
         components={},
     )

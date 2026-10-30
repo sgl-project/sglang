@@ -24,14 +24,15 @@ const DFLASH2_FLAGS = [
 // M3.1 NVFP4 DFLASH requires Blackwell and colocated serving, and DFLASH rejects
 // DP attention off NPU, so the B300 / B200 High-Throughput recipes
 // (--attn-dp-size 2) cannot switch to it.
-const BLACKWELL_HW = ["b300", "gb300", "b200"];
+const BLACKWELL_HW = ["b300", "gb300", "b200", "gb200"];
 const DFLASH2_NOTE =
   "DFlash2 loads its draft from RadixArk/Minimax-M3.1-Flash-Dflash2 and runs in colocated serving only "
   + "(no PD disaggregation).";
 
 // B300 Low-Latency: the MSA-V1 MonoKernel serves single-request DSpark steps
-// The plugin declares sm_100 and sm_103 at TP4 only;
-// only B300 has been measured, so GB300 / B200 get no cell yet.
+// The plugin declares sm_100 and sm_103 at TP4 only. B300 is measured; the GB300,
+// B200 and GB200 cells run the same command (final verification of B200 and GB200
+// is in progress).
 // SGLANG_FORCE_COARSE_WAR_BARRIER=1 enables canonical
 // MegaAttention placement (~3-4% faster), which traps if another process holds SMs.
 // Measured on 4x B300 at batch size 1, acceptance fixed at 5: 1028 tok/s at 1K, 919 at
@@ -43,7 +44,7 @@ const MONOKERNEL_NOTE =
 const cfg = {
   modelName: "MiniMax-M3.1-Flash",
 
-  supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "mi350x"],
+  supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "mi355x", "mi350x"],
 
   variants: [
     { id: "flash", label: "Flash" },
@@ -56,7 +57,7 @@ const cfg = {
       disabled: (s) => !["mi355x", "mi350x"].includes(s.hw),
       disableReason: "The Quark MXFP4 checkpoint is for AMD MI350X / MI355X only." },
   ],
-  // Low-Latency: AMD, plus the B300 / GB300 MonoKernel recipe. Balanced + High-Throughput elsewhere.
+  // Low-Latency: AMD, plus the B300 / GB300 / B200 / GB200 MonoKernel recipe. Balanced + High-Throughput elsewhere.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
     { id: "balanced",        label: "Balanced"        },
@@ -86,11 +87,11 @@ const cfg = {
           hints: [DFLASH2_NOTE],
           disabled: (s) => !BLACKWELL_HW.includes(s.hw) || cellAttnDp(s) > 1 || cellMonokernel(s),
           disableReason: (s) => !BLACKWELL_HW.includes(s.hw)
-            ? "M3.1 NVFP4 DFlash2 requires NVIDIA Blackwell (B300 / GB300 / B200)."
+            ? "M3.1 NVFP4 DFlash2 requires NVIDIA Blackwell (B300 / GB300 / B200 / GB200)."
             : cellMonokernel(s)
               ? "The MonoKernel runs the DSpark draft and verify steps; DFlash2 is not supported with --monokernel-backend msa."
               : "DFlash2 does not support DP attention, and this recipe runs --attn-dp-size "
-                + cellAttnDp(s) + ". Pick Balanced, or GB300 High-Throughput." },
+                + cellAttnDp(s) + ". Pick Balanced, or GB300 / GB200 High-Throughput." },
       ],
     },
   ],
@@ -116,6 +117,7 @@ const cfg = {
   dockerImages: {
     b300:  "lmsysorg/sglang:dev-minimax-m31-flash",
     gb300: "lmsysorg/sglang:dev-minimax-m31-flash",
+    gb200: "lmsysorg/sglang:dev-minimax-m31-flash",
     b200:  "lmsysorg/sglang:dev-minimax-m31-flash",
     h200:  "lmsysorg/sglang:dev-minimax-m31-flash",
     mi355x: "lmsysorg/sglang:dev-minimax-m31-flash-mi35x ",
@@ -191,7 +193,7 @@ const cfg = {
           note: DFLASH2_NOTE,
           disable: [
             { when: { hw: ["h200", "mi355x", "mi350x"] },
-              reason: "M3.1 NVFP4 DFlash2 requires NVIDIA Blackwell (B300 / GB300 / B200)." },
+              reason: "M3.1 NVFP4 DFlash2 requires NVIDIA Blackwell (B300 / GB300 / B200 / GB200)." },
             { when: { dpAttnOn: [true] },
               reason: "DFlash2 does not support DP attention. Turn DP-Attention off in the Attention card above to use DFlash2." },
           ] },
@@ -451,7 +453,10 @@ const cfg = {
     // 78.09%). High-throughput (AIME26 91.67%, MMMU-Pro 76.88%) runs out of
     // GPU memory with B300's settings, first capturing the 32k-token prefill
     // CUDA graphs, then in multimodal image preprocessing on GPU 0, hence
-    // --cuda-graph-max-bs-prefill 16384 and --mem-fraction-static 0.75. ----
+    // --cuda-graph-max-bs-prefill 16384 and --mem-fraction-static 0.75.
+    // Low-Latency is the B300 MonoKernel command unchanged; it serves batch-1
+    // AgentX traffic on 4x B200 (SemiAnalysisAI/InferenceX#4509), and its final
+    // verification is in progress. ----
     {
       match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verificationStatus: "in-progress",
@@ -472,6 +477,33 @@ const cfg = {
         "--cuda-graph-max-bs-decode 128",
         "--mem-fraction-static 0.8",
         "--tokenizer-worker-num 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      warn: MONOKERNEL_NOTE,
+      env: ["FMHA_SM100_ALLOW_JIT=1", "ALLOW_JIT=1", "SGLANG_FORCE_COARSE_WAR_BARRIER=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser minimax-m3",
+        "--tool-call-parser minimax-m3",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--page-size 128",
+        "--speculative-algorithm DSPARK",
+        "--speculative-use-block-verification",
+        "--speculative-num-steps 1",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 8",
+        "--speculative-dspark-block-size 7",
+        "--monokernel-backend msa",
+        "--disable-attn-tp-gather",
+        "--max-running-requests 8",
+        "--mem-fraction-static 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -501,6 +533,93 @@ const cfg = {
         "--cuda-graph-max-bs-decode 128",
         "--cuda-graph-max-bs-prefill 16384",
         "--mem-fraction-static 0.75",
+        "--tokenizer-worker-num 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ---- GB200 (sm_100, 4 GPUs per node, 186 GB per GPU): the B200 recipes where
+    // they fit one 4-GPU node. Balanced is B200's command. B200's High-Throughput
+    // (--tp 8 --attn-dp-size 2) needs 8 GPUs, so GB200 runs the GB300 TP4 + EP4
+    // recipe with B200's 16K prefill-graph cap (--cuda-graph-max-bs-prefill 16384).
+    // Low-Latency is the B300 MonoKernel command unchanged, as run for batch-1
+    // AgentX traffic (SemiAnalysisAI/InferenceX#4509). Final verification of all
+    // three is in progress. ----
+    {
+      match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verificationStatus: "in-progress",
+      warn: BLACKWELL_NOTE,
+      env: ["FMHA_SM100_ALLOW_JIT=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser minimax-m3",
+        "--tool-call-parser minimax-m3",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--speculative-algorithm DSPARK",
+        "--speculative-use-block-verification",
+        "--cuda-graph-backend-prefill breakable",
+        "--chunked-prefill-size 32768",
+        "--max-running-requests 128",
+        "--cuda-graph-max-bs-decode 128",
+        "--mem-fraction-static 0.8",
+        "--tokenizer-worker-num 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verificationStatus: "in-progress",
+      warn: MONOKERNEL_NOTE,
+      env: ["FMHA_SM100_ALLOW_JIT=1", "ALLOW_JIT=1", "SGLANG_FORCE_COARSE_WAR_BARRIER=1"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser minimax-m3",
+        "--tool-call-parser minimax-m3",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_trtllm_routed",
+        "--page-size 128",
+        "--speculative-algorithm DSPARK",
+        "--speculative-use-block-verification",
+        "--speculative-num-steps 1",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 8",
+        "--speculative-dspark-block-size 7",
+        "--monokernel-backend msa",
+        "--disable-attn-tp-gather",
+        "--max-running-requests 8",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verificationStatus: "in-progress",
+      warn: BLACKWELL_NOTE,
+      env: [
+        "FMHA_SM100_ALLOW_JIT=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=32768",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser minimax-m3",
+        "--tool-call-parser minimax-m3",
+        "--tp 4",
+        "--ep 4",
+        "--speculative-algorithm DSPARK",
+        "--speculative-use-block-verification",
+        "--cuda-graph-backend-prefill breakable",
+        "--chunked-prefill-size 32768",
+        "--max-running-requests 128",
+        "--cuda-graph-max-bs-decode 128",
+        "--cuda-graph-max-bs-prefill 16384",
+        "--mem-fraction-static 0.8",
         "--tokenizer-worker-num 8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

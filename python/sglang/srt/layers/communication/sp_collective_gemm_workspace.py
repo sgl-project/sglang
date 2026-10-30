@@ -1,10 +1,6 @@
-"""Symmetric-memory workspaces of the SP collective GEMMs.
+"""SP collective GEMM workspaces, cached by (kind, group, width, dtype, device).
 
-The kernels are ``all_gather_matmul`` / ``matmul_reduce_scatter`` in
-``sglang.kernels.ops.communication.sp_collective_gemm``; pass
-:func:`sp_collective_gemm_workspace` as their ``workspace``. One workspace per
-``(kind, group, width, dtype, device)`` lives for the process and grows by
-reallocation outside CUDA-graph capture.
+Grow outside graph capture and retain old generations for captured replay.
 """
 
 import torch
@@ -13,6 +9,7 @@ import torch.distributed as dist
 from sglang.kernels.ops.communication.sp_collective_gemm import _TILE_M, _TILE_N
 
 _workspaces = {}
+_retired_workspaces = []
 
 
 class SPCollectiveGemmWorkspace:
@@ -84,6 +81,9 @@ def sp_collective_gemm_workspace(
             # Peer mappings must stay alive until all ranks stop reading them.
             ws.handle.barrier(channel=0)
             torch.cuda.current_stream().synchronize()
+            # Captured graphs still hold these addresses. Capacities double on
+            # growth, so retired data buffers sum to less than the current one.
+            _retired_workspaces.append(ws)
         ws = SPCollectiveGemmWorkspace(
             kind, group, rows, width, x.dtype, x.device, row_align, flag_tile_mn
         )

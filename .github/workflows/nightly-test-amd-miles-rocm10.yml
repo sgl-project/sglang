@@ -2,8 +2,9 @@ name: Nightly Test Miles (AMD ROCm 10)
 
 on:
   schedule:
-    # Runs after the 12:00 UTC miles image build has pushed the dated image.
-    - cron: "30 17 * * *"
+    # Runs after the 11:00 UTC miles image build has pushed the dated image,
+    # and after the 16:00/21:00 UTC sglang nightlies have claimed their runners.
+    - cron: "0 22 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -46,8 +47,18 @@ jobs:
             partition_id: 1
             partition_size: 2
             part: 2/2
+          # The 8-GPU suite grew to ~6.5 h of estimated test time and no longer
+          # finishes in the step timeout; split it the same way.
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi35x-gpu-8
+            partition_id: 0
+            partition_size: 2
+            part: 1/2
+          - suite: nightly-stage-c-8-gpu-mi350
+            runner: linux-mi35x-gpu-8
+            partition_id: 1
+            partition_size: 2
+            part: 2/2
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -65,7 +76,7 @@ jobs:
           base="miles-rocm10-mi35x"
           tag="${{ inputs.image_tag }}"
           if [ -z "${tag}" ]; then
-            # Walk back from today; the build job pushes a dated tag at 12:00 UTC.
+            # Walk back from today; the build job pushes a dated tag at 11:00 UTC.
             # Probe with `manifest inspect` so we don't pull a multi-GB image just
             # to test existence; the real pull happens in amd_ci_start_container.sh.
             for i in $(seq 0 6); do

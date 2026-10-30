@@ -97,6 +97,12 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-int8-mamba-checkpoint is not supported together with "
             "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
         )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--enable-unified-memory: the unified pool keeps no int8 checkpoint "
+            "pool, so the flag would have no effect. Disable one of them."
+        )
 
 
 def _platform_supports_mamba_cache_extra_buffer() -> bool:

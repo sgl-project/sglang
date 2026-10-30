@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -76,6 +77,11 @@ def get_attn_backend() -> AttentionBackend:
 
 def get_token_to_kv_pool() -> KVCache:
     return get_attn_backend().token_to_kv_pool
+
+
+def get_kv_layers() -> KVLayerRouter:
+    """The active pool's per-layer KV, as its layer router hands it out."""
+    return get_token_to_kv_pool().layer_router
 
 
 def get_req_to_token_pool() -> ReqToTokenPool:

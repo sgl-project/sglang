@@ -20,7 +20,8 @@ Correctness contract:
 - ``NUM_WARMUP`` eager runs precede capture so triton JIT compile / autotune
   happen outside capture.
 - Any capture failure (e.g. a backend syncing or reading host values inside
-  its prep) permanently disables the glue graph and falls back to eager.
+  its prep) permanently disables the glue graph and falls back to eager. A
+  strict glue (a backend-declared one, in CI) raises instead.
 - Backends whose prep computes values on the HOST each replay (e.g. the
   DFlash-family host-fed fast verify plans) must never be glued: capture
   records only device ops, so the host-written plan inputs would replay
@@ -44,8 +45,9 @@ logger = logging.getLogger(__name__)
 class MetadataGlueGraph:
     NUM_WARMUP = 2
 
-    def __init__(self, device):
+    def __init__(self, device, strict: bool = False):
         self.device = device
+        self.strict = strict
         self.disabled = False
         # Since the first warm-up: prep steps served by a graph replay, and steps
         # that ran eagerly after it (capture failure, disabled, or never routed here).
@@ -118,6 +120,8 @@ class MetadataGlueGraph:
             ):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
         except Exception:
+            if self.strict:
+                raise
             logger.warning(
                 "Metadata glue-graph capture failed for key %s; falling back "
                 "to eager metadata prep permanently.",

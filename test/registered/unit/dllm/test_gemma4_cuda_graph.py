@@ -9,7 +9,7 @@ import torch
 from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -18,7 +18,7 @@ from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _ReadStream:
@@ -27,6 +27,10 @@ class _ReadStream:
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
+
+    def space(self, kind):
+        # A pool without a window sub-pool has no window id space.
+        return None
 
     def pack_read_stream(
         self,
@@ -52,7 +56,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend.device = "cpu"
         backend.dllm_block_size = 4
         backend.sliding_window_size = 6
-        backend.kv_index_translator = _ReadStream()
+        backend.runner_ids = _ReadStream()
         backend.token_to_kv_pool = None
         backend.kv_indptr = torch.zeros(4, dtype=torch.int32)
         backend.qo_indptr = torch.zeros(4, dtype=torch.int32)

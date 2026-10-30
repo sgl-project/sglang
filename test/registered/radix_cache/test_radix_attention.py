@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
+    register_ppu_ci,
 )
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
@@ -18,9 +19,10 @@ from sglang.test.test_utils import (
 )
 
 # RadixAttention server integration tests
-register_cuda_ci(est_time=148, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=145, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=405, suite="stage-b-test-cpu-intel")
+register_ppu_ci(est_time=450, suite="stage-a-test-1-gpu-ppu")
 
 
 class TestRadixCacheFCFS(CustomTestCase):

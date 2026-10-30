@@ -22,10 +22,10 @@ page ids:
     kernel_page(virtual_page) = v2p[virtual_page]
 
 ONE builder computes that formula for every family -- the iteration plan's
-read table (`KVLocPlan.read_table`) -- and the backends only differ in how
+read table (`IterationIds.read_table`) -- and the backends only differ in how
 they consume it:
   - trtllm_mla / cutedsl_mla / flashmla: the plan's rows
-    copied into their padded block tables (`KVIndexTranslator.copy_page_table`);
+    copied into their padded block tables (`RunnerIds.copy_page_table`);
   - the flashinfer updaters: token ids reconstructed from the table by
     `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;
   - fa3's captured decode: the plan's rows copied into its captured page
@@ -61,7 +61,7 @@ _DEV = "cuda"
 
 def _fill_block_table(req_to_token, req_pool_indices, seq_lens, page_size, *, v2p):
     """The unified route: canonical builder into a -1-filled block table
-    (exactly what KVIndexTranslator.build_into does for trtllm_mla/flashmla)."""
+    (exactly what RunnerIds.build_into does for trtllm_mla/flashmla)."""
     from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
 
     bs = req_pool_indices.shape[0]
@@ -325,13 +325,13 @@ class TestBlockTable(unittest.TestCase):
 @unittest.skipUnless(_HAS_CUDA, "requires CUDA")
 class TestFa3MetadataBlockTable(unittest.TestCase):
     """fa3's captured-decode page table is written by `normal_decode_set_metadata`
-    fed with the translator's read table kernel page table
+    fed with the `RunnerIds`' read table kernel page table
     (src_is_read_table=True): the fused kernel copies the canonical
     rows' live prefixes into the capture-stable buffer. Pinned END-TO-END:
     build_kv_read_table -> wrapper -> page_table must equal the python
     reference of the physical-id formula, on both the page_size == 1 / no-SWA fast
     path (what Kimi-Linear takes) and the general kernel. The static call
-    (no source flag) stays byte-identical to the pre-translator kernel.
+    (no source flag) stays byte-identical to the pre-runner_ids kernel.
     """
 
     def _run(self, page_size, *, v2p, bs=5, max_ctx=2048):
