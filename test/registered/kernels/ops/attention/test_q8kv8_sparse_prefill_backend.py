@@ -40,11 +40,13 @@ from sglang.test.kernels.deepseek_v4.k_cache_reference import (
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value():
+def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value(monkeypatch):
     assert not use_dsv4_q8kv8_sparse_prefill()
     assert not use_dsv4_q8kv8_sparse_prefill("auto")
     assert not use_dsv4_q8kv8_sparse_prefill("flashmla_sparse")
     assert use_dsv4_q8kv8_sparse_prefill("flashmla_sparse_q8")
+    monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", "1")
+    assert not use_dsv4_q8kv8_sparse_prefill("cutedsl_h16")
 
 
 class _Pool:
@@ -848,6 +850,42 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         **kwargs,
     )
     torch.testing.assert_close(actual, expected.squeeze(1), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+@torch.inference_mode()
+def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
+    device = torch.device("cuda")
+    backend, batch, pool, q, sink, metadata = _make_sparse_prefill_case(
+        device, local_heads=64
+    )
+    _populate_compress_metadata(metadata, compress_ratio=compress_ratio, device=device)
+    backend._cutedsl_h16_c128_combined_topk = 512
+    args = dict(
+        q=q,
+        layer_id=0,
+        compress_ratio=compress_ratio,
+        forward_batch=batch,
+        token_to_kv_pool=pool,
+        core_attn_metadata=metadata,
+        attn_sink=sink,
+    )
+    with _patched_compressed_sparse_cache_paths(compress_ratio):
+        expected = backend._forward_prefill_sparse(**args)[:, :16]
+        cache = backend.forward_metadata.sparse_prefill_cache
+        actual = backend._forward_prefill_sparse(**args, use_cutedsl_h16=True)
+        torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-3)
+        assert backend.forward_metadata.sparse_prefill_cache is cache
+        if compress_ratio == 128:
+            padded, lengths = cache.get_c128_combined(512)
+            live = cache.compressed[128].combined_indices
+            torch.testing.assert_close(padded[:, : live.shape[1]], live)
+            assert torch.all(padded[:, live.shape[1] :] == -1)
+            assert lengths is cache.compressed[128].combined_lens
+            repeated = backend._forward_prefill_sparse(**args, use_cutedsl_h16=True)
+            assert torch.equal(repeated, actual)
+            assert cache.get_c128_combined(512)[0] is padded
 
 
 if __name__ == "__main__":

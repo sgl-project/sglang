@@ -381,44 +381,21 @@ class SparsePrefillChunkCache:
         self.compressed[128] = gather
         return gather
 
-    def get_c128_combined(
-        self, padded_width: Optional[int] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return C128 metadata, optionally padded to a fixed aligned width.
-
-        The live combine remains unchanged for FlashMLA/Q8KV8. CuTe H16 passes
-        the width derived from the configured maximum context length, avoiding
-        a new compiled kernel when live chunks (for example 31K and 40K) have
-        different C128 extents.
-        """
+    def get_c128_combined(self, padded_width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cache a fixed C128 width so changing chunk lengths reuse the H16 JIT."""
         gather = self.compressed[128]
-        assert gather.combined_indices is not None
-        assert gather.combined_lens is not None
-        if padded_width is None or padded_width == gather.combined_indices.shape[1]:
-            return gather.combined_indices, gather.combined_lens
-        if padded_width < gather.combined_indices.shape[1]:
-            raise ValueError(
-                f"C128 padded width {padded_width} is smaller than live width "
-                f"{gather.combined_indices.shape[1]}"
+        indices, lengths = gather.combined_indices, gather.combined_lens
+        assert indices is not None and lengths is not None
+        padding = padded_width - indices.shape[1]
+        if padding < 0 or padded_width % SPARSE_PREFILL_TOPK_ALIGNMENT:
+            raise ValueError("C128 width must be aligned and at least the live width")
+        if padding == 0:
+            return indices, lengths
+        if padded_width not in self.c128_padded_combined_indices:
+            self.c128_padded_combined_indices[padded_width] = torch.nn.functional.pad(
+                indices, (0, padding), value=-1
             )
-        if padded_width % SPARSE_PREFILL_TOPK_ALIGNMENT != 0:
-            raise ValueError(
-                f"C128 padded width {padded_width} must be aligned to "
-                f"{SPARSE_PREFILL_TOPK_ALIGNMENT}"
-            )
-
-        padded = self.c128_padded_combined_indices.get(padded_width)
-        if padded is None:
-            live_width = gather.combined_indices.shape[1]
-            padded = torch.full(
-                (self.num_qo_tokens, padded_width),
-                -1,
-                dtype=torch.int32,
-                device=gather.combined_indices.device,
-            )
-            padded[:, :live_width].copy_(gather.combined_indices)
-            self.c128_padded_combined_indices[padded_width] = padded
-        return padded, gather.combined_lens
+        return self.c128_padded_combined_indices[padded_width], lengths
 
     def ensure_compressed(
         self,

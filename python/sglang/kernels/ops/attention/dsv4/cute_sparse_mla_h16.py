@@ -37,16 +37,12 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, warpgroup
 from cutlass.cute.nvgpu.warpgroup import MmaF16BF16Op, OperandSource
 from cutlass.cute.runtime import from_dlpack
 
-from sglang.kernels.ops.attention.dsv4.cutedsl_h16_contract import (
-    DSV4_CUTEDSL_H16_MAX_TOPK as MAX_TOPK,
-)
-from sglang.kernels.ops.attention.dsv4.cutedsl_h16_contract import (
-    DSV4_CUTEDSL_H16_TOPK_ALIGNMENT as TOPK_ALIGNMENT,
-)
 from sglang.srt.utils.custom_op import register_custom_op
 
 # SGLang DSV4 TP=8 contract.
 H = 16
+TOPK_ALIGNMENT = 128
+MAX_TOPK = 8192
 DQK = 512
 DV = 512
 BN = 64
@@ -693,14 +689,7 @@ def _validate_inputs(
     topk_length: torch.Tensor,
     attn_sink: torch.Tensor,
     sm_scale: float,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    float,
-]:
+) -> None:
     """Validate the allocation-free DSV4 H16 launch contract."""
 
     if q.ndim != 3 or q.shape[1] not in (H, 64) or q.shape[2] != DQK:
@@ -761,90 +750,14 @@ def _validate_inputs(
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"sm_scale must be finite and positive, got {sm_scale}")
 
-    # The model may carry a sink padded to the query's H64 storage shape.  A
-    # leading contiguous view keeps only the 16 logical heads without a copy.
-    return q, kv, indices, topk_length, attn_sink[:H], scale
+
+def _dynamic_tensor(tensor: torch.Tensor, alignment: int):
+    return from_dlpack(tensor, assumed_align=alignment).mark_compact_shape_dynamic(
+        mode=0, stride_order=tuple(range(tensor.ndim)), divisibility=1
+    )
 
 
-def _run_impl(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    topk_length: torch.Tensor,
-    attn_sink: torch.Tensor,
-    output: torch.Tensor,
-    sm_scale: float,
-) -> None:
-    with torch.cuda.device(q.device):
-        # The leading extents are dynamic.  Inner modes, compact strides,
-        # dtypes, and alignment remain specialized in the cached executor.
-        m_q = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
-        m_kv = from_dlpack(kv, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1), divisibility=1
-        )
-        m_indices = from_dlpack(indices, assumed_align=4).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1), divisibility=1
-        )
-        m_topk_length = from_dlpack(
-            topk_length, assumed_align=4
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
-        m_attn_sink = from_dlpack(attn_sink, assumed_align=4)
-        m_out = from_dlpack(output, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
-        stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        tq = cutlass.Int32(int(q.shape[0]))
-        s_kv = cutlass.Int32(int(kv.shape[0]))
-        scale = cutlass.Float32(sm_scale)
-
-        # TQ, KV mode 0, and s_kv are runtime values, so one executor is
-        # reusable across changing chunk and workspace lengths.
-        capability = torch.cuda.get_device_capability(q.device)
-        key = (
-            q.device.index,
-            capability,
-            int(q.shape[1]),
-            int(indices.shape[1]),
-        )
-        fn = _COMPILE_CACHE.get(key)
-        if fn is None:
-            with _COMPILE_LOCK:
-                fn = _COMPILE_CACHE.get(key)
-                if fn is None:
-                    fn = cute.compile(
-                        _launch,
-                        m_q,
-                        m_kv,
-                        m_indices,
-                        m_topk_length,
-                        m_attn_sink,
-                        m_out,
-                        tq,
-                        s_kv,
-                        scale,
-                        stream,
-                    )
-                    _COMPILE_CACHE[key] = fn
-        fn(
-            m_q,
-            m_kv,
-            m_indices,
-            m_topk_length,
-            m_attn_sink,
-            m_out,
-            tq,
-            s_kv,
-            scale,
-            stream,
-        )
-
-
-@register_custom_op(
-    op_name="cute_sparse_mla_h16",
-    mutates_args=["output"],
-)
+@register_custom_op(op_name="cute_sparse_mla_h16", mutates_args=["output"])
 def _cute_sparse_mla_h16_op(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -854,7 +767,29 @@ def _cute_sparse_mla_h16_op(
     output: torch.Tensor,
     sm_scale: float,
 ) -> None:
-    _run_impl(q, kv, indices, topk_length, attn_sink, output, sm_scale)
+    with torch.cuda.device(q.device):
+        # Only TQ/SKV vary at runtime; heads and TOPK specialize the executor.
+        args = (
+            _dynamic_tensor(q, 16),
+            _dynamic_tensor(kv, 16),
+            _dynamic_tensor(indices, 4),
+            _dynamic_tensor(topk_length, 4),
+            from_dlpack(attn_sink, assumed_align=4),
+            _dynamic_tensor(output, 16),
+            cutlass.Int32(q.shape[0]),
+            cutlass.Int32(kv.shape[0]),
+            cutlass.Float32(sm_scale),
+            cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream),
+        )
+        key = (q.device.index, q.shape[1], indices.shape[1])
+        fn = _COMPILE_CACHE.get(key)
+        if fn is None:
+            with _COMPILE_LOCK:
+                fn = _COMPILE_CACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_launch, *args)
+                    _COMPILE_CACHE[key] = fn
+        fn(*args)
 
 
 def cute_sparse_mla_h16_fwd(
@@ -867,9 +802,7 @@ def cute_sparse_mla_h16_fwd(
 ) -> torch.Tensor:
     """Run native-H16 DSV4 sparse prefill and return ``[TQ, 16, 512]``."""
 
-    q, kv, indices, topk_length, attn_sink, scale = _validate_inputs(
-        q, kv, indices, topk_length, attn_sink, sm_scale
-    )
+    _validate_inputs(q, kv, indices, topk_length, attn_sink, sm_scale)
     output = torch.empty((q.shape[0], H, DV), dtype=torch.bfloat16, device=q.device)
     if q.shape[0] == 0:
         return output
@@ -879,9 +812,9 @@ def cute_sparse_mla_h16_fwd(
         kv,
         indices,
         topk_length,
-        attn_sink,
+        attn_sink[:H],
         output,
-        scale,
+        float(sm_scale),
     )
     return output
 

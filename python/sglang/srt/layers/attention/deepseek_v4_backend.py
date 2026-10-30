@@ -27,9 +27,6 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
     late_layer_tail_lens,
 )
-from sglang.kernels.ops.attention.dsv4.cutedsl_h16_contract import (
-    DSV4_CUTEDSL_H16_MAX_TOPK,
-)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
@@ -196,85 +193,14 @@ def _use_dsv4_cutedsl_h16_forward(
     return True
 
 
-def _validate_dsv4_cutedsl_h16_combined_topk(
-    max_context_len: int,
-    c4_topk: int,
-) -> int:
-    """Validate configured sparse widths and return fixed C128 width."""
-    c128_topk = max(max_context_len // 128, 1)
-    combined_widths = {
-        "c4": combined_topk_width(c4_topk, SWA_WINDOW),
-        "c128": combined_topk_width(c128_topk, SWA_WINDOW),
-    }
-    for ratio, width in combined_widths.items():
-        if width > DSV4_CUTEDSL_H16_MAX_TOPK:
-            raise ValueError(
-                f"DeepSeek-V4 cutedsl_h16 {ratio} combined TOPK width "
-                f"{width} exceeds the kernel limit "
-                f"{DSV4_CUTEDSL_H16_MAX_TOPK}. Reduce the configured "
-                "maximum context length or index_topk."
-            )
-    return combined_widths["c128"]
-
-
-def _use_dsv4_cutedsl_h16_sparse_prefill(
-    dsv4_prefill_backend: str,
-    q: torch.Tensor,
-    forward_batch: ForwardBatch,
-    logical_num_heads: int,
-) -> bool:
-    """Select ordinary eager EXTEND and validate the CuTe DSL contract.
-
-    Prefill CUDA graphs and speculative forwards deliberately retain the
-    existing FlashMLA path: the H16 kernel returns a compact 16-head output and
-    does not currently support SGLang's fixed graph output buffers.
-    """
-    if not _use_dsv4_cutedsl_h16_forward(dsv4_prefill_backend, forward_batch):
-        return False
-    if q.is_cuda and torch.cuda.is_current_stream_capturing():
-        return False
-
-    if logical_num_heads != 16:
+def _validate_dsv4_cutedsl_h16_combined_topk(max_context_len: int, c4_topk: int) -> int:
+    """Validate configured widths and return the fixed C128 JIT bucket."""
+    c128_width = combined_topk_width(max(max_context_len // 128, 1), SWA_WINDOW)
+    if max(c128_width, combined_topk_width(c4_topk, SWA_WINDOW)) > 8192:
         raise ValueError(
-            "DeepSeek-V4 cutedsl_h16 prefill requires exactly 16 TP-local "
-            f"query heads, got {logical_num_heads}."
+            "cutedsl_h16 combined TOPK exceeds 8192; reduce context length or index_topk"
         )
-    if (
-        q.ndim != 4
-        or q.shape[1] != 1
-        or q.shape[-2] not in (16, 64)
-        or q.shape[-1] != 512
-        or q.dtype != torch.bfloat16
-    ):
-        raise ValueError(
-            "DeepSeek-V4 cutedsl_h16 prefill requires BF16 Q shaped "
-            f"[TQ, 1, H, 512] with H in {{16, 64}}, got "
-            f"shape={tuple(q.shape)} dtype={q.dtype}."
-        )
-    return True
-
-
-def _run_dsv4_cutedsl_h16_sparse_prefill(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    topk_length: torch.Tensor,
-    attn_sink: torch.Tensor,
-    sm_scale: float,
-) -> torch.Tensor:
-    """Lazily load the native-H16 kernel and preserve its Tensor-only API."""
-    from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
-        cute_sparse_mla_h16_fwd,
-    )
-
-    return cute_sparse_mla_h16_fwd(
-        q=q,
-        kv=kv,
-        indices=indices,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
-        sm_scale=sm_scale,
-    )
+    return c128_width
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1445,35 +1371,20 @@ class DeepseekV4AttnBackend(
                     self.index_topk,
                 )
             )
-            if self.is_dsv41:
-                raise ValueError(
-                    "DeepSeek-V4 cutedsl_h16 prefill does not support DeepSeek-V4.1."
-                )
-            if kernel.dsv4_attn_backend not in ("auto", "flashmla"):
-                raise ValueError(
-                    "DeepSeek-V4 cutedsl_h16 prefill requires the FlashMLA attention backend."
-                )
-            if not get_platform().is_sm90:
-                raise ValueError(
-                    "DeepSeek-V4 cutedsl_h16 prefill requires SM90 CUDA GPUs."
-                )
-            if model_runner.dtype != torch.bfloat16:
-                raise ValueError(
-                    "DeepSeek-V4 cutedsl_h16 prefill requires a BF16 model, "
-                    f"got {model_runner.dtype}."
-                )
-            local_num_heads = model_runner.model_config.get_num_attention_heads(
+            local_heads = model_runner.model_config.get_num_attention_heads(
                 get_parallel().attn_tp_size
             )
-            if local_num_heads != 16:
+            if (
+                self.is_dsv41
+                or kernel.dsv4_attn_backend not in ("auto", "flashmla")
+                or not get_platform().is_sm90
+                or model_runner.dtype != torch.bfloat16
+                or local_heads != 16
+                or self.head_dim_v != 512
+            ):
                 raise ValueError(
-                    "DeepSeek-V4 cutedsl_h16 prefill requires exactly 16 "
-                    f"TP-local query heads, got {local_num_heads}."
-                )
-            if self.head_dim_v != 512:
-                raise ValueError(
-                    "DeepSeek-V4 cutedsl_h16 prefill requires d_v=512, "
-                    f"got {self.head_dim_v}."
+                    "cutedsl_h16 requires DeepSeek-V4 (not V4.1), SM90, BF16, "
+                    "FlashMLA, and 16 TP-local query heads with width 512."
                 )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:
@@ -4438,8 +4349,8 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                     cos_sin_cache=cos_sin_cache,
-                    use_cutedsl_h16=_use_dsv4_cutedsl_h16_sparse_prefill(
-                        self.dsv4_prefill_backend, q, forward_batch, layer.tp_q_head_num
+                    use_cutedsl_h16=_use_dsv4_cutedsl_h16_forward(
+                        self.dsv4_prefill_backend, forward_batch
                     ),
                 )
 
@@ -4651,6 +4562,10 @@ class DeepseekV4AttnBackend(
             )
 
         if use_cutedsl_h16:
+            from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
+                cute_sparse_mla_h16_fwd,
+            )
+
             if not getattr(self, "_cutedsl_h16_prefill_log_emitted", False):
                 logger.info(
                     "DSV4_CUTEDSL_H16_SPARSE_PREFILL_HIT layer_id=%s "
@@ -4664,7 +4579,7 @@ class DeepseekV4AttnBackend(
             # The model normally supplies an H64 padded Q whose first 16 heads
             # are live. The kernel returns compact H16; the model's subsequent
             # ``o[:, :logical_heads, :]`` slice therefore remains valid.
-            return _run_dsv4_cutedsl_h16_sparse_prefill(
+            return cute_sparse_mla_h16_fwd(
                 q=q_flat,
                 kv=kv.squeeze(1),
                 indices=combined_indices,
