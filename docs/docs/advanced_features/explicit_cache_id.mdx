@@ -1,0 +1,102 @@
+---
+title: "Explicit cache_id and load_cache_id"
+metatags:
+    description: "Reuse a request's KV-cache prefix under a caller-chosen id with the cache_id and load_cache_id request parameters."
+---
+
+The radix cache reuses KV automatically whenever two requests share a token prefix. `cache_id` and `load_cache_id` let a caller name that reuse explicitly: the request whose prefix should become reusable carries `cache_id`, and later requests that should reuse it carry `load_cache_id` with the same value. Requests that set neither parameter never share KV with requests that set one, and two different ids never share KV with each other.
+
+This is useful when:
+
+- A long document or image prompt is sent once and then queried many times, and you want those queries to hit exactly that prefix rather than whatever the shared tree happens to hold.
+- Similar prompts from different callers must not share KV, and you want that isolation expressed per request rather than per server.
+
+## How it works
+
+Both parameters resolve to the request's `cache_salt`, the key that namespaces the radix tree. The `cache_id` request is a normal request: it is prefilled, and its KV is inserted into the tree under that namespace. A `load_cache_id` request looks up its prefix in the same namespace and reuses the cached KV for as many leading tokens as match.
+
+Limitations:
+
+- The two requests must tokenize to the same token sequence. `load_cache_id` cannot load KV for mismatched tokens; it reuses the matching prefix and prefills the rest.
+- The id does not pin anything. Cached KV stays only while it remains in the radix cache and can be evicted under memory pressure, in which case the load request falls back to a normal prefill.
+- `cache_id` and `load_cache_id` may be set together only with the same value.
+- They cannot be combined with `cache_salt` (the id already is the namespace) or with `session_id` / `session_params`. Such requests are rejected with a 400 error.
+
+## Usage
+
+The parameters are top-level fields of the request body on `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and the native `/generate` endpoint. Set `cache_id` on the request that should make its prefix reusable:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "LONG_DOCUMENT_OR_IMAGE_PROMPT"}],
+    "max_tokens": 128,
+    "cache_id": "doc-42"
+  }'
+```
+
+Set `load_cache_id` on later requests that should reuse it:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "LONG_DOCUMENT_OR_IMAGE_PROMPT"}],
+    "max_tokens": 128,
+    "load_cache_id": "doc-42"
+  }'
+```
+
+On `/generate`, a batch request accepts one id per prompt as a list, with `""` meaning "no id" for that prompt.
+
+With the OpenAI Python client, pass the fields through `extra_body`:
+
+```python
+import openai
+
+client = openai.Client(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+prompt = "Describe this document in detail. LONG_DOCUMENT"
+
+# Make the prefix reusable under an explicit id.
+client.chat.completions.create(
+    model="MODEL_PATH",
+    messages=[{"role": "user", "content": prompt}],
+    max_tokens=128,
+    extra_body={"cache_id": "doc-42"},
+)
+
+# Reuse it.
+response = client.chat.completions.create(
+    model="MODEL_PATH",
+    messages=[{"role": "user", "content": prompt}],
+    max_tokens=128,
+    extra_body={"load_cache_id": "doc-42"},
+)
+
+print(response.usage.prompt_tokens_details.cached_tokens)
+```
+
+## Check that the cache was reused
+
+Launch the server with `--enable-cache-report` and read `usage.prompt_tokens_details.cached_tokens` in the response:
+
+```bash Command
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "LONG_DOCUMENT_OR_IMAGE_PROMPT"}],
+    "max_tokens": 128,
+    "load_cache_id": "doc-42"
+  }' | jq '.usage.prompt_tokens_details.cached_tokens'
+```
+
+A `load_cache_id` request whose prompt fully matches the saved prefix reports `prompt_tokens - 1` cached tokens: the last prompt token is always recomputed so that its logits are available.
+
+## Relationship to cache_salt
+
+`cache_id` and `load_cache_id` are a thin layer over the existing `cache_salt` parameter. Internally, SGLang uses the id as the request's `cache_salt`, so the radix tree namespaces the prefix exactly as it does for a salt. If you already use `cache_salt`, nothing changes for you; the two ids exist for callers who want explicit save/load semantics in the request itself.
