@@ -21,6 +21,7 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -475,7 +476,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if self._source_rank_offset:
                 hints = _offset_source_ports(hints, self._source_rank_offset)
             try:
-                self._runtime.client.submit_hint(hints, request_id=scope)
+                self._runtime.client.submit_hint(
+                    decode_kv_hints_envelope(hints), request_id=scope
+                )
             except ValueError as error:
                 # SGLang envelopes may carry actions that KVCR does not consume.
                 logger.warning(

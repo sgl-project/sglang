@@ -133,7 +133,7 @@ class KVCRRuntime:
             if not isinstance(config[name], str) or not config[name]:
                 raise ValueError(f"KVCR {name} must be a nonempty host")
 
-        from kvcr import KVCR, KVCRBindings, KVCRSocketError
+        from kvcr import KVCR, KVCRBindings, KVCRSocketError, ZmqPeerControlChannel
         from kvcr.config import (
             KVCRBackendConfigs,
             KVCRConfig,
@@ -141,7 +141,6 @@ class KVCRRuntime:
             LocalDramOptions,
             RemoteFWDramOptions,
         )
-        from kvcr.control_channels import ZmqPeerControlChannel
         from kvcr.types import CacheTier, KVCRStartupError
 
         self._layout = layout

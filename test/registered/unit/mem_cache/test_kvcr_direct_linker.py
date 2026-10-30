@@ -10,6 +10,7 @@ from copy import copy
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
@@ -23,6 +24,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+def hint_envelope(actions=()):
+    return {"protocol_version": "0.1", "message_id": "test", "actions": list(actions)}
+
+
+def hint_action(payload, action_type="kv.fetch"):
+    return {
+        "action_id": "test",
+        "action_type": action_type,
+        "action_version": "1.0",
+        "payload": payload,
+    }
 
 
 class Event:
@@ -50,7 +64,9 @@ class Client:
         self.fetch_data = {}
 
     def submit_hint(self, hint, request_id=None):
-        self.hints[request_id] = hint
+        if not isinstance(hint, msgspec.Struct):
+            raise ValueError("KVCR requires typed hint envelopes")
+        self.hints[request_id] = msgspec.to_builtins(hint)
 
     def discard_hint(self, request_id):
         self.hints.pop(request_id, None)
@@ -552,22 +568,29 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertTrue(self.linker.pop_completed_offload())
 
     def test_hint_scope_cleanup_waits_for_accepted_load(self):
+        from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
+
         a, b = CacheRequestHandle("a", 1), CacheRequestHandle("b", 2)
-        hints = {"actions": [{"source": ["a"]}]}
+        hints = hint_envelope([hint_action({"source": ["a"]})])
         self.linker.set_request_context(a, hints)
         scope = next(iter(self.client.hints))
-        hints["actions"][0]["source"].append("changed")
-        self.assertEqual(self.client.hints[scope], {"actions": [{"source": ["a"]}]})
-        self.linker.set_request_context(b, {"actions": [{"source": "b"}]})
+        hints["actions"][0]["payload"]["source"].append("changed")
+        expected = hint_envelope([hint_action({"source": ["a"]})])
+        self.assertEqual(self.client.hints[scope], expected)
+        self.linker.set_request_context(
+            b, decode_kv_hints_envelope(hint_envelope([hint_action({"source": "b"})]))
+        )
         self.assertEqual(len(self.client.hints), 2)
         self.linker.load("a", self.transfer(["a"]))
         self.linker.release_request_context(a)
         next_attempt = CacheRequestHandle("a", 2)
-        self.linker.set_request_context(next_attempt, {"actions": [{"source": "new"}]})
+        self.linker.set_request_context(
+            next_attempt, hint_envelope([hint_action({"source": "new"})])
+        )
         self.linker.release_request_context(b)
         self.assertEqual(len(self.client.hints), 2)
         self.linker.release_request_context(next_attempt)
-        self.assertEqual(self.client.hints, {scope: {"actions": [{"source": ["a"]}]}})
+        self.assertEqual(self.client.hints, {scope: expected})
         self.linker.start_layer_wise_loading()
         eventually(lambda: len(self.client.calls) == 3)
         self.assertEqual({call[3] for call in self.client.calls}, {scope})
@@ -701,7 +724,7 @@ class TestKVCRDirectLinker(CustomTestCase):
             {self.linker.layout.encode_key(k, PoolName.KV): labels for k in "abc"}
         )
         self.assertTrue(self.linker.requires_lookup_confirmation)
-        self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
+        self.linker.set_request_context(CacheRequestHandle("a", 0), hint_envelope())
         return [
             PoolTransfer(PoolName.KV, keys=["a", "b", "c"]),
             PoolTransfer(pool, keys=["c"], hit_policy=PoolHitPolicy.TRAILING_PAGES),
@@ -774,7 +797,7 @@ class TestKVCRDirectLinker(CustomTestCase):
         with patch.object(self.linker, "_make_runtime", return_value=Runtime()):
             self.linker.reset()
         self.assertTrue(self.runtime.closed)
-        self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
+        self.linker.set_request_context(CacheRequestHandle("a", 0), hint_envelope())
         self.assertFalse(self.linker.confirm_lookup("a", transfers, 3))
 
     def test_mamba_confirmation_retains_full_prefix_and_remembers_misses(self):
@@ -838,7 +861,7 @@ class TestKVCRDirectLinker(CustomTestCase):
 
     def test_request_cleanup_after_close_and_shutdown_rejects_waiting_commands(self):
         handle = CacheRequestHandle("a", 0)
-        self.linker.set_request_context(handle, {"actions": []})
+        self.linker.set_request_context(handle, hint_envelope())
         entered, release = threading.Event(), threading.Event()
         original_close = self.runtime.close
 
@@ -959,15 +982,10 @@ class TestKVCRDirectLinker(CustomTestCase):
             options = {"replicated_source_rank_routing": True} if enabled else {}
             with self.subTest(options=options, endpoint=endpoint):
                 linker, client = self.ranked_linker(options)
-                hint = {
-                    "actions": [
-                        {
-                            "action_type": action,
-                            "payload": {"source_control_endpoint": endpoint},
-                        }
-                        for action in ("kv.other", "kv.fetch")
-                    ]
-                }
+                hint = hint_envelope(
+                    hint_action({"source_control_endpoint": endpoint}, action)
+                    for action in ("kv.other", "kv.fetch")
+                )
                 linker.set_request_context(CacheRequestHandle("a", 0), hint)
                 sent = next(iter(client.hints.values()))
                 self.assertEqual(
@@ -1113,8 +1131,7 @@ class TestKVCRRuntime(CustomTestCase):
             return instance
 
         modules = {
-            name: ModuleType(name)
-            for name in ("kvcr", "kvcr.config", "kvcr.control_channels", "kvcr.types")
+            name: ModuleType(name) for name in ("kvcr", "kvcr.config", "kvcr.types")
         }
         modules["kvcr"].KVCR = client
         modules["kvcr"].KVCRBindings = SimpleNamespace
@@ -1125,8 +1142,8 @@ class TestKVCRRuntime(CustomTestCase):
         config_module.KVCRGuardConfig = SimpleNamespace
         config_module.LocalDramOptions = lambda pools: SimpleNamespace(pools=pools)
         config_module.RemoteFWDramOptions = SimpleNamespace
-        modules["kvcr.control_channels"].ZmqPeerControlChannel = (
-            lambda host, port, advertise: SimpleNamespace(
+        modules["kvcr"].ZmqPeerControlChannel = lambda host, port, advertise: (
+            SimpleNamespace(
                 host=host,
                 port=port,
                 advertise=advertise,
