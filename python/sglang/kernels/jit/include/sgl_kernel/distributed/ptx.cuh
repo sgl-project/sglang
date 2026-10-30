@@ -14,7 +14,7 @@
 // `red_add_relaxed_sys`) so a call site can be checked against the ISA docs
 // without indirection.
 //
-// These join `sglang::ptx`, the namespace sgl_kernel/mbarrier.cuh opens for
+// These join `sglang::ptx`, the namespace sgl_kernel/ptx/*.cuh open for
 // inline PTX: one vocabulary for every family, split across headers by what
 // the instructions are for.
 
