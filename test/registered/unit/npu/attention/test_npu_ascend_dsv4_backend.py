@@ -785,9 +785,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     bs=2,
                     actual_seq_lengths_q_pa=cu_seqlens_q,
                     actual_seq_lengths_kv=seqused_kv,
-                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                    max_seqlen_q=2,
-                    is_nextn=False,
                 )
 
                 metadata_op = getattr(custom_ops, metadata_op_name)
@@ -827,9 +824,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 bs=2,
                 actual_seq_lengths_q_pa=cu_seqlens_q,
                 actual_seq_lengths_kv=seqused_kv,
-                block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                max_seqlen_q=2,
-                is_nextn=False,
             )
 
         metadata_op.assert_called_once()
