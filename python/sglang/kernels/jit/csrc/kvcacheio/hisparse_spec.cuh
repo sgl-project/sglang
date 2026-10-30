@@ -1044,7 +1044,7 @@ void load_cache_to_device_buffer_spec(
       scratch_state_stride_0,
       num_request_slots};
   auto cuda_device = SymbolicDevice{};
-  cuda_device.set_options<kDLCUDA>();
+  cuda_device.set_options<kDLGPU>();
   TensorMatcher({bs}).with_dtype<int64_t>().with_device(cuda_device).verify(req_pool_indices);
   TensorMatcher({bs * NUM_STEPS}).with_dtype<int32_t>().with_device(cuda_device).verify(seq_lens);
   const auto device = cuda_device.unwrap();

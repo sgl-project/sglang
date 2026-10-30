@@ -80,6 +80,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_offload_compatibility, server_args)
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
+        handle_aux_hidden_state_capture,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
         validate_response_store,
@@ -89,6 +90,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
+    # Before any reader of speculative_algorithm: the flag may reset it.
+    run_hook(handle_aux_hidden_state_capture, server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
@@ -195,6 +198,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_nccl_pre_warm,
         handle_npu_backends,
         handle_platform_defaults,
+        handle_sail_backends,
         handle_symm_mem_device_support,
         handle_xpu_backends,
     )
@@ -204,6 +208,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_npu_backends, server_args)
     run_hook(handle_mps_backends, server_args)
     run_hook(handle_xpu_backends, server_args)
+    run_hook(handle_sail_backends, server_args)
     # Must precede handle_gpu_memory_settings: its symm-mem prealloc default
     # keys off enable_symm_mem.
     run_hook(handle_symm_mem_device_support, server_args)
@@ -283,6 +288,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
+        resolve_ascend_ops_speculative_draft,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
         validate_flashinfer_a2a_token_budget,
@@ -301,6 +307,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+    run_post_process_pass(server_args, resolve_ascend_ops_speculative_draft)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
@@ -349,8 +356,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     # needs the resolved CUDA-graph, attention-backend and speculative settings
-    from sglang.srt.megakernels.guards import handle_nvidia_megakernel
-    from sglang.srt.monokernels.guards import handle_monokernel
+    from sglang.srt.kernel_plugins.amd.binding import handle_monokernel
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        handle_nvidia_megakernel,
+    )
 
     # first, so a server with both kernel flags gets every reason in one error
     run_hook(handle_nvidia_megakernel, server_args)

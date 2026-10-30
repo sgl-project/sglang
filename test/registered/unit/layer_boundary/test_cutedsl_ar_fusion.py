@@ -30,10 +30,10 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
@@ -45,7 +45,7 @@ from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _MODULE = "sglang.srt.layers.layer_boundary.fusions.cutedsl"
 _DECODE = SimpleNamespace(forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8))
@@ -415,7 +415,7 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
     finish = MagicMock(return_value=torch.ones(2, 8))
     with (
         # A norm the kernel could fold in, on a batch it does not take.
-        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch(f"{_MODULE}.fused_norm_gamma", return_value=torch.ones(8)),
         patch.object(CuteDSLFusion, "_finalize_eligible", return_value=False),
         patch.object(CuteDSLFusion, "_eligible", return_value=False),
     ):

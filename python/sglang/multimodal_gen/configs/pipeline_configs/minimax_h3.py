@@ -229,6 +229,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        if server_args.performance_mode == "memory":
+            # Batched decoder tiles add activations on top of the resident
+            # decoder; memory mode keeps the one-tile recipe at every tier.
+            self.vae_config.decoder_tile_batch = 1
+            self.vae_config.window_batch = 1
         if current_platform.is_mps():
             required_components = (
                 "transformer",
@@ -346,7 +351,8 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
-        self.vae_config.stack_tiling = True
+        # FastVideo's recipe decodes each rank's tiles in one call.
+        self.vae_config.decoder_tile_batch = 0
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
@@ -411,9 +417,9 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
-        # Stack tiling batches every VAE tile in one forward; FastH3 only
-        # decodes, but Omni also encodes reference videos, which runs out of
-        # memory stacked.
+        # Omni also encodes reference videos. The encoder runs one tile per
+        # forward regardless, and the decoder keeps the base
+        # ``decoder_tile_batch`` cap instead of FastH3's all-tiles recipe.
 
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:

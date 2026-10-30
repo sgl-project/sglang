@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -161,15 +162,15 @@ class UnifiedTreeNode:
 
     @property
     def backuped(self) -> bool:
-        """Tree-level: Full KV present on host."""
-        return self.component_data[ComponentType.FULL].host_value is not None
+        """Tree-level: the token slot's KV present on host."""
+        return self.component_data[BASE_COMPONENT_TYPE].host_value is not None
 
     @property
     def evicted(self) -> bool:
         """Tree-level: Full KV not on device (non-root with value=None)."""
         return (
             self.parent is not None
-            and self.component_data[ComponentType.FULL].value is None
+            and self.component_data[BASE_COMPONENT_TYPE].value is None
         )
 
     def __lt__(self, other: UnifiedTreeNode):
@@ -429,7 +430,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         components: dict[ComponentType, TreeComponent],
     ):
         self.page_size = params.page_size
-        self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
+        # Each family's slot id: the tree names a slot by its family, never by
+        # a kind (one slot per family; several windows would list more).
+        self._family_slot_ids: dict[str, ComponentType] = {}
+        for slot in params.tree_slots:
+            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
+        self.is_eagle = params.is_eagle and TREE_STATE not in self._family_slot_ids
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
@@ -475,7 +481,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     # ==== Tree API ====
 
     def _session_lru_predicate(self, ct: ComponentType):
-        if not self.enable_session_radix_cache or ct is ComponentType.FULL:
+        if not self.enable_session_radix_cache or ct is BASE_COMPONENT_TYPE:
             return None
         return lambda node: node.component_data[ct].session_ref > 0
 
@@ -580,6 +586,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Logical-page KV sharding: the node's chain rotation base, or None
         when sharding is off (and on the root, which starts no chain)."""
         return self.node_by_id(node_id).rotation_base
+
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: rotation_base plus the node's first
+        position-page (host backups draw slots of the same owners)."""
+        node = self.node_by_id(node_id)
+        if node.rotation_base is None:
+            return None
+        prefix_len = 0
+        parent = node.parent
+        while parent is not None:
+            prefix_len += len(parent.key)
+            parent = parent.parent
+        return node.rotation_base + prefix_len // self.page_size
 
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -751,7 +770,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         nodes they unlock, so the order is not load-bearing for the sets."""
         swa_priority = None
         if skip_swa_and_below:
-            swa_component = self.components_by_type.get(ComponentType.SWA)
+            swa_component = self.component_of(TREE_WINDOW)
             if swa_component is not None:
                 swa_priority = swa_component.eviction_priority(is_leaf=False)
         for component in reversed(self.components):
@@ -759,7 +778,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if ct in params.skipped_lock_components:
                 continue
             if swa_priority is not None and (
-                ct == ComponentType.SWA
+                ct == self.slot_id(TREE_WINDOW)
                 or component.eviction_priority(is_leaf=False) < swa_priority
             ):
                 continue
@@ -830,12 +849,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._assert_receipt_anchor(node, params)
         if node is self.root_node:
             return result
-        swa_component = self.components_by_type.get(ComponentType.SWA)
+        swa_component = self.component_of(TREE_WINDOW)
         if swa_component is None:
             return result
         swa_component.release_window_lock(
             node,
-            params.get_lock_uuid(ComponentType.SWA),
+            params.get_lock_uuid(swa_component.component_type),
             result.device_frees,
             result.host_frees,
             cache_actions=result.cache_actions,
@@ -1341,7 +1360,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             dup = value_slice[dup_start:consumed_from]
             abs_start = state.total_prefix_length + dup_start
             swa_already_freed = min(
-                max(state.params.get_evicted_seqlen(ComponentType.SWA) - abs_start, 0),
+                max(
+                    state.params.get_evicted_seqlen(self.slot_id(TREE_WINDOW))
+                    - abs_start,
+                    0,
+                ),
                 dup.numel(),
             )
             if swa_already_freed > 0:
@@ -1674,9 +1697,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if delta:
                 result.tracker[ct] = delta
         if isinstance(step, InternalStateBackup):
-            assert component_type in (ComponentType.MAMBA, ComponentType.SWA)
+            assert component_type in (
+                self.slot_id(TREE_STATE),
+                self.slot_id(TREE_WINDOW),
+            )
             self._pending_internal_evictions[component_type] = step.node_id
-            if component_type == ComponentType.MAMBA:
+            if component_type == self.slot_id(TREE_STATE):
                 result.mamba_backup_node_id = step.node_id
             else:
                 result.swa_backup_node_id = step.node_id
@@ -1695,10 +1721,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
-        return self._finish_internal_component_eviction(ComponentType.MAMBA, node_id)
+        return self._finish_internal_component_eviction(
+            self.slot_id(TREE_STATE), node_id
+        )
 
     def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
-        return self._finish_internal_component_eviction(ComponentType.SWA, node_id)
+        return self._finish_internal_component_eviction(
+            self.slot_id(TREE_WINDOW), node_id
+        )
 
     def _finish_internal_component_eviction(
         self, component_type: ComponentType, node_id: NodeId
@@ -1723,7 +1753,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             or node.component_data[component_type].value is None
             or node.component_data[component_type].lock_ref > 0
             or (
-                component_type == ComponentType.MAMBA
+                component_type == self.slot_id(TREE_STATE)
                 and node.load_back_pending_id is not None
             )
             or not lru.in_list(node)
@@ -1735,7 +1765,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node in self.evictable_device_leaves
             and (not enabled or component._can_evict_leaf_atomically(node))
         ) or (
-            component_type == ComponentType.MAMBA
+            component_type == self.slot_id(TREE_STATE)
             and node.component_data[BASE_COMPONENT_TYPE].value is None
         ):
             # Re-select changed leaves through the normal walk; internal
@@ -1952,7 +1982,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
+        self.component_of(TREE_STATE)._evict_excess_path_states(
             self.node_by_id(tail_node_id),
             device_frees,
             host_frees,
@@ -2859,7 +2889,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
         """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
         ranges: list[tuple[int, int]] = []
@@ -2884,7 +2914,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA slice to an existing tombstoned tree span."""
         assert len(swa_values) == window_end - window_start, (
@@ -3340,17 +3370,26 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def full_protected_size(self) -> int:
         return self.protected_size()
 
+    def slot_id(self, family: str) -> Optional[ComponentType]:
+        """The id of the tree's slot of ``family``; None when it has none."""
+        return self._family_slot_ids.get(family)
+
+    def component_of(self, family: str) -> Optional[TreeComponent]:
+        """The component keeping the tree's slot of ``family``, if any."""
+        slot_id = self._family_slot_ids.get(family)
+        return None if slot_id is None else self.components_by_type[slot_id]
+
     def swa_evictable_size(self) -> int:
-        return self.component_evictable_size_.get(ComponentType.SWA, 0)
+        return self.component_evictable_size_.get(self.slot_id(TREE_WINDOW), 0)
 
     def mamba_evictable_size(self) -> int:
-        return self.component_evictable_size_.get(ComponentType.MAMBA, 0)
+        return self.component_evictable_size_.get(self.slot_id(TREE_STATE), 0)
 
     def swa_protected_size(self) -> int:
-        return self.component_protected_size_.get(ComponentType.SWA, 0)
+        return self.component_protected_size_.get(self.slot_id(TREE_WINDOW), 0)
 
     def mamba_protected_size(self) -> int:
-        return self.component_protected_size_.get(ComponentType.MAMBA, 0)
+        return self.component_protected_size_.get(self.slot_id(TREE_STATE), 0)
 
     def total_size(self) -> tuple[int, int]:
         total_size = 0
@@ -3378,7 +3417,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         slots: list[int] = []
         positions: list[int] = []
         prev_slots: list[int] = []
-        swa_filter = swa_resident_only and ComponentType.SWA in self.components_by_type
+        window_slot = self.slot_id(TREE_WINDOW)
+        swa_filter = swa_resident_only and window_slot is not None
 
         def _dfs(node: UnifiedTreeNode, depth: int, parent_last_slot: int) -> None:
             value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -3388,10 +3428,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if unlocked_only:
                 # Unified SWA owns an independent component lock. A node can still
                 # hold Full KV for a running request while its SWA slots are unused.
-                lock_ct = ComponentType.SWA if swa_filter else BASE_COMPONENT_TYPE
+                lock_ct = window_slot if swa_filter else BASE_COMPONENT_TYPE
                 emit = emit and node.component_data[lock_ct].lock_ref == 0
             if swa_filter:
-                emit = emit and node.component_data[ComponentType.SWA].value is not None
+                emit = emit and node.component_data[window_slot].value is not None
 
             # Skipped nodes still advance the chain/depth so descendants stay consistent.
             chain_last_slot = parent_last_slot
@@ -3453,4 +3493,4 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return torch.tensor([], dtype=torch.int64, device=self.device)
 
     def all_mamba_values_flatten(self) -> torch.Tensor:
-        return self._all_component_values_flatten(ComponentType.MAMBA)
+        return self._all_component_values_flatten(self.slot_id(TREE_STATE))
