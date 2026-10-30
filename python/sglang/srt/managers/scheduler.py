@@ -3698,6 +3698,10 @@ class Scheduler(
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                # Finished in place, so a later abort in the same intake skips it.
+                candidate_req.finish_outside_step(
+                    FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE)
+                )
 
         self.send_abort_output(
             _make_abort_req(
@@ -5861,6 +5865,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # Finished in place, so a later abort in the same intake skips it.
+            if req.finished_reason is None:
+                req.finish_outside_step(FINISH_ABORT())
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5874,8 +5881,6 @@ class Scheduler(
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                if req.finished_reason is None:
-                    req.finish_outside_step(FINISH_ABORT())
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5892,6 +5897,9 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                # Finished in place, so a later abort in the same intake skips it.
+                if req.finished_reason is None:
+                    req.finish_outside_step(FINISH_ABORT())
                 self._release_aborted_request(req)
                 self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
