@@ -1395,7 +1395,7 @@ class KimiK3MoE(nn.Module):
             and cfg.correction_bias is not None
             and (cfg.num_expert_group or 1) == 1
             and (cfg.topk_group or 1) == 1
-            and cfg.num_fused_shared_experts == 0
+            and cfg.num_shared_topk_slots == 0
             and cfg.custom_routing_function is None
             and cfg.routed_scaling_factor in (None, 1.0)
         ):
