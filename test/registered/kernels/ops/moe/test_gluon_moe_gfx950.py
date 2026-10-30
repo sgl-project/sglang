@@ -5,7 +5,6 @@ import unittest
 from functools import lru_cache
 
 import torch
-from parameterized import parameterized
 
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -74,22 +73,14 @@ class TestGluonMoeGfx950(CustomTestCase):
         empty_gpu_cache()
         super().tearDownClass()
 
-    @parameterized.expand(
-        [
-            (
-                f"{family}_tp{tp}_ep{ep}_rank{rank}_nextn{nextn}_m{m}",
-                family,
-                tp,
-                ep,
-                rank,
-                nextn,
-                m,
-            )
-            for family, tp, ep, rank, nextn, sizes in FAMILY_CASES
-            for m in sizes
-        ]
-    )
-    def test_family_matches_reference(self, name, family, tp, ep, rank, nextn, m):
+    def test_family_matches_reference(self):
+        for family, tp, ep, rank, nextn, sizes in FAMILY_CASES:
+            for m in sizes:
+                name = f"{family}_tp{tp}_ep{ep}_rank{rank}_nextn{nextn}_m{m}"
+                with self.subTest(name=name):
+                    self._check_family(name, family, tp, ep, rank, nextn, m)
+
+    def _check_family(self, name, family, tp, ep, rank, nextn, m):
         from sglang.srt.layers.moe.glm_mxfp4_gluon import _KERNEL_PACKAGE, _kernel_name
 
         module_name = f"fused_moe_{family}"
@@ -122,16 +113,18 @@ class TestGluonMoeGfx950(CustomTestCase):
         self.assertLess(relative_rmse, 0.005, name)
         print(f"NUMERICS {name}: relative_rmse={relative_rmse:.6g}")
 
-    @parameterized.expand(
-        [
+    def test_ep_nonlocal_routes_produce_zero(self):
+        """A rank with no selected local experts must not read unwritten partials."""
+        for family, m in (
             ("tp4_m1_16", 4),
             ("tp4_m32_64", 33),
             ("tp4_m128_4192", 65),
             ("tp4_m4193_16768_shared", 4193),
-        ]
-    )
-    def test_ep_nonlocal_routes_produce_zero(self, family, m):
-        """A rank with no selected local experts must not read unwritten partials."""
+        ):
+            with self.subTest(family=family, m=m):
+                self._check_ep_nonlocal_zero(family, m)
+
+    def _check_ep_nonlocal_zero(self, family, m):
         fixture, _ = _fixture(8, 4, 2, False)
         router = torch.zeros_like(fixture.router)
         bias = torch.zeros_like(fixture.bias)
