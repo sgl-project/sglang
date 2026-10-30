@@ -1,6 +1,7 @@
 """CPU regression tests for the Ascend MXFP4 W4A4 online config (Linear gate)."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -9,13 +10,18 @@ import torch
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUDualLevelMXFP4LinearMethod,
+    NPUMXFP4W4A8LinearMethod,
     _prepare_dual_level_weight_l0_scale,
 )
-from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import (
-    MXFP4_W4A4_GROUP_SIZE,
-    Mxfp4W4A4Config,
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    ReplicatedLinear,
+    RowParallelLinear,
 )
+from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
+from sglang.srt.layers.quantization.npu_mxfp4_utils import MXFP4_BLOCK_SIZE
+from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -61,7 +67,7 @@ class TestMxfp4W4A4ConfigGroupAlignment(CustomTestCase):
     def test_skips_group_unaligned_linear(self):
         # K=4304 is not a multiple of 32 -> must fall back to BF16, not the
         # dual-level FP4 method (whose block scales cannot tile K=4304).
-        self.assertNotEqual(4304 % MXFP4_W4A4_GROUP_SIZE, 0)
+        self.assertNotEqual(4304 % MXFP4_BLOCK_SIZE, 0)
         layer = self._make_linear_layer(4304)
 
         method = Mxfp4W4A4Config().get_quant_method(
@@ -87,11 +93,51 @@ class TestMxfp4W4A4ConfigGroupAlignment(CustomTestCase):
                 UnquantizedLinearMethod,
             )
 
+    def test_both_configs_use_the_bound_group_local_k(self):
+        prefix = "model.layers.0.self_attn.o_proj"
+        for config_cls, method_cls in (
+            (Mxfp4W4A4Config, NPUDualLevelMXFP4LinearMethod),
+            (Mxfp4W4A8Config, NPUMXFP4W4A8LinearMethod),
+        ):
+            for linear_cls, size, tp, aligned in (
+                (RowParallelLinear, 4352, 16, False),
+                (RowParallelLinear, 4096, 16, True),
+                (RowParallelLinear, 4352, 1, True),
+                (RowParallelLinear, 4304, 1, False),
+                (ColumnParallelLinear, 4352, 16, True),
+                (ReplicatedLinear, 4352, 16, True),
+            ):
+                layer = linear_cls.__new__(linear_cls)
+                torch.nn.Module.__init__(layer)
+                layer.input_size = size
+                layer.tp_group = SimpleNamespace(rank=0, size=tp)
+                self.assertFalse(hasattr(layer, "input_size_per_partition"))
+                with (
+                    self.subTest(config=config_cls, layer=linear_cls, size=size, tp=tp),
+                    patch(f"{config_cls.__module__}.is_npu", return_value=True),
+                    patch(
+                        "sglang.srt.distributed.utils.get_group_rank_size",
+                        return_value=(0, tp),
+                    ) as group,
+                ):
+                    method = config_cls().get_quant_method(layer, prefix)
+                    self.assertIsInstance(
+                        method, method_cls if aligned else UnquantizedLinearMethod
+                    )
+                    if linear_cls is RowParallelLinear:
+                        group.assert_called_once_with(layer.tp_group)
+                    else:
+                        group.assert_not_called()
+                    ignored = config_cls(ignored_layers=[prefix]).get_quant_method(
+                        layer, prefix
+                    )
+                    self.assertIsInstance(ignored, UnquantizedLinearMethod)
+
     def test_aligned_linear_not_skipped(self):
         # A 32-aligned K must NOT hit the fallback: on CPU (is_npu() False) the
         # method resolution reaches the NPU-only branch and raises, proving the
         # alignment gate did not short-circuit it.
-        self.assertEqual(4096 % MXFP4_W4A4_GROUP_SIZE, 0)
+        self.assertEqual(4096 % MXFP4_BLOCK_SIZE, 0)
         layer = self._make_linear_layer(4096)
         config = Mxfp4W4A4Config()
 

@@ -11,13 +11,18 @@ import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUMXFP4W4A8LinearMethod,
 )
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW4A4MXFP4MoEMethod,
+)
 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+    NPUW4A4MXFP4OnlineMoEMethod,
     NPUW4A8MXFP4OnlineMoEMethod,
 )
 from sglang.srt.layers import linear
 from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
+from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -79,10 +84,10 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
         )
         return layer, method
 
-    def moe(self, fused=False, with_bias=False):
+    def moe(self, fused=False, with_bias=False, w4a4=False, dtype=torch.bfloat16):
         layer = moe_layer.FusedMoE.__new__(moe_layer.FusedMoE)
         torch.nn.Module.__init__(layer)
-        layer.quant_config = Mxfp4W4A8Config()
+        layer.quant_config = Mxfp4W4A4Config() if w4a4 else Mxfp4W4A8Config()
         layer.scheme = None
         layer.uses_expert_location = False
         layer.layer_id = 0
@@ -96,14 +101,17 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
         layer.use_triton_kernels = layer.use_flashinfer_trtllm_moe = False
         layer.use_padded_loading = layer.use_presharded_weights = False
         layer.moe_runner_config = SimpleNamespace(is_gated=True)
-        method = NPUW4A8MXFP4OnlineMoEMethod(layer.quant_config)
+        method_cls = (
+            NPUW4A4MXFP4OnlineMoEMethod if w4a4 else NPUW4A8MXFP4OnlineMoEMethod
+        )
+        method = method_cls(layer.quant_config)
         layer.quant_method = method
         method.create_weights(
             layer,
             2,
             64,
             64,
-            torch.bfloat16,
+            dtype,
             with_bias=with_bias,
             weight_loader=layer.weight_loader_fused if fused else layer.weight_loader,
         )
@@ -369,6 +377,127 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
             param = getattr(layer, f"{prefix}_weight")
             param.weight_loader(param, source, f"{prefix}_weight", prefix)
         method.process_weights_after_loading(layer)
+
+    def test_w4a4_real_preparation_releases_sources_and_preserves_reload(self):
+        """Use the W4A4 method and kernel; mock only quantization/format ops."""
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                layer, method = self.moe(
+                    fused=True, with_bias=True, w4a4=True, dtype=dtype
+                )
+                stale = {p: getattr(layer, f"{p}_weight") for p in ("w13", "w2")}
+                source_handles = []
+
+                def quantize(weight, fp4_dtype):
+                    self.assertEqual(weight.dtype, dtype)
+                    source_handles.append(getattr(layer, f"{prefix}_weight"))
+                    return (
+                        torch.zeros(
+                            *weight.shape[:-1], weight.shape[-1] // 2, dtype=torch.uint8
+                        ),
+                        torch.zeros(
+                            *weight.shape[:-1],
+                            weight.shape[-1] // 64,
+                            2,
+                            dtype=torch.uint8,
+                        ),
+                    )
+
+                for prefix in stale:
+                    stale[prefix].checkpoint_marker = prefix
+                    setattr(layer, f"{prefix}_kernel", NPUW4A4MXFP4MoEMethod(prefix))
+                with (
+                    patch.object(
+                        NPUW4A4MXFP4MoEMethod,
+                        "_quantize_weight_online",
+                        side_effect=quantize,
+                    ) as convert,
+                    patch(
+                        "sglang.srt.hardware_backend.npu.quantization.moe_methods.npu_format_cast",
+                        side_effect=lambda x: x,
+                    ),
+                ):
+                    for cycle in range(2):
+                        source_handles.clear()
+                        for prefix, shape in (
+                            ("w13", (2, 256, 64)),
+                            ("w2", (2, 64, 128)),
+                        ):
+                            old = stale[prefix]
+                            old.weight_loader(
+                                old,
+                                torch.ones(shape, dtype=dtype) * (cycle + 1),
+                                f"{prefix}_weight",
+                                prefix,
+                            )
+                            current = getattr(layer, f"{prefix}_weight")
+                            self.assertEqual(current.dtype, torch.uint8)
+                            self.assertTrue(callable(current.weight_loader))
+                            self.assertEqual(current.checkpoint_marker, prefix)
+                            self.assertEqual(
+                                getattr(layer, f"{prefix}_weight_scale").ndim, 4
+                            )
+                            self.assertFalse(current.is_contiguous())
+                            # The original meta handles remain usable for a later reload.
+                            self.assertTrue(old.is_meta)
+                        method.process_weights_after_loading(layer)
+                        method.process_weights_after_loading(layer)
+                        self.assertEqual(convert.call_count, 2 * (cycle + 1))
+                        self.assertTrue(
+                            all(source.numel() == 0 for source in source_handles)
+                        )
+                    self.assertEqual(layer.moe_dispatch_dtype, "bf16")
+                    self.assertFalse(layer.w13_weight_bias.is_meta)
+                    layer.w13_weight = torch.nn.Parameter(
+                        torch.ones(2, 128, 64, dtype=dtype), requires_grad=False
+                    )
+                    with self.assertRaisesRegex(
+                        RuntimeError, "registered weight loader"
+                    ):
+                        method.process_weights_after_loading(layer)
+
+    def test_w4a4_partial_nonlocal_duplicate_and_source_release(self):
+        layer, method = self.moe(w4a4=True)
+        w13, w2 = layer.w13_weight, layer.w2_weight
+        load = w13.weight_loader
+        source = torch.ones(128, 64, dtype=torch.bfloat16)
+        load(w13, source, "w13_weight", "w1", 0)
+        self.assertTrue(layer.w13_weight.is_meta)
+        load(w13, source, "w13_weight", "w1", 2)
+        with self.assertRaisesRegex(RuntimeError, "Duplicate shard"):
+            load(w13, source, "w13_weight", "w1", 2)
+        self.assertNotIn("w13_weight", self.snapshots)
+        for expert, shard in ((3, "w1"), (2, "w3"), (3, "w3")):
+            load(w13, source, "w13_weight", shard, expert)
+        self.assertEqual(len(self.snapshots["w13_weight"]), 1)
+        self.assertEqual(self.source_handles[-1].numel(), 0)
+        self.assertIs(layer.w2_weight, w2)
+        with self.assertRaisesRegex(RuntimeError, "not completely loaded"):
+            method.process_weights_after_loading(layer)
+        for expert in (2, 3):
+            load(w2, source.T, "w2_weight", "w2", expert)
+        method.process_weights_after_loading(layer)
+        for prefix in ("w13", "w2"):
+            self.assertTrue(callable(getattr(layer, f"{prefix}_weight").weight_loader))
+        self.assertTrue(all(source.numel() == 0 for source in self.source_handles))
+
+    def test_online_moe_rejects_invalid_dtype_and_failed_conversion(self):
+        for w4a4 in (False, True):
+            with self.subTest(w4a4=w4a4):
+                with self.assertRaisesRegex(ValueError, "FP16/BF16"):
+                    self.moe(w4a4=w4a4, dtype=torch.float32)
+                layer, method = self.moe(fused=True, w4a4=w4a4)
+                layer.w13_kernel.process_weights_after_loading = Mock(
+                    side_effect=RuntimeError("conversion failed")
+                )
+                weight = layer.w13_weight
+                source = torch.ones(2, 256, 64, dtype=torch.bfloat16)
+                with self.assertRaisesRegex(RuntimeError, "conversion failed"):
+                    weight.weight_loader(weight, source, "w13_weight", "w13")
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    weight.weight_loader(weight, source, "w13_weight", "w13")
+                with self.assertRaisesRegex(RuntimeError, "not completely loaded"):
+                    method.process_weights_after_loading(layer)
 
     def test_expert_destinations_preserve_eplb_replication_shared_and_global_slots(
         self,
