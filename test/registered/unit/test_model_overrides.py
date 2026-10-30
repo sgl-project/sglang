@@ -1915,10 +1915,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "LlamaForCausalLM", "llama", enable_deterministic_inference=True
             )
             self.assertEqual(resolution_result(sa, "fp8_gemm_runner_backend"), "triton")
-        sa = self._construct(
-            "LlamaForCausalLM", "llama", enable_deterministic_inference=True
-        )
-        self.assertEqual(resolution_result(sa, "fp8_gemm_runner_backend"), "auto")
+        with override_platform(is_cuda=True, is_hip=False):
+            sa = self._construct(
+                "LlamaForCausalLM", "llama", enable_deterministic_inference=True
+            )
+            self.assertEqual(resolution_result(sa, "fp8_gemm_runner_backend"), "auto")
 
     def test_deterministic_incompatible_backend_raises(self):
         from sglang.srt.arg_groups.overrides import (
