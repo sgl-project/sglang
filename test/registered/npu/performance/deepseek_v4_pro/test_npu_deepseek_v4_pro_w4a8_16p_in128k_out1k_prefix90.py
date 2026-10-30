@@ -17,20 +17,21 @@ register_npu_ci(
 
 # Environment variables for DSV4-Pro-0813 two-node mix deployment,
 DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
-    "DEEPEP_HCCL_BUFFSIZE": "1536",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
     "HCCL_CONNECT_TIMEOUT": "300",
-    "HCCL_EXEC_TIMEOUT": "68",
+    "HCCL_EXEC_TIMEOUT": "300",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "ACL_DEVICE_SYNC_TIMEOUT": "60",
+    "DEEPEP_HCCL_BUFFSIZE": "2000",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_SET_CPU_AFFINITY": "1",
+    "SGLANG_NPU_USE_MULTI_STREAM": "1",
+    "SGLANG_DSV4_FP4_EXPERTS": "False",
     # skip gpu branch
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "FORCE_DRAFT_MODEL_NON_QUANT": "1",
-    "SGLANG_DSV4_FP4_EXPERTS": "True",
     "SGLANG_OPT_FUSE_WQA_WKV": "0",
     "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
     "SGLANG_OPT_USE_FUSED_HASH_TOPK": "False",
@@ -39,16 +40,34 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     "SGLANG_OPT_FP8_WO_A_GEMM": "False",
     # [DEEPEP]
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "30",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    # [DSPARK]
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "SGLANG_DSPARK_FAST_SAMPLING": "0",
+    "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
+    "SGLANG_DSPARK_QUANT_AUDIT": "1",
+    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
+    "TRANSFORMERS_VERBOSITY": "error",
 }
 
 
 # Server launch arguments for DSV4-Pro W4A8 two-node 16p PD-mix.
 DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
-    "--tp-size",
-    32,
+    "--served-model-name",
+    "dsv4",
     "--nnodes",
     2,
+    "--tp-size",
+    32,
+    "--dp-size",
+    8,
+    "--enable-dp-attention",
+    "--enable-dp-lm-head",
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
@@ -57,20 +76,30 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--max-running-requests",
-    64,
+    32,
     "--mem-fraction-static",
     0.8,
     "--quantization",
     "modelslim",
     "--chunked-prefill-size",
-    65536,
+    16384,
+    "--prefill-decode-interval",
+    2,
+    "--enable-prefill-delayer",
     "--kv-cache-dtype",
     "auto",
     "--moe-dense-tp-size",
     1,
     "--cuda-graph-bs-decode",
     1,
+    2,
     4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
     "--load-balance-method",
     "round_robin",
     "--moe-a2a-backend",
@@ -78,11 +107,19 @@ DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS = [
     "--deepep-mode",
     "auto",
     "--enable-metrics",
-    "--dp-size",
-    16,
-    "--enable-dp-attention",
-    "--enable-dp-lm-head",
-    "--disable-radix-cache",
+    "--enable-cache-report",
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
 ]
 
 
@@ -100,7 +137,7 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
-    warmup_requests = 8
+    warmup_requests = 16
     max_concurrency = 8
     num_prompts = 32
     repeat_rate = 0.9
