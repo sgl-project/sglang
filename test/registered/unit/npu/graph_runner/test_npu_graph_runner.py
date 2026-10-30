@@ -51,7 +51,9 @@ def test_cpu_lengths_are_padded_without_reading_device_lengths():
     assert backend.cache_loc_dtype == torch.int32
 
 
-@pytest.mark.parametrize("dflash,dspark", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "dflash,dspark", [(False, False), (True, False), (False, True)]
+)
 def test_verify_cpu_lengths_include_block_only_once(dflash, dspark):
     backend, _, _ = make_backend(dflash=dflash, dspark=dspark, width=3)
     batch = SimpleNamespace(
