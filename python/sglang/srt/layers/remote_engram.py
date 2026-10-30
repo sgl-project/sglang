@@ -1,8 +1,8 @@
 """Experimental adapter for the external shared-Engram research runtime.
 
 This adapter is opt-in and is not a supported NIXL integration. It expects the
-legacy research runtime on PYTHONPATH and deliberately does not use its old
-prefetch hooks. The reader owns the registered scratch until GPU work retires.
+legacy research runtime on PYTHONPATH. The reader owns registered scratch
+until GPU work retires.
 """
 
 import os
@@ -12,12 +12,22 @@ import torch
 _runtime = None
 
 
+def prepare_forward(cp_extend: bool):
+    if _runtime is None or not _runtime.prefetch_enabled:
+        raise RuntimeError("remote Engram prefetch runtime is not initialized")
+    _runtime.start_forward(cp_extend)
+
+
+def prefetch_full_hash(hash_ids, local_rows: int, cp_size: int):
+    if _runtime is None:
+        raise RuntimeError("remote Engram reader has not finished loading")
+    _runtime.begin_prefetch(hash_ids, local_rows, cp_size)
+
+
 class RemoteEngramTable:
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
         if dim != 256 or layer_id not in (1, 14):
             raise ValueError("research remote Engram supports 256-wide layers 1 and 14")
-        if os.environ.get("ENGRAM_SHARED_PREFETCH") == "1":
-            raise ValueError("legacy prefetch hooks do not support current SGLang")
         self.num_embeddings = num_embeddings
         self.dim = dim
         self.layer_id = layer_id
@@ -54,6 +64,16 @@ class RemoteEngramTable:
         if tuple(actual) != expected:
             raise ValueError("remote Engram table size mismatch")
         self.runtime.ranges[self.layer_id] = (row_start, row_start + rows)
+        if os.environ.get("ENGRAM_SHARED_READ_PLAN") == "1" and set(
+            self.runtime.ranges
+        ) == {1, 14}:
+            with torch.cuda.stream(self.runtime.comm_stream):
+                self.runtime.context.prime(
+                    self.runtime.ranges,
+                    self.runtime.p_off,
+                    self.runtime.dump,
+                    self.runtime.layer_stats,
+                )
 
     def lookup(self, indices, row_start: int, rows: int, new_rows):
         if self.runtime is None:
@@ -67,6 +87,11 @@ class RemoteEngramTable:
         if self.runtime.storage_layout == "row264":
             from row264_kernels import gather_row264
 
+            representatives = (
+                self.runtime.context.representatives((1, 14).index(self.layer_id))
+                if hasattr(self.runtime.context, "representatives")
+                else None
+            )
             gather_row264(
                 weight.data_ptr(),
                 ids,
@@ -74,7 +99,7 @@ class RemoteEngramTable:
                 row_start,
                 row_start + rows,
                 query_order=True,
-                representatives=None,
+                representatives=representatives,
             )
         else:
             from sglang.kernels.ops.embeddings.engram_gather import engram_gather
@@ -95,3 +120,11 @@ class RemoteEngramTable:
             )
         self.runtime.record_consumed(self.layer_id)
         return out
+
+    def after_reduction(self):
+        if (
+            self.layer_id == 1
+            and self.runtime.prefetch_enabled
+            and self.runtime.defer_layer14
+        ):
+            self.runtime.issue_prefetch_layer(14)

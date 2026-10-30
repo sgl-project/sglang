@@ -48,8 +48,11 @@ Setting `SGLANG_EXPERIMENTAL_REMOTE_ENGRAM=1` and selecting
 TP-owned rows through the research adapter. The option is off by default.
 The adapter requires the external `shared_model_adapter`, `row264_kernels`,
 owner service, and experimental NIXL/GPUNETIO library used in the prior
-research runtime. It currently only supports 256-wide Engram layers 1 and 14;
-the old prefetch path is rejected. It is not a self-contained installation,
+research runtime. It currently only supports 256-wide Engram layers 1 and 14.
+`ENGRAM_SHARED_PREFETCH=1` enables the external reader's experimental CP hash
+prefetch; `ENGRAM_SHARED_READ_PLAN=1` uses its prepared multi-QP READ plan.
+These options require the matching external runtime and have not been qualified
+for all graph, cancellation, or model configurations. It is not a self-contained installation,
 nor does this draft provide the owner, NIXL GET implementation or setup script.
 The experimental runtime validates checkpoint identity and registered table
 metadata. With the experimental runtime, one same-version H20 1P1D smoke ran
@@ -60,6 +63,20 @@ handled P/D KV transfer. P recorded one KV transfer, and both P/D requests
 returned successfully. This is a single functional smoke, not a performance,
 concurrency or production qualification. The reader runtime and owner remain
 external dependencies.
+
+A subsequent paired C8 test used three rounds of 32 measured requests per arm
+with 16K input and 64 output tokens on the same two H20 nodes. The Shared P
+used 16 QPs and the experimental READ plan/prefetch; Native P used the current
+per-node local CPU table. Both used the same D process, Mooncake KV, model
+version, prompt sets, and bounded replay disabled. Median-of-round TTFT p50 was
+5159.83 ms Native and 5204.95 ms Shared (+0.87%); output throughput was 94.33
+and 93.52 tokens/s (-0.85%). All 96 paired input and output hashes matched,
+with zero measured cache hits, retractions or client errors. P was restarted
+between arms, Shared ran first, and no per-window NIC counter audit was made;
+the sample is not a production or p99 qualification. The 1-QP path had a
+5928.08 ms TTFT p50 in one earlier 32-request round; the combined READ plan and
+prefetch changes improved that matching-input round by 12.44%, but individual
+contributions and multi-run 1-QP variance were not isolated.
 
 ## Research evidence and limits
 

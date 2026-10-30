@@ -1247,6 +1247,8 @@ class EngramEmbedding(nn.Module):
         values = self._owned_rows(indices)
         if self.tp_size > 1:
             values = self._reduce_owned_rows(values)
+        if self.remote_table is not None:
+            self.remote_table.after_reduction()
         return values
 
     def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
