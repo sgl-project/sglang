@@ -2196,8 +2196,9 @@ class Envs:
     # ===================================================================
     # GLM-5.3-Flash
     # ===================================================================
-    # Overlap BF16 KDA gate projections with QKV on tuned SM90 shapes.
-    SGLANG_GLM5_KDA_PROJ_OVERLAP = EnvBool(True)
+    # Opt-in: overlap BF16 KDA gate projections with QKV on tuned SM90 shapes.
+    # Standalone projection gains have not translated into a serving speedup.
+    SGLANG_GLM5_KDA_PROJ_OVERLAP = EnvBool(False)
 
     # ===================================================================
     # Kimi K3

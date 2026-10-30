@@ -43,8 +43,11 @@ class GemmStreams(TorchDispatchMode):
 
 @pytest.fixture
 def runtime():
-    with get_context().override_server_args(
-        device="cuda", enable_lora=False, lora_paths=None, bf16_gemm_backend="torch"
+    with (
+        get_context().override_server_args(
+            device="cuda", enable_lora=False, lora_paths=None, bf16_gemm_backend="torch"
+        ),
+        envs.SGLANG_GLM5_KDA_PROJ_OVERLAP.override(True),
     ):
         yield
 
