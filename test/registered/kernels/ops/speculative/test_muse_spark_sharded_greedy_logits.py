@@ -7,8 +7,8 @@ are column slices and the all-gather is torch.stack."""
 import pytest
 import torch
 
-from sglang.kernels.ops.activation.softcap import (
-    gathered_softcap_logits,
+from sglang.kernels.ops.activation.softcap import gathered_softcap_logits
+from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
 )
