@@ -6,7 +6,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.models.iquest_q1 import _apply_learned_sink
@@ -55,9 +55,11 @@ class TestFlashAttentionReturnLse(CustomTestCase):
                 kv_cache_dtype_str="auto",
                 page_size=1,
                 is_draft_worker=False,
-                kv_index_translator=KVIndexTranslator(
+                runner_ids=RunnerIds(
                     req_to_token=req_pool.req_to_token,
-                    token_to_kv_pool_allocator=object(),
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        hands_out_virtual_ids=False
+                    ),
                     token_to_kv_pool=pool,
                     page_size=1,
                     device="cuda",
