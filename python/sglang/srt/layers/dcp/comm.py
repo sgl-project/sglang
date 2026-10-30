@@ -337,23 +337,38 @@ def all_gather_kv_cache_for_dcp(
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
 
     cycle_size = dcp_world_size * interleave_size
-    start_offset = prefix_starts_cpu % cycle_size
-    end_offset = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % cycle_size
-    left_pads = (
-        (start_offset - dcp_rank * interleave_size)
-        .clamp(0, interleave_size)
-        .to(torch.int32)
-    )
-    right_pads = (
-        ((dcp_rank + 1) * interleave_size - 1 - end_offset)
-        .clamp(0, interleave_size)
-        .to(torch.int32)
-    )
-    padded_lens = (
-        (prefix_kv_lens_cpu + start_offset + cycle_size - 1)
-        // cycle_size
-        * interleave_size
-    )
+    if interleave_size == 1:
+        # Preserve the original token-interleaved padding path.
+        left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
+        left_pads = left_pads.to(torch.int32)
+        right_pads = (
+            prefix_starts_cpu + prefix_kv_lens_cpu - 1
+        ) % dcp_world_size < dcp_rank
+        right_pads = right_pads.to(torch.int32)
+        padded_lens = (
+            prefix_kv_lens_cpu
+            + (prefix_starts_cpu % dcp_world_size)
+            + dcp_world_size
+            - 1
+        ) // dcp_world_size
+    else:
+        start_offset = prefix_starts_cpu % cycle_size
+        end_offset = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % cycle_size
+        left_pads = (
+            (start_offset - dcp_rank * interleave_size)
+            .clamp(0, interleave_size)
+            .to(torch.int32)
+        )
+        right_pads = (
+            ((dcp_rank + 1) * interleave_size - 1 - end_offset)
+            .clamp(0, interleave_size)
+            .to(torch.int32)
+        )
+        padded_lens = (
+            (prefix_kv_lens_cpu + start_offset + cycle_size - 1)
+            // cycle_size
+            * interleave_size
+        )
     local_kv_lens = padded_lens - left_pads - right_pads
     local_kv_lens_cu = torch.zeros(
         len(prefix_kv_lens_cpu) + 1,
