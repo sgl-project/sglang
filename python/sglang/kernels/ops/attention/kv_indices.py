@@ -64,7 +64,7 @@ def create_flashinfer_kv_indices_triton(
     kv_indptr,
     kv_start_idx,
     kv_indices_ptr,
-    # Runtime, not constexpr: the translator's eager table is allocated at the
+    # Runtime, not constexpr: the `RunnerIds`' eager table is allocated at the
     # batch's live width, so a constexpr stride would JIT-specialize per width
     # (a recompile every few decode steps at small page sizes).
     req_to_token_ptr_stride,
@@ -76,7 +76,7 @@ def create_flashinfer_kv_indices_triton(
 
     ``ENTRY_PAGE_SIZE == 1`` (default): the source table is token-granular and
     entries are emitted verbatim -- byte-identical to the historical kernel.
-    ``ENTRY_PAGE_SIZE == ps``: the source is the translator's PAGE-granular
+    ``ENTRY_PAGE_SIZE == ps``: the source is the `RunnerIds`' PAGE-granular
     read table (entries already physical page ids); token ids are rebuilt
     as ``token = entry * ps + pos % ps``, exact because converting an id keeps
     its offset inside the page.
@@ -202,7 +202,7 @@ def create_flashmla_kv_indices_triton(
     PAGED_SIZE: tl.constexpr = 64,
 ):
     # Static-pool builder only: token ids here are physical, entry = token//ps.
-    # The unified pool's block table is filled by KVIndexTranslator instead.
+    # The unified pool's block table is filled by RunnerIds instead.
     NUM_PAGE_PER_BLOCK: tl.constexpr = (
         FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON // PAGED_SIZE
     )
