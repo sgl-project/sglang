@@ -338,6 +338,7 @@ def generate_gsm8k_shared_prefix_dataset(
     batch_size,
     input_len,
     output_file,
+    output_format="sharegpt",
 ):
     """Generate a natural-text shared-prefix dataset from GSM8K.
 
@@ -371,21 +372,30 @@ def generate_gsm8k_shared_prefix_dataset(
 
     output_data = []
     for i in range(batch_size):
-        output_data.append(
-            {
-                "id": f"gsm8k_shared_prefix_{i:02d}",
-                "conversations": [
-                    {"from": "human", "value": prompt_text},
-                    {"from": "gpt", "value": "none"},
-                ],
-            }
-        )
+        if output_format == "aisbench":
+            # run_aisbench()'s gsm8k jsonl layout: {"question": ..., "answer": ...}
+            output_data.append({"question": prompt_text, "answer": "none"})
+        else:
+            output_data.append(
+                {
+                    "id": f"gsm8k_shared_prefix_{i:02d}",
+                    "conversations": [
+                        {"from": "human", "value": prompt_text},
+                        {"from": "gpt", "value": "none"},
+                    ],
+                }
+            )
 
     output_dir = os.path.dirname(output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(output_data, f, ensure_ascii=False)
+    if output_format == "aisbench":
+        with open(output_file, "w", encoding="utf-8") as f:
+            for row in output_data:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    else:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, ensure_ascii=False)
     print(
         f"Shared-prefix GSM8K dataset saved to {output_file} "
         f"({len(output_data)} identical rows of ~{input_len} tokens)"
