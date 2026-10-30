@@ -35,16 +35,21 @@ nothing in this module executes.
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import Optional
 
 import torch
 
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_forward,
     get_parallel,
 )
 from sglang.srt.utils.common import ceil_align
+
+logger = logging.getLogger(__name__)
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
@@ -73,16 +78,50 @@ def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
+def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
     """Whether this forward runs SP: an enabled model, prefill only.
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
     re-execute on graph replay, so the flag is stale there.
+
+    With --layernorm-sp-min-tokens set, a pass of at most that many tokens takes
+    the replicated path instead. ``num_tokens`` is the pass's real token count;
+    a caller that does not know it passes None and the pass runs SP, so the
+    threshold only applies where the count is known.
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not (layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND):
+        return False
+    return num_tokens is None or num_tokens > _sp_min_tokens()
+
+
+@functools.lru_cache(maxsize=1)
+def _sp_min_tokens() -> int:
+    """--layernorm-sp-min-tokens, validated against the prefill graph buckets.
+
+    A threshold between two captured buckets would send a replayed graph down a
+    path it was not captured for, so it has to BE a bucket, or sit at or above
+    the largest one where no bucket is below it.
+    """
+    want = int(get_parallel().layernorm_sp_min_tokens or 0)
+    if want <= 0:
+        return 0
+    graph = get_exec().graph.cuda_graph_config
+    buckets = sorted(int(b) for b in (graph.prefill.bs or ())) if graph else []
+    if buckets and want < buckets[-1] and want not in buckets:
+        raise ValueError(
+            f"--layernorm-sp-min-tokens {want} is not one of the captured prefill "
+            f"CUDA graph buckets {buckets}; a replayed graph would take a path it "
+            f"was not captured for"
+        )
+    logger.info(
+        "LayerNorm SP: passes above %d tokens run sequence-parallel, smaller ones "
+        "take the replicated path",
+        want,
+    )
+    return want
 
 
 class _SPForwardState:
@@ -156,7 +195,7 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
