@@ -115,9 +115,6 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         # compression, KV writes and the output gather use the live lengths
         # produced by prepare_cp_forward, never the bucket's padded tail.
         metadata.graph_num_tokens = static_num_tokens
-        # Attention backends read forward_batch.positions, which is restored to
-        # the global view below; hand them the CP-local rows explicitly.
-        metadata.presharded_positions = forward_batch.positions
         self.moe_local_token_count.fill_(
             metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
         )
