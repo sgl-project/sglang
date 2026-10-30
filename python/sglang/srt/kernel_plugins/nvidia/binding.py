@@ -287,47 +287,39 @@ class ForwardView:
     ):
         self.hybrid = hybrid
         if legacy:
-            # Keep API-v1's nonhybrid behavior without handing the plugin the
-            # backend. Hybrid consumers get only the typed surface above.
-            self._trtllm_attn = lambda: backend.trtllm_attn
-            self._attention = lambda: backend.forward
-            self._store_cache = lambda: backend.store_cache
-            self._swa_out_cache_loc = lambda: backend.get_swa_out_cache_loc
-            self._low_ratio_sources = lambda: backend.forward_low_ratio_sources
-            self._core_compressor = lambda: backend.forward_core_compressor
-            self._use_fused_topk = lambda: bool(
-                getattr(backend, "use_fused_topk", False)
-            )
+            # Optional operations stay lazy; hybrid consumers retain only the
+            # typed surface above, not a reference to the backend.
+            self._backend = backend
             self.metadata = backend.forward_metadata
             self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
 
     @property
     def use_fused_topk(self) -> bool:
-        return self._use_fused_topk()
+        return bool(getattr(self._backend, "use_fused_topk", False))
 
     @property
     def trtllm_attn(self) -> bool:
-        return self._trtllm_attn()
+        return self._backend.trtllm_attn
 
     @property
     def attention(self) -> Callable[..., Any]:
-        return self._attention()
+        return self._backend.forward
 
     @property
     def store_cache(self) -> Callable[..., None]:
-        return self._store_cache()
+        return self._backend.store_cache
 
     @property
     def swa_out_cache_loc(self) -> Callable[[Any], torch.Tensor]:
-        return self._swa_out_cache_loc()
+        return self._backend.get_swa_out_cache_loc
 
     @property
     def low_ratio_sources(self) -> Callable[..., Any]:
-        return self._low_ratio_sources()
+        return self._backend.forward_low_ratio_sources
 
     @property
     def core_compressor(self) -> Callable[..., Any]:
-        return self._core_compressor()
+        return self._backend.forward_core_compressor
 
 
 class _SealedSource(msgspec.Struct, frozen=True):

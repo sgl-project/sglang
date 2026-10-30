@@ -488,7 +488,7 @@ class TestMegakernelBinding(CustomTestCase):
         self.assertIs(view.kv_pool.pool, pool)
         self.assertIs(view.kv_pool.get_swa_key_buffer_radix(1), pool.keys[1])
         self.assertIsNone(view.hybrid)
-        self.assertFalse(hasattr(view, "_backend"))
+        self.assertFalse(any(callable(value) for value in vars(view).values()))
 
         # API v1 reads optional operations lazily: a consumer that only needs the
         # metadata and pool must not require every backend method to exist.
@@ -500,8 +500,18 @@ class TestMegakernelBinding(CustomTestCase):
             minimal_view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
         self.assertEqual(minimal_view.metadata.core_attn_metadata, "minimal")
         self.assertIs(minimal_view.kv_pool.pool, pool)
+        self.assertFalse(minimal_view.use_fused_topk)
         with self.assertRaises(AttributeError):
             _ = minimal_view.attention
+        minimal.forward = lambda: "late attention"
+        minimal.use_fused_topk = True
+        self.assertIs(minimal_view.attention, minimal.forward)
+        self.assertTrue(minimal_view.use_fused_topk)
+
+        hybrid_view = mb.ForwardView(minimal, legacy=False)
+        self.assertFalse(hasattr(hybrid_view, "_backend"))
+        self.assertFalse(hasattr(hybrid_view, "metadata"))
+        self.assertFalse(hasattr(hybrid_view, "kv_pool"))
 
     def test_a_replaced_source_fails_assert_live_by_name(self):
         model = torch.nn.Module()
