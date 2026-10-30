@@ -1460,9 +1460,9 @@ class ModelRunner:
                 dtype=self.dtype,
             )
 
-    def load_lora_adapter(self, lora_ref: LoRARef):
+    def load_lora_adapter(self, lora_ref: LoRARef, upsert: bool = False):
         """Load a new lora adapter from disk or huggingface."""
-        return self.lora_manager.load_lora_adapter(lora_ref)
+        return self.lora_manager.load_lora_adapter(lora_ref, upsert=upsert)
 
     def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
         logger.info(f"LoRA adapter registration: {lora_ref}.")

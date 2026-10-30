@@ -205,7 +205,38 @@ class BaseTpWorker(ABC):
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        result = self.model_runner.load_lora_adapter(recv_req.to_ref())
+        result = self.model_runner.load_lora_adapter(
+            recv_req.to_ref(), upsert=recv_req.upsert
+        )
+        if recv_req.upsert:
+            manager = self.model_runner.lora_manager
+            pool = manager.memory_pool
+            uid = recv_req.lora_id
+            states = [(result.success, uid in pool.invalid_uids)]
+            tp_group = get_parallel().tp_group
+            if tp_group.world_size > 1:
+                try:
+                    states = tp_group.all_gather_object(states[0])
+                except Exception:
+                    pool.invalid_uids.add(uid)
+                    raise
+            succeeded = [success for success, _ in states]
+            if any(invalid for _, invalid in states) or (
+                any(succeeded) and not all(succeeded)
+            ):
+                # Registry publication cannot undo a peer's resident-slot write.
+                # Fail closed on every TP rank. An inference attempt while
+                # invalid terminates the scheduler and shuts down the engine.
+                pool.invalid_uids.add(uid)
+                return manager.create_lora_update_result(
+                    success=False,
+                    error_message=(
+                        f"LoRA adapter '{recv_req.lora_name}' has an incomplete update "
+                        "across TP ranks. The next inference attempt shuts down "
+                        "the engine; recover before any further inference or "
+                        f"restart the engine. {result.error_message}"
+                    ).strip(),
+                )
         return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):

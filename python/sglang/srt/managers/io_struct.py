@@ -2605,6 +2605,11 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
     pinned: bool = False
     # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
     lora_id: Optional[str] = None
+    # Replace a same-name adapter in place (same lora_id, served slot rewritten)
+    # instead of rejecting the duplicate name; a fresh name loads as usual.
+    # The caller coordinates generation and KV/prefix-cache invalidation around
+    # the swap; same-name path updates currently require PP=1.
+    upsert: bool = False
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
