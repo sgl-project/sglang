@@ -2257,12 +2257,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # Drop the MLP-sync pad rows: a spec draft re-pads the hidden states to
+            # its own bucket. seq_lens_sum also counts the cached prefix.
+            num_tokens = (
+                self._original_num_tokens
+                if self._original_num_tokens is not None
+                else self.seq_lens_sum
+            )
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            if logits_output.mm_input_embeds is not None:
+                logits_output.mm_input_embeds = logits_output.mm_input_embeds[
+                    :num_tokens
+                ]
 
         # Full aux capture keeps both outputs on the same token rows.
         if (

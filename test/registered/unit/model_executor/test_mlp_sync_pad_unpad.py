@@ -47,7 +47,9 @@ def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
 
 def _logits_output(num_rows: int) -> SimpleNamespace:
     return SimpleNamespace(
-        next_token_logits=torch.randn(num_rows, 16), hidden_states=None
+        next_token_logits=torch.randn(num_rows, 16),
+        hidden_states=None,
+        mm_input_embeds=None,
     )
 
 
@@ -289,6 +291,41 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # sample() derives prefill sampling positions from seq_lens - 1, so the
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
+
+    def test_extend_post_forward_drops_bucket_rows_of_full_hidden_states(self):
+        """A chunked prefill padded to a DP-wide prefill-graph bucket returns only
+        its real token rows: an EAGLE draft re-pads them to its own, smaller width."""
+        real, bucket, prefix = 29, 48, 640
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(real),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([prefix + real]),
+            out_cache_loc=torch.arange(real),
+            seq_lens_sum=prefix + real,
+            positions=torch.arange(prefix, prefix + real),
+            seq_lens_cpu=torch.tensor([prefix + real]),
+            lora_ids=[None],
+        )
+        fb._original_batch_size = fb.batch_size
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=bucket, bs=1)
+
+        hidden = torch.randn(bucket, 8)
+        mm_input_embeds = torch.randn(bucket, 8)
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn(1, 16),
+            hidden_states=hidden,
+            last_hidden_states=None,
+            mm_input_embeds=mm_input_embeds,
+        )
+        fb.post_forward_mlp_sync_batch(logits_output)
+
+        torch.testing.assert_close(logits_output.hidden_states, hidden[:real])
+        torch.testing.assert_close(
+            logits_output.mm_input_embeds, mm_input_embeds[:real]
+        )
+        self.assertEqual(logits_output.next_token_logits.shape[0], 1)
 
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()
