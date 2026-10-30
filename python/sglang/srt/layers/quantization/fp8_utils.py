@@ -500,6 +500,8 @@ class Mxfp8DenseGemmBackend(Enum):
     GFX95_MXFP8_AITER = "gfx95_mxfp8_aiter"
     # Intel XPU: torch scaled_mm BlockWise1x32 on plain fp8 weight + [N, K // 32] ue8m0 bytes
     XPU_SCALED_MM = "xpu_scaled_mm"
+    # MiniMax dense MXFP8: shuffled B and per-1x32 scales through FlyDSL
+    GFX95_MXFP8_FLYDSL = "gfx95_mxfp8_flydsl"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -528,6 +530,9 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_gfx95_mxfp8_aiter(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
+
+    def is_gfx95_mxfp8_flydsl(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_FLYDSL
 
     def is_gfx95(self) -> bool:
         return self in (
@@ -916,6 +921,13 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
                 "but that kernel requires an Intel XPU."
             )
         return Mxfp8DenseGemmBackend.XPU_SCALED_MM
+    if backend.is_aiter():
+        if not (_use_aiter and _is_hip and _is_gfx95_supported):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=aiter, "
+                "but that path requires ROCm gfx950 with SGLANG_USE_AITER=1."
+            )
+        return Mxfp8DenseGemmBackend.GFX95_MXFP8_FLYDSL
 
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
@@ -1082,6 +1094,12 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return halops_w8a8_mxfp8_linear_with_fallback
     elif backend.is_xpu_scaled_mm():
         return xpu_mxfp8_scaled_mm_linear
+    elif backend.is_gfx95_mxfp8_flydsl():
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            flydsl_mxfp8_blockscaled_linear,
+        )
+
+        return flydsl_mxfp8_blockscaled_linear
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
