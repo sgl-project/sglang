@@ -1070,6 +1070,9 @@ class Envs:
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    # Run the BF16 lm_head through aiter tgemm, as gfx1250 always does,
+    # so its tuned rows apply instead of hipBLASLt's heuristic (measured on gfx950).
+    SGLANG_OPT_AITER_LM_HEAD_GEMM = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
