@@ -82,7 +82,7 @@ class TestKimiLinearUnifiedMemory(
     GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
     """BUG REGRESSION. The unified pool must keep GSM8K at the static-pool bar;
-    a wrapper backend that drops `kv_index_translator` silently skips the MLA
+    a wrapper backend that drops `runner_ids` silently skips the MLA
     prefix translation and the model reads the wrong KV."""
 
     model = KIMI_LINEAR_MODEL
