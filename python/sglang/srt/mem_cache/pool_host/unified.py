@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import heapq
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from contextlib import contextmanager
 
+import heapq
+from collections.abc import Iterable
 import torch
 
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
