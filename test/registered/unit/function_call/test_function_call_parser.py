@@ -4028,7 +4028,7 @@ class TestLing3Detector(unittest.TestCase):
                 self.assertEqual(tool_calls[0]["parameters"], expected)
 
 
-class TestJsonArrayParser(unittest.TestCase):
+class TestJsonArrayParser(CustomTestCase):
     def setUp(self):
         # Create sample tools for testing
         self.tools = [
@@ -4118,6 +4118,67 @@ class TestJsonArrayParser(unittest.TestCase):
             ],
         )
         self.assertEqual(self.detector.finish(self.tools).calls, [])
+
+    def test_inter_call_whitespace_preserves_calls_across_chunks(self):
+        """JSON spacing must not drop later calls or leak into response text."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="process",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "ids": {"type": "array", "items": {"type": "integer"}},
+                            "text": {"type": "string"},
+                        },
+                    },
+                ),
+            )
+        ]
+        arguments = [
+            {"ids": [1]},
+            {"ids": [2, 3], "text": ' \t["quoted"]\\tail\r\n '},
+        ]
+        encoded = [
+            json.dumps({"name": "process", "parameters": value}) for value in arguments
+        ]
+        for whitespace in ("", " ", "\t", "\r", "\n", "\r\n", " \t\r\n"):
+            text = "[" + (whitespace + ",").join(encoded) + whitespace + "]"
+            schedules = [[text], list(text)]
+            schedules.extend([text[:cut], text[cut:]] for cut in range(len(text) + 1))
+            for chunks in schedules:
+                with self.subTest(
+                    whitespace=repr(whitespace), chunk_lengths=list(map(len, chunks))
+                ):
+                    detector = JsonArrayParser()
+                    results = [
+                        detector.parse_streaming_increment(chunk, tools)
+                        for chunk in chunks
+                    ]
+                    results.append(detector.finish(tools))
+                    self.assertEqual(
+                        "".join(result.normal_text for result in results), ""
+                    )
+                    streamed = {}
+                    for result in results:
+                        for call in result.calls:
+                            entry = streamed.setdefault(
+                                call.tool_index, {"name": "", "arguments": ""}
+                            )
+                            entry["name"] += call.name or ""
+                            entry["arguments"] += call.parameters
+                    self.assertEqual(sorted(streamed), [0, 1])
+                    self.assertEqual(
+                        [
+                            (streamed[i]["name"], json.loads(streamed[i]["arguments"]))
+                            for i in (0, 1)
+                        ],
+                        [("process", value) for value in arguments],
+                    )
+                    final = detector.finish(tools)
+                    self.assertEqual(final.calls, [])
+                    self.assertEqual(final.normal_text, "")
 
     def test_braces_in_strings(self):
         """Test that JSON with } characters inside strings works correctly"""
