@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    # The kernels throw on other dtypes (csrc/allreduce/custom_all_reduce.cu, .hip).
+    _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
     _MAX_CAR_SIZE = 8192 * 1024
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
@@ -259,6 +261,8 @@ class CustomAllreduce:
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
+            return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16

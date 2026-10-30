@@ -38,16 +38,20 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import (
+    _WRITE_BACK_STAGING_PAGE_CHUNK,
+    prepare_page_unified_write_back_staging,
+)
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
@@ -71,42 +75,80 @@ if TYPE_CHECKING:
 def prepare_hicache_staging(
     *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
 ) -> None:
-    """Materialize MHA transfer buffers before the final KV budget is measured."""
+    """Materialize transfer buffers before the final KV budget is measured."""
     if is_npu():
         return
     memory = get_memory()
     page_size = get_schedule().page_size
-    if memory.hicache_mem_layout != "page_first" or not (
+    if memory.hicache_mem_layout not in ("page_first", "page_unified") or not (
         memory.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):
         return
 
     def prepare(pool, packed_drafts=(), *, sidecar=False):
-        if isinstance(pool, SWAKVPool):
-            prepare(pool.full_kv_pool)
-            prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
-        elif isinstance(pool, HybridLinearKVPool):
-            prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
-        elif isinstance(pool, MHATokenToKVPool):
+        router = pool.layer_router
+        if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+            prepare(router.view(IdSpaceKind.FULL))
+            prepare(
+                router.view(IdSpaceKind.SLIDING_WINDOW),
+                tuple(p.swa_kv_pool for p in packed_drafts),
+            )
+        elif router.wrapped_view() is not None:
+            prepare(router.wrapped_view(), packed_drafts, sidecar=sidecar)
+        elif isinstance(pool, (MHAKVView, MLAKVView)):
+            is_mla = isinstance(pool, MLAKVView)
+            if pool.layer_num == 0 or (
+                is_mla and memory.hicache_mem_layout != "page_unified"
+            ):
+                return
             # Ratio-based host pools can only shrink with post-capture KV sizing.
             # Sidecars instead inherit their target host pool's capacity.
             page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
             if memory.hicache_size <= 0 and not sidecar:
-                page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
-            staging = prepare_mha_write_back_staging(
-                pool.get_device_pool_infos()[0].buffer_info,
-                layer_num=pool.layer_num + len(packed_drafts),
-                page_size=page_size,
-                page_capacity=page_capacity,
-                staging=pool.hicache_write_back_staging,
-            )
+                capacity_tokens = (
+                    pool.size
+                    if pool.host_capacity_tokens is None
+                    else pool.host_capacity_tokens
+                )
+                page_capacity = (
+                    int(capacity_tokens * memory.hicache_ratio) // page_size + 1
+                )
+            info = pool.get_device_pool_infos()[0].buffer_info
+            if memory.hicache_mem_layout == "page_unified":
+                geometry = resolve_kv_host_geometry(
+                    pool,
+                    page_size=page_size,
+                    layout=memory.hicache_mem_layout,
+                    use_mla=is_mla,
+                    draft_layer_num=len(packed_drafts),
+                ).page_unified_layout
+                assert geometry is not None
+                layer_num = geometry.layer_num
+                staging = prepare_page_unified_write_back_staging(
+                    geometry,
+                    dtype=info.dtype,
+                    device=info.device,
+                    page_capacity=page_capacity,
+                    staging=pool.hicache_write_back_staging,
+                )
+                buffers = (staging,)
+            else:
+                layer_num = pool.layer_num + len(packed_drafts)
+                staging = prepare_mha_write_back_staging(
+                    info,
+                    layer_num=layer_num,
+                    page_size=page_size,
+                    page_capacity=page_capacity,
+                    staging=pool.hicache_write_back_staging,
+                )
+                buffers = staging
             pool.hicache_write_back_staging = staging
             if staging is not None:
                 logger.info(
                     "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
-                    sum(buffer.nbytes for buffer in staging) / (1 << 20),
-                    pool.layer_num + len(packed_drafts),
+                    sum(buffer.nbytes for buffer in buffers) / (1 << 20),
+                    layer_num,
                 )
 
     runner = tp_worker.model_runner
@@ -114,10 +156,11 @@ def prepare_hicache_staging(
     if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
         for pool in draft_plan.device_pools:
             # SWA sidecars follow only the draft's SWA component.
-            prepare(
-                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
-                sidecar=True,
-            )
+            if pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+                pool = pool.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+            elif isinstance(pool, DeepSeekV4TokenToKVPool):
+                pool = pool.swa_kv_pool
+            prepare(pool, sidecar=True)
 
 
 def maybe_register_hicache_draft(
@@ -217,7 +260,11 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             and not uses_ssm_state(tp_worker.model_runner.model_config)
             and (
                 isinstance(kv_cache, MHATokenToKVPool)
-                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+                or (
+                    kv_cache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+                    is not None
+                    and full_tokens_per_layer > 0
+                )
             )
         )
         schedule = get_schedule()

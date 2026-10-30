@@ -83,7 +83,6 @@ class FusedWanRMSNormSiLU(nn.Module):
             not torch.compiler.is_compiling()
             and not self._post_gate.disabled
             and x.is_cuda
-            and torch.version.hip is None
             and not torch.is_grad_enabled()
             and x.ndim == 5
             and (

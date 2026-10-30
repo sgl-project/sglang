@@ -33,10 +33,18 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
     _SwaStrategy,
-    _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
+    build_unified_host_stack,
+    validate_fused_hicache_draft,
+)
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -51,11 +59,11 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4SWAPageLayout(CustomTestCase):
@@ -119,13 +127,14 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         use_mla=False,
                         host_pool_decls=lambda: (),
                     )
-                    req_pool = SimpleNamespace(
-                        mamba_pool=object(),
-                    )
+                    state = SimpleNamespace(pool=object())
                     params = SimpleNamespace(
-                        req_to_token_pool=req_pool,
+                        req_to_token_pool=SimpleNamespace(),
+                        token_to_kv_pool_allocator=SimpleNamespace(state=state),
                         tp_cache_group=None,
                         pp_cache_group=None,
+                        attn_cp_cache_group=None,
+                        attn_tp_cache_group=None,
                     )
                     controller = SimpleNamespace(transfer_layer_id_max=4)
                     built = (
@@ -222,10 +231,7 @@ class TestMambaInfoRouting(CustomTestCase):
                             mtp_draft_device_pools=(),
                             mtp_draft_mamba_pools=drafts,
                             token_to_kv_pool_allocator=SimpleNamespace(
-                                swa_attn_allocator=allocator
-                            ),
-                            req_to_token_pool=SimpleNamespace(
-                                mamba_allocator=allocator
+                                swa_attn_allocator=allocator, state_slots=allocator
                             ),
                             tp_cache_group=None,
                             pp_cache_group=None,
@@ -352,6 +358,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         full = SimpleNamespace(layer_num=0)
         full.host_pool_decls = lambda: (make_kv_pool_decl(full),)
         draft_kv_pool.full_kv_pool = full
+        draft_kv_pool.full_attention_layer_id_mapping = {}
 
         specs, entries = build_full_draft_pools(
             draft_kv_pool=draft_kv_pool,
@@ -362,13 +369,15 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_kv_pool = SimpleNamespace(layer_num=1, size=800, start_layer=0)
+        draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_kv_pool.host_pool_decls = lambda: (make_kv_pool_decl(draft_kv_pool),)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
             cache_controller=SimpleNamespace(
                 mem_pool_host=SimpleNamespace(size=100, logical_size=800),
                 page_size=512,
+                transfer_layer_id_max=1,
             )
         )
         # The layout comes from the published configuration.
@@ -406,6 +415,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         breaks only here, not on the target path."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
         draft_kv_pool.layer_num = 1
+        draft_kv_pool.start_layer = 0
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
         draft_kv_pool.page_size = 64
@@ -417,6 +427,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             cache_controller=SimpleNamespace(
                 mem_pool_host=SimpleNamespace(size=100, logical_size=800),
                 page_size=512,
+                transfer_layer_id_max=1,
             )
         )
         from sglang.srt.runtime_context import publish, reset_context
@@ -947,16 +958,13 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             page_size=64,
             mtp_draft_device_pools=(),
             mtp_draft_mamba_pools=(),
-            token_to_kv_pool_allocator=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state_slots=SimpleNamespace(alloc=lambda n: None, free=lambda x: None)
+            ),
             tp_cache_group=None,
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
             pp_cache_group=None,
-            req_to_token_pool=SimpleNamespace(
-                mamba_allocator=SimpleNamespace(
-                    alloc=lambda n: None, free=lambda x: None
-                )
-            ),
         )
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
@@ -1291,8 +1299,8 @@ class TestTransferLayerSpan(CustomTestCase):
         )
 
 
-def _build_unified_swa_pool(page_size: int = 4):
-    return init_unified_swa_pools(
+def _build_unified_swa_pool(page_size: int = 4, *, fused_draft=None):
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=2,
@@ -1310,13 +1318,14 @@ def _build_unified_swa_pool(page_size: int = 4):
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=True,
+        fused_draft=fused_draft,
     )
 
 
 def _build_unified_host_pair(bundle):
     pool = bundle.token_to_kv_pool
     return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
-        device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+        device_pools=tuple(map(pool.layer_router.view, ("full", "swa"))),
         host_to_device_ratio=1.0,
         host_size=0,
         page_size=pool.page_size,
@@ -1326,21 +1335,41 @@ def _build_unified_host_pair(bundle):
     )
 
 
+class TestFusedDraftHiCacheValidation(CustomTestCase):
+    def test_fused_draft_binding_uses_its_host_sub_pool(self):
+        """A bound full draft passes HiCache admission; a window draft is refused."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        for host in ("full", "swa"):
+            with self.subTest(host=host):
+                placement = FusedDraftPlacement.from_counts(
+                    counts={host: [1]}, regions={host: region}
+                )
+                bundle = _build_unified_swa_pool(fused_draft=placement)
+                draft = DraftMHAView(
+                    arena=bundle.arena,
+                    host_spec=bundle.storage.plan.sub_pool(host).spec,
+                    layer_lanes={0: 0},
+                    page_size=bundle.token_to_kv_pool.page_size,
+                )
+                if host == "full":
+                    validate_fused_hicache_draft(draft_device_pools=(draft,))
+                else:
+                    with self.assertRaisesRegex(NotImplementedError, "full-attention"):
+                        validate_fused_hicache_draft(draft_device_pools=(draft,))
+
+
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
     def test_packed_drafts_are_not_silently_dropped_by_shared_arena(self):
-        bundle = _build_unified_swa_pool()
-        pool = bundle.token_to_kv_pool
-        for draft_arg in (
-            "mtp_full_device_pools",
-            "mtp_swa_device_pools",
-            "mtp_swa_full_device_pools",
-        ):
+        storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
+        draft = _build_unified_swa_pool().token_to_kv_pool
+        for full_indices in (False, True):
+            draft.swa_uses_full_indices = full_indices
             with (
-                self.subTest(draft_arg=draft_arg),
-                patch(
-                    _ASSEMBLER + "get_memory",
-                    return_value=SimpleNamespace(hicache_host_memory_mode="auto"),
-                ),
+                self.subTest(full_indices=full_indices),
+                patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(None)),
+                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
                 patch(
                     _ASSEMBLER + "build_kv_host_pool",
                     side_effect=NotImplementedError("packed pool reached host factory"),
@@ -1349,17 +1378,13 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                     UnifiedPageEnvelopeHostPool, "build_hybrid_swa_pool_pair"
                 ) as build_pair,
             ):
-                with self.assertRaisesRegex(
-                    NotImplementedError, "reached host factory"
-                ):
-                    build_hybrid_swa_group(
-                        page_size=4,
-                        full_kv_pool=pool.full_kv_pool,
-                        swa_kv_pool=pool.swa_kv_pool,
-                        full_layer_mapping={0: 0, 1: 1, 2: 2},
-                        swa_layer_mapping={3: 0},
-                        use_mla=False,
-                        **{draft_arg: (object(),)},
+                with self.assertRaises(Exception):
+                    build_unified_host_stack(
+                        storage=storage,
+                        params=_unified_params(storage, drafts=(draft,)),
+                        cache=None,
+                        load_cache_event=None,
+                        storage_backend=None,
                     )
                 build_pair.assert_not_called()
 
@@ -1491,34 +1516,52 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
     keep the page-envelope host arena."""
 
     def test_only_no_backend_and_mori_select_the_envelope(self):
-        from sglang.srt.runtime_context import publish, reset_context
-        from sglang.srt.server_args import ServerArgs
-
-        pool = _build_unified_swa_pool().token_to_kv_pool
-        self.addCleanup(reset_context)
+        storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
         for backend, expected in (
-            (None, True),
-            ("mori", True),
-            ("mooncake", False),
-            ("dynamic", False),
+            (None, "pair"),
+            ("mori", "pair"),
+            ("mooncake", "kv host"),
+            ("dynamic", "kv host"),
         ):
-            with self.subTest(backend=backend):
-                reset_context()
-                publish(
-                    ServerArgs(
-                        model_path="dummy",
-                        enable_unified_memory=True,
-                        hicache_storage_backend=backend,
-                        hicache_mem_layout="layer_first",
-                    ),
-                    role="tokenizer",
-                )
-                self.assertEqual(
-                    _uses_unified_page_envelope_host(
-                        pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
-                    ),
-                    expected,
-                )
+            with (
+                self.subTest(backend=backend),
+                patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(backend)),
+                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
+                patch(
+                    _ASSEMBLER + "build_kv_host_pool",
+                    side_effect=NotImplementedError("kv host"),
+                ),
+                patch.object(
+                    UnifiedPageEnvelopeHostPool,
+                    "build_hybrid_swa_pool_pair",
+                    side_effect=NotImplementedError("pair"),
+                ),
+            ):
+                with self.assertRaises(NotImplementedError) as raised:
+                    build_unified_host_stack(
+                        storage=storage,
+                        params=_unified_params(storage),
+                        cache=None,
+                        load_cache_event=None,
+                        storage_backend=backend,
+                    )
+                self.assertEqual(str(raised.exception), expected)
+
+
+def _unified_memory(backend):
+    return SimpleNamespace(
+        hicache_storage_backend=backend,
+        hicache_size=0,
+        hicache_ratio=1.0,
+        hicache_mem_layout="layer_first",
+        hicache_host_memory_mode="auto",
+    )
+
+
+def _unified_params(storage, drafts=()):
+    return SimpleNamespace(
+        page_size=4, mtp_draft_device_pools=drafts, mtp_draft_mamba_pools=()
+    )
 
 
 class TestMtpMhaPhysicalConstruction(CustomTestCase):
@@ -1613,6 +1656,58 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
                     for host in allocated:
                         host.destroy()
                     allocated.clear()
+
+
+class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
+    """The full + window + state stack builds its controller and state host the
+    way the full + window and full + state stacks do."""
+
+    def test_passes_the_attention_groups(self):
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(pool=object())
+            ),
+            tp_cache_group=object(),
+            pp_cache_group=object(),
+            attn_cp_cache_group=object(),
+            attn_tp_cache_group=object(),
+        )
+        kvcache = SimpleNamespace(
+            layers_mapping={0: (0, False), 1: (0, True)},
+            start_layer=0,
+            full_kv_pool=object(),
+            swa_kv_pool=object(),
+        )
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_hybrid_mamba_swa_stack",
+            return_value=(MagicMock(), MagicMock()),
+        ) as build:
+            _MambaSwaStrategy().build(
+                cache=SimpleNamespace(page_size=1),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+        kwargs = build.call_args.kwargs
+        self.assertIs(kwargs["attn_cp_group"], params.attn_cp_cache_group)
+        self.assertIs(kwargs["attn_tp_group"], params.attn_tp_cache_group)
+
+    def test_state_host_has_no_kv_split(self):
+        for layout, expected in (
+            ("page_first_kv_split", "page_first_direct"),
+            ("page_first", "page_first"),
+        ):
+            with (
+                self.subTest(layout=layout),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(hicache_mem_layout=layout),
+                ),
+            ):
+                self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
@@ -19,6 +20,8 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -91,6 +94,10 @@ class TestKvLayoutSignature(unittest.TestCase):
         def make(**kw):
             base = dict(
                 page_size=1,
+                kv_cache_dtype_str="bf16",
+                kv_layout=None,
+                swa_kv_cache_layout=None,
+                state_types=[StateType.SWA],
                 kv_item_lens=[64, 64],
                 state_item_lens=[[32]],
             )
@@ -106,6 +113,11 @@ class TestKvLayoutSignature(unittest.TestCase):
         self.assertNotEqual(same, make(kv_item_lens=[64]))
         self.assertNotEqual(same, make(page_size=16))
         self.assertNotEqual(same, make(state_item_lens=[[16]]))
+        # Same byte sizes, other bytes: another dtype of the same width, or
+        # another page layout of the same pool.
+        self.assertNotEqual(same, make(kv_cache_dtype_str="fp16"))
+        self.assertNotEqual(same, make(kv_layout="bucketed"))
+        self.assertNotEqual(same, make(state_types=[StateType.DSA]))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
@@ -227,12 +239,19 @@ class TestKvChecksumComputer(unittest.TestCase):
         self.assertEqual(value, expected)
 
 
+def _plain_kv_pool():
+    """A one-sub-pool KV pool: no window sub-pool, no wrapped view."""
+    pool = SimpleNamespace(start_layer=0, layer_num=1)
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
     def __init__(self, computer, req_to_token):
         self.kv_checksum_computer = computer
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=lambda: SimpleNamespace()
+            page_size=1, get_kvcache=_plain_kv_pool
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
@@ -264,23 +283,32 @@ class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
         )
 
 
-def _make_req(expected_chksum, num_input_tokens, rid="r0", bootstrap_host="127.0.0.1"):
+def _make_req(
+    expected_chksum,
+    num_input_tokens,
+    rid="r0",
+    bootstrap_host="127.0.0.1",
+    start_idx=0,
+):
     return SimpleNamespace(
         rid=rid,
         bootstrap_host=bootstrap_host,
         bootstrap_port=8998,
         bootstrap_room=12345,
-        kv=SimpleNamespace(req_pool_idx=0),
+        # start_idx: the decode-cached prefix, as each role records it.
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=start_idx),
         origin_input_ids=list(range(num_input_tokens)),
         fill_ids=list(range(num_input_tokens)),
         extend_end=num_input_tokens,
         expected_kv_checksum=expected_chksum,
+        disagg_decode_prefix_len=start_idx,
         return_logprob=False,
     )
 
 
 class TestPrefillChecksum(unittest.TestCase):
     def _send_last_chunk(self, sched, req):
+        page_indices = Mock(return_value=None)
         with (
             patch.object(
                 SchedulerDisaggregationPrefillMixin,
@@ -289,14 +317,15 @@ class TestPrefillChecksum(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.disaggregation.prefill.page_indices_for_request",
-                lambda *args: None,
+                page_indices,
             ),
             patch(
                 "sglang.srt.disaggregation.prefill.state_indices_for_request",
-                lambda *args: None,
+                lambda *args, **kwargs: None,
             ),
         ):
             sched.send_kv_chunk(req, last_chunk=True)
+        return page_indices
 
     def test_health_check_clears_metadata_checksum(self):
         sched = _FakePrefillScheduler()
@@ -311,6 +340,14 @@ class TestPrefillChecksum(unittest.TestCase):
         sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(
             req, 0x55, 0x1234
         )
+
+    def test_digest_starts_where_the_decode_cached_prefix_ends(self):
+        """A decode-side radix hit makes prefill send only the suffix; the
+        digest must cover that suffix, not the whole prompt."""
+        sched = _FakePrefillScheduler(SimpleNamespace(compute=lambda *args: 0x55))
+        req = _make_req(0, 7, start_idx=4)
+        page_indices = self._send_last_chunk(sched, req)
+        page_indices.assert_called_once_with(sched, req, 7, start_idx=4)
 
 
 class TestKvChecksumComparable(unittest.TestCase):
@@ -487,6 +524,23 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(req.expected_kv_checksum, 0)
         self.kv[0][0, 0] += 1
         sched.waiting_queue = batch.reqs
+        self.assertEqual(self._run_once(sched).reqs, [req])
+        self.assertEqual(sched.streamed_aborts, [])
+
+    def test_suffix_digest_skips_decode_cached_prefix(self):
+        """After a decode-side radix hit the digest covers only the pages
+        prefill sent; the prefix decode cached itself is not corruption."""
+        start = self.num_pages // 2
+        suffix = torch.arange(
+            start, self.num_pages, dtype=torch.int64, device=self.device
+        )
+        expected = _ref_strided_adler32(
+            self.kv, [suffix] * len(self.kv), [self.item_len] * len(self.kv)
+        )
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(expected, self.num_pages, start_idx=start)
+        sched.waiting_queue = [req]
+        self.kv[0][0, 0] += 1
         self.assertEqual(self._run_once(sched).reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
 

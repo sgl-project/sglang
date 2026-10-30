@@ -26,7 +26,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 @contextmanager
@@ -55,7 +55,8 @@ def make_batch(tokens=2, rows=4, return_lse=False):
 @pytest.mark.parametrize("breakable", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("tokens", [0, 2, 4])
-def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens):
+@pytest.mark.parametrize("flat_q", [False, True])
+def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens, flat_q):
     layer = RadixAttention(2, 3, 1.0, 2, 7)
     batch = make_batch(tokens=tokens, return_lse=return_lse)
     original = batch.out_cache_loc, batch.positions
@@ -73,7 +74,7 @@ def test_dense_outputs_padding_and_lse(breakable, return_lse, tokens):
             return out, torch.full((tokens, 2), 7.0)
         return out
 
-    q = torch.zeros(4, 2, 3)
+    q = torch.zeros(4, 6) if flat_q else torch.zeros(4, 2, 3)
     with (
         attention_scope(
             batch,
@@ -221,7 +222,6 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
         cuda_graph=graph,
-        _barrier_fn=None,
         _end_current_segment=lambda: None,
         _begin_new_segment=lambda: None,
     )
@@ -250,15 +250,15 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
     index_pointer = index_output.data_ptr() if sparse else None
     with attention_scope(live_batch, backend, raw_num_tokens=1):
         graph._break_fns[0]()
-    assert seen == [captured_batch, live_batch]
+    assert seen == [live_batch]
     assert output.data_ptr() == pointer
-    assert torch.all(output[:1] == 2) and torch.count_nonzero(output[1:]) == 0
+    assert torch.all(output[:1] == 1) and torch.count_nonzero(output[1:]) == 0
     if sparse:
         assert index_output.data_ptr() == index_pointer
-        assert torch.all(index_output[:1] == 4)
+        assert torch.all(index_output[:1] == 3)
         assert torch.count_nonzero(index_output[1:]) == 0
     if return_lse:
-        assert torch.all(lse[:1] == 2) and torch.count_nonzero(lse[1:]) == 0
+        assert torch.all(lse[:1] == 1) and torch.count_nonzero(lse[1:]) == 0
 
 
 def test_prefill_graph_policy_restores_after_exception():

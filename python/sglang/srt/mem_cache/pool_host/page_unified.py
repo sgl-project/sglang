@@ -36,6 +36,8 @@ L3, and neither side has to ask which.
 
 from __future__ import annotations
 
+from typing import Any, NamedTuple
+
 import msgspec
 
 # Byte order identity, recorded in the L3 namespace digest. Bump when the axis
@@ -150,3 +152,49 @@ class PageUnifiedLayout(msgspec.Struct, frozen=True, kw_only=True):
             )
         offset = head_group * self.head_group_bytes + start * self.layer_bytes
         return offset, (end - start) * self.layer_bytes
+
+
+class KVHostGeometry(NamedTuple):
+    target_layer_num: int
+    page_unified_layout: PageUnifiedLayout | None
+
+
+def resolve_kv_host_geometry(
+    kv_pool: Any,
+    *,
+    page_size: int,
+    layout: str,
+    use_mla: bool,
+    draft_layer_num: int = 0,
+    override_kv_cache_dim: int | None = None,
+) -> KVHostGeometry:
+    """Resolve physical host/staging dimensions, independent of capacity and keys.
+
+    ``page_size`` is physical, including under DCP. Uneven MLA layer shards
+    reserve the largest shard's layer count; packed drafts follow that reserve.
+    """
+    target_layer_num = kv_pool.layer_num
+    if use_mla and kv_pool.layer_shard_enabled:
+        target_layer_num = (
+            target_layer_num + kv_pool.layer_shard_size - 1
+        ) // kv_pool.layer_shard_size
+    if layout != "page_unified":
+        return KVHostGeometry(target_layer_num, None)
+
+    from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
+
+    info = kv_pool.get_device_pool_infos()[0].buffer_info
+    return KVHostGeometry(
+        target_layer_num,
+        PageUnifiedLayout(
+            page_size=page_size,
+            layer_num=target_layer_num + draft_layer_num,
+            head_num=1 if use_mla else info.head_num,
+            head_group_num=1 if use_mla else resolve_head_group_num(info.head_num),
+            head_dim=(override_kv_cache_dim or info.kv_cache_dim)
+            if use_mla
+            else info.head_dim,
+            itemsize=info.dtype.itemsize,
+            is_mla=use_mla,
+        ),
+    )

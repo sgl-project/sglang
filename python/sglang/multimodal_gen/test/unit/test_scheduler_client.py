@@ -2,17 +2,24 @@ import asyncio
 import pickle
 import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime import ipc_array
 from sglang.multimodal_gen.runtime.distributed.ipc_cuda import CudaIpcRef
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReleaseRealtimeSessionReq,
+)
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClient,
@@ -21,6 +28,88 @@ from sglang.multimodal_gen.runtime.scheduler_client import (
 )
 from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_S
 from sglang.srt.utils.network import get_free_port
+
+
+@pytest.mark.parametrize("client_type", [SchedulerClient, AsyncSchedulerClient])
+def test_session_release_reaches_owner_over_zmq(client_type):
+    async def run_test():
+        context = zmq.asyncio.Context()
+        servers = [context.socket(zmq.REP) for _ in range(2)]
+        endpoints = [
+            f"tcp://127.0.0.1:{server.bind_to_random_port('tcp://127.0.0.1')}"
+            for server in servers
+        ]
+        caches = [RealtimeSessionCache() for _ in servers]
+        client = client_type()
+        client.context = (
+            zmq.Context() if client_type is SchedulerClient else zmq.asyncio.Context()
+        )
+        client.server_args = SimpleNamespace(
+            scheduler_endpoints=endpoints, scheduler_rpc_timeout=2
+        )
+        client.request_logger = MagicMock()
+
+        async def serve(replica):
+            socket, cache = servers[replica], caches[replica]
+            while True:
+                request = await socket.recv_pyobj()
+                released = None
+                if isinstance(request, ReleaseRealtimeSessionReq):
+                    released = cache.release(request.session_id)
+                else:
+                    for req in request:
+                        cache.attach(req)
+                await socket.send_pyobj(
+                    OutputBatch(output={"replica": replica, "released": released})
+                )
+
+        async def forward(request):
+            if client_type is SchedulerClient:
+                return await asyncio.to_thread(client.forward, request)
+            return await client.forward(request)
+
+        tasks = [asyncio.create_task(serve(replica)) for replica in range(2)]
+        try:
+            owners = set()
+            for index in range(16):
+                session_id = f"session-{index}"
+                chunks = [
+                    await forward(
+                        [
+                            Req(
+                                prompt="a pear",
+                                realtime_session_id=session_id,
+                                block_idx=block,
+                            )
+                        ]
+                    )
+                    for block in range(2)
+                ]
+                owner = chunks[0].output["replica"]
+                owners.add(owner)
+                assert chunks[1].output["replica"] == owner
+
+                # unrelated traffic must not change session cleanup ownership
+                ordinary = await forward([Req(prompt="a pear")])
+                assert ordinary.output["replica"] == index % 2
+                for expected_released in (True, False):
+                    release = await forward(ReleaseRealtimeSessionReq(session_id))
+                    assert release.output == {
+                        "replica": owner,
+                        "released": expected_released,
+                    }
+                assert all(not cache._sessions for cache in caches)
+            assert owners == {0, 1}
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            client.close()
+            for server in servers:
+                server.close(linger=0)
+            context.destroy(linger=0)
+
+    asyncio.run(asyncio.wait_for(run_test(), timeout=30))
 
 
 @pytest.mark.parametrize(
@@ -287,6 +376,93 @@ def test_broker_closes_socket_and_context(monkeypatch, failure):
 
         socket.close.assert_called_once_with(linger=0)
         context.destroy.assert_called_once_with(linger=0)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("sync", [False, True])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "bad_pickle",
+        "bad_array",
+        "timeout_before",
+        "timeout_after",
+        "cancel_before",
+        "cancel_after",
+    ],
+)
+def test_reply_file_lifetime(monkeypatch, tmp_path, sync, outcome):
+    if sync and outcome.startswith("cancel"):
+        pytest.skip("sync callers use a transport timeout, not asyncio cancellation")
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(ipc_array, "_MIN_FILE_REF_BYTES", 16)
+
+    async def run_test():
+        context = zmq.asyncio.Context()
+        server = context.socket(zmq.ROUTER)
+        port = server.bind_to_random_port("tcp://127.0.0.1")
+        client = SchedulerClient() if sync else AsyncSchedulerClient()
+        client.context = zmq.Context() if sync else zmq.asyncio.Context()
+        client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+        endpoint = f"tcp://127.0.0.1:{port}"
+        args = (endpoint, {}, 1000)
+        request = asyncio.create_task(
+            asyncio.to_thread(client._forward_one, *args)
+            if sync
+            else client._forward_one(*args)
+        )
+        try:
+            identity, _, _ = await asyncio.wait_for(server.recv_multipart(), 5)
+            assert list(tmp_path.iterdir())
+            expected = np.arange(16, dtype=np.uint8)
+
+            async def finish():
+                if outcome.startswith("cancel"):
+                    request.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await request
+                elif outcome.startswith("timeout"):
+                    with pytest.raises(TimeoutError):
+                        await request
+                elif outcome == "success":
+                    result = await request
+                    assert all(np.array_equal(item, expected) for item in result.output)
+                else:
+                    with pytest.raises((ValueError, pickle.UnpicklingError)):
+                        await request
+                assert not list(tmp_path.iterdir())
+
+            if outcome.endswith("before"):
+                await finish()
+                assert (
+                    ipc_array.spill_large_arrays_to_file_refs(expected, identity)
+                    is expected
+                )
+            else:
+                output = OutputBatch(
+                    output=ipc_array.spill_large_arrays_to_file_refs(
+                        [expected] * 2, identity
+                    )
+                )
+                assert len(list(tmp_path.rglob("*.npy"))) == 2
+                if outcome == "bad_array":
+                    Path(output.output[0].path).write_bytes(b"bad npy file")
+                if outcome in {"success", "bad_pickle", "bad_array"}:
+                    payload = (
+                        b"bad pickle"
+                        if outcome == "bad_pickle"
+                        else pickle.dumps(output)
+                    )
+                    await server.send_multipart([identity, b"", payload])
+                await finish()
+        finally:
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+            server.close(linger=0)
+            context.destroy(linger=0)
+            client.close()
 
     asyncio.run(run_test())
 
