@@ -13,11 +13,16 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.eplb.eplb_manager import get_routed_experts_weights_of_layer
+from sglang.srt.eplb.expert_location_updater import _log_p2p_op_metrics
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
+from sglang.srt.models import glm5_next as glm5_next_module
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+from sglang.srt.models.glm5_next import _collect_stage_routed_experts_weights
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import LazyValue
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -33,10 +38,79 @@ class _FakeExpertParam(nn.Module):
         self.global_scale._sglang_require_global_experts = True
 
 
+class _HashForbiddenParameter(nn.Parameter):
+    def __hash__(self):
+        raise AssertionError("EPLB weight discovery must not hash expert parameters")
+
+
+class _FakeMoE(nn.Module):
+    def __init__(self, *, num_fused_shared_experts: int):
+        super().__init__()
+        self.num_fused_shared_experts = num_fused_shared_experts
+        self.experts = _FakeExpertParam()
+
+
+class _FakeGlmMoE(nn.Module):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def get_moe_weights(self):
+        return self.value
+
+
 class TestWaterfillEPLB(CustomTestCase):
+    def test_eplb_metrics_map_global_peers_to_stage_local_slots(self):
+        op = SimpleNamespace(
+            op=torch.distributed.isend,
+            peer=3,
+            tensor=torch.ones(2, dtype=torch.float32),
+        )
+
+        with self.assertLogs(
+            "sglang.srt.eplb.expert_location_updater", level="INFO"
+        ) as logs:
+            _log_p2p_op_metrics(
+                [(0, [op])],
+                peer_ranks=(2, 3),
+                rank_to_node=(5, 5),
+                self_node_id=5,
+            )
+
+        self.assertIn("isend_nbytes_of_gpu=[0, 8]", logs.output[0])
+        self.assertIn("isend_nbytes_of_node=[8]", logs.output[0])
+
+    def test_glm5_weight_collection_skips_pp_missing_layers(self):
+        expected = [torch.ones(1)]
+        local_layer = SimpleNamespace(mlp=_FakeGlmMoE(expected))
+        model = SimpleNamespace(
+            start_layer=1,
+            end_layer=2,
+            layers=[nn.Module(), local_layer, nn.Module()],
+        )
+
+        with patch.object(glm5_next_module, "Glm5NextMoE", _FakeGlmMoE):
+            actual = _collect_stage_routed_experts_weights(model)
+
+        self.assertEqual(actual, {1: expected})
+
+    def test_eplb_weight_map_resolver_materializes_private_lazy_value(self):
+        model = nn.Module()
+        expected = {3: [torch.ones(1)]}
+        model._routed_experts_weights_of_layer = LazyValue(lambda: expected)
+
+        self.assertIs(get_routed_experts_weights_of_layer(model), expected)
+
+    def test_lazy_value_materialize_preserves_creator_attribute_error(self):
+        def fail():
+            raise AttributeError("original creator failure")
+
+        with self.assertRaisesRegex(AttributeError, "original creator failure"):
+            LazyValue(fail).materialize()
+
     def test_deepseek_moe_get_moe_weights_excludes_fused_shared_slot(self):
-        experts = _FakeExpertParam()
-        moe = SimpleNamespace(num_fused_shared_experts=1, experts=experts)
+        moe = _FakeMoE(num_fused_shared_experts=1)
+        experts = moe.experts
         shared_before = experts.weight.data[-1].clone()
 
         weights = DeepseekV2MoE.get_moe_weights(moe)
@@ -52,12 +126,25 @@ class TestWaterfillEPLB(CustomTestCase):
         self.assertTrue(torch.equal(experts.weight.data[-1], shared_before))
 
     def test_deepseek_moe_get_moe_weights_keeps_full_shape_without_fusion(self):
-        experts = _FakeExpertParam()
-        moe = SimpleNamespace(num_fused_shared_experts=0, experts=experts)
+        moe = _FakeMoE(num_fused_shared_experts=0)
+        experts = moe.experts
         weights = DeepseekV2MoE.get_moe_weights(moe)
 
         self.assertEqual(len(weights), 1)
         self.assertEqual(weights[0].shape, (experts.num_local_experts, 2))
+
+    def test_deepseek_moe_get_moe_weights_ignores_module_back_reference(self):
+        """EPLB discovery must avoid module traversal and parameter hashing."""
+
+        moe = _FakeMoE(num_fused_shared_experts=0)
+        experts = moe.experts
+        experts.add_module("runner_layer", experts)
+        experts.weight = _HashForbiddenParameter(experts.weight.detach())
+
+        weights = DeepseekV2MoE.get_moe_weights(moe)
+
+        self.assertEqual(len(weights), 1)
+        self.assertEqual(weights[0].data_ptr(), experts.weight.data.data_ptr())
 
     def test_topk_recorder_ids_exclude_per_rank_fused_shared_slots(self):
         topk_ids = torch.tensor([[0, 33, 263, 256]], dtype=torch.int32)

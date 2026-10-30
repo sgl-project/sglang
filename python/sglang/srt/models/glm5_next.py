@@ -149,6 +149,16 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
+def _collect_stage_routed_experts_weights(model):
+    """Collect only the MoE layers materialized on this pipeline stage."""
+
+    return {
+        layer_id: model.layers[layer_id].mlp.get_moe_weights()
+        for layer_id in range(model.start_layer, model.end_layer)
+        if isinstance(model.layers[layer_id].mlp, Glm5NextMoE)
+    }
+
+
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -1298,11 +1308,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: (
-                {
-                    layer_id: layer.mlp.get_moe_weights()
-                    for layer_id, layer in enumerate(self.model.layers)
-                    if isinstance(layer.mlp, Glm5NextMoE)
-                }
+                _collect_stage_routed_experts_weights(self.model)
                 if self.model is not None
                 else {}
             )
@@ -1338,7 +1344,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     @property
     def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
+        # Use the explicit method so an AttributeError raised while discovering
+        # expert weights is not masked by LazyValue.__getattr__ recursion.
+        return self._routed_experts_weights_of_layer.materialize()
 
     @property
     def start_layer(self):
