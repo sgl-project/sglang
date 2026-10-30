@@ -49,7 +49,8 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: false, fp8: true }
     },
     '8b': {
       baseName: '8B',
@@ -73,7 +74,8 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '1.7b': {
       baseName: '1.7B',
@@ -85,7 +87,8 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '0.6b': {
       baseName: '0.6B',
@@ -97,7 +100,8 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: true, fp8: true }
     }
   };
 
@@ -173,11 +177,12 @@ export const Qwen3Deployment = () => {
     const currentModelConfig = modelConfigs[values.modelsize];
 
     if (values.hardware === 'arc_b') {
+      const arcBConfig = currentModelConfig && currentModelConfig.arc_b;
       options.quantization = {
         ...baseOptions.quantization,
         items: baseOptions.quantization.items.map(item => ({
           ...item,
-          disabled: item.id !== 'bf16'
+          disabled: !arcBConfig || !arcBConfig[item.id]
         }))
       };
 
@@ -185,7 +190,7 @@ export const Qwen3Deployment = () => {
         ...baseOptions.modelsize,
         items: baseOptions.modelsize.items.map(item => ({
           ...item,
-          disabled: item.id !== '30b' && item.id !== '32b'
+          disabled: !modelConfigs[item.id].arc_b
         }))
       };
     }
@@ -242,10 +247,24 @@ export const Qwen3Deployment = () => {
       const newValues = { ...prev, [optionName]: value };
 
       if (optionName === 'hardware' && value === 'arc_b') {
-        newValues.quantization = 'bf16';
-        if (newValues.modelsize !== '30b' && newValues.modelsize !== '32b') {
+        if (!modelConfigs[newValues.modelsize].arc_b) {
           newValues.modelsize = '32b';
         }
+        const arcBConfig = modelConfigs[newValues.modelsize].arc_b;
+        if (!arcBConfig[newValues.quantization]) {
+          newValues.quantization = arcBConfig.bf16 ? 'bf16' : 'fp8';
+        }
+        newValues.category = 'base';
+      }
+
+      if (newValues.hardware === 'arc_b' && optionName === 'modelsize') {
+        const arcBConfig = modelConfigs[value].arc_b;
+        if (!arcBConfig[newValues.quantization]) {
+          newValues.quantization = arcBConfig.bf16 ? 'bf16' : 'fp8';
+        }
+      }
+
+      if (newValues.hardware === 'arc_b' && ['14b', '4b', '1.7b', '0.6b'].includes(newValues.modelsize)) {
         newValues.category = 'base';
       }
 
@@ -271,7 +290,8 @@ export const Qwen3Deployment = () => {
   // Generate command
   const generateCommand = () => {
     const { hardware, modelsize, quantization, category, reasoningParser, toolcall } = values;
-    const effectiveQuantization = hardware === 'arc_b' ? 'bf16' : quantization;
+    const isArcBNewModel = hardware === 'arc_b' && ['14b', '4b', '1.7b', '0.6b'].includes(modelsize);
+    const effectiveQuantization = hardware === 'arc_b' && !isArcBNewModel ? 'bf16' : quantization;
 
     // Special error handling
     const commandKey = `${hardware}-${modelsize}-${effectiveQuantization}-${category}`;
@@ -312,6 +332,9 @@ export const Qwen3Deployment = () => {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     } else if (hardware === 'arc_b') {
       cmd += ` \\\n  --device xpu`;
+      if (isArcBNewModel) {
+        cmd += ` \\\n  --attention-backend intel_xpu`;
+      }
     }
 
     if (hwConfig.tp > 1) {
@@ -334,7 +357,9 @@ export const Qwen3Deployment = () => {
 
     // Add tool call parser
     if (toolcall === 'enabled') {
-      cmd += ' \\\n  --tool-call-parser qwen25';
+      cmd += isArcBNewModel
+        ? ' \\\n  --tool-call-parser qwen'
+        : ' \\\n  --tool-call-parser qwen25';
     }
 
     if (hardware === 'b300') {

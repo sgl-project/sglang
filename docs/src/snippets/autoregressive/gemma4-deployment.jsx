@@ -132,6 +132,8 @@ export const Gemma4Deployment = () => {
     let cmd = `sglang serve --model-path ${modelPath}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (isArcBStandalone) {
+      cmd += ` \\\n  --device xpu \\\n  --attention-backend intel_xpu \\\n  --linear-attn-backend intel_xpu \\\n  --tp-size 1`;
     }
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;

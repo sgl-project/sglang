@@ -7,7 +7,8 @@ export const GLMOCRDeployment = () => {
       items: [
         { id: 'h100', label: 'H100', default: true },
         { id: 'h200', label: 'H200', default: false },
-        { id: 'b200', label: 'B200', default: false }
+        { id: 'b200', label: 'B200', default: false },
+        { id: 'arc_b', label: 'BMG', default: false }
       ]
     },
     strategy: {
@@ -15,7 +16,7 @@ export const GLMOCRDeployment = () => {
       title: 'Deployment Strategy',
       type: 'checkbox',
       items: [
-        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: true }
+        { id: 'mtp', label: 'MTP', subtitle: 'Multi-token Prediction', default: true, disabledWhen: (values) => values.hardware === 'arc_b' }
       ]
     }
   };
@@ -53,11 +54,16 @@ export const GLMOCRDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => ({
+      ...prev,
+      [optionName]: value,
+      ...(optionName === 'hardware' && value === 'arc_b' ? { strategy: [] } : {})
+    }));
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
     setValues(prev => {
+      if (prev.hardware === 'arc_b' && itemId === 'mtp' && isChecked) return prev;
       const currentValues = prev[optionName] || [];
       if (isChecked) {
         return { ...prev, [optionName]: [...currentValues, itemId] };
@@ -74,10 +80,18 @@ export const GLMOCRDeployment = () => {
 
     const modelName = 'zai-org/GLM-OCR';
 
-    let cmd = 'SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \\\n';
+    const isArcB = values.hardware === 'arc_b';
+    let cmd = isArcB
+      ? 'python -m sglang.launch_server \\\n'
+      : 'SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
-    if (strategyArray.includes('mtp')) {
+    if (isArcB) {
+      cmd += ` \\\n  --device xpu`;
+      cmd += ` \\\n  --attention-backend intel_xpu`;
+    }
+
+    if (!isArcB && strategyArray.includes('mtp')) {
       cmd += ` \\\n  --speculative-algorithm EAGLE`;
       cmd += ` \\\n  --speculative-num-steps 3`;
       cmd += ` \\\n  --speculative-eagle-topk 1`;
@@ -107,7 +121,7 @@ export const GLMOCRDeployment = () => {
             {option.type === 'checkbox' ? (
               option.items.map(item => {
                 const isChecked = (values[option.name] || []).includes(item.id);
-                const isDisabled = item.required;
+                const isDisabled = item.required || (item.disabledWhen && item.disabledWhen(values));
                 return (
                   <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
                     <input type="checkbox" checked={isChecked} disabled={isDisabled} onChange={(e) => handleCheckboxChange(option.name, item.id, e.target.checked)} style={{ display: 'none' }} />
