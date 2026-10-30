@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -718,6 +719,7 @@ def eagle_sample(
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
             target_predict=target_predict,
             topk=verify_input.tree_topk,
+            is_ngram=verify_input.spec_input_type == SpecInputType.NGRAM_VERIFY,
         )
 
         if _is_hip:

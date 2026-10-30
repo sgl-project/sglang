@@ -240,7 +240,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if forward_batch.needs_forward_metadata_init():
+        # NGRAM's tree mask changes even when the batch was already planned.
+        if (
+            forward_batch.needs_forward_metadata_init()
+            or self.model_runner.spec_algorithm.is_ngram()
+        ):
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             if not self.model_runner.spec_algorithm.is_dflash():
@@ -374,11 +378,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
-                # replay; other algorithms keep the capture-time list, so
+                # DFlash and NGRAM refresh seq_lens_cpu_list at replay.
+                # Other algorithms keep the capture-time list, so
                 # recompute from the live batch as before — reading the
                 # backend list there would replay stale capture-time lengths.
-                if self.model_runner.spec_algorithm.is_dflash():
+                if (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    or self.model_runner.spec_algorithm.is_ngram()
+                ):
                     _attn = self._replay_attn_backend()
                     _meta = getattr(_attn, "forward_metadata", None)
                     _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
@@ -387,7 +394,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 if _meta_list is not None:
                     # graph.update must carry the exact KV length already
                     # computed in forward_metadata.seq_lens_cpu_list (it
-                    # already includes the draft block for DFlash); do not
+                    # already includes the draft block); do not
                     # recompute and double-add here.
                     seq_lens = list(_meta_list)
                 else:

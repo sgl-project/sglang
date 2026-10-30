@@ -69,6 +69,13 @@ def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
     )
 
 
+def _is_ngram_verify(spec_info: Optional[SpecInput]) -> bool:
+    return (
+        spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.NGRAM_VERIFY
+    )
+
+
 def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
     if topk_indices.dim() == 2:
@@ -119,6 +126,8 @@ class ForwardMetadata:
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
+
+    ngram_attn_mask: Optional[torch.Tensor] = None
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
@@ -406,6 +415,22 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
         self.is_hybrid_swa = model_runner.is_hybrid_swa
+        if model_runner.spec_algorithm.is_ngram():
+            unsupported = []
+            if self.is_hybrid_swa or (
+                model_runner.model_config.linear_attn_registry_result is not None
+            ):
+                unsupported.append("sliding-window or linear attention")
+            if getattr(self.token_to_kv_pool, "index_head_dim", None) is not None:
+                unsupported.append("sparse indexed attention")
+            if getattr(self, "use_alibi", False):
+                unsupported.append("ALiBi")
+            if self.kv_cache_dtype not in (torch.float16, torch.bfloat16):
+                unsupported.append(f"{self.kv_cache_dtype} KV cache")
+            if unsupported:
+                raise ValueError(
+                    "NGRAM on Ascend does not support " + ", ".join(unsupported) + "."
+                )
         if self.is_hybrid_swa:
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
@@ -419,7 +444,7 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia:
+            if self.use_fia or model_runner.spec_algorithm.is_ngram():
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
@@ -590,6 +615,20 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices, :: self.page_size
                 ]
                 // self.page_size
+            )
+        if (
+            _is_ngram_verify(forward_batch.spec_info)
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sgl_kernel_npu.attention.ngram_attention import (
+                build_ngram_attention_mask,
+            )
+
+            self.forward_metadata.ngram_attn_mask = build_ngram_attention_mask(
+                forward_batch.spec_info.custom_mask,
+                forward_batch.seq_lens,
+                int(forward_batch.spec_info.draft_token_num),
+                self.forward_metadata.block_tables.shape[1] * self.page_size,
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
@@ -1103,6 +1142,32 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+
+        if _is_ngram_verify(spec_info):
+            from sgl_kernel_npu.attention.ngram_attention import (
+                build_ngram_attention_mask,
+            )
+
+            d = int(spec_info.draft_token_num)
+            kv_len = metadata.block_tables.shape[1] * self.page_size
+            if metadata.ngram_attn_mask is None:
+                # Allocate once per graph bucket; replay updates this storage.
+                metadata.ngram_attn_mask = torch.empty(
+                    (bs, 1, d, kv_len), dtype=torch.bool, device=self.device
+                )
+            # A live batch can have fewer requests than its captured bucket.
+            # Block every key for padding rows and expand only the live trees.
+            mask_bs = min(bs, spec_info.custom_mask.numel() // (d * d))
+            metadata.ngram_attn_mask.fill_(True)
+            metadata.ngram_attn_mask[:mask_bs].copy_(
+                build_ngram_attention_mask(
+                    spec_info.custom_mask[: mask_bs * d * d],
+                    seq_lens[:mask_bs] - d,
+                    d,
+                    kv_len,
+                )
+            )
+            metadata.seq_lens_cpu_list = attention_kv_lens_cpu.tolist()
 
         self.forward_metadata = metadata
 
@@ -2461,6 +2526,23 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        """Share KV preparation and FIA dispatch for MTP and NGRAM verification."""
+        is_ngram = _is_ngram_verify(forward_batch.spec_info)
+        if is_ngram and (
+            layer.sliding_window_size != -1
+            or layer.attn_type != AttentionType.DECODER
+            or layer.logit_cap != 0
+            or sinks is not None
+        ):
+            raise ValueError(
+                "NGRAM on Ascend requires full decoder attention without "
+                "attention sinks or logit capping."
+            )
+        draft_tokens = (
+            int(forward_batch.spec_info.draft_token_num)
+            if is_ngram
+            else self.speculative_num_draft_tokens
+        )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -2495,7 +2577,7 @@ class AscendAttnBackend(AttentionBackend):
                 # operator's batchSize (TND layout); only target_verify has a
                 # uniform per-request width.
                 if forward_batch.forward_mode.is_target_verify():
-                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
+                    real_bs = query.shape[0] // draft_tokens
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph mode: bind the Python list, which graph.update can
@@ -2522,9 +2604,9 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
-                    self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens + query.shape[0],
-                    self.speculative_num_draft_tokens,
+                    draft_tokens,
+                    draft_tokens + query.shape[0],
+                    draft_tokens,
                 )
 
             if not self.graph_mode:
@@ -2548,7 +2630,17 @@ class AscendAttnBackend(AttentionBackend):
                 # Drop DP padding rows (see real_bs comment above).
                 block_table = block_table[:real_bs]
 
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
+            input_layout = "TND"
+            if is_ngram:
+                # The paged MHA TND split-fuse path only accepts causal masks.
+                input_layout = "BSH"
+                query = query.reshape(
+                    -1, draft_tokens, layer.tp_q_head_num * layer.qk_head_dim
+                )
+                actual_seq_lengths = [draft_tokens] * query.shape[0]
+                mask = self.forward_metadata.ngram_attn_mask
+                sparse_mode = 0
+            elif layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
                 sparse_mode = 0
             else:
@@ -2564,7 +2656,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     num_query_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     atten_mask=mask,
                     softmax_scale=layer.scaling,
                     actual_seq_qlen=actual_seq_lengths,
@@ -2587,7 +2679,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
-                    input_layout="TND",
+                    input_layout=input_layout,
                     atten_mask=mask,
                     scale=layer.scaling,
                     actual_seq_lengths=actual_seq_lengths,
@@ -2642,9 +2734,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             actual_seq_lengths = np.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens + q_nope.shape[0],
-                self.speculative_num_draft_tokens,
+                draft_tokens,
+                draft_tokens + q_nope.shape[0],
+                draft_tokens,
             )
 
             # When not in graph_mode, query is sliced to num_token_non_padded
@@ -2658,6 +2750,14 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables
 
             if (
+                is_ngram
+                and self.q_head_num_padding is not None
+                and self.q_head_num_padding > self.tp_q_head_num
+            ):
+                padding = self.q_head_num_padding - self.tp_q_head_num
+                q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, padding))
+                q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, padding))
+            elif (
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
             ):
@@ -2690,12 +2790,14 @@ class AscendAttnBackend(AttentionBackend):
                 q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
                 q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
+            mask = self.forward_metadata.ngram_attn_mask if is_ngram else self.mtp_mask
+            sparse_mode = 0 if is_ngram else 3
             num_query_heads = q_nope.shape[1]
             if self.use_fias_v2_bsnd:
                 # The existing paged MLA cache is [block, KV_N, page, D].
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
-                query_seq_len = self.speculative_num_draft_tokens
+                query_seq_len = draft_tokens
                 assert q_nope.shape[0] == batch_size * query_seq_len, (
                     "FIAS V2 target verify requires one fixed draft block per request"
                 )
@@ -2734,8 +2836,8 @@ class AscendAttnBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=sparse_mode,
+                        atten_mask=mask,
                         actual_seq_qlen=[query_seq_len] * batch_size,
                         actual_seq_kvlen=actual_seq_lengths_kv,
                         pre_tokens=FULL_ATTENTION_WINDOW,
@@ -2762,8 +2864,8 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=sparse_mode,
+                        atten_mask=mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
                     )
@@ -2784,8 +2886,8 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=sparse_mode,
+                    atten_mask=mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     workspace=workspace,
@@ -2795,6 +2897,7 @@ class AscendAttnBackend(AttentionBackend):
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
+                and forward_batch.global_num_token_non_padded_cpu is not None
                 and forward_batch.global_num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(
