@@ -1,7 +1,7 @@
 // KDA chain spec-verify for gfx950 with the ReplaySSM ring: causal conv1d (width 4) on the packed
 // q|k|v input, the gated delta-rule recurrence over the T verify tokens and the ring / conv-window
 // writes, in one wave per (V tile, request, head). Same contract as the Triton
-// fused_kda_conv_gating_verify with cache_ring=True and no per-step state snapshots.
+// fused_kda_conv_gating_verify: with kSnap, no ring and a per-step state snapshot instead.
 //
 // Phase 1 computes everything that does not depend on the recurrent state for all T tokens at
 // once (conv outputs rounded to bf16, q/k l2 norms, gate decays, beta) into LDS and writes the
@@ -47,6 +47,7 @@ struct KdaVerifyParams {
   uint16_t* __restrict__ rawk;                 // [slots, H, L, K] bf16
   float* __restrict__ ring_g;                  // [slots, HV, L, K]
   float* __restrict__ ring_beta;               // [slots, HV, L]
+  float* __restrict__ snap;                    // [rows, steps, HV, V, K]; row = window_indices[i_n]
   uint16_t* __restrict__ o;                    // [seq_len, HV, V] bf16
   int64_t stride_x_tok;
   int64_t stride_w_dim;
@@ -62,6 +63,8 @@ struct KdaVerifyParams {
   int64_t stride_rawk_slot;
   int64_t stride_g_slot;
   int64_t stride_beta_slot;
+  int64_t stride_snap_row;
+  int64_t stride_snap_step;
   float scale;
   float lower_bound;
   float softplus_beta;
@@ -199,7 +202,7 @@ SGL_DEVICE void conv_octet(const uint4 (&hist)[4], const float4 (&w)[8], const f
 
 // Block = 4 waves sharing one head's state-independent work (phase 1) for 4 * BV value columns;
 // each wave then runs the serial recurrence on its own [K, BV] state tile (phase 2).
-template <int kBV, int kT, bool kLowerBound, bool kHasBias>
+template <int kBV, int kT, bool kLowerBound, bool kHasBias, bool kSnap>
 __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_constant__ KdaVerifyParams p) {
   constexpr int K = kKdaK;
   constexpr int V = kKdaV;
@@ -408,12 +411,21 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
     }
     const float o_sum = group_sum<LPC>(o0 + o1);
     if (j == 0) p.o[((bos + t) * H + hv) * V + col] = f32_to_bf16(o_sum);
+    if constexpr (kSnap) {
+      if (widx >= 0) {
+        float* sp = p.snap + widx * p.stride_snap_row + t * p.stride_snap_step +
+                    (static_cast<int64_t>(hv) * V + col) * K + r0;
+#pragma unroll
+        for (int i = 0; i < KR; i += 4)
+          store_as<float4>(sp + i, make_float4(h[i], h[i + 1], h[i + 2], h[i + 3]));
+      }
+    }
   }
 }
 
 }  // namespace kda_verify_detail
 
-template <int kBV, int kT, bool kLowerBound, bool kHasBias>
+template <int kBV, int kT, bool kLowerBound, bool kHasBias, bool kSnap>
 struct KdaVerifyGfx950Kernel {
   static void
   run(const tvm::ffi::TensorView x,
@@ -432,6 +444,7 @@ struct KdaVerifyGfx950Kernel {
       const tvm::ffi::TensorView rawk,
       const tvm::ffi::TensorView ring_g,
       const tvm::ffi::TensorView ring_beta,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> snap,
       const tvm::ffi::TensorView o,
       const int64_t num_heads,
       const double scale,
@@ -459,6 +472,14 @@ struct KdaVerifyGfx950Kernel {
     RuntimeCheck(
         rawv.stride(2) == kKdaV && rawk.stride(2) == kKdaK && ring_g.stride(2) == kKdaK,
         "ring rows must be contiguous");
+    if constexpr (kSnap) {
+      RuntimeCheck(snap.has_value(), "the snapshot variant needs the intermediate state buffer");
+      const tvm::ffi::TensorView sv = snap.value();
+      RuntimeCheck(
+          sv.stride(4) == 1 && sv.stride(3) == kKdaK && sv.stride(2) == kKdaK * kKdaV && sv.size(1) >= kT,
+          "snapshots must be [rows, steps >= T, HV, V, K] with contiguous heads");
+      RuntimeCheck(rawv.size(2) == 0, "the snapshot variant writes no ring");
+    }
     if (batch == 0) return;
     const KdaVerifyParams params{
         .x = static_cast<const uint16_t*>(x.data_ptr()),
@@ -477,6 +498,7 @@ struct KdaVerifyGfx950Kernel {
         .rawk = static_cast<uint16_t*>(rawk.data_ptr()),
         .ring_g = static_cast<float*>(ring_g.data_ptr()),
         .ring_beta = static_cast<float*>(ring_beta.data_ptr()),
+        .snap = kSnap ? static_cast<float*>(snap.value().data_ptr()) : nullptr,
         .o = static_cast<uint16_t*>(o.data_ptr()),
         .stride_x_tok = x.stride(0),
         .stride_w_dim = conv_w.stride(0),
@@ -492,6 +514,8 @@ struct KdaVerifyGfx950Kernel {
         .stride_rawk_slot = rawk.stride(0),
         .stride_g_slot = ring_g.stride(0),
         .stride_beta_slot = ring_beta.stride(0),
+        .stride_snap_row = kSnap ? snap.value().stride(0) : 0,
+        .stride_snap_step = kSnap ? snap.value().stride(1) : 0,
         .scale = static_cast<float>(scale),
         .lower_bound = static_cast<float>(lower_bound),
         .softplus_beta = static_cast<float>(softplus_beta),
@@ -500,7 +524,7 @@ struct KdaVerifyGfx950Kernel {
         .ring_len = static_cast<int32_t>(rawv.size(2)),
     };
     const dim3 grid(kKdaV / (kWaves * kBV), static_cast<uint32_t>(batch * num_heads));
-    LaunchKernel(grid, kBlock, x.device())(kda_verify_gfx950_kernel<kBV, kT, kLowerBound, kHasBias>, params);
+    LaunchKernel(grid, kBlock, x.device())(kda_verify_gfx950_kernel<kBV, kT, kLowerBound, kHasBias, kSnap>, params);
   }
 };
 

@@ -1,7 +1,7 @@
-"""KDA chain spec-verify on gfx950 with the ReplaySSM ring, in one HIP kernel.
+"""KDA chain spec-verify on gfx950 in one HIP kernel.
 
-Conv1d, recurrence, ring and conv-window writes all run in
-csrc/attention/kda_verify_gfx950.cuh. Takes the arguments of
+Conv1d, recurrence, conv-window writes and either the ReplaySSM ring or the per-step
+state snapshots run in csrc/attention/kda_verify_gfx950.cuh. Takes the arguments of
 ``fused_kda_conv_gating_verify`` so the KDA backend can dispatch either.
 """
 
@@ -18,8 +18,10 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module(bv: int, t: int, lower_bound: bool, has_bias: bool) -> Module:
-    args = make_cpp_args(bv, t, lower_bound, has_bias)
+def _jit_module(
+    bv: int, t: int, lower_bound: bool, has_bias: bool, snap: bool
+) -> Module:
+    args = make_cpp_args(bv, t, lower_bound, has_bias, snap)
     return load_jit(
         "kda_verify_gfx950",
         *args,
@@ -33,6 +35,15 @@ def _octet_rows(t: torch.Tensor) -> torch.Tensor:
     if t.stride(1) == 1 and t.stride(0) % 8 == 0 and t.data_ptr() % 16 == 0:
         return t
     return t.contiguous()
+
+
+@cache_once
+def _no_ring(device: torch.device) -> tuple[torch.Tensor, ...]:
+    # Zero-length ring views for the snapshot variant: ring_len 0 disables every ring store.
+    rows_bf16 = torch.empty((1, 1, 0, 128), dtype=torch.bfloat16, device=device)
+    rows_f32 = torch.empty((1, 1, 0, 128), dtype=torch.float32, device=device)
+    beta = torch.empty((1, 1, 0), dtype=torch.float32, device=device)
+    return rows_bf16, rows_bf16, rows_f32, beta
 
 
 def kda_verify_block_v(batch_size: int) -> int:
@@ -57,9 +68,20 @@ def supports_kda_verify_gfx950(
     intermediate_states_buffer: Optional[torch.Tensor],
     intermediate_conv_window: Optional[torch.Tensor],
 ) -> bool:
-    return (
+    ring = (
         replayssm_rawv is not None
         and intermediate_states_buffer is None
+        and replayssm_rawv.dtype == torch.bfloat16
+    )
+    snapshots = (
+        replayssm_rawv is None
+        and intermediate_states_buffer is not None
+        and intermediate_states_buffer.dtype == torch.float32
+        and intermediate_states_buffer.is_contiguous()
+        and intermediate_states_buffer.shape[1] >= T
+    )
+    return (
+        (ring or snapshots)
         and intermediate_conv_window is not None
         and num_q_heads == num_v_heads
         and head_k_dim == head_v_dim == 128
@@ -68,7 +90,6 @@ def supports_kda_verify_gfx950(
         and a.dtype == b.dtype == torch.bfloat16
         and conv_weight.dtype == torch.float32
         and ssm_states.dtype == torch.float32
-        and replayssm_rawv.dtype == torch.bfloat16
     )
 
 
@@ -106,13 +127,18 @@ def kda_verify_gfx950(
     block_v: Optional[int] = None,
 ) -> torch.Tensor:
     """Returns ``o`` of shape [1, seq_len, HV, V]."""
-    assert cache_ring and use_qk_l2norm_in_kernel and intermediate_states_buffer is None
+    snap = intermediate_states_buffer is not None
+    assert use_qk_l2norm_in_kernel and cache_ring != snap
+    if snap:
+        replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta = _no_ring(
+            mixed_qkv.device
+        )
     seq_len = mixed_qkv.shape[0]
     HV, V = num_v_heads, head_v_dim
     batch_size = seq_len // T
     bv = block_v or kda_verify_block_v(batch_size)
     o = mixed_qkv.new_empty(seq_len, HV, V)
-    module = _jit_module(bv, T, lower_bound is not None, conv_bias is not None)
+    module = _jit_module(bv, T, lower_bound is not None, conv_bias is not None, snap)
     module.run(
         _octet_rows(mixed_qkv),
         conv_weight,
@@ -130,6 +156,7 @@ def kda_verify_gfx950(
         replayssm_rawk,
         replayssm_g,
         replayssm_beta,
+        intermediate_states_buffer,
         o,
         num_q_heads,
         float(scale),

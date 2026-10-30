@@ -1,7 +1,8 @@
-"""HIP KDA chain verify (gfx950, ReplaySSM ring) must match the Triton chain verify.
+"""HIP KDA chain verify (gfx950) must match the Triton chain verify, with the ReplaySSM
+ring or with per-step state snapshots.
 
 Conv windows, v ring rows and beta are bit-identical; k ring rows and gate decays sit
-within an ulp (the HIP gate's fast exp / log); the output is close."""
+within an ulp (the HIP gate's fast exp / log); outputs and snapshots are close."""
 
 import sys
 
@@ -52,7 +53,8 @@ def _inputs(B, H, has_bias, seed):
     )
 
 
-def _run(fn, inp, H, lower_bound):
+def _run(fn, inp, H, lower_bound, snapshots=None):
+    ring = snapshots is None
     return fn(
         mixed_qkv=inp["mixed"],
         conv_weight=inp["w"],
@@ -67,7 +69,7 @@ def _run(fn, inp, H, lower_bound):
         dt_bias=inp["dt_bias"],
         ssm_states=inp["ssm"],
         cache_indices=inp["idx"],
-        intermediate_states_buffer=None,
+        intermediate_states_buffer=snapshots,
         scale=_K**-0.5,
         T=_T,
         num_q_heads=H,
@@ -75,11 +77,11 @@ def _run(fn, inp, H, lower_bound):
         head_k_dim=_K,
         head_v_dim=_K,
         lower_bound=lower_bound,
-        cache_ring=True,
-        replayssm_rawv=inp["rawv"],
-        replayssm_rawk=inp["rawk"],
-        replayssm_g=inp["g"],
-        replayssm_beta=inp["beta"],
+        cache_ring=ring,
+        replayssm_rawv=inp["rawv"] if ring else None,
+        replayssm_rawk=inp["rawk"] if ring else None,
+        replayssm_g=inp["g"] if ring else None,
+        replayssm_beta=inp["beta"] if ring else None,
     )
 
 
@@ -115,6 +117,50 @@ def test_matches_triton_chain_verify(B, H, lower_bound, has_bias):
     rows = valid.repeat_interleave(_T)
     torch.testing.assert_close(
         o_new[0][rows].float(), o_ref[0][rows].float(), rtol=2e-2, atol=2e-3
+    )
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+@pytest.mark.parametrize("B", [1, 3, 8, 24])
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+def test_snapshots_match_triton_chain_verify(B, lower_bound):
+    """Without the ring (the monokernel configs), every step's state must land where the
+    Triton kernel puts it, and a padded row's snapshots must stay untouched."""
+    H = 12
+    ref, new = (_inputs(B, H, False, seed=B * 17 + 5) for _ in range(2))
+    rows = B + 2
+    snaps = [
+        torch.full((rows, _T, H, _K, _K), 7.0, device=_DEVICE, dtype=torch.float32)
+        for _ in range(2)
+    ]
+    assert supports_kda_verify_gfx950(
+        num_q_heads=H,
+        num_v_heads=H,
+        head_k_dim=_K,
+        head_v_dim=_K,
+        T=_T,
+        mixed_qkv=new["mixed"],
+        conv_weight=new["w"],
+        a=new["a"],
+        b=new["b"],
+        ssm_states=new["ssm"],
+        replayssm_rawv=None,
+        intermediate_states_buffer=snaps[1],
+        intermediate_conv_window=new["win"],
+    )
+    o_ref = _run(fused_kda_conv_gating_verify, ref, H, lower_bound, snaps[0])
+    o_new = _run(kda_verify_gfx950, new, H, lower_bound, snaps[1])
+    for name in ("win", "conv", "ssm"):
+        assert torch.equal(ref[name], new[name]), name
+    # The gate decays differ within an ulp and compound over T steps of O(1) states:
+    # 4.8e-5 at most on MI350X (B=24).
+    torch.testing.assert_close(snaps[1], snaps[0], rtol=1e-3, atol=1e-4)
+    valid = ref["idx"] >= 0
+    torch.testing.assert_close(
+        o_new[0][valid.repeat_interleave(_T)].float(),
+        o_ref[0][valid.repeat_interleave(_T)].float(),
+        rtol=2e-2,
+        atol=2e-3,
     )
 
 
