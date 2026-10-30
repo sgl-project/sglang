@@ -189,7 +189,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
 
     def test_rebootstrap_input_len_used_for_capacity(self):
         """Rebootstrap requests carry both prompt and emitted output_ids; the
-        admission gate must use the rebootstrap-aware length (prompt + output)
+        admission gate must use the pre-alloc fill length (prompt + output - 1)
         rather than just the prompt length."""
         queue = _make_prealloc_queue(
             enable_hisparse=True,

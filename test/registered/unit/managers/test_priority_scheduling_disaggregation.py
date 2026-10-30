@@ -784,15 +784,16 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
     def test_rebootstrap_lengths_match_prefill_input(self):
         """The decode KV preallocation and admission length must equal the
         token count the prefill recomputes, with or without emitted output."""
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         for output_ids in ([], [np.int32(3)], [np.int32(3), np.int32(4)]):
             with self.subTest(num_output_ids=len(output_ids)):
                 req = self._new_req()
-                req.output_ids = output_ids
+                req.output_ids = list(output_ids)
 
                 prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
 
-                self.assertEqual(queue._pre_alloc_fill_len(req), prefill_len)
+                self.assertEqual(
+                    DecodePreallocQueue._pre_alloc_fill_len(req), prefill_len
+                )
                 self.assertEqual(req.output_ids, output_ids)
 
 
