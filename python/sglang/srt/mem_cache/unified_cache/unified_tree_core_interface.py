@@ -11,7 +11,6 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
-
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
@@ -132,7 +131,6 @@ class InsertStepResult(msgspec.Struct, frozen=True):
 
 if TYPE_CHECKING:
     import torch
-
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.base_prefix_cache import (
         DecLockRefParams,
@@ -550,6 +548,14 @@ class UnifiedTreeCoreInterface(ABC):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
+        ...
+
+    @abstractmethod
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """Host leaves in the order drive_host_eviction would take them, until
+        their tokens reach num_tokens: (node_id, tokens, hash_value). Read-only."""
         ...
 
     @abstractmethod

@@ -8,7 +8,6 @@ from array import array
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
-
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -863,6 +862,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
         )
         return self._fill_evict_result(binding_result, DriveHostEvictionResult())
+
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        raise NotImplementedError(
+            "SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT needs the python tree core"
+        )
 
     def evict_excess_path_states(
         self,
