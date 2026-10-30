@@ -8,15 +8,16 @@ Verifies the contract that:
      mm_hashes — the property external KV routers depend on.
 
 The wiring step that copies GenerateReqInput.mm_hashes into per-item
-MultimodalDataItem.hash lives in tokenizer_manager.py and is exercised by
-the e2e serve tests; this file pins the unit-level invariants the wiring
-relies on.
+MultimodalDataItem.hash is mm_utils.apply_caller_mm_hashes, called by
+tokenizer_manager.py and the encoder-disaggregation receiver; this file pins
+the unit-level invariants the wiring relies on.
 """
 
 import asyncio
 import pickle
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -24,13 +25,18 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.mm_utils import hash_feature
+from sglang.srt.managers.mm_utils import apply_caller_mm_hashes, hash_feature
 from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
     MultimodalDataItem,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -52,6 +58,39 @@ class TestMmHashesContract(CustomTestCase):
         self.assertEqual(req[0].mm_hashes, ["01"])
         self.assertEqual(req[1].mm_hashes, ["02", "03"])
         self.assertEqual(len(req[1].mm_content_hashes), 2)
+
+    def test_non_string_hashes_fail_normalization_not_scheduler_ipc(self):
+        """mm_hashes reach the scheduler as a typed list of strings, so another
+        shape must fail the request at normalization, not the scheduler decode."""
+        single = GenerateReqInput(text="one", image_data=["a"], mm_hashes=[["01"]])
+        batch = GenerateReqInput(
+            text=["one", "two"], image_data=[["a"], ["b"]], mm_hashes=["01", [2]]
+        )
+        for req in (single, batch):
+            with self.assertRaises(ValueError):
+                req.normalize_batch_and_arguments()
+
+    def test_tokenized_request_carries_mm_hashes_to_scheduler(self):
+        """With zmq_to_scheduler or mooncake the scheduler builds mm_inputs, so
+        the tokenized request must carry mm_hashes to it."""
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(vocab_size=32)
+        req = GenerateReqInput(text="one", image_data=["a"], mm_hashes=["00c0ffee"])
+        req.normalize_batch_and_arguments()
+        manager.rid_to_state = {
+            req.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+        }
+
+        tokenized = manager._create_tokenized_object(
+            obj=req, input_text="one", input_ids=[1, 2]
+        )
+
+        self.assertEqual(tokenized.mm_hashes, ["00c0ffee"])
 
     def test_set_pad_value_honors_preset_hash(self):
         """set_pad_value() must use a pre-set hash without recomputing."""
@@ -79,6 +118,24 @@ class TestMmHashesContract(CustomTestCase):
         expected = MultimodalDataItem(modality=Modality.IMAGE, hash=0xBBBB)
         expected.set_pad_value()
         self.assertEqual(item.padding_values(), expected.padding_values())
+
+    def test_caller_hashes_keep_a_processor_owned_identity(self):
+        """A caller hash must not replace an identity the processor assigned (Kimi)."""
+        owned = MultimodalDataItem(modality=Modality.IMAGE)
+        owned.set_identity(bytes(range(32)))
+        owned_pads = owned.padding_values()
+        plain = MultimodalDataItem(modality=Modality.IMAGE)
+        mm_inputs = SimpleNamespace(mm_items=[owned, plain])
+
+        apply_caller_mm_hashes(
+            mm_inputs=mm_inputs, mm_hashes=["07", "00c0ffee12345678"]
+        )
+
+        self.assertEqual(owned.identity, bytes(range(32)))
+        self.assertEqual(owned.padding_values(), owned_pads)
+        expected = MultimodalDataItem(modality=Modality.IMAGE, hash=0x00C0FFEE12345678)
+        expected.set_pad_value()
+        self.assertEqual(plain.padding_values(), expected.padding_values())
 
     def test_wide_padding_is_shared_by_all_modalities(self):
         expected = (
