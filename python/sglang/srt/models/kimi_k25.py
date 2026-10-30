@@ -26,7 +26,9 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -50,7 +52,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
 )
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_sail
 
 logger = logging.getLogger(__name__)
 
@@ -690,13 +692,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         self.language_model = None
         if not config.encoder_only:
+            # ModelSlim / Quark quant configs match layers by the checkpoint's
+            # full names, so the language model must carry the same prefix.
+            # SAIL's MXFP4 and W8A8-INT8 configs follow the same convention.
+            prefix_config = (ModelSlimConfig, QuarkConfig)
+            if is_sail():
+                prefix_config += (Mxfp4Config, W8A8Int8Config)
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
                 prefix=(
-                    "language_model"
-                    if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
-                    else ""
+                    "language_model" if isinstance(quant_config, prefix_config) else ""
                 ),
             )
 
