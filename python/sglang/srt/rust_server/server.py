@@ -10,17 +10,21 @@ and delegates to it.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import operator
 import os
 import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
+import orjson
 import psutil
 
+from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -41,7 +45,8 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.json_response import ORJSON_RESPONSE_OPTIONS
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
@@ -55,6 +60,25 @@ logger = logging.getLogger(__name__)
 # `hidden_poslens`). A frame without extras that sends a later column pads
 # them empty; `push_generation` asserts the count whenever it sends extras.
 _EXTRAS_HEADER_COLS = 12
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False  # a hostname; assume it resolves beyond this machine
+
+
+def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
+    """Whether every node rendezvoused on this machine (nodes emulated locally)."""
+    if not dist_init_addr:
+        return False
+    try:
+        return _is_loopback(NetworkAddress.parse(dist_init_addr).host)
+    except ValueError:
+        return False
 
 
 class RustServer:
@@ -79,6 +103,9 @@ class RustServer:
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
         self.startup_time: Optional[Dict[str, Any]] = None
+        # Batches whose customized_info could not be sent (see
+        # `_customized_info_json`).
+        self._dropped_customized_info = 0
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
@@ -112,7 +139,8 @@ class RustServer:
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
         model package whose ``_start_multimodal`` starts its own pipeline
-        overrides this to return ``None``."""
+        overrides this to return ``None``; its server admits no generation
+        request until that pipeline starts."""
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
@@ -153,6 +181,59 @@ class RustServer:
         )
 
     @classmethod
+    def _port_offset(cls) -> int:
+        """This listener's offset from the base port based on per-node DP rank."""
+        if get_exec().moe.is_ep_scale_joiner:
+            # The joining TP group is entirely local to this node.
+            tp_size_per_node = get_parallel().tp_size
+        else:
+            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
+            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
+        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
+        if not get_parallel().attn_dp_enabled and get_parallel().dp_size > 1:
+            # Plain DP: one TP group per replica, every leader on this node.
+            return get_parallel().dp_rank
+        return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+
+    @classmethod
+    def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
+        """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0", "::"):
+            # An unspecified bind address is not reachable from another
+            # node; advertise the address the interfaces answer on.
+            host = get_local_ip_auto(fallback="127.0.0.1")
+        # Nodes that rendezvous on loopback share this machine, so a loopback
+        # listener reaches them; otherwise it is a likely misconfiguration.
+        if get_parallel().nnodes > 1 and _is_loopback(host):
+            dist_init_addr = get_parallel().dist_init_addr
+            if not _rendezvous_is_loopback(dist_init_addr):
+                logger.warning(
+                    "SGLANG_RUST_SERVER: this rank listens on loopback %r but the "
+                    "%d nodes rendezvous at %r; a node on another machine cannot "
+                    "reach this rank's control endpoint",
+                    host,
+                    get_parallel().nnodes,
+                    dist_init_addr,
+                )
+        config = None
+        if hosts_listener:
+            port = get_serving().port + cls._port_offset()
+            config = {
+                "dp_rank": select_kv_publisher_dp_rank(
+                    get_parallel().attn_dp_size,
+                    get_parallel().attn_dp_rank,
+                    get_parallel().dp_rank,
+                ),
+                "endpoint": NetworkAddress(host, port).to_url(),
+            }
+        gathered = get_parallel().world_group.all_gather_object(config)
+        return sorted(
+            (entry for entry in gathered if entry is not None),
+            key=lambda entry: entry["dp_rank"],
+        )
+
+    @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
@@ -167,20 +248,11 @@ class RustServer:
         dp_rank = (
             get_parallel().attn_dp_rank if get_parallel().num_dp_ranks > 1 else None
         )
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
-        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        # Count DP leaders within this node's TP range. The first leader must
-        # use the base port even when a DP group spans multiple nodes.
-        local_dp_rank = (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
-        listen_port = get_serving().port + local_dp_rank
+        port_offset = cls._port_offset()
+        listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        launch_cores, server_cores = cls._partition_cores(
+        _, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
@@ -189,8 +261,9 @@ class RustServer:
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback. The listener answers as soon as the server is constructed,
-        # so refuse a model without one first.
+        # fallback. The listener answers as soon as the server is constructed
+        # (a multimodal one admits generation requests once `_start_multimodal`
+        # starts its pool), so refuse a model without one first.
         mm_spec = (
             cls._resolve_multimodal(scheduler)
             if scheduler.model_config.is_multimodal
@@ -207,21 +280,27 @@ class RustServer:
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
-            port_offset=local_dp_rank,
+            port_offset=port_offset,
             **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
 
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
-            # thread still holds the full mask. Narrow it first so every MM thread
+            # thread holds the full mask. Narrow it while the MM threads are
             # created below (the Rust MM workers, and any a model package's
-            # `_start_multimodal` starts) stays off the scheduler's reserved
-            # cores, where MM preprocessing would preempt the scheduler loop and
-            # inflate inter-token latency.
+            # `_start_multimodal` starts) so they stay off the scheduler's
+            # reserved cores, where MM preprocessing would preempt the scheduler
+            # loop and inflate inter-token latency. Then give it back its own
+            # mask: the scheduler thread itself is not pinned, as in the Python
+            # frontend, so a busy neighbour on one core never holds it (and every
+            # TP rank waiting on it at the next collective) in that core's queue.
+            scheduler_cpus = None
             if server_cores is not None:
                 try:
+                    full_mask = os.sched_getaffinity(0)
                     os.sched_setaffinity(0, set(server_cores))
+                    scheduler_cpus = full_mask
                 except OSError as e:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
@@ -229,14 +308,8 @@ class RustServer:
             instance.mm_spec = mm_spec
             instance._start_multimodal(scheduler)
             instance._multimodal_enabled = True
-
-        # Narrow the scheduler thread only after the server threads are launched.
-        if launch_cores is not None:
-            try:
-                # pid 0 == this thread (the scheduler event-loop / launch thread).
-                os.sched_setaffinity(0, set(launch_cores))
-            except OSError as e:
-                logger.warning("rust server: cannot pin scheduler launch thread: %s", e)
+            if scheduler_cpus is not None:
+                os.sched_setaffinity(0, scheduler_cpus)
 
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
@@ -438,7 +511,11 @@ class RustServer:
         self.server.push_health_ack()
 
     def push_generation(
-        self, payload: BatchTokenIDOutput, decode_latencies: Dict[int, float]
+        self,
+        payload: BatchTokenIDOutput,
+        decode_latencies: Dict[int, float],
+        cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
+        storage_backend: Optional[str] = None,
     ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
@@ -452,9 +529,16 @@ class RustServer:
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones), then the finished requests' weight-version
-            spans, a multimodal model's media token counts, and
+            spans, a multimodal model's media token counts,
             ``decode_latencies`` (by row: a finished non-streaming request's
-            decode latency in seconds).
+            decode latency in seconds), the scheduler's ``customized_info``
+            (per key, each request's values for its new output tokens) as one
+            JSON text, which the frontend accumulates and reports in
+            ``meta_info`` as Python's TokenizerManager does,
+            ``cached_tokens_split`` (by row: the request's cached tokens per
+            cache tier, ``(device, host, storage)``, when the cache has more
+            tiers than the device) and, for the whole frame, the attached
+            ``storage_backend``.
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -467,7 +551,6 @@ class RustServer:
         buffers plus a per-position ``lens`` vector (0 = null position). Hidden
         states flatten to rows of floats (one row per output position).
         """
-        output_ids = payload.output_ids or []
         prompt_tokens = payload.prompt_tokens or []
 
         # Hot-path guard: almost no decode step wants logprobs / hidden states,
@@ -486,15 +569,14 @@ class RustServer:
         # Python-level pass over the batch costs inter-token latency: `rids` are
         # the plain rid strings (hashed to a routing key on the Rust side with a
         # per-process seed, off the GIL — not parsed; a rid is any string),
-        # `finished_reasons` already `dict | None`, and `output_ids` entries are
-        # always `array("q")` slices of `Req.output_ids` (never None), so both
-        # `map`s stay in C and their bytes go out as-is: one memcpy per request,
-        # no per-element repack. Measured at 256 single-token requests: 10 us,
-        # against 18 us for `array("i", chain.from_iterable(...))`.
+        # `finished_reasons` already `dict | None`, and the token ids already
+        # one flat `array("q")`, whose bytes go out as-is in one copy, with
+        # `tok_lens` taken from its row offsets in a C-level `map`.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
-        tok_lens = list(map(len, output_ids))
-        flat_ids = b"".join(map(array.tobytes, output_ids))
+        offsets = payload.output_ids_offsets
+        tok_lens = list(map(operator.sub, offsets[1:], offsets[:-1]))
+        flat_ids = payload.output_ids_flat.tobytes()
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
@@ -602,10 +684,12 @@ class RustServer:
             )
 
         # After the extras: the finished requests' weight-version spans (None
-        # for the others), a multimodal model's media token counts and the
-        # finished requests' decode latencies, each empty when nothing in the
-        # batch carries it. Only the last is built here, for finished rows; the
-        # header stops at its last non-empty column.
+        # for the others), a multimodal model's media token counts, the
+        # finished requests' decode latencies, the customized_info columns and
+        # the cached tokens by tier, each empty when nothing in the batch
+        # carries it, then the frame's storage backend. Only the latencies are
+        # built here, for finished rows; the header stops at its last non-empty
+        # column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
@@ -618,6 +702,10 @@ class RustServer:
             (payload.audio_tokens or []) if media else [],
             (payload.video_tokens or []) if media else [],
             latencies,
+            [],  # abort_outputs, push_abort's column
+            self._customized_info_json(payload.customized_info),
+            cached_tokens_split or [],
+            storage_backend,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()
@@ -634,6 +722,30 @@ class RustServer:
                 "Rust egress closed; dropped batch of %d requests during shutdown",
                 len(rids),
             )
+
+    def _customized_info_json(self, customized_info: Optional[dict]) -> bytes:
+        """The batch's customized_info as the JSON text Python's responses
+        carry it in (orjson, with `dumps_json`'s options), a value orjson has
+        no form for as its `str`; empty when there is none. A batch even that
+        cannot encode (say, an int past 64 bits) goes without it, logged, so a
+        model's values never fail the scheduler step."""
+        if not customized_info:
+            return b""
+        try:
+            return orjson.dumps(
+                customized_info, option=ORJSON_RESPONSE_OPTIONS, default=str
+            )
+        except orjson.JSONEncodeError as error:
+            self._dropped_customized_info += 1
+            count = self._dropped_customized_info
+            if count & (count - 1) == 0:
+                logger.warning(
+                    "Dropped customized_info the Rust frontend cannot send "
+                    "(%d batches so far): %s",
+                    count,
+                    error,
+                )
+            return b""
 
     @classmethod
     def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
