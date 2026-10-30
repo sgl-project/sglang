@@ -485,7 +485,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
         return ScheduleBatch(
-            reqs=[SimpleNamespace(rid="request", finished=Mock(return_value=False))],
+            reqs=[
+                SimpleNamespace(
+                    rid="request", finished=Mock(return_value=False), inflight_steps=0
+                )
+            ],
             forward_mode=mode,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             launch_ts=launch_ts,

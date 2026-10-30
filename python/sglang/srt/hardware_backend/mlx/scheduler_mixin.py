@@ -98,6 +98,7 @@ class SchedulerMlxOverlapMixin:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        batch.mark_launched()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
         self.profiler_manager._profile_batch_predicate(batch)

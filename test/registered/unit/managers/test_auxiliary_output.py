@@ -541,6 +541,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
         ),
         split_index=0,
         reqs=[],
+        mark_launched=Mock(),
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
         extend_num_tokens=1,
