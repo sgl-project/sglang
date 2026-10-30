@@ -448,7 +448,8 @@ python3 -m dynamo.sglang \
 DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) at concurrency 1–40: TP8·EP8 with the AMD monokernels at low concurrency, TP4·EP4 with HiCache at high concurrency.
 
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-1027`.
-- **HiCache.** At high concurrency, switch to the TP4 HiCache flags below. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
+- **Monokernels.** At low concurrency, add the monokernel flags below.
+- **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -458,15 +459,13 @@ python -m sglang.launch_server \
   --model-path amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
   --tp-size 8 \
   --ep-size 8 \
-  --monokernel-backend amd \
   --attention-backend aiter \
   --page-size 16 \
   --kv-cache-dtype fp8_e4m3 \
   --mem-fraction-static 0.85 \
-  --max-running-requests 2 \
-  --cuda-graph-max-bs-decode 2 \
+  --max-running-requests 128 \
   --swa-full-tokens-ratio 0.2 \
-  --prefill-decode-interval 64 \
+  --prefill-decode-interval 20 \
   --scheduler-recv-interval 20 \
   --tokenizer-worker-num 4 \
   --speculative-algorithm DFLASH \
@@ -481,7 +480,14 @@ python -m sglang.launch_server \
   --port 30000
 ```
 
-```bash HiCache (high concurrency, replaces the TP and batch flags above)
+```bash Monokernels (low concurrency)
+  --monokernel-backend amd \
+  --max-running-requests 2 \
+  --cuda-graph-max-bs-decode 2 \
+  --prefill-decode-interval 64
+```
+
+```bash HiCache (high concurrency)
   --tp-size 4 \
   --ep-size 4 \
   --max-running-requests 80 \
