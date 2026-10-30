@@ -233,12 +233,11 @@ class _Run:
 
 class TestMhcPrefillStatsOverlap(CustomTestCase):
     def _assert_side_stream_lifetimes(self, run):
-        # The residual is read on the stats stream and the triplet on the main
-        # stream; each must be recorded there so the caching allocator does not
-        # reuse its memory early.
-        self.assertEqual(
-            run.residual.record_stream.call_args_list, [mock.call(run.side)]
-        )
+        # The triplet is read on the main stream and must be recorded there. The
+        # residual is not recorded on the stats stream: the post joins that
+        # stream before the residual can be released, and recording it would
+        # hold every layer's residual until the GPU caught up.
+        run.residual.record_stream.assert_not_called()
         self.assertEqual(len(run.coefficients), 3)
         for coefficient in run.coefficients:
             coefficient.record_stream.assert_called_once_with(run.main)

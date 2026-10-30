@@ -330,9 +330,21 @@ def issue_prefill_stats(
 ) -> HcTriplet:
     """Fork the stats stream here, right before the sublayer's TP all-reduce, and
     issue the triplet on it. The caller joins the stream before the post reads
-    the triplet."""
+    the triplet.
+
+    The residual is not recorded on the stats stream. The post joins that stream
+    before it reads the residual, and the residual is released only after the
+    post, so any main-stream reuse of its memory is already ordered after the mix
+    GEMM. Recording it would instead hold each freed residual until the GPU
+    caught up with the CPU, which in a prefill forward is most of the layers:
+    an 8K chunk would keep about twenty 320 MiB residuals alive at once."""
     fork_stats_stream(stats_stream)
-    return mix_stats(hc, residual, stats_stream)
+    main_stream = torch.cuda.current_stream()
+    with torch.cuda.stream(stats_stream):
+        coefficients = _mix_stats_impl(hc, residual)
+    for coefficient in coefficients:
+        coefficient.record_stream(main_stream)
+    return coefficients
 
 
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
