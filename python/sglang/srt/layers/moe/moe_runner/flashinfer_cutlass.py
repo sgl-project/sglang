@@ -296,8 +296,8 @@ def _mxfp4_moe_workspace(
         # Release a smaller buffer before taking the larger one.
         del held
         # Taken once per stream and size. If the driver cannot supply it, return
-        # the allocator's unused blocks first rather than going through its OOM
-        # retry.
+        # the allocator's unused blocks first (on every device: empty_cache is
+        # process-wide) rather than going through its OOM retry.
         if torch.cuda.mem_get_info()[0] < nbytes:
             torch.cuda.empty_cache()
         try:
@@ -319,7 +319,17 @@ def _run_with_mxfp4_moe_workspace(run, get_workspace) -> None:
     """Run the MoE with the stream's workspace; if FlashInfer rejects its size,
     turn workspaces off for this process and rerun with per-call scratch."""
     global _MXFP4_MOE_WORKSPACE_OFF
-    workspace = get_workspace()
+    try:
+        workspace = get_workspace()
+    except Exception as e:  # e.g. a FlashInfer without the size query
+        # The workspace is an optimization; failing to set it up must not fail
+        # serving.
+        _MXFP4_MOE_WORKSPACE_OFF = True
+        _MXFP4_MOE_WORKSPACES.clear()
+        logger.warning(
+            "FlashInfer MoE workspace unavailable; using per-call scratch: %s", e
+        )
+        workspace = None
     try:
         run(workspace)
         return

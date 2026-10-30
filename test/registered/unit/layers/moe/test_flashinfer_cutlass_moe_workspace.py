@@ -51,9 +51,10 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         self.stream = types.SimpleNamespace(cuda_stream=7)
         self.free = 1 << 40
         self.queries, self.allocations, self.flushes = [], [], []
-        # Whether every earlier buffer was already released at each allocation.
-        self.released_before = []
-        self.refs = []
+        # Whether every earlier buffer was already released at each allocation
+        # and each cache purge, and the device each scoped block ran on.
+        self.released_before, self.released_before_flush = [], []
+        self.refs, self.devices = [], []
 
         def size(*args, **kwargs):
             self.queries.append((args, kwargs))
@@ -71,9 +72,9 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         for target, value in (
             ("torch.cuda.is_current_stream_capturing", lambda: False),
             ("torch.cuda.current_stream", lambda *args: self.stream),
-            ("torch.cuda.device", lambda device: contextlib.nullcontext()),
+            ("torch.cuda.device", self._device),
             ("torch.cuda.mem_get_info", lambda *args: (self.free, 1 << 40)),
-            ("torch.cuda.empty_cache", lambda: self.flushes.append(1)),
+            ("torch.cuda.empty_cache", self._flush),
             ("torch.compiler.is_compiling", lambda: False),
             (f"{fc.__name__}._cutlass_moe_tune_max_num_tokens", lambda n: 8192),
         ):
@@ -86,6 +87,14 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def _device(self, device):
+        self.devices.append(device)
+        return contextlib.nullcontext()
+
+    def _flush(self):
+        self.flushes.append(1)
+        self.released_before_flush.append(all(r() is None for r in self.refs))
 
     def workspace(self, tokens, top_k=6, **kwargs):
         return fc._mxfp4_moe_workspace(
@@ -120,6 +129,8 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         self.assertTrue(kwargs["use_fused_finalize"])
         self.assertFalse(kwargs["use_wfp4afp8_humming"])
         self.assertEqual(kwargs["device"], torch.device("cuda", 0))
+        # The capture check and the free-memory check ran on the input's device.
+        self.assertEqual(self.devices, [torch.device("cuda", 0)] * 4)
         self.assertEqual(first.nbytes, 1000 + 8192 + 6)
         # The driver had room, so the allocator's cache was left alone.
         self.assertEqual(self.flushes, [])
@@ -131,9 +142,12 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
 
     def test_a_larger_call_replaces_the_buffer_after_releasing_it(self):
         self.workspace(8192)
+        # The driver lacks room, so the larger buffer purges the cache first.
+        self.free = 100
         second = self.workspace(16384)
         self.assertEqual(second.nbytes, 1000 + 16384 + 6)
         self.assertEqual(self.released_before, [True, True])
+        self.assertEqual(self.released_before_flush, [True])
         self.assertIs(self.workspace(100), second)
 
     def test_each_stream_has_its_own_buffer(self):
@@ -213,6 +227,16 @@ class TestMxfp4MoeWorkspaceFallback(CustomTestCase):
             fc._run_with_mxfp4_moe_workspace(too_small, lambda: None)
         self.assertFalse(fc._MXFP4_MOE_WORKSPACE_OFF)
 
+    def test_a_failed_workspace_setup_runs_with_per_call_scratch(self):
+        calls = []
+
+        def no_size_query():
+            raise ImportError("cannot import name 'cutlass_fused_moe_workspace_size'")
+
+        fc._run_with_mxfp4_moe_workspace(calls.append, no_size_query)
+        self.assertEqual(calls, [None])
+        self.assertTrue(fc._MXFP4_MOE_WORKSPACE_OFF)
+
 
 class TestMxfp4MoeCallPassesTheWorkspace(CustomTestCase):
     def test_the_runner_hands_the_workspace_to_flashinfer(self):
@@ -269,6 +293,10 @@ class TestMxfp4MoeCallPassesTheWorkspace(CustomTestCase):
                 runner_config=MoeRunnerConfig(layer=layer),
             )
         self.assertIs(seen["workspace_buffer"], sentinel)
+        args = workspace.call_args.kwargs
+        self.assertIs(args["w2_weight"], quant_info.w2_weight)
+        self.assertEqual(args["x"].shape, (tokens, hidden))
+        self.assertEqual(args["runner_config"].moe_ep_size, 1)
         self.assertEqual(workspace.call_args.kwargs["top_k"], top_k)
         self.assertEqual(workspace.call_args.kwargs["output_dtype"], torch.bfloat16)
 
