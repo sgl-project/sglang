@@ -563,37 +563,79 @@ def test_vae_copy_is_the_canvas_and_the_vlm_copy_is_thumbnailed():
     assert vlm_copy.size != vae_copy.size
 
 
-def test_mask_changes_the_vae_copy_but_not_its_size():
-    """Greying is baked into the pixels; the canvas stays the same."""
+def _masked_batch(image, mask_path, mask=None):
+    """A batch carrying the request's mask path, as the pipeline sees it."""
+    fields = {"condition_image": image, "mask_path": mask_path}
+    if mask is not None:
+        fields["mask"] = mask
+    return type("Batch", (), fields)()
+
+
+def test_repaint_mask_greys_the_marked_region_before_the_crop(tmp_path):
+    """`preprocess_vae_image` is the hook that sees the batch, so the mask lands there."""
     from PIL import Image, ImageDraw
 
     config = BriaFibo2PipelineConfig()
     image = Image.new("RGB", (2000, 1000), (255, 0, 0))
     mask = Image.new("L", (2000, 1000), 0)
     ImageDraw.Draw(mask).rectangle([1000, 0, 1999, 999], fill=255)
+    mask_path = str(tmp_path / "mask.png")
+    mask.save(mask_path)
 
-    batch = type("Batch", (), {"mask": mask})()
-    greyed, final_size = config.preprocess_condition_image(
-        image, 1440, 720, batch=batch
-    )
+    batch = config.preprocess_vae_image(_masked_batch(image, mask_path), None)
+
+    # the hook must leave a list behind: the stage iterates `condition_image`
+    assert isinstance(batch.condition_image, list)
+    greyed = batch.condition_image[0]
+    assert greyed.size == (2000, 1000), "the greying must not resize the image"
+    assert greyed.getpixel((1500, 500)) == (128, 128, 128)
+    assert greyed.getpixel((500, 500)) == (255, 0, 0)
+
+    # the crop downstream is unchanged in size, only the masked pixels differ
+    cropped, size = config.preprocess_condition_image(greyed, 1440, 720)
     plain, _ = config.preprocess_condition_image(image, 1440, 720)
-
-    assert greyed.size == plain.size == (1440, 720)
-    # the masked half is flat grey, the other half keeps the source colour
-    assert greyed.getpixel((1100, 360)) == (128, 128, 128)
+    assert size == (1440, 720)
+    assert cropped.size == plain.size == (1440, 720)
+    assert cropped.getpixel((1100, 360)) == (128, 128, 128)
     assert plain.getpixel((1100, 360)) == (255, 0, 0)
-    assert greyed.getpixel((300, 360)) == (255, 0, 0)
+    assert cropped.getpixel((300, 360)) == (255, 0, 0)
 
 
-def test_no_mask_field_leaves_the_image_untouched():
-    """A request without a mask must not be greyed at all."""
+def test_request_without_a_mask_is_not_greyed():
+    """No `mask_path` on the request leaves the image untouched."""
     from PIL import Image
 
     config = BriaFibo2PipelineConfig()
     image = Image.new("RGB", (64, 64), (7, 8, 9))
-    batch = type("Batch", (), {})()  # no `mask` attribute
-    out, _ = config.preprocess_condition_image(image, 64, 64, batch=batch)
-    assert out.getpixel((1, 1)) == (7, 8, 9)
+    batch = config.preprocess_vae_image(_masked_batch(image, None), None)
+    assert batch.condition_image.getpixel((1, 1)) == (7, 8, 9)
+
+
+def test_repaint_mask_rejects_multiple_images(tmp_path):
+    """A mask marks a region of one image; several references cannot share it."""
+    from PIL import Image
+
+    config = BriaFibo2PipelineConfig()
+    images = [
+        Image.new("RGB", (32, 32), (1, 2, 3)),
+        Image.new("RGB", (32, 32), (4, 5, 6)),
+    ]
+    mask_path = str(tmp_path / "mask.png")
+    Image.new("L", (32, 32), 255).save(mask_path)
+    with pytest.raises(ValueError, match="single image"):
+        config.preprocess_vae_image(_masked_batch(images, mask_path), None)
+
+
+def test_repaint_mask_size_must_match_the_image(tmp_path):
+    """A mask of another size cannot be composited onto the source image."""
+    from PIL import Image
+
+    config = BriaFibo2PipelineConfig()
+    image = Image.new("RGB", (32, 32), (1, 2, 3))
+    mask_path = str(tmp_path / "mask.png")
+    Image.new("L", (16, 16), 255).save(mask_path)
+    with pytest.raises(ValueError, match="mask size"):
+        config.preprocess_vae_image(_masked_batch(image, mask_path), None)
 
 
 # ---------------------------------------------------------------------------

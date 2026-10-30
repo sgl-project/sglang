@@ -525,30 +525,59 @@ class BriaFibo2PipelineConfig(Flux2PipelineConfig):
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, None, None)
 
-    def _mask_for(self, batch):
-        """Optional repaint mask carried by the request, if any."""
-        return getattr(batch, "mask", None)
+    def _load_mask(self, batch):
+        """The repaint mask the request asked for, as a PIL image, if any."""
+        from PIL import Image
+
+        mask_path = getattr(batch, "mask_path", None)
+        if mask_path is None:
+            return None
+        return Image.open(mask_path).convert("L")
+
+    def preprocess_vae_image(self, batch, vae_image_processor):
+        """Grey out the requested repaint region on the *original* images.
+
+        The request mask arrives as `mask_path` and this hook is the first place
+        the batch is available, so the greying happens here: on the whole image,
+        before `preprocess_condition_image` crops it, exactly as training prepared
+        edit pairs. The transformer never sees the mask, it infers the region from
+        the flat grey.
+
+        `InputValidationStage` calls `preprocess_condition_image` per image
+        without the batch, so applying the mask there would never reach a request.
+        """
+        mask = self._load_mask(batch)
+        if mask is None:
+            return batch
+
+        condition_image = batch.condition_image
+        images = (
+            list(condition_image)
+            if isinstance(condition_image, (list, tuple))
+            else [condition_image]
+        )
+        if len(images) != 1:
+            raise ValueError(
+                "A repaint mask applies to a single image, but the request "
+                f"edits {len(images)} images."
+            )
+        # `InputValidationStage` iterates `condition_image` right after this hook,
+        # so the greyed image has to stay a one-element list.
+        batch.condition_image = [apply_mask_to_image(images[0], mask)]
+        return batch
 
     def preprocess_condition_image(
-        self, image, target_width, target_height, vae_image_processor=None, batch=None
+        self, image, target_width, target_height, vae_image_processor=None
     ):
-        """Grey out the repaint region, then crop to the generation canvas.
+        """Crop the image to the generation canvas.
 
-        This is the copy the VAE encodes. The greying happens on the *original*
-        image, before any resize, exactly as training prepared edit pairs: the
-        transformer never sees the mask, it infers the region from the flat grey.
+        The VAE copy is this crop; a repaint mask has already been applied to
+        `batch.condition_image` by `preprocess_vae_image`.
         """
-        mask = None if batch is None else self._mask_for(batch)
-        if mask is not None:
-            image = apply_mask_to_image(image, mask)
         return crop_to_size(image, target_width, target_height), (
             target_width,
             target_height,
         )
-
-    def preprocess_vae_image(self, batch, vae_image_processor):
-        """Keep the caller's images as they are; sizing happens per image below."""
-        return batch
 
     # -- editing: text side -------------------------------------------------
 

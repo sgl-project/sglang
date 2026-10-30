@@ -91,7 +91,7 @@ edited.save("edited.png")
 
 ### 4.2 Masked edit
 
-The mask is white where the image should be regenerated and black elsewhere; everything outside the mask is preserved. The masked region is greyed out before the VAE encodes the source image, as in training.
+The mask is white where the image should be regenerated and black elsewhere; everything outside the mask is preserved. The masked region is greyed out before the VAE encodes the source image, as in training. A mask applies to a single source image and must match that image's size.
 
 ```bash curl
 curl -sS http://localhost:30000/v1/images/edits \
