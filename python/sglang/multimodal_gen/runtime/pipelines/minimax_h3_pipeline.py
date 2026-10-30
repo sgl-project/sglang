@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import replace
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.minimax_h3_metadata import (
+    validate_minimax_h3_sigma_shift_scales,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -34,6 +38,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    hf_hub_download,
+    snapshot_download,
+)
+from sglang.multimodal_gen.runtime.utils.model_overlay import (
+    maybe_load_overlay_model_index,
+)
 
 
 class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
@@ -90,6 +101,35 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"unsupported MiniMax H3 model variant {variant!r}; "
                 f"supported: {sorted(subfolders)!r}"
             ) from exc
+
+    def _preflight_model_config(self, model_subfolder: str | None) -> None:
+        # The base loader resolves overlays only for root-level pipelines.
+        # FastH3/VDN-H3 source repos obtain their index from overlay metadata,
+        # which can be fetched without downloading or materializing weights.
+        if model_subfolder is None:
+            model_index = maybe_load_overlay_model_index(
+                self.model_path,
+                snapshot_download_fn=snapshot_download,
+                hf_hub_download_fn=hf_hub_download,
+            )
+            if model_index is not None:
+                validate_minimax_h3_sigma_shift_scales(model_index)
+                return
+        filename = (
+            f"{model_subfolder}/model_index.json"
+            if model_subfolder is not None
+            else "model_index.json"
+        )
+        if os.path.exists(self.model_path):
+            index_path = os.path.join(self.model_path, filename)
+        else:
+            index_path = hf_hub_download(
+                repo_id=self.model_path,
+                filename=filename,
+                revision=self.server_args.revision,
+            )
+        with open(index_path) as f:
+            validate_minimax_h3_sigma_shift_scales(json.load(f))
 
     def _load_config(self):
         model_variant = self.server_args.model_variant
