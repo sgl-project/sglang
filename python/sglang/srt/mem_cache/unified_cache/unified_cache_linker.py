@@ -462,10 +462,6 @@ class UnifiedCacheLinkerWrapper:
         # Keep a non-restorable SWA range as tombstones instead of rebuilding
         # it from an uninitialized FULL-to-SWA mapping when the tail is inserted.
         if self._skip_swa:
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
             req.kv.set_evicted_seqlen(
                 ComponentType.SWA,
                 max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
