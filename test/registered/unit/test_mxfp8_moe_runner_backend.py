@@ -1,5 +1,5 @@
-"""Unit tests for the mxfp8 moe_runner_backend constraints in
-srt/arg_groups/overrides.py."""
+"""Check the MoE backend quantization constraints and the SAIL A2A admission
+boundary."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -7,11 +7,18 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import contextlib
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.model_override_base import ResolvedView
-from sglang.srt.arg_groups.overrides import _moe_runner_backend_quant_constraints
+from sglang.srt.arg_groups.overrides import (
+    _a2a_backend_overrides,
+    _moe_runner_backend_quant_constraints,
+    declare_resolution,
+)
+from sglang.srt.arg_groups.platform_hook import handle_sail_backends
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 
@@ -84,6 +91,77 @@ class TestMxfp8MoeRunnerBackend(CustomTestCase):
     def test_non_mxfp8_quantization_is_untouched(self):
         with _platform(is_hip=True, is_gfx95=False):
             self.assertEqual(_resolve("triton", quantization="fp8"), "triton")
+
+
+class TestSailMoeA2aBackend(CustomTestCase):
+    """An emulated CUDA capability must not let SAIL pick a MegaMoE it cannot run.
+
+    The refusal lives in ``handle_sail_backends``, not in the platform-agnostic
+    ``_a2a_backend_overrides`` pass, so the cases below drive the hook the same
+    way the resolution pipeline does: run the A2A pass, then the hook.
+    """
+
+    def setUp(self):
+        super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # The hook switches both DeepGEMM toggles on and gates its MXFP4 W4A16
+        # checks off these vars; keep all four out of the process-global env.
+        for var in (
+            envs.SGLANG_SAIL_DEEPGEMM_DENSE,
+            envs.SGLANG_SAIL_DEEPGEMM_MOE,
+            envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16,
+            envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA,
+        ):
+            stack.enter_context(var.override(False))
+
+    @staticmethod
+    def _run_hook(backend, waterfill=False):
+        args = SimpleNamespace(moe_a2a_backend=backend, enable_waterfill=waterfill)
+        declared = _a2a_backend_overrides(ResolvedView(args))
+        if declared:
+            declare_resolution(args, "_a2a_backend_overrides", **declared)
+        # The hook only reads MLA afterwards to tweak prefill CUDA graphs, which
+        # needs a real checkpoint; that branch is not under test here.
+        with patch(
+            "sglang.srt.arg_groups.platform_hook.use_mla_backend",
+            return_value=False,
+        ):
+            handle_sail_backends(args)
+        return args
+
+    def test_sail_rejects_megamoe_with_or_without_waterfill(self):
+        # Waterfill keeps megamoe in _a2a_backend_overrides, so only this hook
+        # can stop it reaching a communicator SAIL cannot drive.
+        with override_platform(is_sail=True):
+            for waterfill in (False, True):
+                with (
+                    self.subTest(waterfill=waterfill),
+                    self.assertRaisesRegex(ValueError, "SAIL.*MegaMoE"),
+                ):
+                    self._run_hook("megamoe", waterfill)
+
+    def test_sail_preserves_supported_backends_and_waterfill_resolution(self):
+        cases = (
+            ("none", False, "none"),
+            ("deepep", False, "deepep"),
+            ("none", True, "deepep"),
+            ("deepep", True, "deepep"),
+        )
+        with override_platform(is_sail=True):
+            for backend, waterfill, expected in cases:
+                with self.subTest(backend=backend, waterfill=waterfill):
+                    args = self._run_hook(backend, waterfill)
+                    # The record keeps what the operator typed; the pass declares
+                    # the waterfill rewrite and the hook must accept it.
+                    self.assertEqual(args.moe_a2a_backend, backend)
+                    self.assertEqual(ResolvedView(args).moe_a2a_backend, expected)
+
+    def test_other_platforms_keep_megamoe(self):
+        with override_platform(is_sail=False):
+            args = SimpleNamespace(moe_a2a_backend="megamoe", enable_waterfill=True)
+            handle_sail_backends(args)
+            self.assertEqual(ResolvedView(args).moe_a2a_backend, "megamoe")
 
 
 if __name__ == "__main__":
