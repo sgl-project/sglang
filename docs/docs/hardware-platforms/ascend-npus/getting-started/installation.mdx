@@ -153,6 +153,19 @@ docker pull quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
 
 ## Preparing the Running Environment
 
+Pick one of the two methods below based on your situation:
+
+| Your situation                                                            | Recommended path                                                                                 |
+|---------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| New to SGLang on Ascend, or deploying a serving environment               | [Using Docker Image](#method-2-using-docker-image)                                               |
+| Developing or debugging SGLang, or pinning/customizing component versions | [Installing from source with prerequisites](#method-1-installing-from-source-with-prerequisites) |
+
+**For most users, the Docker image is the recommended path.** It is the most convenient option: the matched component
+set from the [version mapping table](#component-version-mapping-for-sglang) comes pre-installed, and validated image
+builds are tested as a whole. Installing from source is the more flexible option: you choose every component version
+and control the build yourself, with no prebuilt binaries you cannot inspect. Whichever path you take, strictly follow
+the version mapping table and do not mix versions across CANN sets.
+
 ### Method 1: Installing from source with prerequisites
 
 The steps in this method install the component set from the [version mapping table](#component-version-mapping-for-sglang).
