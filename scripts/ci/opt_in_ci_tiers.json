@@ -36,5 +36,11 @@
     "workflows": [
       ".github/workflows/pr-test-mlu.yml"
     ]
+  },
+  "ppu": {
+    "label": "run-ci-ppu",
+    "workflows": [
+      ".github/workflows/pr-test-ppu.yml"
+    ]
   }
 }

@@ -77,7 +77,7 @@ struct HeliosQKRoPEKernel {
     auto D = SymbolicSize{"head_dim"};
     auto F = SymbolicSize{"freq_dim"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     int64_t batch = 1;
     if (q.ndim() == 4) {

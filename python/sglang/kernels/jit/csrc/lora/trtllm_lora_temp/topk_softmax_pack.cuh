@@ -343,17 +343,17 @@ void topk_softmax_pack(
   SymbolicSize E{"num_experts"};
   SymbolicSize K{"topk"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
-  TensorMatcher({N, E}).with_dtype<fp32_t, fp16_t, bf16_t>().with_device<kDLCUDA>(device_).verify(gating_output);
-  TensorMatcher({N, K}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(topk_weights);
-  TensorMatcher({N, K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk_indices);
-  TensorMatcher({N, K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(packed);
+  TensorMatcher({N, E}).with_dtype<fp32_t, fp16_t, bf16_t>().with_device<kDLGPU>(device_).verify(gating_output);
+  TensorMatcher({N, K}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(topk_weights);
+  TensorMatcher({N, K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(topk_indices);
+  TensorMatcher({N, K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(packed);
 
   const int32_t* ntnp_ptr = nullptr;
   if (num_token_non_padded.has_value()) {
     SymbolicSize One{"ntnp_numel"};
-    TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(num_token_non_padded.value());
+    TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(num_token_non_padded.value());
     RuntimeCheck(One.unwrap() == 1, "num_token_non_padded must be a 1-element tensor");
     ntnp_ptr = static_cast<const int32_t*>(num_token_non_padded.value().data_ptr());
   }
