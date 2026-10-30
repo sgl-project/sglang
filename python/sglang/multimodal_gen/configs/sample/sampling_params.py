@@ -293,6 +293,10 @@ class SamplingParams:
     image_path: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
+    # Region of the image to regenerate, white on black, for models that accept
+    # masked edits. Per-request like `image_path`, and only meaningful with a
+    # single image.
+    mask_path: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
