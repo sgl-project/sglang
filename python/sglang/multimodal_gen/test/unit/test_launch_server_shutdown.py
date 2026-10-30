@@ -66,6 +66,7 @@ class TestLaunchServerShutdown(unittest.TestCase):
             host="127.0.0.1",
             enable_metrics=False,
             scheduler_port=15000,
+            scheduler_endpoint="tcp://127.0.0.1:15000",
             disagg_dispatch_policy="round_robin",
             disagg_timeout=30,
             for_disagg_role=lambda role, **overrides: SimpleNamespace(**overrides),
