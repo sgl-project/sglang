@@ -170,8 +170,8 @@ class TestOutputStreamerReasoningUsage(unittest.TestCase):
                         self.assertEqual(accumulator.reasoning_tokens, [expected])
                         self.assertEqual(req.reasoning_tokens, original_count)
                         self.assertEqual(
-                            accumulator.output_ids,
-                            [tokens[1 if stream else 0 : retained]],
+                            accumulator.output_ids_flat,
+                            array("q", tokens[1 if stream else 0 : retained]),
                         )
                         if not rust:
                             self.assertEqual(accumulator.completion_tokens, [retained])

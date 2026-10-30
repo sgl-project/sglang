@@ -66,7 +66,9 @@ def _make_batch_str_output() -> BatchStrOutput:
         spec_correct_drafts_histogram=[[], []],
         finished_reasons=[None, {"type": "length"}],
         output_strs=["first", "second"],
-        output_ids=[[1], [2]],
+        # Rows [1] and [2, 3].
+        output_ids_flat=array("q", [1, 2, 3]),
+        output_ids_offsets=[0, 1, 3],
         completion_tokens=[1, 2],
         reasoning_tokens=[0, 0],
         # Only rid-1 has new request stats in this step.
@@ -134,7 +136,9 @@ def _make_batch_token_id_output() -> BatchTokenIDOutput:
         spec_num_cap_tokens=[],
         spec_cap_lens_histogram=[],
         finished_reasons=[None, None],
-        output_ids=[[1], [2]],
+        # Rows [1] and [].
+        output_ids_flat=array("q", [1]),
+        output_ids_offsets=[0, 1, 1],
         reasoning_tokens=[0, 0],
         completion_tokens=[1, 2],
         input_token_logprobs_val=[[], []],
@@ -311,6 +315,24 @@ class TestMultiTokenizerMixin(CustomTestCase):
             grouped.input_top_logprobs_val_flat[1], np.array([[1.0]], np.float32)
         )
 
+    def test_split_slices_each_rows_output_ids(self):
+        """Rows of different lengths, an empty one included, keep their ids."""
+        for output, rows in (
+            (_make_batch_str_output(), [[1], [2, 3]]),
+            (_make_batch_token_id_output(), [[1], []]),
+        ):
+            with self.subTest(type=type(output).__name__):
+                for i, ids in enumerate(rows):
+                    one = _handle_output_by_index(output, i)
+                    self.assertEqual(one.output_ids_flat, array("q", ids))
+                    self.assertEqual(one.output_ids_offsets, [0, len(ids)])
+                grouped = _handle_output_by_indices(output, [1, 0])
+                self.assertEqual(grouped.output_ids_flat, array("q", rows[1] + rows[0]))
+                self.assertEqual(
+                    grouped.output_ids_offsets,
+                    [0, len(rows[1]), len(rows[1]) + len(rows[0])],
+                )
+
     def test_grouped_split_caches_struct_fields_by_output_type(self):
         self.addCleanup(_cached_output_fields.cache_clear)
         _cached_output_fields.cache_clear()
@@ -371,7 +393,8 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "detok-a")
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(sent[0][1].output_ids, [[1], [2]])
+        self.assertEqual(sent[0][1].output_ids_flat, array("q", [1]))
+        self.assertEqual(sent[0][1].output_ids_offsets, [0, 1, 1])
         self.assertIsNone(sent[0][1].spec_verify_ct)
 
     def test_router_split_keeps_each_finished_rows_route(self):

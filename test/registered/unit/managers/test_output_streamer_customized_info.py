@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     msgpack_decode,
     msgpack_encode,
+    row_output_ids,
     unwrap_from_pickle,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
@@ -185,7 +186,10 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
         customized_info = unwrap_from_pickle(payload.customized_info)
 
-        self.assertEqual(payload.output_ids, [[10, 11], [20, 21, 22], [30]])
+        self.assertEqual(
+            [list(row_output_ids(payload, i)) for i in range(3)],
+            [[10, 11], [20, 21, 22], [30]],
+        )
         self.assertEqual(
             customized_info["probe"],
             [[None, None], [200, 201, 202], [None]],
@@ -844,7 +848,7 @@ class TestOutputStreamerStreamInterval(unittest.TestCase):
                     req.output_ids.extend(range(num_tokens))
                     accumulator = _accumulator()
                     accumulator.accept(req=req)
-                    sent.append(sum(map(len, accumulator.output_ids)))
+                    sent.append(len(accumulator.output_ids_flat))
                 self.assertEqual(sent, expected)
 
 
