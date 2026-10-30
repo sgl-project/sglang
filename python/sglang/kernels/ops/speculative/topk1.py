@@ -160,3 +160,62 @@ def draft_topk1_argmax_only(next_token_logits: torch.Tensor):
         device=next_token_logits.device,
     )
     return draft_topk1_postprocess(next_token_logits, scratch_positions)
+
+
+@triton.jit
+def _argmax_finalize_kernel(
+    partial_vals,
+    partial_indices,
+    out,
+    num_splits: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    vals = tl.load(
+        partial_vals + row * num_splits + offsets,
+        mask=offsets < num_splits,
+        other=-float("inf"),
+    )
+    split = tl.argmax(vals, axis=0)
+    tl.store(
+        out + row, tl.load(partial_indices + row * num_splits + split).to(tl.int64)
+    )
+
+
+def split_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """torch.argmax(logits, dim=-1) for wide vocab rows, split across CTAs.
+
+    Same first-max tie order; NaN logits rank below every finite value instead
+    of winning."""
+    assert logits.ndim == 2 and logits.stride(1) == 1
+    rows, vocab_size = logits.shape
+    out = torch.empty(rows, dtype=torch.int64, device=logits.device)
+    if rows == 0:
+        return out
+    num_splits = triton.cdiv(vocab_size, _DRAFT_TOPK1_BLOCK)
+    partial_vals = torch.empty(
+        (rows, num_splits), dtype=torch.float32, device=logits.device
+    )
+    partial_indices = torch.empty(
+        (rows, num_splits), dtype=torch.int32, device=logits.device
+    )
+    _draft_topk1_partial_argmax_kernel[(rows, num_splits)](
+        logits,
+        partial_vals,
+        partial_indices,
+        logits.stride(0),
+        vocab_size,
+        num_splits,
+        BLOCK=_DRAFT_TOPK1_BLOCK,
+        num_warps=8,
+    )
+    _argmax_finalize_kernel[(rows,)](
+        partial_vals,
+        partial_indices,
+        out,
+        num_splits,
+        BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+    )
+    return out

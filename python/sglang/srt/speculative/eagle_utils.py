@@ -32,6 +32,7 @@ from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_xpu,
 )
@@ -54,8 +55,12 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
+_is_gfx95 = is_gfx95_supported()
 
 logger = logging.getLogger(__name__)
+
+# Measured on MI350X: from this vocab width the split argmax beats torch.argmax.
+_SPLIT_ARGMAX_MIN_VOCAB = 32768
 
 
 def per_step_draft_out_cache_loc(
@@ -706,7 +711,13 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        if _is_gfx95 and next_token_logits.shape[-1] >= _SPLIT_ARGMAX_MIN_VOCAB:
+            # torch.argmax reduces each row on one workgroup; this splits it.
+            from sglang.kernels.ops.speculative.topk1 import split_argmax
+
+            target_predict = split_argmax(next_token_logits)
+        else:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
