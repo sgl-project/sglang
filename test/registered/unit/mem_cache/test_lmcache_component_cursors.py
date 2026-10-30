@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lmcache.load_cost_profile import LoadCostKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -159,17 +160,22 @@ def test_lmcache_lookup_admission_uses_rank_common_upper_bound(
 
 
 @pytest.mark.parametrize(
-    "minimum, total, local, peer_local, expected_hit, release_end",
+    "minimum, total, local, peer_local, expected_hit, release_end, cost_load",
     [
-        (0, 256, 255, 255, 1, 0),
-        (256, 512, 300, 300, 0, 512),
-        (256, 512, 256, 256, 256, 256),
-        (256, 512, 500, 0, 512, 0),
-        (256, 256, 512, 512, 0, 256),
+        (0, 256, 255, 255, 1, 0, None),
+        (256, 512, 300, 300, 0, 512, None),
+        (256, 512, 256, 256, 256, 256, None),
+        (256, 512, 500, 0, 512, 0, None),
+        (256, 256, 512, 512, 0, 256, None),
+        (0, 512, 500, 0, 0, 512, False),
+        (0, 512, 500, 0, 512, 0, True),
+        (0, 512, 300, 300, 0, 512, False),
+        (0, 512, 300, 300, 212, 256, True),
+        (512, 256, 0, 0, 0, 256, True),
     ],
 )
 def test_lmcache_short_hit_releases_locks_and_preserves_rank_consensus(
-    cache_class, minimum, total, local, peer_local, expected_hit, release_end
+    cache_class, minimum, total, local, peer_local, expected_hit, release_end, cost_load
 ):
     cache = cache_class.__new__(cache_class)
     handle = CacheRequestHandle("request", 0)
@@ -182,6 +188,13 @@ def test_lmcache_short_hit_releases_locks_and_preserves_rank_consensus(
     cache._external_flows = {handle.rid: flow}
     cache._min_retrieve_tokens = minimum
     cache.prefetch_loaded_tokens_by_reqid = {}
+    cache._load_cost_profile = (
+        mock.Mock(should_load=mock.Mock(return_value=cost_load))
+        if cost_load is not None
+        else None
+    )
+    cache._load_cost_model_name = "model"
+    cache._load_cost_world_size = 2
     cache.prefetch_loaded_storage_start_by_reqid = {handle: 999}
     cache.lmcache_connector = mock.Mock(chunk_size=256)
     cache.lmcache_connector.poll_lookup.return_value = total
@@ -201,6 +214,13 @@ def test_lmcache_short_hit_releases_locks_and_preserves_rank_consensus(
         assert cache.check_prefetch_progress(handle)
 
     cache.lmcache_connector.parallel_all_reduce.assert_called_once()
+    if cost_load is not None:
+        if total <= peer_local or total - peer_local < minimum:
+            cache._load_cost_profile.should_load.assert_not_called()
+        else:
+            cache._load_cost_profile.should_load.assert_called_once_with(
+                LoadCostKey("model", 2, 256, 1024, peer_local, total - peer_local)
+            )
     assert cache.prefetch_loaded_tokens_by_reqid[handle] == expected_hit
     if release_end:
         cache.lmcache_connector.free_lookup_locks.assert_called_once_with(

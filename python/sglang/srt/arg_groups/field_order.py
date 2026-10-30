@@ -560,5 +560,6 @@ POSITIONAL_FIELD_ORDER = (
     "cp_kv_layout",
     "enable_prefill_weight_versions",
     "lmcache_min_retrieve_tokens",
+    "lmcache_load_cost_profile",
 )
 # fmt: on

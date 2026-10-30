@@ -358,7 +358,9 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         enter_override(
             self,
             get_context().override_server_args(
-                enable_lmcache=True, lmcache_min_retrieve_tokens=512
+                enable_lmcache=True,
+                lmcache_min_retrieve_tokens=512,
+                lmcache_load_cost_profile="costs.json",
             ),
         )
         fake_module = MagicMock()
@@ -378,6 +380,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 tp_rank=ctx.tp_rank,
                 lmcache_config_file=None,
                 min_retrieve_tokens=512,
+                load_cost_profile="costs.json",
                 forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
             self.assertEqual(_slots(ctx), [("FULL", "token")])

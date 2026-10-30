@@ -2438,6 +2438,17 @@ class TestHiCacheArgs(CustomTestCase):
         )
         self.assertEqual(args.lmcache_min_retrieve_tokens, 512)
 
+    def test_lmcache_load_cost_profile_cli(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = ServerArgs.from_cli_args(
+            parser.parse_args(
+                ["--model-path", "dummy", "--lmcache-load-cost-profile", "costs.json"]
+            )
+        )
+        self.assertEqual(args.lmcache_load_cost_profile, "costs.json")
+        self.assertIsNone(ServerArgs(model_path="dummy").lmcache_load_cost_profile)
+
     def test_lmcache_retrieve_minimum_must_be_non_negative(self):
         for minimum in (0, 256, 1024):
             args = self._make_args(

@@ -28,6 +28,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lmcache.load_cost_profile import (
+    LoadCostKey,
+    LoadCostProfile,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
 
@@ -52,11 +56,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         lmcache_config_file: Optional[str],
         forward_stream: Any,
         min_retrieve_tokens: int = 0,
+        load_cost_profile: Optional[str] = None,
     ) -> None:
         # The parent constructor calls reset() before the connector exists.
         self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
         super().__init__(params)
         self._min_retrieve_tokens = min_retrieve_tokens
+        self._load_cost_profile = (
+            LoadCostProfile.from_file(load_cost_profile) if load_cost_profile else None
+        )
+        self._load_cost_model_name = model_config.model_path
+        self._load_cost_world_size = tp_size * params.pp_size
         self._mamba_component = self._find_mamba_component()
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
@@ -250,6 +260,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 total_hit <= local_hit_tokens
                 or total_hit - local_hit_tokens < self._min_retrieve_tokens
             )
+            if not decline and self._load_cost_profile is not None:
+                decline = not self._load_cost_profile.should_load(
+                    LoadCostKey(
+                        model_name=self._load_cost_model_name,
+                        world_size=self._load_cost_world_size,
+                        chunk_size=self.lmcache_connector.chunk_size,
+                        lookup_tokens=len(flow.key),
+                        engine_computed_tokens=local_hit_tokens,
+                        external_tokens=total_hit - local_hit_tokens,
+                    )
+                )
             release_end = min(
                 total_hit,
                 local_hit_tokens

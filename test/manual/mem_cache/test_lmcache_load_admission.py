@@ -4,6 +4,7 @@ Install LMCache in the active SGLang environment. Set
 SGLANG_TEST_LMCACHE_TP_SIZE=2 to exercise two ranks.
 """
 
+import json
 import os
 import socket
 import subprocess
@@ -32,6 +33,7 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
         if torch.cuda.device_count() < cls.tp_size:
             raise unittest.SkipTest(f"Requires {cls.tp_size} GPUs")
         cls.use_shm = os.environ.get("SGLANG_TEST_LMCACHE_SHM") == "1"
+        cls.use_cost_profile = os.environ.get("SGLANG_TEST_LMCACHE_COST_PROFILE") == "1"
         cls.model = os.environ.get("SGLANG_TEST_LMCACHE_MODEL", "Qwen/Qwen3-0.6B")
         port = int(os.environ.get("SGLANG_TEST_LMCACHE_BASE_PORT", "31700"))
         cls.engine_port = port + 1
@@ -42,6 +44,34 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
         cls.addClassCleanup(directory.cleanup)
         cls.addClassCleanup(cls._stop_all)
         cls.config = Path(directory.name) / "mp.yaml"
+        cls.cost_profile = Path(directory.name) / "costs.json"
+        # Synthetic costs exercise both branches; these are not calibration data.
+        cls.cost_profile.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "metric": "request_elapsed_ms",
+                    "profiles": [
+                        {
+                            "model_name": cls.model,
+                            "world_size": cls.tp_size,
+                            "chunk_size": 256,
+                            "lookup_tokens": lookup,
+                            "engine_computed_tokens": 0,
+                            "external_tokens": external,
+                            "load_ms": load,
+                            "recompute_ms": recompute,
+                        }
+                        for lookup, external, load, recompute in (
+                            (256, 256, 10, 1),
+                            (1024, 256, 10, 1),
+                            (1024, 1024, 1, 10),
+                        )
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         cls.config.write_text(
             f"mp_host: 127.0.0.1\nmp_port: {cls.cache_port}\n"
             "extra_config:\n  lmcache.mp.mp_transfer_mode: engine_driven\n"
@@ -126,8 +156,10 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
                 "--lmcache-config-file",
                 str(cls.config),
                 "--lmcache-min-retrieve-tokens",
-                "512",
+                "0" if cls.use_cost_profile else "512",
             ]
+            if cls.use_cost_profile:
+                args += ["--lmcache-load-cost-profile", str(cls.cost_profile)]
         cls.processes["engine"] = subprocess.Popen(
             [
                 sys.executable,
@@ -190,6 +222,10 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
         short_reference = self._generate(short, "baseline")
         self._flush()
         long_reference = self._generate(long, "baseline")
+        if self.use_cost_profile:
+            self._flush()
+            unknown = filler[: 769 - len(question)] + question
+            unknown_reference = self._generate(unknown, "baseline")
         self._stop("engine")
         self._start_cache()
         self._start_engine(enable_lmcache=True)
@@ -205,6 +241,15 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
         self._assert_result(self._generate(short, "partial"), short_reference, 0)
         self._flush()
         self._assert_result(self._generate(long, "isolated"), long_reference, 0)
+        if self.use_cost_profile:
+            self._flush()
+            self._assert_result(
+                self._generate(unknown, "unknown"), unknown_reference, 0
+            )
+            self._flush()
+            self._assert_result(
+                self._generate(unknown, "unknown"), unknown_reference, 768
+            )
 
 
 if __name__ == "__main__":
