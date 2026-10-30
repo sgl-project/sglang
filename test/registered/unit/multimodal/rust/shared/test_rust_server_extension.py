@@ -662,6 +662,92 @@ class TestRustServerExtension(CustomTestCase):
         )
         scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
+    def test_mixed_logprob_batch_frame(self):
+        """In a batch where only some rows carry each logprob family, every row
+        reads back its own cells from the frame (`for_each_chunk`'s column
+        order), and a family no row carries leaves its header columns empty
+        instead of a zero per request."""
+        import msgspec
+
+        no_cells = [[] for _ in range(4)]
+        payload = SimpleNamespace(
+            rids=["a", "b", "c", "d"],
+            finished_reasons=[None] * 4,
+            prompt_tokens=[3, 3, 3, 3],
+            output_ids=[
+                array("q", [7, 8]),
+                array("q", [9]),
+                array("q", [5]),
+                array("q"),
+            ],
+            cached_tokens=[0] * 4,
+            reasoning_tokens=[0] * 4,
+            weight_versions=None,
+            image_tokens=None,
+            audio_tokens=None,
+            video_tokens=None,
+            output_token_logprobs_val=[[-0.5, -0.25], [], [-1.5], []],
+            output_token_logprobs_idx=[[7, 8], [], [5], []],
+            input_token_logprobs_val=[[], [None, -2.0, -3.0], [], []],
+            input_token_logprobs_idx=[[], [1, 2, 3], [], []],
+            output_top_logprobs_val=[[[-0.5, -1.0], [-0.25]], [], [], []],
+            output_top_logprobs_idx=[[[7, 4], [8]], [], [], []],
+            input_top_logprobs_val=[[], [None, [-2.0]], [], []],
+            input_top_logprobs_idx=[[], [None, [2]], [], []],
+            output_token_ids_logprobs_val=[[], [], [[-4.0, -6.0]], []],
+            output_token_ids_logprobs_idx=[[], [], [[11, 12]], []],
+            input_token_ids_logprobs_val=no_cells,
+            input_token_ids_logprobs_idx=no_cells,
+            output_hidden_states=[None, None, None, [[0.5, 1.5]]],
+            customized_info=None,
+        )
+        server = RustServer(Mock(), http_port=0)
+        server.push_generation(payload, {})
+        header, data_cols = server.server.push_decode_result_batch.call_args.args
+        h = msgspec.msgpack.decode(header)
+        data = b"".join(data_cols)
+        offset = 0
+
+        def take(typecode, count):
+            nonlocal offset
+            out = array(typecode)
+            out.frombytes(data[offset : offset + count * out.itemsize])
+            offset += count * out.itemsize
+            return [None if x != x else x for x in out]  # NaN -> None
+
+        def by_row(counts, items):
+            starts = [sum(counts[:r]) for r in range(len(counts))]
+            return [items[s : s + c] for s, c in zip(starts, counts)]
+
+        def flat(col):
+            vals, idxs = take("f", sum(h[col])), take("i", sum(h[col]))
+            return [
+                list(zip(*p)) for p in zip(by_row(h[col], vals), by_row(h[col], idxs))
+            ]
+
+        def ragged(col):
+            reqlens, poslens = h[col], h[col + 1]
+            vals, idxs = take("f", sum(poslens)), take("i", sum(poslens))
+            positions = [
+                list(zip(*p)) or None
+                for p in zip(by_row(poslens, vals), by_row(poslens, idxs))
+            ]
+            return by_row(reqlens, positions)
+
+        self.assertEqual(by_row(h[3], take("q", sum(h[3]))), [[7, 8], [9], [5], []])
+        self.assertEqual(flat(6), [[(-0.5, 7), (-0.25, 8)], [], [(-1.5, 5)], []])
+        self.assertEqual(flat(7), [[], [(None, 1), (-2.0, 2), (-3.0, 3)], [], []])
+        self.assertEqual(
+            ragged(8), [[[(-0.5, 7), (-1.0, 4)], [(-0.25, 8)]], [], [], []]
+        )
+        self.assertEqual(ragged(10), [[], [None, [(-2.0, 2)]], [], []])
+        self.assertEqual(ragged(12), [[], [], [[(-4.0, 11), (-6.0, 12)]], []])
+        # input_token_ids_logprobs: no row carries it.
+        self.assertEqual((h[14], h[15]), ([], []))
+        self.assertEqual((h[16], h[17]), ([0, 0, 0, 1], [2]))
+        self.assertEqual(take("f", 2), [0.5, 1.5])
+        self.assertEqual(offset, len(data))
+
     def test_customized_info_goes_out_as_python_responses_render_it(self):
         """The egress sends customized_info as the JSON Python's responses
         render: numpy values as lists (float32 at its own precision), NaN as

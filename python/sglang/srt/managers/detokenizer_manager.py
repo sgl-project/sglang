@@ -30,6 +30,9 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.kv_canary.perturb.detokenizer import (
+    maybe_perturb_batch_token_id_out,
+)
 from sglang.srt.managers.incremental_detokenize import (
     DETOKENIZER_MAX_STATES,
     DetokenizeHeader,
@@ -395,6 +398,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return ipcs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        maybe_perturb_batch_token_id_out(recv_obj)
         states = self._update_detokenize_states(recv_obj)
         headers = [None if s is None else s.header for s in states]
         # Beam decoding is additive: a batch may mix beam leaders with normal
@@ -455,6 +459,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             weight_versions=recv_obj.weight_versions,
+            prefill_weight_versions=recv_obj.prefill_weight_versions,
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
