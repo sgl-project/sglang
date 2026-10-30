@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=80, stage="base-c", runner_config="4-gpu-h100")
 
 
 class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
@@ -40,9 +40,8 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     "deepseek-ai/dspark_qwen3_14b_block7",
                     "--tp-size",
                     "2",
-                    "--dp-size",
+                    "--attn-dp-size",
                     "2",
-                    "--enable-dp-attention",
                     "--enable-dp-lm-head",
                     "--attention-backend",
                     "trtllm_mha" if is_sm100_supported() else "fa3",

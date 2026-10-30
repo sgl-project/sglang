@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
@@ -154,6 +154,12 @@ def _aiter_situ_uses_gu_interleaved_weights() -> bool:
     return a8w4 or not a4w4
 
 
+def _aiter_situ_uses_a8w4() -> bool:
+    """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
+    gfx1250 overrides it with fp4 activations."""
+    return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
+
+
 def _get_flashinfer_mxfp4_device_permute_indices(
     x: torch.Tensor,
     epilogue_tile_m: int,
@@ -225,6 +231,20 @@ def _pad_hopper_mxfp4_scale(scale, k_size):
     if scale.shape[-1] >= want:
         return scale
     return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
+
+
+@lru_cache(maxsize=1)
+def _mx_block_kwargs():
+    # triton_kernels 3.8 rejects an mx scale without its block size; the field is
+    # absent in 3.7, which ROCm still ships, so probe before importing the value.
+    from triton_kernels.matmul import PrecisionConfig
+
+    if "b_microblock_size" not in {f.name for f in fields(PrecisionConfig)}:
+        return {}
+
+    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
+
+    return {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -619,6 +639,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache
+            # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
+            layer.dispatcher.set_quant_config({})
+
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -686,7 +711,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     check_mega_moe_shapes,
                 )
 
-                mma_type = _mega_moe_mma_type()
+                mma_type = _mega_moe_mma_type(layer)
                 check_mega_moe_shapes(
                     hidden=layer.w13_weight.shape[2] * 2,
                     intermediate=layer.w13_weight.shape[1] // 2,
@@ -1042,11 +1067,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            mx_block = _mx_block_kwargs()
             self.w13_precision_config = PrecisionConfig(
-                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex), **mx_block
             )
             self.w2_precision_config = PrecisionConfig(
-                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex), **mx_block
             )
 
             self.w13_weight_triton_tensor = w13_weight
@@ -1482,10 +1508,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
@@ -1529,10 +1551,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
-            moe_tp_size=layer.moe_tp_size,
-            moe_tp_rank=layer.moe_tp_rank,
-            moe_ep_size=layer.moe_ep_size,
-            moe_ep_rank=layer.moe_ep_rank,
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)
@@ -1872,6 +1890,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         return w, mx_scales
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if get_moe_a2a_backend().is_mori() and hasattr(layer, "dispatcher"):
+            # Resolve MORI dtype overrides and build the EPv2 op before KV cache
+            # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
+            layer.dispatcher.set_quant_config({})
+
         w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 

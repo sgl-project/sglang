@@ -10,31 +10,36 @@ This page focuses on optimal configuration and benchmark results for MiMo-V2-Fla
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### MiMo-V2-Flash 1P1D 12P IN16K OUT1 TTFT 5s
+### MiMo-V2-Flash 1P1D 16P IN16K OUT1 TTFT 5s
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -166,8 +171,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --enable-dp-attention --dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
@@ -212,13 +216,13 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### MiMo-V2-Flash 1P1D 12P IN16K OUT1K TPOT 20ms
+### MiMo-V2-Flash 1P1D 16P IN16K OUT1K TPOT 20ms
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -350,8 +354,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --enable-dp-attention --dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
@@ -396,13 +399,13 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### MiMo-V2-Flash 1P1D 12P IN32K OUT1 TTFT 5s
+### MiMo-V2-Flash 1P1D 16P IN32K OUT1 TTFT 5s
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -534,8 +537,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --enable-dp-attention --dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency
@@ -580,13 +582,13 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### MiMo-V2-Flash 1P1D 12P IN32K OUT1K TPOT 20ms
+### MiMo-V2-Flash 1P1D 16P IN32K OUT1K TPOT 20ms
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -718,8 +720,7 @@ do
         --speculative-num-draft-tokens 4 \
         --enable-multi-layer-eagle \
         --disable-radix-cache \
-        --dp-size 2 \
-        --enable-dp-attention \
+        --enable-dp-attention --dp-size 2 \
         --enable-dp-lm-head \
         --moe-a2a-backend deepep \
         --deepep-mode low_latency

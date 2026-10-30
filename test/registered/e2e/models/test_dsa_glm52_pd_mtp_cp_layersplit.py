@@ -20,7 +20,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=898, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=1250, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 6}'
 
@@ -107,9 +107,8 @@ class TestGLM52DSACacheLayerSplitMixedMoE(TestGLM52DSACacheLayerSplit):
     gsm8k_num_threads = 32
 
     extra_decode_args = TestGLM52DSACacheLayerSplit.extra_decode_args + [
-        "--dp-size",
+        "--attn-dp-size",
         "4",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--ep-size",
         "4",

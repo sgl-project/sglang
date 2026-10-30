@@ -12,7 +12,6 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -44,7 +43,7 @@ def torch_reference_conflicts_with_decode_graph(device: torch.device) -> bool:
     # than waves through: a startup error beats a canary that reports clean forever.
     return (
         use_torch_reference(device)
-        and current_platform.support_cuda_graph()
+        and current_platform.capabilities.graph_capture
         and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
     )
 
@@ -83,9 +82,7 @@ def install_canary(
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     allocator = model_runner.token_to_kv_pool_allocator
-    swa_allocator = (
-        allocator if isinstance(allocator, SWATokenToKVPoolAllocator) else None
-    )
+    swa_allocator = allocator if allocator.has_window_pool else None
     launch_capacities = CanaryLaunchCapacities.from_args(
         req_to_token_pool_size=model_runner.req_to_token_pool.size,
         max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],

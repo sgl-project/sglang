@@ -317,16 +317,21 @@ class MockKDAModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
-        self.init_kv_index_translator()
-        self.attn_cp_size = 1
+        self.req_to_token_pool.state.bind_routes(self.token_to_kv_pool.layer_router)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
+        self.is_draft_worker = False
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property
@@ -553,6 +558,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
@@ -658,9 +665,6 @@ def build_kda_attention_fixture(
         device=device,
     )
     # KDA gate input is per-head-channel ([T, HV*K] raw); beta is per-head ([T, HV]).
-    # For extend, the production model unflattens gate to [1, T, HV, K] and
-    # sigmoid-then-unsqueezes beta to [1, T, HV] before calling the attn layer.
-    # For decode, both stay flat and beta is sigmoid'd inside the fused kernel.
     a_raw = torch.randn(
         case.num_input_tokens,
         case.num_v_heads * head_k_dim,
@@ -672,10 +676,9 @@ def build_kda_attention_fixture(
     )
     if case.forward_mode.is_decode():
         a = a_raw
-        b = b_raw.unsqueeze(0)
     else:
         a = a_raw.unflatten(-1, (case.num_v_heads, head_k_dim)).unsqueeze(0)
-        b = b_raw.float().sigmoid().unsqueeze(0).to(dtype)
+    b = b_raw.unsqueeze(0)
 
     fixture = KDAAttentionFixture(
         case=case,
@@ -738,11 +741,11 @@ def _copy_kda_parameters(
 
 
 def _ssm_states(fixture: KDAAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).temporal
 
 
 def _conv_states(fixture: KDAAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).conv[0]
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).conv[0]
 
 
 def _clone_kda_cache(fixture: KDAAttentionFixture):
@@ -885,14 +888,6 @@ def make_kda_case_with_prefix_lens(
 
 
 def kda_fixture_inputs(fixture: KDAAttentionFixture) -> dict[str, torch.Tensor]:
-    # `a, b` are the per-forward-mode shaped tensors the actual module
-    # consumes (see `build_kda_attention_fixture`: for DECODE
-    # `a = a_raw [T, HV*K]` and `b = b_raw.unsqueeze(0) [1, T, HV]`; for
-    # non-DECODE `a = a_raw.unflatten(-1, (HV, K)).unsqueeze(0)` and
-    # `b = b_raw.sigmoid().unsqueeze(0)`). The verify reference
-    # (`expected_kda_verify_output_from_inputs` →
-    # `_pure_torch_kda_gating`) expects raw `[T, HV*K]` / `[T, HV]`
-    # instead, so we expose both shapes through the inputs dict.
     return {
         "mixed_qkv": fixture.mixed_qkv,
         "a": fixture.a,
@@ -924,10 +919,9 @@ def make_kda_random_inputs(
     )
     if case.forward_mode.is_decode():
         a = a_raw
-        b = b_raw.unsqueeze(0)
     else:
         a = a_raw.unflatten(-1, (case.num_v_heads, head_k_dim)).unsqueeze(0)
-        b = b_raw.float().sigmoid().unsqueeze(0).to(dtype)
+    b = b_raw.unsqueeze(0)
     return {
         "mixed_qkv": torch.randn(
             case.num_input_tokens,

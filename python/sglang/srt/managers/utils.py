@@ -16,6 +16,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
 )
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.auxiliary_output import append_auxiliary_output
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
@@ -24,8 +25,17 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
+    from sglang.srt.managers.auxiliary_output import (
+        DeviceAuxiliaryOutput,
+        HostAuxiliaryOutput,
+    )
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+    from sglang.srt.observability.forward_pass_metrics import (
+        FpmTiming,
+        ScheduledRequestMetrics,
+    )
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -72,7 +82,7 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -118,10 +128,18 @@ class GenerationBatchResult:
     # until the accepted path comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
 
+    # The plan the forward wrote its KV through, when the caller asked for it
+    # (`return_iteration_ids`): a speculative worker's own writes into the same
+    # slots take their ids from it.
+    iteration_ids: Optional[IterationIds] = None
+
     # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
+    prepared_draft_extend_inputs: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -135,10 +153,12 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
-    fpm_start_event: Optional[torch.cuda.Event] = None
-    fpm_end_event: Optional[torch.cuda.Event] = None
+    # Forward pass metrics (FPM)
+    fpm_timing: Optional[FpmTiming] = None
+    fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
+    # ForwardObserver output, copied together with the sampling observer's.
+    forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
     @property
@@ -219,10 +239,13 @@ class GenerationBatchResult:
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:
             return
-        device_output = self.logits_output.auxiliary_device_output
+        device_output = append_auxiliary_output(
+            self.forward_auxiliary_output, self.logits_output.auxiliary_device_output
+        )
         if device_output is not None:
             self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
             self.logits_output.auxiliary_device_output = None
+            self.forward_auxiliary_output = None
 
     @classmethod
     def from_pp_proxy(
@@ -312,6 +335,11 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
         ),
+        "sampling_mask_num_accept_tokens": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.num_accept_tokens
+        ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -332,6 +360,7 @@ def get_logprob_from_pp_outputs(
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
             support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
+            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large
@@ -375,8 +404,9 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     can_run_cuda_graph: bool = False
+    fpm_timing: Optional[FpmTiming] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):

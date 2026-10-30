@@ -38,6 +38,7 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -169,7 +170,7 @@ class ExpertDistributionRecorder(ABC):
     def on_select_experts(self, topk_ids: torch.Tensor):
         pass
 
-    def get_current_pass_count_buffer(self, layer_idx: int):
+    def get_current_pass_count_buffer(self):
         return None
 
     def on_deepep_dispatch_normal(
@@ -285,13 +286,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
-    def get_current_pass_count_buffer(self, layer_idx: int):
-        if not self._recording or not self._record_current_pass:
+    def get_current_pass_count_buffer(self):
+        if not self._hook_enabled():
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
             return None
-        return gatherer._data[layer_idx]
+        return gatherer._data[self._current_layer_idx.value]
 
     def on_deepep_dispatch_normal(
         self,
@@ -316,14 +317,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
-    def _on_hook(self, hook_name: str, **kwargs):
+    def _hook_enabled(self) -> bool:
         if self._disable_all:
-            return
+            return False
         if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
-            return
-        if not (
+            return False
+        return (
             self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
+        )
+
+    def _on_hook(self, hook_name: str, **kwargs):
+        if not self._hook_enabled():
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -615,8 +619,10 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
-    # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if topk_ids.is_cuda:
+            record_physical_counts(topk_ids, self._data[layer_idx])
+            return
         topk_ids = topk_ids.flatten()
         mask = (topk_ids >= 0) & (
             topk_ids < self._expert_location_metadata.num_physical_experts
@@ -1092,9 +1098,14 @@ class _InfiniteBuffer(_Buffer):
         device = self._buffer.device
 
         if self._size == curr_buffer_size:
-            new_buffer = torch.zeros(
-                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
-            )
+            # Growth can happen inside a caller's inference_mode (e.g. DSpark draft);
+            # an inference tensor buffer would reject later appends made outside it.
+            with torch.inference_mode(False):
+                new_buffer = torch.zeros(
+                    (2 * curr_buffer_size, *self._item_shape),
+                    dtype=dtype,
+                    device=device,
+                )
             new_buffer[:curr_buffer_size] = self._buffer
             self._buffer = new_buffer
 

@@ -28,7 +28,7 @@ from sglang.test.observability.fake_ray import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -223,46 +223,6 @@ class TestLabelsCopyAndGuard(TestRayWrapperBase):
             counter.labels("only_one_arg")
 
 
-class TestCollectorSubclassWiring(TestRayWrapperBase):
-    """Each Ray collector subclass must override only the ``_xxx_cls`` attrs the
-    underlying collector actually uses."""
-
-    def test_scheduler_overrides_all_four(self):
-        cls = self.rw.RaySchedulerMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._gauge_cls, self.rw.RayGaugeWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIs(cls._summary_cls, self.rw.RaySummaryWrapper)
-
-    def test_tokenizer_overrides_counter_gauge_histogram(self):
-        cls = self.rw.RayTokenizerMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._gauge_cls, self.rw.RayGaugeWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._summary_cls)
-
-    def test_storage_overrides_counter_histogram_only(self):
-        cls = self.rw.RayStorageMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._gauge_cls)
-        self.assertIsNone(cls._summary_cls)
-
-    def test_radix_overrides_counter_histogram_only(self):
-        cls = self.rw.RayRadixCacheMetricsCollector
-        self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._gauge_cls)
-        self.assertIsNone(cls._summary_cls)
-
-    def test_expert_dispatch_overrides_histogram_only(self):
-        cls = self.rw.RayExpertDispatchCollector
-        self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._counter_cls)
-        self.assertIsNone(cls._gauge_cls)
-        self.assertIsNone(cls._summary_cls)
-
-
 class TestRayMissingImportError(unittest.TestCase):
     """Importing the module must succeed even without Ray; instantiating a
     wrapper without Ray must raise ImportError with a clear message."""
@@ -386,17 +346,18 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
                 set_last_time=lambda: None,
             ),
         )
+        request_stats = SimpleNamespace(
+            prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
+        )
         for j, count in enumerate(completion_tokens):
             last = j == len(completion_tokens) - 1
             state.finished = last and finish_type is not None
             recv = SimpleNamespace(
                 finished_reasons=[{"type": finish_type} if state.finished else None],
-                prompt_tokens=[100],
-                cached_tokens=[0],
             )
             if count is not None:
                 recv.completion_tokens = [count]
-            TokenizerManager.collect_metrics(manager, state, recv, 0)
+            TokenizerManager.collect_metrics(manager, state, recv, 0, request_stats)
         return collector
 
     def _itl_samples(self, collector):

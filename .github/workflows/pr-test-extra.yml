@@ -2,7 +2,7 @@ name: PR Test Extra
 # Label-gated extra CI workflow opted into per-PR via labels.
 #
 # Adds runtime to a PR only when the author asks for it: the PR must carry
-# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-extra` (explicit opt-in
+# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-nv-extra` (explicit opt-in
 # to this workflow). The label check happens at runtime in pr-gate.yml via
 # live `gh pr view --json labels`, so reruns after adding the labels via
 # slash command pick up the new label set (workflow-level `if` checks would
@@ -14,12 +14,11 @@ name: PR Test Extra
 # `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
 
 on:
+  # No `labeled` trigger: a label event would join the concurrency group and
+  # cancel the run in progress. Adding `run-ci-nv-extra` after a push takes a
+  # rerun (/run-extra-ci nv, or a manual rerun), which the live label
+  # gate in pr-gate.yml then passes.
   pull_request:
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push — otherwise GHA leaves the stale
-    # skipped run in place and there's no way to enable extra without
-    # another push. See check-changes.if below for the matching guard.
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -76,24 +75,15 @@ permissions:
 
 jobs:
   # =============================================== check changes ====================================================
-  # The actual `run-ci` + `run-ci-extra` label gate now lives in the
+  # The actual `run-ci` + `run-ci-nv-extra` label gate now lives in the
   # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
   # the PR's current labels at runtime, so a rerun (e.g. via
-  # /tag-and-rerun-ci extra, which adds labels via GITHUB_TOKEN — these
+  # /run-extra-ci nv, which adds labels via GITHUB_TOKEN — these
   # don't cascade-trigger labeled events) picks up the new label set and
   # passes. The previous workflow-level `if` checked the frozen event
   # payload, which never updates on rerun and made the slash-add-label flow
   # impossible to recover.
-  #
-  # We only keep one filter here: for `labeled` events, only proceed if the
-  # just-added label is one of the gating labels. This prevents every
-  # unrelated label addition from dispatching a full CI run.
   check-changes:
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -104,7 +94,7 @@ jobs:
 
   # =============================================== PR Gate ====================================================
   # Runtime live-fetch gate. Mirrors pr-test.yml's call-gate, but additionally
-  # requires `run-ci-extra`. Failure here cascades down to every test job
+  # requires `run-ci-nv-extra`. Failure here cascades down to every test job
   # via `needs`, so the workflow ends with one red gate job (~30s) plus a
   # row of skipped test jobs instead of consuming a runner.
   call-gate:
@@ -113,7 +103,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
-      require-run-ci-extra: true
+      require-label: run-ci-nv-extra
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
@@ -133,7 +123,7 @@ jobs:
 
   # =============================================== Rust extensions ====================================================
 
-  # Own build job because artifacts are per-run: a standalone `run-ci-extra` run
+  # Own build job because artifacts are per-run: a standalone `run-ci-nv-extra` run
   # cannot reach the base run's. Only artifact_name is suffixed; the cache prefix
   # stays at the default so the two workflows share one cache entry.
   rust-ext-build:
@@ -160,6 +150,15 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     # No `secrets: inherit`: this hosted CPU job has no secret consumer.
 
+  simulator-test-gpu:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/_pr-test-simulator-gpu.yml
+    with:
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+
   # =============================================== extra-a / extra-b ===============================================
   # `name:` keeps the job names wait-for-jobs and check-pr-test-health match on.
   extra-test:
@@ -173,9 +172,22 @@ jobs:
           - { stage: extra-a, runner_config: 1-gpu-small, timeout_per_file: '' }
           - { stage: extra-a, runner_config: 1-gpu-large, timeout_per_file: '1800' }
           - { stage: extra-a, runner_config: 2-gpu-large, timeout_per_file: '' }
-          - { stage: extra-b, runner_config: 4-gpu-h100, timeout_per_file: '3600' }
+          - {
+              stage: extra-b,
+              runner_config: 4-gpu-h100,
+              timeout_per_file: '3600',
+              warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4',
+              warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4',
+            }
           - { stage: extra-b, runner_config: 4-gpu-b200, timeout_per_file: '1800' }
-          - { stage: extra-b, runner_config: 8-gpu-h200, timeout_per_file: '' }
+          - {
+              stage: extra-b,
+              runner_config: 8-gpu-h200,
+              timeout_per_file: '1800',
+              warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8',
+              warmup_timeout: '60',
+            }
+          - { stage: extra-b, runner_config: 8-gpu-h20, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 8-gpu-b300, timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -186,7 +198,20 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '60'
       timeout_per_file: ${{ matrix.timeout_per_file }}
+      warmup_deep_gemm_models: ${{ matrix.warmup_deep_gemm_models || '' }}
+      warmup_server_models: ${{ matrix.warmup_server_models || '' }}
+      warmup_timeout_minutes: ${{ matrix.warmup_timeout || '25' }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
+
+  xeon-extra:
+    needs: [check-changes, call-gate]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/pr-test-xeon.yml
+    with:
+      ref: ${{ inputs.git_ref || github.ref }}
+      run_all_tests: ${{ inputs.run_all_tests == true }}
+      extra_only: true
     secrets: inherit
 
   # =============================================== aggregator ====================================================
@@ -201,16 +226,11 @@ jobs:
         sgl-kernel-build-wheels,
         rust-ext-build,
         simulator-test-cpu,
+        simulator-test-gpu,
         extra-test,
+        xeon-extra,
       ]
-    # Without this guard an unrelated label starts a run that finishes green with
-    # nothing executed, over the real failure; `skipped` is what pr-states.yml reads.
-    if: |
-      always() &&
-      (github.event_name != 'pull_request' ||
-       github.event.action != 'labeled' ||
-       github.event.label.name == 'run-ci' ||
-       github.event.label.name == 'run-ci-extra')
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
@@ -240,14 +260,10 @@ jobs:
   # there (initial completion) and pull_request_target (push / label).
   notify-pr-states:
     needs: [pr-test-extra-finish]
-    # Same guard; pr-states.yml subscribes to labeled/unlabeled itself, so nothing is lost.
     if: |
       always() &&
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      (github.event.action != 'labeled' ||
-       github.event.label.name == 'run-ci' ||
-       github.event.label.name == 'run-ci-extra')
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch pr-states refresh

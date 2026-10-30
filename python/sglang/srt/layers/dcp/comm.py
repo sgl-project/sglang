@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     correct_attn_out,
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
+    dcp_pack_q,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -123,6 +124,41 @@ def cp_lse_ag_out_rs_mla(
     return out.to(cp_attn_out.dtype)
 
 
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge NPU DCP partial outputs and return the local head slice."""
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    batch_size, total_heads, head_dim = cp_attn_out.shape
+    world_size = cp_group.world_size
+    local_heads = total_heads // world_size
+    packed = torch.cat([cp_attn_out.float(), cp_attn_lse.float().unsqueeze(-1)], dim=-1)
+    packed = packed.permute(1, 2, 0).contiguous()
+    gathered = torch.empty_like(packed)
+    cp_group.all_to_all_single(gathered, packed)
+    # all_to_all_single splits the leading head dimension. After the exchange,
+    # the heads are grouped by source rank inside every token. Move that source
+    # rank in front before flattening tokens and local heads for the update op.
+    gathered = gathered.permute(2, 0, 1).contiguous()
+    gathered = (
+        gathered.view(batch_size, world_size, local_heads, head_dim + 1)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+        .view(world_size, batch_size * local_heads, head_dim + 1)
+    )
+    out_flat, lse_flat = torch.split(gathered, [head_dim, 1], dim=-1)
+    merged, _ = torch_npu.npu_attention_update(
+        lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0
+    )
+    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
+
+
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     parallel = get_parallel()
     dcp_world_size = parallel.dcp_size
@@ -176,9 +212,9 @@ def all_gather_kv_cache_for_mha_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
-    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
-    )
+    prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
+        attn_mqa.layer_id
+    ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -223,12 +259,28 @@ def all_gather_kv_cache_for_mha_extend(
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
 ):
+    """All-gather the DCP group's query heads; ``dtype`` casts q before the wire."""
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
+    if dtype is None or dtype == q_pe.dtype:
+        with use_symmetric_memory(group):
+            # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
+            combined = torch.cat(
+                [q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1
+            )
+        gathered = group.all_gather(combined, dim=0)
+    else:
+        B, H, d_nope = q_nope_out.shape
+        with use_symmetric_memory(group):
+            combined = torch.empty(
+                (H, B, q_pe.shape[-1] + d_nope), dtype=dtype, device=q_pe.device
+            )
+        dcp_pack_q(q_nope_out, q_pe, combined)
+        # The aiter custom all-gather only takes 16/32-bit floats and pynccl has
+        # no FP8 dtype: pair the bytes into fp16 when the row allows, an exact copy.
+        wire = torch.float16 if combined.shape[-1] % 2 == 0 else torch.uint8
+        gathered = group.all_gather(combined.view(wire), dim=0).view(dtype)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
@@ -250,7 +302,9 @@ def all_gather_kv_cache_for_mla_extend(
 ):
     # On hip, skip the all-gather when there is no cached prefix to avoid crash
     if not _is_hip or dcp_extend_prefix_lens_sum > 0:
-        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+        cache_k_nope, cache_k_rope = token_to_kv_pool.layer_router.read(
+            attn_mqa.layer_id
+        ).read_mla(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )
@@ -264,17 +318,19 @@ def all_gather_kv_cache_for_mla_extend(
         )
         dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # Attention TP may append dummy tokens to align an extend batch to its
+    # group width. The DCP buffer tracks only real sequence tokens.
+    extend_num_tokens = dcp_kv_buffer.shape[0] - dcp_extend_prefix_lens_sum
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         :kv_lora_rank,
-    ] = k_nope
+    ] = k_nope[:extend_num_tokens]
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         kv_lora_rank:,
-    ] = k_pe
+    ] = k_pe[:extend_num_tokens]
 
 
 # all gather kv cache and re-org to query orders

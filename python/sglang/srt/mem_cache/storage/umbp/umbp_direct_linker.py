@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -22,9 +21,12 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+    TransferReady,
+    UnifiedCacheLinker,
+)
 from sglang.srt.runtime_context import (
-    get_memory,
     get_model,
     get_parallel,
 )
@@ -63,64 +65,20 @@ def _ordered_layers(entry) -> list[int]:
             f"UMBP pool {entry.name} components have different layer counts."
         )
     pool_layer_count = component_lengths.pop()
-    if pool_layer_count != len(entry.layer_mapping):
-        raise ValueError(
-            f"UMBP pool {entry.name} has {pool_layer_count} buffers per component "
-            f"but {len(entry.layer_mapping)} mapped layers."
-        )
-    by_buffer = {
-        buffer_index: logical_layer
-        for logical_layer, buffer_index in entry.layer_mapping.items()
-    }
+    by_buffer = {}
+    for logical_layer, mapped in entry.layer_mapping.items():
+        indices = [mapped] if isinstance(mapped, int) else list(mapped)
+        for index in indices:
+            if index in by_buffer:
+                raise ValueError(
+                    f"UMBP pool {entry.name} maps buffer {index} more than once."
+                )
+            by_buffer[index] = logical_layer
     if sorted(by_buffer) != list(range(pool_layer_count)):
         raise ValueError(
             f"UMBP pool {entry.name} layer mapping is not a contiguous bijection."
         )
-    return [by_buffer[index] for index in range(pool_layer_count)]
-
-
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures: dict[int, list[Future]] = {}
-
-    def update_producer(self) -> int:
-        self._producer_index += 1
-        self._futures[self._producer_index] = [Future() for _ in range(self.num_layers)]
-        return self._producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self._futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        for future in self._futures.get(index, ()):
-            if not future.done():
-                future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self._futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            raise RuntimeError("UMBP layer-wise KV load failed.") from error
-        finally:
-            if threshold == self.num_layers - 1:
-                self._futures.pop(index, None)
-
-    def reset(self) -> None:
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures.clear()
+    return list(dict.fromkeys(by_buffer[index] for index in range(pool_layer_count)))
 
 
 @dataclass
@@ -133,8 +91,8 @@ class _PoolRangePlan:
     entries_per_page: int
 
 
-# One queued offload: the pools it resolved to, and the event guarding its KV.
-_OffloadTask = tuple[list[PoolTransfer], object]
+# One queued offload: the pools it resolved to, and the events gating the read.
+_OffloadTask = tuple[list[PoolTransfer], TransferReady]
 
 
 def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
@@ -173,19 +131,6 @@ def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
     return indices.detach().to(device="cpu", dtype=torch.int64).flatten()
 
 
-def _parse_storage_extra_config(raw_config):
-    # Keep the linker module importable in CPU-only unit tests. The hybrid
-    # controller imports device-specific memory-pool modules transitively.
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        HybridCacheController,
-    )
-
-    extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-        raw_config
-    )
-    return extra_config
-
-
 class UMBPDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -193,8 +138,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        extra_config=None,
         _storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
@@ -247,10 +195,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = _parse_storage_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
-        extra_config = dict(extra_config)
+        extra_config = dict(extra_config or {})
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -295,6 +240,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 )
             extra_config["dram_page_size"] = dram_page_size
 
+        # TODO: `tp_rank` is the rank in the cache TP group but `tp_size` is the
+        # full TP width, and no `dp_rank` is set, unlike
+        # `HiCacheController._generate_storage_config`. Aligning the
+        # storage-config producers changes persisted storage keys, so it waits
+        # for a storage-key format change.
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=get_parallel().tp_size,
@@ -387,16 +337,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise
 
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
-        if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[
-            tuple[int, list[str], list[_PoolRangePlan], object] | None
-        ] = Queue()
-        self._completed_loads: Queue[list[str]] = Queue()
+        self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
+            Queue()
+        )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
@@ -545,27 +490,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # The tree node is already visible in L1. Dropping its transfer would
-        # leave a device hit pointing at slots that were never populated.
-        return False
+        return self._pending.pop(rid, None) is not None
 
-    def num_completed_loads(self) -> int:
-        return self._completed_loads.qsize()
-
-    def pop_completed_load(self) -> list[str]:
-        return self._completed_loads.get_nowait()
+    def finish_layer_wise_loading(self, counter_index: int) -> bool:
+        return self.layer_done_counter.finish(counter_index)
 
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
             return -1
         self._freeze_gc_once()
         pending = self._pending
-        rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready = self.record_transfer_ready()
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, rids, plans, ready_event))
+        self._load_queue.put((counter_index, plans, ready))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
@@ -707,11 +645,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, rids, plans, ready_event = task
-                try:
-                    self._run_layer_wise_batch(counter_index, plans, ready_event)
-                finally:
-                    self._completed_loads.put(rids)
+                counter_index, plans, ready = task
+                self._run_layer_wise_batch(counter_index, plans, ready)
             finally:
                 self._load_queue.task_done()
 
@@ -759,15 +694,17 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         entry = self.pools[plan.name]
         items: list[list[tuple[int, int, int, int]]] = []
         for logical_layer in layers:
-            buffer_index = entry.layer_mapping.get(logical_layer)
-            if buffer_index is None:
+            mapped = entry.layer_mapping.get(logical_layer)
+            if mapped is None:
                 continue
+            indices = [mapped] if isinstance(mapped, int) else list(mapped)
             items.append(
                 [
-                    (*component[buffer_index], offsets[buffer_index])
+                    (*component[index], offsets[index])
                     for component, offsets in zip(
                         entry.buffer_meta, entry._component_offsets
                     )
+                    for index in indices
                 ]
             )
         return items
@@ -843,10 +780,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
 
     def _run_layer_wise_batch(
-        self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
+        self, counter_index: int, plans: list[_PoolRangePlan], ready: TransferReady
     ) -> None:
         try:
-            ready_event.synchronize()
+            ready.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
@@ -896,14 +833,15 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for start in range(0, self.num_layers, self.layer_group)
         ]
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: str | None = None
+    ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = device_module.Event()
-        ready_event.record()
-        self._offload_queue.put((expanded, ready_event))
+        ready = self.record_transfer_ready()
+        self._offload_queue.put((expanded, ready))
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -957,8 +895,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.put(success)
 
     def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
-        for _, ready_event in tasks:
-            ready_event.synchronize()
+        for _, ready in tasks:
+            ready.synchronize()
         next_slot = 0
 
         def materialize_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -1043,11 +981,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self._offload_results.get_nowait()
-            except Empty:
-                break
-        while True:
-            try:
-                self._completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()

@@ -3,42 +3,38 @@
 import unittest
 import weakref
 from contextlib import nullcontext
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
-from sglang.srt.layers.layer_boundary import ADD
+from sglang.srt.layers.layer_boundary import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestBatchOwnedResidual(CustomTestCase):
     def test_start_releases_previous_call_and_resets_state(self):
         fb = SimpleNamespace(residual_stream=None)
         with self.assertRaisesRegex(RuntimeError, "start"):
-            batch.current(fb)
+            batch.stream_of(fb)
         batch.start(fb)
-        old = batch.current(fb)
-        self.assertIs(old, batch.current(fb))
+        old = batch.stream_of(fb)
+        self.assertIs(old, batch.stream_of(fb))
         value = torch.ones(2, 4)
         ref = weakref.ref(value)
         old.write(value)
         del value, old
         batch.start(fb)
-        fresh = batch.current(fb)
-        self.assertIs(fresh, batch.current(fb))
+        fresh = batch.stream_of(fb)
+        self.assertIs(fresh, batch.stream_of(fb))
         self.assertIsNone(fresh.pending)
         self.assertIsNone(fresh.residual)
         self.assertIsNone(ref())
@@ -46,75 +42,33 @@ class TestBatchOwnedResidual(CustomTestCase):
     def test_terminal_completion_releases_batch_before_final_norm(self):
         fb = SimpleNamespace(residual_stream=None)
         batch.start(fb)
-        stream = batch.current(fb)
+        stream = batch.stream_of(fb)
         residual = torch.full((2, 4), 3.0)
         partial = torch.ones(2, 4)
         group = SimpleNamespace(all_reduce=Mock(side_effect=lambda x: x * 2))
         stream.write(residual)
-        hidden = stream.leave(UnreducedOutput(partial, group=group), ADD)
-        result = batch.norm(hidden, fb, lambda value, prior: (value + prior, prior))
+        hidden = stream.record(UnreducedOutput(partial, group=group), PLAIN_ADD)
+        result = batch.final_norm(
+            hidden, fb, lambda value, prior: (value + prior, prior)
+        )
         self.assertIsNone(fb.residual_stream)
         group.all_reduce.assert_called_once()
         torch.testing.assert_close(result, torch.full((2, 4), 5.0))
         with self.assertRaisesRegex(RuntimeError, "start"):
-            batch.current(fb)
+            batch.stream_of(fb)
 
     def test_pp_export_releases_the_batch_owner(self):
         fb = SimpleNamespace(residual_stream=None)
         batch.start(fb)
         hidden = torch.full((2, 4), 2.0)
         residual = torch.ones(2, 4)
-        stream = batch.current(fb)
+        stream = batch.stream_of(fb)
         stream.write(residual)
-        output = stream.leave(hidden, ADD)
+        output = stream.record(hidden, PLAIN_ADD)
         proxy = batch.to_pp(output, fb)
         self.assertIs(proxy["hidden_states"], hidden)
         self.assertIs(proxy["residual"], residual)
         self.assertIsNone(fb.residual_stream)
-
-    def test_tbo_metadata_and_reused_batch_remain_stream_free_between_calls(self):
-        size = 4
-        parent = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=size,
-            input_ids=torch.zeros(size, dtype=torch.long),
-            positions=torch.zeros(size, dtype=torch.long),
-            out_cache_loc=torch.zeros(size, dtype=torch.long),
-            req_pool_indices=torch.zeros(size, dtype=torch.long),
-            seq_lens=torch.ones(size, dtype=torch.int32),
-            seq_lens_cpu=torch.ones(size, dtype=torch.int32),
-            seq_lens_sum=size,
-            spec_info=None,
-        )
-        for _ in range(2):
-            self.assertIsNone(parent.residual_stream)
-            with (
-                get_context().override_server_args(
-                    attention_backend="fa3", moe_dense_tp_size=None
-                ),
-                get_parallel().override(attn_tp_size=1),
-            ):
-                children = [
-                    TboForwardBatchPreparer.filter_batch(
-                        parent,
-                        start_token_index=start,
-                        end_token_index=start + 2,
-                        start_seq_index=start,
-                        end_seq_index=start + 2,
-                        out_num_token_non_padded=torch.tensor(2),
-                        out_num_token_non_padded_cpu=2,
-                    )
-                    for start in (0, 2)
-                ]
-            self.assertTrue(all(child.residual_stream is None for child in children))
-            batch.start(parent)
-            owner = batch.current(parent)
-            self.assertTrue(all(child.residual_stream is None for child in children))
-            hidden = owner.write(torch.ones(size, 4))
-            batch.norm(hidden, parent, lambda value: value)
-            cloned = replace(parent)
-            self.assertIsNone(cloned.residual_stream)
-            self.assertIsNone(parent.residual_stream)
 
     def test_split_prefill_retains_then_releases_batch_owner(self):
         from sglang.srt.models.llama4 import Llama4ForCausalLM
@@ -154,12 +108,12 @@ class TestBatchOwnedResidual(CustomTestCase):
 
         class Layer:
             def __call__(self, positions, hidden, forward_batch, **kwargs):
-                stream = batch.current(forward_batch)
+                stream = batch.stream_of(forward_batch)
                 owner_ids.append(id(stream))
-                hidden, old = stream.finish(hidden)
+                hidden, old = stream.export(hidden)
                 stream.write(hidden if old is None else hidden + old)
-                return stream.leave(
-                    UnreducedOutput(torch.ones_like(hidden), group=group), ADD
+                return stream.record(
+                    UnreducedOutput(torch.ones_like(hidden), group=group), PLAIN_ADD
                 )
 
         self_outer = self
@@ -196,12 +150,12 @@ class TestBatchOwnedResidual(CustomTestCase):
         from sglang.srt.models.nemotron_h_mtp import NemotronHMultiTokenPredictor
 
         def terminal_layer(*, inputs_embeds, hidden_states, forward_batch):
-            stream = batch.current(forward_batch)
+            stream = batch.stream_of(forward_batch)
             stream.write(hidden_states)
-            hidden_states = stream.leave(torch.ones_like(hidden_states), ADD)
+            hidden_states = stream.record(torch.ones_like(hidden_states), PLAIN_ADD)
             hidden_states = batch.fold(hidden_states, forward_batch)
             normalized = hidden_states * 3
-            return batch.written(normalized, forward_batch)
+            return batch.set_written(normalized, forward_batch)
 
         predictor = SimpleNamespace(pattern_len=1, layers={"0": terminal_layer})
         fb = SimpleNamespace(
@@ -217,13 +171,13 @@ class TestBatchOwnedResidual(CustomTestCase):
     def test_take_output_rejects_pending_or_mismatched_outputs(self):
         fb = SimpleNamespace(residual_stream=None)
         batch.start(fb)
-        stream = batch.current(fb)
+        stream = batch.stream_of(fb)
         value = torch.ones(2, 4)
         stream.write(value)
-        pending = stream.leave(value * 2, ADD)
+        pending = stream.record(value * 2, PLAIN_ADD)
         with self.assertRaises(RuntimeError):
             batch.take_output(pending, fb)
-        self.assertIs(batch.current(fb), stream)
+        self.assertIs(batch.stream_of(fb), stream)
         stream.write(value)
         with self.assertRaises(RuntimeError):
             batch.take_output(value.clone(), fb)

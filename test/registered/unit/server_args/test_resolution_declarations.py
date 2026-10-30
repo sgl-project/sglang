@@ -25,7 +25,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=26, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
@@ -58,7 +58,7 @@ _SHAPES = (
         "speculative_eagle_topk": 1,
         "speculative_num_draft_tokens": 4,
     },
-    {"dp_size": 2, "tp_size": 2, "enable_dp_attention": True},
+    {"attn_dp_size": 2, "tp_size": 2},
     {"enable_hierarchical_cache": True},
     {"disaggregation_mode": "prefill"},
     {"enable_lora": True, "max_lora_rank": 16},
@@ -66,7 +66,7 @@ _SHAPES = (
     # A pass and a handler both decide this one: waterfill forces `deepep`
     # and the ascend handler wants `none`. Without this shape nothing in
     # the set reaches a field two writers disagree about.
-    {"enable_waterfill": True, "moe_a2a_backend": "ascend_tp"},
+    {"enable_waterfill": True, "moe_a2a_backend": "none"},
 )
 
 # Which converted fields the shapes above reach; the rest need a device or an
@@ -77,6 +77,7 @@ _REACHED_BY_SHAPES = frozenset(
         "_speculative_draft_quantization_explicitly_set",
         "allowed_media_domains",
         "attention_backend",
+        "attn_dp_size",
         "chunked_prefill_size",
         "cuda_graph_config",
         "custom_weight_loader",
@@ -84,7 +85,6 @@ _REACHED_BY_SHAPES = frozenset(
         "disable_cuda_graph",
         "disaggregation_ib_device",
         "dp_size",
-        "enable_dp_attention",
         "enable_dp_attention_local_control_broadcast",
         "enable_dp_lm_head",
         "enable_flashinfer_allreduce_fusion",
@@ -535,7 +535,7 @@ class TestResolutionDeclarations(CustomTestCase):
         registry entry that ran earlier -- where before, the pass's declaration
         was applied on top of the handler's bare write. One handler was found
         that way (it gated on the raw field while its neighbours read the
-        resolving view, so `--enable-waterfill --moe-a2a-backend ascend_tp`
+        resolving view, so `--enable-waterfill --moe-a2a-backend none`
         silently stopped forcing `deepep`).
 
         This is the invariant rather than that instance: walk the stash in
@@ -761,7 +761,7 @@ class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
             ("disaggregation", {"disaggregation_mode": "prefill"}),
             ("deterministic", {"enable_deterministic_inference": True}),
             ("speculative", {"speculative_algorithm": "EAGLE"}),
-            ("dp_attention", {"tp_size": 2, "dp_size": 2, "enable_dp_attention": True}),
+            ("dp_attention", {"tp_size": 2, "attn_dp_size": 2}),
         ):
             with self.subTest(shape=label):
                 server_args, recorded = self._resolve_recording_each_entry(**supplied)
