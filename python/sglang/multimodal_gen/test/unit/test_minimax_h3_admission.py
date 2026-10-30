@@ -426,6 +426,7 @@ def test_prequeue_forwards_reference_resize_mode_and_target_canvas(
         uri="file:///reference.png",
     )
     plan = SimpleNamespace(
+        policy=None,
         materials=(material,),
         shape={
             "geometry": "resolved_v2",

@@ -19,8 +19,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_MIN_DURATION_SECONDS,
     MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
     MINIMAX_H3_SUPPORTED_FPS,
-    PIKA_H3_FLEX_ASPECT_RATIOS,
-    PIKA_H3_FLEX_MAX_PIXELS,
     warn_unverified_short_edge,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
@@ -31,8 +29,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_TASK_FL2VA,
     MINIMAX_H3_TASK_REF2VA,
     MINIMAX_H3_TASK_T2VA,
+    MiniMaxH3RequestPolicy,
     MiniMaxH3TaskProfile,
     canonical_minimax_h3_task,
+    minimax_h3_request_policy,
     minimax_h3_task_profile,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
@@ -70,7 +70,10 @@ def _optional_nonnegative_finite_float(value: Any, path: str) -> float | None:
 
 
 def _validate_target(
-    target: Any, *, profile: MiniMaxH3TaskProfile, request_policy: str | None = None
+    target: Any,
+    *,
+    profile: MiniMaxH3TaskProfile,
+    policy: MiniMaxH3RequestPolicy | None = None,
 ) -> dict[str, Any]:
     path = "target"
     if not isinstance(target, Mapping):
@@ -81,21 +84,18 @@ def _validate_target(
     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
     if short_edge <= 0:
         raise ValueError(f"{path}.short_edge must be positive, got {short_edge}")
-    if (
-        request_policy != "pika_h3_flex"
-        and short_edge != MINIMAX_H3_RECOMMENDED_SHORT_EDGE
-    ):
+    if policy is None and short_edge != MINIMAX_H3_RECOMMENDED_SHORT_EDGE:
         # Same guard the resolver applies. Without it the recommended value warns
         # that it is "outside the verified configuration", naming itself as the
         # verified one.
         warn_unverified_short_edge(short_edge)
     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
-    if request_policy == "pika_h3_flex":
-        if short_edge not in PIKA_H3_FLEX_MAX_PIXELS:
+    if policy is not None:
+        if short_edge not in policy.max_pixels:
             raise ValueError("Pika H3 Flex target.short_edge must be 480 or 768")
-        if aspect_ratio not in PIKA_H3_FLEX_ASPECT_RATIOS:
+        if aspect_ratio not in policy.aspect_ratios:
             raise ValueError(
-                f"Pika H3 Flex target.aspect_ratio must be one of {PIKA_H3_FLEX_ASPECT_RATIOS}"
+                f"Pika H3 Flex target.aspect_ratio must be one of {policy.aspect_ratios}"
             )
         if target.get("duration_seconds") is None:
             raise ValueError("Pika H3 Flex target.duration_seconds is required")
@@ -106,7 +106,7 @@ def _validate_target(
         )
     has_duration = target.get("duration_seconds") is not None
     if (
-        request_policy != "pika_h3_flex"
+        policy is None
         and profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
         and aspect_ratio != "auto"
         and aspect_ratio not in MINIMAX_H3_FINITE_ASPECT_RATIOS
@@ -140,6 +140,13 @@ def _validate_target(
                 f"{path}.duration_seconds must be in "
                 f"[{MINIMAX_H3_MIN_DURATION_SECONDS:g}, "
                 f"{MINIMAX_H3_MAX_DURATION_SECONDS:g}], got {duration}"
+            )
+        if policy is not None and (
+            not float(duration).is_integer()
+            or not policy.duration_seconds[0] <= duration <= policy.duration_seconds[1]
+        ):
+            raise ValueError(
+                "Pika H3 Flex target.duration_seconds must be whole seconds from 5 to 15"
             )
         out["duration_seconds"] = float(duration)
     return out
@@ -306,17 +313,14 @@ def minimax_h3_validate_canonical_request(
     # Normalize the task name before profile lookup so offline callers match
     # the adapter behaviour.
     task_name = canonical_minimax_h3_task(_require_str(task, "task"))
-    if request_policy not in (None, "pika_h3_flex"):
-        raise ValueError(f"unknown MiniMax H3 request policy {request_policy!r}")
+    policy = minimax_h3_request_policy(request_policy)
     requested_task = task_name
-    if request_policy == "pika_h3_flex" and task_name in {"i2va", "l2va"}:
+    if policy is not None and task_name in policy.keyframe_task_aliases:
         task_name = "fl2va"
     profile = minimax_h3_task_profile(task_name)
     prompt_text = _require_str(prompt, "prompt")
 
-    normalized_target = _validate_target(
-        target, profile=profile, request_policy=request_policy
-    )
+    normalized_target = _validate_target(target, profile=profile, policy=policy)
     requested_frame_count = None
     if normalized_target.get("duration_seconds") is not None:
         requested_frame_count = int(
@@ -366,9 +370,9 @@ def minimax_h3_validate_canonical_request(
                 "audio-bearing references are provided"
             )
 
-    if request_policy == "pika_h3_flex":
-        if requested_task in {"i2va", "l2va"}:
-            expected = [0] if requested_task == "i2va" else [-1]
+    if policy is not None:
+        if requested_task in policy.keyframe_task_aliases:
+            expected = [policy.keyframe_task_aliases[requested_task]]
             if [c.get("frame_index") for c in normalized_conditions] != expected:
                 raise ValueError(
                     f"Pika H3 Flex {requested_task} requires frame_index {expected}"
@@ -410,7 +414,7 @@ def minimax_h3_validate_canonical_request(
     normalized_audio_flow_shift = optional_positive_finite_float(
         audio_flow_shift, "audio_flow_shift"
     )
-    if request_policy == "pika_h3_flex" and (
+    if policy is not None and (
         normalized_flow_shift not in (None, 12.0)
         or normalized_audio_flow_shift not in (None, 3.0)
     ):

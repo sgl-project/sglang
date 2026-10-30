@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import msgspec
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_MAX_DURATION_SECONDS,
     MINIMAX_H3_MIN_DURATION_SECONDS,
@@ -42,20 +44,7 @@ MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY = "minimax_h3_resolved_material_sh
 def _replace_plan_shape(
     plan: MiniMaxH3ResolvedPlan, shape: dict[str, Any]
 ) -> MiniMaxH3ResolvedPlan:
-    return MiniMaxH3ResolvedPlan(
-        task=plan.task,
-        prompt=plan.prompt,
-        seed=plan.seed,
-        materials=plan.materials,
-        encoders=plan.encoders,
-        branches=plan.branches,
-        default_flow_shift=plan.default_flow_shift,
-        default_audio_flow_shift=plan.default_audio_flow_shift,
-        flow_shift=plan.flow_shift,
-        audio_flow_shift=plan.audio_flow_shift,
-        shape=shape,
-        condition_mask=plan.condition_mask,
-    )
+    return msgspec.structs.replace(plan, shape=shape)
 
 
 def _display_shape(facts: dict[str, Any], *, label: str) -> tuple[float, float]:
@@ -261,7 +250,7 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
 
         shape = dict(plan.shape)
         _validate_reference_start_times(plan, probe_facts)
-        if shape.get("shape_policy_version") == "pika_h3_flex":
+        if plan.policy is not None:
             totals = {"video": 0.0, "audio": 0.0}
             for material in plan.materials:
                 kind = material.condition_type
@@ -325,14 +314,15 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                     height=height,
                     base_short_edge=(
                         int(shape["base_short_edge"])
-                        if shape.get("shape_policy_version") == "pika_h3_flex"
+                        if plan.policy is not None
                         else MINIMAX_H3_BASE_SHORT_EDGE
                     ),
                     max_pixels=(
                         int(shape["max_pixels"])
-                        if shape.get("shape_policy_version") == "pika_h3_flex"
+                        if plan.policy is not None
                         else MINIMAX_H3_MAX_PIXELS
                     ),
+                    warn_unverified=plan.policy is None,
                 )
             elif material.material_chain == "image.reference_preserve":
                 width, height = _display_shape(
@@ -373,8 +363,6 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
         # Req delegates these fields to SamplingParams. Freezing them here makes
         # queue metadata and dynamic-batch signatures use the same final shape
         # that the MiniMax H3 stages consume.
-        if shape.get("shape_policy_version") == "pika_h3_flex":
-            batch.sampling_params.task = resolved_plan.task
         batch.width = int(shape["width"])
         batch.height = int(shape["height"])
         batch.fps = MINIMAX_H3_SUPPORTED_FPS

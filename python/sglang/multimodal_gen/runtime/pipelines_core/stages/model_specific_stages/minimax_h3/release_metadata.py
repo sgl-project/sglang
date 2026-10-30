@@ -213,7 +213,10 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         task = None if batch.sampling_params is None else batch.sampling_params.task
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
-        self.metadata.canonical_task(task)
+        plan = minimax_h3_plan_from_batch(batch)
+        self.metadata.canonical_task(
+            plan.task if plan is not None and plan.policy is not None else task
+        )
         min_steps = MiniMaxH3SamplingParams.min_num_inference_steps
         if batch.num_inference_steps < min_steps:
             raise ValueError(f"MiniMax H3 requires num_inference_steps >= {min_steps}")

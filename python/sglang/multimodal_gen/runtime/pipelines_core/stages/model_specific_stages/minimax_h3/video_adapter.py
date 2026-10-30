@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     canonical_minimax_h3_task,
+    minimax_h3_request_policy,
 )
 
 try:
@@ -74,8 +75,11 @@ class MiniMaxH3VideoModelAdapter:
     supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
 
     def __init__(self, *, request_policy: str | None = None) -> None:
-        if request_policy == "pika_h3_flex":
-            self.supported_tasks = self.supported_tasks | {"i2va", "l2va"}
+        policy = minimax_h3_request_policy(request_policy)
+        if policy is not None:
+            self.supported_tasks = (
+                self.supported_tasks | policy.keyframe_task_aliases.keys()
+            )
 
     def validate_task_gate(self, task: Any, *, provided: bool) -> None:
         if not provided or task is None:

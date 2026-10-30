@@ -1042,6 +1042,10 @@ def _minimax_h3_attention_core_impl(
             is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
         ):
             impl = attention._attention_impl
+            if cu_seqlens_host is None:
+                # This attention core runs eagerly during BCG replay. Read live
+                # boundaries here; capture-time host lengths would become stale.
+                cu_seqlens_host = tuple(cu_seqlens.tolist())
             sparse_will_run = (
                 cu_seqlens_host is not None
                 and impl._sparse_ready(q, k)

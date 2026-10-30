@@ -27,10 +27,14 @@ logger = init_logger(__name__)
 _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
-def _validate_pika_text_length(plan, text_tokens: int) -> None:
-    if plan.shape.get("shape_policy_version") == "pika_h3_flex" and text_tokens > 2048:
+def _validate_text_length(plan, tokens: torch.Tensor, *, tagged: bool = False) -> None:
+    if plan.policy is None:
+        return
+    text_tokens = int((tokens == 1).sum()) if tagged else tokens.numel()
+    if text_tokens > plan.policy.max_text_tokens:
         raise ValueError(
-            f"Pika H3 Flex presentation has {text_tokens} text tokens; maximum is 2048"
+            f"Pika H3 Flex presentation has {text_tokens} text tokens; "
+            f"maximum is {plan.policy.max_text_tokens}"
         )
 
 
@@ -311,7 +315,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 )
             else:
                 positive_ids = minimax_h3_text_only_ids(self.tokenizer, prompt)
-                _validate_pika_text_length(plan, int(positive_ids.numel()))
+                _validate_text_length(plan, positive_ids)
                 embeddings = {
                     "positive": {
                         "hidden_states": encode_ids(positive_ids),
@@ -368,7 +372,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             prompt=prompt,
             image_token_counts=image_token_counts,
         )
-        _validate_pika_text_length(plan, int((pos_tags == 1).sum()))
+        _validate_text_length(plan, pos_tags, tagged=True)
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,
@@ -577,7 +581,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 image_token_count=n_image_tokens,
             )
             pos_video_mask = None
-        _validate_pika_text_length(plan, int((pos_tags == 1).sum()))
+        _validate_text_length(plan, pos_tags, tagged=True)
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,

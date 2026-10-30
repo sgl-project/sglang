@@ -364,34 +364,101 @@ def test_reference_image_uses_output_tier(monkeypatch, tier, expected):
     assert (shape["width"], shape["height"]) == expected
 
 
-@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
-def test_condition_noise_preserves_clean_cache_and_release_precision(task):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-        _apply_condition_noise_aug,
+@pytest.mark.parametrize(
+    "task,seed,device",
+    [
+        ("fl2va", 42, "cpu"),
+        ("ref2va", 42, "cpu"),
+        ("fl2va", None, "cpu"),
+        pytest.param(
+            "ref2va",
+            42,
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA condition noise"
+            ),
+        ),
+    ],
+)
+def test_condition_noise_preserves_clean_cache_and_release_precision(
+    task, seed, device, monkeypatch
+):
+    """Each condition draws in external latent order; an omitted seed uses 42."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+        minimax_h3_patchify_video_latent,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+        denoising,
     )
 
-    clean = torch.tensor([[1.003, -0.12345, 7.997]], dtype=torch.float32)
+    shapes = [(1, 4, 6), (1 if task == "fl2va" else 3, 4, 4)]
+    monkeypatch.setattr(
+        denoising.current_platform,
+        "get_local_torch_device",
+        lambda: torch.device(device),
+    )
+    clean = torch.linspace(
+        -2.003, 7.997, sum(t * h * w // 4 for t, h, w in shapes) * 96
+    ).reshape(-1, 96)
     original = clean.clone()
     audio = torch.tensor([[0.123456]], dtype=torch.float32)
-    sampling = PikaH3FlexSamplingParams(prompt="a lake", seed=42)
+    conditions = (
+        [
+            dict(type="image", role="keyframe", uri=f"frame{i}", frame_index=idx)
+            for i, idx in enumerate([0, -1])
+        ]
+        if task == "fl2va"
+        else [
+            dict(type="image", role="reference", uri="image"),
+            dict(type="video", role="reference", uri="video"),
+        ]
+    )
+    sampling = _pika_request(task, conditions)
+    sampling.seed = seed
+    plan = _plan(sampling)
     contexts = [
         SimpleNamespace(
             cond_rows=clean,
-            audio_cond_rows=audio,
-            plan=SimpleNamespace(task=task, seed=42),
+            audio_ref_rows=audio,
+            plan=plan,
+            latent_t=8,
+            is_ref2va=task == "ref2va",
+            keyframe={"keyframes": [dict(latent_h=h, latent_w=w) for _, h, w in shapes]}
+            if task == "fl2va"
+            else None,
+            ref2va_positive_blocks=[
+                dict(kind=kind, latent_t=t, latent_h=h, latent_w=w)
+                for kind, (t, h, w) in zip(("image", "video"), shapes)
+            ]
+            if task == "ref2va"
+            else None,
         )
         for _ in range(2)
     ]
     for context in contexts:
-        _apply_condition_noise_aug(
+        denoising._apply_condition_noise_aug(
             context, sampling=sampling, imgvid_noise_aug=0.999, audio_noise_aug=1.0
         )
-    noise = torch.randn(clean.shape, generator=torch.Generator().manual_seed(42 + 7919))
-    rounded = clean.bfloat16().float() if task == "fl2va" else clean
-    torch.testing.assert_close(contexts[0].cond_rows, 0.999 * rounded + 0.001 * noise)
+    # Reference wrapper draws [B,F,C,H,W] per condition before packing.
+    generator = torch.Generator(device=device).manual_seed(42 + 7919)
+    noise = torch.cat(
+        [
+            minimax_h3_patchify_video_latent(
+                torch.randn(1, t, 24, h, w, generator=generator, device=device).permute(
+                    0, 2, 1, 3, 4
+                ),
+                patch_size=[1, 2, 2],
+            )
+            for t, h, w in shapes
+        ]
+    )
+    rounded = (clean.bfloat16().float() if task == "fl2va" else clean).to(device)
+    torch.testing.assert_close(
+        contexts[0].cond_rows, 0.999 * rounded + (1.0 - 0.999) * noise, rtol=0, atol=0
+    )
     assert torch.equal(contexts[0].cond_rows, contexts[1].cond_rows)
     assert torch.equal(clean, original)
-    assert contexts[0].audio_cond_rows is audio
+    assert contexts[0].audio_ref_rows is audio
 
 
 def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch):
@@ -409,3 +476,101 @@ def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch)
     )
     with pytest.raises(ValueError, match="disable SGLANG_CACHE_DIT_ENABLED"):
         PikaH3FlexPipelineConfig().validate_server_args(args)
+
+
+@pytest.mark.parametrize("duration", [4, 5.5])
+def test_output_duration_requires_released_integer_seconds(duration):
+    """The release CLI admits whole seconds 5–15, not the base H3 range."""
+    with pytest.raises(ValueError, match="duration_seconds"):
+        _plan(_pika_request(duration_seconds=duration))
+
+
+@pytest.mark.parametrize("duration,frames", [(5, 124), (6, 158), (15, 362)])
+def test_warmup_frames_recover_requested_duration(duration, frames):
+    """17n+5 alignment is not inverted by dividing aligned frames by 24."""
+    target = PikaH3FlexSamplingParams._synthetic_warmup_target(
+        SimpleNamespace(width=832, height=480),
+        SimpleNamespace(warmup_resolutions=["832x480"], warmup_num_frames=frames),
+    )
+    assert target["duration_seconds"] == duration
+    assert _plan(_pika_request(**target)).shape["frame_count"] == frames
+
+
+@pytest.mark.parametrize("variant", ["FL2VA", "Ref2VA"])
+def test_variant_keeps_base_case_insensitive_contract(monkeypatch, variant):
+    """Pika validation must accept variants accepted by the shared loader."""
+    monkeypatch.setattr(
+        MiniMaxH3PipelineConfig, "validate_server_args", lambda *_: None
+    )
+    args = SimpleNamespace(
+        model_variant=variant,
+        lora_alpha=None,
+        lora_scale=1.0,
+        is_arg_explicitly_set=lambda _: False,
+    )
+    PikaH3FlexPipelineConfig().validate_server_args(args)
+
+
+@pytest.mark.parametrize("task,index", [("i2va", 0), ("l2va", -1)])
+def test_prequeue_retains_public_task_and_admits_internal_partition(
+    monkeypatch, task, index
+):
+    """Plan canonicalization must not change the task returned in API metadata."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
+        MiniMaxH3PartitionAdmissionStage,
+    )
+
+    params = _pika_request(
+        task, [dict(type="image", role="keyframe", uri="frame.png", frame_index=index)]
+    )
+    batch = SimpleNamespace(
+        sampling_params=params,
+        extra=params.build_request_extra(),
+        num_inference_steps=6,
+        is_warmup=False,
+    )
+    monkeypatch.setattr(
+        prequeue,
+        "minimax_h3_probe_material",
+        lambda *a, **kw: {"display_width": 832, "display_height": 480},
+    )
+    plan = prequeue.minimax_h3_prepare_for_queue(batch)
+    assert params.task == task
+    assert plan.task == "fl2va"
+    import msgspec
+
+    assert plan.policy is not None
+    assert msgspec.msgpack.decode(msgspec.msgpack.encode(plan), type=type(plan)) == plan
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+                "dmd_denoising_steps": list(PIKA_KNOTS),
+                "stochastic_sampling": True,
+                "lora_adapter": "pika/adapter.safetensors",
+            }
+        }
+    )
+    MiniMaxH3PartitionAdmissionStage(metadata).forward(
+        batch, SimpleNamespace(minimax_h3_adaln_online=False)
+    )
+
+
+def test_text_limit_counts_text_only_and_leaves_base_h3_untouched():
+    """The release's 2048-token cap excludes media; base H3 must not scan tags."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.text_encoding import (
+        _validate_text_length,
+    )
+
+    plan = _plan(_pika_request())
+    tags = torch.cat(
+        (torch.ones(2048, dtype=torch.int), torch.zeros(4096, dtype=torch.int))
+    )
+    _validate_text_length(plan, tags, tagged=True)
+    tags[-1] = 1
+    with pytest.raises(ValueError, match="2049 text tokens"):
+        _validate_text_length(plan, tags, tagged=True)
+    _validate_text_length(SimpleNamespace(policy=None), object(), tagged=True)

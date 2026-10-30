@@ -442,7 +442,8 @@ class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
                 "Pika H3 Flex requires all six denoiser evaluations; "
                 "disable SGLANG_CACHE_DIT_ENABLED"
             )
-        if server_args.model_variant not in (None, "fl2va", "ref2va"):
+        variant = server_args.model_variant
+        if variant is not None and variant.strip().lower() not in ("fl2va", "ref2va"):
             raise ValueError("Pika H3 Flex model_variant must be fl2va or ref2va")
         if server_args.lora_alpha not in (None, 128) or server_args.lora_scale != 1.0:
             raise ValueError("Pika H3 Flex requires LoRA alpha 128 and scale 1.0")

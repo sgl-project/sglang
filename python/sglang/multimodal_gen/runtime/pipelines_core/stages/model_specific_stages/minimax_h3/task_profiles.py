@@ -21,6 +21,51 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_DEFAULT_BRANCHES,
 )
 
+
+class MiniMaxH3RequestPolicy(msgspec.Struct, frozen=True):
+    name: str
+    aspect_ratios: tuple[str, ...]
+    max_pixels: dict[int, int]
+    reference_short_edges: dict[int, int]
+    keyframe_task_aliases: dict[str, int]
+    duration_seconds: tuple[int, int]
+    max_text_tokens: int
+    condition_noise_seed_offset: int
+
+
+# Pinned Pika buckets.yaml and CLI contract. Base H3 retains its adaptive policy.
+PIKA_H3_FLEX_POLICY = MiniMaxH3RequestPolicy(
+    name="pika_h3_flex",
+    aspect_ratios=(
+        "21:9",
+        "16:9",
+        "3:2",
+        "4:3",
+        "5:4",
+        "1:1",
+        "4:5",
+        "3:4",
+        "2:3",
+        "9:16",
+        "9:21",
+    ),
+    max_pixels={480: 480 * 832, 768: 768 * 1344},
+    reference_short_edges={480: 1024, 768: 2048},
+    keyframe_task_aliases={"i2va": 0, "l2va": -1},
+    duration_seconds=(5, 15),
+    max_text_tokens=2048,
+    condition_noise_seed_offset=7919,
+)
+
+
+def minimax_h3_request_policy(name: str | None) -> MiniMaxH3RequestPolicy | None:
+    if name is None:
+        return None
+    if name == PIKA_H3_FLEX_POLICY.name:
+        return PIKA_H3_FLEX_POLICY
+    raise ValueError(f"unknown MiniMax H3 request policy {name!r}")
+
+
 MINIMAX_H3_CONDITION_ROLE_KEYFRAME = "keyframe"
 MINIMAX_H3_CONDITION_ROLE_REFERENCE = "reference"
 

@@ -252,3 +252,19 @@ def test_direct_overlay_repo_downloads_full_metadata_not_just_manifest(tmp_path)
     assert model_overlay.load_model_index_from_dir(overlay_dir)["_class_name"] == (
         "SomePipeline"
     )
+
+
+def test_pinned_overlay_rejects_other_cached_revisions(tmp_path, monkeypatch):
+    """A cached snapshot must not be materialized or labelled with another revision's pin."""
+    pinned = "a" * 40
+    spec = {"overlay_repo_id": "test/overlay", "source_revision": pinned}
+    monkeypatch.setattr(
+        model_overlay, "_load_model_overlay_registry", lambda: {"test/model": spec}
+    )
+    good = tmp_path / "models--test--model" / "snapshots" / pinned
+    bad = good.with_name("b" * 40)
+    good.mkdir(parents=True)
+    bad.mkdir()
+    assert model_overlay.resolve_model_overlay_target(str(good)) == ("test/model", spec)
+    with pytest.raises(ValueError, match="pinned"):
+        model_overlay.resolve_model_overlay_target(str(bad))

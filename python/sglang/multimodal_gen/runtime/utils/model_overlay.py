@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 from typing import Any, Callable, cast
 
@@ -182,6 +183,18 @@ def resolve_model_overlay_target(
                 f"models--{source_model_id.lower().replace('/', '--')}"
             )
             if cache_repo_fragment in path_parts:
+                suffix = path_parts[path_parts.index(cache_repo_fragment) + 1 :]
+                revision = spec.get("source_revision")
+                if (
+                    revision
+                    and re.fullmatch(r"[0-9a-fA-F]{40}", revision)
+                    and len(suffix) >= 2
+                    and suffix[0] == "snapshots"
+                    and suffix[1] != revision.lower()
+                ):
+                    raise ValueError(
+                        f"{source_model_id} requires pinned source revision {revision}; got cached snapshot {suffix[1]}"
+                    )
                 return source_model_id, spec
 
     return None

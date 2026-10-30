@@ -366,7 +366,7 @@
                 "5": 711.8735029362142
             },
             "expected_e2e_ms": 6350.244611967355,
-            "expected_load_ms": 61374.173089,
+            "expected_load_ms": 108541.68,
             "load_peak_vram_mb": 127772.0,
             "runtime_peak_vram_mb": 125922.0,
             "warmup_peak_vram_mb": 0.0,
@@ -374,7 +374,7 @@
             "runtime_peak_allocated_mb": 122178.96,
             "expected_avg_denoise_ms": 664.9600964932082,
             "expected_median_denoise_ms": 717.4113465007395,
-            "estimated_full_test_time_s": 85
+            "estimated_full_test_time_s": 130
         },
         "pika_h3_flex_ref2va_b200": {
             "stages_ms": {
@@ -397,7 +397,7 @@
                 "5": 908.810795051977
             },
             "expected_e2e_ms": 7980.076943058521,
-            "expected_load_ms": 60098.543037,
+            "expected_load_ms": 104722.24,
             "load_peak_vram_mb": 127772.0,
             "runtime_peak_vram_mb": 125818.0,
             "warmup_peak_vram_mb": 0.0,
@@ -405,7 +405,7 @@
             "runtime_peak_allocated_mb": 122210.03,
             "expected_avg_denoise_ms": 829.639891802799,
             "expected_median_denoise_ms": 919.5077479816973,
-            "estimated_full_test_time_s": 85
+            "estimated_full_test_time_s": 130
         }
     }
 }

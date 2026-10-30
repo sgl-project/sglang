@@ -425,35 +425,45 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
 
     @staticmethod
     def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-            PIKA_H3_FLEX_ASPECT_RATIOS,
-            PIKA_H3_FLEX_MAX_PIXELS,
-        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
             minimax_h3_resolve_spatial_shape,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+            PIKA_H3_FLEX_POLICY,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+            minimax_h3_align_frame_count,
         )
 
         canvas = (
             (req.width, req.height) if server_args.warmup_resolutions else (832, 480)
         )
-        for tier, max_pixels in PIKA_H3_FLEX_MAX_PIXELS.items():
-            for aspect_ratio in PIKA_H3_FLEX_ASPECT_RATIOS:
+        policy = PIKA_H3_FLEX_POLICY
+        frames = server_args.warmup_num_frames
+        # Upward 17-frame alignment adds less than one 24-fps second, so floor
+        # division recovers the requested integer duration (rounding does not).
+        duration = frames // 24 if frames else policy.duration_seconds[0]
+        if not policy.duration_seconds[0] <= duration <= policy.duration_seconds[1] or (
+            frames and minimax_h3_align_frame_count(duration * 24) != frames
+        ):
+            raise ValueError(
+                "Pika H3 Flex warmup frames must match an aligned whole-second duration from 5 to 15"
+            )
+        for tier, max_pixels in policy.max_pixels.items():
+            for aspect_ratio in policy.aspect_ratios:
                 width, height = map(int, aspect_ratio.split(":"))
                 shape = minimax_h3_resolve_spatial_shape(
                     width=width,
                     height=height,
                     base_short_edge=tier,
                     max_pixels=max_pixels,
+                    warn_unverified=False,
                 )
                 if canvas == (shape["width"], shape["height"]):
                     return {
                         "short_edge": tier,
                         "aspect_ratio": aspect_ratio,
-                        "duration_seconds": (
-                            server_args.warmup_num_frames / 24
-                            if server_args.warmup_num_frames
-                            else 5.0
-                        ),
+                        "duration_seconds": float(duration),
                     }
         raise ValueError(
             f"Pika H3 Flex warmup canvas {canvas} is not a released bucket"

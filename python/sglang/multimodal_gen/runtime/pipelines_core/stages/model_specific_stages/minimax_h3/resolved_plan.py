@@ -27,11 +27,12 @@ import msgspec
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SUPPORTED_FPS,
-    PIKA_H3_FLEX_MAX_PIXELS,
     warn_unverified_short_edge,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
+    MiniMaxH3RequestPolicy,
+    minimax_h3_request_policy,
     minimax_h3_task_profile,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
@@ -75,6 +76,7 @@ class MiniMaxH3ResolvedPlan(msgspec.Struct, frozen=True):
     audio_flow_shift: float | None
     shape: dict
     condition_mask: dict
+    policy: MiniMaxH3RequestPolicy | None = None
 
 
 def _parse_aspect_ratio(value: str) -> tuple[int, int]:
@@ -118,6 +120,7 @@ def minimax_h3_resolve_spatial_shape(
     height: int | float,
     base_short_edge: int = MINIMAX_H3_BASE_SHORT_EDGE,
     max_pixels: int = MINIMAX_H3_MAX_PIXELS,
+    warn_unverified: bool = True,
 ) -> dict[str, Any]:
     """Resolve one display ratio with the ``adapt_shape_v1`` math.
 
@@ -129,9 +132,7 @@ def minimax_h3_resolve_spatial_shape(
     """
     base_short_edge = _validate_base_short_edge(
         base_short_edge,
-        warn_unverified=not (
-            base_short_edge == 480 and max_pixels == PIKA_H3_FLEX_MAX_PIXELS[480]
-        ),
+        warn_unverified=warn_unverified,
     )
     try:
         source_width = float(width)
@@ -195,7 +196,7 @@ def _resolve_shape(
     geometry_source: str,
     auto_aspect_ratio: str | None = None,
     auto_geometry_source: str | None = None,
-    request_policy: str | None = None,
+    policy: MiniMaxH3RequestPolicy | None = None,
 ) -> dict[str, Any]:
     fps = MINIMAX_H3_SUPPORTED_FPS
     if "duration_seconds" not in target:
@@ -212,7 +213,7 @@ def _resolve_shape(
             target,
             auto_aspect_ratio=auto_aspect_ratio,
             auto_geometry_source=auto_geometry_source,
-            request_policy=request_policy,
+            policy=policy,
         )
     frame_count = minimax_h3_align_frame_count(
         int(round(float(target["duration_seconds"]) * fps))
@@ -230,7 +231,7 @@ def _resolve_shape(
         target,
         auto_aspect_ratio=auto_aspect_ratio,
         auto_geometry_source=auto_geometry_source,
-        request_policy=request_policy,
+        policy=policy,
     )
 
 
@@ -240,9 +241,9 @@ def _resolve_spatial(
     *,
     auto_aspect_ratio: str | None,
     auto_geometry_source: str | None,
-    request_policy: str | None = None,
+    policy: MiniMaxH3RequestPolicy | None = None,
 ) -> dict[str, Any]:
-    if request_policy == "pika_h3_flex":
+    if policy is not None:
         tier = target["short_edge"]
         ar_w, ar_h = _parse_aspect_ratio(target["aspect_ratio"])
         shape.update(
@@ -250,15 +251,16 @@ def _resolve_spatial(
                 width=ar_w,
                 height=ar_h,
                 base_short_edge=tier,
-                max_pixels=PIKA_H3_FLEX_MAX_PIXELS[tier],
+                max_pixels=policy.max_pixels[tier],
+                warn_unverified=False,
             )
         )
         shape.update(
             geometry_source="request",
-            shape_policy_version="pika_h3_flex",
+            shape_policy_version=policy.name,
             size_mode="bucket",
             keyframe_fit="source_crop",
-            reference_short_edge=1024 if tier == 480 else 2048,
+            reference_short_edge=policy.reference_short_edges[tier],
         )
         return shape
 
@@ -343,16 +345,14 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                 "conditions with frame_index [0], [-1], or [0, -1], got "
                 f"{signatures!r}"
             )
-    request_policy = canonical.get("request_policy")
-    if request_policy not in (None, "pika_h3_flex"):
-        raise ValueError(f"unknown MiniMax H3 request policy {request_policy!r}")
+    policy = minimax_h3_request_policy(canonical.get("request_policy"))
     target = canonical["target"]
     shape = _resolve_shape(
         target,
         geometry_source=profile.geometry_source,
         auto_aspect_ratio=profile.auto_aspect_ratio,
         auto_geometry_source=profile.auto_geometry_source,
-        request_policy=request_policy,
+        policy=policy,
     )
 
     materials: list[MiniMaxH3MaterialPlanItem] = []
@@ -454,6 +454,7 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         ),
         shape=shape,
         condition_mask=condition_mask,
+        policy=policy,
     )
 
 
