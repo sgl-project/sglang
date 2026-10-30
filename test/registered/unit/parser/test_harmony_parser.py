@@ -468,6 +468,130 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertEqual(events[0].event_type, "tool_call")
         self.assertEqual(events[0].content, '{"query": "SGLang"}')
 
+    def test_analysis_tool_call_in_five_chunks(self):
+        parser = HarmonyParser()
+        chunks = [
+            "<|channel|>analysis to=browser.search",
+            "<|message|>",
+            '{"query":',
+            ' "SGLang"}',
+            "<|call|>",
+        ]
+
+        for chunk in chunks[:-1]:
+            self.assertEqual(parser.parse(chunk), [])
+        events = parser.parse(chunks[-1])
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "tool_call")
+        self.assertEqual(events[0].content, '{"query": "SGLang"}')
+        self.assertEqual(events[0].raw_text, "".join(chunks))
+
+    def test_analysis_tool_call_chunk_boundaries(self):
+        headers = [
+            "<|channel|>analysis to=browser.search",
+            "<|start|>assistant<|channel|>analysis to=browser.search",
+            "<|start|>assistant to=browser.search<|channel|>analysis",
+        ]
+        arguments = [
+            '{"query": "SGLang"}',
+            ' \n{"query": "杭州", "note": " a  b "}\n ',
+        ]
+        for header in headers:
+            for payload in arguments:
+                for separate_call in (False, True):
+                    with self.subTest(
+                        header=header, payload=payload, separate_call=separate_call
+                    ):
+                        parser = HarmonyParser()
+                        midpoint = len(payload) // 2
+                        chunks = [header, "<|message|>", payload[:midpoint]]
+                        if separate_call:
+                            chunks.extend([payload[midpoint:], "<|call|>"])
+                        else:
+                            chunks.append(payload[midpoint:] + "<|call|>")
+
+                        for chunk in chunks[:-1]:
+                            self.assertEqual(parser.parse(chunk), [])
+                        events = parser.parse(chunks[-1])
+                        expected = HarmonyParser().parse("".join(chunks))
+
+                        self.assertEqual(events, expected)
+                        self.assertEqual(len(events), 1)
+                        self.assertEqual(events[0].event_type, "tool_call")
+                        self.assertEqual(events[0].content, payload.strip())
+                        self.assertEqual(events[0].raw_text, "".join(chunks))
+
+    def test_analysis_tool_recipient_across_chunks(self):
+        headers = [
+            ["<|channel|>analysis to=browser.", "search"],
+            ["<|start|>assistant to=browser.", "search<|channel|>analysis"],
+        ]
+        for header_chunks in headers:
+            with self.subTest(header_chunks=header_chunks):
+                parser = HarmonyParser()
+                chunks = header_chunks + [
+                    "<|message|>",
+                    '{"query": "SGLang"}',
+                    "<|call|>",
+                ]
+                for chunk in chunks[:-1]:
+                    self.assertEqual(parser.parse(chunk), [])
+                events = parser.parse(chunks[-1])
+
+                self.assertEqual(events, HarmonyParser().parse("".join(chunks)))
+                self.assertEqual(events[0].content, '{"query": "SGLang"}')
+                self.assertEqual(events[0].raw_text, "".join(chunks))
+
+    def test_analysis_body_recipient_text_is_immediate(self):
+        for content in ("to=browser.search", "Treat to=browser.search as text."):
+            with self.subTest(content=content):
+                parser = HarmonyParser()
+                events = parser.parse("<|channel|>analysis<|message|>" + content)
+
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].event_type, "reasoning")
+                self.assertEqual(events[0].content, content)
+
+    def test_analysis_tool_call_between_reasoning_and_final(self):
+        parser = HarmonyParser()
+        tool_header = (
+            "<|start|>assistant to=browser.search<|channel|>analysis<|message|>"
+        )
+        chunks = [
+            "<|channel|>analysis<|message|>I should check.",
+            "<|end|>",
+            tool_header,
+            '{"query":',
+            ' "SGLang"}',
+            "<|call|>",
+            "<|channel|>analysis<|message|>I have the result.",
+            "<|end|>",
+            "<|start|>assistant<|channel|>final<|message|>Done.<|return|>",
+        ]
+        events = []
+        for index, chunk in enumerate(chunks):
+            chunk_events = parser.parse(chunk)
+            if index == 6:
+                self.assertEqual(len(chunk_events), 1)
+                self.assertEqual(chunk_events[0].event_type, "reasoning")
+                self.assertEqual(chunk_events[0].content, "I have the result.")
+            events.extend(chunk_events)
+
+        self.assertEqual(
+            "".join(e.content for e in events if e.event_type == "reasoning"),
+            "I should check.I have the result.",
+        )
+        tool_events = [e for e in events if e.event_type == "tool_call"]
+        self.assertEqual(len(tool_events), 1)
+        self.assertEqual(tool_events[0].content, '{"query": "SGLang"}')
+        self.assertEqual(
+            tool_events[0].raw_text, tool_header + '{"query": "SGLang"}<|call|>'
+        )
+        self.assertEqual(
+            "".join(e.content for e in events if e.event_type == "normal"), "Done."
+        )
+
     def test_streaming_property_canonical(self):
         """Test streaming property: chunked parsing produces same semantic content as one-shot parsing."""
         full_text = (
