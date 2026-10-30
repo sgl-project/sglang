@@ -10,7 +10,7 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
-from sglang.kernels.ops.attention.utils import get_num_page_per_block_flashmla
+from sglang.kernels.ops.attention.kv_indices import get_num_page_per_block_flashmla
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -219,6 +219,8 @@ class MockModelRunner:
         self.dtype = config["dtype"]
         self.kv_cache_dtype = config["kv_cache_dtype"]
         self.page_size = config["page_size"]
+        # FlashInfer MLA __init__ scans model.modules() for the layers' attn_type.
+        self.model = torch.nn.Module()
 
         # Server args stub - needed by attention backends
         self.server_args = get_server_args()
@@ -274,12 +276,12 @@ def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
     """Compare outputs with detailed analysis."""
 
     # Basic checks
-    assert (
-        trtllm_out.shape == reference_out.shape
-    ), f"Shape mismatch: {trtllm_out.shape} vs {reference_out.shape}"
-    assert (
-        trtllm_out.dtype == reference_out.dtype
-    ), f"Dtype mismatch: {trtllm_out.dtype} vs {reference_out.dtype}"
+    assert trtllm_out.shape == reference_out.shape, (
+        f"Shape mismatch: {trtllm_out.shape} vs {reference_out.shape}"
+    )
+    assert trtllm_out.dtype == reference_out.dtype, (
+        f"Dtype mismatch: {trtllm_out.dtype} vs {reference_out.dtype}"
+    )
 
     # Check for NaN/Inf
     assert not torch.isnan(trtllm_out).any(), "TRTLLM output contains NaN"
@@ -310,7 +312,7 @@ def compare_outputs(trtllm_out, reference_out, tolerance=1e-2):
             trt_val = trtllm_out[idx_tuple].item()
             ref_val = reference_out[idx_tuple].item()
             print(
-                f"  [{idx_tuple}]: TRTLLM={trt_val:.6f}, Reference={ref_val:.6f}, diff={abs(trt_val-ref_val):.6f}"
+                f"  [{idx_tuple}]: TRTLLM={trt_val:.6f}, Reference={ref_val:.6f}, diff={abs(trt_val - ref_val):.6f}"
             )
 
     return all_close
@@ -327,7 +329,6 @@ class TestTRTLLMMLA(CustomTestCase):
     def setUpClass(cls):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         set_global_server_args_for_scheduler(server_args)
 
     @classmethod

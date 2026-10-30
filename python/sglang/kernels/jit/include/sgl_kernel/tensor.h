@@ -10,6 +10,7 @@
 /// usage examples.
 
 #pragma once
+#include <sgl_kernel/bits.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -291,11 +293,12 @@ struct SymbolicDType {
 
   auto set_options(std::span<const DLDataType> options) -> void {
     m_options = options;
+    m_check_bound();
   }
 
   template <typename... Ts>
   auto set_options() -> void {
-    m_options = details::kDTypeList<Ts...>;
+    this->set_options(details::kDTypeList<Ts...>);
   }
 
   auto verify(DLDataType dtype) -> void {
@@ -316,6 +319,17 @@ struct SymbolicDType {
     return stdr::empty(m_options) || (stdr::find(m_options, value) != stdr::end(m_options));
   }
 
+  // options set after binding (e.g. a runtime value) must still hold
+  auto m_check_bound() const -> void {
+    if (!this->has_value()) return;
+    RuntimeCheck(
+        m_check(m_value),
+        "Dtype value [",
+        m_value,
+        "] not in the allowed options: ",
+        details::PrintAbleSpan{m_options});
+  }
+
   std::span<const DLDataType> m_options;
   DLDataType m_value;
 };
@@ -324,7 +338,7 @@ struct SymbolicDType {
  * \brief A symbolic device that can be constrained and verified.
  *
  * Optionally restrict allowed device types via
- * `set_options<kDLCUDA, kDLCPU>()`. The device id can be wildcarded.
+ * `set_options<kDLGPU, kDLCPU>()`. The device id can be wildcarded.
  */
 struct SymbolicDevice {
  public:
@@ -358,11 +372,12 @@ struct SymbolicDevice {
 
   auto set_options(std::span<const DLDevice> options) -> void {
     m_options = options;
+    m_check_bound();
   }
 
   template <DLDeviceType... Codes>
   auto set_options() -> void {
-    m_options = details::kDeviceList<Codes...>;
+    this->set_options(details::kDeviceList<Codes...>);
   }
 
   auto verify(DLDevice device) -> void {
@@ -386,6 +401,17 @@ struct SymbolicDevice {
              // device id can be wildcarded
              return opt.device_id == details::kAnyDeviceID || opt.device_id == value.device_id;
            }));
+  }
+
+  // options set after binding (e.g. a runtime value) must still hold
+  auto m_check_bound() const -> void {
+    if (!this->has_value()) return;
+    RuntimeCheck(
+        m_check(m_value),
+        "Device value [",
+        details::PrintableDevice{m_value},
+        "] not in the allowed options: ",
+        details::PrintAbleSpan{m_options});
   }
 
   std::span<const DLDevice> m_options;
@@ -469,7 +495,7 @@ struct DeviceRef : BaseRef<SymbolicDevice> {
  *   auto N = SymbolicSize{"N"};
  *   TensorMatcher({N, 128})
  *       .with_dtype<fp16_t, bf16_t>()
- *       .with_device<kDLCUDA>()
+ *       .with_device<kDLGPU>()
  *       .verify(input_tensor);
  * \endcode
  *
@@ -499,7 +525,8 @@ struct TensorMatcher {
   auto with_dtype(DTypeRef&& dtype) && -> TensorMatcher&& {
     m_init_dtype();
     m_dtype.rebind(*dtype);
-    m_dtype->set_options<Ts...>();
+    // an empty pack keeps the options already set on the symbol
+    if constexpr (sizeof...(Ts) > 0) m_dtype->set_options<Ts...>();
     return std::move(*this);
   }
 
@@ -515,7 +542,8 @@ struct TensorMatcher {
   auto with_device(DeviceRef&& device) && -> TensorMatcher&& {
     m_init_device();
     m_device.rebind(*device);
-    m_device->set_options<Codes...>();
+    // an empty pack keeps the options already set on the symbol
+    if constexpr (sizeof...(Codes) > 0) m_device->set_options<Codes...>();
     return std::move(*this);
   }
 
@@ -524,6 +552,14 @@ struct TensorMatcher {
     static_assert(sizeof...(Codes) > 0, "At least one device option must be specified");
     m_init_device();
     m_device->set_options<Codes...>();
+    return std::move(*this);
+  }
+
+  /// Ensure alignment on all dimensions except for the last dimension.
+  auto ensure_alignment(int64_t alignment) && -> TensorMatcher&& {
+    RuntimeCheck(!m_alignment.has_value(), "Alignment already specified");
+    RuntimeCheck(is_pow2<uint64_t>(alignment), "Alignment must be a power of 2");
+    m_alignment = alignment;
     return std::move(*this);
   }
 
@@ -580,6 +616,18 @@ struct TensorMatcher {
     // since we may double verify, we will force to check
     m_dtype->verify(view.dtype());
     m_device->verify(view.device());
+    if (m_alignment.has_value()) {
+      const auto alignment = *m_alignment;
+      CHECK_HOST(std::bit_cast<uintptr_t>(view.data_ptr()) % alignment == 0)
+          << "Tensor data pointer is not aligned to " << alignment << " bytes";
+      if (dim > 0) [[likely]] {
+        const auto bytes = static_cast<int64_t>(dtype_bytes(view.dtype()));
+        for (const auto i : irange(dim - 1)) {
+          CHECK_HOST(view.size(i) == 1 || (view.stride(i) * bytes) % alignment == 0)
+              << "Tensor stride for dimension " << i << " is not aligned to " << alignment << " bytes";
+        }
+      }
+    }
   }
 
   auto m_init_dtype() -> void {
@@ -602,6 +650,7 @@ struct TensorMatcher {
   DeviceRef m_device;
   bool m_has_dtype = false;
   bool m_has_device = false;
+  std::optional<int64_t> m_alignment;
 };
 
 }  // namespace host

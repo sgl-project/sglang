@@ -29,18 +29,16 @@ from diffusers.models.normalization import (
 from torch.nn import LayerNorm as LayerNorm
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    FUSED_LN_MODULATE,
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
     can_use_ln_modulate,
-    fused_gelu_active,
     fused_layernorm_modulate,
     fused_linear_gelu_tanh,
     fused_ln_modulate,
-    fused_ln_modulate_active,
     is_plain_layer_norm,
-    mark_fused_gelu_site,
-    mark_fused_ln_modulate_site,
     modulate_scale_shift,
     residual_gate_add,
 )
@@ -76,8 +74,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
+    FluxPosEmbed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -89,7 +87,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -119,8 +119,9 @@ def _flux_fused_ln_modulate(
     """
     if (
         _FLUX_LN_MOD.disabled
+        or not x.is_cuda
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale, shift)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return None
     sig = (
@@ -152,10 +153,6 @@ def _flux_fused_ln_modulate(
         ref,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX fused LN+modulate fast path is not bit-exact against this "
-            "platform's LayerNorm dispatch; falling back to eager"
-        ),
     )
 
 
@@ -169,16 +166,17 @@ def _flux_norm_modulate(
     """``norm(x) * (1 + scale) + shift`` for the FLUX adaLN sites.
 
     Priority: (1) the bit-exact single-kernel LN+modulate -- lossless, so it
-    needs no quality gate and also supersedes the ``quality="high"`` affine
+    needs no quality gate and also supersedes the request-gated affine
     fold wherever it verifies; (2) when the site is mounted
-    (``quality="high"``) and the bit-exact kernel is unavailable, the
-    modulate folded into the LN affine (one aten kernel; not bit-exact);
+    (``quality="lossless"`` or ``"high"``) and the bit-exact kernel is
+    unavailable, the modulate folded into the LN affine (one aten kernel; not
+    bit-exact);
     (3) affine-free LayerNorm + the bit-exact fused modulate.
     """
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
     if out is not None:
         return out
-    if fused_ln_modulate_active(site) and can_use_ln_modulate(x, scale, shift):
+    if FUSED_LN_MODULATE.is_enabled(site) and can_use_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
     return modulate_scale_shift(norm(x), scale, shift)
 
@@ -189,7 +187,7 @@ class FluxAdaLayerNormZero(AdaLayerNormZero):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        mark_fused_ln_modulate_site(self)
+        FUSED_LN_MODULATE.mark(self)
 
     def forward(
         self,
@@ -215,7 +213,7 @@ class FluxAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        mark_fused_ln_modulate_site(self)
+        FUSED_LN_MODULATE.mark(self)
 
     def forward(
         self,
@@ -244,6 +242,23 @@ def _rope_cos_sin_cache(
         ],
         dim=-1,
     )
+
+
+def _rope_complex_freqs(
+    freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None],
+) -> Optional[torch.Tensor]:
+    """Complex-valued sibling of ``_rope_cos_sin_cache``: build [seq, dim//2]
+    complex64 freqs for the (is_neox=False) NPU fast path in
+    apply_qk_norm_with_optional_rope. Accepts the same inputs as
+    _rope_cos_sin_cache — a raw (cos, sin) tuple, or its already-hoisted
+    cat([cos, sin], dim=-1) cache tensor, split back in half."""
+    if freqs_cis is None:
+        return None
+    if isinstance(freqs_cis, torch.Tensor):
+        cos, sin = freqs_cis.chunk(2, dim=-1)
+    else:
+        cos, sin = freqs_cis
+    return torch.complex(cos.to(torch.float32), sin.to(torch.float32))
 
 
 try:
@@ -387,12 +402,14 @@ class FluxGELU(nn.Module):
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.gelu = nn.GELU(approximate="tanh")
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # lossless/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -407,16 +424,18 @@ class FluxFusedGELUProj(nn.Module):
     ``approximate="tanh"`` that keeps the ``net.0.proj`` parameter path. The
     default path is the bit-exact reference (plain Linear + tanh-GELU); the
     cublasLt GELU epilogue is mounted per batch by the denoising stage for
-    quality="high" requests only.
+    requests with ``quality="lossless"`` or ``quality="high"`` only.
     """
 
     def __init__(self, proj: nn.Linear):
         super().__init__()
         self.proj = proj
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -502,7 +521,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         )
         self.local_heads = divide(self.heads, self.tp_size)
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
         self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
@@ -619,12 +637,43 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 prefix=f"{prefix}.to_add_out" if prefix else "",
             )
 
+        # TODO Need to create mxfp8 attention scheme and port the code below
+        from sglang.multimodal_gen import envs
+
+        quant_description = getattr(quant_config, "quant_description", {})
+        self.use_offline_qk_rotation = (
+            quant_description.get(f"{prefix}.q_rot") == "FLOAT"
+            and quant_description.get(f"{prefix}.k_rot") == "FLOAT"
+            and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
+        )
+        if self.use_offline_qk_rotation:
+            self.register_buffer(
+                "q_rot",
+                torch.empty(
+                    self.head_dim,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            self.register_buffer(
+                "k_rot",
+                torch.empty(
+                    self.head_dim,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=True,
+            )
+            quant_config.use_offline_qk_rotation = True
+
         self.attn = USPAttention(
             num_heads=self.local_heads if self.shard_qkv else num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -632,6 +681,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         x: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis=None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[Dict[str, int]] = None,
@@ -658,6 +708,13 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             encoder_value = encoder_value.unflatten(-1, (num_heads, -1))
 
             text_seq_len = encoder_query.shape[1]
+            # complex_freqs covers [text, image] positions in order (same
+            # table cos_sin_cache/positions index into); slice per call the
+            # same way position_offset selects rows below — the class's
+            # complex_freqs path does not do positional indexing itself.
+            text_freqs_complex = (
+                complex_freqs[:text_seq_len] if complex_freqs is not None else None
+            )
             encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
                 q=encoder_query,
                 k=encoder_key,
@@ -665,8 +722,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_added_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=text_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
+            )
+            img_seq_len = query.shape[1]
+            img_freqs_complex = (
+                complex_freqs[text_seq_len : text_seq_len + img_seq_len]
+                if complex_freqs is not None
+                else None
             )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
@@ -675,6 +739,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=img_freqs_complex,
                 is_neox=False,
                 position_offset=text_seq_len,
                 allow_inplace=True,
@@ -687,6 +752,10 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             key = join_seqs(encoder_key, key, sp_txt_pad)
             value = join_seqs(encoder_value, value, sp_txt_pad)
         else:
+            seq_len = query.shape[1]
+            joint_freqs_complex = (
+                complex_freqs[:seq_len] if complex_freqs is not None else None
+            )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -694,9 +763,23 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=joint_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
             )
+
+        # Offline rotations belong to the MXFP8 FA contract.
+        if (
+            self.use_offline_qk_rotation
+            and self.attn.backend is AttentionBackendEnum.FA
+            and query.shape[1:3] == key.shape[1:3]
+            and key.shape == value.shape
+            and (query.shape[0] * query.shape[1]) % 64 == 0
+        ):
+            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
+            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
+            query = torch.matmul(query, self.q_rot)
+            key = torch.matmul(key, self.k_rot)
 
         x = self.attn(
             query,
@@ -790,14 +873,14 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
-            # quality="high" fusion site: proj_mlp GEMM + tanh-GELU in the
+            # lossless/high fusion site: proj_mlp GEMM + tanh-GELU in the
             # cublasLt epilogue (mounted per batch by the denoising stage).
-            mark_fused_gelu_site(self, "proj_mlp")
+            FUSED_LINEAR_GELU.mark(self, "proj_mlp")
             proj_out_cls = (
                 RowParallelLinear if shard_single_block else ColumnParallelLinear
             )
             proj_out_kwargs = (
-                {"input_is_parallel": True}
+                {"input_is_parallel": True, "input_sizes": [dim, self.mlp_hidden_dim]}
                 if shard_single_block
                 else {"gather_output": True}
             )
@@ -809,8 +892,6 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
-            if shard_single_block:
-                self._patch_proj_out_weight_loader()
             self.attn = FluxAttention(
                 query_dim=dim,
                 dim_head=attention_head_dim,
@@ -823,36 +904,13 @@ class FluxSingleTransformerBlock(nn.Module):
                 prefix=f"{prefix}.attn" if prefix else "attn",
             )
 
-    def _patch_proj_out_weight_loader(self) -> None:
-        dim, mlp_dim = self.local_dim, self.local_mlp_hidden_dim
-        tp_rank = self.proj_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                # checkpoint columns are [attn_full | mlp_full], while TP consumes [attn_shard | mlp_shard]
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * dim, dim)
-                mlp_cols = loaded_weight.narrow(
-                    input_dim,
-                    self.tp_size * dim + tp_rank * mlp_dim,
-                    mlp_dim,
-                )
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        self.proj_out.weight_loader = _loader
-        if hasattr(self.proj_out.weight, "_weight_loader"):
-            self.proj_out.weight._weight_loader = _loader
-        else:
-            self.proj_out.weight.weight_loader = _loader
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -881,6 +939,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                complex_freqs=complex_freqs,
                 num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
@@ -892,7 +951,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if fused_gelu_active(self) and can_use_linear_gelu(
+            if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(
@@ -905,6 +964,7 @@ class FluxSingleTransformerBlock(nn.Module):
             attn_output = self.attn(
                 x=norm_hidden_states,
                 freqs_cis=freqs_cis,
+                complex_freqs=complex_freqs,
                 num_replicated_prefix=num_replicated_prefix,
                 **joint_attention_kwargs,
             )
@@ -954,9 +1014,9 @@ class FluxTransformerBlock(nn.Module):
 
         self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        # quality="high" site: the norm2/norm2_context modulate folds into the
+        # lossless/high site: norm2/norm2_context modulate folds into the
         # LN affine when mounted.
-        mark_fused_ln_modulate_site(self)
+        FUSED_LN_MODULATE.mark(self)
 
         nunchaku_enabled = (
             quant_config is not None
@@ -1009,7 +1069,7 @@ class FluxTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
             # Re-home each FF's tanh-GELU up-projection onto a marked
-            # quality="high" fusion site (bit-exact reference by default).
+            # lossless/high fusion site (bit-exact reference by default).
             self.ff.net[0] = FluxFusedGELUProj(self.ff.net[0].proj)
             self.ff_context.net[0] = FluxFusedGELUProj(self.ff_context.net[0].proj)
 
@@ -1019,6 +1079,7 @@ class FluxTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1040,6 +1101,7 @@ class FluxTransformerBlock(nn.Module):
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1099,28 +1161,11 @@ class FluxTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class FluxPosEmbed(nn.Module):
-    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
-    def __init__(self, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.rope = NDRotaryEmbedding(
-            rope_dim_list=axes_dim,
-            rope_theta=theta,
-            use_real=False,
-            repeat_interleave_real=False,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-        )
-
-    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pos = ids.float()
-        # TODO: potential error: flux use n_axes = ids.shape[-1]
-        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
-        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
-        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
+def _add_control_residual(hidden_states, residuals, index):
+    # Residuals are the image-token shard on the compute dtype; None skips a block.
+    if index < len(residuals) and residuals[index] is not None:
+        return hidden_states + residuals[index]
+    return hidden_states
 
 
 class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
@@ -1130,6 +1175,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
+    _compile_conditions = [
+        lambda name, module: isinstance(
+            module, (FluxTransformerBlock, FluxSingleTransformerBlock)
+        )
+    ]
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
     @classmethod
@@ -1250,6 +1300,8 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples: Optional[List[Optional[torch.Tensor]]] = None,
+        controlnet_single_block_samples: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -1325,8 +1377,14 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(sin[:t_loc], sin[t_loc:], pad, dim=0),
                     )
 
-        # Build the RoPE cos/sin cache once per step; every attention call
-        # below reuses the same tensor.
+        # Build the RoPE cos/sin cache and complex_freqs once per step; every
+        # attention call below reuses the same tensors.
+        complex_freqs = _rope_complex_freqs(freqs_cis)
+        singles_complex_freqs = (
+            complex_freqs
+            if singles_freqs_cis is freqs_cis
+            else _rope_complex_freqs(singles_freqs_cis)
+        )
         hoisted_freqs_cis = _rope_cos_sin_cache(freqs_cis)
         singles_freqs_cis = (
             hoisted_freqs_cis
@@ -1350,25 +1408,44 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         run_transformer_blocks = (
             self.begin_spectrum_step() if spectrum_enabled else True
         )
+        if (
+            controlnet_block_samples is not None
+            or controlnet_single_block_samples is not None
+        ) and (
+            len(self.transformer_blocks) != self.config.num_layers
+            or len(self.single_transformer_blocks) != self.config.num_single_layers
+        ):
+            # Block wrappers (e.g. cache-dit) break the index mapping.
+            raise ValueError("ControlNet residuals need the unwrapped block lists")
         if run_transformer_blocks:
-            for block in self.transformer_blocks:
+            for index, block in enumerate(self.transformer_blocks):
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     freqs_cis=freqs_cis,
+                    complex_freqs=complex_freqs,
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
-            for block in self.single_transformer_blocks:
+                if controlnet_block_samples is not None:
+                    hidden_states = _add_control_residual(
+                        hidden_states, controlnet_block_samples, index
+                    )
+            for index, block in enumerate(self.single_transformer_blocks):
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
                     freqs_cis=singles_freqs_cis,
+                    complex_freqs=singles_complex_freqs,
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
+                if controlnet_single_block_samples is not None:
+                    hidden_states = _add_control_residual(
+                        hidden_states, controlnet_single_block_samples, index
+                    )
             if spectrum_enabled:
                 self.spectrum_record_features(hidden_states)
         else:

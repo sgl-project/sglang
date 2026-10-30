@@ -25,13 +25,28 @@ from __future__ import annotations
 
 from typing import Callable, TypeVar
 
+import torch
+
 F = TypeVar("F", bound=Callable)
 
-_CUDA_LIKE = frozenset({"cuda", "hip"})
+
+def is_cuda_sm_at_least(
+    min_sm: tuple[int, int], device: torch.device | int | None = None
+) -> bool:
+    """True on a CUDA build whose ``device`` has compute capability >= ``min_sm``.
+
+    ``torch.version.cuda`` rules out ROCm, whose capability is derived from the
+    gfx number (gfx1250 reports (12, 5)) and would clear a bare comparison.
+    """
+    return (
+        torch.version.cuda is not None
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) >= min_sm
+    )
 
 
 def platform_key() -> str:
-    """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``cpu``.
+    """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``xpu``/``cpu``.
 
     Deliberately *not* memoized: :func:`select_impl` calls it at module import
     time, and latching that first answer would freeze the choice before the
@@ -40,7 +55,7 @@ def platform_key() -> str:
     """
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    for name in ("cuda", "hip", "npu", "mps", "musa"):
+    for name in ("cuda", "hip", "npu", "mps", "musa", "xpu"):
         if getattr(current_platform, f"is_{name}")():
             return name
     return "cpu"
@@ -66,9 +81,10 @@ def is_hip() -> bool:
     return current_platform.is_hip()
 
 
-def has_triton() -> bool:
-    """True when the live device runs the Triton implementations."""
-    return platform_key() in _CUDA_LIKE
+def is_xpu() -> bool:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    return current_platform.is_xpu()
 
 
 def lazy_fallback(kind: str, name: str) -> Callable:

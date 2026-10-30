@@ -18,7 +18,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_disagg,
     get_exec,
     get_model,
@@ -73,7 +72,7 @@ class ExpertBackupManager:
         # losing the initial PUB message due to slow joiners.
         num_ready_clients = 0
 
-        while num_ready_clients < configured_tp_size():
+        while num_ready_clients < get_parallel().tp_size:
             sock_recv(self.recv_from_expert_backup_client)
             num_ready_clients += 1
 

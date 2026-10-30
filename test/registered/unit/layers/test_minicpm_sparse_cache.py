@@ -1,3 +1,4 @@
+import functools
 import sys
 from types import SimpleNamespace
 
@@ -7,29 +8,41 @@ import torch
 from sglang.srt.layers.attention.minicpm.cache import (
     attach_compressed_cache,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolShape
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class RecordingAllocator:
+class RecordingAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
     def __init__(self, capacity: int):
+        super().__init__(
+            size=capacity,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         self.capacity = capacity
-        self.page_size = 1
         self.next_slot = 1
         self.live: set[int] = set()
-
-    @property
-    def size(self):
-        return self.capacity
 
     def alloc(self, size: int):
         if size > self.available_size():
@@ -44,6 +57,9 @@ class RecordingAllocator:
 
     def available_size(self):
         return self.capacity - len(self.live)
+
+    def get_all_free_pages(self):
+        return self.free_pages
 
     def clear(self):
         self.next_slot = 1
@@ -66,9 +82,8 @@ def make_pool_and_req(capacity: int = 64):
         enable_memory_saver=False,
     )
     req = SimpleNamespace(
-        req_pool_idx=None,
         inflight_middle_chunks=0,
-        kv_committed_len=0,
+        kv=ReqKvInfo(),
     )
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
@@ -79,6 +94,16 @@ def alloc_extend(pool, req_pool_idx: int, seq_len: int):
         req_pool_indices_cpu=torch.tensor([req_pool_idx], dtype=torch.int64),
         target_seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
     )
+
+
+def setup_function(_):
+    # The cache reads its parallel topology from the context.
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+
+def teardown_function(_):
+    reset_context()
 
 
 def test_extend_allocates_at_sparse_boundaries():
@@ -153,57 +178,67 @@ def test_reserve_leaves_only_dense_capacity_visible():
     assert pool.schedulable_token_capacity(69) == 64
 
 
+def _state_stub():
+    return SimpleNamespace(
+        slots=SimpleNamespace(available_size=lambda: 1),
+        pool=SimpleNamespace(size=1),
+        ckpt_pool=None,
+    )
+
+
+def _state_model_observer(pool, allocator, tree_cache):
+    return SchedulerPoolStatsObserver(
+        tree_cache=tree_cache,
+        storage=StaticKVStorage(
+            pool,
+            allocator,
+            shape=StaticPoolShape(has_window=False, has_state=True, token_capacity=42),
+        ),
+        token_to_kv_pool_allocator=allocator,
+        session_controller=None,
+        hisparse_coordinator=None,
+        enable_hisparse=False,
+    )
+
+
 def test_reserved_slots_are_excluded_from_full_pool_invariant():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
+    allocator.state = _state_stub()
+    tree_cache = SimpleNamespace(
+        supports_mamba=lambda: True,
+        supports_prefix_sharing=lambda: False,
+        full_protected_size=lambda: 0,
+    )
+    observer = _state_model_observer(pool, allocator, tree_cache)
     checker = SchedulerInvariantChecker(
-        is_hybrid_swa=False,
-        is_hybrid_ssm=True,
         disaggregation_mode=None,
         page_size=1,
-        full_tokens_per_layer=None,
-        swa_tokens_per_layer=None,
-        max_total_num_tokens=64,
-        tree_cache=SimpleNamespace(
-            supports_mamba=lambda: False,
-            protected_size=lambda: 0,
-        ),
+        tree_cache=tree_cache,
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
         pool_stats_observer=SimpleNamespace(session_held_tokens=lambda: 0),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
-    leak, message = checker._check_full_pool(
-        SimpleNamespace(
-            full_available_size=allocator.available_size(), full_evictable_size=0
-        )
-    )
+    leak, message = checker._check_full_pool(observer.get_pool_stats())
 
     assert not leak, message
 
 
 def test_hybrid_pool_stats_exclude_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
-    pool.mamba_allocator = SimpleNamespace(available_size=lambda: 1)
-    pool.mamba_pool = SimpleNamespace(size=1)
-    observer = SchedulerPoolStatsObserver(
-        tree_cache=SimpleNamespace(supports_mamba=lambda: False),
-        token_to_kv_pool_allocator=allocator,
-        req_to_token_pool=pool,
-        session_controller=None,
-        hisparse_coordinator=None,
-        is_hybrid_swa=False,
-        is_hybrid_ssm=True,
-        enable_hisparse=False,
-        full_tokens_per_layer=None,
-        swa_tokens_per_layer=None,
-        max_total_num_tokens=42,
-        get_last_batch=lambda: None,
-        get_running_batch=lambda: None,
+    allocator.state = _state_stub()
+    observer = _state_model_observer(
+        pool,
+        allocator,
+        SimpleNamespace(
+            supports_mamba=lambda: True, supports_prefix_sharing=lambda: False
+        ),
     )
 
-    stats = observer._get_mamba_token_info()
+    stats = observer.get_pool_stats()
 
     assert stats.full_num_used == 0
     assert stats.full_token_usage == 0
@@ -217,16 +252,17 @@ def test_streaming_session_release_frees_compressed_slots():
     compressed_cache = pool._aux_cache
     assert len(compressed_cache.free_slots) < len(compressed_cache.reserved_slots)
 
-    session = StreamingSession(
-        SimpleNamespace(
-            req_to_token_pool=pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-        )
+    cache = SimpleNamespace(
+        req_to_token_pool=pool,
+        token_to_kv_pool_allocator=allocator,
+        logical_page_size=allocator.page_size,
+        page_size=1,
+        unlock=lambda lock: None,
     )
+    cache.free_kv_row = functools.partial(BasePrefixCache.free_kv_row, cache)
+    session = StreamingSession(cache)
     session.slots["session-a"] = SessionSlot(
-        req_pool_idx=req_pool_idx,
-        kv=SimpleNamespace(kv_allocated_len=16),
+        kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_allocated_len=16),
     )
 
     session.release_session("session-a")
@@ -238,20 +274,14 @@ def test_streaming_session_release_frees_compressed_slots():
 def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     allocator.free_pages = torch.arange(6, 70, dtype=torch.int64)
-    allocator.release_pages = torch.empty(0, dtype=torch.int64)
-    pool.mamba_pool = SimpleNamespace(size=1)
-    pool.mamba_allocator = SimpleNamespace(
-        size=1,
-        free_slots=torch.empty(0, dtype=torch.int64),
+    allocator.state = SimpleNamespace(
+        slots=SimpleNamespace(size=1, free_slots=torch.empty(0, dtype=torch.int64)),
+        pool=SimpleNamespace(size=1),
+        ckpt_pool=None,
     )
     checker = SchedulerInvariantChecker(
-        is_hybrid_swa=False,
-        is_hybrid_ssm=True,
         disaggregation_mode=None,
         page_size=1,
-        full_tokens_per_layer=None,
-        swa_tokens_per_layer=None,
-        max_total_num_tokens=64,
         tree_cache=SimpleNamespace(
             mamba_protected_size=lambda: 0,
             all_values_flatten=lambda: torch.empty(0, dtype=torch.int64),
@@ -264,10 +294,13 @@ def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
         ),
         get_last_batch=lambda: None,
         get_running_batch=lambda: None,
+        scheduler_stage_metrics=None,
     )
 
     leak, message = checker._check_mamba_pool(
-        SimpleNamespace(mamba_available_size=0, mamba_evictable_size=0)
+        SimpleNamespace(
+            mamba_available_size=0, mamba_evictable_size=0, mamba_capacity=1
+        )
     )
 
     assert leak
@@ -294,7 +327,7 @@ def test_partial_failure_rolls_back_and_free_releases_every_slot():
     assert len(cache.free_slots) == 0
 
     pool.free(req)
-    assert req.req_pool_idx is None
+    assert req.kv.req_pool_idx is None
     assert allocator.available_size() == 12
     assert len(cache.free_slots) == 8
 

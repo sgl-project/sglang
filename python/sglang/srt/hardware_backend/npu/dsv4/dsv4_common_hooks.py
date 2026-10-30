@@ -10,8 +10,9 @@ these hooks then:
   2. Write newly allocated C128 page ids into the per-request sidecar.
 
 Compressor state is fixed ring storage and does not participate in this
-allocation/write path. PD reuses the public SWA/C128-state payloads and only
-builds an NPU-specific payload for the independently addressed C128 KV pool.
+allocation/write path. PD reuses the public SWA/C128-state payloads and builds
+NPU-specific payloads for the independently addressed C128 KV pool and A5 C4
+compress-state rows.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
@@ -71,11 +72,26 @@ def dsv4_state_payloads(
     *,
     prefix_len: int = 0,
 ):
-    """Build the only NPU-specific DSV4 PD payload: C128 KV pages."""
+    """Build NPU-specific DSV4 PD payloads.
+
+    Returns payloads for components that are addressed differently from the
+    cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
+
+    * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
+    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill
+      and decode derive physical rows using their own local ring sizes, so
+      decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
+      Pre-A5 uses EXPLICIT cache_mode and the C4 state is handled by the
+      shared ``StateType.SWA`` payload.
+    """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+        c4_state_transfer_indices,
+    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -94,7 +110,20 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    return {AscendStateType.DSV4_C128: c128_kv_pages}
+    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
+
+    if is_npu_arch35():
+
+        def c4_state_indices():
+            return c4_state_transfer_indices(
+                req_pool_idx,
+                seq_len,
+                ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
+            )
+
+        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
+
+    return payloads
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
@@ -104,7 +133,7 @@ def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device)
         return {}
     return dict(
         req_pool_indices=torch.tensor(
-            [req.req_pool_idx], dtype=torch.int64, device=device
+            [req.kv.req_pool_idx], dtype=torch.int64, device=device
         ),
         req_to_token_pool=req_to_token_pool,
     )
@@ -130,7 +159,7 @@ def write_dsv4_prealloc_tables(
     prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
     if bundle is None or not hasattr(req_to_token_pool, "write_c128"):
         return
-    rp = torch.tensor([req.req_pool_idx])
+    rp = torch.tensor([req.kv.req_pool_idx])
     pl = torch.tensor([prefix_len])
     sl = torch.tensor([fill_len])
 
@@ -163,14 +192,17 @@ def _write_dsv4_tables(
 
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
+    req_pool_indices_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     token_per_req: int,
 ) -> None:
     """Post-alloc_decode hook for DSV4. Spreads new C128 KV slot ids into
     the per-req sidecar on DSV4NPUReqToTokenPool.
 
-    ``seq_lens_cpu`` is the POST-decode seq len (already incremented by
-    ``token_per_req``); the new compressed tokens go at positions
+    ``req_pool_indices_cpu`` must be the batch's host mirror — reading the
+    device tensor here D2H-syncs with the in-flight forward. ``seq_lens_cpu``
+    is the POST-decode seq len (already incremented by ``token_per_req``);
+    the new compressed tokens go at positions
     ``[(old_seq) // ratio, (new_seq) // ratio)``.
     """
     # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
@@ -184,7 +216,6 @@ def maybe_write_dsv4_decode(
         return
 
     prefix_lens_cpu = (seq_lens_cpu - token_per_req).clamp(min=0)
-    req_pool_indices_cpu = batch.req_pool_indices.cpu()
 
     _write_per_req_slice(
         req_to_token_pool.write_c128,
@@ -194,6 +225,29 @@ def maybe_write_dsv4_decode(
         bundle.out_c128_loc,
         ratio=128,
     )
+
+
+def _compact_c4_loc(out_full_loc: torch.Tensor, upper: int) -> torch.Tensor:
+    """C4 slots of the group-closing full slots, compacted in order and
+    zero-padded to ``upper``.
+
+    Equivalent to
+    ``out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4``
+    followed by the verify consumers' zero padding, but without boolean
+    indexing: ``x[mask]`` lowers to aclnnNonzeroV2, a host-synchronizing op
+    that stalls the draft->verify transition until the draft kernels drain.
+    All ops below are asynchronous device kernels.
+    """
+    if upper <= 0:
+        return out_full_loc.new_zeros((0,))
+    valid = (out_full_loc >= 0) & ((out_full_loc % 4) == 3)
+    # Compact destination per row; invalid rows dump into a trash slot at
+    # ``upper`` (their values are arbitrary — duplicate scatter into the
+    # trash slot is fine) which the slice below drops.
+    dest = valid.cumsum(0).sub_(1).masked_fill_(~valid, upper)
+    buf = out_full_loc.new_zeros((upper + 1,))
+    buf.scatter_(0, dest, out_full_loc // 4)
+    return buf[:upper]
 
 
 def maybe_build_dsv4_verify_bundle(
@@ -240,7 +294,12 @@ def maybe_build_dsv4_verify_bundle(
         return torch.cat(chunks) if chunks else table.new_empty((0,))
 
     out_full_loc = batch.out_cache_loc
-    out_c4_loc = out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4
+    # Fixed upper bound — the padding size the verify consumers already use
+    # (ascend_dsv4_backend: ``max(1, min(t, t // ratio + bs))``), so the padded
+    # result is byte-identical to what they built from the compact tensor.
+    t = out_full_loc.numel()
+    c4_upper = min(t, t // 4 + len(req_indices))
+    out_c4_loc = _compact_c4_loc(out_full_loc, c4_upper)
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,
         out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(

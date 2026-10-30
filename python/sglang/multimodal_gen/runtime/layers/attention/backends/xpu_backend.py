@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
 
 
 class XPUAttentionBackend(AttentionBackend):
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -61,8 +65,28 @@ def _get_cu_seqlens(device_index: int, bsz: int, seqlen: int) -> torch.Tensor:
     )
 
 
-class XPUAttentionImpl(AttentionImpl):
+def _as_fa_input(t: torch.Tensor, rows: int, heads: int, head_dim: int) -> torch.Tensor:
+    """``t`` as the ``[rows, heads, head_dim]`` flash-attention input, copying only if needed.
 
+    The kernel reads rows through their stride, so a head-packed row-strided view
+    (e.g. q/k/v slices of a fused projection output) is used in place; measured
+    bit-identical to the contiguous input.
+    """
+    try:
+        view = t.view(rows, heads, head_dim)
+    except RuntimeError:
+        return t.contiguous().view(rows, heads, head_dim)
+    if (
+        view.stride(-1) == 1
+        and view.stride(-2) == head_dim
+        and view.stride(0) % 8 == 0
+        and view.data_ptr() % 16 == 0
+    ):
+        return view
+    return view.contiguous()
+
+
+class XPUAttentionImpl(AttentionImpl):
     def __init__(
         self,
         num_heads: int,
@@ -94,9 +118,9 @@ class XPUAttentionImpl(AttentionImpl):
         max_seqlen_q = seqlen_q
         max_seqlen_k = seqlen_k
 
-        q_ = query.contiguous().reshape(bsz * seqlen_q, nheads_q, d)
-        k_ = key.contiguous().reshape(bsz * seqlen_k, nheads_k, d)
-        v_ = value.contiguous().reshape(bsz * seqlen_k, nheads_k, d)
+        q_ = _as_fa_input(query, bsz * seqlen_q, nheads_q, d)
+        k_ = _as_fa_input(key, bsz * seqlen_k, nheads_k, d)
+        v_ = _as_fa_input(value, bsz * seqlen_k, nheads_k, d)
         cu_q = _get_cu_seqlens(q_.device.index, bsz, seqlen_q)
         cu_k = _get_cu_seqlens(q_.device.index, bsz, seqlen_k)
 
@@ -116,7 +140,36 @@ class XPUAttentionImpl(AttentionImpl):
         if return_softmax_lse:
             out_tensor, softmax_lse = out[:2]
             result = out_tensor.reshape(bsz, seqlen_q, nheads_q, d)
+            # The kernel returns lse as (H, B * S); ring attention needs [B, H, S].
+            softmax_lse = softmax_lse.view(nheads_q, bsz, seqlen_q).permute(1, 0, 2)
             return result, softmax_lse
 
         result = out.reshape(bsz, seqlen_q, nheads_q, d)
         return result
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        q_ = query.contiguous()
+        k_ = key.contiguous()
+        v_ = value.contiguous()
+        output = flash_attn_func(
+            q=q_,
+            k=k_,
+            v=v_,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        return output[0] if isinstance(output, tuple) else output

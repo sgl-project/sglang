@@ -210,7 +210,7 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
         )
 
         self.assertEqual(processed_size, (expected_width, expected_height))
-        self.assertTrue(torch.equal(processed, expected))
+        self.assertTrue(torch.equal(processed.cpu(), expected))
 
     @patch.object(Flux2Pipeline, "add_standard_ti2i_stages")
     def test_runtime_pipeline_uses_flux2_image_processor(self, mock_add_stages):
@@ -262,6 +262,21 @@ class TestFlux2TI2ISizeResolution(unittest.TestCase):
         )
 
         self.assertEqual((batch.width, batch.height), (768, 512))
+
+
+class TestPerRequestTask(unittest.TestCase):
+    def test_image_preprocessing_uses_request_on_video_default(self):
+        config = _DummyTI2IConfig()
+        config.task_type = ModelTaskType.T2V
+        image = Image.new("RGB", (1255, 833))
+        batch = _make_batch(image)
+        batch.task_type = ModelTaskType.I2I
+        InputValidationStage().preprocess_condition_image(
+            batch, _make_server_args(config), image.width, image.height
+        )
+        self.assertEqual((batch.width, batch.height), (1248, 832))
+        self.assertIsInstance(batch.condition_image, list)
+        self.assertEqual(config.task_type, ModelTaskType.T2V)
 
 
 if __name__ == "__main__":

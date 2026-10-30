@@ -9,7 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 _CUDA_BF16_AVAILABLE = bool(
@@ -121,7 +121,7 @@ def _run_factored_pipeline(
     collapsed_routing_cache: dict,
     routed_scaling_factor: float,
 ) -> None:
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
     from sglang.srt.lora.marlin_lora_temp.shared_outer import weighted_topk_rank_sum

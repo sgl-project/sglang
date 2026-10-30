@@ -11,9 +11,10 @@ from sglang.srt.model_executor.model_runner_components import (
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     ResolvedAttentionBackendStr,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _FakeBackend:
@@ -37,7 +38,10 @@ def test_split_full_attention_applies_model_wrapper_once():
             kv_cache_dtype=None,
             token_to_kv_pool=object(),
             req_to_token_pool=object(),
+            runner_ids=None,
             init_new_workspace=None,
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         wrapper_inputs = []
         wrapped_backend = object()
@@ -90,6 +94,8 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
         token_to_kv_pool=object(),
         req_to_token_pool=object(),
         init_new_workspace=None,
+        is_draft_worker=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     constructors = {
         "global-test": lambda _runner: _FakeBackend("global"),

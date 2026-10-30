@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    deployment_attn_dp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -35,11 +38,13 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
+    get_exec,
     get_flags,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -54,6 +59,8 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+_GREEDY_VARIANT = "greedy"
 
 
 @dataclass
@@ -71,6 +78,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     draft_probs: Optional[torch.Tensor]
+    sampling_seed: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -111,18 +119,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.ps.tp_size
-        self.attn_dp_size = model_runner.ps.attn_dp_size
-        self.pp_size = configured_pp_size()
+        self.attn_dp_size = deployment_attn_dp_size()
+        self.pp_size = get_parallel().pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
-        self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
+        self.disable_padding = get_exec().graph.disable_cuda_graph_padding
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
             if speculative_num_steps is None
@@ -196,7 +201,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     (self.max_bs, self.model_runner.model_config.vocab_size),
                     dtype=torch.float32,
                 )
-                if self.model_runner.server_args.speculative_use_rejection_sampling
+                if get_spec().speculative_use_rejection_sampling
+                else None
+            )
+            sampling_seed = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if get_exec().deterministic.enable_deterministic_inference
+                and get_spec().speculative_use_rejection_sampling
                 else None
             )
             _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
@@ -212,6 +223,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
+            # Real per-request top_k, for the same reason temperatures are
+            # carried: the draft proposal cannot tell a greedy request from a
+            # T=1 one by temperature alone, because SamplingParams rewrites
+            # temperature 0 to temperature=1.0 with top_k=1.
+            # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
+            # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
+            # greedy, for the padded rows and for a run that never copies in.
+            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -237,7 +256,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk = (
             torch.zeros(
-                (self.max_bs, self.eagle_worker.dsa_index_topk),
+                (self.max_bs, self.eagle_worker.dsa_seed_topk_width),
                 dtype=torch.int32,
                 device=model_runner.device,
             )
@@ -259,12 +278,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            sampling_seed=sampling_seed,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
+        # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
+        # once per label of the graph variants it offers this runner
+        self.megakernel = eagle_worker.megakernel
+        self.megakernel_served = (
+            frozenset()
+            if self.megakernel is None
+            else self.megakernel.bind_draft_graphs(self)
+        )
+        self.attention_graph_variants = megakernel_graph_variants(
+            model_runner.model, "draft_loop", batch_sizes=self.megakernel_served
+        )
+        self.attention_variant_sizes = self.megakernel_served
 
         self.backend = resolve_decode_backend(self)
 
@@ -277,8 +309,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+        # Metadata glue graph is intentionally not used for the EAGLE draft
+        # runner.  FlashInferMLAMultiStepDraftBackend.init_forward_metadata_out_graph
+        # re-plans the per-step CUDA-graph wrappers that were already captured
+        # (decode_cuda_graph_metadata dict entries).  Capturing that re-plan
+        # into a secondary glue graph would corrupt the wrapper's internal GPU
+        # state on replay.  The main decode runner (DecodeCudaGraphRunner) is
+        # where the glue graph saves latency; draft metadata is cheaper and
+        # already amortised over speculative_num_steps.
+        self._metadata_glue = None
+
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     # -----------------------------------------------------------------
     # Helpers
@@ -286,9 +329,24 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        # EAGLE doesn't use stream_idx / lora variants.
-        return ShapeKey(size=bs)
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, attention_variant=None
+    ):
+        # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
+        return ShapeKey(
+            size=bs, variant_label=variant_label, attention_variant=attention_variant
+        )
+
+    def _sampling_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        # Under rejection sampling an all-greedy batch replays the graph that
+        # skips the draft proposal distribution (see draft_forward).
+        if (
+            get_spec().speculative_use_rejection_sampling
+            and forward_batch.sampling_info is not None
+            and forward_batch.sampling_info.is_all_greedy
+        ):
+            return _GREEDY_VARIANT
+        return None
 
     # -----------------------------------------------------------------
     # can_run_graph
@@ -312,13 +370,26 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run(
+                forward_batch,
+                self._make_graph_key(
+                    cuda_graph_bs,
+                    variant_label=self._sampling_variant(forward_batch),
+                    attention_variant=self._resolve_attention_variant(
+                        forward_batch, cuda_graph_bs
+                    ),
+                ),
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
 
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported
+                and forward_batch.can_run_decode_cuda_graph
+                and forward_batch.can_run_dp_draft_cuda_graph
+            )
 
         return is_bs_supported
 
@@ -331,6 +402,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
@@ -403,7 +475,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
             is_any_greedy=False,
@@ -411,6 +483,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             need_top_k_sampling=False,
             need_min_p_sampling=False,
             vocab_size=self.model_runner.model_config.vocab_size,
+            sampling_seed=(
+                self.buffers.sampling_seed[:num_seqs]
+                if self.buffers.sampling_seed is not None
+                else None
+            ),
         )
 
         forward_batch = ForwardBatch(
@@ -440,6 +517,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
         )
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        served = num_seqs in self.megakernel_served
 
         def run_once():
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -452,6 +531,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            if served:
+                # leaves positions as they are, so nothing is subtracted after it
+                return self.megakernel.run_draft_loop(
+                    runner=self, forward_batch=forward_batch
+                )
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
@@ -465,7 +549,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
-        with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=self.draft_attn_backend),
+            forward_batch=forward_batch,
+        ):
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
@@ -473,7 +560,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # per-step forwards inside draft_forward must not re-plan.
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
-            shape_key = self._make_graph_key(num_seqs)
             post_warmup_hook = getattr(
                 self.draft_attn_backend, "on_after_cuda_graph_warmup", None
             )
@@ -483,12 +569,23 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 post_warmup_hook=post_warmup_hook,
                 run_lm_head=True,
             )
-            self.backend.capture_one(
-                shape_key,
-                run_once,
-                capture_inputs=None,
-                post_warmup_hook=post_warmup_hook,
+            variants = (
+                (None, _GREEDY_VARIANT)
+                if get_spec().speculative_use_rejection_sampling
+                else (None,)
             )
+            for variant in variants:
+                sampling_info.is_all_greedy = variant == _GREEDY_VARIANT
+                self.backend.capture_one(
+                    self._make_graph_key(
+                        num_seqs,
+                        variant_label=variant,
+                        attention_variant=attention_variant,
+                    ),
+                    run_once,
+                    capture_inputs=None,
+                    post_warmup_hook=post_warmup_hook,
+                )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -572,6 +669,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.topk_index,
             forward_batch.req_pool_indices,
         ]
+        if self.model_runner.model_config.model_is_mrope:
+            if bs != raw_bs or forward_batch.mrope_positions is None:
+                buffers.mrope_positions.zero_()
+            if forward_batch.mrope_positions is not None:
+                copy_dsts.append(buffers.mrope_positions[:, :raw_num_token])
+                copy_srcs.append(forward_batch.mrope_positions)
         if buffers.rids_int is not None and forward_batch.rids_int is not None:
             copy_dsts.append(buffers.rids_int[:raw_bs])
             copy_srcs.append(forward_batch.rids_int)
@@ -604,12 +707,17 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.
         if (
-            self.model_runner.server_args.speculative_use_rejection_sampling
+            get_spec().speculative_use_rejection_sampling
             and forward_batch.sampling_info is not None
         ):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            if self.buffers.sampling_seed is not None:
+                self.buffers.sampling_seed[:raw_bs].copy_(
+                    forward_batch.sampling_info.sampling_seed[:raw_bs]
+                )
+            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -653,13 +761,21 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        # forward_batch.batch_size was overwritten to bs above when padding.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
+        # each speculative step).  The glue-graph optimisation is not applied
+        # here — see __init__ comment for why.
+        self.draft_attn_backend.init_forward_metadata_out_graph(
+            SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
+        )
         self.raw_bs = raw_bs
         self.bs = bs
 
         # Replay via backend
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs,
+            variant_label=self._sampling_variant(forward_batch),
+            attention_variant=self._resolve_attention_variant(forward_batch, bs),
+        )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft"):
             out = self._replay_graph(shape_key, forward_batch)
         if self.buffers.dsa_seed_topk is not None:

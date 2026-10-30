@@ -25,6 +25,12 @@ done
 
 OPTIONAL_DEPS="${1:-}"
 
+if [[ ",${OPTIONAL_DEPS}," == *,diffusion,* ]]; then
+  # MiniMax H3 uses ffprobe for input admission and output audio validation.
+  docker exec ci_sglang apt-get update
+  docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang apt-get install -y --no-install-recommends ffmpeg
+fi
+
 # Build python extras
 EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
@@ -50,11 +56,13 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000|-rocm1010)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
+        *-rocm1000) IMAGE_BASE_ARG_SUFFIX="_ROCM1000"; IMAGE_STAGE_SUFFIX="-rocm1000" ;;
+        *-rocm1010) IMAGE_BASE_ARG_SUFFIX="_ROCM1010"; IMAGE_STAGE_SUFFIX="-rocm1010" ;;
         *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
@@ -82,15 +90,20 @@ fi
 unset IMAGE_GPU_ARCH
 
 # Install the required dependencies in CI.
-# ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
-# compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
-if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
+# Select the dependency extra that matches each image's torch stack. Plain
+# srt_hip pins compressed-tensors below the version required by torch 2.11.
+if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
+elif [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm1010" ]]; then
+  # ROCm 10.1 ships torch 2.12.
+  EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm101}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
-# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
+# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files.
+# pip running as root disables the cache unless the cache dir itself is owned by root; it
+# never checks the entries beneath it. Simply changing folder permissions reduces chown runtime.
+docker exec ci_sglang chown root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
@@ -134,38 +147,8 @@ ensure_httpx() {
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
-# Helper function to git clone with retries
-git_clone_with_retry() {
-  local repo_url="$1"
-  local dest_dir="${2:-}"
-  local branch_args="${3:-}"
-  local max_attempts=3
-
-  for attempt in $(seq 1 $max_attempts); do
-    echo "Git clone attempt $attempt/$max_attempts: $repo_url"
-
-    # prevent from partial clone
-    if [ -n "$dest_dir" ] && [ -d "$dest_dir" ]; then
-      rm -rf "$dest_dir"
-    fi
-
-    if git \
-      -c http.lowSpeedLimit=1000 \
-      -c http.lowSpeedTime=30 \
-      clone --depth 1 ${branch_args:+$branch_args} "$repo_url" "$dest_dir"; then
-      echo "Git clone succeeded."
-      return 0
-    fi
-
-    if [ $attempt -lt $max_attempts ]; then
-      echo "Git clone failed, retrying in 5 seconds..."
-      sleep 5
-    fi
-  done
-
-  echo "Git clone failed after $max_attempts attempts: $repo_url"
-  return 1
-}
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/git_clone_with_retry.sh"
 
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
@@ -174,21 +157,58 @@ else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
   docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
-  # Clear Python cache to ensure latest code is used
-  docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
-  docker exec ci_sglang find /opt/venv -name "__pycache__" -type d -exec rm -rf {} + || true
-  # Also clear cache in sglang-checkout
+  # Clear Python cache in the checkout so the latest code is used. The uninstalls
+  # above already removed the old sglang files from /opt/venv, so walking all of
+  # site-packages there (~6 s) only made every job recompile torch's bytecode.
   docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
   docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
-  docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && python3 setup_rocm.py install"
+
+  # The AOT kernels depend only on python/sglang/kernels/aot, the image and the
+  # GPU arch, yet rebuilding them took ~30 s in every job. Cache the wheel on the
+  # persistent /sgl-data volume, keyed by the source tree hash and the image ID.
+  # A dirty tree (local runs) or a missing key always builds without caching.
+  AOT_KEY=""
+  if git diff --quiet HEAD -- python/sglang/kernels/aot 2>/dev/null; then
+    AOT_TREE=$(git rev-parse --short=16 HEAD:python/sglang/kernels/aot 2>/dev/null || true)
+    AOT_IMAGE=$(docker inspect --format '{{.Image}}' ci_sglang 2>/dev/null || true)
+    AOT_IMAGE="${AOT_IMAGE#sha256:}"
+    if [[ -n "${AOT_TREE}" && -n "${AOT_IMAGE}" ]]; then
+      AOT_KEY="${AOT_TREE}-${AOT_IMAGE:0:16}-${IMAGE_GFX}"
+    fi
+  fi
+  AOT_CACHE_ROOT=/sgl-data/sgl-kernel-wheels
+  AOT_CACHE="${AOT_CACHE_ROOT}/${AOT_KEY}"
+  if [[ -n "${AOT_KEY}" ]] && docker exec ci_sglang bash -c "ls ${AOT_CACHE}/*.whl" >/dev/null 2>&1; then
+    echo "[AOT] Reusing cached sglang-kernel wheel ${AOT_KEY}"
+    docker exec ci_sglang touch "${AOT_CACHE}" || true
+    AOT_WHEEL_DIR="${AOT_CACHE}"
+  else
+    echo "[AOT] Building sglang-kernel (cache key: ${AOT_KEY:-none})"
+    docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && rm -rf dist && python3 setup_rocm.py bdist_wheel"
+    AOT_WHEEL_DIR=/sglang-checkout/python/sglang/kernels/aot/dist
+    if [[ -n "${AOT_KEY}" ]]; then
+      # Publish atomically: concurrent jobs on the same host may build the same key.
+      docker exec ci_sglang bash -c "
+        mkdir -p ${AOT_CACHE_ROOT} &&
+        tmp=\$(mktemp -d ${AOT_CACHE_ROOT}/.tmp.XXXXXX) &&
+        cp ${AOT_WHEEL_DIR}/*.whl \"\$tmp\"/ &&
+        { mv -T \"\$tmp\" ${AOT_CACHE} 2>/dev/null || rm -rf \"\$tmp\"; }
+        find ${AOT_CACHE_ROOT} -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null
+      " || echo "[AOT] Warning: could not store the wheel in ${AOT_CACHE}" >&2
+    fi
+  fi
+  docker exec ci_sglang bash -c "pip install --no-deps --force-reinstall ${AOT_WHEEL_DIR}/*.whl"
 
   docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
-# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
-install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"
+# serving_responses.py imports responses_tools/beam.py, which needs
+# ResponseFunctionShellToolCall from openai>=2.8.0. pyproject_other.toml still
+# pins openai==2.6.1, so the Responses handler fails to import and every
+# /v1/responses request returns 500. Drop this once pyproject_other.toml moves
+# to 2.8.0.
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "openai==2.8.0"
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
@@ -200,7 +220,9 @@ else
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
   docker cp lmms-eval ci_sglang:/
   docker exec ci_sglang git config --global --add safe.directory /lmms-eval
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  # pyarrow 26 needs NumPy 2 at import, but lmms-eval pins numpy 1.26.4;
+  # drop the cap once lmms-eval allows NumPy 2.
+  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . "pyarrow<26"
 
   # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
   # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
@@ -254,20 +276,26 @@ fi
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
-if docker exec ci_sglang test -d /sgl-workspace/mori; then
+# When the image's checkout is already at the pin the reinstall is redundant.
+MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
+IMAGE_MORI_COMMIT=$(docker exec ci_sglang git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
+if [[ -n "${MORI_COMMIT}" && "${IMAGE_MORI_COMMIT}" == "${MORI_COMMIT}" ]]; then
+  echo "[MORI] Image already has MORI ${MORI_COMMIT}; skipping reinstall"
+elif docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
-  MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
 
-  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    MORI_GPU_ARCHS="gfx950"
-  else
-    MORI_GPU_ARCHS="gfx942"
+  if [[ -z "${MORI_COMMIT}" ]]; then
+    echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"
+    exit 1
   fi
 
+  MORI_GPU_ARCHS="${IMAGE_GFX}"
+
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
-  # Only the rocm724 (noble) base is missing libgrpc++-dev; 7.0 and 7.2.0 built
-  # MORI without it for months before this step existed, so skip the apt round
-  # trip there. Where it does run, neither step may be fatal: apt-get update
+  # Only the rocm724 and rocm1000 (noble) bases attempt to install
+  # libgrpc++-dev; 7.0 and 7.2.0 built MORI without it for months before this
+  # step existed, so skip the apt round trip there. Where it does run, neither
+  # step may be fatal: apt-get update
   # exits 100 for a single unreachable index while still keeping every index it
   # did fetch, which under set -e is enough to take out the dependency install
   # on every AMD runner at once. Six external apt hosts are in play, so the
@@ -282,9 +310,29 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ]; then
+    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ] || [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ]; then
       apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
       apt-get install -y --no-install-recommends libgrpc++-dev || echo '[MORI] libgrpc++-dev unavailable; building MORI without it'
+    fi
+    # The pip ROCm SDK vendors NUMA and libdrm under rocm_sysdeps, outside the
+    # default compiler, CMake, and linker search paths used by MORI.
+    # gfx1250 additionally needs the SDK's own cmake trees on the prefix path:
+    # that is what lets hsakmt-config.cmake resolve find_dependency(NUMA)
+    # without patching MORI's CMakeLists. Same split as docker/rocm.Dockerfile.
+    ROCM_SYSDEPS="\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"
+    if [ '${IMAGE_GFX}' = 'gfx1250' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+      export PATH="\${ROCM_HOME}/bin:\${PATH}"
+      export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}/lib/cmake:\${ROCM_SYSDEPS}:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
+      export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
+      export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
+      echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    elif [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+      export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
+      export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
+      export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
+      echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
     fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
@@ -319,11 +367,11 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
 # identified near the top of this script.
 #############################################
-if [[ "${IMAGE_GFX}" == "gfx950" ]]; then
-    _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}"
-else
-    _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}"
-fi
+case "${IMAGE_GFX}" in
+    gfx950)  _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}" ;;
+    gfx1250) _from_line="FROM \$BASE_IMAGE_1250${IMAGE_BASE_ARG_SUFFIX} AS gfx1250${IMAGE_STAGE_SUFFIX}" ;;
+    *)       _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}" ;;
+esac
 echo "[CI-AITER-CHECK] Using ${_from_line} from Dockerfile..."
 REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
                     | grep 'AITER_COMMIT_DEFAULT=' \
@@ -398,7 +446,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     "
 
     # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
-    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
+    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
         docker exec -i ci_sglang python3 - <<'PY'
 from pathlib import Path
 p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
