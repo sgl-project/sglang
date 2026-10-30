@@ -71,6 +71,7 @@ enum class CPUActMethod : int {
   silu_and_mul = 0,
   swiglu = 1,
   gelu_and_mul = 2,
+  silu_clamped = 3,
 };
 
 // swiglu is selected by its (alpha, limit) parameters rather than by name and
@@ -83,6 +84,9 @@ inline CPUActMethod act_method_from_string(const std::optional<std::string>& act
         "Unsupported activation with clamped swiglu parameters: ",
         activation.value());
     return CPUActMethod::swiglu;
+  }
+  if (activation.value() == "silu_clamped") {
+    return CPUActMethod::silu_clamped;
   }
   if (unnamed_or_silu) {
     return CPUActMethod::silu_and_mul;

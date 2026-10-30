@@ -773,6 +773,20 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
             return
+        if _is_cpu and self.weight_block_size == [32, 32]:
+            weight = layer.weight.data
+            scale = layer.weight_scale_inv.float()
+            n, k = weight.shape
+            dequantized = (
+                (
+                    weight.float().view(n // 32, 32, k // 32, 32)
+                    * scale[:, None, :, None]
+                )
+                .reshape(n, k)
+                .to(torch.bfloat16)
+            )
+            layer.weight = Parameter(dequantized, requires_grad=False)
+            return
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -1342,6 +1356,8 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu and self.block_quant and self.weight_block_size == [32, 32]:
+            return torch.nn.functional.linear(x, layer.weight, bias)
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -1735,7 +1751,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             fp4_block_k = 32
             if fp4_scale_dtype is None:
                 fp4_scale_dtype = (
-                    torch.float8_e8m0fnu if _use_aiter or is_xpu() else torch.float32
+                    torch.float8_e8m0fnu
+                    if _use_aiter or is_xpu() or _is_cpu
+                    else torch.float32
                 )
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
@@ -1915,6 +1933,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if _is_cpu and self.is_fp4_expert:
+            layer.w13_weight.data = layer.w13_weight.data.view(torch.uint8)
+            layer.w2_weight.data = layer.w2_weight.data.view(torch.uint8)
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            layer.w13_weight_scale_inv = Parameter(
+                torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w13_weight_scale_inv.view(torch.uint8)
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                torch.ops.sgl_kernel.convert_scale_packed(
+                    layer.w2_weight_scale_inv.view(torch.uint8)
+                ),
+                requires_grad=False,
+            )
+            return
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -3161,18 +3196,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUQuantMethod.FP8_W8A16,
+                CPUQuantMethod.MXFP4
+                if self.is_fp4_expert
+                else CPUQuantMethod.FP8_W8A16,
                 layer.w13_weight_scale_inv,  # w1_scale
                 layer.w2_weight_scale_inv,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
-                self.quant_config.weight_block_size,  # block_size
+                None if self.is_fp4_expert else self.quant_config.weight_block_size,
                 None,  # w1 bias
                 None,  # w3 bias
                 None,  # alpha
-                None,  # limit
+                moe_runner_config.swiglu_limit,
                 True,  # is_vnni
-                moe_runner_config.activation,  # activation
+                "silu_clamped"
+                if self.is_fp4_expert and (moe_runner_config.swiglu_limit or 0) > 0
+                else moe_runner_config.activation,
             )
             return StandardCombineInput(hidden_states=output)
 

@@ -62,12 +62,13 @@ from sglang.srt.utils.common import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_cpu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
-
+_is_cpu = is_cpu()
 
 @dataclass
 class MemoryPoolConfig:
@@ -1098,7 +1099,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self._unified_row_bytes = dsv4_unified_row_bytes(
             self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
         )
-        if self._unified:
+        if _is_cpu:
+            self.kv_bytes = self.attn_head_dim * 2
+        elif self._unified:
             # Unified_kv stores the whole latent: one bf16 row, or fp8 nope + bf16 rope.
             self.kv_bytes = self._unified_row_bytes
         elif get_exec().kernel.dsv4_attn_backend == "trtllm":
@@ -1170,6 +1173,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
+        if _is_cpu:
+            self.low_ratio_index_bytes = self.indexer_head_dim * 2
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1351,6 +1356,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
+        if _is_cpu:
+            return self.kv_bytes
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":

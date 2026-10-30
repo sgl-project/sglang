@@ -432,6 +432,10 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    if mixes.device.type == "cpu":
+        return torch.ops.sgl_kernel.dsv4_hc_split_sinkhorn_cpu(
+            mixes.contiguous(), hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
     b, s, _ = mixes.size()
     if b * s == 0:
         # DP attention's idle forward carries no tokens, and every backend below
@@ -2744,6 +2748,10 @@ def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    if x_flat.device.type == "cpu":
+        return torch.ops.sgl_kernel.dsv4_hc_combine_cpu(
+            x_flat.contiguous(), pre.contiguous(), hc
+        ).to(out_dtype)
     assert x_flat.stride(1) == 1
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
