@@ -27,6 +27,8 @@ _use_aiter_gfx95 = envs.SGLANG_USE_AITER.get() and is_hip() and is_gfx95_support
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
 _gluon_fallback_warned = False
+_sgl_native_q8kv8_fallback_warned = False
+_sgl_native_q8kv8_hit_logged = False
 
 
 def _warn_msa_fallback(err: Exception) -> None:
@@ -50,6 +52,32 @@ def _warn_gluon_fallback(msg: str) -> None:
         msg,
     )
     _gluon_fallback_warned = True
+
+
+def _warn_sgl_native_q8kv8_fallback(err: Exception) -> None:
+    global _sgl_native_q8kv8_fallback_warned
+    if _sgl_native_q8kv8_fallback_warned:
+        return
+    logger.warning(
+        "SGL native Q8KV8 sparse attention is unavailable (%s); "
+        "falling back to the existing sparse-attention provider chain.",
+        err,
+    )
+    _sgl_native_q8kv8_fallback_warned = True
+
+
+def _log_sgl_native_q8kv8_hit(q: torch.Tensor, k_cache: torch.Tensor) -> None:
+    global _sgl_native_q8kv8_hit_logged
+    if _sgl_native_q8kv8_hit_logged:
+        return
+    logger.info(
+        "SGL native Q8KV8 sparse prefill Step 3 active: "
+        "q_shape=%s, kv_shape=%s, local_gqa_group_size=%d.",
+        tuple(q.shape),
+        tuple(k_cache.shape),
+        q.shape[1] // k_cache.shape[1],
+    )
+    _sgl_native_q8kv8_hit_logged = True
 
 
 def minimax_sparse_prefill(
@@ -80,6 +108,7 @@ def minimax_sparse_prefill(
     score_type: str = "max",
     disable_index_value: bool = False,
     use_msa: bool = False,
+    use_sgl_native_q8kv8: bool = False,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
@@ -168,11 +197,40 @@ def minimax_sparse_prefill(
 
     # Reduced top-k cached by the caller for subsequent skip layers.
     reduced_topk_idx = topk_idx
-    # Step 3: Sparse attention using topk index (main head). The Gluon and
-    # MSA paths only replace this step; the indexer above is unchanged. MSA has
-    # no attn-sink input, so keep the Triton path when sink is present.
+    # Step 3: Sparse attention using topk index (main head). Native providers
+    # only replace this step; the indexer above is unchanged. Providers that do
+    # not support attention sinks or HiSparse remapping leave the existing path
+    # in place for those configurations.
     o = None
-    if (
+    if use_sgl_native_q8kv8 and sink is None and loc_mapping is None:
+        from .sgl_native_q8kv8 import (
+            SglNativeQ8KV8UnavailableError,
+            sgl_native_q8kv8_sparse_prefill_main,
+        )
+
+        try:
+            o = sgl_native_q8kv8_sparse_prefill_main(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                topk_idx=topk_idx,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                block_size_k=block_size_k,
+                page_size=page_size,
+                sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            _log_sgl_native_q8kv8_hit(q, k_cache)
+        except SglNativeQ8KV8UnavailableError as err:
+            _warn_sgl_native_q8kv8_fallback(err)
+
+    if o is None and (
         _use_aiter_gfx95
         and envs.SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL.get()
         # the scratch gather reads pool slots without the HiSparse remap
