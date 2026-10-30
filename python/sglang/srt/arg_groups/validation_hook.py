@@ -174,6 +174,10 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    assert cfg.max_queued_tokens is None or cfg.max_queued_tokens >= 0, (
+        "--max-queued-tokens must be non-negative or None"
+    )
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (

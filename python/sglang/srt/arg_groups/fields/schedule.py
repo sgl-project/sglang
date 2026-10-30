@@ -36,6 +36,20 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
     ] = None
+    max_queued_tokens: A[
+        Optional[int],
+        Arg(
+            help=(
+                "The maximum total input tokens in the waiting queue, including "
+                "cached tokens and excluding output tokens. Requests exceeding either "
+                "this limit or --max-queued-requests are rejected with HTTP 503. "
+                "With priority scheduling, lower-priority requests may be evicted. "
+                "This option is ignored when using disaggregation-mode. "
+                "By default, there is no limit."
+            ),
+            type_parser=human_readable_int,
+        ),
+    ] = None
     max_total_tokens: A[
         Optional[int],
         Arg(

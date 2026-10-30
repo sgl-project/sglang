@@ -9,11 +9,11 @@ import time
 import unittest
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -46,6 +46,7 @@ class _FakeReq:
         self.session = None
         self.multimodal_inputs = None
         self._finished = is_finished
+        self.origin_input_ids = [0]
         self.output_ids = []
         self.weight_version_events = []
         self.time_stats = SimpleNamespace(
@@ -87,12 +88,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
 
 class TestQueuedLimitAbort(CustomTestCase):
     def setUp(self):
-        patcher = patch(
-            "sglang.srt.managers.scheduler.get_serving",
-            return_value=SimpleNamespace(weight_version="v0"),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        enter_scope(self, get_context().override_server_args(weight_version="v0"))
 
     def test_hicache_without_storage_uses_common_abort_cleanup(self):
         candidate = _req("candidate", wait_entry=1.0)
@@ -113,6 +109,83 @@ class TestQueuedLimitAbort(CustomTestCase):
             candidate.cache_request_handle, CacheRequestOutcome.ABORT
         )
         self.assertEqual(s.waiting_queue, [])
+
+    def _token_scheduler(self, queue, *, limit=10, priority=False, low_first=False):
+        enter_scope(self, get_context().override_server_args(max_queued_tokens=limit))
+        s = _scheduler(queue)
+        s.max_queued_requests = None
+        s.enable_priority_scheduling = priority
+        s.schedule_low_priority_values_first = low_first
+        s.tree_cache = MagicMock(spec=["finish"])
+        return s
+
+    def _token_req(self, rid, tokens, *, priority=0, entry=1.0):
+        req = _req(rid, wait_entry=entry)
+        req.origin_input_ids = [0] * tokens
+        req.priority = priority
+        return req
+
+    def test_token_boundary_counts_cached_inputs_but_not_output(self):
+        queued = self._token_req("queued", 6)
+        queued.prefix_len = 6
+        queued.output_ids = [0] * 100
+        incoming = self._token_req("incoming", 4)
+        s = self._token_scheduler([queued])
+        self.assertFalse(s._abort_on_queued_limit(incoming))
+        incoming.origin_input_ids.append(0)
+        self.assertTrue(s._abort_on_queued_limit(incoming))
+        output = s.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        self.assertEqual(output.finished_reason["status_code"], 503)
+        self.assertEqual(s.waiting_queue, [queued])
+
+    def test_both_limits_apply_and_removed_requests_release_budget(self):
+        queued = self._token_req("queued", 6)
+        incoming = self._token_req("incoming", 5)
+        s = self._token_scheduler([queued])
+        s.max_queued_requests = 2
+        self.assertTrue(s._abort_on_queued_limit(incoming))
+        incoming.origin_input_ids = [0]
+        s.max_queued_requests = 1
+        self.assertTrue(s._abort_on_queued_limit(incoming))
+        s.waiting_queue.clear()
+        self.assertFalse(s._abort_on_queued_limit(incoming))
+
+    def test_priority_evicts_multiple_requests_in_preference_order(self):
+        for low_first in (False, True):
+            with self.subTest(low_first=low_first):
+                direction = 1 if low_first else -1
+                old = self._token_req("old", 3, priority=2 * direction, entry=1)
+                new = self._token_req("new", 3, priority=2 * direction, entry=2)
+                better = self._token_req("better", 3, priority=direction)
+                incoming = self._token_req("incoming", 7, priority=0)
+                s = self._token_scheduler(
+                    [old, better, new], priority=True, low_first=low_first
+                )
+                self.assertFalse(s._abort_on_queued_limit(incoming))
+                self.assertEqual(s.waiting_queue, [better])
+                outputs = s.ipc_channels.send_to_tokenizer.send_output.call_args_list
+                self.assertEqual([c.args[0].rid for c in outputs], ["new", "old"])
+                self.assertEqual(s.tree_cache.finish.call_count, 2)
+                self.assertEqual(s.beam_coordinator.retire_group.call_count, 2)
+
+    def test_failed_priority_admission_does_not_evict_any_requests(self):
+        for incoming_tokens in (8, 11):
+            with self.subTest(incoming_tokens=incoming_tokens):
+                worse = self._token_req("worse", 3, priority=-1)
+                equal = self._token_req("equal", 4, priority=0)
+                incoming = self._token_req("incoming", incoming_tokens, priority=0)
+                s = self._token_scheduler([worse, equal], priority=True)
+                self.assertTrue(s._abort_on_queued_limit(incoming))
+                self.assertEqual(s.waiting_queue, [worse, equal])
+                self.assertEqual(s.tree_cache.finish.call_count, 0)
+
+    def test_zero_limits_reject_without_selecting_from_an_empty_queue(self):
+        incoming = self._token_req("incoming", 1)
+        s = self._token_scheduler([], limit=0, priority=True)
+        self.assertTrue(s._abort_on_queued_limit(incoming))
+        s.max_queued_requests = 0
+        incoming.origin_input_ids = []
+        self.assertTrue(s._abort_on_queued_limit(incoming))
 
 
 class TestWaitingTimeout(CustomTestCase):
