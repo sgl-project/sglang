@@ -381,6 +381,29 @@ def test_backend_eligible_override_gates_per_call(monkeypatch):
     assert op(torch.zeros(8)) == "jit"
 
 
+def test_dynamic_dispatch_resolves_its_fallback_once(monkeypatch):
+    class _GatedCuda(_CudaOnlyPlatformOp):
+        priority = (KernelBackend.JIT, KernelBackend.TORCH)
+        capabilities = {KernelBackend.JIT: frozenset()}
+
+        def forward_jit(self, x):
+            return "jit"
+
+        def backend_eligible(self, backend, *args, **kwargs):
+            return False
+
+    _mock_platform(monkeypatch, key="cuda", info=_CUDA)
+    op = _GatedCuda()
+    calls = []
+    original = op._platform_method
+    monkeypatch.setattr(
+        op, "_platform_method", lambda key: calls.append(key) or original(key)
+    )
+    assert op(torch.zeros(1)) == "cuda"
+    assert op(torch.zeros(1)) == "cuda"
+    assert calls == ["cuda"]  # the per-call path must not walk the MRO again
+
+
 # --- torch.compile protocol -----------------------------------------------------
 
 

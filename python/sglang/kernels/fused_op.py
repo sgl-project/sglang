@@ -386,6 +386,10 @@ class BaseFusedOp(nn.Module, ABC):
         # so module-level op instances never trigger platform detection at
         # import time. Subclass __init__ may overwrite it to pin a path.
         self._forward_method: Optional[Callable] = None
+        # Per-call backend selection (an overridden ``backend_eligible``): the
+        # candidates, and the platform forward / native that runs when none applies.
+        self._dynamic_backend_candidates: Tuple[KernelBackend, ...] = ()
+        self._dynamic_fallback: Optional[Callable] = None
         # torch.compile mode bookkeeping (see enter/leave_torch_compile).
         self._original_forward_method: Optional[Callable] = None
         self.is_torch_compile = False
@@ -555,6 +559,9 @@ class BaseFusedOp(nn.Module, ABC):
             if self._defined_method("backend_eligible") is not None:
                 # Per-call shape/dtype gates: keep selection dynamic.
                 self._dynamic_backend_candidates = candidates
+                self._dynamic_fallback = (
+                    self._platform_method(_platform_key()) or self.forward_native
+                )
                 return self._forward_backend_dynamic
             platform = _platform()
             for backend in candidates:
@@ -575,8 +582,7 @@ class BaseFusedOp(nn.Module, ABC):
                 if _trace_enabled:
                     _record_trace(self, backend.value, args, kwargs)
                 return result
-        method = self._platform_method(_platform_key())
-        method = method or self.forward_native
+        method = self._dynamic_fallback
         result = method(*args, **kwargs)
         if _trace_enabled:
             _record_trace(self, _dispatch_label(method), args, kwargs)
