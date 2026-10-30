@@ -264,4 +264,18 @@ class FastH3Pipeline(MiniMaxH3Pipeline):
     default_model_subfolder = None
 
 
-EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline]
+class PikaH3FlexPipeline(MiniMaxH3Pipeline):
+    """Pika H3 Flex: MiniMax-H3 plus Pika's six-step LoRA adapters.
+
+    The release's model overlay links the pinned MiniMax-H3 base into the
+    base-H3 layout (root and ``FL2VA/`` for t2va/fl2va, ``Ref2VA/`` for
+    ref2va) with the matching adapter next to each partition. Its
+    ``_minimax_h3`` block carries the sampling contract (knots
+    1000/750/500/250/100/40, video shift 12, audio shift 3, re-noising) and
+    the adapter, which loads at startup.
+    """
+
+    pipeline_name = "PikaH3FlexPipeline"
+
+
+EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, PikaH3FlexPipeline]
