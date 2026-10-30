@@ -1354,16 +1354,45 @@ def _lean_num_cus() -> int:
     return _NUM_CU
 
 
+_LEAN_NUM_STAGES = 2
+# Barrier/scratch the compiler adds on top of the staged K tile.
+_LEAN_LDS_SLACK = 1024
+
+
+def _lean_lds_limit() -> int:
+    """Shared memory one workgroup may request on the current device, in bytes."""
+    try:
+        return int(
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).shared_memory_per_block
+        )
+    except Exception:
+        return 64 * 1024
+
+
 def _lean_decode_block_n(Lk: int) -> int:
     """KV block size for the Lean decode kernel.
 
     Large head dims (MLA, Lk in {288, 576}) use a small KV block to bound LDS/register
     usage; standard head dims use a large block since decode is memory-bound. The value
     must be identical everywhere it is used so the tile schedule stays consistent.
+
+    The K tile is the only operand staged in LDS: ``num_stages`` copies of a
+    ``[BLOCK_DMODEL, BLOCK_N]`` bf16 tile. At head dim 128 the upstream BLOCK_N of 128
+    asks for 2 * 128 * 128 * 2 = 65536 B plus the slack above, which does not fit the
+    64 KiB LDS of gfx1151 and raises OutOfResources at launch, so the tile is halved
+    whenever the device budget does not cover it.
     """
     if not _is_hip:
         return 64
-    return 16 if Lk > 256 else 128
+    if Lk > 256:
+        return 16
+    budget = _lean_lds_limit() - _LEAN_LDS_SLACK
+    for block_n in (128, 64, 32, 16):
+        if _LEAN_NUM_STAGES * block_n * Lk * 2 <= budget:
+            return block_n
+    return 16
 
 
 @triton.jit
@@ -2093,5 +2122,5 @@ def _decode_lean_attention_fwd(
         Lk=Lk,
         Lv=Lv,
         num_warps=4,
-        num_stages=2,
+        num_stages=_LEAN_NUM_STAGES,
     )
