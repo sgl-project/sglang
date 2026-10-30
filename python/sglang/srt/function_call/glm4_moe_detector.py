@@ -226,7 +226,12 @@ class Glm4MoeDetector(BaseFormatDetector):
         Rescanning the whole buffer every chunk is O(n^2) for a long arg.
         """
         if self._open_call is None:
-            match = self._STREAMING_PARTIAL_PATTERN.search(text)
+            # Start at the first opening tag. Searching retries an unclosed
+            # call from every later tag and can take quadratic time.
+            start = text.find(self.bot_token)
+            if start == -1:
+                return None
+            match = self._STREAMING_PARTIAL_PATTERN.match(text, start)
             if match is None:
                 return None
             self._open_call = match.group(1), match.start(2)
