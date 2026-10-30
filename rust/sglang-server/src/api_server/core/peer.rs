@@ -231,6 +231,29 @@ mod tests {
         assert!(matches!(error, CoreError::Unavailable), "{error}");
     }
 
+    /// A fan-out whose table points a rank at another rank's listener fails
+    /// that rank with a server-side error instead of recording its reply.
+    #[tokio::test]
+    async fn fan_out_fails_a_rank_relayed_to_another_ranks_listener() {
+        use crate::api_server::core::fanout::testing::status_bytes;
+        let (url, _) = peer_listener((
+            StatusCode::MISDIRECTED_REQUEST,
+            Bytes::from_static(b"relayed to dp rank 0's listener"),
+        ))
+        .await;
+        let peers: [Arc<dyn ControlTarget>; 1] =
+            [Arc::new(Peer::new(reqwest::Client::new(), 2, &url))];
+        let replies = fan_out(0, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
+        let error = replies
+            .decode::<serde::de::IgnoredAny>("status")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "control request failed on 1 of 2 dp ranks: dp rank 2: relayed to dp rank 0's listener"
+        );
+        assert_eq!(error.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     /// The peer list is every listener in the table but this rank's own,
     /// and the fan-out over it lands each peer's reply on its rank.
     #[tokio::test]

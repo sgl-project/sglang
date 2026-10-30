@@ -66,13 +66,20 @@ async fn forward_control_req(
         .and_then(|value| value.parse::<RankId>().ok());
     match target {
         Some(target) if target == own => {}
-        Some(_) => {
+        Some(target) => {
+            tracing::warn!(
+                dp_rank = own,
+                requested_dp_rank = target,
+                "refusing a control request relayed for another dp rank"
+            );
             return (
                 StatusCode::MISDIRECTED_REQUEST,
                 format!("relayed to dp rank {own}'s listener"),
             )
                 .into_response();
         }
+        // Every listener in a deployment runs the same binary, so only a
+        // caller other than `Peer::forward` omits the header.
         None => {
             return (
                 StatusCode::BAD_REQUEST,
