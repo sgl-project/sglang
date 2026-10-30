@@ -17,7 +17,7 @@ import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 import orjson
@@ -510,7 +510,11 @@ class RustServer:
         self.server.push_health_ack()
 
     def push_generation(
-        self, payload: BatchTokenIDOutput, decode_latencies: Dict[int, float]
+        self,
+        payload: BatchTokenIDOutput,
+        decode_latencies: Dict[int, float],
+        cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
+        storage_backend: Optional[str] = None,
     ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
@@ -526,10 +530,14 @@ class RustServer:
             and hidden ones), then the finished requests' weight-version
             spans, a multimodal model's media token counts,
             ``decode_latencies`` (by row: a finished non-streaming request's
-            decode latency in seconds), and the scheduler's
-            ``customized_info`` (per key, each request's values for its new
-            output tokens) as one JSON text, which the frontend accumulates
-            and reports in ``meta_info`` as Python's TokenizerManager does.
+            decode latency in seconds), the scheduler's ``customized_info``
+            (per key, each request's values for its new output tokens) as one
+            JSON text, which the frontend accumulates and reports in
+            ``meta_info`` as Python's TokenizerManager does,
+            ``cached_tokens_split`` (by row: the request's cached tokens per
+            cache tier, ``(device, host, storage)``, when the cache has more
+            tiers than the device) and, for the whole frame, the attached
+            ``storage_backend``.
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -678,10 +686,11 @@ class RustServer:
 
         # After the extras: the finished requests' weight-version spans (None
         # for the others), a multimodal model's media token counts, the
-        # finished requests' decode latencies and the customized_info columns,
-        # each empty when nothing in the batch carries it. Only the latencies
-        # are built here, for finished rows; the header stops at its last
-        # non-empty column.
+        # finished requests' decode latencies, the customized_info columns and
+        # the cached tokens by tier, each empty when nothing in the batch
+        # carries it, then the frame's storage backend. Only the latencies are
+        # built here, for finished rows; the header stops at its last non-empty
+        # column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
@@ -696,6 +705,8 @@ class RustServer:
             latencies,
             [],  # abort_outputs, push_abort's column
             self._customized_info_json(payload.customized_info),
+            cached_tokens_split or [],
+            storage_backend,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()
