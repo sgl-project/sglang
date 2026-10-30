@@ -50,7 +50,6 @@ class TestAllocationConfiguration(CustomTestCase):
                 "disaggregation_mode": "decode",
                 "disaggregation_decode_host_receive_threshold": 0.5,
             },
-            {"enable_pdmux": True},
             {"enable_pd_role_switch": True},
             {"language_only": True},
             {

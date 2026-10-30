@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -364,6 +365,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+        ragged_layout = forward_batch.ragged_verify_layout
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -371,42 +373,47 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             seq_lens_cpu = seq_lens.cpu()
 
             if forward_mode.is_decode_or_idle():
-                decode_wrapper = BatchMLAPagedAttentionWrapper(
-                    self.workspace_buffer,
-                    use_cuda_graph=True,
-                    qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
-                    kv_indptr=self.cuda_graph_kv_indptr[: num_tokens + 1],
-                    kv_indices=self.cuda_graph_kv_indices,
-                    kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
-                    backend="auto",
-                )
-                self.indices_updater_decode.update(
-                    seq_lens,
-                    seq_lens_sum,
-                    decode_wrapper=decode_wrapper,
-                    init_metadata_replay=False,
-                    spec_info=spec_info,
-                    req_pool_indices=req_pool_indices[:bs],
-                    plan=forward_batch.iteration_ids,
-                )
-                self.decode_cuda_graph_metadata[bs] = decode_wrapper
+                # Graph variants of one batch size share the wrapper: replay
+                # re-plans only this one, and every variant's kernels read it.
+                decode_wrapper = self.decode_cuda_graph_metadata.get(bs)
+                if decode_wrapper is None:
+                    decode_wrapper = BatchMLAPagedAttentionWrapper(
+                        self.workspace_buffer,
+                        use_cuda_graph=True,
+                        qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
+                        kv_indptr=self.cuda_graph_kv_indptr[: num_tokens + 1],
+                        kv_indices=self.cuda_graph_kv_indices,
+                        kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
+                        backend="auto",
+                    )
+                    # Bootstrap the real plan once; later captures use the
+                    # host-fed fast plan in _apply_cuda_graph_metadata below.
+                    self.indices_updater_decode.update(
+                        seq_lens,
+                        seq_lens_sum,
+                        decode_wrapper=decode_wrapper,
+                        init_metadata_replay=False,
+                        spec_info=spec_info,
+                        req_pool_indices=req_pool_indices[:bs],
+                        plan=forward_batch.iteration_ids,
+                    )
+                    self.decode_cuda_graph_metadata[bs] = decode_wrapper
+                    decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
                 self.forward_metadata = DecodeMetadata(decode_wrapper)
-                # fast_mla_decode_plan needs _cached_module from the initial
-                # begin_forward above, so install it only after that call completes.
-                decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
             elif forward_mode.is_target_verify():
-                prefill_wrapper = BatchMLAPagedAttentionWrapper(
-                    self.workspace_buffer,
-                    use_cuda_graph=True,
-                    qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
-                    kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
-                    kv_indices=self.cuda_graph_kv_indices,
-                    kv_len_arr=self.cuda_graph_kv_lens[:bs],
-                    backend="auto",
-                )
-                self.prefill_cuda_graph_metadata[
-                    self._verify_graph_key(bs, spec_info)
-                ] = prefill_wrapper
+                key = self._verify_graph_key(bs, ragged_layout)
+                prefill_wrapper = self.prefill_cuda_graph_metadata.get(key)
+                if prefill_wrapper is None:
+                    prefill_wrapper = BatchMLAPagedAttentionWrapper(
+                        self.workspace_buffer,
+                        use_cuda_graph=True,
+                        qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
+                        kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+                        kv_indices=self.cuda_graph_kv_indices,
+                        kv_len_arr=self.cuda_graph_kv_lens[:bs],
+                        backend="auto",
+                    )
+                    self.prefill_cuda_graph_metadata[key] = prefill_wrapper
                 self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
             else:
                 raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -421,6 +428,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
                 in_capture=True,
+                ragged_verify_layout=ragged_layout,
             )
             if forward_mode.is_target_verify() and (
                 spec_info is None
@@ -438,6 +446,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                ragged_verify_layout=ragged_layout,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -521,6 +530,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # Recapture replaces buffers; wrappers must bind to the new ones.
+        self.decode_cuda_graph_metadata = {}
+        self.prefill_cuda_graph_metadata = {}
+
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len,),
@@ -547,13 +560,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         }
 
     @staticmethod
-    def _verify_graph_key(bs: int, spec_info: Optional[SpecInput]):
+    def _verify_graph_key(bs: int, ragged_layout: Optional[RaggedVerifyLayout]):
         """bs for uniform graphs; token tier for ragged (tiers share slot
         counts but each graph must replay its own recorded plan buffers)."""
-        layout = spec_info.ragged_verify_layout if spec_info is not None else None
-        if layout is None:
+        if ragged_layout is None:
             return bs
-        return ("ragged", layout.graph_num_tokens)
+        return ("ragged", ragged_layout.graph_num_tokens)
 
     def _apply_cuda_graph_metadata(
         self,
@@ -566,6 +578,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         in_capture: bool = False,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -612,6 +625,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             fast_verify_plan_kwargs = self._build_fast_verify_plan_kwargs(
                 bs=bs,
                 spec_info=spec_info,
+                ragged_verify_layout=ragged_verify_layout,
                 seq_lens_cpu=seq_lens_cpu,
                 in_capture=in_capture,
             )
@@ -624,7 +638,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
-                    self._verify_graph_key(bs, spec_info)
+                    self._verify_graph_key(bs, ragged_verify_layout)
                 ],
                 use_ragged=False,
                 spec_info=spec_info,
@@ -654,6 +668,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         *,
         bs: int,
         spec_info: Optional[SpecInput],
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
         seq_lens_cpu: Optional[torch.Tensor],
         in_capture: bool,
     ) -> Optional[dict]:
@@ -685,10 +700,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return None
         if spec_info.spec_input_type != SpecInputType.DFLASH_VERIFY:
             return None
-        if (
-            spec_info.ragged_verify_layout is not None
-            or spec_info.custom_mask is not None
-        ):
+        if ragged_verify_layout is not None or spec_info.custom_mask is not None:
             return None
         if get_parallel().dcp_enabled:
             return None
