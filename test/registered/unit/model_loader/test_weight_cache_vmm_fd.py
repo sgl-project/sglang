@@ -9,7 +9,9 @@ standing in for the VMM allocations:
   - the daemon's export path (WeightCacheDaemon._export_state ->
     VmmFdTransportBackend.prepare_export): values, ties, and freeing every
     original as its allocation is filled
-  - the packing plan's sizes, logged before anything is allocated or copied
+  - the packing plan's sizes and the free device memory, logged before
+    anything is allocated or copied, and the warning when the free memory is
+    below the largest allocation
   - the fetch_state exchange over a socketpair, then rebuilding every tensor
     on the engine side
   - engine-side layout validation
@@ -102,8 +104,9 @@ class _HostReservation:
 
 
 @contextlib.contextmanager
-def _host_vmm():
-    """Run the vmm_fd backend's packing on host memory."""
+def _host_vmm(free_bytes=1 << 40):
+    """Run the vmm_fd backend's packing on host memory, with ``free_bytes`` of
+    free device memory."""
     with (
         mock.patch.object(cuda_vmm_utils, "VmmReservation", _HostReservation),
         mock.patch.object(
@@ -111,6 +114,7 @@ def _host_vmm():
         ),
         mock.patch("torch.cuda.synchronize"),
         mock.patch("torch.cuda.empty_cache") as empty_cache,
+        mock.patch("torch.cuda.mem_get_info", return_value=(free_bytes, free_bytes)),
     ):
         yield empty_cache
 
@@ -341,9 +345,9 @@ class TestVmmExportAndImport(CustomTestCase):
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
-        freed_at_each_allocation = []
+        freed_at_each_empty_cache = []
         with _host_vmm() as empty_cache:
-            empty_cache.side_effect = lambda: freed_at_each_allocation.append(
+            empty_cache.side_effect = lambda: freed_at_each_empty_cache.append(
                 {name for name, ref in originals.items() if ref.expired()}
             )
             daemon = _make_daemon(model, backend)
@@ -361,7 +365,11 @@ class TestVmmExportAndImport(CustomTestCase):
         )
         self.assertEqual(backend.exported_bytes, reservation.size)
 
-        # Every original is freed once its allocation is filled, not at the end.
+        # The cache is emptied once before packing, when the plan still holds
+        # every original, and then after each allocation. Every original is
+        # freed once its allocation is filled, not at the end.
+        before_packing, *freed_at_each_allocation = freed_at_each_empty_cache
+        self.assertEqual(before_packing, set())
         self.assertEqual(len(freed_at_each_allocation), len(backend._alloc_sizes))
         for alloc_index, freed in enumerate(freed_at_each_allocation):
             packed_so_far = {
@@ -509,32 +517,43 @@ class TestVmmExportAndImport(CustomTestCase):
 
 
 class TestPackPlanLog(CustomTestCase):
-    """prepare_export logs the sizes of its packing plan before it allocates
-    or copies anything."""
+    """prepare_export logs the sizes of its packing plan and the free device
+    memory before it allocates or copies anything, and warns, without
+    stopping, when the free memory is below the largest allocation."""
 
-    def _pack(self, state, max_alloc_bytes):
-        """Pack ``state`` on host memory; returns the backend and the plan line."""
+    # 20000 bytes in "big": with a 4 KiB cap it gets an allocation of its own,
+    # of 20480 bytes.
+    LARGEST_ALLOCATION = 20480
+
+    @staticmethod
+    def _state_with_a_large_storage():
+        return {
+            "small": (torch.arange(16, dtype=torch.float32), True),
+            "big": (torch.arange(5000, dtype=torch.float32), True),
+            "after": (torch.ones(16), True),
+        }
+
+    def _pack(self, state, max_alloc_bytes, free_bytes=1 << 40):
+        """Pack ``state`` on host memory; returns the backend, the plan line
+        and the warnings."""
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=max_alloc_bytes
         )
-        with _host_vmm(), self.assertLogs(transport.logger, "INFO") as logs:
+        with (
+            _host_vmm(free_bytes),
+            self.assertLogs(transport.logger, "INFO") as logs,
+        ):
             backend.prepare_export(state)
         self.addCleanup(backend.close)
         (line,) = [msg for msg in logs.output if "pack plan" in msg]
-        return backend, line
+        warnings = [msg for msg in logs.output if msg.startswith("WARNING:")]
+        return backend, line, warnings
 
     def test_a_storage_larger_than_the_cap_sets_the_largest_allocation(self):
         cap = GRANULARITY
-        backend, line = self._pack(
-            {
-                "small": (torch.zeros(16), True),
-                "big": (torch.zeros(5000), True),  # 20000 bytes
-                "after": (torch.zeros(16), True),
-            },
-            cap,
-        )
+        backend, line, _ = self._pack(self._state_with_a_large_storage(), cap)
         largest = max(backend._alloc_sizes)
-        self.assertEqual(largest, 20480)  # 20000 bytes, rounded up to the granule
+        self.assertEqual(largest, self.LARGEST_ALLOCATION)
         self.assertGreater(largest, cap)
         self.assertIn(
             f"3 slot(s) in 3 allocation(s), cap {cap} bytes, largest slot 20000 "
@@ -546,7 +565,7 @@ class TestPackPlanLog(CustomTestCase):
     def test_storages_smaller_than_the_cap_keep_every_allocation_within_it(self):
         # The cap is a multiple of the granularity, as 1 GiB is on CUDA.
         cap = GRANULARITY
-        backend, line = self._pack(
+        backend, line, _ = self._pack(
             {f"t{i}": (torch.zeros(256), True) for i in range(10)},  # 1 KiB each
             cap,
         )
@@ -555,6 +574,40 @@ class TestPackPlanLog(CustomTestCase):
         self.assertIn(
             f"largest slot 1024 bytes (t0), largest allocation {largest} bytes", line
         )
+
+    def test_the_plan_line_reports_the_free_memory(self):
+        _, line, warnings = self._pack(
+            self._state_with_a_large_storage(), GRANULARITY, free_bytes=123456789
+        )
+        self.assertTrue(line.endswith(", 123456789 bytes free"), line)
+        self.assertEqual(warnings, [])
+
+    def test_short_free_memory_warns_and_packing_goes_on(self):
+        free = self.LARGEST_ALLOCATION - 1
+        short, _, warnings = self._pack(
+            self._state_with_a_large_storage(), GRANULARITY, free_bytes=free
+        )
+        (warning,) = warnings
+        self.assertIn(
+            f"{free} bytes of device memory are free, less than the largest "
+            f"allocation ({self.LARGEST_ALLOCATION} bytes)",
+            warning,
+        )
+        # Packed the same as with enough free memory.
+        enough, _, _ = self._pack(self._state_with_a_large_storage(), GRANULARITY)
+        self.assertEqual(short._alloc_sizes, enough._alloc_sizes)
+        self.assertEqual(short.exported_bytes, enough.exported_bytes)
+        self.assertTrue(
+            torch.equal(short._reservation.buffer, enough._reservation.buffer)
+        )
+
+    def test_free_memory_that_fits_the_largest_allocation_does_not_warn(self):
+        _, _, warnings = self._pack(
+            self._state_with_a_large_storage(),
+            GRANULARITY,
+            free_bytes=self.LARGEST_ALLOCATION,
+        )
+        self.assertEqual(warnings, [])
 
     def test_the_plan_is_logged_before_anything_is_allocated_or_copied(self):
         events = []
@@ -577,19 +630,26 @@ class TestPackPlanLog(CustomTestCase):
         def recording_info(msg, *args):
             events.append(msg % args)
 
+        def recording_mem_get_info(device):
+            events.append("mem_get_info")
+            return 1 << 40, 1 << 40
+
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
         self.addCleanup(backend.close)
         with (
-            _host_vmm(),
+            _host_vmm() as empty_cache,
             mock.patch.object(cuda_vmm_utils, "VmmReservation", RecordingReservation),
             mock.patch.object(transport, "pack_slot", recording_pack_slot),
             mock.patch.object(transport.logger, "info", side_effect=recording_info),
+            mock.patch("torch.cuda.mem_get_info", side_effect=recording_mem_get_info),
         ):
+            empty_cache.side_effect = lambda: events.append("empty_cache")
             backend.prepare_export({f"t{i}": (torch.randn(8), True) for i in range(3)})
-        self.assertIn("pack plan", events[0])
-        self.assertLessEqual({"reserve", "map", "copy"}, set(events[1:]))
+        self.assertEqual(events[:2], ["empty_cache", "mem_get_info"])
+        self.assertIn("pack plan", events[2])
+        self.assertLessEqual({"reserve", "map", "copy"}, set(events[3:]))
 
 
 class TestValidateVmmLayout(CustomTestCase):

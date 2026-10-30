@@ -318,7 +318,11 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         state_tensors.clear()
         if not plan.alloc_sizes:
             return plan.entries
-        self._log_pack_plan(plan)
+        # Hand back what torch still caches (e.g. from the released model), so
+        # that the free memory read here is what the first allocation can use.
+        torch.cuda.empty_cache()
+        free_bytes, _ = torch.cuda.mem_get_info(self._device)
+        self._log_pack_plan(plan, free_bytes)
 
         offsets = _prefix_offsets(plan.alloc_sizes)
         self._reservation = VmmReservation(
@@ -361,9 +365,15 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         )
         return plan.entries
 
-    def _log_pack_plan(self, plan) -> None:
-        """Log the sizes ``plan`` will allocate, before anything is allocated
-        or copied."""
+    def _log_pack_plan(self, plan, free_bytes: int) -> None:
+        """Log the sizes ``plan`` will allocate and the free device memory,
+        before anything is allocated or copied.
+
+        Free memory below the largest allocation only gets a warning: packing
+        returns originals to the driver as it copies them, so the free memory
+        before packing is not the exact need, and an allocation that does not
+        fit makes cuMemCreate fail before any engine attaches.
+        """
         largest = max(plan.slots, key=lambda slot: slot.nbytes)
         slot_key = (largest.alloc_index, largest.offset, largest.nbytes)
         name = next(
@@ -375,18 +385,28 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             ),
             None,
         )
+        largest_alloc = max(plan.alloc_sizes)
         logger.info(
             "[weight_cache] vmm_fd: pack plan: %d slot(s) in %d allocation(s), "
             "cap %d bytes, largest slot %d bytes%s, largest allocation %d bytes, "
-            "%d bytes in total",
+            "%d bytes in total, %d bytes free",
             len(plan.slots),
             len(plan.alloc_sizes),
             self._max_alloc_bytes,
             largest.nbytes,
             f" ({name})" if name is not None else "",
-            max(plan.alloc_sizes),
+            largest_alloc,
             sum(plan.alloc_sizes),
+            free_bytes,
         )
+        if free_bytes < largest_alloc:
+            logger.warning(
+                "[weight_cache] vmm_fd: %d bytes of device memory are free, less "
+                "than the largest allocation (%d bytes); packing may not have "
+                "enough memory.",
+                free_bytes,
+                largest_alloc,
+            )
 
     def _export_fds(self) -> List[int]:
         """Export a fresh POSIX fd per allocation; the caller closes them."""
