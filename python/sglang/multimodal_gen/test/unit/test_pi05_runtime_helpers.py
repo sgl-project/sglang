@@ -676,9 +676,11 @@ def test_cached_pi05_sinusoidal_scaling_is_bit_exact():
     assert torch.equal(actual, expected)
 
 
-def test_prepare_denoise_layout_matches_per_step_construction():
+@pytest.mark.parametrize("backend", ["auto", "triton_split_kv"])
+def test_prepare_denoise_layout_matches_per_step_construction(backend):
     model = Pi05CoreModel.__new__(Pi05CoreModel)
     nn.Module.__init__(model)
+    model.config = Pi05PipelineConfig(action_attention_backend=backend)
     prefix_pad_masks = torch.tensor(
         [[True, True, False], [True, False, False]], dtype=torch.bool
     )
@@ -703,7 +705,7 @@ def test_prepare_denoise_layout_matches_per_step_construction():
     expected_mask = model.prepare_attention_masks_4d(expected_2d_mask)
     expected_positions = torch.tensor([[5, 6, 7, 8], [4, 5, 6, 7]])
 
-    assert torch.equal(attention_mask, expected_mask)
+    assert torch.equal(attention_mask.expand_as(expected_mask), expected_mask)
     assert torch.equal(position_ids, expected_positions)
     full_attention_mask, full_attention_positions = model.prepare_denoise_layout(
         prefix_pad_masks,

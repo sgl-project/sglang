@@ -452,6 +452,35 @@ class PiGemmaAttention(nn.Module):
 
         if past_key_values is not None:
             if (
+                getattr(self, "use_split_kv", False)
+                and self.sp_attn is None
+                and past_key_values.read_only
+                and query_states.device.type == "cuda"
+                and query_states.dtype in (torch.float16, torch.bfloat16)
+                and self.head_dim in (64, 128, 256)
+                and (attention_mask is None or attention_mask.shape[1:3] == (1, 1))
+            ):
+                from sglang.kernels.ops.attention.pi05_split_kv import (
+                    split_kv_attention,
+                )
+
+                prefix_keys, prefix_values = past_key_values.get_prefix(self.layer_idx)
+                attn_output = (
+                    split_kv_attention(
+                        query_states,
+                        prefix_keys,
+                        prefix_values,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        self.scaling,
+                    )
+                    .transpose(1, 2)
+                    .reshape(*input_shape, -1)
+                    .contiguous()
+                )
+                return linear_forward(self.o_proj, attn_output), None
+            if (
                 self.sp_attn is not None
                 and past_key_values.read_only
                 and attention_mask is None
@@ -1320,6 +1349,11 @@ class Pi05CoreModel(nn.Module):
             torch.empty(0, dtype=torch.float64),
             persistent=False,
         )
+        if self.paligemma_with_expert.gemma_expert is not None:
+            for layer in self.paligemma_with_expert.gemma_expert.model.layers:
+                layer.self_attn.use_split_kv = (
+                    config.action_attention_backend == "triton_split_kv"
+                )
         for module in self.modules():
             if isinstance(module, PiGemmaRMSNorm):
                 module.enable_fusion = config.enable_fused_norm
@@ -1459,6 +1493,12 @@ class Pi05CoreModel(nn.Module):
                 [prefix_pad_2d_masks, suffix_att_2d_masks],
                 dim=2,
             )
+            if self.config.action_attention_backend == "triton_split_kv" and not (
+                model_parallel_is_initialized()
+                and get_sequence_parallel_world_size() > 1
+            ):
+                # Pi0.5 action queries share one noncausal key-padding mask.
+                full_att_2d_masks = full_att_2d_masks[:, :1, :]
             # A masked prefix guarantees that the concatenated layout is not
             # full attention. Avoid a device-to-host ``.item()`` here so this
             # path remains CUDA-graph capturable.

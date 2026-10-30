@@ -75,6 +75,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.pi05_split_kv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.pi05_split_kv:split_kv_attention",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
