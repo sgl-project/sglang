@@ -243,6 +243,13 @@ pip install torch_npu==$TORCH_NPU_VERSION --extra-index-url https://ascend.devcl
 
 If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
+After the installation, verify that PyTorch can compute on the NPUs — the check should print `True`, followed by the
+result of a matrix multiplication run on the device:
+
+```bash Command
+python3 -c "import torch; print(torch.npu.is_available()); print(torch.randn(2, 2).npu().mm(torch.randn(2, 2).npu()))"
+```
+
 #### Triton on Ascend
 
 We provide our own implementation of Triton for Ascend.
