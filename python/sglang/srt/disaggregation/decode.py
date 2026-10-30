@@ -528,7 +528,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> int:
         return max(
             allocated_tokens + self.num_reserved_decode_tokens,
-            self._rebootstrap_prefill_len(req)
+            self._pre_alloc_fill_len(req)
             - prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
             - retractable_tokens,
@@ -869,9 +869,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.retire_unadmitted_request(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
-            if req.output_ids:
-                req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-            req.pd_rebootstrap_in_progress = True
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
@@ -982,25 +979,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_rebootstrap=True)
 
     @staticmethod
-    def _rebootstrap_prefill_len(req: Req) -> int:
-        if getattr(req, "pd_rebootstrap_in_progress", False):
-            return len(req.origin_input_ids) + len(req.output_ids)
-        return len(req.origin_input_ids)
-
-    @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
-        if getattr(req, "pd_rebootstrap_in_progress", False):
-            # pause_generation(retract) already popped the boundary token out of
-            # output_ids (it is replayed via the decode-side override at commit
-            # time), so output_ids here is prompt + emitted-tokens-minus-boundary,
-            # i.e. the original seqlen - 1. The prefill recomputes KV for *all* of
-            # these tokens, leaving no just-sampled "pending" token in the list, so
-            # we allocate exactly len(origin)+len(output_ids) with no -1 (unlike
-            # normal decode, where the last token's KV has not been written yet).
-            # This is the same token count as offloading-based retraction, where
-            # offload_kv_cache saves seqlen-1 tokens; the boundary token's KV is
-            # (re)computed on the decode side once generation resumes.
-            return len(req.origin_input_ids) + len(req.output_ids)
+        # The last output id is the pending decode input; its KV is not written yet.
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
@@ -1022,7 +1002,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if self.scheduler.enable_hisparse
                 else self.max_total_num_tokens
             )
-            input_len = self._rebootstrap_prefill_len(req)
+            input_len = self._pre_alloc_fill_len(req)
             if input_len > capacity:
                 message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             elif self._uses_swa_tail_prealloc():
@@ -1543,7 +1523,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
-            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            fill_len = self._pre_alloc_fill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
@@ -1560,8 +1540,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
-
-                fill_len = self._pre_alloc_fill_len(decode_req.req)
 
                 # Decode transfers the SWA tail fresh, so retain only the
                 # full-attention prefix lock needed for reuse.
@@ -1596,7 +1574,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len = 0
                 total_prefix_len = 0
                 required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=self._pre_alloc_fill_len(decode_req.req), prefix_len=0
+                    fill_len=fill_len, prefix_len=0
                 )
 
             full_required_for_admission = self._required_admission_tokens(
@@ -1689,7 +1667,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_transfer_page_size = page_size
             raw_kv_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.kv.req_pool_idx
-            ][total_prefix_len:origin_input_len]
+            ][total_prefix_len:fill_len]
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
@@ -1698,7 +1676,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                kv_indices = dst_kv_indices[: fill_len - prefix_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -1707,7 +1685,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
 
-            seq_len = origin_input_len
+            seq_len = fill_len
 
             def _mamba_payload():
                 state_ids = self.token_to_kv_pool_allocator.state_ids(
@@ -1852,7 +1830,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # the independently allocated target host page IDs.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx,
-                    prefix_len:origin_input_len,
+                    prefix_len:fill_len,
                 ]
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,
@@ -2813,36 +2791,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
-        # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
-        # under the current weights and sampled a fresh handoff token, but when
-        # there is a remembered boundary token we are *replaying* an
-        # already-emitted token. Override the handoff with it, and skip
-        # re-committing a logprob or sampling mask for it -- it keeps its original
-        # behavior logprob and sampling mask from before the retract (we never
-        # re-score generated tokens under the new policy). A rebootstrap with no
-        # boundary token (retracted before emitting any output) falls through to
-        # the normal path so its first token and logprob are committed as usual.
-        replayed_boundary = (
-            decode_req.is_rebootstrap
-            and decode_req.req.pd_rebootstrap_forced_output_id is not None
+        # A rebootstrap that already emitted output keeps its last output id as
+        # the pending decode input and ignores the token the prefill sampled;
+        # that id already carries its logprob, sampling mask, and reasoning count.
+        resumes_output = (
+            decode_req.is_rebootstrap and len(decode_req.req.output_ids) > 0
         )
-        if replayed_boundary:
-            committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
-            decode_req.req.pd_rebootstrap_forced_output_id = None
-        elif _is_fake_transfer(decode_req.req):
-            committed_output_id = _generate_fake_prefill_handoff_output_id(
-                decode_req.req
-            )
-        else:
-            committed_output_id = output_id[0].item()
-        decode_req.req.output_ids.append(committed_output_id)
-        if not replayed_boundary:
+        if not resumes_output:
+            if _is_fake_transfer(decode_req.req):
+                committed_output_id = _generate_fake_prefill_handoff_output_id(
+                    decode_req.req
+                )
+            else:
+                committed_output_id = output_id[0].item()
+            decode_req.req.output_ids.append(committed_output_id)
             # The handoff token is generated on the prefill worker, so it does
             # not pass through the decode worker's normal batch-result path.
             # Account for it here using the same request-selected reasoning
-            # terminator matcher as subsequent decode tokens.  A rebootstrap
-            # boundary has already been accounted for before retraction and
-            # must not be consumed twice.
+            # terminator matcher as subsequent decode tokens.
             self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
                 decode_req.req, committed_output_id
             )
@@ -2874,7 +2840,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
-        if decode_req.req.return_logprob and not replayed_boundary:
+        if decode_req.req.return_logprob and not resumes_output:
             decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
@@ -2895,7 +2861,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # Prefill omits these scores; reserve a row for the streaming offset.
                 decode_req.req.logprob.output_token_ids_logprobs_val.append([])
                 decode_req.req.logprob.output_token_ids_logprobs_idx.append([])
-        if decode_req.req.return_sampling_mask and not replayed_boundary:
+        if decode_req.req.return_sampling_mask and not resumes_output:
             assert output_token_sampling_mask_idx is not None, (
                 "sampling mask buffer disabled on decode side"
             )
