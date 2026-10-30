@@ -8,6 +8,19 @@ description: "Documentation for OpenAI-Compatible APIs"
 
 For the Anthropic-compatible `/v1/messages` endpoint (including Claude Code integration), see [Anthropic-Compatible API](./anthropic_api).
 
+## Prompt usage across APIs
+
+Chat, Responses and Messages use the same public input boundary. For K3,
+reported prompt usage excludes the model-owned assistant generation stub;
+physical KV keys and scheduler token counts keep the complete input.
+The Messages `/v1/messages/count_tokens` endpoint uses this boundary too.
+
+Responses reports the public input total, caps cached input at that total, and
+uses it in `total_tokens` for both ordinary and streaming output. Messages
+splits the same total into uncached input, cache reads and measured cache
+creation. When creation is unknown, it remains unclassified rather than being
+assumed to be zero.
+
 ## Cache write usage
 
 With `--enable-cache-report`, supported Python frontend unified-cache paths report newly adopted,

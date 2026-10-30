@@ -94,7 +94,7 @@ struct FusedStoreCacheIndexerKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, 128})  // input
         .with_dtype<KeyT>()
         .with_device(device_)

@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import BatchStrOutput  # noqa: E402
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     GenerateReqInput,
+    RequestOutputStats,
     TokenizedGenerateReqInput,
     msgpack_decode,
     msgpack_encode,
@@ -59,16 +60,25 @@ def _batch(cls, values):
         http_worker_ipcs=[None] * count,
         finished_reasons=[None] * count,
         output_ids=[array("i", [1])] * count,
-        prompt_tokens=[20] * count,
         reasoning_tokens=[0] * count,
         completion_tokens=[1] * count,
-        cached_tokens=[4] * count,
         cache_write_tokens=values,
-        retraction_counts=[0] * count,
+        request_stats=[
+            RequestOutputStats(
+                prompt_tokens=20,
+                cached_tokens=4,
+                cached_tokens_details={"device": 2, "host": 2},
+                retraction_count=0,
+                image_tokens=0,
+                audio_tokens=0,
+                video_tokens=0,
+                time_stats=None,
+            )
+            for _ in values
+        ],
     )
     if cls is BatchTokenIDOutput:
         fields.update(
-            decoded_texts=[""] * count,
             decode_ids=[array("i", [1])] * count,
             read_offsets=[0] * count,
             skip_special_tokens=[True] * count,
@@ -138,6 +148,7 @@ class TestCacheWriteTransport(CustomTestCase):
             cached_tokens=4,
             cache_write_tokens=8,
             get_mm_token_counts=lambda: (0, 0, 0),
+            take_request_stats_due=lambda: True,
             mm_image_tokens=0,
             mm_audio_tokens=0,
             mm_video_tokens=0,
@@ -149,9 +160,8 @@ class TestCacheWriteTransport(CustomTestCase):
             init_incremental_detokenize=lambda: ([1], 0),
         )
         snapshots = []
-        for value, reported_cached in ((8, 4), (16, 4), (16, 3)):
+        for value in (8, 16, 16):
             req.cache_write_tokens = value
-            req.reported_cached_tokens = reported_cached
             req.output_ids.append(2)
             req.output_ids_through_stop = req.output_ids
             acc = _GenerationStreamAccumulator(
@@ -159,22 +169,28 @@ class TestCacheWriteTransport(CustomTestCase):
                 return_hidden_states=False,
                 return_routed_experts=False,
                 return_indexer_topk=False,
-                enable_metrics=False,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
                 default_stream_interval=1,
                 default_force_stream_interval=1,
-                get_cached_tokens_details=lambda req: {"device": 2, "host": 2},
+                build_request_stats=lambda req: RequestOutputStats(
+                    prompt_tokens=len(req.origin_input_ids),
+                    cached_tokens=req.cached_tokens,
+                    cached_tokens_details={"device": 2, "host": 2},
+                    retraction_count=req.retraction_count,
+                    image_tokens=0,
+                    audio_tokens=0,
+                    video_tokens=0,
+                    time_stats=None,
+                ),
                 is_request_level_customized_info_key=lambda key: False,
                 current_weight_version=None,
             )
             acc.accept(req=req)
             snapshots.append(acc.to_payload(dp_rank=0, is_idle_batch=False))
         self.assertEqual([x.cache_write_tokens for x in snapshots], [[8], [16], [16]])
-        self.assertEqual([x.cached_tokens for x in snapshots], [[4], [4], [3]])
         self.assertEqual(
-            [x.cached_tokens_details for x in snapshots],
-            [[{"device": 2, "host": 2}], [{"device": 2, "host": 2}], [None]],
+            [x.request_stats[0].cached_tokens for x in snapshots], [4, 4, 4]
         )
 
 
@@ -207,6 +223,54 @@ class TestCacheWriteNativeMetadata(unittest.IsolatedAsyncioTestCase, CustomTestC
                         self.assertNotIn("cache_write_tokens", meta)
                     else:
                         self.assertEqual(meta["cache_write_tokens"], value)
+
+    async def test_cached_stats_stay_physical_while_metadata_uses_public_window(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.enable_metrics = False
+        manager.incremental_streaming_output = True
+        manager.config_value = lambda key: "test"
+        manager.dump_requests_folder = ""
+        manager.crash_dump_folder = ""
+        obj = GenerateReqInput(input_ids=list(range(20)), stream=True)
+        obj._cache_write_reporting_suffix_tokens = 3
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=SimpleNamespace(first_token_time=1.0),
+        )
+        manager.rid_to_state = {"cache-0": state}
+        stats = RequestOutputStats(
+            prompt_tokens=20,
+            cached_tokens=19,
+            cached_tokens_details={"device": 19, "host": 0},
+            retraction_count=0,
+            image_tokens=0,
+            audio_tokens=0,
+            video_tokens=0,
+            time_stats=None,
+        )
+        for index, value in enumerate((0, 1, None)):
+            payload = _batch(BatchStrOutput, [value])
+            payload.request_stats = [stats] if index != 1 else None
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.get_serving",
+                return_value=SimpleNamespace(batch_notify_size=1),
+            ):
+                await manager._handle_batch_output(payload)
+            meta = state.out_list[-1]["meta_info"]
+            self.assertEqual(meta["prompt_tokens"], 20)
+            self.assertEqual(meta["cached_tokens"], 17)
+            self.assertIsNone(meta["cached_tokens_details"])
+            if value is None:
+                self.assertNotIn("cache_write_tokens", meta)
+            else:
+                self.assertEqual(meta["cache_write_tokens"], value)
+            self.assertEqual(state.request_stats.cached_tokens, 19)
+            self.assertEqual(
+                state.request_stats.cached_tokens_details, {"device": 19, "host": 0}
+            )
 
 
 class TestCacheWriteReportingWindowTransport(CustomTestCase):

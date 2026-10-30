@@ -83,7 +83,7 @@ void wan_norm_silu_post(
   auto elements = SymbolicSize{"elements"};
   auto pixels = SymbolicSize{"pixels"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
   TensorMatcher({elements}).with_dtype<X>().with_device(device_).verify(input);
   TensorMatcher({pixels}).with_dtype<float>().with_device(device_).verify(denominator);
   TensorMatcher({channels}).with_dtype<A>().with_device(device_).verify(gamma);

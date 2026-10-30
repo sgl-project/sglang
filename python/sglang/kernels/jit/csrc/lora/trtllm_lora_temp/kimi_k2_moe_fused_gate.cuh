@@ -415,7 +415,7 @@ struct KimiK2MoEFusedGateKernel {
     auto bias_dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     K.set_value(topk);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, E}).with_dtype<float, bf16_t, fp16_t>(input_dtype).with_device(device).verify(input);
     TensorMatcher({E}).with_dtype<float, bf16_t, fp16_t>(bias_dtype).with_device(device).verify(bias);

@@ -3,8 +3,9 @@ import json
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest.mock import Mock
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -22,6 +23,7 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat  # noqa: E402
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -1834,6 +1836,85 @@ class TestAnthropicServing(unittest.TestCase):
             any("content_filter" in rec for rec in log.output),
             f"expected a warning mentioning the unmapped finish_reason: {log.output}",
         )
+
+
+class TestAnthropicCountTokens(CustomTestCase):
+    def _serving(self, prompt_ids, encoding="kimi_k3", stub_tokens=3):
+        chat = _FakeOpenAIServingChat()
+        chat.chat_encoding_spec = encoding
+        chat._KIMI_K3_GENERATION_STUB_TOKENS = stub_tokens
+        chat.tokenizer_manager.model_config = SimpleNamespace(
+            is_multimodal=isinstance(prompt_ids, str)
+        )
+        chat.tokenizer_manager.tokenizer.encode = Mock(return_value=list(range(10)))
+        chat._process_messages = Mock(
+            return_value=SimpleNamespace(prompt_ids=prompt_ids)
+        )
+        chat._reported_prompt_tokens = Mock(
+            wraps=OpenAIServingChat._reported_prompt_tokens.__get__(chat)
+        )
+        return AnthropicServing(chat)
+
+    def _request(self):
+        return AnthropicCountTokensRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+    def test_count_uses_generation_public_input_boundary(self):
+        for prompt_ids in (list(range(10)), "rendered prompt"):
+            for encoding, stub_tokens, expected in (
+                ("kimi_k3", 3, 7),
+                ("other_model", 3, 10),
+                ("kimi_k3", 7, 3),
+                ("kimi_k3", 20, 0),
+            ):
+                with self.subTest(
+                    prompt_type=type(prompt_ids).__name__,
+                    encoding=encoding,
+                    stub_tokens=stub_tokens,
+                ):
+                    serving = self._serving(prompt_ids, encoding, stub_tokens)
+                    chat = serving.openai_serving_chat
+                    response = asyncio.run(
+                        serving.handle_count_tokens(self._request(), None)
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(
+                        json.loads(response.body)["input_tokens"], expected
+                    )
+                    chat._reported_prompt_tokens.assert_called_once_with(
+                        {"prompt_tokens": 10}
+                    )
+                    chat._process_messages.assert_called_once()
+                    converted, is_multimodal = chat._process_messages.call_args.args
+                    self.assertIsInstance(converted, ChatCompletionRequest)
+                    self.assertEqual(is_multimodal, isinstance(prompt_ids, str))
+                    if isinstance(prompt_ids, str):
+                        chat.tokenizer_manager.tokenizer.encode.assert_called_once_with(
+                            prompt_ids
+                        )
+                    else:
+                        chat.tokenizer_manager.tokenizer.encode.assert_not_called()
+
+    def test_count_preserves_cancellation_and_tokenization_errors(self):
+        serving = self._serving("rendered prompt")
+        chat = serving.openai_serving_chat
+        chat.tokenizer_manager.tokenizer.encode.side_effect = asyncio.CancelledError
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(serving.handle_count_tokens(self._request(), None))
+        chat._reported_prompt_tokens.assert_not_called()
+
+        chat.tokenizer_manager.tokenizer.encode.side_effect = RuntimeError(
+            "tokenizer failed"
+        )
+        with self.assertLogs("sglang.srt.entrypoints.anthropic.serving", level="ERROR"):
+            response = asyncio.run(serving.handle_count_tokens(self._request(), None))
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(json.loads(response.body)["error"]["type"], "api_error")
+        self.assertEqual(
+            json.loads(response.body)["error"]["message"], "Internal server error"
+        )
+        chat._reported_prompt_tokens.assert_not_called()
 
 
 class TestDetectInlineSystemSupport(unittest.TestCase):
