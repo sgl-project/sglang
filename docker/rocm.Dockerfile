@@ -335,11 +335,6 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
-# uTLX (see the uTLX step): ROCm/triton#983 versions libtriton's exported
-# symbols so they stay apart from the SDK's libLLVM. May be removed once the
-# SDK's Triton has it. UTLX_TRITON_ROCM selects uTLX's Triton release/3.8 code.
-ENV UTLX_TRITON_PATCH="triton-ext-llvm-symbols-gfx950.patch"
-ENV UTLX_TRITON_ROCM="1"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -424,11 +419,11 @@ ENV TRITON_REPO="${TRITON_REPO:-${TRITON_REPO_DEFAULT:-https://github.com/triton
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
 ARG TRITON_REVERT_COMMITS=""
 ENV TRITON_REVERT_COMMITS="${TRITON_REVERT_COMMITS:-${TRITON_REVERT_COMMITS_DEFAULT}}"
-# uTLX (see the uTLX step), off by default. BUILD_UTLX=1 needs a flavor whose
-# stage sets UTLX_TRITON_PATCH; checked here, not at the end of the build.
+# uTLX (see the uTLX step), off by default and only on gfx950-rocm1000; checked
+# here, not at the end of the build.
 ARG BUILD_UTLX="0"
 ENV BUILD_UTLX="${BUILD_UTLX}"
-RUN if [ "${BUILD_UTLX}" = "1" ] && [ -z "${UTLX_TRITON_PATCH:-}" ]; then \
+RUN if [ "${BUILD_UTLX}" = "1" ] && [ "${GPU_ARCH}" != "gfx950-rocm1000" ]; then \
         echo "[uTLX] BUILD_UTLX=1 is not supported for GPU_ARCH=${GPU_ARCH}"; \
         exit 1; \
     fi
@@ -1189,9 +1184,6 @@ RUN cd /tmp/whl \
         ;; \
     esac
 
-# Triton patches for uTLX (UTLX_TRITON_PATCH, see the Triton step below).
-COPY --from=local_src /src/docker/patches/triton-ext-llvm-symbols-*.patch /tmp/triton-patches/
-
 # -----------------------
 # Install AMD's ROCm Triton, replacing the base image's. The local version is
 # part of the pin: `==3.7.0` alone would accept any revision the index later
@@ -1204,10 +1196,8 @@ COPY --from=local_src /src/docker/patches/triton-ext-llvm-symbols-*.patch /tmp/t
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 #
 # With BUILD_UTLX=1 (see the uTLX step below) the source build also gets plugin
-# support and the flavor's UTLX_TRITON_PATCH, so the build tree is written once;
-# gfx950-rocm1000 builds Triton from source only then. UTLX_TRITON_PATCH is a
-# file in docker/patches, applied uncommitted so the version keeps
-# TRITON_COMMIT's hash.
+# support, so the build tree is written once; gfx950-rocm1000 builds Triton from
+# source only then.
 RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
         case "${GPU_ARCH}" in \
           gfx950-rocm1000|gfx1250-rocm1000|gfx1250-rocm1010) \
@@ -1226,7 +1216,8 @@ RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
                      commit -q -am "Revert $rev" || exit 1; \
                done \
             && if [ "${BUILD_UTLX}" = "1" ]; then \
-                 git apply /tmp/triton-patches/${UTLX_TRITON_PATCH} \
+                 # ROCm/triton#983; uncommitted so the version keeps the hash torch pins.
+                 git cherry-pick --no-commit 89c3a46ba4908396313782443229eee3541a08f2 \
                  && export TRITON_EXT_ENABLED=ON; \
                fi \
             && pip install -r python/requirements.txt \
@@ -1247,12 +1238,12 @@ RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
 RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
-# uTLX (standalone TLX) for sglang's TLX kernels, built with BUILD_UTLX=1 on the
-# flavors whose stage sets UTLX_TRITON_PATCH (gfx950-rocm1000). The Triton step
-# above builds their Triton from source in /sgl-workspace/triton-custom with
-# plugin support (TRITON_EXT_ENABLED=ON) and their UTLX_TRITON_PATCH; this step
-# builds the uTLX plugin against it, from /sgl-workspace/triton-ext. Both stay
-# in the image, with Triton's build tree and LLVM, to rebuild in place.
+# uTLX (standalone TLX) for sglang's TLX kernels, built with BUILD_UTLX=1 on
+# gfx950-rocm1000. The Triton step above builds its Triton from source in
+# /sgl-workspace/triton-custom with plugin support (TRITON_EXT_ENABLED=ON) and
+# ROCm/triton#983; this step builds the uTLX plugin against it, from
+# /sgl-workspace/triton-ext. Both stay in the image, with Triton's build tree
+# and LLVM, to rebuild in place.
 #
 # Triton release/3.8 does not install the C++ headers uTLX compiles against,
 # so then they come from the build tree, staged outside the source tree
@@ -1277,8 +1268,9 @@ RUN if [ "${BUILD_UTLX}" = "1" ]; then \
         && unset CPATH LIBRARY_PATH \
         && export TRITON_WHEEL_DIR=/sgl-workspace/triton-custom/python/triton \
         && export LLVM_INSTALL_DIR="$(readlink -f /root/.triton/llvm/llvm-ubuntu-x64)" \
+        # UTLX_TRITON_ROCM selects uTLX's code for ROCm's Triton release/3.8.
         && pip install --no-build-isolation --no-deps \
-               --config-settings=cmake.define.UTLX_TRITON_ROCM=${UTLX_TRITON_ROCM} \
+               --config-settings=cmake.define.UTLX_TRITON_ROCM=ON \
                ./extensions/utlx \
         && mkdir -p /sgl-workspace/utlx \
         && cp -r extensions/utlx/examples extensions/utlx/test /sgl-workspace/utlx/ \
