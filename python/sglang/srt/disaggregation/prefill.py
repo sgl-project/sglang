@@ -693,6 +693,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -809,6 +810,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # A result wait takes new work only with continuous input polling.
             should_ingest_requests = (
@@ -976,6 +978,9 @@ class SchedulerDisaggregationPrefillMixin:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if (record := result.kv_weight_version_record) is not None:
+            record.finalize(tracker=self.kv_weight_version_tracker)
+            result.kv_weight_version_record = None
 
         logprob_pt = 0
         aborted_reqs: List[Req] = []
