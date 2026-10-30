@@ -79,7 +79,14 @@ jobs:
         KUBECONFIG: /root/.cache/.cache/kb.yaml
         KUBECTL: /root/.cache/.cache/kubectl
         NAMESPACE: sgl-project
+        # KUBE_JOB_TAG (the matrix test_config_name) disambiguates parallel
+        # matrix jobs of one run: the "Clear resources" wait loop greps pods
+        # by the K8s job name prefix and would otherwise find (and delete)
+        # each other's pods. Volcano rejects K8s names longer than 63 chars,
+        # so every step derives JOB_PREFIX with a 10-char hash of the tag
+        # instead of the full name (the full name measured 84 chars; a 10-char digest leaves headroom for longer run_ids).
         KUBE_JOB_NAME: ascend-${{ github.run_id }}
+        KUBE_JOB_TAG: ${{ inputs.test_config_name }}
         SGLANG_IS_IN_CI: true
         ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
         SGLANG_USE_MODELSCOPE: true
@@ -101,19 +108,23 @@ jobs:
       - name: Prepare code for testing
         run: |
           # copy source code to shared-disk
-          # Append run_id to isolate concurrent runs sharing the same PVC.
+          # Append run_id AND the matrix test_config_name to isolate
+          # concurrent runs AND parallel matrix jobs sharing the same PVC:
+          # with only run_id, two parallel jobs of the same run race their
+          # rm -rf / cp -r on the identical directory ("Directory not empty").
           current_path=$(pwd)
-          target_path=/root/.cache/tests/sglang-${{ github.run_id }}
+          target_path=/root/.cache/tests/sglang-${{ github.run_id }}-${{ inputs.test_config_name }}
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
 
       - name: Clear resources
         run: |
+          JOB_PREFIX="${KUBE_JOB_NAME}-$(echo "${KUBE_JOB_TAG}" | tr '_:' '--' | md5sum | cut -c1-10)"
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
 
-          pod_name_prefix="${KUBE_JOB_NAME}-"
+          pod_name_prefix="${JOB_PREFIX}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
           while true; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
@@ -130,8 +141,10 @@ jobs:
         timeout-minutes: 300
         run: |
           # sglang_source_relative_path is shared-disk path
-          # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
-          sglang_source_relative_path=tests/sglang-${{ github.run_id }}
+          # Must match the "Prepare code for testing" target_path above:
+          # run_id + test_config_name isolate concurrent runs and parallel
+          # matrix jobs on the shared PVC.
+          sglang_source_relative_path=tests/sglang-${{ github.run_id }}-${{ inputs.test_config_name }}
           sglang_source_path=/root/.cache/${sglang_source_relative_path}
           echo "Source code path: ${sglang_source_path}"
 
@@ -183,6 +196,7 @@ jobs:
 
           transformers_version="${{ inputs.transformers_version }}"
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
+          JOB_PREFIX="${KUBE_JOB_NAME}-$(echo "${KUBE_JOB_TAG}" | tr '_:' '--' | md5sum | cut -c1-10)"
           CMD="python3 -u run_npu_e2e_test.py \
             --env ci \
             --image ${{ inputs.image }} \
@@ -191,7 +205,7 @@ jobs:
             --test-case ${test_case} \
             --kube-name-space ${NAMESPACE} \
             --kube-job-type ${kube_job_type} \
-            --kube-job-name-prefix ${KUBE_JOB_NAME} \
+            --kube-job-name-prefix ${JOB_PREFIX} \
             --run-id ${{ github.run_id }}"
 
           if [ "$prefill_decode_deployment" = "separation" ];then
@@ -233,11 +247,12 @@ jobs:
       - name: Post process
         if: always()
         run: |
+          JOB_PREFIX="${KUBE_JOB_NAME}-$(echo "${KUBE_JOB_TAG}" | tr '_:' '--' | md5sum | cut -c1-10)"
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
-          kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
+          kubectl get pods -n $NAMESPACE | grep $JOB_PREFIX || true
           kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
 
-          pod_name_prefix="${KUBE_JOB_NAME}-"
+          pod_name_prefix="${JOB_PREFIX}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
           while true; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
@@ -250,4 +265,4 @@ jobs:
             fi
           done
           # Cleanup the run-scoped source code directory on the shared PVC.
-          rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true
+          rm -rf /root/.cache/tests/sglang-${{ github.run_id }}-${{ inputs.test_config_name }} || true
