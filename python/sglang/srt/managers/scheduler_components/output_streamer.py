@@ -381,6 +381,8 @@ class SchedulerOutputStreamer:
 
         embeddings = []
         request_stats = []
+        tensor_embeddings = []
+        has_tensor_embeddings = False
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -388,7 +390,13 @@ class SchedulerOutputStreamer:
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
+                if isinstance(req.embedding, torch.Tensor):
+                    embeddings.append([])
+                    tensor_embeddings.append(req.embedding)
+                    has_tensor_embeddings = True
+                else:
+                    embeddings.append(req.embedding)
+                    tensor_embeddings.append(None)
                 request_stats.append(self.build_request_stats(req))
 
                 phs = req.pooled_hidden_state
@@ -428,6 +436,9 @@ class SchedulerOutputStreamer:
                 request_stats=request_stats,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                tensor_embeddings=(
+                    tensor_embeddings if has_tensor_embeddings else None
+                ),
                 pooled_hidden_states=stacked_phs,
             )
         )

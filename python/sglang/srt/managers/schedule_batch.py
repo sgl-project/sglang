@@ -1200,6 +1200,7 @@ class Req(ReqDllmMixin):
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
@@ -1561,6 +1562,7 @@ class Req(ReqDllmMixin):
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+        self.encoding_format = encoding_format
 
         # Beam search overlay: leader and internal members share one BeamGroup.
         self.beam_group = None
