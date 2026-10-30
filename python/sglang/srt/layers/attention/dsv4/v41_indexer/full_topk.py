@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.deep_select import (
     is_deep_select_supported,
     topk_page_transform,
 )
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -33,6 +34,8 @@ from .types import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    from .scoring import DeepGEMMPrefillData
+
 
 class FullTopKIndexer:
     def __init__(
@@ -42,10 +45,12 @@ class FullTopKIndexer:
         req_to_token: torch.Tensor,
         use_deep_gemm_prefill: bool,
         use_deep_gemm_decode: bool,
+        use_prefill_lite_topk: bool = False,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_prefill_lite_topk = use_prefill_lite_topk
         self.use_deep_gemm_decode = use_deep_gemm_decode
         self.use_deep_select_decode = (
             not use_deep_gemm_decode and is_deep_select_supported()
@@ -68,11 +73,43 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
-        )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        out = inputs.out_raw_indices[: data.num_rows]
+        # NOTE: only faster when score length is long enough
+        if self.use_prefill_lite_topk and max(data.lens_per_request) >= 24576:
+            self._prefill_lite_topk(inputs, data, out)
+        else:
+            kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                inputs.layer_id, data.k_slots
+            )
+            dense_prefill_topk(data, kv, out=out)
         data.write_page_indices(inputs)
+
+    def _prefill_lite_topk(
+        self,
+        inputs: PrefillInputs,
+        data: DeepGEMMPrefillData,
+        out: torch.Tensor,
+    ) -> None:
+        """Request-local compressed positions into ``out`` from the fp4 indexer + bf16 top-k."""
+        # The indexer's scale tensor map needs a multiple of 4 keys: pad with slot 0, past every row's range.
+        slots = data.k_slots
+        pad = -slots.shape[0] % 4
+        if pad:
+            slots = torch.cat([slots, slots[:1].expand(pad)])
+        kv_fp4, kv_sf = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+            inputs.layer_id, slots
+        )
+        fp4_indexer_topk(
+            data.q_fp4,
+            data.q_sf,
+            data.weights.to(torch.bfloat16),
+            kv_fp4,
+            kv_sf,
+            data.request_starts,
+            data.request_starts + data.compress_lens,
+            out.shape[1],
+            out=out,
+        )
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:
         requests = prefill_requests(

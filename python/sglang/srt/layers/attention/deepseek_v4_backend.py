@@ -1291,15 +1291,16 @@ class DeepseekV4AttnBackend(
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
         )
+        self.index_topk = getattr(cfg, "index_topk", DEFAULT_INDEX_TOPK)
         self.full_topk_indexer = make_full_topk_indexer(
-            token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            index_heads=int(cfg.index_n_heads),
+            index_topk=self.index_topk,
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
-        )
 
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
