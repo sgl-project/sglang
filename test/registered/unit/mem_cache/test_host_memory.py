@@ -212,6 +212,14 @@ class TestHostMemory(unittest.TestCase):
                             self.available(allow_cgroup_fallback=True), 5000
                         )
 
+    def test_namespaced_parent_membership_uses_mount_root(self):
+        self.configure(
+            "/../../../step_extern/user/task_0", mount_root="/.."
+        )
+        self.memory("", 300, 1000)
+        with self.assertLogs(host_memory.logger, level="WARNING"):
+            self.assertEqual(self.available(), 700)
+
     def test_missing_counters_for_known_limit_requires_explicit_sizing(self):
         for name in ("memory.current", "memory.stat"):
             with self.subTest(name=name):
