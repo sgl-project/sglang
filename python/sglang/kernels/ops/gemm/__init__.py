@@ -296,7 +296,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -587,5 +587,13 @@ register_kernel(
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
     )
 )

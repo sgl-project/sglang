@@ -54,6 +54,8 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
@@ -72,6 +74,7 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.selection_cuda_graph import TrieSelectionGraphCache
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -109,8 +112,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
+    # Loaded from model_config.beam_trie_config in __post_init__.
+    trie_constraint: Optional[BeamTrieConstraint] = None
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+    _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
+
+    def __post_init__(self) -> None:
+        config = self.model_config.beam_trie_config
+        if config is not None:
+            self.trie_constraint = BeamTrieConstraint.load(
+                config, self.req_to_token_pool.device
+            )
 
     def _storage(self):
         """Where member rows and their token ids are taken and given back."""
@@ -176,7 +189,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search does not support min_new_tokens yet."
         if user_params.n > beam_width:
             return f"n ({user_params.n}) cannot exceed beam_width ({beam_width})."
-        if 2 * beam_width > self.model_config.vocab_size:
+        if (
+            self.trie_constraint is None
+            and 2 * beam_width > self.model_config.vocab_size
+        ):
             return f"beam_width ({beam_width}) is too large for the vocabulary."
         if beam_width > self.req_to_token_pool.size:
             return (
@@ -201,16 +217,55 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"Beam search needs at least 1 generated token within the "
                 f"context budget (prompt_len={prompt_len}, max_req_len={self.max_req_len})."
             )
-
+        required_kv_slots = (
+            prompt_len
+            + beam_width * max(max_new_tokens - 1, 0)
+            + self.token_to_kv_pool_allocator.page_size
+        )
+        if required_kv_slots >= self.token_to_kv_pool_allocator.size:
+            return (
+                f"beam_width ({beam_width}) with prompt length {prompt_len} and "
+                f"max_new_tokens {max_new_tokens} needs up to {required_kv_slots} "
+                f"KV slots, but the pool holds only "
+                f"{self.token_to_kv_pool_allocator.size}."
+            )
+        stop_token_ids = self._collect_stop_token_ids(req, user_params)
+        if self.trie_constraint is not None:
+            config = self.trie_constraint.config
+            if max_new_tokens != config.num_codebooks:
+                return (
+                    "Trie-conditioned beam output requires max_new_tokens == "
+                    f"{config.num_codebooks}; got {max_new_tokens}."
+                )
+            expandable_capacity = min(self.trie_constraint.level_cardinalities[1:])
+            if beam_width > expandable_capacity:
+                return (
+                    f"beam_width ({beam_width}) exceeds the trie frontier "
+                    f"capacity ({expandable_capacity})."
+                )
+            if any(
+                config.token_start <= token < config.token_end
+                for token in stop_token_ids
+            ):
+                return (
+                    "Trie-conditioned beam output does not support stop tokens "
+                    "inside the configured SID codebooks."
+                )
         group = BeamGroup(
             beam_width=beam_width,
-            stop_token_ids=self._collect_stop_token_ids(req, user_params),
+            stop_token_ids=stop_token_ids,
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
-            # Frontier state lives on device: selection consumes device top-2k
-            # tensors in place; only k-sized results ever reach the host.
+            # Frontier state lives on device; only k-sized results reach the host.
             device=self.req_to_token_pool.device,
+            device_history=self.trie_constraint is not None,
         )
+        if self.trie_constraint is not None:
+            group.trie_prefix_codes = torch.empty(
+                (1, 0),
+                dtype=torch.int64,
+                device=self.req_to_token_pool.device,
+            )
         group.leader = req
         group.prompt_len = prompt_len
 
@@ -305,8 +360,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
-        top_logprobs, top_tokens = _rows_topk_logprobs(
-            [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
+        top_logprobs, top_tokens = self._group_topk_logprobs(
+            group,
+            [logits_output.beam.leader_logits[pos : pos + 1]],
+            self._capture_normalizers(
+                logits_output.beam,
+                leader_slice=slice(pos, pos + 1),
+            ),
         )
         final = group.next_step_is_final()
         next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
@@ -340,7 +400,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             f"admission gate (get_num_allocatable_reqs) must reserve them."
         )
         device = self.req_to_token_pool.device
-        member_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+        member_rows_cpu = torch.tensor(
+            rows, dtype=torch.int64, pin_memory=torch.device(device).type == "cuda"
+        )
+        member_rows = member_rows_cpu.to(device, non_blocking=True)
         alias_members_prompt_kv(
             self.req_to_token_pool.req_to_token,
             member_rows,
@@ -348,10 +411,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group.prompt_len,
         )
         group.member_rows = member_rows
-        group.member_rows_cpu = torch.tensor(rows, dtype=torch.int64)
+        group.member_rows_cpu = member_rows_cpu
         leader_row = torch.tensor(
-            [leader.kv.req_pool_idx], dtype=torch.int64, device=device
-        )
+            [leader.kv.req_pool_idx],
+            dtype=torch.int64,
+            pin_memory=torch.device(device).type == "cuda",
+        ).to(device, non_blocking=True)
         group.all_rows = torch.cat([leader_row, member_rows])
 
     def select_and_relay_decode(
@@ -367,16 +432,34 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
-            top_logprobs, top_tokens = _rows_topk_logprobs(
-                [
-                    capture.leader_logits[gi : gi + 1],
-                    capture.tail_logits[entry.start : entry.end],
-                ],
-                group.num_candidates,
+            pieces = [
+                capture.leader_logits[gi : gi + 1],
+                capture.tail_logits[entry.start : entry.end],
+            ]
+            normalizers = self._capture_normalizers(
+                capture,
+                leader_slice=slice(gi, gi + 1),
+                tail_slice=slice(entry.start, entry.end),
             )
-            next_tokens, parent_idx = self._select_group(
-                group, top_logprobs, top_tokens, batch.forward_iter
-            )
+            selected = None
+            if envs.SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH.get():
+                from sglang.srt.beam_search.selection_cuda_graph import (
+                    TrieSelectionGraphCache,
+                )
+
+                if self._trie_selection_graph_cache is None:
+                    self._trie_selection_graph_cache = TrieSelectionGraphCache()
+                selected = self._trie_selection_graph_cache.select(
+                    self, group, pieces, normalizers, batch.forward_iter
+                )
+            if selected is None:
+                top_logprobs, top_tokens = self._group_topk_logprobs(
+                    group, pieces, normalizers
+                )
+                selected = self._select_group(
+                    group, top_logprobs, top_tokens, batch.forward_iter
+                )
+            next_tokens, parent_idx = selected
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
@@ -425,9 +508,56 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             top_tokens,
             group.stop_token_ids,
             k,
+            num_output_candidates=(
+                k if self.trie_constraint is not None else group.num_candidates
+            ),
         )
         group.advance_frontier(sel, tick)
+        if self.trie_constraint is not None:
+            group.trie_prefix_codes = self.trie_constraint.advance_prefixes(
+                group.trie_prefix_codes,
+                sel.parent_idx,
+                sel.next_tokens,
+                group.num_generated - 1,
+            )
         return sel.next_tokens[:k], sel.parent_idx[:k]
+
+    @staticmethod
+    def _capture_normalizers(
+        capture,
+        *,
+        leader_slice: slice,
+        tail_slice: Optional[slice] = None,
+    ):
+        if capture.leader_normalizer is None:
+            return None
+        normalizers = [capture.leader_normalizer[leader_slice]]
+        if tail_slice is not None:
+            assert capture.tail_normalizer is not None
+            normalizers.append(capture.tail_normalizer[tail_slice])
+        return normalizers
+
+    def _group_topk_logprobs(
+        self,
+        group: BeamGroup,
+        pieces: Sequence[torch.Tensor],
+        normalizers=None,
+    ):
+        if self.trie_constraint is None:
+            return _rows_topk_logprobs(pieces, group.num_candidates)
+        config = self.trie_constraint.config
+        if (
+            group.num_generated >= config.num_codebooks
+            and pieces[0].shape[1] != config.codebook_size
+        ):
+            return _rows_topk_logprobs(pieces, group.num_candidates)
+        return self.trie_constraint.topk_logprobs(
+            pieces,
+            group.trie_prefix_codes,
+            min(group.num_generated, config.num_codebooks - 1),
+            group.beam_width,
+            normalizers,
+        )
 
     def _apply_survivors(
         self,
