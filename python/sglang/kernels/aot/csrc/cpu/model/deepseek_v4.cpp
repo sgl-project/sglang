@@ -130,8 +130,7 @@ sqrtsoftplus_topk_cpu(const at::Tensor& logits, const std::optional<at::Tensor>&
   CHECK_INPUT(logits);
   TORCH_CHECK(logits.dim() == 2 && topk > 0 && topk <= logits.size(1), "Invalid router shape/top-k");
   auto logits_float = logits.to(at::kFloat);
-  auto softplus =
-      at::where(logits_float > 20.f, logits_float, at::log1p(at::exp(logits_float)));
+  auto softplus = at::where(logits_float > 20.f, logits_float, at::log1p(at::exp(logits_float)));
   auto scores = softplus.sqrt();
   auto choices = scores;
   if (bias.has_value()) {

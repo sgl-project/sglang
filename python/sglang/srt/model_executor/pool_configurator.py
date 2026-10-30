@@ -59,16 +59,17 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
+    is_cpu,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
-    is_cpu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
 
 @dataclass
 class MemoryPoolConfig:

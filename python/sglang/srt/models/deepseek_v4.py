@@ -168,11 +168,11 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
+    _is_cpu,
     _is_cuda,
     _is_hip,
     _is_npu,
     _is_xpu,
-    _is_cpu,
 )
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
