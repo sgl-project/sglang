@@ -968,7 +968,7 @@ def test_fp8_transfer_preserves_bytes_and_blocking_semantics(non_blocking):
 
 
 @pytest.fixture
-def fp8_checkpoint(tmp_path):
+def checkpoint(tmp_path):
     checkpoint = SimpleNamespace(path=tmp_path / "model.safetensors")
     checkpoint.config = NomasVAEConfig(
         arch_config=NomasVAEArchConfig(
@@ -1035,9 +1035,8 @@ def fp8_checkpoint(tmp_path):
 
 
 @pytest.mark.parametrize("direct", [False, True])
-def test_complete_checkpoint_load_and_offload_dtype_roundtrip(fp8_checkpoint, direct):
+def test_complete_checkpoint_load_and_offload_dtype_roundtrip(checkpoint, direct):
     """Meta assignment must retain FP8/FP32 and ignore only the unused encoder."""
-    checkpoint = fp8_checkpoint
     model = checkpoint.load(direct)
     model.bfloat16().to("cpu")
     state = model.state_dict()
@@ -1049,9 +1048,8 @@ def test_complete_checkpoint_load_and_offload_dtype_roundtrip(fp8_checkpoint, di
     assert sum(isinstance(m, NomasFP8Linear) for m in model.modules()) == 5
 
 
-def test_rejects_missing_scale_and_invalid_scale_values(fp8_checkpoint):
+def test_rejects_missing_scale_and_invalid_scale_values(checkpoint):
     """Partial or corrupt serialized blocks must fail before inference."""
-    checkpoint = fp8_checkpoint
     name = checkpoint.sources[0].removesuffix(".weight") + ".fp8_scale"
     scale = checkpoint.state.pop(name)
     save_file(checkpoint.state, checkpoint.path, metadata=checkpoint.metadata)
@@ -1064,32 +1062,29 @@ def test_rejects_missing_scale_and_invalid_scale_values(fp8_checkpoint):
 
 
 @pytest.mark.parametrize("direct", [False, True])
-def test_bf16_checkpoint_ignores_encoder_but_keeps_decoder_strict(
-    fp8_checkpoint, direct
-):
+def test_bf16_checkpoint_ignores_encoder_but_keeps_decoder_strict(checkpoint, direct):
     """Encoder filtering also applies to ordinary and direct BF16 loads."""
-    checkpoint = fp8_checkpoint
     original = dict(checkpoint.original.state_dict())
     original["encoder.project_in.conv.conv.bias"] = torch.zeros(
         32, dtype=torch.bfloat16
     )
     checkpoint.metadata = {}
-    checkpoint.state = dict(original)
+    checkpoint.state = original
     model = checkpoint.load(direct)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, original[name], rtol=0, atol=0)
-    del checkpoint.state["decoder.layers.0.attn.k_proj.weight"]
+    key = "decoder.layers.0.attn.k_proj.weight"
+    weight = checkpoint.state.pop(key)
     with pytest.raises((RuntimeError, ValueError), match="[Mm]issing"):
         checkpoint.load(direct)
-    checkpoint.state = dict(original)
+    checkpoint.state[key] = weight
     checkpoint.state["decoder.unknown.weight"] = torch.zeros(1, dtype=torch.bfloat16)
     with pytest.raises((RuntimeError, ValueError), match="[Uu]nexpected"):
         checkpoint.load(direct)
 
 
-def test_rejects_incomplete_manifest(fp8_checkpoint):
+def test_rejects_incomplete_manifest(checkpoint):
     """A self-consistent partial manifest must not silently leave BF16 projections."""
-    checkpoint = fp8_checkpoint
     checkpoint.metadata["quantized_source_keys"] = json.dumps(checkpoint.sources[:-1])
     checkpoint.metadata["quantized_layers"] = "4"
     name = checkpoint.sources[-1].removesuffix(".weight")
@@ -1098,9 +1093,8 @@ def test_rejects_incomplete_manifest(fp8_checkpoint):
         checkpoint.load()
 
 
-def test_rejects_missing_decoder_parameters(fp8_checkpoint):
+def test_rejects_missing_decoder_parameters(checkpoint):
     """Ignoring the unused encoder must not weaken decoder completeness checks."""
-    checkpoint = fp8_checkpoint
     del checkpoint.state["decoder.layers.0.attn.k_proj.weight"]
     with pytest.raises(ValueError, match="missing tensors"):
         checkpoint.load()
@@ -1226,7 +1220,9 @@ def test_int8_rejects_non_bf16_input(int8_layer):
         int8_layer(torch.zeros(1, 130))
 
 
-def test_parallel_weight_loaders_preserve_group_scales():
+@pytest.mark.parametrize("cls", [ColumnParallelLinear, RowParallelLinear])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_parallel_weight_loaders_preserve_group_scales(cls, rank):
     """Row TP shards scales along groups; column TP shards along outputs."""
     weight = (torch.arange(4 * 256).reshape(4, 256) % 255 - 127).to(torch.int8)
     scales = torch.arange(1, 9, dtype=torch.float32).reshape(4, 2) * 0.01003
@@ -1236,40 +1232,39 @@ def test_parallel_weight_loaders_preserve_group_scales():
         .bfloat16()
     )
     inputs = torch.ones(3, 256, dtype=torch.bfloat16)
-    for cls in (ColumnParallelLinear, RowParallelLinear):
-        for rank in (0, 1):
-            kwargs = (
-                {"gather_output": False}
-                if cls is ColumnParallelLinear
-                else {"input_is_parallel": True, "reduce_results": False}
-            )
-            layer = cls(
-                256,
-                4,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=NomasInt8Config({"projection": [4, 256]}),
-                prefix="projection",
-                tp_group=SimpleNamespace(world_size=2, rank_in_group=rank),
-                **kwargs,
-            )
-            layer.weight_loader(layer.weight, weight)
-            layer.weight_loader(layer.weight_scale, scales)
-            if cls is ColumnParallelLinear:
-                x, w = inputs, full[rank * 2 : (rank + 1) * 2]
-                expected_scales = scales[rank * 2 : (rank + 1) * 2]
-            else:
-                x, w = (
-                    inputs[:, rank * 128 : (rank + 1) * 128],
-                    full[:, rank * 128 : (rank + 1) * 128],
-                )
-                expected_scales = scales[:, rank : rank + 1]
-            torch.testing.assert_close(
-                layer.weight_scale, expected_scales, rtol=0, atol=0
-            )
-            torch.testing.assert_close(
-                layer(x)[0], torch.nn.functional.linear(x, w), rtol=0, atol=0
-            )
+    kwargs = (
+        {"gather_output": False}
+        if cls is ColumnParallelLinear
+        else {"input_is_parallel": True, "reduce_results": False}
+    )
+    layer = cls(
+        256,
+        4,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=NomasInt8Config({"projection": [4, 256]}),
+        prefix="projection",
+        tp_group=SimpleNamespace(world_size=2, rank_in_group=rank),
+        **kwargs,
+    )
+    layer.weight_loader(layer.weight, weight)
+    layer.weight_loader(layer.weight_scale, scales)
+    if cls is ColumnParallelLinear:
+        x, w = inputs, full[rank * 2 : (rank + 1) * 2]
+        expected_scales = scales[rank * 2 : (rank + 1) * 2]
+    else:
+        x, w = (
+            inputs[:, rank * 128 : (rank + 1) * 128],
+            full[:, rank * 128 : (rank + 1) * 128],
+        )
+        expected_scales = scales[:, rank : rank + 1]
+    torch.testing.assert_close(layer.weight_scale, expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(
+        layer(x)[0], torch.nn.functional.linear(x, w), rtol=0, atol=0
+    )
+
+
+def test_int8_row_parallel_rejects_unaligned_input_shards():
     with pytest.raises(ValueError, match="align to 128"):
         RowParallelLinear(
             130,
