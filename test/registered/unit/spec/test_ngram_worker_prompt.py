@@ -19,10 +19,20 @@ from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 class TestNgramWorkerPrompt(CustomTestCase):
     def test_multimodal_padding_stays_out_of_corpus(self):
-        for overlap, grammar in [(False, False), (True, False), (True, True)]:
+        for overlap, grammar, prompt_sam_budget in [
+            (False, False, 0),
+            (True, False, 0),
+            (True, True, 0),
+            (False, False, 2),
+            (True, False, 2),
+            (True, True, 2),
+        ]:
             for multimodal in [False, True]:
                 with self.subTest(
-                    overlap=overlap, grammar=grammar, multimodal=multimodal
+                    overlap=overlap,
+                    grammar=grammar,
+                    multimodal=multimodal,
+                    prompt_sam_budget=prompt_sam_budget,
                 ):
                     worker = object.__new__(NGRAMWorker)
                     worker.enable_overlap = overlap
@@ -34,6 +44,7 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         max_bfs_breadth=1,
                         draft_token_num=4,
                         capacity=1000,
+                        prompt_sam_budget=prompt_sam_budget,
                     )
                     req = Req("prompt", "", array("q", [1, 2, 3]), SamplingParams())
                     if multimodal:
@@ -58,6 +69,7 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         max_bfs_breadth=1,
                         draft_token_num=4,
                         capacity=1000,
+                        prompt_sam_budget=prompt_sam_budget,
                     )
                     reference.batch_put([sequence])
                     reference.synchronize()
@@ -67,7 +79,10 @@ class TestNgramWorkerPrompt(CustomTestCase):
                             [1, 2, 3] + list(req.output_ids) + ([5] if splice else [])
                         )
                         expected = reference.batch_get(
-                            [req.rid], [tokens], [len(tokens)]
+                            [req.rid],
+                            [tokens],
+                            [len(tokens)],
+                            prompt_ids=[req.origin_input_ids_unpadded],
                         )
                         actual = worker._prepare_draft_tokens(batch)
                         np.testing.assert_array_equal(actual[0], expected[0])

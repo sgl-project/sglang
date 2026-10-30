@@ -52,6 +52,7 @@ def get_ngram_corpus_cls():
             match_type: str,
             external_sam_budget: int = 0,
             external_corpus_max_tokens: int = 10000000,
+            prompt_sam_budget: int = 0,
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:
@@ -67,6 +68,7 @@ def get_ngram_corpus_cls():
                 mt,
                 external_sam_budget,
                 external_corpus_max_tokens,
+                prompt_sam_budget,
             )
             self._draft_token_num = draft_token_num
 
@@ -96,6 +98,13 @@ def get_ngram_corpus_cls():
             return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(
                 np.int64
             )
+
+        def set_prompt(self, state_id: int, prompt_ids: Sequence[int]) -> None:
+            tokens_t = torch.tensor(list(prompt_ids), dtype=torch.int32)
+            self.set_prompt_sam(state_id, tokens_t)  # type: ignore
+
+        def set_filter(self, state_id: int, corpus_ids: List[str]) -> None:
+            self.set_corpus_filter(state_id, "\n".join(corpus_ids))  # type: ignore
 
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)

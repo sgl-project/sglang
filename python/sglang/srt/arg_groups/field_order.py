@@ -556,5 +556,7 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",
+    "speculative_ngram_prompt_sam_budget",
+    "speculative_ngram_prompt_sam_max_tokens",
 )
 # fmt: on
