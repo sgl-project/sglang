@@ -703,7 +703,10 @@ def run_aisbench(
         # 12 rows collapse to 4 there): watch "Total data num" in the log -
         # 12 means no dedup, fewer means collapse. The sh wrapper is fed
         # dataset-type gsm8k; the file layout is a plain gsm8k jsonl.
-        dataset_file = "/tmp/datasets/gsm8k_shared_prefix.jsonl"
+        # GSM8KDataset hardcodes test.jsonl inside the config's path dir -
+        # run_aisbench.sh feeds it the file's parent dir (it also drops the
+        # gsm8k train.jsonl next to it), so the name must match exactly.
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix/test.jsonl"
         if not os.path.exists(dataset_file):
             generate_gsm8k_shared_prefix_dataset(
                 model_path=model_path,
