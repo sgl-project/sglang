@@ -19,12 +19,17 @@
 
 """Inference-only OLMoE model compatible with HuggingFace weights."""
 
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import (
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -152,8 +157,11 @@ class OlmoeAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        # The norms span all heads, while q and k are sharded across TP ranks.
+        self.tp_size = tp_size
+        self.tp_rank = get_parallel().tp_rank
         self.q_norm = RMSNorm(hidden_size, eps=1e-5)
-        self.k_norm = RMSNorm(hidden_size, eps=1e-5)
+        self.k_norm = RMSNorm(self.total_num_kv_heads * self.head_dim, eps=1e-5)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -180,6 +188,19 @@ class OlmoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
+        q, k = self.q_norm(q.contiguous()), self.k_norm(k.contiguous())
+        if self.tp_size > 1:
+            splitter = partial(split_tensor_along_last_dim, num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+        return q, k
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -188,7 +209,7 @@ class OlmoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.q_norm(q.contiguous()), self.k_norm(k.contiguous())
+        q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
