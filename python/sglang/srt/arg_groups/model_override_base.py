@@ -328,6 +328,8 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
                 return "fa4"
             return "trtllm_mha"
         elif get_platform().is_hip:
+            if get_platform().is_rdna:
+                return "triton"
             return "aiter"
         elif is_mps():
             return "torch_native"
