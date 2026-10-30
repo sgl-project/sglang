@@ -19,7 +19,8 @@ standing in for the VMM allocations:
     a malformed message, and that received fds are close-on-exec
   - a client that breaks off a fetch part-way, followed by a healthy one
   - a loaded model keeps its transport mappings after the model object goes
-  - --weight-cache-transport selection and the non-fatal daemon-exit watcher
+  - --weight-cache-transport selection, the daemon liveness check (a zombie
+    counts as exited) and the non-fatal daemon-exit watcher
 """
 
 import argparse
@@ -135,6 +136,30 @@ def _memfds(contents):
 def _close_all(fds):
     for fd in fds:
         os.close(fd)
+
+
+_HAS_PROCFS = os.path.exists("/proc/self/stat")
+
+
+def _proc_state(pid) -> str:
+    """The state letter of ``pid`` in /proc/<pid>/stat."""
+    with open(f"/proc/{pid}/stat", "rb") as f:
+        return f.read().rsplit(b")", 1)[1].split()[0].decode()
+
+
+@contextlib.contextmanager
+def _zombie_process():
+    """Yield the PID of a child that has exited but is not reaped yet."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while _proc_state(child.pid) != "Z":
+            if time.monotonic() > deadline:
+                raise AssertionError(f"process {child.pid} did not become a zombie")
+            time.sleep(0.01)
+        yield child.pid
+    finally:
+        child.wait()
 
 
 class _FdExportDriver:
@@ -1208,12 +1233,60 @@ class TestLoadedModelKeepsItsMappings(CustomTestCase):
             ipc_loader._LOADED_MODEL_TRANSPORTS.remove(backend)
 
 
-class TestDaemonExitWatcher(CustomTestCase):
-    def test_non_fatal_watcher_only_logs(self):
-        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+@unittest.skipUnless(_HAS_PROCFS, "needs Linux procfs")
+class TestDaemonAlive(CustomTestCase):
+    """The watchdog's liveness check, shared by both transports."""
 
+    def test_a_running_process_is_alive(self):
+        self.assertTrue(ipc_loader._daemon_alive(os.getpid()))
+
+    def test_a_missing_pid_has_exited(self):
         child = subprocess.Popen([sys.executable, "-c", "pass"])
         child.wait()
+        self.assertFalse(ipc_loader._daemon_alive(child.pid))
+
+    def test_a_zombie_has_exited(self):
+        # Signal 0 still succeeds on a zombie, which nothing may ever reap.
+        with _zombie_process() as pid:
+            os.kill(pid, 0)
+            self.assertFalse(ipc_loader._daemon_alive(pid))
+
+    def test_the_state_follows_the_last_parenthesis(self):
+        # The command name may contain spaces and parentheses, even ") Z (".
+        for proc_stat, alive in (
+            (b"4242 (a) Z (b) S 1 4242 4242 0", True),
+            (b"4242 (x (y) z) Z 1 4242 4242 0", False),
+        ):
+            with (
+                self.subTest(proc_stat=proc_stat),
+                mock.patch.object(ipc_loader.os, "kill"),
+                mock.patch.object(
+                    ipc_loader, "open", mock.mock_open(read_data=proc_stat), create=True
+                ),
+            ):
+                self.assertEqual(ipc_loader._daemon_alive(4242), alive)
+
+    def test_a_vanished_stat_file_means_exited_unless_there_is_no_procfs(self):
+        for has_procfs, alive in ((True, False), (False, True)):
+            with (
+                self.subTest(has_procfs=has_procfs),
+                mock.patch.object(ipc_loader.os, "kill"),
+                mock.patch.object(
+                    ipc_loader, "open", side_effect=FileNotFoundError, create=True
+                ),
+                mock.patch.object(
+                    ipc_loader.os.path, "exists", return_value=has_procfs
+                ),
+            ):
+                self.assertEqual(ipc_loader._daemon_alive(4242), alive)
+
+
+class TestDaemonExitWatcher(CustomTestCase):
+    def _run_non_fatal_watcher(self, daemon_pid):
+        """Run the non-fatal watcher on ``daemon_pid`` until it stops; returns
+        its log output and every os.kill call made meanwhile."""
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+
         loader = ipc_loader.WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             weight_cache_mode="client",
@@ -1223,16 +1296,27 @@ class TestDaemonExitWatcher(CustomTestCase):
             mock.patch.object(ipc_loader.os, "kill", wraps=os.kill) as kill,
             self.assertLogs(ipc_loader.logger, "WARNING") as logs,
         ):
-            loader._start_daemon_liveness_watchdog(child.pid, fatal=False)
+            loader._start_daemon_liveness_watchdog(daemon_pid, fatal=False)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline and any(
                 t.name == "weight-cache-daemon-watchdog" for t in threading.enumerate()
             ):
                 time.sleep(0.01)
-        self.assertIn("serving continues", "\n".join(logs.output))
-        self.assertNotIn(
-            mock.call(os.getpid(), ipc_loader.signal.SIGKILL), kill.call_args_list
-        )
+        return "\n".join(logs.output), kill.call_args_list
+
+    def test_non_fatal_watcher_only_logs(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        output, kills = self._run_non_fatal_watcher(child.pid)
+        self.assertIn("serving continues", output)
+        self.assertNotIn(mock.call(os.getpid(), ipc_loader.signal.SIGKILL), kills)
+
+    @unittest.skipUnless(_HAS_PROCFS, "needs Linux procfs")
+    def test_non_fatal_watcher_notices_a_zombie_daemon(self):
+        with _zombie_process() as daemon_pid:
+            output, kills = self._run_non_fatal_watcher(daemon_pid)
+        self.assertIn("serving continues", output)
+        self.assertNotIn(mock.call(os.getpid(), ipc_loader.signal.SIGKILL), kills)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,34 @@ logger = logging.getLogger(__name__)
 # How often the client polls the serving daemon's PID for liveness.
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
+
+def _daemon_alive(pid: int) -> bool:
+    """Whether the daemon process ``pid`` is still running.
+
+    A zombie counts as exited. Where nothing reaps exited processes (e.g. a
+    container whose PID 1 does not), a killed daemon stays a zombie, and
+    signal 0 still succeeds on a zombie.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            proc_stat = f.read()
+    except FileNotFoundError:
+        # Exited since the signal check, unless there is no procfs at all.
+        return not os.path.exists("/proc/self/stat")
+    except OSError:
+        return True  # unreadable: the signal check decides
+    # The command name is in parentheses and may contain spaces and
+    # parentheses itself, so the state is the first field after the last ")".
+    fields = proc_stat[proc_stat.rfind(b")") + 1 :].split()
+    return not fields or fields[0] not in (b"Z", b"X")
+
+
 # Transport backends of loaded models, kept until the process exits. For
 # vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
 # sit on non-owning storages and a parameter or view can outlive the model
@@ -235,15 +263,6 @@ class WeightCacheModelLoader(BaseModelLoader):
                 "daemon-liveness watchdog. A daemon crash will not be detected."
             )
             return
-
-        def _daemon_alive(pid: int) -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True  # exists but owned by another user
-            return True
 
         def _watch() -> None:
             while True:
