@@ -99,8 +99,9 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         self.assertIs(plan.batch_to_run, running)
         self.assertIs(plan.running_batch, running)
 
-        # Step N+1: one row finished; the batch comes back as last_batch.
+        # Step N+1: processing finished one row; the batch comes back as last_batch.
         running.reqs[0].finished.return_value = True
+        s.running_reqs.leave_finished()
         plan = s.get_next_batch_to_run(
             running_batch=plan.running_batch, last_batch=plan.batch_to_run
         )

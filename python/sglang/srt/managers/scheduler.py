@@ -4088,7 +4088,6 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        self.running_reqs.leave_finished()
         self._maybe_check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
@@ -5289,6 +5288,8 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+        # Running requests finish only in a step's processing.
+        self.running_reqs.leave_finished()
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()

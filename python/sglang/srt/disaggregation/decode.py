@@ -3538,8 +3538,6 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
-        # update_running_batch below filters the finished rows out.
-        self.running_reqs.leave_finished()
         self._maybe_check_running_reqs(running_batch, last_batch=None)
 
         # Schedule decode batch

@@ -199,8 +199,9 @@ class TestRunningReqsHooks(CustomTestCase):
             plan = step(plan.running_batch, plan.batch_to_run)
             self.assertIs(plan.batch_to_run, prefill)
             self.assertEqual(list(s.running_reqs), [a, b])
-            # The prefill result finishes a; the next step leaves it.
+            # Processing the prefill result finishes a, and it leaves.
             _finish(a)
+            s.running_reqs.leave_finished()
             plan = step(plan.running_batch, plan.batch_to_run)
             self.assertEqual(list(s.running_reqs), [b])
 
