@@ -214,13 +214,23 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
         # A request's first semantic keyframe is its geometry anchor, including
         # the single-image last-frame-only signature [-1]. Only the second image in the
         # two-keyframe FL extension is a follower and receives cover-crop.
+        if plan.shape.get("keyframe_fit") == "source_crop":
+            # Pika crops in source space before resampling, for both anchors.
+            ratio = canvas_w / canvas_h
+            crop_w, crop_h = image.size
+            if crop_w / crop_h > ratio:
+                crop_w = max(1, min(crop_w, round(crop_h * ratio)))
+            else:
+                crop_h = max(1, min(crop_h, round(crop_w / ratio)))
+            left, top = (image.width - crop_w) // 2, (image.height - crop_h) // 2
+            image = image.crop((left, top, left + crop_w, top + crop_h))
         prepared_image = (
             minimax_h3_stretch_keyframe_canvas(
                 image,
                 target_width=canvas_w,
                 target_height=canvas_h,
             )
-            if keyframe_index == 0
+            if keyframe_index == 0 or plan.shape.get("keyframe_fit") == "source_crop"
             else minimax_h3_prepare_keyframe_canvas(
                 image,
                 target_width=canvas_w,

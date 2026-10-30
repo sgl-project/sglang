@@ -217,6 +217,13 @@ def test_sibling_hf_cache_repo_does_not_match_overlay(monkeypatch, tmp_path):
         "Lightricks/LTX-2.3",
         spec,
     )
+    # Partition selection must materialize a canonical source-cache directory
+    # before looking for native subfolders, which do not exist in source packs.
+    assert model_overlay.is_model_overlay(str(exact))
+    assert not model_overlay.is_model_overlay(str(sibling))
+    named_local = tmp_path / "LTX-2.3"
+    named_local.mkdir()
+    assert not model_overlay.is_model_overlay(str(named_local))
 
 
 def test_direct_overlay_repo_downloads_full_metadata_not_just_manifest(tmp_path):

@@ -61,6 +61,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
+    PikaH3FlexPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
@@ -124,4 +125,5 @@ __all__ = [
     "LingBotVideoMoEPipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
+    "PikaH3FlexPipelineConfig",
 ]

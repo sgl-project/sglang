@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
+    _minimax_h3_renoise_target_rows_,
     _minimax_h3_update_target_rows_,
     minimax_h3_denoise_loop,
 )
@@ -441,3 +442,105 @@ def test_grouped_outputs_share_prompt_refinement():
 
     assert model.calls == 1
     assert first.static_kwargs["prompt_embeds"] is second.static_kwargs["prompt_embeds"]
+
+
+@pytest.mark.parametrize("mode", ["t2va", "fl2va", "ref2va"])
+def test_renoise_trajectory_keeps_anchors_and_uses_independent_request_noise(mode):
+    branch = _branch(mode)
+    video = torch.full((branch.img_pos.numel(), 96), 0.25)
+    audio = torch.full((branch.audio_pos.numel(), 32), -0.5)
+    video_anchor = video[: branch.video_target_start].clone()
+    audio_anchor = audio[: branch.audio_target_start].clone()
+    knots = (1000, 750, 500, 250, 100, 40)
+    video_sigmas = minimax_h3_time_shift_sigmas(
+        num_steps=6, shift_scale=12.0, dmd_steps=knots
+    )
+    audio_sigmas = minimax_h3_time_shift_sigmas(
+        num_steps=6, shift_scale=3.0, dmd_steps=knots
+    )
+
+    def sample(seed):
+        expected_video, expected_audio = video.clone(), audio.clone()
+        oracle_generator = torch.Generator().manual_seed(seed + 1)
+        generator = torch.Generator().manual_seed(seed + 1)
+        forwards = []
+
+        def model_forward(_model, kwargs, step):
+            forwards.append(step)
+            return (
+                torch.full_like(video[branch.video_target_slice], 0.125 * (step + 1)),
+                torch.full_like(audio, -0.25 * (step + 1)),
+            )
+
+        def on_step(step, actual_video, actual_audio):
+            for expected, target_slice, sigmas, velocity in (
+                (expected_video, branch.video_target_slice, video_sigmas, 0.125),
+                (expected_audio, branch.audio_target_slice, audio_sigmas, -0.25),
+            ):
+                target = expected[target_slice]
+                clean = target + sigmas[step] * (velocity * (step + 1))
+                if step == 5:
+                    target.copy_(clean)
+                else:
+                    noise = torch.randn(target.shape, generator=oracle_generator)
+                    target.copy_(
+                        (1 - sigmas[step + 1]) * clean + sigmas[step + 1] * noise
+                    )
+            torch.testing.assert_close(actual_video, expected_video)
+            torch.testing.assert_close(actual_audio, expected_audio)
+            torch.testing.assert_close(
+                actual_video[: branch.video_target_start], video_anchor
+            )
+            torch.testing.assert_close(
+                actual_audio[: branch.audio_target_start], audio_anchor
+            )
+
+        result = minimax_h3_denoise_loop(
+            model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+            model_forward=model_forward,
+            positive=branch,
+            initial_video_rows=video,
+            initial_audio_rows=audio,
+            keyframe_cond_rows=video_anchor if video_anchor.numel() else None,
+            audio_ref_rows=audio_anchor if audio_anchor.numel() else None,
+            sigmas_video=video_sigmas,
+            sigmas_audio=audio_sigmas,
+            device=torch.device("cpu"),
+            renoise_generator=generator,
+            on_step=on_step,
+        )
+        assert forwards == list(range(6))
+        # A terminal clean prediction must not consume another noise draw.
+        assert torch.equal(generator.get_state(), oracle_generator.get_state())
+        return result
+
+    first = sample(42)
+    torch.randn(100)
+    repeated = sample(42)
+    changed = sample(43)
+    for left, right, other in zip(first, repeated, changed):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+        assert not torch.equal(left, other)
+
+
+def test_renoise_update_reuses_buffers_and_matches_gaussian_moments():
+    state = torch.full((4096, 32), 2.0)
+    velocity = torch.full_like(state, -0.5)
+    scratch = torch.empty_like(state)
+    noise = torch.empty_like(state)
+    pointers = [tensor.data_ptr() for tensor in (state, velocity, scratch, noise)]
+    generator = torch.Generator().manual_seed(43)
+    _minimax_h3_renoise_target_rows_(
+        state,
+        velocity,
+        sigma=torch.tensor(0.75),
+        sigma_next=0.4,
+        denoised_scratch=scratch,
+        noise_buffer=noise,
+        generator=generator,
+    )
+    assert state.mean().item() == pytest.approx(0.6 * (2.0 - 0.75 * 0.5), abs=0.005)
+    assert state.var().item() == pytest.approx(0.4**2, abs=0.003)
+    assert pointers == [
+        tensor.data_ptr() for tensor in (state, velocity, scratch, noise)
+    ]

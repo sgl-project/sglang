@@ -9,10 +9,26 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
     PikaH3FlexPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.minimax_h3 import PikaH3FlexSamplingParams
-from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_non_diffusers_pipeline_name,
+    has_registered_diffusion_model_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VideoGenerationsRequest,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
+    LoRAFormat,
+    detect_lora_format_from_state_dict,
+    normalize_lora_state_dict,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
+    prequeue,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _minimax_h3_renoise_target_rows_,
@@ -23,6 +39,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3ReleaseMetadata,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+    minimax_h3_resolve_plan,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
@@ -92,15 +111,23 @@ def test_renoise_update() -> None:
     _minimax_h3_renoise_target_rows_(
         out,
         velocity,
-        sigma=0.8,
+        sigma=torch.tensor(0.8),
         sigma_next=0.5,
+        denoised_scratch=torch.empty_like(out),
+        noise_buffer=torch.empty_like(out),
         generator=torch.Generator().manual_seed(7),
     )
     noise = torch.randn(4, 8, generator=torch.Generator().manual_seed(7))
     torch.testing.assert_close(out, 0.5 * denoised + 0.5 * noise)
     last = state.clone()
     _minimax_h3_renoise_target_rows_(
-        last, velocity, sigma=0.8, sigma_next=0.0, generator=torch.Generator()
+        last,
+        velocity,
+        sigma=torch.tensor(0.8),
+        sigma_next=0.0,
+        denoised_scratch=torch.empty_like(last),
+        noise_buffer=torch.empty_like(last),
+        generator=torch.Generator(),
     )
     torch.testing.assert_close(last, denoised)
 
@@ -179,3 +206,259 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
     explicit = server_args(True, "merge")
     PikaH3FlexPipelineConfig().validate_server_args(explicit)
     assert explicit.lora_merge_mode == "merge"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "other-org/Pika-H3-Flex",
+        "Pika-Labs/Pika-H3-Flex-extra",
+        "/cache/models--pika-labs--pika-h3-flex-extra/snapshots/abc",
+    ],
+)
+def test_pika_registry_requires_the_exact_repo_id(path):
+    assert get_non_diffusers_pipeline_name(path) is None
+    assert not has_registered_diffusion_model_path(path)
+
+
+def test_pika_registry_accepts_the_pinned_cache_directory():
+    path = "/cache/models--Pika-Labs--Pika-H3-Flex/snapshots/abc"
+    assert get_non_diffusers_pipeline_name(path) == "PikaH3FlexPipeline"
+    assert get_model_info(path).pipeline_config_cls is PikaH3FlexPipelineConfig
+
+
+@pytest.mark.parametrize(
+    "block", ["transformer_blocks.49", "token_refiner.refiner_blocks.1"]
+)
+def test_pika_peft_format_preserves_tensor_pairs(block):
+    weights = {
+        f"{block}.attn.to_q.lora_A.default.weight": torch.randn(128, 8),
+        f"{block}.attn.to_q.lora_B.default.weight": torch.randn(16, 128),
+    }
+    assert detect_lora_format_from_state_dict(weights) is LoRAFormat.STANDARD
+    normalized = normalize_lora_state_dict(weights)
+    assert set(normalized) == {key.replace(".default.", ".") for key in weights}
+    for name, weight in weights.items():
+        assert normalized[name.replace(".default.", ".")] is weight
+
+
+def _pika_request(task="t2va", conditions=None, **target):
+    return PikaH3FlexSamplingParams(
+        prompt="a waterfall",
+        task=task,
+        conditions=conditions or [],
+        seed=42,
+        target={
+            "short_edge": 480,
+            "aspect_ratio": "16:9",
+            "duration_seconds": 5,
+            **target,
+        },
+    )
+
+
+def _plan(params):
+    return minimax_h3_resolve_plan(
+        params.build_request_extra()["minimax_h3_canonical_request"]
+    )
+
+
+@pytest.mark.parametrize(
+    "tier,aspect,expected",
+    [
+        (480, "21:9", (960, 416)),
+        (480, "16:9", (832, 480)),
+        (480, "3:2", (704, 480)),
+        (480, "4:3", (640, 480)),
+        (480, "5:4", (608, 480)),
+        (480, "1:1", (480, 480)),
+        (480, "4:5", (480, 608)),
+        (480, "3:4", (480, 640)),
+        (480, "2:3", (480, 704)),
+        (480, "9:16", (480, 832)),
+        (480, "9:21", (416, 960)),
+        (768, "21:9", (1536, 672)),
+        (768, "16:9", (1344, 768)),
+        (768, "3:2", (1152, 768)),
+        (768, "4:3", (1024, 768)),
+        (768, "5:4", (960, 768)),
+        (768, "1:1", (768, 768)),
+        (768, "4:5", (768, 960)),
+        (768, "3:4", (768, 1024)),
+        (768, "2:3", (768, 1152)),
+        (768, "9:16", (768, 1344)),
+        (768, "9:21", (672, 1536)),
+    ],
+)
+def test_released_buckets_and_aligned_time(tier, aspect, expected):
+    plan = _plan(_pika_request(short_edge=tier, aspect_ratio=aspect))
+    assert (plan.shape["width"], plan.shape["height"]) == expected
+    warmup_target = PikaH3FlexSamplingParams._synthetic_warmup_target(
+        SimpleNamespace(width=expected[0], height=expected[1]),
+        SimpleNamespace(
+            warmup_resolutions=[f"{expected[0]}x{expected[1]}"], warmup_num_frames=None
+        ),
+    )
+    assert warmup_target == {
+        "short_edge": tier,
+        "aspect_ratio": aspect,
+        "duration_seconds": 5.0,
+    }
+    assert _plan(_pika_request(**warmup_target)).shape == plan.shape
+    assert plan.shape["frame_count"] == 124
+    assert plan.shape["fps"] == 24
+    assert _plan(_pika_request(duration_seconds=15)).shape["frame_count"] == 362
+
+
+@pytest.mark.parametrize(
+    "task,indices", [("i2va", [0]), ("l2va", [-1]), ("fl2va", [0, -1])]
+)
+def test_offline_and_http_aliases_share_keyframe_plan(task, indices):
+    conditions = [
+        dict(type="image", role="keyframe", uri=f"frame{i}.png", frame_index=i)
+        for i in indices
+    ]
+    params = _pika_request(task, conditions)
+    request = VideoGenerationsRequest(
+        prompt=params.prompt, task=task, conditions=conditions, target=params.target
+    )
+    kwargs = PikaH3FlexSamplingParams.lower_video_request_kwargs(
+        request, {"prompt": params.prompt}
+    )
+    http_plan = _plan(PikaH3FlexSamplingParams(**kwargs))
+    plan = _plan(params)
+    assert http_plan.shape == plan.shape
+    assert plan.task == "fl2va"
+    assert plan.condition_mask["semantic_frame_indices"] == indices
+    assert plan.shape["keyframe_fit"] == "source_crop"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"short_edge": 512},
+        {"short_edge": 1088},
+        {"aspect_ratio": "auto"},
+        {"aspect_ratio": "2:1"},
+    ],
+)
+def test_pika_rejects_unreleased_geometry(target):
+    with pytest.raises(ValueError, match="Pika H3 Flex target"):
+        _plan(_pika_request(**target))
+
+
+@pytest.mark.parametrize("kind,count", [("image", 10), ("video", 4), ("audio", 4)])
+def test_reference_count_limits(kind, count):
+    refs = [dict(type=kind, role="reference", uri=f"ref{i}") for i in range(count)]
+    with pytest.raises(ValueError, match="reference limits"):
+        _plan(_pika_request("ref2va", refs))
+
+
+def test_reference_requires_visual_input():
+    with pytest.raises(ValueError, match="at least one image or video"):
+        _plan(
+            _pika_request(
+                "ref2va", [dict(type="audio", role="reference", uri="audio.wav")]
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "durations,accepted",
+    [([2, 13], True), ([1.99], False), ([15.01], False), ([8, 8], False)],
+)
+def test_reference_duration_limits_before_queue(monkeypatch, durations, accepted):
+    refs = [
+        dict(type="video", role="reference", uri=f"ref{i}.mp4")
+        for i in range(len(durations))
+    ]
+    params = _pika_request("ref2va", refs)
+    batch = SimpleNamespace(sampling_params=params, extra=params.build_request_extra())
+
+    def probe(batch, uri, *, condition_type, condition_index):
+        return {
+            "display_width": 1920,
+            "display_height": 1080,
+            "video_duration_seconds": durations[condition_index],
+        }
+
+    monkeypatch.setattr(prequeue, "minimax_h3_probe_material", probe)
+    if accepted:
+        plan = prequeue.minimax_h3_prepare_for_queue(batch)
+        assert (plan.shape["width"], plan.shape["height"]) == (832, 480)
+        shapes = batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY]
+        assert (shapes[0]["width"], shapes[0]["height"]) == (832, 480)
+    else:
+        with pytest.raises(ValueError, match="Pika H3 Flex"):
+            prequeue.minimax_h3_prepare_for_queue(batch)
+
+
+@pytest.mark.parametrize("tier,expected", [(480, (1536, 1024)), (768, (3072, 2048))])
+def test_reference_image_uses_output_tier(monkeypatch, tier, expected):
+    params = _pika_request(
+        "ref2va", [dict(type="image", role="reference", uri="ref.png")], short_edge=tier
+    )
+    batch = SimpleNamespace(sampling_params=params, extra=params.build_request_extra())
+    monkeypatch.setattr(
+        prequeue,
+        "minimax_h3_probe_material",
+        lambda *a, **kw: {"display_width": 600, "display_height": 400},
+    )
+    prequeue.minimax_h3_prepare_for_queue(batch)
+    shape = batch.extra[prequeue.MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY][0]
+    assert (shape["width"], shape["height"]) == expected
+
+
+def test_explicit_pika_id_resolves_a_neutral_directory():
+    assert (
+        get_model_info(
+            "/models/materialized-pack", model_id="Pika-H3-Flex"
+        ).pipeline_config_cls
+        is PikaH3FlexPipelineConfig
+    )
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_condition_noise_preserves_clean_cache_and_release_precision(task):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _apply_condition_noise_aug,
+    )
+
+    clean = torch.tensor([[1.003, -0.12345, 7.997]], dtype=torch.float32)
+    original = clean.clone()
+    audio = torch.tensor([[0.123456]], dtype=torch.float32)
+    sampling = PikaH3FlexSamplingParams(prompt="a lake", seed=42)
+    contexts = [
+        SimpleNamespace(
+            cond_rows=clean,
+            audio_cond_rows=audio,
+            plan=SimpleNamespace(task=task, seed=42),
+        )
+        for _ in range(2)
+    ]
+    for context in contexts:
+        _apply_condition_noise_aug(
+            context, sampling=sampling, imgvid_noise_aug=0.999, audio_noise_aug=1.0
+        )
+    noise = torch.randn(clean.shape, generator=torch.Generator().manual_seed(42 + 7919))
+    rounded = clean.bfloat16().float() if task == "fl2va" else clean
+    torch.testing.assert_close(contexts[0].cond_rows, 0.999 * rounded + 0.001 * noise)
+    assert torch.equal(contexts[0].cond_rows, contexts[1].cond_rows)
+    assert torch.equal(clean, original)
+    assert contexts[0].audio_cond_rows is audio
+
+
+def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch):
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
+    monkeypatch.setattr(
+        MiniMaxH3PipelineConfig, "validate_server_args", lambda *_: None
+    )
+    args = SimpleNamespace(
+        model_variant="fl2va",
+        lora_path=None,
+        lora_alpha=None,
+        lora_scale=1.0,
+        is_arg_explicitly_set=lambda _: False,
+    )
+    with pytest.raises(ValueError, match="disable SGLANG_CACHE_DIT_ENABLED"):
+        PikaH3FlexPipelineConfig().validate_server_args(args)

@@ -208,6 +208,10 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
 }
 
 
+# These releases must not match unrelated repositories with the same short name.
+EXACT_MATCH_HF_MODEL_IDS = SENSENOVA_U1_MODEL_IDS | {"pika-labs/pika-h3-flex"}
+
+
 def register_configs(
     sampling_param_cls: Any,
     pipeline_config_cls: Type[PipelineConfig],
@@ -384,7 +388,7 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
-        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+        if registered_model_hf_id.lower() in EXACT_MATCH_HF_MODEL_IDS:
             continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
@@ -408,6 +412,11 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
+        if (
+            registered_model_hf_id.lower() in EXACT_MATCH_HF_MODEL_IDS
+            and cache_repo_fragment not in normalized_model_path.split("/")
+        ):
+            continue
         if cache_repo_fragment in normalized_model_path:
             logger.debug(
                 "Resolved HuggingFace cache path '%s' to registered model '%s'.",
@@ -427,6 +436,13 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
     )
 
 
+def _match_registered_model_id(model_id: str) -> Optional[str]:
+    for registered_hf_id in sorted(_MODEL_HF_PATH_TO_NAME, key=len, reverse=True):
+        if get_model_short_name(registered_hf_id).lower() == model_id.lower():
+            return registered_hf_id
+    return None
+
+
 @lru_cache(maxsize=1)
 def _get_config_info(
     model_path: str, model_id: Optional[str] = None
@@ -439,13 +455,12 @@ def _get_config_info(
 
     # 0. Explicit model_id override: match by short name
     if model_id is not None:
-        model_id_lower = model_id.lower()
-        for registered_hf_id in all_model_hf_paths:
-            if get_model_short_name(registered_hf_id).lower() == model_id_lower:
-                logger.debug(
-                    f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
-                )
-                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+        registered_hf_id = _match_registered_model_id(model_id)
+        if registered_hf_id is not None:
+            logger.debug(
+                f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
+            )
+            return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
         logger.warning(
             f"--model-id '{model_id}' did not match any registered model; "
             "falling back to automatic detection."
@@ -638,6 +653,9 @@ def get_model_info(
 
     # 2. Get pipeline class - check non-diffusers models first
     pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_class_name is None and model_id is not None:
+        explicit_model_path = _match_registered_model_id(model_id) or model_id
+        pipeline_class_name = get_non_diffusers_pipeline_name(explicit_model_path)
     if pipeline_class_name:
         # Known non-diffusers model, skip model_index.json download
         logger.debug(
@@ -734,6 +752,14 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
         pattern = pattern.lower()
+        if pattern in EXACT_MATCH_HF_MODEL_IDS:
+            if (
+                normalized_model_path == pattern
+                or f"models--{pattern.replace('/', '--')}"
+                in normalized_model_path.split("/")
+            ):
+                return pipeline_name
+            continue
         if "/" not in pattern and pattern in normalized_model_path:
             return pipeline_name
         if "/" in pattern and (

@@ -73,6 +73,10 @@ class MiniMaxH3VideoModelAdapter:
     )
     supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
 
+    def __init__(self, *, request_policy: str | None = None) -> None:
+        if request_policy == "pika_h3_flex":
+            self.supported_tasks = self.supported_tasks | {"i2va", "l2va"}
+
     def validate_task_gate(self, task: Any, *, provided: bool) -> None:
         if not provided or task is None:
             raise ValueError(
@@ -85,7 +89,7 @@ class MiniMaxH3VideoModelAdapter:
         if task not in self.supported_tasks:
             raise ValueError(
                 f"unsupported MiniMax H3 task {task!r}; supported tasks: "
-                "fl2va, ref2va, t2va"
+                f"{sorted(self.supported_tasks)}"
             )
 
     @staticmethod

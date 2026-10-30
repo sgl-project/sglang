@@ -829,12 +829,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
             renoise_generator = None
             if self.stochastic_sampling:
-                # The plan carries this output's own seed after output expansion
-                # (42 is latent preparation's default). A device generator keeps
-                # the stream independent of the CPU generators seeded with the
-                # same value for the initial and condition noise.
+                # Pika's per-step stream uses S+1, separate from initial noise
+                # (S) and conditioning augmentation (S+7919).
                 seed = 42 if ctx.plan.seed is None else int(ctx.plan.seed)
-                renoise_generator = torch.Generator(device=device).manual_seed(seed)
+                renoise_generator = torch.Generator(device=device).manual_seed(seed + 1)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -1247,6 +1245,33 @@ def _apply_condition_noise_aug(
     audio_noise_aug: float,
 ) -> None:
     """Apply condition noise augmentation to cond rows."""
+
+    if getattr(sampling, "request_policy", None) == "pika_h3_flex":
+        # The released FL2VA adapter quantizes clean latent conditioning before
+        # FP32 augmentation. Ref2VA preserves the clean FP32 latent values.
+        if ctx.cond_rows is not None:
+            clean = ctx.cond_rows
+            if ctx.plan.task != "ref2va":
+                clean = clean.to(torch.bfloat16)
+            clean = clean.float()
+            seed = ctx.plan.seed
+            if seed is None:
+                seed = (
+                    sampling.seed[0]
+                    if isinstance(sampling.seed, list)
+                    else sampling.seed
+                )
+            generator = torch.Generator(device=clean.device).manual_seed(
+                int(seed) + 7919
+            )
+            noise = torch.randn(
+                clean.shape,
+                device=clean.device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            ctx.cond_rows = imgvid_noise_aug * clean + (1.0 - imgvid_noise_aug) * noise
+        return
 
     noise_visual_conditions = (
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0

@@ -124,23 +124,25 @@ def _minimax_h3_renoise_target_rows_(
     state: torch.Tensor,
     velocity: torch.Tensor,
     *,
-    sigma: float,
+    sigma: torch.Tensor,
     sigma_next: float,
+    denoised_scratch: torch.Tensor,
+    noise_buffer: torch.Tensor,
     generator: torch.Generator,
 ) -> None:
-    """Few-step re-noising update, in place and in fp32.
+    """Predict x0 = x + sigma * v, then re-noise with reusable FP32 buffers.
 
-    ``x0 = x + sigma * v`` from the grid sigma, then
-    ``x_next = (1 - sigma_next) * x0 + sigma_next * noise`` with fresh noise.
-    The terminal ``sigma_next == 0`` returns ``x0`` and draws nothing.
+    The terminal sigma_next == 0 step returns x0 without drawing noise.
     """
-    state.add_(velocity, alpha=sigma)
+    torch.mul(sigma, velocity, out=denoised_scratch)
+    torch.add(state, denoised_scratch, out=denoised_scratch)
     if sigma_next == 0.0:
+        state.copy_(denoised_scratch)
         return
-    noise = torch.randn(
-        state.shape, generator=generator, device=state.device, dtype=torch.float32
-    )
-    state.mul_(1.0 - sigma_next).add_(noise, alpha=sigma_next)
+    noise_buffer.normal_(generator=generator)
+    torch.mul(denoised_scratch, 1.0 - sigma_next, out=state)
+    noise_buffer.mul_(sigma_next)
+    state.add_(noise_buffer)
 
 
 def _build_local_embedding_layout(
@@ -587,6 +589,16 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+    video_noise_buffer = (
+        torch.empty_like(video_denoised_scratch)
+        if renoise_generator is not None
+        else None
+    )
+    audio_noise_buffer = (
+        torch.empty_like(audio_denoised_scratch)
+        if renoise_generator is not None
+        else None
+    )
     if rollout_ctx is not None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
             minimax_h3_rollout_update_video_target,
@@ -659,8 +671,10 @@ def minimax_h3_denoise_loop(
                     _minimax_h3_renoise_target_rows_(
                         video_target,
                         mv_video_t,
-                        sigma=s_v,
+                        sigma=video_sigmas[step],
                         sigma_next=s_n_v,
+                        denoised_scratch=video_denoised_scratch,
+                        noise_buffer=video_noise_buffer,
                         generator=renoise_generator,
                     )
                 else:
@@ -679,8 +693,10 @@ def minimax_h3_denoise_loop(
                     _minimax_h3_renoise_target_rows_(
                         audio_target,
                         mv_audio_t,
-                        sigma=s_a,
+                        sigma=audio_sigmas[step],
                         sigma_next=sigmas_audio[step + 1],
+                        denoised_scratch=audio_denoised_scratch,
+                        noise_buffer=audio_noise_buffer,
                         generator=renoise_generator,
                     )
                 else:
