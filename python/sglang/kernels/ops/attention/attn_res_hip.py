@@ -15,12 +15,19 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported
+
 # _agg_kernel keeps a next_pow2(nvb) x next_pow2(H) fp32 tile in registers, and
 # that is the whole basis of its speed. Past this budget it spills and loses to
 # the 2-kernel Triton pipeline it replaces: measured at T=4 on MI355X,
 # next_pow2(nvb)=8 is 2.0x faster, 16 is 1.2x, 32 is 0.2x. K3 sits right at the
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
+# On gfx950, batches of at least STREAM_MIN_ROWS whose bank tile pads to 8 rows read
+# the bank two rows at a time instead (_agg_stream_kernel): many CTAs per CU then beat
+# one register-bound CTA. Measured on MI350X; at 4 rows the register tile still wins.
+STREAM_MIN_ROWS: int = 64
+STREAM_MIN_TILE_ROWS: int = 8
 
 
 @cache
@@ -133,6 +140,84 @@ def _agg_kernel(
     tl.store(out_ptr + t * stride_o + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _agg_stream_kernel(
+    prefix_ptr,  # [T, H]
+    addend_ptr,  # [T, H]; the pending residual, or prefix_ptr when not HAS_ADD
+    prefix_out_ptr,  # [T, H]; materialized prefix, written when HAS_ADD
+    bank_ptr,  # [T, NB, H]
+    cw_ptr,  # [H] fp32; score_norm weight * score_proj weight
+    ow_ptr,  # [H]; out RMSNorm weight, unread when not APPLY_OUT_NORM
+    out_ptr,  # [T, H]
+    score_eps,
+    out_eps,
+    nvb,
+    stride_pm,
+    stride_am,
+    stride_om,
+    stride_bm,
+    stride_bb,
+    stride_o,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    ROWS: tl.constexpr,
+    HAS_ADD: tl.constexpr,
+    WRITE_BANK: tl.constexpr,
+    APPLY_OUT_NORM: tl.constexpr,
+):
+    """_agg_kernel for prefill-sized batches: the bank is read ROWS rows at a time
+    (a runtime loop with an online softmax), so a CTA holds a bounded tile instead
+    of the whole bank and enough CTAs share a CU to stream at HBM bandwidth. Same
+    math as _agg_kernel; the running rescale rounds differently in the last ulp."""
+    t = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    row = tl.load(prefix_ptr + t * stride_pm + offs, mask=mask, other=0.0)
+    if HAS_ADD:
+        row = (
+            row.to(tl.float32)
+            + tl.load(addend_ptr + t * stride_am + offs, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        ).to(prefix_out_ptr.dtype.element_ty)
+        tl.store(prefix_out_ptr + t * stride_om + offs, row, mask=mask)
+    if WRITE_BANK:
+        tl.store(bank_ptr + t * stride_bm + nvb * stride_bb + offs, row, mask=mask)
+    acc = row.to(tl.float32)
+
+    cw = tl.load(cw_ptr + offs, mask=mask, other=0.0)
+    m = tl.sum(acc * cw) / tl.sqrt(tl.sum(acc * acc) / H + score_eps)
+    denom = 1.0
+    offs_r = tl.arange(0, ROWS)
+    for i in range(0, nvb, ROWS):
+        mask_r = (i + offs_r) < nvb
+        tile = tl.load(
+            bank_ptr
+            + t * stride_bm
+            + (i + offs_r)[:, None] * stride_bb
+            + offs[None, :],
+            mask=mask_r[:, None] & mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        score = tl.sum(tile * cw[None, :], axis=1) / tl.sqrt(
+            tl.sum(tile * tile, axis=1) / H + score_eps
+        )
+        m_new = tl.maximum(m, tl.max(tl.where(mask_r, score, -float("inf"))))
+        alpha = tl.exp(m - m_new)
+        w = tl.where(mask_r, tl.exp(score - m_new), 0.0)
+        denom = denom * alpha + tl.sum(w)
+        acc = acc * alpha + tl.sum(w[:, None] * tile, axis=0)
+        m = m_new
+    acc = acc / denom
+
+    if APPLY_OUT_NORM:
+        scale = 1.0 / tl.sqrt(tl.sum(acc * acc) / H + out_eps)
+        ow = tl.load(ow_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        acc = acc * scale * ow
+    tl.store(out_ptr + t * stride_o + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
 def attn_res_hip(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -185,28 +270,45 @@ def attn_res_hip(
     prefix_out_arg = prefix_out if has_add else prefix_sum
     ow_arg = ow if ow is not None else cw
 
-    _agg_kernel[(T,)](
-        prefix_sum,
-        addend_arg,
-        prefix_out_arg,
-        bank,
-        cw,
-        ow_arg,
-        out,
-        score_eps,
-        out_eps,
+    pointers = (prefix_sum, addend_arg, prefix_out_arg, bank, cw, ow_arg, out)
+    strides = (
         prefix_sum.stride(0),
         addend_arg.stride(0),
         prefix_out_arg.stride(0),
         bank.stride(0),
         bank.stride(1),
         out.stride(0),
+    )
+    flags = dict(
+        HAS_ADD=has_add, WRITE_BANK=write_prefix, APPLY_OUT_NORM=ow is not None
+    )
+    if (
+        T >= STREAM_MIN_ROWS
+        and triton.next_power_of_2(nvb) >= STREAM_MIN_TILE_ROWS
+        and is_gfx95_supported()
+    ):
+        _agg_stream_kernel[(T,)](
+            *pointers,
+            score_eps,
+            out_eps,
+            nvb,
+            *strides,
+            H=H,
+            BLOCK_H=triton.next_power_of_2(H),
+            ROWS=2,
+            **flags,
+            num_warps=4,
+        )
+        return
+    _agg_kernel[(T,)](
+        *pointers,
+        score_eps,
+        out_eps,
+        *strides,
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
         NVB=nvb,
         R_PAD=triton.next_power_of_2(nvb),
-        HAS_ADD=has_add,
-        WRITE_BANK=write_prefix,
-        APPLY_OUT_NORM=ow is not None,
+        **flags,
         num_warps=4,
     )
