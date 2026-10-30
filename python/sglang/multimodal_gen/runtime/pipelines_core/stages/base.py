@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     ReportingTqdm,
     get_progress_reporter,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import step_cancel_check
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -119,6 +120,7 @@ class PipelineStage(StageDedupMixin, ABC):
         # report even when the bar is hidden: the first rank of replica N>0 is
         # not world rank 0
         reporter = get_progress_reporter()
+        request_ids = []
         if (
             reporter is not None
             and batch is not None
@@ -126,16 +128,24 @@ class PipelineStage(StageDedupMixin, ABC):
             and not batch.is_warmup
         ):
             request_ids = batch.client_request_ids()
-            if request_ids:
-                return ReportingTqdm(
-                    iterable=iterable,
-                    total=total,
-                    disable=disable,
-                    reporter=reporter,
-                    request_ids=request_ids,
-                    progress_range=self._progress_range,
-                    **kwargs,
-                )
+        on_step = step_cancel_check(batch)
+        # the check is a collective, and only the main rank runs these stages
+        if on_step is not None and self.parallelism_type_for(batch) in (
+            StageParallelismType.MAIN_RANK_ONLY,
+            StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS,
+        ):
+            on_step = None
+        if request_ids or on_step is not None:
+            return ReportingTqdm(
+                iterable=iterable,
+                total=total,
+                disable=disable,
+                reporter=reporter if request_ids else None,
+                request_ids=request_ids,
+                progress_range=self._progress_range,
+                on_step=on_step,
+                **kwargs,
+            )
         return tqdm(iterable=iterable, total=total, disable=disable, **kwargs)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

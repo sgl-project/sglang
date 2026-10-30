@@ -234,9 +234,9 @@ def prepare_host_pool_config(
 
 
 def is_mla_pool(pool: Any) -> bool:
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 
-    return isinstance(pool, MLATokenToKVPool)
+    return isinstance(pool, MLAKVView)
 
 
 def _kv_row_signature(pool: Any, *, use_mla: bool) -> tuple:
