@@ -332,12 +332,16 @@ def issue_prefill_stats(
     issue the triplet on it. The caller joins the stream before the post reads
     the triplet.
 
-    The residual is not recorded on the stats stream. The post joins that stream
-    before it reads the residual, and the residual is released only after the
-    post, so any main-stream reuse of its memory is already ordered after the mix
-    GEMM. Recording it would instead hold each freed residual until the GPU
-    caught up with the CPU, which in a prefill forward is most of the layers:
-    an 8K chunk would keep about twenty 320 MiB residuals alive at once."""
+    The residual is not recorded on the stats stream. The caller must keep it
+    alive until the main stream has joined the stats stream: the read state holds
+    it, ``HcUpdate.post`` joins before it reads the residual, and the boundary
+    releases the residual only after the post. The caching allocator reuses a
+    freed block only for allocations on the stream that allocated it (the main
+    stream) until it returns the block to the driver, which synchronizes the
+    device, so every reuse is ordered after the mix GEMM. Recording the residual
+    would instead hold each freed residual until the GPU caught up with the CPU,
+    which in a prefill forward is most of the layers: an 8K chunk would keep about
+    twenty 320 MiB residuals alive at once."""
     fork_stats_stream(stats_stream)
     main_stream = torch.cuda.current_stream()
     with torch.cuda.stream(stats_stream):
