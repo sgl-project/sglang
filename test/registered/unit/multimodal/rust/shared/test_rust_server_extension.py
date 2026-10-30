@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
@@ -53,22 +54,37 @@ NO_EXTRAS = dict.fromkeys(
 
 def build_rust_frame_metadata_fixture() -> dict:
     """The headers `push_generation` and `push_abort` send for the weight-version,
-    media-count and decode-latency columns, and the `meta_info` keys Python's
-    TokenizerManager derives from the same values, with "launch" as the
-    server's weight version.
+    media-count, decode-latency and cached-token-split columns, and the
+    `meta_info` keys Python's TokenizerManager derives from the same values,
+    with "launch" as the server's weight version, plus the
+    `sglang:cached_tokens_total` increments by `cache_source` its metrics
+    collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
+    from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.io_struct import AbortReq
+    from sglang.srt.managers.scheduler_components.output_streamer import (
+        SchedulerOutputStreamer,
+    )
+    from sglang.srt.observability.metrics_collector import (
+        TokenizerMetricsCollector,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils.weight_versions import (
         WeightVersionSpan,
         add_weight_versions_to_meta_info,
     )
 
-    def meta_info(spans, completion_tokens, image=0, audio=0, video=0):
-        # TokenizerManager._handle_batch_output / _handle_abort_req.
+    def meta_info(
+        spans, completion_tokens, image=0, audio=0, video=0, *, cached=None, abort=False
+    ):
+        # TokenizerManager._handle_batch_output / _handle_abort_req; only the
+        # former reports the cached-token details.
         meta = {"weight_version": "launch"}
         if spans is not None:
             add_weight_versions_to_meta_info(meta, spans, completion_tokens)
+        if not abort:
+            meta["cached_tokens_details"] = cached
         for key, count in (
             ("image_tokens", image),
             ("audio_tokens", audio),
@@ -78,11 +94,19 @@ def build_rust_frame_metadata_fixture() -> dict:
                 meta[key] = count
         return meta
 
-    def push_generation(multimodal, decode_latencies, **columns):
+    def push_generation(
+        multimodal,
+        decode_latencies,
+        cached_tokens_split=None,
+        storage_backend=None,
+        **columns,
+    ):
         server = RustServer(Mock(), http_port=0)
         server._multimodal_enabled = multimodal
         payload = SimpleNamespace(**{**NO_EXTRAS, **columns})
-        server.push_generation(payload, decode_latencies)
+        server.push_generation(
+            payload, decode_latencies, cached_tokens_split, storage_backend
+        )
         header, data = server.server.push_decode_result_batch.call_args.args
         return {
             "header": header.hex(),
@@ -103,7 +127,8 @@ def build_rust_frame_metadata_fixture() -> dict:
         rids=["done", "running"],
         finished_reasons=[{"type": "length", "length": 3}, None],
         prompt_tokens=[5, 6],
-        output_ids=[array("q", [1, 2, 3]), array("q", [4])],
+        output_ids_flat=array("q", [1, 2, 3, 4]),
+        output_ids_offsets=[0, 3, 4],
         cached_tokens=[0, 0],
         reasoning_tokens=[0, 0],
         weight_versions=[swapped, None],
@@ -124,7 +149,8 @@ def build_rust_frame_metadata_fixture() -> dict:
         rids=["logprobs", "plain"],
         finished_reasons=[{"type": "length", "length": 2}, None],
         prompt_tokens=[3, 4],
-        output_ids=[array("q", [7, 8]), array("q", [9])],
+        output_ids_flat=array("q", [7, 8, 9]),
+        output_ids_offsets=[0, 2, 3],
         cached_tokens=[0, 0],
         reasoning_tokens=[0, 0],
         weight_versions=[single, None],
@@ -138,6 +164,113 @@ def build_rust_frame_metadata_fixture() -> dict:
         "logprobs": meta_info(single, 2),
         "plain": meta_info(None, 1),
     }
+
+    class HiCacheFile:
+        """Stands in for a storage backend, which the details name by type."""
+
+    def cache_batch(storage_attached, rows):
+        """A frame from a cache with a host tier and, when `storage_attached`,
+        a storage tier, whose `rows` map rid -> (cached_tokens, device, host,
+        storage)."""
+        with patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+            return_value=SimpleNamespace(
+                enable_metrics=False, enable_request_time_stats_logging=False
+            ),
+        ):
+            streamer = SchedulerOutputStreamer(
+                send_to_detokenizer=None,
+                tree_cache=SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        storage_backend=HiCacheFile() if storage_attached else None
+                    )
+                ),
+                server_args=SimpleNamespace(enable_lmcache=False),
+                is_generation=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
+                enable_hicache_storage=lambda: storage_attached,
+            )
+        reqs = {
+            rid: SimpleNamespace(
+                cached_tokens=cached,
+                cached_tokens_device=device,
+                cached_tokens_host=host,
+                cached_tokens_storage=storage,
+            )
+            for rid, (cached, device, host, storage) in rows.items()
+        }
+        rids = list(reqs)
+        frame = push_generation(
+            False,
+            {},
+            rids=rids,
+            finished_reasons=[{"type": "length", "length": 1}] * len(rids),
+            prompt_tokens=[16] * len(rids),
+            output_ids_flat=array("q", [1] * len(rids)),
+            output_ids_offsets=list(range(len(rids) + 1)),
+            cached_tokens=[req.cached_tokens for req in reqs.values()],
+            reasoning_tokens=[0] * len(rids),
+            weight_versions=None,
+            cached_tokens_split=[
+                (
+                    req.cached_tokens_device,
+                    req.cached_tokens_host,
+                    req.cached_tokens_storage,
+                )
+                for req in reqs.values()
+            ],
+            storage_backend=(
+                streamer._get_storage_backend_type() if storage_attached else None
+            ),
+        )
+        details = {
+            rid: streamer.get_cached_tokens_details(req) for rid, req in reqs.items()
+        }
+        frame["meta_info"] = {
+            rid: meta_info(None, 1, cached=cached) for rid, cached in details.items()
+        }
+        frame["cached_tokens_total"] = {
+            rid: cached_tokens_total(reqs[rid].cached_tokens, cached)
+            for rid, cached in details.items()
+        }
+        return frame
+
+    def cached_tokens_total(cached_tokens, details):
+        # TokenizerMetricsCollector.observe_one_finished_request's increments.
+        collector = Mock()
+        counts = {}
+        collector.cached_tokens_total.labels.side_effect = lambda **labels: Mock(
+            inc=lambda value: counts.__setitem__(labels["cache_source"], value)
+        )
+        TokenizerMetricsCollector.observe_one_finished_request(
+            collector, {}, 16, 1, cached_tokens, 0.0, False, details
+        )
+        return counts
+
+    host_tier = cache_batch(
+        False,
+        {
+            "miss": (0, 0, 0, 0),
+            "device": (4, 4, 0, 0),
+            "host": (6, 2, 4, 0),
+            # A PD decode server's storage hit, reported by prefill.
+            "storage": (5, 1, 1, 3),
+            # A hit the scheduler did not split, and one it split short.
+            "unsplit": (3, 0, 0, 0),
+            "short": (5, 4, 0, 0),
+        },
+    )
+    storage_tier = cache_batch(
+        True,
+        {
+            "miss": (0, 0, 0, 0),
+            "device": (4, 4, 0, 0),
+            "storage": (8, 2, 2, 4),
+            "unsplit": (2, 0, 0, 0),
+        },
+    )
     # The scheduler's spans run past the three tokens the client received.
     aborted = [
         WeightVersionSpan(version="old", start=0, end=2),
@@ -150,10 +283,12 @@ def build_rust_frame_metadata_fixture() -> dict:
     return {
         "batch": batch,
         "logprob_batch": logprob_batch,
+        "host_tier": host_tier,
+        "storage_tier": storage_tier,
         "abort": {
             "header": abort_header.hex(),
             "completion_tokens": 3,
-            "meta_info": meta_info(aborted, 3),
+            "meta_info": meta_info(aborted, 3, abort=True),
         },
     }
 
@@ -162,13 +297,15 @@ def generation_payload(rows: dict, **columns) -> SimpleNamespace:
     """A `push_generation` payload for `rows` (rid -> new output ids), every
     optional column unset unless `columns` sets it."""
     rids = list(rows)
+    output_ids_flat, output_ids_offsets = flatten_output_ids(rows.values())
     return SimpleNamespace(
         **{
             **NO_EXTRAS,
             "rids": rids,
             "finished_reasons": [None] * len(rids),
             "prompt_tokens": [1] * len(rids),
-            "output_ids": [array("q", ids) for ids in rows.values()],
+            "output_ids_flat": output_ids_flat,
+            "output_ids_offsets": output_ids_offsets,
             "cached_tokens": [0] * len(rids),
             "reasoning_tokens": [0] * len(rids),
             "weight_versions": None,
@@ -492,7 +629,7 @@ class TestRustServerExtension(CustomTestCase):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts
         and marked as outside the stream; without the Rust server it still
-        goes to the tokenizer socket."""
+        goes to the tokenizer socket, with the request's detokenizer state released."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
@@ -503,7 +640,9 @@ class TestRustServerExtension(CustomTestCase):
         )
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
-        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
+        scheduler = SimpleNamespace(
+            rust_server=server, ipc_channels=Mock(), output_streamer=Mock()
+        )
         Scheduler.send_abort_output(scheduler, abort, req)
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
@@ -514,12 +653,14 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertEqual(cols, [b""])
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req
         )
+        scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
     def test_customized_info_goes_out_as_python_responses_render_it(self):
         """The egress sends customized_info as the JSON Python's responses

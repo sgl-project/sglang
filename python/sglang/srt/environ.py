@@ -1388,6 +1388,7 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -2243,6 +2244,7 @@ class Envs:
     # KV-Canary and Token-Oracle (testing only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_ENABLE_INFO = EnvBool(False)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
     SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
@@ -2252,6 +2254,7 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_DETOKENIZER_SWAP_AT_OUTPUT = EnvInt(-1)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
@@ -2418,6 +2421,8 @@ def third_party_cache_defaults() -> Dict[str, str]:
         # default the burst is invisible to anyone warming, mounting or baking
         # SGLANG_CACHE_DIR, and gets paid again on every cold container.
         "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
+        "HUMMING_CACHE_DIR": os.path.join(base, "humming", "cache"),
+        "HUMMING_TMP_DIR": os.path.join(base, "humming", "tmp"),
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,
@@ -2434,6 +2439,7 @@ def redirect_third_party_caches():
     - FlashInfer was imported. It resolves its workspace at import time.
     - Inductor made its first ``cache_dir()`` call. That call setdefaults
       TORCHINDUCTOR_CACHE_DIR itself.
+    - Humming resolved its cache or temporary directory for the first time.
     """
     for key, value in third_party_cache_defaults().items():
         os.environ.setdefault(key, value)
