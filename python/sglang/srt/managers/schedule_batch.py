@@ -68,6 +68,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -349,8 +350,8 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
-# Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
-# containers intentionally decode as lists, matching msgpack's native model.
+# Any processor-owned value. Msgpack IPC pickles the ones it would not decode
+# back unchanged (tuples, dataclasses, transport proxies); see map_object_fields.
 MultimodalDataValue: TypeAlias = object
 
 
@@ -659,6 +660,40 @@ class MultimodalProcessorOutput(
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
         )
+
+    def map_object_fields(
+        self, transform: Callable[[list], list]
+    ) -> MultimodalProcessorOutput:
+        """Copy with transform applied to every item's object-typed values.
+
+        transform sees the values of all items in one list, in a fixed order,
+        and returning that list unchanged returns self.
+        """
+        values = [
+            value
+            for item in self.mm_items
+            for value in (
+                item.feature,
+                item.precomputed_embeddings,
+                *item.model_specific_data.values(),
+            )
+        ]
+        new_values = transform(values)
+        if new_values is values:
+            return self
+        new_values = iter(new_values)
+        mm_items = [
+            msgspec.structs.replace(
+                item,
+                feature=next(new_values),
+                precomputed_embeddings=next(new_values),
+                model_specific_data={
+                    key: next(new_values) for key in item.model_specific_data
+                },
+            )
+            for item in self.mm_items
+        ]
+        return msgspec.structs.replace(self, mm_items=mm_items)
 
     @staticmethod
     def build_padded_input_ids(input_ids, mm_items: List[MultimodalDataItem]):

@@ -71,7 +71,13 @@ from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
-from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
+from sglang.srt.utils.msgpack_utils import (
+    dec_hook,
+    enc_hook,
+    ext_hook,
+    pickle_unfaithful_values,
+    unpickle_values,
+)
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
@@ -1183,9 +1189,17 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
+        self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
+        self.positional_embed_overrides = wrap_object_fields_as_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
+        self.mm_inputs = unwrap_object_fields_from_pickle(self.mm_inputs)
+        self.positional_embed_overrides = unwrap_object_fields_from_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -1549,9 +1563,17 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
+        self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
+        self.positional_embed_overrides = wrap_object_fields_as_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
+        self.mm_inputs = unwrap_object_fields_from_pickle(self.mm_inputs)
+        self.positional_embed_overrides = unwrap_object_fields_from_pickle(
+            self.positional_embed_overrides
+        )
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -1577,7 +1599,10 @@ TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
 TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
 HiddenStateChunk = List[Optional[Union[float, List[float]]]]
-OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
+# A row is one vector for return_hidden_states="last", else a list of chunks.
+OutputHiddenStates = Optional[
+    List[Optional[List[Optional[Union[float, HiddenStateChunk]]]]]
+]
 CachedTokensDetails = Dict[str, Union[int, str]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
@@ -2694,6 +2719,24 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
         # objects (native-MM `mm_inputs`) without a pickle hop.
         return obj
     return pickle.loads(obj.data)
+
+
+def wrap_object_fields_as_pickle(
+    obj: Optional[Union[MultimodalProcessorOutput, PositionalEmbeds]],
+):
+    """Pickle the object-typed values in obj that msgpack would not round-trip."""
+    if obj is None or _USE_PICKLE_IPC:
+        return obj
+    return obj.map_object_fields(pickle_unfaithful_values)
+
+
+def unwrap_object_fields_from_pickle(
+    obj: Optional[Union[MultimodalProcessorOutput, PositionalEmbeds]],
+):
+    """Inverse of wrap_object_fields_as_pickle."""
+    if obj is None or _USE_PICKLE_IPC:
+        return obj
+    return obj.map_object_fields(unpickle_values)
 
 
 _struct_types = tuple(
