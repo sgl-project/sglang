@@ -5,8 +5,10 @@ backpointer history DAG, and the BeamGroup lifecycle. The differential oracle is
 a naive walk-in-order loop written here, not the implementation under test.
 """
 
+import gc
 import random
 import unittest
+import weakref
 from types import SimpleNamespace
 
 import torch
@@ -265,6 +267,27 @@ class TestBeamGroup(CustomTestCase):
         self.assertEqual(ids, [0, 2, 5, 31])
         group = self._make_group(stop_token_ids=ids)
         self.assertEqual(group.stop_token_ids.tolist(), ids)
+
+    def test_dropped_request_frees_its_group_without_a_gc_pass(self):
+        """A request and its group must be freed by reference counting once the
+        scheduler drops the request. A reference cycle between them left every
+        finished beam request to Python's full GC passes, which stall the
+        scheduler for as long as they scan."""
+
+        class Req:  # weakly referenceable, as the scheduler's Req is
+            pass
+
+        req = Req()
+        req.beam_group = self._make_group()
+        req.beam_group.leader = req
+        self.assertIs(req.beam_group.leader, req)
+        group = weakref.ref(req.beam_group)
+        gc.disable()
+        try:
+            del req
+            self.assertIsNone(group())
+        finally:
+            gc.enable()
 
 
 if __name__ == "__main__":
