@@ -33,6 +33,10 @@ class TestDisaggregationLMCache(unittest.TestCase):
         if torch.cuda.device_count() < 2 * cls.tp_size:
             raise unittest.SkipTest(f"Requires {2 * cls.tp_size} GPUs")
         cls.model = os.environ.get("SGLANG_TEST_LMCACHE_MODEL", "Qwen/Qwen3-0.6B")
+        cls.transfer_mode = os.environ.get("LMCACHE_MP_TRANSFER_MODE", "engine_driven")
+        cls.use_shm = os.environ.get("SGLANG_TEST_LMCACHE_SHM") == "1"
+        if cls.use_shm and cls.transfer_mode != "engine_driven":
+            raise ValueError("SGLANG_TEST_LMCACHE_SHM requires engine_driven transfers")
         base_port = int(os.environ.get("SGLANG_TEST_LMCACHE_BASE_PORT", "31500"))
         cls.ports = dict(
             prefill=base_port + 1,
@@ -53,6 +57,7 @@ class TestDisaggregationLMCache(unittest.TestCase):
         cls.config_path = Path(directory.name) / "mp.yaml"
         cls.config_path.write_text(
             f"mp_host: 127.0.0.1\nmp_port: {cls.ports['cache']}\n"
+            f"extra_config:\n  lmcache.mp.mp_transfer_mode: {cls.transfer_mode}\n"
         )
         for port in [*cls.ports.values(), *cls.nccl_ports]:
             with socket.socket() as probe:
@@ -60,28 +65,33 @@ class TestDisaggregationLMCache(unittest.TestCase):
                 probe.bind(("127.0.0.1", port))
         # Each invocation owns a fresh daemon, so cold misses and persistence
         # across engine restarts cannot be satisfied by a previous test run.
-        cls.processes["cache"] = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "lmcache.cli.main",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(cls.ports["cache"]),
-                "--l1-size-gb",
-                "1",
-                "--http-port",
-                str(cls.ports["cache_http"]),
-                "--chunk-size",
-                "256",
-                "--eviction-policy",
-                "LRU",
-                "--supported-transfer-mode",
-                os.environ.get("LMCACHE_MP_TRANSFER_MODE", "engine_driven"),
+        cache_command = [
+            sys.executable,
+            "-m",
+            "lmcache.cli.main",
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(cls.ports["cache"]),
+            "--l1-size-gb",
+            "1",
+            "--http-port",
+            str(cls.ports["cache_http"]),
+            "--chunk-size",
+            "256",
+            "--eviction-policy",
+            "LRU",
+            "--supported-transfer-mode",
+            cls.transfer_mode,
+        ]
+        if cls.use_shm:
+            cache_command += [
+                "--no-l1-use-lazy",
+                "--shm-name",
+                f"sglang_kv_test_{uuid.uuid4().hex}",
             ]
-        )
+        cls.processes["cache"] = subprocess.Popen(cache_command)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if cls.processes["cache"].poll() is not None:
@@ -102,8 +112,9 @@ class TestDisaggregationLMCache(unittest.TestCase):
 
     @classmethod
     def _stop_all(cls):
-        for name in list(cls.processes):
-            cls._stop(name)
+        cls._stop("decode")
+        cls._stop("prefill")
+        cls._stop("cache")
 
     @classmethod
     def _start_pair(cls, enable_lmcache):
