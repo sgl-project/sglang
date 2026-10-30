@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
+    _topk_transform_v2_packed,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     _fp8_mqa_logits_torch,
@@ -1379,6 +1380,192 @@ class TestDSAIndexer(CustomTestCase):
                         with_row_starts=True,
                         query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
                     )
+
+    def _assert_paged_topk_exact(
+        self,
+        out: torch.Tensor,
+        scores: torch.Tensor,
+        row_starts: torch.Tensor,
+        lengths: torch.Tensor,
+        row_to_req: torch.Tensor,
+        page_table_1: torch.Tensor,
+        topk: int,
+    ):
+        for row in range(out.shape[0]):
+            start, length = int(row_starts[row]), int(lengths[row])
+            num_valid = min(topk, length)
+            self.assertTrue(torch.all(out[row, num_valid:] == -1))
+            # Each request's slot table is injective, so sorting it inverts it;
+            # a slot outside the row's window has no preimage there.
+            req_slots = page_table_1[int(row_to_req[row]), :length].to(torch.int64)
+            sorted_slots, slot_positions = torch.sort(req_slots)
+            slots = out[row, :num_valid].to(torch.int64)
+            idx = torch.searchsorted(sorted_slots, slots).clamp(max=length - 1)
+            self.assertTrue(torch.equal(sorted_slots[idx], slots))
+            positions = slot_positions[idx]
+            self.assertEqual(torch.unique(positions).numel(), num_valid)
+            window = scores[row, start : start + length]
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(window[positions]).values,
+                    torch.sort(torch.topk(window, num_valid).values).values,
+                )
+            )
+
+    def test_packed_paged_extend_dispatch(self):
+        """PAGED extend top-k with row starts runs the packed v2 kernel, exactly.
+
+        That holds for a whole-forward call and for the indexer's row chunks. A
+        prefill-CP rank's token shard stays on legacy for both calls.
+        """
+        import sgl_kernel
+
+        topk, page_size = 2048, 64
+        # (key-axis base, keys, row windows) per request; base 3203 is unaligned and
+        # the windows reach the trivial, Register2, Register4 and Streaming paths.
+        requests = [
+            (0, 3203, [1500, 3203]),
+            (3203, 40960, [1500, 6000, 12000, 40960]),
+        ]
+        num_cols = sum(keys for _, keys, _ in requests)
+        # DeepGEMM pads the logits row stride to 256 columns.
+        row_stride = -(-num_cols // 256) * 256
+        i32 = dict(dtype=torch.int32, device=self.device)
+        row_starts = torch.tensor([b for b, _, ws in requests for _ in ws], **i32)
+        lengths = torch.tensor([w for _, _, ws in requests for w in ws], **i32)
+        token_to_batch_idx = torch.tensor(
+            [q for q, (_, _, ws) in enumerate(requests) for _ in ws], **i32
+        )
+        keys = torch.tensor([n for _, n, _ in requests], **i32)
+        num_rows = lengths.shape[0]
+
+        # Requests own disjoint pages of a permuted pool, so a wrong page size
+        # or page-table row maps a selection outside its request's slots.
+        num_pages = [-(-n // page_size) for _, n, _ in requests]
+        pool = torch.randperm(2 * sum(num_pages), device=self.device).to(torch.int32)
+        real_page_table = torch.full((len(requests), max(num_pages)), -1, **i32)
+        page_table_1 = torch.full((len(requests), int(keys.max())), -1, **i32)
+        used = 0
+        for q, (_, n, _) in enumerate(requests):
+            real_page_table[q, : num_pages[q]] = pool[used : used + num_pages[q]]
+            used += num_pages[q]
+            pos = torch.arange(n, **i32)
+            page_table_1[q, :n] = (
+                real_page_table[q, pos // page_size] * page_size + pos % page_size
+            )
+
+        def cumsum(x):
+            return torch.nn.functional.pad(
+                torch.cumsum(x, 0, dtype=torch.int32), (1, 0)
+            )
+
+        def make_metadata(rows, prefill_cp_sharded=False):
+            row_lengths = lengths[rows]
+            row_batch = token_to_batch_idx[rows]
+            q_lens = torch.bincount(row_batch, minlength=len(requests)).to(torch.int32)
+            clipped = torch.clamp(row_lengths, max=topk)
+            return DSAIndexerMetadata(
+                attn_metadata=DSAMetadata(
+                    page_size=page_size,
+                    cache_seqlens_int32=keys,
+                    max_seq_len_q=int(q_lens.max()),
+                    max_seq_len_k=int(keys.max()),
+                    cu_seqlens_q=cumsum(q_lens),
+                    cu_seqlens_k=cumsum(keys),
+                    page_table_1=page_table_1,
+                    real_page_table=real_page_table,
+                    dsa_cache_seqlens_int32=clipped,
+                    dsa_cu_seqlens_q=torch.arange(row_lengths.shape[0] + 1, **i32),
+                    dsa_cu_seqlens_k=cumsum(clipped),
+                    dsa_extend_seq_lens_list=q_lens.tolist(),
+                    dsa_seqlens_expanded=row_lengths,
+                    token_to_batch_idx=row_batch,
+                    prefill_cp_sharded=prefill_cp_sharded,
+                ),
+                topk_transform_method=TopkTransformMethod.PAGED,
+                topk_backend=DSATopKBackend.SGL_KERNEL,
+            )
+
+        def chunk_kwargs(rows):
+            return dict(
+                cu_seqlens_q=torch.ones(lengths[rows].shape[0], **i32),
+                ke_offset=lengths[rows],
+                batch_idx_list=token_to_batch_idx[rows],
+            )
+
+        whole = make_metadata(slice(None))
+        # Interleaved prefill CP, rank 1 of 2: every second token of the batch.
+        # Both requests keep tokens here, so their indices and key bases hold.
+        cp_rows = torch.arange(1, num_rows, 2, device=self.device)
+        cp_shard = make_metadata(cp_rows, prefill_cp_sharded=True)
+        chunk = slice(1, 5)  # crosses the request boundary
+        cp_chunk = cp_rows[:2]  # crosses it on the CP rank
+        # (call, metadata, rows of the unsharded batch, kwargs, (packed, legacy) calls)
+        cases = [
+            ("whole forward", whole, slice(None), {}, (1, 0)),
+            ("indexer row chunk", whole, chunk, chunk_kwargs(chunk), (1, 0)),
+            ("prefill-CP whole forward", cp_shard, cp_rows, {}, (0, 1)),
+            (
+                "prefill-CP row chunk",
+                cp_shard,
+                cp_chunk,
+                chunk_kwargs(cp_chunk),
+                (0, 1),
+            ),
+        ]
+        scores = self._make_tie_free_logits(num_rows, row_stride)
+        for name, metadata, rows, kwargs, want_calls in cases:
+            with self.subTest(call=name):
+                # Row-gather first, then cut the columns: the logits keep
+                # DeepGEMM's padded row stride, as the packed path requires.
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+                    patch(
+                        "sglang.srt.layers.attention.dsa.dsa_topk_backend."
+                        "_topk_transform_v2_packed",
+                        wraps=_topk_transform_v2_packed,
+                    ) as packed,
+                    patch(
+                        "sgl_kernel.fast_topk_transform_fused",
+                        wraps=sgl_kernel.fast_topk_transform_fused,
+                    ) as legacy,
+                ):
+                    out = metadata.topk_transform(
+                        scores[rows].clone()[:, :num_cols],
+                        topk,
+                        ks=row_starts[rows],
+                        **kwargs,
+                    )
+                self.assertEqual(
+                    (packed.call_count, legacy.call_count),
+                    want_calls,
+                    "(packed, legacy) calls",
+                )
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+                ):
+                    ref = metadata.topk_transform(
+                        scores[rows].clone()[:, :num_cols],
+                        topk,
+                        ks=row_starts[rows],
+                        **kwargs,
+                    )
+                self.assertTrue(
+                    torch.equal(
+                        torch.sort(out, dim=-1).values, torch.sort(ref, dim=-1).values
+                    )
+                )
+                self._assert_paged_topk_exact(
+                    out,
+                    scores[rows],
+                    row_starts[rows],
+                    lengths[rows],
+                    token_to_batch_idx[rows],
+                    page_table_1,
+                    topk,
+                )
 
     def test_topk_v2_respects_topk_backend(self):
         seq_lens = torch.tensor([2048, 4096], dtype=torch.int32, device=self.device)
