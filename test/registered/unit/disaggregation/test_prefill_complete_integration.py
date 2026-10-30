@@ -14,7 +14,10 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
+from sglang.srt.disaggregation.common.bootstrap import (
+    DecodeHandshake,
+    DeferredBootstrap,
+)
 from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     KVTransferError,
@@ -22,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+from sglang.srt.disaggregation.decode_readiness import DecodeReadinessPacer
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
@@ -34,7 +38,7 @@ from sglang.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_prefill_pp_sections
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -58,7 +62,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
-from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -79,8 +83,12 @@ class _BroadcastGroup:
 
 
 class TestAllocationConfiguration(CustomTestCase):
-    def test_pp_prefill_keeps_optimistic_prefill_only_for_prefill_complete(self):
-        for policy, attempts in (("prefill_complete", 1), ("early", 0)):
+    def test_pp_prefill_keeps_optimistic_prefill_only_for_deferred_policies(self):
+        for policy, attempts in (
+            ("prefill_complete", 1),
+            ("just_in_time", 1),
+            ("early", 0),
+        ):
             with self.subTest(policy=policy):
                 args = ServerArgs(
                     model_path="dummy",
@@ -123,16 +131,17 @@ class TestAllocationConfiguration(CustomTestCase):
                 "disaggregation_decode_enable_radix_cache": True,
             },
         ]
-        for changed in combinations:
-            with self.subTest(changed=changed):
-                values = dict(
-                    model_path="dummy",
-                    disaggregation_mode="prefill",
-                    disaggregation_decode_allocation_policy="prefill_complete",
-                )
-                values.update(changed)
-                with self.assertRaisesRegex(ValueError, "prefill_complete"):
-                    handle_pd_disaggregation(ServerArgs(**values))
+        for policy in ("prefill_complete", "just_in_time"):
+            for changed in combinations:
+                with self.subTest(policy=policy, changed=changed):
+                    values = dict(
+                        model_path="dummy",
+                        disaggregation_mode="prefill",
+                        disaggregation_decode_allocation_policy=policy,
+                    )
+                    values.update(changed)
+                    with self.assertRaisesRegex(ValueError, policy):
+                        handle_pd_disaggregation(ServerArgs(**values))
 
 
 class TestAllocationIntegration(CustomTestCase):
@@ -261,9 +270,53 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+
+    def test_handshake_runs_from_readiness_message_to_first_destination(self):
+        """just_in_time estimates the handshake from these transport timestamps,
+        not from when the scheduler next polls the request. Readiness that waits
+        for decode to register is sent, and timed, on registration: signaling
+        earlier cannot shorten that wait."""
+        now = [0.0]
+        with patch(
+            "sglang.srt.disaggregation.common.bootstrap.time.monotonic",
+            side_effect=lambda: now[0],
+        ):
+            for room, registered_first, handshake in (
+                (1, True, 0.75),
+                (2, False, 0.25),
+            ):
+                with self.subTest(registered_first=registered_first):
+                    now[0] = 0.0
+                    sender = self.sender(room)
+                    if registered_first:
+                        receiver = self.receiver(room)
+                        self.flush()
+                    now[0] = 10.0
+                    sender.signal_decode_readiness()
+                    self.flush()
+                    if not registered_first:
+                        now[0] = 10.5
+                        receiver = self.receiver(room)
+                        self.flush()
+                    self.assertIsNone(sender.decode_handshake())
+                    now[0] = 10.75
+                    self.prefill.update_status(room, KVPoll.WaitingForInput)
+                    now[0] = 11.5
+                    self.prefill.update_status(room, KVPoll.WaitingForInput)
+                    # A duplicate BOOTSTRAP does not move the registration time.
+                    self.prefill.deferred_bootstrap.register(room, ("decode", 2))
+                    self.assertEqual(
+                        sender.decode_handshake(),
+                        DecodeHandshake(
+                            endpoint=("decode", 2),
+                            seconds=handshake,
+                            registered_at=0.0 if registered_first else 10.5,
+                        ),
+                    )
+                    self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
 
     def test_shared_receive_wrapper_preserves_native_abort_and_metadata(self):
         sender = self.sender()
@@ -296,7 +349,7 @@ class TestAllocationIntegration(CustomTestCase):
                     self.decode._fail_prefill_recompute(old_receiver, "late HTTP error")
                 self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
                 self.assertNotIn(1, self.decode.failure_records)
-                sender.mark_prefill_complete()
+                sender.signal_decode_readiness()
                 self.flush()
                 self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
                 # Duplicate control registration must not enqueue another ready
@@ -331,7 +384,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_fake_warmup_sender_never_registers_deferred_bootstrap(self):
         sender = FakeKVSender(self.prefill, "fake:0", 0)
         sender.init(0)
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
         sender.send([])
         self.assertEqual(sender.poll(), KVPoll.Success)
@@ -400,7 +453,7 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertFalse(entry.waiting_for_input)
             queue.req_to_metadata_buffer_idx_allocator.available_size.assert_not_called()
             queue.req_to_token_pool.available_size.assert_not_called()
-            sender.mark_prefill_complete()
+            sender.signal_decode_readiness()
             self.flush()
             self.assertEqual(queue.pop_preallocated(), ([], []))
         self.assertTrue(entry.waiting_for_input)
@@ -539,7 +592,7 @@ class TestAllocationIntegration(CustomTestCase):
         )
 
     def test_chunked_prefill_does_not_yield_for_decode_admission(self):
-        for policy in ("early", "prefill_complete"):
+        for policy in ("early", "prefill_complete", "just_in_time"):
             for inflight_steps in (0, 1):
                 with self.subTest(policy=policy, inflight_steps=inflight_steps):
                     override = get_context().override_server_args(
@@ -573,7 +626,7 @@ class TestAllocationIntegration(CustomTestCase):
                             SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
                                 scheduler, None, running
                             )
-                        if policy == "prefill_complete":
+                        if policy != "early":
                             self.assertIs(scheduler.chunked_req, req)
                             self.assertFalse(running.batch_is_full)
                             scheduler.optimistic_release_and_requeue.assert_not_called()
@@ -654,7 +707,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_completed_prefill_parks_until_normal_pointer_handshake(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         # Decode may reserve KV now, but prefill still has no destination indices.
@@ -721,7 +774,7 @@ class TestAllocationIntegration(CustomTestCase):
         receiver = self.receiver(stages=stages)
         self.flush()
         # Stage 0 finishes the last chunk first; its readiness alone admits the room.
-        senders[0].mark_prefill_complete()
+        senders[0].signal_decode_readiness()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         stages[0].conclude_transfer(
@@ -731,7 +784,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         # The last stage's readiness can trail stage 0's Success, never its own.
-        senders[1].mark_prefill_complete()
+        senders[1].signal_decode_readiness()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         stages[1].conclude_transfer(
@@ -956,6 +1009,54 @@ class TestAllocationIntegration(CustomTestCase):
                     scheduler.handle_bootstrap_failure.call_count, int(pp_size == 1)
                 )
 
+    def test_destination_mid_prefill_starts_transfer_only_without_pp(self):
+        """just_in_time lets decode's destination arrive while the request still
+        chunks. Without PP the next chunk round finalizes it and sends the
+        finished chunks, or under overlap marks them for the next result's
+        send; under PP only the parked consensus may finalize."""
+        room = 10
+        for pp_size in (1, 2):
+            for overlap in (False, True):
+                with self.subTest(pp_size=pp_size, overlap=overlap):
+                    room += 1
+                    sender = self.sender(room=room)
+                    self.prefill.update_status(room, KVPoll.WaitingForInput)
+                    req = Mock(
+                        disagg_kv_sender=sender,
+                        pending_bootstrap=True,
+                        to_finish=None,
+                        finished_reason=None,
+                        extend_end=1024,
+                        origin_input_ids=[0] * 4096,
+                        tmp_end_idx=None,
+                    )
+                    scheduler = self.inflight_scheduler([])
+                    scheduler.chunked_req = req
+                    scheduler.enable_overlap = overlap
+
+                    def finalize(r):
+                        r.pending_bootstrap = False
+                        return True
+
+                    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+                        finalize_bootstrap=Mock(side_effect=finalize)
+                    )
+                    running = SimpleNamespace(batch_is_full=True)
+                    with get_parallel().override(pp_size=pp_size):
+                        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                            scheduler, None, running
+                        )
+                    finalized = pp_size == 1
+                    self.assertIs(scheduler.chunked_req, req)
+                    self.assertEqual(req.pending_bootstrap, not finalized)
+                    self.assertEqual(
+                        req.tmp_end_idx, 1024 if finalized and overlap else None
+                    )
+                    if finalized and not overlap:
+                        scheduler.send_kv_chunk.assert_called_once_with(req)
+                    else:
+                        scheduler.send_kv_chunk.assert_not_called()
+
     def test_recompute_waits_in_bootstrap_queue_until_room_release(self):
         """A retraction recompute that reaches prefill before it released the
         room's previous request would fail to open the room as a duplicate."""
@@ -994,7 +1095,7 @@ class TestAllocationIntegration(CustomTestCase):
         Success can admit it early."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
         self.prefill.conclude_transfer(
             bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
@@ -1013,7 +1114,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(list(self.wire), [])
         self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
         new_sender = self.sender()
-        new_sender.mark_prefill_complete()
+        new_sender.signal_decode_readiness()
         self.flush()
         self.assertEqual(new_receiver.poll(), KVPoll.WaitingForInput)
 
@@ -1023,7 +1124,7 @@ class TestAllocationIntegration(CustomTestCase):
         decode's retraction resume that registered meanwhile."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
         self.prefill.conclude_transfer(
             bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
@@ -1039,7 +1140,7 @@ class TestAllocationIntegration(CustomTestCase):
             sender.failure_exception()
         self.assertEqual(list(self.wire), [])
         new_sender = self.sender()
-        new_sender.mark_prefill_complete()
+        new_sender.signal_decode_readiness()
         self.flush()
         self.assertEqual(new_receiver.poll(), KVPoll.WaitingForInput)
 
@@ -1101,7 +1202,7 @@ class TestAllocationIntegration(CustomTestCase):
         Success only after it."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
 
         def during_cleanup():
@@ -1120,7 +1221,7 @@ class TestAllocationIntegration(CustomTestCase):
         would otherwise lose the transfer state the old worker still erases."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
 
         def during_cleanup():
@@ -1139,7 +1240,7 @@ class TestAllocationIntegration(CustomTestCase):
         fails the room; decode must then hear Failed, never Success."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
         table = self.prefill.deferred_bootstrap
         commit = table.conclude
@@ -1163,7 +1264,7 @@ class TestAllocationIntegration(CustomTestCase):
     def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
-        sender.mark_prefill_complete()
+        sender.signal_decode_readiness()
         self.flush()
         self.prefill.conclude_transfer(
             bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
@@ -1325,6 +1426,288 @@ class TestAllocationIntegration(CustomTestCase):
         queue.add(req, is_rebootstrap=True)
         self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
+
+
+PACED_CHUNK = 100
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def _paced_req(
+    rid,
+    *,
+    input_len,
+    handshake=None,
+    endpoint=("decode", 1),
+    pending=True,
+    registered_at=0.0,
+):
+    sender = Mock()
+    sender.decode_handshake.return_value = (
+        None
+        if handshake is None
+        else DecodeHandshake(
+            endpoint=endpoint, seconds=handshake, registered_at=registered_at
+        )
+    )
+    return SimpleNamespace(
+        rid=rid,
+        bootstrap_room=hash(rid),
+        origin_input_ids=[0] * input_len,
+        extend_end=0,
+        pending_bootstrap=pending,
+        to_finish=None,
+        finished_reason=None,
+        disagg_kv_sender=sender,
+    )
+
+
+class TestDecodeReadinessPacer(CustomTestCase):
+    """When just_in_time signals decode readiness during prefill."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = _Clock()
+        self.pacer = DecodeReadinessPacer(chunk_tokens=PACED_CHUNK, clock=self.clock)
+
+    def prime(self, *, handshakes, interval, lead):
+        for seconds in handshakes:
+            self.pacer.on_bootstrap_done(
+                _paced_req("h", input_len=1, handshake=seconds)
+            )
+        warm = _paced_req("warm", input_len=PACED_CHUNK)
+        self.schedule(warm)
+        self.clock.now += interval
+        self.pacer.on_round([_paced_req("busy", input_len=1, pending=False)])
+        self.clock.now += lead - interval
+        self.pacer.on_prefill_finished(warm)
+        # An idle round, so the next scheduled round starts a new interval.
+        self.pacer.on_round([])
+
+    def schedule(self, req, tokens=PACED_CHUNK):
+        req.extend_end = min(req.extend_end + tokens, len(req.origin_input_ids))
+        self.pacer.on_round([req])
+
+    def rounds_until_signal(self, req, *, interval, tokens=PACED_CHUNK, admit_at=None):
+        """Schedule req's chunks one round apart; return the 1-based chunk whose
+        round signaled readiness, or None. From chunk admit_at on, decode has
+        admitted the request."""
+        chunk, signaled = 0, None
+        while req.extend_end < len(req.origin_input_ids):
+            chunk += 1
+            if chunk == admit_at:
+                req.pending_bootstrap = False
+            self.schedule(req, tokens)
+            if signaled is None and req.disagg_kv_sender.signal_decode_readiness.called:
+                signaled = chunk
+            self.clock.now += interval
+        return signaled
+
+    def test_signals_at_last_round_whose_remaining_prefill_covers_handshake(self):
+        # Remaining time after scheduling chunk c of 10: (10 - c) chunks at 1 s
+        # plus a 2 s lead, i.e. 12 - c. Chunk 9 is the last round with
+        # remaining >= 2.5 s; waiting a round would leave 2 s < 2.5 s.
+        self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
+        req = _paced_req("long", input_len=10 * PACED_CHUNK)
+        self.assertEqual(self.rounds_until_signal(req, interval=1.0), 9)
+        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
+
+    def test_signals_before_first_forward_without_estimates_or_short_prefill(self):
+        with self.subTest("no estimates yet"):
+            req = _paced_req("cold", input_len=10 * PACED_CHUNK)
+            self.assertEqual(self.rounds_until_signal(req, interval=1.0), 1)
+        with self.subTest("prefill shorter than the handshake"):
+            self.prime(handshakes=[10.0, 10.0], interval=1.0, lead=2.0)
+            req = _paced_req("short", input_len=3 * PACED_CHUNK)
+            self.assertEqual(self.rounds_until_signal(req, interval=1.0), 1)
+
+    def test_first_handshake_with_each_decode_endpoint_is_not_an_estimate(self):
+        # The 100 s connection-setup outlier would make every request signal at
+        # its first round; the second handshake (1 s) is the estimate.
+        self.prime(handshakes=[100.0, 1.0], interval=1.0, lead=2.0)
+        req = _paced_req("long", input_len=10 * PACED_CHUNK)
+        self.schedule(req)
+        req.disagg_kv_sender.signal_decode_readiness.assert_not_called()
+
+    def test_pp_drops_handshakes_decode_registered_after_finish(self):
+        """Under PP any stage's readiness admits a room, so when decode registers
+        only after PP0's final result another stage's message may admit it and
+        PP0 sees a residual. Such samples would pull H toward zero; without PP,
+        and with registration before the finish, the sample is the handshake."""
+        for pipelined, registered_at, kept in (
+            (True, 6.0, False),
+            (True, 4.0, True),
+            (False, 6.0, True),
+        ):
+            with self.subTest(pipelined=pipelined, registered_at=registered_at):
+                self.clock.now = 0.0
+                self.pacer = DecodeReadinessPacer(
+                    chunk_tokens=PACED_CHUNK, pipelined=pipelined, clock=self.clock
+                )
+                self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
+                self.clock.now = 5.0
+                for i in range(10):
+                    req = _paced_req(
+                        f"late-{i}",
+                        input_len=PACED_CHUNK,
+                        handshake=0.001,
+                        registered_at=registered_at,
+                    )
+                    self.pacer.on_prefill_finished(req)
+                    self.pacer.on_bootstrap_done(req)
+                self.pacer.on_round([])
+                # 2.5 s handshake: signal at chunk 9 of 10; 1 ms: never by round.
+                req = _paced_req("long", input_len=10 * PACED_CHUNK)
+                self.assertEqual(
+                    self.rounds_until_signal(req, interval=1.0), None if kept else 9
+                )
+
+    def test_lead_runs_from_final_chunk_after_mid_prefill_admission(self):
+        """Once decode admits a request mid-prefill its later chunks still move
+        the lead's start; a lead measured from the admission round would make
+        later requests signal too late."""
+        self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
+        for i in range(2):
+            req = _paced_req(f"admitted-{i}", input_len=10 * PACED_CHUNK)
+            self.rounds_until_signal(req, interval=1.0, admit_at=3)
+            self.clock.now += 2.0 - 1.0
+            self.pacer.on_prefill_finished(req)
+            self.pacer.on_round([])
+        req = _paced_req("long", input_len=10 * PACED_CHUNK)
+        self.assertEqual(self.rounds_until_signal(req, interval=1.0), 9)
+
+    def test_remaining_chunks_follow_dynamic_chunk_sizes(self):
+        # PP dynamic chunking shrinks continuation chunks to 50 tokens; with 1 s
+        # rounds, a 2 s lead and a 2.5 s handshake the request must signal once
+        # at most one 50-token chunk is left, not one 100-token chunk.
+        self.pacer = DecodeReadinessPacer(
+            chunk_tokens=PACED_CHUNK,
+            next_chunk_tokens=lambda prefix_len: PACED_CHUNK // 2,
+            clock=self.clock,
+        )
+        self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
+        req = _paced_req("dynamic", input_len=10 * PACED_CHUNK)
+        chunk = self.rounds_until_signal(req, interval=1.0, tokens=PACED_CHUNK // 2)
+        self.assertEqual(chunk * (PACED_CHUNK // 2), 9.5 * PACED_CHUNK)
+
+    def test_signaled_request_is_not_recounted(self):
+        """After readiness the remaining-chunk count is never read again; under
+        PP dynamic chunking each recount walks the chunk-size predictor."""
+        calls = []
+        self.pacer = DecodeReadinessPacer(
+            chunk_tokens=PACED_CHUNK,
+            next_chunk_tokens=lambda prefix_len: calls.append(prefix_len),
+            clock=self.clock,
+        )
+        req = _paced_req("cold", input_len=10 * PACED_CHUNK)
+        self.schedule(req)
+        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
+        calls.clear()
+        for _ in range(9):
+            self.clock.now += 1.0
+            self.schedule(req)
+        self.assertEqual(calls, [])
+
+    def test_slow_first_request_does_not_steer_later_pacing(self):
+        """The first requests after startup also pay compilation; their round
+        interval and lead must not keep later requests signaling early."""
+        self.prime(handshakes=[2.5, 2.5], interval=30.0, lead=60.0)
+        for i in range(2):
+            self.prime(handshakes=[], interval=1.0, lead=2.0)
+        req = _paced_req("long", input_len=10 * PACED_CHUNK)
+        self.assertEqual(self.rounds_until_signal(req, interval=1.0), 9)
+
+
+class TestDecodeReadinessWiring(CustomTestCase):
+    """Both prefill loops hand each scheduled batch to the pacer before it
+    launches, and finalized bootstraps feed the handshake estimate; without
+    either, just_in_time silently degrades to another policy's timing."""
+
+    def scheduler_with_cold_pacer(self, req):
+        s = Scheduler.__new__(Scheduler)
+        s.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            readiness_pacer=DecodeReadinessPacer(chunk_tokens=PACED_CHUNK)
+        )
+        s.dp_attn_adapter = Mock()
+        s.get_new_batch_prefill = Mock(
+            return_value=NextBatchPlan(
+                batch_to_run=SimpleNamespace(reqs=[req]),
+                running_batch=SimpleNamespace(batch_is_full=False),
+            )
+        )
+        return s
+
+    def test_scheduled_batch_reaches_pacer_before_launch(self):
+        req = _paced_req("r", input_len=PACED_CHUNK)
+        s = self.scheduler_with_cold_pacer(req)
+        s.scheduler_stage_metrics = None
+        s.process_pending_chunked_abort = Mock()
+        s._process_hicache_events = Mock()
+        s.resolve_waiting_queue_bootstrap = Mock()
+        s.process_prefill_chunk = Mock()
+        s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
+        s.get_next_disagg_prefill_batch_to_run(
+            running_batch=SimpleNamespace(batch_is_full=False), last_batch=None
+        )
+        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
+
+    def test_pp_scheduled_batch_reaches_pacer_before_launch(self):
+        req = _paced_req("r", input_len=PACED_CHUNK)
+        s = self.scheduler_with_cold_pacer(req)
+        enter_scope(self, published_topology(pp_size=2))
+        s.init_pp_loop_state = Mock()
+        s.pp_loop_size = 1
+        s.pp_group = SimpleNamespace(is_last_rank=True)
+        s.running_mbs = [SimpleNamespace(batch_is_full=False)]
+        s.last_mbs = [None]
+        s.mbs = [None]
+        s.ingest_requests = Mock(return_value=[])
+        s.process_bootstrapped_queue = Mock()
+        s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
+        s._pp_commit_comm_work = Mock()
+        s.process_prefill_chunk = Mock()
+        s._process_hicache_events = Mock()
+        # Stop the infinite loop right after admission, before any launch.
+        s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = StopIteration
+        with self.assertRaises(StopIteration):
+            s.event_loop_pp_disagg_prefill()
+        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
+
+    def test_finalized_bootstrap_feeds_handshake_estimate(self):
+        clock = _Clock()
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.readiness_pacer = DecodeReadinessPacer(
+            chunk_tokens=PACED_CHUNK, clock=clock
+        )
+        queue.scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1)
+        )
+        for _ in range(2):
+            req = _paced_req("r", input_len=PACED_CHUNK, handshake=0.5)
+            req.metadata_buffer_index = 0
+            req.time_stats = Mock()
+            req.disagg_kv_sender.pop_decode_prefix_len.return_value = 0
+            self.assertTrue(queue.finalize_bootstrap(req))
+        # The only other estimates: a 1 s round and a 1 s lead.
+        pacer = queue.readiness_pacer
+        warm = _paced_req("warm", input_len=PACED_CHUNK)
+        pacer.on_round([warm])
+        clock.now += 1.0
+        pacer.on_round([_paced_req("busy", input_len=1, pending=False)])
+        pacer.on_prefill_finished(warm)
+        pacer.on_round([])
+        # 10 s of prefill remain against a 0.5 s handshake; with no handshake
+        # estimate the request would signal at once.
+        req = _paced_req("long", input_len=10 * PACED_CHUNK)
+        req.extend_end = PACED_CHUNK
+        pacer.on_round([req])
+        req.disagg_kv_sender.signal_decode_readiness.assert_not_called()
 
 
 if __name__ == "__main__":

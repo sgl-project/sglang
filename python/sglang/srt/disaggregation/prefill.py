@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.decode_readiness import DecodeReadinessPacer
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -53,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    defers_decode_allocation,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -185,6 +187,8 @@ class PrefillBootstrapQueue:
     Store the requests in bootstrapping
     """
 
+    readiness_pacer: Optional[DecodeReadinessPacer] = None
+
     def __init__(
         self,
         token_to_kv_pool: KVCache,
@@ -231,6 +235,17 @@ class PrefillBootstrapQueue:
             abort=self._abort_room_waiters,
             req_of=lambda waiter: waiter[0],
         )
+        # Readiness from any PP stage admits a room, and stage 0 schedules first.
+        if (
+            get_disagg().disaggregation_decode_allocation_policy == "just_in_time"
+            and self.pp_rank == 0
+        ):
+            sizer = self.scheduler.dynamic_chunk_sizer
+            self.readiness_pacer = DecodeReadinessPacer(
+                chunk_tokens=self.scheduler.chunked_prefill_size,
+                next_chunk_tokens=sizer.predict if sizer is not None else None,
+                pipelined=self.pp_size > 1,
+            )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -453,6 +468,8 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
+        if self.readiness_pacer is not None:
+            self.readiness_pacer.on_bootstrap_done(req)
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
@@ -547,8 +564,7 @@ class PrefillBootstrapQueue:
         """Check eligibility; pause and metadata admission stay in the shared queue."""
         return (
             req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
-            or get_disagg().disaggregation_decode_allocation_policy
-            == "prefill_complete"
+            or defers_decode_allocation()
         ) and not (
             _uses_write_through_cache(self.scheduler.tree_cache)
             and req.swa_branching_seqlen is not None
@@ -704,6 +720,12 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
         self.waiting_queue.leave(failed)
 
+    def pace_decode_readiness(self: Scheduler, batch: Optional[ScheduleBatch]) -> None:
+        """Signal decode readiness for pending requests whose prefill nears its end."""
+        pacer = self.disagg_prefill_bootstrap_queue.readiness_pacer
+        if pacer is not None:
+            pacer.on_round(batch.reqs if batch is not None else [])
+
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
             not req.pending_bootstrap and not is_aborted(req)
@@ -739,6 +761,7 @@ class SchedulerDisaggregationPrefillMixin:
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        self.pace_decode_readiness(batch)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -1178,11 +1201,11 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )
-                if (
-                    get_disagg().disaggregation_decode_allocation_policy
-                    == "prefill_complete"
-                ):
-                    req.disagg_kv_sender.mark_prefill_complete()
+                if defers_decode_allocation():
+                    pacer = self.disagg_prefill_bootstrap_queue.readiness_pacer
+                    if pacer is not None:
+                        pacer.on_prefill_finished(req)
+                    req.disagg_kv_sender.signal_decode_readiness()
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
@@ -1331,8 +1354,7 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                 elif (
                     poll == KVPoll.Bootstrapping
-                    and get_disagg().disaggregation_decode_allocation_policy
-                    != "prefill_complete"
+                    and not defers_decode_allocation()
                     and self.req_to_token_pool.available_size() == 0
                     and (
                         self.waiting_queue
@@ -1645,8 +1667,7 @@ class SchedulerDisaggregationPrefillMixin:
                     # bootstrap failed
                     self.chunked_req = None
                 elif (
-                    get_disagg().disaggregation_decode_allocation_policy
-                    != "prefill_complete"
+                    not defers_decode_allocation()
                     and self.has_bootstrapped_waiting_req()
                 ):
                     # optimistic request yields to waiting requests; with a step
@@ -2082,11 +2103,7 @@ class SchedulerDisaggregationPrefillMixin:
         # A fresh lookup budget for the new attempt, as after a retraction.
         req.storage_prefetch_retry_attempts = 0
         req.storage_prefetch_last_match_len = yielded_prefix_len or None
-        if (
-            req.prefill_attempt_count >= max_attempts
-            and get_disagg().disaggregation_decode_allocation_policy
-            != "prefill_complete"
-        ):
+        if req.prefill_attempt_count >= max_attempts and not defers_decode_allocation():
             logger.info(
                 f"Req {req.rid} exhausted optimistic prefill attempts "
                 "falling back to bootstrap queue"

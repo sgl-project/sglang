@@ -227,8 +227,9 @@ sends every request to prefill on arrival, but sends at most N per prefill DP
 rank on to decode before decode streams their first token; the rest wait at
 the router in arrival order and get their decode rank when they are sent.
 Prefill must start a request before decode connects, so prefill engines need
-`--optimistic-prefill-attempts` above 0 or
-`--disaggregation-decode-allocation-policy prefill_complete`; the router
+`--optimistic-prefill-attempts` above 0 or a deferred
+`--disaggregation-decode-allocation-policy` (`prefill_complete` or
+`just_in_time`); the router
 refuses to register a prefill whose `/server_info` reports neither, since its
 gated requests could never start. A request that expires or loses its
 client while waiting has its prefill aborted; requests with a caller-set `rid`

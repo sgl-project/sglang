@@ -200,7 +200,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            pop_bootstrapped=lambda: [], readiness_pacer=None
         )
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch

@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.choices import DEFERRED_DECODE_ALLOCATION_POLICIES
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -1735,6 +1736,13 @@ def is_unadmitted_reject(req: Req) -> bool:
         or req.kv.holds_mamba
         or req.metadata_buffer_index >= 0
         or req.kv.retraction_backup is not None
+    )
+
+
+def defers_decode_allocation() -> bool:
+    return (
+        get_disagg().disaggregation_decode_allocation_policy
+        in DEFERRED_DECODE_ALLOCATION_POLICIES
     )
 
 

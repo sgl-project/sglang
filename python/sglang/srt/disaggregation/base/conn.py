@@ -11,6 +11,7 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.common.bootstrap import DecodeHandshake
     from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
@@ -198,9 +199,15 @@ class BaseKVSender(ABC):
         """
         ...
 
-    def mark_prefill_complete(self) -> None:
-        """Publish retained final-prefill KV for an enabled allocation policy."""
+    def signal_decode_readiness(self) -> None:
+        """Ask decode to reserve this request's KV under a deferred allocation
+        policy. Idempotent; readiness alone never starts a KV write."""
         raise NotImplementedError
+
+    def decode_handshake(self) -> Optional[DecodeHandshake]:
+        """Timing of decode's reservation handshake for this request, once its
+        destination indices arrived under a deferred allocation policy."""
+        return None
 
     def pop_decode_prefix_len(self) -> int:
         return 0

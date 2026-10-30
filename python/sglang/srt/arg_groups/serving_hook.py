@@ -10,6 +10,7 @@ import random
 import socket
 from typing import Any
 
+from sglang.srt.arg_groups.choices import DEFERRED_DECODE_ALLOCATION_POLICIES
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
@@ -499,15 +500,17 @@ def handle_other_validations(server_args: Any):
 
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":
-        # Under PP only prefill_complete resolves parked requests on a PP-wide
-        # consensus; the other policies' yield paths act on per-stage polls.
+        # Under PP only deferred decode allocation resolves parked requests on a
+        # PP-wide consensus; the early policy's yield paths act on per-stage polls.
         if (
             cfg.pp_size > 1
-            and cfg.disaggregation_decode_allocation_policy != "prefill_complete"
+            and cfg.disaggregation_decode_allocation_policy
+            not in DEFERRED_DECODE_ALLOCATION_POLICIES
         ):
             logger.warning(
-                "Optimistic prefill supports pp_size > 1 only with "
-                "--disaggregation-decode-allocation-policy prefill_complete"
+                "Optimistic prefill supports pp_size > 1 only with a deferred "
+                "--disaggregation-decode-allocation-policy "
+                f"({', '.join(sorted(DEFERRED_DECODE_ALLOCATION_POLICIES))})"
             )
             declare_resolution(
                 server_args,
@@ -536,13 +539,14 @@ def handle_other_validations(server_args: Any):
             )
 
     if (
-        cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+        cfg.disaggregation_decode_allocation_policy
+        in DEFERRED_DECODE_ALLOCATION_POLICIES
         and cfg.disaggregation_mode == "prefill"
         and resolving_view(server_args).optimistic_prefill_attempts <= 0
     ):
         raise ValueError(
-            "prefill_complete requires optimistic prefill, but the resolved "
-            "model/cache configuration disabled it."
+            f"{cfg.disaggregation_decode_allocation_policy} requires optimistic "
+            "prefill, but the resolved model/cache configuration disabled it."
         )
 
     # Handle model inference tensor dump.

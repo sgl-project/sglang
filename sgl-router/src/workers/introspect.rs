@@ -75,8 +75,9 @@ pub struct ServerInfo {
     /// The engine's native gRPC port (`--grpc-port`), served beside HTTP.
     pub grpc_port: Option<u16>,
     /// Whether a prefill engine computes a request before its decode peer
-    /// bootstraps: `--optimistic-prefill-attempts` above 0 or
-    /// `--disaggregation-decode-allocation-policy prefill_complete`.
+    /// bootstraps: `--optimistic-prefill-attempts` above 0 or a deferred
+    /// `--disaggregation-decode-allocation-policy` (`prefill_complete` or
+    /// `just_in_time`).
     /// `--decode-dispatch-limit` holds decode back until earlier KV has
     /// arrived, so a prefill without either never starts. `None` when
     /// `/server_info` predates the field or did not answer.
@@ -209,8 +210,10 @@ impl WorkerIntrospector {
             grpc_port: parsed.grpc_port,
             prefill_before_bootstrap: parsed.optimistic_prefill_attempts.map(|attempts| {
                 attempts > 0
-                    || parsed.disaggregation_decode_allocation_policy.as_deref()
-                        == Some("prefill_complete")
+                    || matches!(
+                        parsed.disaggregation_decode_allocation_policy.as_deref(),
+                        Some("prefill_complete" | "just_in_time")
+                    )
             }),
         }
     }
@@ -890,6 +893,13 @@ mod tests {
                 json!({
                     "optimistic_prefill_attempts": 0,
                     "disaggregation_decode_allocation_policy": "prefill_complete",
+                }),
+                Some(true),
+            ),
+            (
+                json!({
+                    "optimistic_prefill_attempts": 0,
+                    "disaggregation_decode_allocation_policy": "just_in_time",
                 }),
                 Some(true),
             ),

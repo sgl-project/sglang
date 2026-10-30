@@ -40,12 +40,14 @@ from sglang.srt.disaggregation.base.conn import (
 )
 from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
+    DecodeHandshake,
     DeferredBootstrap,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    defers_decode_allocation,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
@@ -421,14 +423,13 @@ class CommonKVManager(BaseKVManager):
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
-        self.defer_decode_allocation = (
-            get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
-        )
+        self.defer_decode_allocation = defers_decode_allocation()
         self.deferred_bootstrap = None
         if self.defer_decode_allocation:
             if any(state != StateType.DSA for state in args.state_types):
                 raise ValueError(
-                    "prefill_complete currently supports full-attention and DSA KV pools only"
+                    "Deferred decode allocation currently supports "
+                    "full-attention and DSA KV pools only"
                 )
             if disaggregation_mode == DisaggregationMode.PREFILL:
                 self.deferred_bootstrap = DeferredBootstrap(
@@ -716,6 +717,12 @@ class CommonKVManager(BaseKVManager):
             # Failed is terminal. It also sorts lowest, so the max() below would
             # happily promote it back to Transferring or Success.
             return
+        if (
+            status == KVPoll.WaitingForInput
+            and current == KVPoll.Bootstrapping
+            and self.deferred_bootstrap is not None
+        ):
+            self.deferred_bootstrap.mark_destination(bootstrap_room)
         self.request_status[bootstrap_room] = max(current, status)
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
@@ -2186,7 +2193,7 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
-        self._prefill_complete_time: Optional[float] = None
+        self._readiness_time: Optional[float] = None
         self._owns_bootstrap_room = True
         if mgr.deferred_bootstrap is not None:
             room_state = mgr.deferred_bootstrap.open(bootstrap_room, self)
@@ -2253,16 +2260,21 @@ class CommonKVSender(BaseKVSender):
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
 
-    def mark_prefill_complete(self) -> None:
+    def signal_decode_readiness(self) -> None:
         if self.kv_mgr.deferred_bootstrap is None:
             return
         # Give decode admission a fresh budget, excluding prefill queue/compute.
-        if self._prefill_complete_time is None:
-            self._prefill_complete_time = time.time()
+        if self._readiness_time is None:
+            self._readiness_time = time.time()
             self.kv_mgr._notify_bootstrap(
                 self.bootstrap_room,
                 self.kv_mgr.deferred_bootstrap.complete(self.bootstrap_room, self),
             )
+
+    def decode_handshake(self) -> Optional[DecodeHandshake]:
+        if self.kv_mgr.deferred_bootstrap is None:
+            return None
+        return self.kv_mgr.deferred_bootstrap.handshake(self.bootstrap_room, self)
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
@@ -2446,7 +2458,7 @@ class CommonKVSender(BaseKVSender):
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         start = (
-            self._prefill_complete_time
+            self._readiness_time
             if self.kv_mgr.defer_decode_allocation
             else self.init_time
         )
@@ -2590,10 +2602,10 @@ class CommonKVReceiver(BaseKVReceiver):
                 f"prefill={info.decode_allocation_policy}, decode={policy}. "
                 "Set --disaggregation-decode-allocation-policy identically on both roles."
             )
-        elif policy == "prefill_complete" and (
+        elif self.kv_mgr.defer_decode_allocation and (
             info.attn_tp_size != 1 or info.attn_cp_size != 1
         ):
-            reason = "prefill_complete requires peer attention TP1/CP1"
+            reason = f"{policy} requires peer attention TP1/CP1"
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
