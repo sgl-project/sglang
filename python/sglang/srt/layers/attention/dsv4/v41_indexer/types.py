@@ -43,8 +43,8 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     q_lora: torch.Tensor  # [rows, q_lora_rank]
     positions: torch.Tensor  # [rows] absolute position of each row
 
-    # [rows] req_to_token row of each query row; None under prefill CP, where a
-    # rank's rows are an interleaved subset of the batch's.
+    # [rows] req_to_token row of each query row; under prefill CP, of the rank's
+    # local rows.
     req_rows: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor  # [requests] req_to_token row of each request
     # [columns] int64 index-K pool slot of each flattened-K column, from
