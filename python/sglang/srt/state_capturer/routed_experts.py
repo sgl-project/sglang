@@ -28,6 +28,16 @@ def _is_scattered_a2a_backend() -> bool:
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
 
 
+def _is_output_rank() -> bool:
+    # Must match the scheduler's is_rank_zero: only that rank sends outputs.
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
@@ -36,6 +46,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     slicing. The device cache also holds extra columns for any fused shared
     experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
+
+    Only the rank that sends outputs keeps a host cache.
     """
 
     @staticmethod
@@ -90,6 +102,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
+            allocate_host_cache=_is_output_rank(),
         )
 
         # Rebuild the full token batch before routed-expert readback.
