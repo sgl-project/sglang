@@ -23,6 +23,7 @@ on:
       - "python/sglang/kernels/aot/**"
       - ".github/workflows/pr-test-amd.yml"
       - "docker/rocm.Dockerfile"
+      - "docker/rocm10.Dockerfile"
   workflow_dispatch:
     inputs:
       rocm_version:
@@ -238,16 +239,19 @@ jobs:
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd.yml"
               - "docker/rocm.Dockerfile"
+              - "docker/rocm10.Dockerfile"
             sgl_kernel:
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd.yml"
               - "docker/rocm.Dockerfile"
+              - "docker/rocm10.Dockerfile"
             jit_kernel:
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**"
               - "test/registered/kernels/**"
               - ".github/workflows/pr-test-amd.yml"
               - "docker/rocm.Dockerfile"
+              - "docker/rocm10.Dockerfile"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
@@ -258,6 +262,7 @@ jobs:
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "docker/rocm.Dockerfile"
+              - "docker/rocm10.Dockerfile"
 
   # =============================================== extra (scheduled) ====================================================
   # Chain the label-gated AMD extra tier into the scheduled run, mirroring

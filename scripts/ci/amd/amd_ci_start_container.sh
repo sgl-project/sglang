@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
       echo "  --custom-image IMAGE       Use a specific Docker image directly (or set AMD_CI_IMAGE)"
-      echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
+      echo "  --build-from-dockerfile    Build image from the matching ROCm Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm1000)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm10)"
       echo ""
@@ -231,6 +231,9 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 
   DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
   DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
+  case "${GPU_ARCH_BUILD}" in
+    *-rocm1000|*-rocm1010) DOCKERFILE="${DOCKERFILE_DIR}/rocm10.Dockerfile" ;;
+  esac
 
   if [[ ! -f "${DOCKERFILE}" ]]; then
     echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
@@ -246,7 +249,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
     --build-arg SGL_BRANCH="main" \
     -t "${IMAGE}" \
     -f "${DOCKERFILE}" \
-    "${DOCKERFILE_DIR}"
+    "${DOCKERFILE_DIR}/.."
   echo "Successfully built image: ${IMAGE}"
 else
   # Find the latest pre-built image
