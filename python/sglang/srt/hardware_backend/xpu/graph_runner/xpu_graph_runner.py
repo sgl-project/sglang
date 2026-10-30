@@ -75,12 +75,16 @@ def register_fake_ops():
         pack_gqa,
         sm_margin,
         out,
-        softmax_lse,
+        return_softmax_lse,
     ):
-        # The op writes into the caller-provided ``out`` and ``softmax_lse``
-        # buffers in place and returns nothing. ``softmax_lse`` is ``None`` when
-        # the caller does not request the logsumexp.
-        return None
+        if out is None:
+            out = q.new_empty((q.shape[0], q.shape[1], v.shape[-1]))
+        lse = (
+            q.new_empty((q.shape[1], q.shape[0]), dtype=torch.float32)
+            if return_softmax_lse
+            else None
+        )
+        return out, lse
 
     @torch.library.register_fake("sgl_kernel::flash_mla_decode")
     def _(
