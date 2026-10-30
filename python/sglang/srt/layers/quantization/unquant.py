@@ -14,6 +14,7 @@ from torch.nn.parameter import Parameter
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -51,6 +52,7 @@ from sglang.srt.utils import (
     is_gfx115_supported,
     is_hip,
     is_npu,
+    is_sail,
     is_xpu,
     use_intel_amx_backend,
 )
@@ -1407,7 +1409,43 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        # SAIL's DeepGEMM MoE engines only implement gated SiLU and SiTU. A gelu
+        # or ungated checkpoint routed there trips the runner's assertion during
+        # construction, far from the cause, so decide that here instead.
+        sail_deep_gemm_reason = None
+        if is_sail() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            from sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe import (
+                sail_deepgemm_moe_unsupported_reason,
+            )
+
+            sail_deep_gemm_reason = sail_deepgemm_moe_unsupported_reason(
+                moe_runner_config
+            )
+        sail_deep_gemm_ok = sail_deep_gemm_reason is None
+        if not sail_deep_gemm_ok:
+            message = (
+                f"SAIL DeepGEMM MoE cannot run this layer: {sail_deep_gemm_reason}"
+            )
+            if (
+                get_moe_runner_backend().is_deep_gemm()
+                or get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+            ):
+                raise ValueError(
+                    f"{message}; use --moe-runner-backend triton or a gated "
+                    "SiLU/SiTU checkpoint."
+                )
+            logger.warning_once(f"{message}; using the triton MoE runner.")
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and is_sail()
+            and sail_deep_gemm_ok
+            and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        ):
+            backend = MoeRunnerBackend.DEEP_GEMM
+        elif self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -1426,8 +1464,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel = NPUUnquantMoEMethod()
             moe_runner_config.layer = layer
             backend = MoeRunnerBackend.ASCEND
+        elif (
+            is_sail()
+            and get_moe_runner_backend().is_auto()
+            and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and sail_deep_gemm_ok
+        ):
+            backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
+        if is_sail() and backend.is_deep_gemm():
+            import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.
@@ -1517,7 +1565,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
             # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
             # otherwise use_fp8=True for FP8 dispatch path
-            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            use_fp8 = (
+                not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+                and w13_weight.dtype == torch.float8_e4m3fn
+            )
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,
