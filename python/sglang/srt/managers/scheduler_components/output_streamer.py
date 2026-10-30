@@ -385,9 +385,9 @@ class _GenerationStreamAccumulator:
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
-    # By row, the route the row carries, else None; see BatchTokenIDOutput.
+    # By row, the http_worker_ipc the row carries, else None; see BatchTokenIDOutput.
     http_worker_ipcs: list = field(default_factory=list)
-    has_row_route: bool = False
+    has_http_worker_ipc: bool = False
     finished_reasons: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     # OutputSink.DETOKENIZER only.
@@ -541,14 +541,14 @@ class _GenerationStreamAccumulator:
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)
-            # A finished row carries its route, so it reaches its tokenizer
-            # worker even with no stored state.
-            route = req.http_worker_ipc if req.finished() else None
-            self.http_worker_ipcs.append(route)
-            self.has_row_route = self.has_row_route or route is not None
+            # A finished row carries its http_worker_ipc, so it reaches its
+            # tokenizer worker even with no stored state.
+            ipc = req.http_worker_ipc if req.finished() else None
+            self.http_worker_ipcs.append(ipc)
+            self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
         elif self.output_sink is OutputSink.TOKENIZER:
             self.http_worker_ipcs.append(req.http_worker_ipc)
-            self.has_row_route = True
+            self.has_http_worker_ipc = True
 
         if self.output_sink is OutputSink.RUST:
             # Per-step header columns of `push_generation`.
@@ -757,7 +757,9 @@ class _GenerationStreamAccumulator:
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
-            http_worker_ipcs=self.http_worker_ipcs if self.has_row_route else None,
+            http_worker_ipcs=(
+                self.http_worker_ipcs if self.has_http_worker_ipc else None
+            ),
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
