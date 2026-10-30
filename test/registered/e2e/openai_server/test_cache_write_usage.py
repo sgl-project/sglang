@@ -10,6 +10,7 @@ import json
 import unittest
 
 import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
