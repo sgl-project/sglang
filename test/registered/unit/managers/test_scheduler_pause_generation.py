@@ -247,6 +247,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.update_running_batch(batch)
 
@@ -657,9 +658,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_called_once_with(
             req
         )
-        self.assertEqual(req.output_ids, [10, 11])
-        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
-        self.assertTrue(req.pd_rebootstrap_in_progress)
+        # Already-streamed output must not shrink while the prefill recomputes.
+        self.assertEqual(req.output_ids, [10, 11, 12])
         # Rebootstrap recomputes the KV from the prefill, so the retract must skip
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()

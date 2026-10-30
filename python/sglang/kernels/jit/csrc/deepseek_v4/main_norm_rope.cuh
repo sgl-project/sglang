@@ -242,7 +242,7 @@ struct FusedQNormRopeKernel {
     auto B = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_q_heads"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
@@ -651,7 +651,7 @@ struct FusedKNormRopeFlashMLAKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  //
         .with_strides({-1, 1})
@@ -901,7 +901,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     auto B = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_heads"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     // Caller path is `wq_b(q_lora).view(-1, H, D)` -> contiguous; the kernel
     // assumes a flat `(B*H, kHeadDim)` layout for both q_input and q_fp8.
@@ -1125,7 +1125,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
     auto B = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_heads"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, H, kHeadDim})
         .with_strides({-1, kHeadDim, 1})
