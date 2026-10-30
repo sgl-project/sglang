@@ -3552,10 +3552,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+        # page_size 1 is accepted: the flat page table runs the non-paged varlen
+        # kernel.
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
+                )
+            ),
+            {},
+        )
+        # an unsupported page still snaps to 128
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    page_size=32,  # non-MLA accepts only 1, 64, 128
                 )
             ),
             {"page_size": 128},
@@ -3569,6 +3581,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {},
+        )
+        # MLA does not inherit MHA's page_size 1: mla_decode has no page_size 1 path.
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    _model_config=SimpleNamespace(attention_arch=AttentionArch.MLA),
+                    page_size=1,
+                )
+            ),
+            {"page_size": 128},
         )
 
     def test_monolith_attention_families_at_callable_level(self):
