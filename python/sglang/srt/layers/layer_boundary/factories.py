@@ -289,6 +289,7 @@ class StageDeclaration:
         reduction: Whether the next stage's input always completes the sum
             (an attention's), or the exit decides (an FFN's or a mixer's).
         gathers_attn_tp_input: Whether attention gathers TP-sharded input itself.
+        gathers_attn_cp_input: Compute owns the CP gather, including its fallback.
         tp_group: Group partitioning attention heads. Full TP consumers require
             full token rows, including when TP shares the prefill CP group.
         in_token_order: Whether an attention reads the whole sequence in token
@@ -336,6 +337,7 @@ class StageDeclaration:
     output_transform: Optional[OutputTransform] = None
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
+    gathers_attn_cp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
     in_token_order: bool = False
     dense_tp_size: Optional[int] = None
@@ -436,6 +438,7 @@ def declare_attn(
     update=PLAIN_ADD,
     reduction=ProducerReduction.ALWAYS_PARTIAL,
     gathers_attn_tp_input=True,
+    gathers_attn_cp_input=False,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
@@ -451,6 +454,7 @@ def declare_attn(
         reduction: ALWAYS_PARTIAL for an attention whose sum the next stage's
             input always completes; EXIT_SCOPED for a mixer whose exit decides.
         gathers_attn_tp_input: Whether compute gathers attention-TP input slices itself.
+        gathers_attn_cp_input: Compute owns the interleave CP input gather.
         output_transform: Optional operation on the output once its sum is
             complete, before the residual update (a sandwich norm). The next
             stage's input runs it, so no fused add + norm takes that input.
@@ -481,6 +485,7 @@ def declare_attn(
         output_transform=output_transform,
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
+        gathers_attn_cp_input=gathers_attn_cp_input,
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
@@ -699,6 +704,21 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
         if stage.gathers_attn_tp_input and (sp or scattered or _use_ag_after_qlora)
         else frozenset()
     )
+    if stage.gathers_attn_cp_input and variant is BatchVariant.CONTEXT_PARALLEL:
+        parallel = get_parallel()
+        if not (
+            stage.tp_group is SumGroup.TP
+            and not stage.in_token_order
+            and parallel.enable_cp_tp_group_sharing
+            and parallel.cp_strategy == "interleave"
+            and parallel.attn_cp_size == parallel.tp_size
+            and parallel.attn_cp_size > 1
+            and parallel.attn_dp_size == 1
+        ):
+            raise NotImplementedError(
+                "compute-owned CP attention gather requires interleave CP/TP group sharing"
+            )
+        gathers = gathers | {TokenAxis.ATTN_CP}
     owes = not sp and axes[TokenAxis.ATTN_TP] > 1
     group = SumGroup.ATTN_TP
     compute_rows = attention
