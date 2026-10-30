@@ -341,7 +341,7 @@ class ReqTimeStatsBase:
             succeeded = True
         finally:
             # Capture the backend interval before any span creation or export.
-            # This is CPU call time, not DMA time; add no device synchronization.
+            # This is elapsed call time, including waits, not CPU consumption.
             end_time = monotonic_time()
             try:
                 self.trace_slice(
