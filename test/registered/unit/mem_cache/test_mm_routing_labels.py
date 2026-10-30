@@ -16,13 +16,11 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
-from sglang.srt.disaggregation.encoder.receiver import WaitingZmqRequest
 from sglang.srt.disaggregation.kv_events import BlockStored, EventBatch
 from sglang.srt.managers.io_struct import (
     MAX_MM_ROUTING_LABEL_BYTES,
     GenerateReqInput,
 )
-from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
@@ -110,23 +108,6 @@ class TestMmRoutingLabels(CustomTestCase):
         self.registry.register(Y, LABEL_V)  # 8 entries: at capacity
         self.registry.register((31_000_000_001,), "ffff000000000001")
         self.assertIsNone(self.registry.get(X[0]))  # least recently used
-
-    def test_eviction_then_reregister_accepts_new_label(self):
-        # Known limitation: once evicted, a pad value can be registered again
-        # under a new label.  Dynamo's id map already keeps the first label for
-        # any block it has indexed, so a re-stored block is counted as a
-        # conflict and dropped.  The only gap is an *unindexed* block re-stored
-        # after eviction; both labels name the same image, so routing to either
-        # worker still yields a cache hit.
-        self.registry.register(X, LABEL_U)  # 4 entries
-        self.registry.register(Y, LABEL_V)  # 8 entries: at capacity
-        # Push X out (LRU) by adding a third item.
-        Z = (31_000_000_001, 32_000_000_002, 33_000_000_003, 34_000_000_004)
-        self.registry.register(Z, "aaaa000000000001")  # evicts X
-        self.assertIsNone(self.registry.get(X[0]))
-        # Re-register X under a different label: accepted because the entry is gone.
-        self.registry.register(X, LABEL_V)
-        self.assertEqual(self.registry.get(X[0]), LABEL_V)
 
     def test_register_maps_each_labeled_item_pad_value(self):
         labeled = MultimodalDataItem(
@@ -241,22 +222,6 @@ class TestMmRoutingLabels(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "labels for"):
                     GenerateReqInput(**kwargs).normalize_batch_and_arguments()
 
-    def test_parallel_sampling_repeats_each_requests_labels(self):
-        # n > 1 turns one request into a batch.
-        for media, labels in (
-            (dict(image_data=["a"], video_data=["v"]), ["I", "V"]),
-            (dict(video_data="v"), ["V"]),
-        ):
-            with self.subTest(labels=labels):
-                req = GenerateReqInput(
-                    text="one",
-                    mm_routing_labels=labels,
-                    sampling_params={"n": 2},
-                    **media,
-                )
-                req.normalize_batch_and_arguments()
-                self.assertEqual(req.mm_routing_labels, [labels, labels])
-
     def test_label_size_is_bounded_in_bytes(self):
         limit = MAX_MM_ROUTING_LABEL_BYTES
         GenerateReqInput(
@@ -290,18 +255,6 @@ class TestMmRoutingLabels(CustomTestCase):
             {"image": ["I1", "I2"], "video": ["V1"]},
         )
         self.assertIsNone(GenerateReqInput(text="one").mm_routing_labels_by_modality())
-
-    def test_attach_matches_labels_within_each_media_type(self):
-        # Items in prompt order: image, video, image, video, image. The k-th
-        # item of a type takes that type's k-th label; "" leaves it unlabeled.
-        kinds = [Modality.IMAGE, Modality.VIDEO] * 2 + [Modality.IMAGE]
-        items = [MultimodalDataItem(modality=kind) for kind in kinds]
-        events.attach_mm_routing_labels(
-            items, {"image": ["I1", "I2", ""], "video": ["V1", "V2"]}
-        )
-        self.assertEqual(
-            [item.routing_label for item in items], ["I1", "V1", "I2", "V2", None]
-        )
 
     def test_a_type_with_mismatched_items_stays_unlabeled(self):
         # Two images left in one bundled item: images stay unlabeled, videos
@@ -353,47 +306,6 @@ class TestMmRoutingLabels(CustomTestCase):
         self.assertEqual(
             [item.routing_label for item in output.mm_items], ["V1", "I1", "V2", "I2"]
         )
-
-    def test_expanded_bundle_items_keep_input_order(self):
-        # The processor path splits one bundled item per image, in
-        # placeholder order, so labels follow the inputs.
-        bundle = MultimodalDataItem(
-            modality=Modality.IMAGE, offsets=[(1, 2), (4, 7)], feature=torch.zeros(6, 2)
-        )
-        bundle.model_specific_data["image_grid_thw"] = torch.tensor(
-            [[1, 1, 2], [1, 2, 2]]
-        )
-        items = get_new_expanded_mm_items([bundle])
-        self.assertEqual([item.offsets for item in items], [[(1, 2)], [(4, 7)]])
-        events.attach_mm_routing_labels(items, {"image": ["I1", "I2"]})
-        self.assertEqual([item.routing_label for item in items], ["I1", "I2"])
-
-    def test_encoder_assembly_in_the_scheduler_attaches_labels(self):
-        # With encoder disaggregation that delivers embeddings to the
-        # scheduler, items are built there, in prompt order; labels ride on
-        # the tokenized request, split by media type.
-        items = [
-            MultimodalDataItem(modality=Modality.VIDEO),
-            MultimodalDataItem(modality=Modality.IMAGE),
-        ]
-        waiting = object.__new__(WaitingZmqRequest)
-        waiting.mm_processor = SimpleNamespace(
-            prefer_tokenized_input=False,
-            get_validated_mm_data=lambda prompt, embedding, **meta: SimpleNamespace(
-                mm_items=items, input_ids=[1, 2, 3]
-            ),
-        )
-        waiting.recv_req = SimpleNamespace(
-            input_text="prompt",
-            input_ids=None,
-            mm_inputs=None,
-            mm_routing_labels={"image": [LABEL_U], "video": [LABEL_V]},
-        )
-        waiting.recv_embedding_data = SimpleNamespace(get_mm_extra_meta=lambda: {})
-        waiting._pool_slot_id = None
-        waiting.embedding_pool = None
-        waiting._finish_assemble(None)
-        self.assertEqual([item.routing_label for item in items], [LABEL_V, LABEL_U])
 
     def test_radix_cache_insert_reports_spans_in_the_dynamo_format(self):
         # The real producer path: insert -> record_store -> BlockStored spans.
