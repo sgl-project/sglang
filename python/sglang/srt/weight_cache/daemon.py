@@ -497,20 +497,30 @@ class WeightCacheDaemon:
             gc.collect()
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
-        # Log approximate serialized metadata size (not payload-backed bytes).
-        # Only the handle blob carries real weight, so measure it directly:
-        # stringifying every entry would allocate a copy of all handles.
-        total_bytes = sum(
-            len(handle)
-            for handle in (entry.get("handle") for entry in self.state_entries.values())
-            if isinstance(handle, (str, bytes, bytearray))
-        )
+        if self.transport_name == VMM_FD_BACKEND:
+            # vmm_fd entries carry no handle blob: a client maps the packed
+            # allocations, one fd each.
+            exported = (
+                f"{self.transport_backend.num_allocations} allocation(s), "
+                f"{self.transport_backend.exported_bytes / (1 << 30):.2f} GiB"
+            )
+        else:
+            # Approximate serialized metadata size (not payload-backed bytes).
+            # Only the handle blob carries real weight, so measure it directly:
+            # stringifying every entry would allocate a copy of all handles.
+            total_bytes = sum(
+                len(handle)
+                for handle in (
+                    entry.get("handle") for entry in self.state_entries.values()
+                )
+                if isinstance(handle, (str, bytes, bytearray))
+            )
+            exported = f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
             f"Exported {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
-            f"transport={self.transport_backend.name}, "
-            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+            f"transport={self.transport_backend.name}, {exported}"
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:

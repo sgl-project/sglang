@@ -408,6 +408,30 @@ class TestVmmExportAndImport(CustomTestCase):
         self.assertIsNone(daemon.model)
         daemon.transport_backend.close()
 
+    def test_export_log_reports_the_allocations(self):
+        # vmm_fd entries carry no handle blob, so a handle-size estimate would
+        # always read zero.
+        backend = VmmFdTransportBackend(
+            device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
+        )
+        daemon = _make_daemon(_TinyModel(), backend)
+        with (
+            _host_vmm(),
+            self.assertLogs("sglang.srt.weight_cache.daemon", "INFO") as logs,
+        ):
+            daemon._export_state()
+        (line,) = [msg for msg in logs.output if "non-persistent buffers" in msg]
+        self.assertGreater(backend.num_allocations, 1)
+        self.assertTrue(
+            line.endswith(
+                f"transport=vmm_fd, {backend.num_allocations} allocation(s), "
+                f"{backend.exported_bytes / (1 << 30):.2f} GiB"
+            ),
+            line,
+        )
+        self.assertNotIn("metadata size", line)
+        backend.close()
+
     def test_state_dict_hook_output_is_exported_not_the_live_tensor(self):
         model = torch.nn.Linear(2, 3, bias=False)
         live_weight = model.weight.detach().clone()

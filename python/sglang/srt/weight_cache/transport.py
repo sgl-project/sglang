@@ -241,6 +241,11 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         self._storages: Dict[Tuple[int, int, int], torch.UntypedStorage] = {}
         self.exported_bytes = 0
 
+    @property
+    def num_allocations(self) -> int:
+        """Allocations packed (daemon) or mapped (engine)."""
+        return len(self._alloc_sizes)
+
     @classmethod
     def for_export(cls, device_id: int) -> VmmFdTransportBackend:
         """Daemon-side backend for ``device_id``.
