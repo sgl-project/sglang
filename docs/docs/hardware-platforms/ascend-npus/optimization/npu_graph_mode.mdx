@@ -378,6 +378,8 @@ individual kernels.
 | Startup OOM or `Not enough memory` right after the graph capture phase | Graph pool plus per-bucket workspaces do not fit next to the KV pool | Lower `--mem-fraction-static`, or lower `--cuda-graph-max-bs-decode`. See [FAQ item 4](/docs/hardware-platforms/ascend-npus/faq) |
 | Decode regresses when the task queue is set aggressively | `TASK_QUEUE_ENABLE=2` can interfere with graph-launched tasks | Keep `TASK_QUEUE_ENABLE=1`, or `0` on decode-heavy nodes; see [Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables) |
 | Capture succeeds but the first requests return wrong lengths | Stale host-side sequence lengths — an update path that was skipped | Verify the model uses the update path (`actual_seq_lengths_kv` / `context_lens` / `actual_seq_kvlen`) and is not accidentally on the DSA replay-only path |
+| `OSError: Could not load this library: .../torch_npu/lib/libop_plugin_atb.so` on the first decode | NNAL ATB is not on the loader path, so `torch_npu` cannot register its ATB op plugin; the Ascend attention backend needs those ops | Source the ATB environment next to CANN before launching: `source $ASCEND_HOME/nnal/atb/set_env.sh`. If a wrapper script sources CANN `set_env.sh` under `set -u`, the script itself fails on unbound `LD_LIBRARY_PATH` — use `set +u` around it |
+| `--cuda-graph-backend-prefill full` dies during startup: `Capture target prefill CUDA graph begin.` then `KeyError: 'block_tables'` from `ascend_backend.init_forward_metadata_out_graph` | Prefill graph has no Ascend implementation — capture reaches NPU attention metadata that only exists for decode | Keep prefill capture disabled (`--cuda-graph-backend-prefill disabled`, the default) and only graph decode |
 
 ## Verify graph mode on your machine
 
@@ -389,6 +391,24 @@ individual kernels.
    end-to-end latency and throughput.
 5. Re-check `npu-smi info` after capture to see how much HBM the graphs hold,
    then decide whether `max_bs` can grow.
+
+Measured on one Atlas 800I A3 die (CANN 9.1.0, `torch_npu` 2.10.0.post6, SGLang
+0.5.21, Qwen2.5-0.5B-Instruct in bf16, buckets `1 2 4 8`, 8 concurrent requests of
+128 output tokens):
+
+```text
+Capture target decode NPU graph begin. backend=full, num_tokens_per_req=1, bs=[1, 2, 4, 8], avail mem=59.75 GB
+Capture target decode NPU graph end. elapsed=1.51 s, mem usage=0.26 GB, avail mem=59.50 GB.
+Decode batch, #running-req: 8, #token: 2048, token usage: 0.50, npu graph: True, gen throughput (token/s): 987.73, #queue-req: 0
+```
+
+| Mode | p50 latency | p90 latency | Output throughput |
+|---|---|---|---|
+| Graph, `backend=full` | 1.138 s | 1.139 s | 896 tok/s |
+| Graph, `backend=breakable` | 1.109 s | 1.110 s | 920 tok/s |
+| `--disable-cuda-graph` | 2.769 s | 2.770 s | 369 tok/s |
+
+Prefill iterations stay at `npu graph: False` throughout, as expected.
 
 ## See also
 
