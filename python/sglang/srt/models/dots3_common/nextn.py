@@ -25,6 +25,7 @@ from sglang.srt.models.dots3_common.modeling import (
     Dots3DecoderLayer,
     Dots3LanguageModelForCausalLM,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, add_prefix
 
@@ -202,5 +203,5 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
             logger.info("Keeping the checkpoint's MTP-specific input embedding.")
         del self.lm_head.weight
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()

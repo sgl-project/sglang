@@ -88,6 +88,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
@@ -1219,8 +1220,8 @@ class NemotronHForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         if not self.pp_group.is_last_rank:
