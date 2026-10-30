@@ -430,6 +430,9 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 
 ### Disable NUMA balancing
 
+The kernel's background NUMA page migration adds memory-bandwidth overhead and latency jitter to SGLang's large resident
+working set (weights and KV cache); disabling it keeps serving latency stable.
+
 ```bash Command
 sudo sysctl -w kernel.numa_balancing=0
 # Check
