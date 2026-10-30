@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -224,6 +224,13 @@ class PrefillBootstrapQueue:
         )
         self.transfer_backend = transfer_backend
         self.pp_poll_sync_work_list: List = []
+        # Retraction recomputes whose room's previous request has not been
+        # released yet; see add().
+        self.room_waiters = IndexedReqList(
+            ListKind.PD_ROOM_WAITERS,
+            abort=self._abort_room_waiters,
+            req_of=lambda waiter: waiter[0],
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -469,9 +476,41 @@ class PrefillBootstrapQueue:
         if is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
+        deferred = self.kv_manager.deferred_bootstrap
+        if (
+            deferred is not None
+            and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+            and deferred.awaits_release(req.bootstrap_room)
+        ):
+            # Decode heard the previous request's Success from the transfer
+            # worker and recomputes before this side released the room. Every
+            # PP stage releases at the same loop iteration, so they agree.
+            self.room_waiters.join([(req, num_kv_heads)])
+            return
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.join([req])
+
+    def admit_room_waiters(self) -> None:
+        """Enqueue the waiting recomputes whose rooms have been released."""
+        if not self.room_waiters:
+            return
+        deferred = self.kv_manager.deferred_bootstrap
+        waiters = list(self.room_waiters.items())
+        self.room_waiters.clear()
+        for req, num_kv_heads in waiters:
+            if deferred.awaits_release(req.bootstrap_room):
+                self.room_waiters.join([(req, num_kv_heads)])
+            elif self.create_sender(req, num_kv_heads):
+                self.queue.join([req])
+
+    def _abort_room_waiters(self, recv_req: AbortReq) -> None:
+        # Waiters have no sender yet and hold no KV.
+        for req in self.room_waiters.take(lambda req: recv_req.matches(req.rid)):
+            logger.debug(f"Abort room-waiting request. {req.rid=}")
+            self.scheduler.request_retirer.abort_queued(
+                req, finished_reason=recv_req.finished_reason
+            )
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -523,6 +562,8 @@ class PrefillBootstrapQueue:
         ``polls`` is a PP consensus poll of ``self.queue`` the caller already synced.
         """
 
+        if polls is None:
+            self.admit_room_waiters()
         bootstrapped_reqs = []
         indices_to_remove = set()
 
@@ -1520,6 +1561,8 @@ class SchedulerDisaggregationPrefillMixin:
         deadlocks the pipeline.
         """
         bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        # Before the poll sections are fixed: the queue must match on every stage.
+        bootstrap_queue.admit_room_waiters()
         # A pending chunked_req resolves once parked: freeing it here would race
         # its earlier chunks still queued on the forward stream.
         waiting = [

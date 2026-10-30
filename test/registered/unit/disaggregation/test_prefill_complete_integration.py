@@ -15,7 +15,11 @@ from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregatio
 from sglang.srt.arg_groups.serving_hook import handle_other_validations
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServerInfo
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVReceiver,
+    KVTransferError,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
@@ -57,6 +61,9 @@ from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+# The decode manager's control endpoint in TestAllocationIntegration.
+DECODE = ("decode", 2)
 
 
 class _BroadcastGroup:
@@ -298,13 +305,14 @@ class TestAllocationIntegration(CustomTestCase):
                     [b"BOOTSTRAP", b"1", b"decode", b"2"]
                 )
                 self.assertEqual(list(self.wire), [])
-                self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+                self.prefill.conclude_transfer(
+                    bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+                )
                 self.flush()
-                self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+                # The transfer worker's Success reaches decode before release.
+                self.assertEqual(receiver.poll(), KVPoll.Success)
                 self.assertEqual(sender.poll(), KVPoll.Success)
                 sender.clear()
-                self.flush()
-                self.assertEqual(receiver.poll(), KVPoll.Success)
                 receiver.clear()
                 self.assertNotIn(1, self.prefill.deferred_bootstrap.rooms)
                 self.assertNotIn(1, self.prefill.request_status)
@@ -716,7 +724,9 @@ class TestAllocationIntegration(CustomTestCase):
         senders[0].mark_prefill_complete()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-        stages[0].conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        stages[0].conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
         senders[0].clear()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
@@ -724,7 +734,9 @@ class TestAllocationIntegration(CustomTestCase):
         senders[1].mark_prefill_complete()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-        stages[1].conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        stages[1].conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
         senders[1].clear()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Success)
@@ -796,6 +808,7 @@ class TestAllocationIntegration(CustomTestCase):
                 )
             queue.pp_rank, queue.pp_size = pp_rank, len(senders)
             queue.pp_poll_sync_work_list = []
+            queue.room_waiters = IndexedReqList(ListKind.PD_ROOM_WAITERS)
             scheduler.processed_tokens_counter = 0
             queue.scheduler = scheduler
             queue.scheduler_stage_metrics = None
@@ -941,50 +954,96 @@ class TestAllocationIntegration(CustomTestCase):
                     scheduler.handle_bootstrap_failure.call_count, int(pp_size == 1)
                 )
 
-    def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
+    def test_recompute_waits_in_bootstrap_queue_until_room_release(self):
+        """A retraction recompute that reaches prefill before it released the
+        room's previous request would fail to open the room as a duplicate."""
+        table = self.prefill.deferred_bootstrap
+        owner = object()
+        table.open(1, owner)
+        table.register(1, DECODE)
+        table.complete(1, owner)
+        table.conclude(1)
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.kv_manager = SimpleNamespace(deferred_bootstrap=table)
+        queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
+        queue.room_waiters = IndexedReqList(
+            ListKind.PD_ROOM_WAITERS, req_of=lambda waiter: waiter[0]
+        )
+        queue.create_sender = Mock(return_value=True)
+        req = SimpleNamespace(
+            to_finish=None,
+            finished_reason=None,
+            bootstrap_host="prefill",
+            bootstrap_room=1,
+        )
+        queue.add(req, 8)
+        queue.admit_room_waiters()
+        queue.create_sender.assert_not_called()
+        self.assertEqual(list(queue.queue), [])
+        table.close(1, owner, success=True)
+        queue.admit_room_waiters()
+        queue.create_sender.assert_called_once_with(req, 8)
+        self.assertEqual((list(queue.queue), list(queue.room_waiters)), ([req], []))
+
+    def test_success_reaches_decode_before_release_and_resume_waits(self):
+        """The transfer worker tells decode at once. A retraction resume that
+        registers before prefill released the room is carried over to the room's
+        next request rather than attached to the finished one, and no second
+        Success can admit it early."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
         sender.mark_prefill_complete()
         self.flush()
-        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        self.prefill.conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        receiver.clear()
+        new_receiver = self.receiver()
+        self.flush()
+        table = self.prefill.deferred_bootstrap
+        self.assertTrue(table.awaits_release(1))
         self.assertEqual(sender.poll(), KVPoll.Success)
-        self.prefill.req_to_decode_prefix_len[1] = 0
-        self.prefill.transfer_infos[1] = {}
-        send = self.prefill.send_kv_status_message
-        next_transfer = []
-
-        def success(**kwargs):
-            self.assertEqual(kwargs["status"], KVPoll.Success)
-            for table in (
-                self.prefill.deferred_bootstrap.rooms,
-                self.prefill.request_status,
-                self.prefill.req_to_decode_prefix_len,
-                self.prefill.transfer_infos,
-            ):
-                self.assertNotIn(1, table)
-            send(**kwargs)
-            self.flush()
-            self.assertEqual(receiver.poll(), KVPoll.Success)
-            receiver.clear()
-            # Resume immediately, before the old clear() call even returns.
-            new_sender, new_receiver = self.sender(), self.receiver()
-            self.flush()
-            next_transfer.extend((new_sender, new_receiver))
-
-        self.prefill.send_kv_status_message = Mock(side_effect=success)
         sender.clear()
         sender.clear()
-        self.prefill.send_kv_status_message.assert_called_once()
-        new_sender, new_receiver = next_transfer
-        self.assertIs(self.prefill.deferred_bootstrap.rooms[1].owner, new_sender)
-        self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
+        self.assertFalse(table.awaits_release(1))
         self.assertEqual(list(self.wire), [])
+        self.assertEqual(new_receiver.poll(), KVPoll.Bootstrapping)
+        new_sender = self.sender()
+        new_sender.mark_prefill_complete()
+        self.flush()
+        self.assertEqual(new_receiver.poll(), KVPoll.WaitingForInput)
 
-    def test_worker_cleanup_finishes_before_sender_can_report_success(self):
+    def test_prefill_abort_after_worker_success_leaves_decode_alone(self):
+        """Decode already heard Success, so an abort of the request on prefill
+        before release must neither send decode Failed for the room nor cancel
+        decode's retraction resume that registered meanwhile."""
         sender, receiver = self.sender(), self.receiver()
         self.flush()
         sender.mark_prefill_complete()
         self.flush()
+        self.prefill.conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        receiver.clear()
+        new_receiver = self.receiver()
+        self.flush()
+        sender.abort()
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        with self.assertRaises(KVTransferError):
+            sender.failure_exception()
+        self.assertEqual(list(self.wire), [])
+        new_sender = self.sender()
+        new_sender.mark_prefill_complete()
+        self.flush()
+        self.assertEqual(new_receiver.poll(), KVPoll.WaitingForInput)
+
+    def _run_last_chunk_through_worker(self, during_cleanup):
+        """Run room 1's last chunk through the Mooncake transfer worker, calling
+        during_cleanup() after its writes and Success, inside its room cleanup."""
         mgr = self.prefill
         mgr._staging_outstanding = defaultdict(int)
         mgr.session_lock = threading.Lock()
@@ -1013,16 +1072,14 @@ class TestAllocationIntegration(CustomTestCase):
         }
         cleanup_observed = []
 
-        def during_cleanup(room, default=None):
+        def pop(room, default=None):
             # The worker has finished writes and decremented its counter, but
-            # is still deleting room-indexed state. Force a scheduler poll here.
+            # is still deleting room-indexed state.
             self.assertEqual(mgr._staging_outstanding[room], 0)
-            self.assertEqual(sender.poll(), KVPoll.Transferring)
-            self.flush()
-            self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+            during_cleanup()
             cleanup_observed.append(room)
 
-        mgr.req_to_decode_prefix_len = SimpleNamespace(pop=during_cleanup)
+        mgr.req_to_decode_prefix_len = SimpleNamespace(pop=pop)
         chunk = TransferKVChunk(
             room=1,
             index_slice=slice(0, 0),
@@ -1034,19 +1091,81 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.transfer_worker(Mock(get=Mock(side_effect=[chunk, None])), None)
         self.assertEqual(cleanup_observed, [1])
         self.assertNotIn(1, mgr._staging_outstanding)
-        self.assertEqual(sender.poll(), KVPoll.Success)
-        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
         mgr.req_to_decode_prefix_len = {}
+
+    def test_release_waits_for_worker_cleanup(self):
+        """Decode hears Success from the worker before its room cleanup, but
+        prefill's sender, whose release lets a recompute open the room, reports
+        Success only after it."""
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+
+        def during_cleanup():
+            self.assertEqual(sender.poll(), KVPoll.Transferring)
+            self.flush()
+            self.assertEqual(receiver.poll(), KVPoll.Success)
+
+        self._run_last_chunk_through_worker(during_cleanup)
+        self.assertEqual(sender.poll(), KVPoll.Success)
         sender.clear()
+        self.assertEqual(list(self.wire), [])
+
+    def test_abort_after_success_still_waits_for_worker_cleanup(self):
+        """An abort after the worker's Success caches Failed, but the room stays
+        held until the worker's room-keyed cleanup ends; a recompute reusing it
+        would otherwise lose the transfer state the old worker still erases."""
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+
+        def during_cleanup():
+            sender.abort()
+            self.assertEqual(sender.poll(), KVPoll.Transferring)
+
+        self._run_last_chunk_through_worker(during_cleanup)
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        with self.assertRaises(KVTransferError):
+            sender.failure_exception()
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_failure_racing_worker_success_is_decodes_only_notice(self):
+        """An abort landing between the worker's Success decision and its commit
+        fails the room; decode must then hear Failed, never Success."""
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        table = self.prefill.deferred_bootstrap
+        commit = table.conclude
+
+        def abort_first(room):
+            sender.abort()
+            return commit(room)
+
+        table.conclude = abort_first
+        send = Mock(wraps=self.prefill.send_kv_status_message)
+        self.prefill.send_kv_status_message = send
+        self.prefill.conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
+        self.assertEqual(
+            [call.kwargs["status"] for call in send.call_args_list], [KVPoll.Failed]
+        )
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
 
     def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
         sender.mark_prefill_complete()
         self.flush()
-        self.prefill.conclude_transfer(bootstrap_room=1, status=KVPoll.Success)
+        self.prefill.conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
         self.assertEqual(sender.poll(), KVPoll.Success)
         sender.clear()
         self.flush()
