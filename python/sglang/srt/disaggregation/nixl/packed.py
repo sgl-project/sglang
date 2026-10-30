@@ -40,8 +40,6 @@ class PackedKVSender:
         # initialize_xfer over raw descriptors costs tens of ms of CPU per batch.
         # The transport keeps them under names prefixed with `layout`, one per worker.
         self.layout = layout
-        # (side, layout name) of each dlist prepared; side "" is this side.
-        self._prepared: set[tuple[str, str]] = set()
         self.buffer = StagingBuffer(
             size_bytes=size_bytes, device=f"cuda:{gpu_id}", gpu_id=gpu_id
         )
@@ -94,7 +92,7 @@ class PackedKVSender:
 
     def _src_layout(self, page_bytes):
         layout = f"{self.layout}:{page_bytes}"
-        if ("", layout) not in self._prepared:
+        if not self.transport.is_prepared(remote=None, layout=layout):
             slots = self.buffer.get_size() // page_bytes
             run = StridedRun(
                 key=self._buffer_key,
@@ -104,12 +102,11 @@ class PackedKVSender:
                 count=slots,
             )
             self.transport.prepare(remote=None, layout=layout, runs=[run])
-            self._prepared.add(("", layout))
         return layout
 
     def _dst_layout(self, remote, target, dst_keys, page_bytes, dst_num_slots):
         layout = f"{self.layout}:{target}:{page_bytes}:{dst_num_slots}"
-        if (remote.agent_name, layout) not in self._prepared:
+        if not self.transport.is_prepared(remote=remote, layout=layout):
             runs = [
                 StridedRun(
                     key=k,
@@ -121,7 +118,6 @@ class PackedKVSender:
                 for k in dst_keys
             ]
             self.transport.prepare(remote=remote, layout=layout, runs=runs)
-            self._prepared.add((remote.agent_name, layout))
         return layout
 
     def _wait(self, *, raise_on_failure=True):

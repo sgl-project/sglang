@@ -144,7 +144,6 @@ def _packer(buffer_bytes, transfer_results, failed_handles=()):
     packer = object.__new__(PackedKVSender)
     packer.transport = transport
     packer.layout = "kv_pack:0"
-    packer._prepared = set()
     packer.gpu_id = 0
     packer.inflight = None
     packer.buffer = SimpleNamespace(
