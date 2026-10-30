@@ -112,10 +112,6 @@ class LMCacheUnifiedCacheLinker(UnifiedCacheLinker):
             self.pools[PoolName.MAMBA] = params.req_to_token_pool.mamba_pool
         self.num_layers = self._resolve_num_layers(kvcache, params.req_to_token_pool)
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
-        if self._mamba_component is not None:
-            params.req_to_token_pool.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
         self._prefetches: dict[str, Any] = {}
         self._queued_loads: dict[str, _QueuedLoad] = {}
         self._load_batches: dict[int, _StartedLoadBatch] = {}
