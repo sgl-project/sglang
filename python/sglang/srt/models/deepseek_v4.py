@@ -5319,10 +5319,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):
                     raise ValueError(
-                        f"FP8 wo_a is enabled but {name} has "
+                        f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
                         "torch.float8_e4m3fn. This checkpoint does not provide "
-                        "a supported fp8-quantized wo_a."
+                        "a supported fp8-quantized wo_a; rerun with "
+                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)

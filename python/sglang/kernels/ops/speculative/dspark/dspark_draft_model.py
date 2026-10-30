@@ -8,7 +8,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 _IDX_SENTINEL = tl.constexpr(2147483647)
 _MARKOV_BLOCK_V = 256
@@ -350,7 +352,7 @@ def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bo
     quant schemes fall back to the per-linear torch path in execute()."""
     # NPU arch35 serves these linears through its own quant methods, which the
     # Triton fused path below does not handle.
-    if is_npu_arch35():
+    if _is_npu:
         return False
     if _block_quant_stack_applies(wkv_linears=wkv_linears):
         return True
