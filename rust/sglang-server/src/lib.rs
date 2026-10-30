@@ -18,14 +18,15 @@ mod tokenizer_manager;
 mod utils;
 
 pub use api_server::http::generate_hook::{
-    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook,
+    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
+    GenerateTerminal,
 };
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::MmData;
+pub use message::request::{GenerateRequest, MmData};
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{

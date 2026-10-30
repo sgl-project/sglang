@@ -294,6 +294,7 @@ from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
     is_health_check_generate_req,
+    is_war_barrier_enabled,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -305,6 +306,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -740,6 +742,8 @@ class Scheduler(
         self.init_load_publisher()
 
         self.init_load_inquirer()
+
+        self.init_kv_weight_version_tracker()
 
         self.init_output_streamer()
 
@@ -2019,7 +2023,7 @@ class Scheduler(
                 )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = is_war_barrier_enabled()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -2037,12 +2041,17 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def increment_scheduler_iterations(self) -> None:
+        if get_observability().enable_metrics:
+            self.metrics_collector.increment_scheduler_iterations()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -2088,6 +2097,7 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -2291,6 +2301,7 @@ class Scheduler(
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)
         else:
+            self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def send_control_output(self, output, recv_req) -> None:
@@ -2660,6 +2671,14 @@ class Scheduler(
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
+    def init_kv_weight_version_tracker(self) -> None:
+        self.kv_weight_version_tracker = KvWeightVersionTracker.maybe_create(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def init_output_streamer(self) -> None:
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
@@ -2668,6 +2687,7 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
+            skip_tokenizer_init=self.skip_tokenizer_init,
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
             ),
@@ -2758,6 +2778,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
+            kv_weight_version_tracker=self.kv_weight_version_tracker,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
             metrics_reporter=self.metrics_reporter,
@@ -3677,6 +3698,10 @@ class Scheduler(
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                # Finished in place, so a later abort in the same intake skips it.
+                candidate_req.finish_outside_step(
+                    FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE)
+                )
 
         self.send_abort_output(
             _make_abort_req(
@@ -3904,7 +3929,7 @@ class Scheduler(
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.to_finish = None
+        req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
@@ -3913,6 +3938,8 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
+        # No member rows exist before the leader's prefill ends.
+        self.beam_coordinator.retire_group(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
@@ -5838,6 +5865,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # Finished in place, so a later abort in the same intake skips it.
+            if req.finished_reason is None:
+                req.finish_outside_step(FINISH_ABORT())
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5851,8 +5881,6 @@ class Scheduler(
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                if req.finished_reason is None:
-                    req.finished_reason = FINISH_ABORT()
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5869,6 +5897,9 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                # Finished in place, so a later abort in the same intake skips it.
+                if req.finished_reason is None:
+                    req.finish_outside_step(FINISH_ABORT())
                 self._release_aborted_request(req)
                 self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
@@ -5943,17 +5974,19 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_finish`
+                # Abort method 3: `request_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
-                    req.to_finish = FINISH_ABORT(
-                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    req.request_finish(
+                        FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
                     )
                 else:
-                    req.to_finish = FINISH_ABORT()
+                    req.request_finish(FINISH_ABORT())
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -6045,9 +6078,6 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if req.output_ids:
-                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                req.pd_rebootstrap_in_progress = True
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
@@ -6550,4 +6580,5 @@ def _make_abort_req(
             current_version=get_serving().weight_version,
             num_output_tokens=len(req.output_ids),
         ),
+        prefill_weight_versions=req.prefill_weight_versions,
     )

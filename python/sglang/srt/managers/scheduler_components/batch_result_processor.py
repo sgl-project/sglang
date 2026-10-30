@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
@@ -140,6 +141,7 @@ class SchedulerBatchResultProcessor:
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
     req_to_token_pool: ReqToTokenPool
+    kv_weight_version_tracker: Optional[KvWeightVersionTracker]
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
     metrics_reporter: SchedulerMetricsReporter
@@ -328,6 +330,9 @@ class SchedulerBatchResultProcessor:
             if result.indexer_topk_output is not None:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
+            if (record := result.kv_weight_version_record) is not None:
+                record.finalize(tracker=self.kv_weight_version_tracker)
+                result.kv_weight_version_record = None
 
             (
                 logits_output,
@@ -403,9 +408,11 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    if (x := self.kv_weight_version_tracker) is not None:
+                        x.fill_req_prefill_weight_versions(req)
 
                     if discard_finish_reason is not None:
-                        req.to_finish = discard_finish_reason
+                        req.request_finish(discard_finish_reason)
                         req.update_finish_state(0)
                     elif req.beam_group is not None:
                         # The relay point already replaced the sampled-token
@@ -526,7 +533,7 @@ class SchedulerBatchResultProcessor:
                     req.discard_output_reason is not None
                     and req.inflight_middle_chunks <= 0
                 ):
-                    req.to_finish = req.discard_output_reason
+                    req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                     req.time_stats.set_completion_time()
@@ -537,6 +544,8 @@ class SchedulerBatchResultProcessor:
                     req.pooled_hidden_state = phs[i]
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    if (x := self.kv_weight_version_tracker) is not None:
+                        x.fill_req_prefill_weight_versions(req)
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.update_finish_state()
@@ -780,10 +789,12 @@ class SchedulerBatchResultProcessor:
                 logger.error(
                     f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                 )
-                req.to_finish = FINISH_ABORT(
-                    f"Grammar accept_token failed: {e}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "InternalServerError",
+                req.request_finish(
+                    FINISH_ABORT(
+                        f"Grammar accept_token failed: {e}",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "InternalServerError",
+                    )
                 )
         req.grammar.finished = req.finished()
 
@@ -926,10 +937,12 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT(
-                f"Grammar accept_token failed: {e}",
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "InternalServerError",
+            req.request_finish(
+                FINISH_ABORT(
+                    f"Grammar accept_token failed: {e}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                )
             )
         return retained
 
@@ -1017,6 +1030,9 @@ class SchedulerBatchResultProcessor:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if (record := result.kv_weight_version_record) is not None:
+            record.finalize(tracker=self.kv_weight_version_tracker)
+            result.kv_weight_version_record = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -1094,7 +1110,7 @@ class SchedulerBatchResultProcessor:
                     status=status
                 )
             if sampling_mask_finish_reason is not None:
-                req.to_finish = sampling_mask_finish_reason
+                req.request_finish(sampling_mask_finish_reason)
                 new_accept_len = 0
             else:
                 req.output_ids.extend(next_token_id)

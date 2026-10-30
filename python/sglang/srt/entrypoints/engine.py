@@ -1668,7 +1668,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def update_weights_from_distributed(
         self,
         names: list[str],
-        dtypes: list[str],
+        dtypes: list[Union[str, torch.dtype]],
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
@@ -1677,7 +1677,8 @@ class Engine(EngineScoreMixin, EngineBase):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
-            dtypes=dtypes,
+            # msgpack IPC carries dtype names only.
+            dtypes=[str(dtype).removeprefix("torch.") for dtype in dtypes],
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
