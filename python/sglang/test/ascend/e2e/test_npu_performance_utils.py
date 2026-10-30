@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     generate_gsm8k_dataset,
+    generate_gsm8k_shared_prefix_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
@@ -217,7 +218,15 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
 BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
-BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+# BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+# Idle timeout: no output for this long means the benchmark is stuck, then
+# force-kill. Long silent phases are normal here: the server may still be
+# loading weights or capturing DSPARK graphs while the bench process waits,
+# and triton JIT compilation is quiet for minutes (run 40705231433 lost
+# both attempts to the old 300s default). Override via env if needed.
+BENCHMARK_STDOUT_IDLE_TIMEOUT = int(
+    os.environ.get("SGLANG_BENCH_STDOUT_IDLE_TIMEOUT", "1800")
+)
 BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 
 # Test parameters
@@ -407,6 +416,28 @@ def run_bench_serving(
 
     write_pkg_info_to_file(result_file)
 
+    if dataset_name == "gsm8k-shared-prefix":
+        # Natural-text shared-prefix dataset: bench_serving's built-in
+        # generated-shared-prefix prompts are random token ids, which the
+        # DSPARK draft cannot predict (accept len ~1.6, run 40993824705).
+        # Pad one GSM8K QA pool to 101% of input_len and emit identical
+        # rows, so random-mode truncation leaves every request
+        # byte-identical - the dev acceptance shape
+        # (sharegpt_natural_shared_131072_100cache_480.json, whose
+        # divergence points sit past the truncation length on purpose).
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix.json"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+            )
+        dataset_path = dataset_file
+        dataset_name = "random"
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
+
     if dataset_name == "generated-shared-prefix":
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
@@ -452,6 +483,12 @@ def run_bench_serving(
             cmd_args.extend(["--num-prompts", str(num_prompts)])
         if request_rate:
             cmd_args.extend(["--request-rate", str(request_rate)])
+        if warmup_requests:
+            # Prime the shared prefix before the measured pass: warmup
+            # requests reuse the first GSP prompt with output capped at 32
+            # tokens, so a handful of them (one per DP rank) fills every
+            # rank's radix cache with the system prompt.
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
         if temperature is not None:
             cmd_args.extend(["--temperature", str(temperature)])
         if top_p is not None:
@@ -694,6 +731,27 @@ def run_aisbench(
             )
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
+    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
+        # aisbench retry of the pure-decode case (user-requested): identical
+        # natural-text rows (one GSM8K QA pool padded past input_len) through
+        # the PLAIN aisbench perf path - no prefix-tool chain involved. The
+        # known risk is dataset dedup of identical rows (run 40431214784 saw
+        # 12 rows collapse to 4 there): watch "Total data num" in the log -
+        # 12 means no dedup, fewer means collapse. The sh wrapper is fed
+        # dataset-type gsm8k; the file layout is a plain gsm8k jsonl.
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix.jsonl"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+                output_format="aisbench",
+            )
+        dataset_path = dataset_file
+        dataset_type = AISBENCHMARK_DATASET_GSM8K
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
@@ -1302,7 +1360,8 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
@@ -1368,7 +1427,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         sglang_thread.start()
 
-        wait_server_ready(f"{cls.base_url}/health")
+        wait_server_ready(
+            f"{cls.base_url}/health", deep_url=f"{cls.base_url}/model_info"
+        )
 
         logger.info(
             f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
@@ -1435,7 +1496,8 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
@@ -1606,7 +1668,8 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
