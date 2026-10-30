@@ -181,9 +181,18 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
+    def _platform(self, *, is_sail: bool):
+        # DeepEP under dp attention is admitted on SAIL only.
+        return patch(
+            f"{_HOOK}.get_platform", return_value=SimpleNamespace(is_sail=is_sail)
+        )
+
     def test_only_megamoe_is_admitted(self):
         """Both sides of the allowlist: megamoe passes, others raise by name."""
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+        with (
+            self._platform(is_sail=False),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+        ):
             _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
@@ -201,11 +210,63 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
                     )
                 )
 
-    def test_a2a_backend_with_compact_verify_mode_raises(self):
-        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
-        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+    def test_sail_admits_deepep(self):
+        """SAIL wires DeepEP under dp attention through its DeepGEMM MoE stack."""
+        args = self._dp_server_args(moe_a2a_backend="deepep")
+        with (
+            self._platform(is_sail=True),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+        ):
+            _handle_dspark(args)
+        self.assertEqual(resolution_result(args, "moe_a2a_backend"), "deepep")
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 6)
+
+    def test_a2a_backend_with_non_static_verify_mode_raises(self):
+        """An a2a backend sizes its dispatch buffers from a fixed verify width."""
+        for mode in ("compact", "cap-accept"):
+            for backend in ("deepep", "megamoe", "mori"):
+                with self.subTest(mode=mode, backend=backend):
+                    server_args = self._dp_server_args(moe_a2a_backend=backend)
+                    with (
+                        self._platform(is_sail=True),
+                        envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "static"):
+                            _handle_dspark(server_args)
+
+    def test_prefill_coordination_without_a2a_requires_static(self):
+        """Coordination is an independent trigger: 'none' still needs static."""
+        server_args = self._dp_server_args(moe_a2a_backend="none")
+        with (
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+        ):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
+
+    def test_single_attention_dp_rank_keeps_cp_exemption(self):
+        args = self._dp_server_args(moe_a2a_backend="deepep")
+        args.attn_dp_size = 1
+        args.enable_dp_lm_head = False
+        args.attn_cp_size = 2
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+    def test_npu_keeps_backend_exemption(self):
+        args = self._dp_server_args(moe_a2a_backend="ascend_fuseep")
+        args.device = "npu"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _handle_dspark(args)
+
+    def test_deepep_rejects_mismatched_draft_backend(self):
+        args = self._dp_server_args(moe_a2a_backend="deepep")
+        args.speculative_moe_a2a_backend = "none"
+        with (
+            self._platform(is_sail=True),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+        ):
+            with self.assertRaisesRegex(ValueError, "must match"):
+                _handle_dspark(args)
 
 
 if __name__ == "__main__":
