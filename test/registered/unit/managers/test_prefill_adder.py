@@ -389,6 +389,34 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertIsNone(req.extend_end)
                 self.assertEqual(adder.memory_budget.total_offset, before)
 
+    def test_sharded_continuation_waits_for_memory_but_not_for_a_short_chunk(self):
+        """Under KV sharding the chunk ends on a page; when that leaves nothing,
+        the continuation waits if memory bounds it, else runs the chunk as is."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        cases = [
+            # (free tokens, chunk tokens, expected extend_len; None parks)
+            (1000, 64, 64),
+            (3, 64, None),
+            (1000, 3, 3),
+        ]
+        for available, chunk, expected in cases:
+            with self.subTest(available=available, chunk=chunk):
+                self.mock_token_allocator.available_size.return_value = available
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=16, rem_chunk_tokens=chunk
+                )
+                adder.kv_shard_granule = 16
+                req = self.create_shared_req("continuation")
+                req.prefix_len = 16
+                req.full_untruncated_fill_ids = list(range(200))
+                self.assertIs(adder.add_chunked_req(req), req)
+                if expected is None:
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(req.extend_end)
+                else:
+                    self.assertEqual(req.extend_len, expected)
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without
