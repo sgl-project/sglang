@@ -3,13 +3,21 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.batch_overlap import operations
+from sglang.srt.batch_overlap import operations, prefill_mbo
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+
+# Layers with prefill microbatch stages (op_mbo_attn, op_mbo_ffn). A model
+# whose layer types alternate is named by its first layer's type.
+_PREFILL_MBO_LAYERS = (
+    "Glm5NextDecoderLayer",
+    "Qwen3_5LinearDecoderLayer",
+    "Qwen3_5AttentionDecoderLayer",
+)
 
 
 @dataclass
@@ -63,6 +71,24 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif (
+            layer_name in _PREFILL_MBO_LAYERS
+            and prefill_mbo.active_child_backends() is not None
+        ):
+            # Only prefill microbatches; these models have no two-batch overlap.
+            ops: List[Operation] = []
+            for layer in layers:
+                ops += [
+                    layer.op_mbo_attn,
+                    operations.YieldOperation(),
+                    layer.op_mbo_ffn,
+                    operations.YieldOperation(),
+                ]
+            # A model whose last FFN sum stays outside the residual stream
+            # writes it in a finishing operation.
+            if hasattr(layers[-1], "op_mbo_finish"):
+                ops.append(layers[-1].op_mbo_finish)
+            return OperationsStrategy(operations=ops, tbo_delta_stages=0)
         # Other model families do not need to import the V4 implementation.
         from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
 

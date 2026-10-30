@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.batch_overlap.operations import (
     execute_operations,
     execute_overlapped_operations,
@@ -959,7 +960,7 @@ def model_forward_stages(
 ):
     """Run stage operations with an independent residual stream per microbatch."""
     strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        layers, forward_batch.global_forward_mode or forward_batch.forward_mode
     )
     inputs = dict(
         positions=positions,
@@ -996,12 +997,15 @@ def model_forward_stages(
         if _is_hip
         else deep_gemm_wrapper.configure_deep_gemm_num_sms(strategy.deep_gemm_num_sms)
     )
-    with context:
-        outputs = execute_overlapped_operations(
-            inputs_arr=parts,
-            operations_arr=[strategy.operations] * 2,
-            delta_stages=[0, strategy.tbo_delta_stages],
-        )
+    try:
+        with context:
+            outputs = execute_overlapped_operations(
+                inputs_arr=parts,
+                operations_arr=[strategy.operations] * 2,
+                delta_stages=[0, strategy.tbo_delta_stages],
+            )
+    finally:
+        prefill_mbo.end_forward()
     for output in outputs:
         output["residual"] = residual_batch.stream_of(output["forward_batch"])
     hidden_states, forward_batch.residual_stream = _model_forward_tbo_merge_outputs(
@@ -1090,7 +1094,8 @@ def _model_forward_filter_inputs(
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
-    positions = positions[token_slice]
+    # Tokens are the last dim of positions: M-RoPE positions are [3, num_tokens].
+    positions = positions[..., token_slice]
 
     assert output_forward_batch.tbo_padded_len is not None
     padded_len = output_forward_batch.tbo_padded_len
@@ -1105,10 +1110,17 @@ def _model_forward_filter_inputs(
         res[: x.shape[0]] = x
         return res
 
+    def _pad_positions(x):
+        if x.shape[-1] == padded_len:
+            return x
+        res = torch.zeros((*x.shape[:-1], padded_len), dtype=x.dtype, device=x.device)
+        res[..., : x.shape[-1]] = x
+        return res
+
     return dict(
         hidden_states=_pad(hidden_states),
         residual=_pad(residual),
-        positions=_pad(positions),
+        positions=_pad_positions(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
     )
