@@ -2729,6 +2729,7 @@ def wrap_object_fields_as_pickle(
 def unwrap_object_fields_from_pickle(
     obj: Optional[Union[MultimodalProcessorOutput, PositionalEmbeds]],
 ):
+    """Inverse of wrap_object_fields_as_pickle."""
     if obj is None or _USE_PICKLE_IPC:
         return obj
     return obj.map_object_fields(unpickle_values)

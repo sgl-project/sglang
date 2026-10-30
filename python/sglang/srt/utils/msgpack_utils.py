@@ -15,8 +15,9 @@ _MSGPACK_EXT_ARRAY = 1
 _MSGPACK_EXT_TORCH_TENSOR = 2
 _MSGPACK_EXT_NP_ARRAY = 3
 _MSGPACK_EXT_SHM_POINTER_MM_DATA = 4
-# ext_hook leaves it an Ext, so a forwarding hop re-sends it unchanged;
-# unpickle_values restores it on the receiver.
+# A pickled value in an object-typed field, where a PickleWrapper struct would
+# decode as a dict. ext_hook leaves it an Ext, so a forwarding hop re-sends it
+# unchanged; unpickle_values restores it on the receiver.
 _MSGPACK_EXT_PICKLED_VALUE = 6
 _MSGPACK_BUFFER_METADATA_SIZE = struct.Struct(">I")
 # Values that decode from msgpack IPC with the same type and contents.
