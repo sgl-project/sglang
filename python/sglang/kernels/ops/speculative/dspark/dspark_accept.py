@@ -153,7 +153,7 @@ def _accept_sampling_core(
 
         # each request's vocabulary over many blocks, not one
         if chain_rejection_supported(target_probs, draft_probs):
-            sampling_fn = _chain_rejection_fn(chain_rejection_sampling)
+            sampling_fn = chain_rejection_sampling
     sampling_fn(
         predicts=predicts,
         accept_index=accept_index,
@@ -178,21 +178,6 @@ def _accept_sampling_core(
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
     return correct_len, cap_trim_lens, accept_index, predicts
-
-
-def _chain_rejection_fn(kernel):
-    """``chain_speculative_sampling_triton``'s keywords onto ``chain_rejection_sampling``."""
-
-    def run(*, predicts, accept_index, accept_token_num, candidates, retrive_index,
-            uniform_samples, uniform_samples_for_final_sampling, target_probs,
-            draft_probs, **_unused):  # fmt: skip
-        kernel(
-            predicts, accept_index, accept_token_num, candidates, retrive_index,
-            uniform_samples, uniform_samples_for_final_sampling, target_probs,
-            draft_probs,
-        )  # fmt: skip
-
-    return run
 
 
 def accept_sampling(

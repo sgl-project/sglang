@@ -592,8 +592,7 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH = EnvBool(
         SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
     )
-    # ROCm speculative verify: temperature, softmax and top-p in one kernel, each row
-    # over many blocks (target rows without top-k; DSpark draft rows).
+    # ROCm speculative verify: temperature, softmax and top-p over many blocks a row
     SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P = EnvBool(
         SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
     )

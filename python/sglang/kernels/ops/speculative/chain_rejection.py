@@ -80,8 +80,13 @@ def chain_rejection_sampling(
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    **_tree_args,
 ) -> None:
-    """``chain_speculative_sampling_triton``'s classic chain path (no block verification)."""
+    """``chain_speculative_sampling_triton``'s classic chain path (no block verification),
+    taking its keywords; a chain's tree arguments are unused."""
+    assert threshold_single == 1.0 and threshold_acc == 1.0
     bs, _, vocab = target_probs.shape
     dev = target_probs.device
     work = _work_for(bs, dev)
