@@ -106,6 +106,20 @@ class TestResolveNextnQuantConfigPtpcOn(CustomTestCase):
             out.quant_config.get("layer_quant_config", {}),
         )
 
+    def test_loader_mapping_preserves_ptpc_detection(self):
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+        cfg = _quark_cfg()
+        cfg.kv_cache_group = None
+        hf = SimpleNamespace(num_hidden_layers=LAYER, num_nextn_predict_layers=1)
+        mapper = GlmMoeDsaForCausalLMNextN.get_hf_to_sglang_mapper(hf)
+        QuarkConfig.apply_weight_name_mapper(cfg, mapper)
+        with patch(_PTPC_ENV, return_value=True):
+            self.assertTrue(should_apply_glm_nextn_moe_ptpc(cfg, LAYER))
+        out = self._resolve(cfg, flag=True)
+        scheme = out.quant_config["layer_quant_config"]["model.decoder.mlp.experts"]
+        self.assertEqual(scheme["weight"]["qscheme"], "per_channel")
+
     def test_flag_on_assigns_ptpc_scheme_instead_of_bf16_exclude(self):
         src = _quark_cfg()
         out = self._resolve(src, flag=True)
