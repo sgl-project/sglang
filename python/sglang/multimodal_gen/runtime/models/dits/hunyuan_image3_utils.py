@@ -384,6 +384,10 @@ class ImageKVCacheManager:
     def __init__(self):
         self._prefix_kv: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
+    def clear(self):
+        """Release cached prefix storage after a generation finishes."""
+        self._prefix_kv.clear()
+
     def __call__(self, query, key, value, attn_metadata, attention_mask=None):
         total_tokens = query.shape[0]
         bs = len(attn_metadata.query_lens)
@@ -419,9 +423,12 @@ class ImageKVCacheManager:
         slot = attn_metadata.cache_slot
         prefix_len = attn_metadata.prefix_len
         if attn_metadata.first_step:
+            # Slicing a contiguous prefix can still retain the full-sequence
+            # allocation (notably when bs == 1). Own compact storage so the
+            # generation cache does not pin the step's full K/V tensors.
             self._prefix_kv[slot] = (
-                key[:, :prefix_len].contiguous(),
-                value[:, :prefix_len].contiguous(),
+                key[:, :prefix_len].clone(),
+                value[:, :prefix_len].clone(),
             )
             return key, value
 

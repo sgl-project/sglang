@@ -859,6 +859,11 @@ class HunyuanImage3Model(nn.Module):
     def get_input_embeddings(self, input_ids):
         return self.embed_tokens(input_ids)
 
+    def clear_prefix_kv_cache(self):
+        """Release per-layer prefix K/V tensors held for the active generation."""
+        for layer in self.layers:
+            layer.self_attn.image_attn.clear()
+
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         if input_embeds is not None:

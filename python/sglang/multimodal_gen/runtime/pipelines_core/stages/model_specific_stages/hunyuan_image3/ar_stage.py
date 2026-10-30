@@ -1334,155 +1334,167 @@ class HunyuanImage3AR(PipelineStage):
             all_cond_t = all_cond_t.to(device)
         timesteps_device = timesteps.to(device)
 
-        for step_idx, t in enumerate(self.progress_bar(timesteps, batch=head)):
-            latent_model_input = scheduler.scale_model_input(latents, t)
-            if do_cfg:
-                latent_model_input = torch.cat([latent_model_input] * cfg_factor, dim=0)
-            latent_bs = latent_model_input.shape[0]
-            t_expand = timesteps_device[step_idx].repeat(latent_bs)
+        try:
+            for step_idx, t in enumerate(self.progress_bar(timesteps, batch=head)):
+                latent_model_input = scheduler.scale_model_input(latents, t)
+                if do_cfg:
+                    latent_model_input = torch.cat(
+                        [latent_model_input] * cfg_factor, dim=0
+                    )
+                latent_bs = latent_model_input.shape[0]
+                t_expand = timesteps_device[step_idx].repeat(latent_bs)
 
-            with (
-                torch.autocast(
-                    device_type=current_platform.device_type,
-                    dtype=torch.bfloat16,
-                    enabled=True,
-                ),
-                set_forward_context(
-                    current_timestep=step_idx,
-                    attn_metadata=None,
-                    forward_batch=head,
-                ),
-            ):
-                # Re-embed the full input_ids every step; shortening produces garbage.
-                hidden_states = self.ar_model.model.get_input_embeddings(input_ids)
-                hidden_states = self._instantiate_vae_tokens_first_step(
-                    hidden_states,
-                    latent_model_input,
-                    t_expand,
-                    image_index,
-                )
-                if timestep_index is not None:
-                    hidden_states = self._instantiate_timestep_tokens(
+                with (
+                    torch.autocast(
+                        device_type=current_platform.device_type,
+                        dtype=torch.bfloat16,
+                        enabled=True,
+                    ),
+                    set_forward_context(
+                        current_timestep=step_idx,
+                        attn_metadata=None,
+                        forward_batch=head,
+                    ),
+                ):
+                    # Re-embed the full input_ids every step; shortening produces garbage.
+                    hidden_states = self.ar_model.model.get_input_embeddings(
+                        input_ids
+                    )
+                    hidden_states = self._instantiate_vae_tokens_first_step(
                         hidden_states,
+                        latent_model_input,
                         t_expand,
-                        timestep_index,
+                        image_index,
                     )
-
-                if has_cond_encoded:
-                    hidden_states = self._scatter_cond_vae_tokens_batched(
-                        hidden_states,
-                        per_request_vae_embeds,
-                        cond_vae_slices_rows,
-                        n_req,
-                        do_cfg,
-                    )
-                    hidden_states = self._scatter_cond_vit_tokens_batched(
-                        hidden_states,
-                        per_request_vit_embeds,
-                        cond_vit_slices_rows,
-                        n_req,
-                        do_cfg,
-                    )
-                    if (
-                        cond_timestep_scatter_index is not None
-                        and all_cond_t is not None
-                    ):
-                        cond_ts_index = cond_timestep_scatter_index
-                        # Legacy tokenizer shapes: 1-D [P] or [1, P] must be
-                        # expanded to one index row per sequence row.
-                        if cond_ts_index.ndim == 1:
-                            cond_ts_index = cond_ts_index.unsqueeze(0).expand(
-                                actual_batch_size, -1
-                            )
-                        elif cond_ts_index.shape[0] == 1 and actual_batch_size > 1:
-                            cond_ts_index = cond_ts_index.expand(actual_batch_size, -1)
-                        expected_t = cond_ts_index.shape[0] * cond_ts_index.shape[1]
-                        if all_cond_t.shape[0] != expected_t:
-                            logger.error(
-                                "cond timestep scatter mismatch: "
-                                "all_cond_t=%d n_req=%d cfg_factor=%d "
-                                "conds_per_req=%s scatter_index=%s "
-                                "cond_vae_slices=%s",
-                                all_cond_t.shape[0],
-                                n_req,
-                                cfg_factor,
-                                [len(j) for j in per_request_joint_infos],
-                                tuple(cond_timestep_scatter_index.shape),
-                                [len(s) for s in cond_vae_slices_rows],
-                            )
-                            raise RuntimeError(
-                                "cond timestep scatter mismatch: "
-                                f"{all_cond_t.shape[0]} t values for "
-                                f"{cond_ts_index.shape} scatter index"
-                            )
+                    if timestep_index is not None:
                         hidden_states = self._instantiate_timestep_tokens(
                             hidden_states,
-                            all_cond_t,
-                            cond_ts_index,
+                            t_expand,
+                            timestep_index,
                         )
 
-                # CFG: run cond/uncond halves separately (halves peak attention memory).
-                if do_cfg:
-                    half = hidden_states.shape[0] // 2
-                    # With a shared half-mask, reuse it for both calls instead of
-                    # slicing a full-batch mask whose two halves are never both live.
-                    cond_mask = attention_mask if mask_shared else attention_mask[:half]
-                    uncond_mask = (
-                        attention_mask if mask_shared else attention_mask[half:]
-                    )
-                    out_cond = self._backbone_forward(
-                        num_image_tokens,
-                        hidden_states[:half],
-                        cond_mask,
-                        (cos[:half], sin[:half]),
-                        step_idx == 0,
-                        timestep=t_expand[:half],
-                        prefix_len=prefix_len,
-                        cache_slot=0,
-                        attn_segments=attn_segments and attn_segments[:half],
-                    )
-                    out_uncond = self._backbone_forward(
-                        num_image_tokens,
-                        hidden_states[half:],
-                        uncond_mask,
-                        (cos[half:], sin[half:]),
-                        step_idx == 0,
-                        timestep=t_expand[half:],
-                        prefix_len=prefix_len,
-                        cache_slot=1,
-                        attn_segments=attn_segments and attn_segments[half:],
-                    )
-                    backbone_out = torch.cat([out_cond, out_uncond], dim=0)
-                else:
-                    backbone_out = self._backbone_forward(
-                        num_image_tokens,
-                        hidden_states,
-                        attention_mask,
-                        (cos, sin),
-                        step_idx == 0,
-                        timestep=t_expand,
-                        prefix_len=prefix_len,
-                        attn_segments=attn_segments,
+                    if has_cond_encoded:
+                        hidden_states = self._scatter_cond_vae_tokens_batched(
+                            hidden_states,
+                            per_request_vae_embeds,
+                            cond_vae_slices_rows,
+                            n_req,
+                            do_cfg,
+                        )
+                        hidden_states = self._scatter_cond_vit_tokens_batched(
+                            hidden_states,
+                            per_request_vit_embeds,
+                            cond_vit_slices_rows,
+                            n_req,
+                            do_cfg,
+                        )
+                        if (
+                            cond_timestep_scatter_index is not None
+                            and all_cond_t is not None
+                        ):
+                            cond_ts_index = cond_timestep_scatter_index
+                            # Legacy tokenizer shapes: 1-D [P] or [1, P] must be
+                            # expanded to one index row per sequence row.
+                            if cond_ts_index.ndim == 1:
+                                cond_ts_index = cond_ts_index.unsqueeze(0).expand(
+                                    actual_batch_size, -1
+                                )
+                            elif cond_ts_index.shape[0] == 1 and actual_batch_size > 1:
+                                cond_ts_index = cond_ts_index.expand(
+                                    actual_batch_size, -1
+                                )
+                            expected_t = cond_ts_index.shape[0] * cond_ts_index.shape[1]
+                            if all_cond_t.shape[0] != expected_t:
+                                logger.error(
+                                    "cond timestep scatter mismatch: "
+                                    "all_cond_t=%d n_req=%d cfg_factor=%d "
+                                    "conds_per_req=%s scatter_index=%s "
+                                    "cond_vae_slices=%s",
+                                    all_cond_t.shape[0],
+                                    n_req,
+                                    cfg_factor,
+                                    [len(j) for j in per_request_joint_infos],
+                                    tuple(cond_timestep_scatter_index.shape),
+                                    [len(s) for s in cond_vae_slices_rows],
+                                )
+                                raise RuntimeError(
+                                    "cond timestep scatter mismatch: "
+                                    f"{all_cond_t.shape[0]} t values for "
+                                    f"{cond_ts_index.shape} scatter index"
+                                )
+                            hidden_states = self._instantiate_timestep_tokens(
+                                hidden_states,
+                                all_cond_t,
+                                cond_ts_index,
+                            )
+
+                    # CFG: run cond/uncond halves separately (halves peak attention memory).
+                    if do_cfg:
+                        half = hidden_states.shape[0] // 2
+                        # With a shared half-mask, reuse it for both calls instead of
+                        # slicing a full-batch mask whose two halves are never both live.
+                        cond_mask = (
+                            attention_mask if mask_shared else attention_mask[:half]
+                        )
+                        uncond_mask = (
+                            attention_mask if mask_shared else attention_mask[half:]
+                        )
+                        out_cond = self._backbone_forward(
+                            num_image_tokens,
+                            hidden_states[:half],
+                            cond_mask,
+                            (cos[:half], sin[:half]),
+                            step_idx == 0,
+                            timestep=t_expand[:half],
+                            prefix_len=prefix_len,
+                            cache_slot=0,
+                            attn_segments=attn_segments and attn_segments[:half],
+                        )
+                        out_uncond = self._backbone_forward(
+                            num_image_tokens,
+                            hidden_states[half:],
+                            uncond_mask,
+                            (cos[half:], sin[half:]),
+                            step_idx == 0,
+                            timestep=t_expand[half:],
+                            prefix_len=prefix_len,
+                            cache_slot=1,
+                            attn_segments=attn_segments and attn_segments[half:],
+                        )
+                        backbone_out = torch.cat([out_cond, out_uncond], dim=0)
+                    else:
+                        backbone_out = self._backbone_forward(
+                            num_image_tokens,
+                            hidden_states,
+                            attention_mask,
+                            (cos, sin),
+                            step_idx == 0,
+                            timestep=t_expand,
+                            prefix_len=prefix_len,
+                            attn_segments=attn_segments,
+                        )
+
+                    pred = self._extract_diffusion_pred(
+                        backbone_out,
+                        t_expand,
+                        image_index,
+                        token_h,
+                        token_w,
                     )
 
-                pred = self._extract_diffusion_pred(
-                    backbone_out,
-                    t_expand,
-                    image_index,
-                    token_h,
-                    token_w,
+                pred = pred.float()
+
+                if do_cfg:
+                    pred_cond, pred_uncond = pred.chunk(2)
+                    pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+
+                latent_dtype = latents.dtype
+                latents = scheduler.step(pred, t, latents, return_dict=False)[0].to(
+                    dtype=latent_dtype
                 )
 
-            pred = pred.float()
-
-            if do_cfg:
-                pred_cond, pred_uncond = pred.chunk(2)
-                pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
-
-            latent_dtype = latents.dtype
-            latents = scheduler.step(pred, t, latents, return_dict=False)[0].to(
-                dtype=latent_dtype
-            )
+        finally:
+            self.ar_model.model.clear_prefix_kv_cache()
 
         # [B, C, H, W] -> [B, C, 1, H, W]
         latents = latents.to(torch.bfloat16)
