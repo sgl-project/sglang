@@ -360,13 +360,19 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=(
-                # page_unified's block carries both components, so its page is
-                # twice page_size * layout_dim.
-                self.page_unified_layout.bytes_per_page
-                if self.layout == "page_unified"
-                else self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                # Direct copies coalesce consecutive pages within a layer.
+                # Keep each entire layer in one registered range.
+                self.size * self.token_stride_size
+                if self.layout == "layer_first"
+                # page_unified's block carries both components, so its page
+                # is twice page_size * layout_dim.
+                else (
+                    self.page_unified_layout.bytes_per_page
+                    if self.layout == "page_unified"
+                    else self.page_size * self.layout_dim
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                )
             ),
         )
         return buffer
@@ -1063,9 +1069,15 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=(
-                self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
-                else None
+                # Direct copies coalesce consecutive pages within a layer.
+                # Keep each entire layer in one registered range.
+                self.size * self.token_stride_size
+                if self.layout == "layer_first"
+                else (
+                    self.page_size * self.layout_dim
+                    if self.layout in ("page_first", "page_first_direct")
+                    else None
+                )
             ),
         )
 
