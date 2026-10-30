@@ -22,6 +22,7 @@ impl CoreHandle {
         mut request: GenerateRequest,
     ) -> Result<CoreCall, CoreError> {
         let created_at = Instant::now();
+        self.set_default_priority(&mut request);
         let mut generation = self
             .inner
             .generations
@@ -47,6 +48,7 @@ impl CoreHandle {
         log_metrics: bool,
     ) -> Result<CoreCall, CoreError> {
         let created_at = Instant::now();
+        self.set_default_priority(&mut request);
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         let metrics = log_metrics
@@ -68,6 +70,9 @@ impl CoreHandle {
         let created_at = Instant::now();
         if requests.is_empty() {
             return Ok(Vec::new());
+        }
+        for request in &mut requests {
+            self.set_default_priority(request);
         }
         let mut generations: Vec<_> = requests
             .iter()
@@ -127,6 +132,15 @@ impl CoreHandle {
 
     fn generation_call(&self, runtime: RuntimeCall, metrics: Option<RequestMetrics>) -> CoreCall {
         CoreCall::new(runtime, self.inner.metadata.weight_version.clone(), metrics)
+    }
+
+    /// Python `_set_default_priority`: an unset priority takes the configured
+    /// default instead of ranking as the scheduler's lowest. Applied before
+    /// the metrics pick the request's `priority` label, as Python does.
+    fn set_default_priority(&self, request: &mut GenerateRequest) {
+        if request.priority.is_none() {
+            request.priority = self.inner.metadata.default_priority;
+        }
     }
 
     fn request_metrics(
@@ -460,9 +474,12 @@ impl Drop for Generation {
 
 #[cfg(test)]
 mod tests {
+    use super::super::handle::{CoreConfig, CoreMetadata};
     use super::*;
+    use crate::api_server::core::FrontendMetrics;
     use crate::api_server::core::{CoreErrorKind, CoreOutput};
     use crate::api_server::handlers::test_utils::*;
+    use crate::message::config::DisaggregationMode;
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
     use crate::message::response::ChunkEvent;
@@ -540,6 +557,71 @@ mod tests {
         assert!(call.recv().await.is_none());
         drop(call);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// A generation that sets no priority is scheduled and counted under the
+    /// configured default, as Python's `_set_default_priority` runs before
+    /// `collect_metrics` picks the label.
+    #[tokio::test]
+    async fn unset_priority_takes_the_default_before_metrics() {
+        let dir = std::env::temp_dir().join(format!("core-priority-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::message::config::MetricsConfig {
+            labels: [("priority".to_string(), String::new())].into(),
+            priority_label: true,
+            ..crate::message::config::MetricsConfig::for_dir(&dir)
+        };
+        let metrics = Arc::new(FrontendMetrics::new(&config, DisaggregationMode::Null).unwrap());
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let handle = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata {
+                    default_priority: Some(5),
+                    ..Default::default()
+                },
+                metrics: Some(metrics.clone()),
+            },
+        );
+        let mut call = handle.generate(GenerateRequest::default()).await.unwrap();
+        let request = accept_intake(intake_rx.recv().unwrap());
+        let RequestKind::Generate(generate) = &request.kind else {
+            unreachable!()
+        };
+        assert_eq!(generate.priority, Some(5));
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent {
+                completion_tokens: 1,
+                finish_reason: Some(crate::message::finish_reason::FinishReason::Known(
+                    crate::message::finish_reason::FinishKind::Stop { matched: None },
+                )),
+                ..Default::default()
+            }))
+            .unwrap();
+        while call.recv().await.is_some() {}
+        drop(call);
+
+        metrics.flush().unwrap();
+        let files = crate::utils::prometheus::read_dir_files(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let text = crate::utils::prometheus::render(&crate::utils::prometheus::merge(
+            files
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_slice())),
+        ));
+        assert!(
+            text.contains(r#"sglang:num_requests_total{is_streaming="false",priority="5"} 1.0"#),
+            "{text}"
+        );
     }
 
     #[tokio::test]
