@@ -21,6 +21,7 @@ import zmq
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mori.buffers import BufferKeys, BufferKind
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.test_utils import CustomTestCase
 
@@ -182,13 +183,18 @@ class TestReceiverControlMessages(CustomTestCase):
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
         )
-        manager.engine_desc = SimpleNamespace(
-            key="mori-peer", pack=lambda: b"engine-desc"
+        manager._local_keys = BufferKeys.for_buffers([0x1000], [0x2000], [[0x3000]])
+        mori_descs = {
+            BufferKind.KV: b"kv-desc",
+            BufferKind.AUX: b"aux-desc",
+            BufferKind.STATE: b"state-desc",
+        }
+        manager.transport = SimpleNamespace(
+            session_id="mooncake-peer",
+            engine_key="mori-peer",
+            engine_desc_blob=b"engine-desc",
+            mem_desc_blobs=lambda keys: [mori_descs[key.kind] for key in keys],
         )
-        manager.kv_mem_descs = [SimpleNamespace(pack=lambda: b"kv-desc")]
-        manager.aux_mem_descs = [SimpleNamespace(pack=lambda: b"aux-desc")]
-        manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
-        manager.transport = SimpleNamespace(session_id="mooncake-peer")
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [

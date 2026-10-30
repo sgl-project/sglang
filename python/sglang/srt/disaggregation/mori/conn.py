@@ -8,23 +8,20 @@ import threading
 import time
 import uuid
 from queue import Full, Queue
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import numpy as np
 import numpy.typing as npt
 import zmq
-from mori.cpp import TransferStatus
 from mori.io import (
     BackendType,
     EngineDesc,
     IOEngine,
     IOEngineConfig,
     MemoryDesc,
-    MemoryLocationType,
     PollCqMode,
     RdmaBackendConfig,
-    StatusCode,
 )
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
@@ -46,6 +43,18 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mori.buffers import (
+    BufferKeys,
+    BufferKind,
+    MoriBufferKey,
+    copy_ranges,
+)
+from sglang.srt.disaggregation.mori.transport import (
+    MoriHandle,
+    MoriRemoteBuffers,
+    MoriTransport,
+)
+from sglang.srt.disaggregation.transport.base import Copy, Status
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
@@ -91,10 +100,9 @@ def _unpack_state_indices(buf: bytes) -> List[npt.NDArray[np.int32]]:
     return [np.asarray(lst, dtype=np.int32) for lst in unpack_int_lists(buf, "i")]
 
 
-def _pack_mem_desc_list(mems: List[MemoryDesc]) -> bytes:
-    if not mems:
+def _pack_mem_desc_list(packed_descs: List[Optional[bytes]]) -> bytes:
+    if not packed_descs:
         return b""
-    packed_descs = [mem.pack() for mem in mems]
     return msgspec.msgpack.encode(packed_descs)
 
 
@@ -105,15 +113,10 @@ def _unpack_mem_desc_list(blob: bytes) -> List[MemoryDesc]:
     return [MemoryDesc.unpack(b) for b in desc_blobs]
 
 
-def _pack_mem_desc_lists(mems_per_comp: List[List[MemoryDesc]]) -> bytes:
-    if not mems_per_comp:
+def _pack_mem_desc_lists(packed_descs_per_comp: List[List[Optional[bytes]]]) -> bytes:
+    if not packed_descs_per_comp:
         return b""
-    return msgspec.msgpack.encode(
-        [
-            [None if mem is None else mem.pack() for mem in comp]
-            for comp in mems_per_comp
-        ]
-    )
+    return msgspec.msgpack.encode(packed_descs_per_comp)
 
 
 def _unpack_mem_desc_lists(blob: bytes) -> List[List[MemoryDesc]]:
@@ -330,16 +333,10 @@ class GroupedIndexPlan:
         )
 
     def materialize(self, item_len: int) -> npt.NDArray[np.uint64]:
-        """(N, 3) rows of (src_offset, dst_offset, length) for a Copy."""
-        return np.array(
-            [
-                (src * item_len, dst * item_len, count * item_len)
-                for src, dst, count in zip(
-                    self.src_starts, self.dst_starts, self.counts
-                )
-            ],
-            dtype=np.uint64,
-        ).reshape(-1, 3)
+        return copy_ranges(
+            (src * item_len, dst * item_len, count * item_len)
+            for src, dst, count in zip(self.src_starts, self.dst_starts, self.counts)
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -348,8 +345,16 @@ class TransferTarget:
     peer_info: KVArgsRegisterInfo
 
 
+class PeerBuffers(msgspec.Struct, frozen=True):
+    """A decode peer as imported from its registration: the transport's handle
+    and the keys of its buffers."""
+
+    remote: MoriRemoteBuffers
+    keys: BufferKeys
+
+
 class _MoriTransferSubmissionError(RuntimeError):
-    def __init__(self, message: str, statuses: List[TransferStatus]):
+    def __init__(self, message: str, statuses: List[MoriHandle]):
         super().__init__(message)
         self.statuses = statuses
 
@@ -361,7 +366,7 @@ class _SubmissionLocal(threading.local):
     into it is a no-op on threads that are not submitting.
     """
 
-    statuses: Optional[List[TransferStatus]] = None
+    statuses: Optional[List[MoriHandle]] = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -384,11 +389,14 @@ class MoriKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        self.engine = self._init_engine()
-        self.engine_desc = self.engine.get_engine_desc()
-        self.kv_mem_descs: List[MemoryDesc] = []
-        self.aux_mem_descs: List[MemoryDesc] = []
-        self.state_mem_descs: List[List[Optional[MemoryDesc]]] = []
+        self.transport = MoriTransport(engine=self._init_engine())
+        self._local_keys = BufferKeys.for_buffers(
+            self.kv_args.kv_data_ptrs,
+            self.kv_args.aux_data_ptrs,
+            self.kv_args.state_data_ptrs,
+        )
+        # Prefill only: decode peers by engine key.
+        self._peers: Dict[str, PeerBuffers] = {}
         self.transfer_lock = threading.Lock()
         self._submission_local = _SubmissionLocal()
         self._zmq_ctx = zmq.Context()
@@ -408,7 +416,7 @@ class MoriKVManager(CommonKVManager):
             self._abort_ack_lock = threading.Lock()
             if self.enable_deferred_decode_kv_release:
                 self._drain_queue: Queue[
-                    Optional[Tuple[TransferKVChunk, List[TransferStatus]]]
+                    Optional[Tuple[TransferKVChunk, List[MoriHandle]]]
                 ] = Queue(maxsize=self._num_shards)
             for shard, queue in enumerate(self._transfer_queues):
                 # Track the thread so teardown() can join it: otherwise every
@@ -488,41 +496,25 @@ class MoriKVManager(CommonKVManager):
         return engine
 
     def _register_local_buffers(self) -> None:
-        for ptr, length in zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens):
-            mem_desc = self.engine.register_memory(
-                ptr,
-                length,
-                self.kv_args.gpu_id,
-                MemoryLocationType.GPU,
-            )
-            self.kv_mem_descs.append(mem_desc)
-        for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
-            desc = self.engine.register_memory(
-                ptr,
-                length,
-                -1,
-                MemoryLocationType.CPU,
-            )
-            self.aux_mem_descs.append(desc)
-        for component_ptrs, component_lens in zip(
+        keyed_ptrs = self._local_keys.pair(
+            self.kv_args.kv_data_ptrs,
+            self.kv_args.aux_data_ptrs,
             self.kv_args.state_data_ptrs,
-            getattr(self.kv_args, "state_data_lens", []),
-        ):
-            component_descs: List[Optional[MemoryDesc]] = []
-            for ptr, length in zip(component_ptrs, component_lens):
-                if length == 0:
-                    # Elided DSA index-K; ibv_reg_mr would abort on size 0.
-                    # Keep the slot so descs stay index-aligned.
-                    component_descs.append(None)
-                    continue
-                desc = self.engine.register_memory(
-                    ptr,
-                    length,
-                    self.kv_args.gpu_id,
-                    MemoryLocationType.GPU,
-                )
-                component_descs.append(desc)
-            self.state_mem_descs.append(component_descs)
+        )
+        lens = dict(
+            self._local_keys.pair(
+                self.kv_args.kv_data_lens,
+                self.kv_args.aux_data_lens,
+                self.kv_args.state_data_lens,
+            )
+        )
+        for key, ptr in keyed_ptrs:
+            self.transport.register(
+                key=key,
+                ptr=ptr,
+                length=lens[key],
+                device=-1 if key.kind == BufferKind.AUX else self.kv_args.gpu_id,
+            )
 
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
@@ -601,13 +593,12 @@ class MoriKVManager(CommonKVManager):
                     targets = self._deferred_ack_targets.pop(room, None)
         self._send_abort_acks(room, targets)
 
-    def _poison_failed_transfer(
-        self, room: int, statuses: List[TransferStatus]
-    ) -> None:
-        # Failed() makes no claim on what the write still puts into the decode's
+    def _poison_failed_transfer(self, room: int, statuses: List[MoriHandle]) -> None:
+        # FAILED makes no claim on what the write still puts into the decode's
         # pages, so the room never acks and decode falls back to its timeout.
-        if self.enable_deferred_decode_kv_release and any(
-            status.Failed() for status in statuses
+        if (
+            self.enable_deferred_decode_kv_release
+            and self.transport.status_all(statuses).status is Status.FAILED
         ):
             with self._abort_ack_lock:
                 self.poison_deferred_ack_room(room)
@@ -654,12 +645,13 @@ class MoriKVManager(CommonKVManager):
         return True
 
     def _wait_for_chunk_completion(
-        self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
+        self, kv_chunk: TransferKVChunk, statuses: List[MoriHandle]
     ) -> Tuple[Optional[str], bool]:
         try:
             failure_reason = self._wait_transfer_completion(statuses)
             is_quiescent = not self.enable_deferred_decode_kv_release or not any(
-                status.InProgress() for status in statuses
+                self.transport.status(handle).status is Status.PENDING
+                for handle in statuses
             )
         except Exception as exc:
             if not self.enable_deferred_decode_kv_release:
@@ -671,7 +663,7 @@ class MoriKVManager(CommonKVManager):
             self._enqueue_transfer_drain(kv_chunk, statuses, failure_reason)
         return failure_reason, is_quiescent
 
-    def _submit_transfer_chunk(self, kv_chunk: TransferKVChunk) -> List[TransferStatus]:
+    def _submit_transfer_chunk(self, kv_chunk: TransferKVChunk) -> List[MoriHandle]:
         if not self.enable_deferred_decode_kv_release:
             return self._submit_kv_transfer(
                 kv_chunk.room,
@@ -705,7 +697,7 @@ class MoriKVManager(CommonKVManager):
     def _enqueue_transfer_drain(
         self,
         kv_chunk: TransferKVChunk,
-        statuses: List[TransferStatus],
+        statuses: List[MoriHandle],
         failure_reason: Optional[str],
     ) -> None:
         # Conclude before the handoff so decode hears now and later chunks skip;
@@ -735,11 +727,9 @@ class MoriKVManager(CommonKVManager):
                     time.sleep(max(self._wait_poll_ms, 1) / 1000)
 
     def _drain_transfer_statuses(
-        self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
+        self, kv_chunk: TransferKVChunk, statuses: List[MoriHandle]
     ) -> None:
-        for status in statuses:
-            if status.InProgress():
-                status.Wait()
+        self.transport.wait(statuses)
         self._poison_failed_transfer(kv_chunk.room, statuses)
         self._mark_transfer_quiescent(kv_chunk)
 
@@ -754,9 +744,7 @@ class MoriKVManager(CommonKVManager):
             return True
         return False
 
-    def _wait_transfer_completion(
-        self, statuses: List[TransferStatus]
-    ) -> Optional[str]:
+    def _wait_transfer_completion(self, statuses: List[MoriHandle]) -> Optional[str]:
         if not statuses:
             return None
 
@@ -764,20 +752,13 @@ class MoriKVManager(CommonKVManager):
         sla_ms = self._transfer_timeout_ms
 
         while True:
-            rc = self.engine.wait_all(statuses, timeout_ms=self._wait_poll_ms)
-            if rc != StatusCode.IN_PROGRESS:
-                if rc == StatusCode.SUCCESS:
+            result = self.transport.wait_all(statuses, timeout_ms=self._wait_poll_ms)
+            if result.status is not Status.PENDING:
+                if result.status is Status.DONE:
                     return None
-                return self._collect_transfer_failure_reason(statuses)
+                return result.reason
             if sla_ms > 0 and (time.perf_counter() - start) * 1000 >= sla_ms:
                 return f"KV transfer exceeded SLA {sla_ms}ms"
-
-    @staticmethod
-    def _collect_transfer_failure_reason(statuses: List[TransferStatus]) -> str:
-        for status in statuses:
-            if status.Failed():
-                return f"KV transfer failed: {status.Message()}"
-        return "KV transfer failed due to unknown reason"
 
     def prepare_send_state_indices(
         self, state_indices: Optional[List]
@@ -1081,26 +1062,7 @@ class MoriKVManager(CommonKVManager):
         except Exception:
             logger.exception("Failed to destroy mori zmq context during teardown")
         # Deregister RDMA memory and drop the IOEngine reference.
-        try:
-            for descs in (self.kv_mem_descs, self.aux_mem_descs):
-                for desc in descs:
-                    try:
-                        self.engine.deregister_memory(desc)
-                    except Exception:
-                        pass
-            for component_descs in self.state_mem_descs:
-                for desc in component_descs:
-                    if desc is None:
-                        continue
-                    try:
-                        self.engine.deregister_memory(desc)
-                    except Exception:
-                        pass
-        finally:
-            self.kv_mem_descs = []
-            self.aux_mem_descs = []
-            self.state_mem_descs = []
-            self.engine = None
+        self.transport.close()
         logger.info(
             "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
         )
@@ -1123,7 +1085,7 @@ class MoriKVManager(CommonKVManager):
             register_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
                 dst_item_lens, register_info.dst_dcp_size
             )
-        self.engine.register_remote_engine(register_info.engine_desc)
+        self._peers[engine_key] = self._import_peer(register_info)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.check_peer_aux_buffer_count(
                 engine_key, len(register_info.dst_aux_mem_descs)
@@ -1136,32 +1098,49 @@ class MoriKVManager(CommonKVManager):
             register_info.dst_port,
         )
 
-    def _get_mha_mem_desc_slices(
+    def _import_peer(self, register_info: KVArgsRegisterInfo) -> PeerBuffers:
+        # Keys follow the registration message's field order, as on decode.
+        descs = (
+            register_info.dst_kv_mem_descs,
+            register_info.dst_aux_mem_descs,
+            register_info.dst_state_mem_descs,
+        )
+        keys = BufferKeys.for_buffers(*descs)
+        remote = self.transport.import_registration(
+            engine_desc=register_info.engine_desc, descs=dict(keys.pair(*descs))
+        )
+        return PeerBuffers(remote=remote, keys=keys)
+
+    def _get_mha_kv_key_slices(
         self,
-        dst_mem_descs: List[MemoryDesc],
+        dst_keys: Sequence[MoriBufferKey],
         dst_kv_layer_ids: Optional[List[int]] = None,
     ) -> tuple[
-        List[MemoryDesc], List[MemoryDesc], List[MemoryDesc], List[MemoryDesc], int
+        Sequence[MoriBufferKey],
+        Sequence[MoriBufferKey],
+        Sequence[MoriBufferKey],
+        Sequence[MoriBufferKey],
+        int,
     ]:
-        src_descs = self.kv_mem_descs
-        if not src_descs:
+        src_keys = self._local_keys.kv
+        if not src_keys:
             raise RuntimeError("KV memory descriptors are empty on prefill side")
 
-        num_local_layers = len(src_descs) // 2
-        src_k_descs = src_descs[:num_local_layers]
-        src_v_descs = src_descs[num_local_layers:]
+        num_local_layers = len(src_keys) // 2
+        src_k_keys = src_keys[:num_local_layers]
+        src_v_keys = src_keys[num_local_layers:]
 
         # Both peers expose the same PP-local layout. Their descriptor indices
         # are already aligned, so applying the Prefill rank's global layer
         # offset would incorrectly index into a local list.
-        if len(src_descs) == len(dst_mem_descs):
-            dst_k_descs = dst_mem_descs[:num_local_layers]
-            dst_v_descs = dst_mem_descs[num_local_layers:]
+        if len(src_keys) == len(dst_keys):
+            dst_k_keys = dst_keys[:num_local_layers]
+            dst_v_keys = dst_keys[num_local_layers:]
             return (
-                src_k_descs,
-                src_v_descs,
-                dst_k_descs,
-                dst_v_descs,
+                src_k_keys,
+                src_v_keys,
+                dst_k_keys,
+                dst_v_keys,
                 num_local_layers,
             )
 
@@ -1170,32 +1149,30 @@ class MoriKVManager(CommonKVManager):
             dst_indices = resolve_dcp_dst_entry_indices(
                 src_layer_ids,
                 dst_kv_layer_ids or [],
-                len(src_descs),
-                len(dst_mem_descs),
+                len(src_keys),
+                len(dst_keys),
             )
-            dst_k_descs = [
-                dst_mem_descs[dst_indices[i]] for i in range(num_local_layers)
-            ]
-            dst_v_descs = [
-                dst_mem_descs[dst_indices[num_local_layers + i]]
+            dst_k_keys = [dst_keys[dst_indices[i]] for i in range(num_local_layers)]
+            dst_v_keys = [
+                dst_keys[dst_indices[num_local_layers + i]]
                 for i in range(num_local_layers)
             ]
             return (
-                src_k_descs,
-                src_v_descs,
-                dst_k_descs,
-                dst_v_descs,
+                src_k_keys,
+                src_v_keys,
+                dst_k_keys,
+                dst_v_keys,
                 num_local_layers,
             )
 
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
-        dst_total_layers = len(dst_mem_descs) // 2
-        if len(dst_mem_descs) < 2 or end_layer > dst_total_layers:
+        dst_total_layers = len(dst_keys) // 2
+        if len(dst_keys) < 2 or end_layer > dst_total_layers:
             raise ValueError(
                 "Destination KV descriptors do not match prefill pp configuration"
             )
-        dst_k_descs = dst_mem_descs[start_layer:end_layer]
+        dst_k_keys = dst_keys[start_layer:end_layer]
         if (
             num_local_layers < dst_total_layers
             and dst_total_layers % num_local_layers != 0
@@ -1206,21 +1183,19 @@ class MoriKVManager(CommonKVManager):
             dst_v_offset = num_local_layers * multiplier_ratio
         else:
             dst_v_offset = dst_total_layers
-        dst_v_descs = dst_mem_descs[
-            dst_v_offset + start_layer : dst_v_offset + end_layer
-        ]
-        return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
+        dst_v_keys = dst_keys[dst_v_offset + start_layer : dst_v_offset + end_layer]
+        return src_k_keys, src_v_keys, dst_k_keys, dst_v_keys, num_local_layers
 
-    def _get_mla_mem_desc_slices(
+    def _get_mla_kv_key_slices(
         self,
-        dst_mem_descs: List[MemoryDesc],
+        dst_keys: Sequence[MoriBufferKey],
         dst_kv_layer_ids: Optional[List[int]] = None,
-    ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
-        src_descs = self.kv_mem_descs
-        num_local_layers = len(src_descs)
+    ) -> tuple[Sequence[MoriBufferKey], Sequence[MoriBufferKey], int]:
+        src_keys = self._local_keys.kv
+        num_local_layers = len(src_keys)
         # Same-PP peers register matching local descriptor lists.
-        if len(src_descs) == len(dst_mem_descs):
-            return src_descs, dst_mem_descs, num_local_layers
+        if len(src_keys) == len(dst_keys):
+            return src_keys, dst_keys, num_local_layers
 
         src_layer_ids = getattr(self.kv_args, "kv_layer_ids", None) or []
         if src_layer_ids or dst_kv_layer_ids:
@@ -1228,46 +1203,38 @@ class MoriKVManager(CommonKVManager):
                 src_layer_ids,
                 dst_kv_layer_ids or [],
                 num_local_layers,
-                len(dst_mem_descs),
+                len(dst_keys),
             )
             return (
-                src_descs,
-                [dst_mem_descs[i] for i in dst_indices],
+                src_keys,
+                [dst_keys[i] for i in dst_indices],
                 num_local_layers,
             )
 
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
-        if end_layer > len(dst_mem_descs):
+        if end_layer > len(dst_keys):
             raise ValueError(
                 "Destination MLA KV descriptors do not match prefill pp configuration"
             )
-        dst_slice = dst_mem_descs[start_layer:end_layer]
-        return src_descs, dst_slice, num_local_layers
+        dst_slice = dst_keys[start_layer:end_layer]
+        return src_keys, dst_slice, num_local_layers
 
     def _submit_batch_transfer_plan(
         self,
-        src_desc: MemoryDesc,
-        dst_desc: MemoryDesc,
+        remote: MoriRemoteBuffers,
+        src: MoriBufferKey,
+        dst: MoriBufferKey,
         plan: npt.NDArray[np.uint64],
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         if not len(plan):
             return []
 
-        transfer_uid = self.engine.allocate_transfer_uid()
-
-        statuses = self.engine.batch_write(
-            [src_desc],
-            [plan[:, 0].tolist()],
-            [dst_desc],
-            [plan[:, 1].tolist()],
-            [plan[:, 2].tolist()],
-            [transfer_uid],
-        )
+        statuses = [self.transport.write(remote=remote, src=src, dst=dst, ranges=plan)]
         self._record_submitted_statuses(statuses)
         return statuses
 
-    def _record_submitted_statuses(self, statuses: List[TransferStatus]) -> None:
+    def _record_submitted_statuses(self, statuses: List[MoriHandle]) -> None:
         active_statuses = self._submission_local.statuses
         if active_statuses is not None:
             active_statuses.extend(statuses)
@@ -1384,21 +1351,20 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
                 prefill_kv_indices,
                 dst_kv_indices,
             )
         )
-        statuses: List[TransferStatus] = []
+        statuses: List[MoriHandle] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
+        peer = self._peers[peer_info.engine_key]
 
         if self.is_mla_backend or self.is_hybrid_mla_backend:
-            src_descs, dst_descs, layers_current_pp_stage = (
-                self._get_mla_mem_desc_slices(
-                    peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
-                )
+            src_keys, dst_keys, layers_current_pp_stage = self._get_mla_kv_key_slices(
+                peer.keys.kv, peer_info.dst_kv_layer_ids
             )
             for layer_id in range(layers_current_pp_stage):
                 layer_plan = self._build_contiguous_transfer_plan(
@@ -1406,22 +1372,21 @@ class MoriKVManager(CommonKVManager):
                 )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
-                        src_descs[layer_id],
-                        dst_descs[layer_id],
-                        layer_plan,
+                        remote=peer.remote,
+                        src=src_keys[layer_id],
+                        dst=dst_keys[layer_id],
+                        plan=layer_plan,
                     )
                 )
             return statuses
 
         (
-            src_k_descs,
-            src_v_descs,
-            dst_k_descs,
-            dst_v_descs,
+            src_k_keys,
+            src_v_keys,
+            dst_k_keys,
+            dst_v_keys,
             layers_current_pp_stage,
-        ) = self._get_mha_mem_desc_slices(
-            peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
-        )
+        ) = self._get_mha_kv_key_slices(peer.keys.kv, peer_info.dst_kv_layer_ids)
 
         if peer_info.decode_tp_size != self.attn_tp_size:
             tp_cfg = self._build_tp_slice_config(peer_info)
@@ -1431,16 +1396,18 @@ class MoriKVManager(CommonKVManager):
             for layer_id in range(layers_current_pp_stage):
                 statuses.extend(
                     self._submit_batch_transfer_plan(
-                        src_k_descs[layer_id],
-                        dst_k_descs[layer_id],
-                        slice_plan,
+                        remote=peer.remote,
+                        src=src_k_keys[layer_id],
+                        dst=dst_k_keys[layer_id],
+                        plan=slice_plan,
                     )
                 )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
-                        src_v_descs[layer_id],
-                        dst_v_descs[layer_id],
-                        slice_plan,
+                        remote=peer.remote,
+                        src=src_v_keys[layer_id],
+                        dst=dst_v_keys[layer_id],
+                        plan=slice_plan,
                     )
                 )
             return statuses
@@ -1449,16 +1416,18 @@ class MoriKVManager(CommonKVManager):
         for layer_id in range(layers_current_pp_stage):
             statuses.extend(
                 self._submit_batch_transfer_plan(
-                    src_k_descs[layer_id],
-                    dst_k_descs[layer_id],
-                    layer_plan,
+                    remote=peer.remote,
+                    src=src_k_keys[layer_id],
+                    dst=dst_k_keys[layer_id],
+                    plan=layer_plan,
                 )
             )
             statuses.extend(
                 self._submit_batch_transfer_plan(
-                    src_v_descs[layer_id],
-                    dst_v_descs[layer_id],
-                    layer_plan,
+                    remote=peer.remote,
+                    src=src_v_keys[layer_id],
+                    dst=dst_v_keys[layer_id],
+                    plan=layer_plan,
                 )
             )
         return statuses
@@ -1472,7 +1441,7 @@ class MoriKVManager(CommonKVManager):
         src_page_offset: int,
         decode_prefix_len: int,
         num_kv_tokens: Optional[int],
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
 
@@ -1503,14 +1472,15 @@ class MoriKVManager(CommonKVManager):
             raise RuntimeError("Missing Mori DCP token item lengths")
 
         # DCP relayout supports MLA and hybrid MLA, both with latent KV entries.
-        src_descs, dst_descs, num_layers = self._get_mla_mem_desc_slices(
-            peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
+        peer = self._peers[peer_info.engine_key]
+        src_keys, dst_keys, num_layers = self._get_mla_kv_key_slices(
+            peer.keys.kv, peer_info.dst_kv_layer_ids
         )
-        desc_pairs = zip(src_descs[:num_layers], dst_descs[:num_layers])
+        key_pairs = zip(src_keys[:num_layers], dst_keys[:num_layers])
 
-        statuses: List[TransferStatus] = []
+        statuses: List[MoriHandle] = []
         plan_cache: Dict[tuple[bool, int], npt.NDArray[np.uint64]] = {}
-        for entry_idx, (src_desc, dst_desc) in enumerate(desc_pairs):
+        for entry_idx, (src_key, dst_key) in enumerate(key_pairs):
             item_len = token_item_lens[entry_idx]
             is_draft = entry_idx >= num_target
             cache_key = (is_draft, item_len)
@@ -1519,7 +1489,9 @@ class MoriKVManager(CommonKVManager):
                 plan_cache[cache_key] = grouped_plan.materialize(item_len)
             transfer_plan = plan_cache[cache_key]
             statuses.extend(
-                self._submit_batch_transfer_plan(src_desc, dst_desc, transfer_plan)
+                self._submit_batch_transfer_plan(
+                    remote=peer.remote, src=src_key, dst=dst_key, plan=transfer_plan
+                )
             )
         return statuses
 
@@ -1529,7 +1501,7 @@ class MoriKVManager(CommonKVManager):
         prefill_aux_index: int,
         dst_aux_index: int,
         room: int,
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         if self._send_aux_rdma:
             return self.send_aux_rdma(peer_info, prefill_aux_index, dst_aux_index, room)
         return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
@@ -1540,31 +1512,32 @@ class MoriKVManager(CommonKVManager):
         prefill_aux_index: int,
         dst_aux_index: int,
         room: int,
-    ) -> List[TransferStatus]:
-        if not self.aux_mem_descs or len(self.aux_mem_descs) != len(
+    ) -> List[MoriHandle]:
+        if not self._local_keys.aux or len(self._local_keys.aux) != len(
             peer_info.dst_aux_mem_descs
         ):
             return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
 
-        src_descs: List[MemoryDesc] = []
-        dst_descs: List[MemoryDesc] = []
-        local_offsets: List[List[int]] = []
-        remote_offsets: List[List[int]] = []
-        sizes: List[List[int]] = []
-        uids = []
-        for i in range(len(self.aux_mem_descs)):
+        peer = self._peers[peer_info.engine_key]
+        copies = []
+        for i in range(len(self._local_keys.aux)):
             item_len = self.kv_args.aux_item_lens[i]
-            src_descs.append(self.aux_mem_descs[i])
-            dst_descs.append(peer_info.dst_aux_mem_descs[i])
-            local_offsets.append([prefill_aux_index * item_len])
-            remote_offsets.append([dst_aux_index * item_len])
-            sizes.append([item_len])
-            uids.append(self.engine.allocate_transfer_uid())
-        statuses = list(
-            self.engine.batch_write(
-                src_descs, local_offsets, dst_descs, remote_offsets, sizes, uids
+            copies.append(
+                Copy(
+                    src=self._local_keys.aux[i],
+                    dst=peer.keys.aux[i],
+                    ranges=copy_ranges(
+                        [
+                            (
+                                prefill_aux_index * item_len,
+                                dst_aux_index * item_len,
+                                item_len,
+                            )
+                        ]
+                    ),
+                )
             )
-        )
+        statuses = self.transport.write_all(remote=peer.remote, copies=copies)
         self._record_submitted_statuses(statuses)
         return statuses
 
@@ -1574,7 +1547,7 @@ class MoriKVManager(CommonKVManager):
         prefill_aux_index: int,
         dst_aux_index: int,
         room: int,
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         # Stop at the shorter list; see check_peer_aux_buffer_count.
         num_bufs = min(
             len(self.kv_args.aux_data_ptrs), len(peer_info.dst_aux_mem_descs)
@@ -1614,9 +1587,9 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         src_state_indices: List[npt.NDArray[np.int32]],
         dst_state_indices: List[npt.NDArray[np.int32]],
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         # Guard: no local state tensors -> no-op (e.g. SWA layers=0 on this PP rank)
-        if not self.state_mem_descs:
+        if not self._local_keys.state:
             return []
 
         state_types = self.kv_args.state_types
@@ -1626,17 +1599,18 @@ class MoriKVManager(CommonKVManager):
                 "state_indices were provided"
             )
 
-        if len(peer_info.dst_state_mem_descs) != len(self.state_mem_descs):
+        if len(peer_info.dst_state_mem_descs) != len(self._local_keys.state):
             raise RuntimeError(
                 f"PD state transfer failed: state component count mismatch "
-                f"(local={len(self.state_mem_descs)}, "
+                f"(local={len(self._local_keys.state)}, "
                 f"remote={len(peer_info.dst_state_mem_descs)})"
             )
 
         src_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
+        peer_state_keys = self._peers[peer_info.engine_key].keys.state
 
-        statuses: List[TransferStatus] = []
+        statuses: List[MoriHandle] = []
         for i, st in enumerate(state_types):
             src_indices = src_state_indices[i] if i < len(src_state_indices) else None
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else None
@@ -1645,8 +1619,8 @@ class MoriKVManager(CommonKVManager):
             if dst_indices is None or dst_indices.size == 0:
                 continue
 
-            src_descs = self.state_mem_descs[i]
-            dst_descs = peer_info.dst_state_mem_descs[i]
+            src_keys = self._local_keys.state[i]
+            dst_keys = peer_state_keys[i]
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
             dst_lens = (
                 peer_info.dst_state_item_lens[i]
@@ -1683,8 +1657,8 @@ class MoriKVManager(CommonKVManager):
                         peer_info,
                         src_indices,
                         dst_indices,
-                        src_descs,
-                        dst_descs,
+                        src_keys,
+                        dst_keys,
                         src_lens,
                         dst_lens,
                         src_dims,
@@ -1710,9 +1684,9 @@ class MoriKVManager(CommonKVManager):
                         peer_info,
                         src_indices,
                         dst_indices,
-                        src_descs,
+                        src_keys,
                         src_lens,
-                        dst_descs,
+                        dst_keys,
                         dst_lens,
                         st,
                         src_layer_ids,
@@ -1729,8 +1703,8 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         src_state_indices: npt.NDArray[np.int32],
         dst_state_indices: npt.NDArray[np.int32],
-        src_state_mem_descs: List[MemoryDesc],
-        dst_state_mem_descs: List[MemoryDesc],
+        src_keys: Sequence[MoriBufferKey],
+        dst_keys: Sequence[MoriBufferKey],
         src_state_item_lens: List[int],
         dst_state_item_lens: List[int],
         src_state_dim_per_tensor: List[int],
@@ -1739,7 +1713,7 @@ class MoriKVManager(CommonKVManager):
         src_state_slice_outer_counts: List[int],
         src_layer_ids: List[int],
         dst_layer_ids: List[int],
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         if src_state_indices.size != 1 or dst_state_indices.size != 1:
             raise RuntimeError(
                 f"PD state transfer failed: mamba requires single state index, "
@@ -1763,7 +1737,8 @@ class MoriKVManager(CommonKVManager):
 
         src_idx = int(src_state_indices[0])
         dst_idx = int(dst_state_indices[0])
-        statuses: List[TransferStatus] = []
+        statuses: List[MoriHandle] = []
+        remote = self._peers[peer_info.engine_key].remote
 
         local_tp_rank = self.kv_args.engine_rank % self.state_tp_size
         dst_tp_rank = peer_info.decode_tp_rank % peer_info.decode_tp_size
@@ -1771,13 +1746,11 @@ class MoriKVManager(CommonKVManager):
         pairs = build_transfer_entry_pairs(
             src_layer_ids,
             dst_layer_ids,
-            len(src_state_mem_descs),
-            len(dst_state_mem_descs),
+            len(src_keys),
+            len(dst_keys),
             allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
-            src_desc = src_state_mem_descs[i]
-            dst_desc = dst_state_mem_descs[j]
             src_item_len = src_state_item_lens[i]
 
             if not tp_mismatch:
@@ -1820,17 +1793,14 @@ class MoriKVManager(CommonKVManager):
                 ]
 
             for src_offset, dst_offset, size in blocks:
-                transfer_uid = self.engine.allocate_transfer_uid()
-                batch_statuses = self.engine.batch_write(
-                    [src_desc],
-                    [[src_offset]],
-                    [dst_desc],
-                    [[dst_offset]],
-                    [[size]],
-                    [transfer_uid],
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        remote=remote,
+                        src=src_keys[i],
+                        dst=dst_keys[j],
+                        plan=copy_ranges([(src_offset, dst_offset, size)]),
+                    )
                 )
-                self._record_submitted_statuses(batch_statuses)
-                statuses.extend(batch_statuses)
 
         return statuses
 
@@ -1839,14 +1809,14 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         src_state_indices: npt.NDArray[np.int32],
         dst_state_indices: npt.NDArray[np.int32],
-        src_state_mem_descs: List[MemoryDesc],
+        src_keys: Sequence[MoriBufferKey],
         src_state_item_lens: List[int],
-        dst_state_mem_descs: List[MemoryDesc],
+        dst_keys: Sequence[MoriBufferKey],
         dst_state_item_lens: List[int],
         state_type: str,
         src_layer_ids: List[int],
         dst_layer_ids: List[int],
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         # TP mismatch check for non-MLA SWA
         if (
             state_type == "swa"
@@ -1925,30 +1895,32 @@ class MoriKVManager(CommonKVManager):
             *group_concurrent_contiguous(src_state_indices, dst_state_indices)
         )
 
-        statuses: List[TransferStatus] = []
+        statuses: List[MoriHandle] = []
+        remote = self._peers[peer_info.engine_key].remote
         pairs = build_transfer_entry_pairs(
             src_layer_ids,
             dst_layer_ids,
-            len(src_state_mem_descs),
-            len(dst_state_mem_descs),
+            len(src_keys),
+            len(dst_keys),
             allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
-            src_desc = src_state_mem_descs[i]
-            dst_desc = dst_state_mem_descs[j]
             state_item_len = src_state_item_lens[i]
             if is_elided_entry(state_item_len, dst_state_item_lens, j):
                 # DSA index-K elision gives every shared-topk layer a 0-row
                 # buffer; either peer eliding it means nothing moves, and the
                 # descriptor describes an empty allocation. Skipping keeps the
-                # index alignment with state_mem_descs that registration relies on.
+                # index alignment with the state keys that registration relies on.
                 continue
 
             statuses.extend(
                 self._submit_batch_transfer_plan(
-                    src_desc,
-                    dst_desc,
-                    self._build_contiguous_transfer_plan(grouped_plan, state_item_len),
+                    remote=remote,
+                    src=src_keys[i],
+                    dst=dst_keys[j],
+                    plan=self._build_contiguous_transfer_plan(
+                        grouped_plan, state_item_len
+                    ),
                 )
             )
 
@@ -1979,7 +1951,7 @@ class MoriKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[npt.NDArray[np.int32]]] = None,
         num_kv_tokens: Optional[int] = None,
-    ) -> List[TransferStatus]:
+    ) -> List[MoriHandle]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
         if (
@@ -2009,7 +1981,7 @@ class MoriKVManager(CommonKVManager):
                     )
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
 
-        result_statuses: List[TransferStatus] = []
+        result_statuses: List[MoriHandle] = []
         for target in targets:
             info = target.info
             peer_info = target.peer_info
@@ -2039,7 +2011,7 @@ class MoriKVManager(CommonKVManager):
                 is_last_chunk
                 and state_indices is not None
                 and not info.is_dummy
-                and self.state_mem_descs
+                and self._local_keys.state
             ):
                 result_statuses.extend(
                     self.send_state(peer_info, state_indices, info.dst_state_indices)
@@ -2060,10 +2032,16 @@ class MoriKVManager(CommonKVManager):
         return result_statuses
 
     def build_receiver_registration_message(self) -> List[bytes]:
-        engine_desc_blob = self.engine_desc.pack()
-        packed_kv_descs = _pack_mem_desc_list(self.kv_mem_descs)
-        packed_aux_descs = _pack_mem_desc_list(self.aux_mem_descs)
-        packed_state_descs = _pack_mem_desc_lists(self.state_mem_descs)
+        engine_desc_blob = self.transport.engine_desc_blob
+        packed_kv_descs = _pack_mem_desc_list(
+            self.transport.mem_desc_blobs(self._local_keys.kv)
+        )
+        packed_aux_descs = _pack_mem_desc_list(
+            self.transport.mem_desc_blobs(self._local_keys.aux)
+        )
+        packed_state_descs = _pack_mem_desc_lists(
+            [self.transport.mem_desc_blobs(keys) for keys in self._local_keys.state]
+        )
         gpu_id = str(self.kv_args.gpu_id).encode("ascii")
         decode_tp_size = str(self.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_args.engine_rank).encode("ascii")
@@ -2138,7 +2116,7 @@ class MoriKVManager(CommonKVManager):
             str(bootstrap_room).encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
-            self.engine_desc.key.encode("ascii"),
+            self.transport.engine_key.encode("ascii"),
             kv_indices_bytes,
             aux_bytes,
             state_bytes,
