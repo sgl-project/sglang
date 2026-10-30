@@ -35,9 +35,11 @@ from typing import (
     Annotated,
     Any,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -54,6 +56,7 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -1644,17 +1647,21 @@ def build_flat_top_logprobs_arrays(
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+    # http_worker_ipcs: by row, the route the row carries, else None to use its
+    # stored DetokenizeHeader's. Every row carries one under OutputSink.TOKENIZER,
+    # finished rows under DETOKENIZER, none under RUST; the field is None when no
+    # row carries one, except on an idle TOKENIZER batch, which sends [].
+
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
-    # For incremental decoding
-    decode_ids: List[array]  # List[array[int]]
-    read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[array]]  # Optional[List[array[int]]]
-    # Detokenization configs
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    no_stop_trim: List[bool]
+    # All rows' new output ids in row order; row i's are
+    # output_ids_flat[output_ids_offsets[i] : output_ids_offsets[i + 1]]
+    # (see row_output_ids).
+    output_ids_flat: array  # array[int]
+    output_ids_offsets: List[int]
+    # By row, the request's DetokenizeHeader on its first output, else None;
+    # the whole field is None when no row carries one.
+    detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
 
     # Token counts
     reasoning_tokens: List[int]
@@ -1739,13 +1746,19 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
 
+class DetokenizeReleaseReq(BaseReq, kw_only=True):
+    """Drops the detokenizer's state of a request that ended outside the output
+    stream; sent on the output socket, so it follows the request's last row."""
+
+
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
     output_strs: List[str]
-    # The token ids
-    output_ids: Optional[List[array]]
+    # See BatchTokenIDOutput.output_ids_flat.
+    output_ids_flat: array  # array[int]
+    output_ids_offsets: List[int]
 
     # Token counts
     completion_tokens: List[int]
@@ -1815,6 +1828,22 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+
+def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:
+    """Row i's new output ids, sliced from the batch's flat column."""
+    offsets = output.output_ids_offsets
+    return output.output_ids_flat[offsets[i] : offsets[i + 1]]
+
+
+def flatten_output_ids(rows: Iterable[Sequence[int]]) -> Tuple[array, List[int]]:
+    """The (output_ids_flat, output_ids_offsets) columns of rows of output ids."""
+    flat = array("q")
+    offsets = [0]
+    for ids in rows:
+        flat.extend(ids)
+        offsets.append(len(flat))
+    return flat, offsets
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

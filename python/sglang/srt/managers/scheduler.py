@@ -2037,12 +2037,17 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def increment_scheduler_iterations(self) -> None:
+        if get_observability().enable_metrics:
+            self.metrics_collector.increment_scheduler_iterations()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -2088,6 +2093,7 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -2291,6 +2297,7 @@ class Scheduler(
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)
         else:
+            self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def send_control_output(self, output, recv_req) -> None:
@@ -2668,6 +2675,7 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
+            skip_tokenizer_init=self.skip_tokenizer_init,
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
             ),
@@ -3913,6 +3921,8 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
+        # No member rows exist before the leader's prefill ends.
+        self.beam_coordinator.retire_group(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None

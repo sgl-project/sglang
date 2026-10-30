@@ -693,6 +693,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
@@ -809,6 +810,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # A result wait takes new work only with continuous input polling.
             should_ingest_requests = (

@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
@@ -126,7 +127,8 @@ def build_rust_frame_metadata_fixture() -> dict:
         rids=["done", "running"],
         finished_reasons=[{"type": "length", "length": 3}, None],
         prompt_tokens=[5, 6],
-        output_ids=[array("q", [1, 2, 3]), array("q", [4])],
+        output_ids_flat=array("q", [1, 2, 3, 4]),
+        output_ids_offsets=[0, 3, 4],
         cached_tokens=[0, 0],
         reasoning_tokens=[0, 0],
         weight_versions=[swapped, None],
@@ -147,7 +149,8 @@ def build_rust_frame_metadata_fixture() -> dict:
         rids=["logprobs", "plain"],
         finished_reasons=[{"type": "length", "length": 2}, None],
         prompt_tokens=[3, 4],
-        output_ids=[array("q", [7, 8]), array("q", [9])],
+        output_ids_flat=array("q", [7, 8, 9]),
+        output_ids_offsets=[0, 2, 3],
         cached_tokens=[0, 0],
         reasoning_tokens=[0, 0],
         weight_versions=[single, None],
@@ -186,6 +189,7 @@ def build_rust_frame_metadata_fixture() -> dict:
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: storage_attached,
             )
         reqs = {
@@ -204,7 +208,8 @@ def build_rust_frame_metadata_fixture() -> dict:
             rids=rids,
             finished_reasons=[{"type": "length", "length": 1}] * len(rids),
             prompt_tokens=[16] * len(rids),
-            output_ids=[array("q", [1])] * len(rids),
+            output_ids_flat=array("q", [1] * len(rids)),
+            output_ids_offsets=list(range(len(rids) + 1)),
             cached_tokens=[req.cached_tokens for req in reqs.values()],
             reasoning_tokens=[0] * len(rids),
             weight_versions=None,
@@ -292,13 +297,15 @@ def generation_payload(rows: dict, **columns) -> SimpleNamespace:
     """A `push_generation` payload for `rows` (rid -> new output ids), every
     optional column unset unless `columns` sets it."""
     rids = list(rows)
+    output_ids_flat, output_ids_offsets = flatten_output_ids(rows.values())
     return SimpleNamespace(
         **{
             **NO_EXTRAS,
             "rids": rids,
             "finished_reasons": [None] * len(rids),
             "prompt_tokens": [1] * len(rids),
-            "output_ids": [array("q", ids) for ids in rows.values()],
+            "output_ids_flat": output_ids_flat,
+            "output_ids_offsets": output_ids_offsets,
             "cached_tokens": [0] * len(rids),
             "reasoning_tokens": [0] * len(rids),
             "weight_versions": None,
@@ -622,7 +629,7 @@ class TestRustServerExtension(CustomTestCase):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts
         and marked as outside the stream; without the Rust server it still
-        goes to the tokenizer socket."""
+        goes to the tokenizer socket, with the request's detokenizer state released."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
@@ -633,7 +640,9 @@ class TestRustServerExtension(CustomTestCase):
         )
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
-        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
+        scheduler = SimpleNamespace(
+            rust_server=server, ipc_channels=Mock(), output_streamer=Mock()
+        )
         Scheduler.send_abort_output(scheduler, abort, req)
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
@@ -644,12 +653,14 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertEqual(cols, [b""])
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req
         )
+        scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
     def test_customized_info_goes_out_as_python_responses_render_it(self):
         """The egress sends customized_info as the JSON Python's responses
