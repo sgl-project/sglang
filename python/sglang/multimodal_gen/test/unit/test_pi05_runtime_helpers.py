@@ -80,7 +80,6 @@ def test_denoise_graph_skips_prefix_copy_for_same_digest(monkeypatch):
         static_x_t=torch.empty(1, 2, 4),
         static_timestep=torch.empty(1),
         static_output=torch.empty(1, 2, 4),
-        current_context_id=123,
         current_context_digest="same",
     )
 
@@ -106,7 +105,6 @@ def test_denoise_graph_copies_mutable_prefix_graph_output():
         static_x_t=torch.empty(1, 2, 4),
         static_timestep=torch.empty(1),
         static_output=torch.empty(1, 2, 4),
-        current_context_id=123,
     )
     current_context = _prefix_context(2.0, None)
     current_context.layout["mutable_graph_output"] = True
@@ -812,3 +810,69 @@ def test_normalized_float_image_is_not_normalized_twice():
         preprocessed[:, (0, 3)],
         torch.full((3, 2, 4), -1.0),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA model kernels")
+def test_prefix_kv_only_matches_full_forward(monkeypatch):
+    """Every cached layer must match even though the final hidden state is unused."""
+    from transformers import GemmaConfig
+
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.vlas.pi05_core import PiGemmaModel
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args",
+        SimpleNamespace(attention_backend="torch_sdpa", attention_backend_config=None),
+    )
+    config = GemmaConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        vocab_size=32,
+        max_position_embeddings=64,
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(42)
+    model = PiGemmaModel(config).cuda().bfloat16().eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.05)
+    inputs = torch.randn(2, 7, 128, device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(2, 1, 7, 7, device="cuda", dtype=torch.bool)
+    mask[0, :, :, -2:] = False
+    with torch.inference_mode(), set_forward_context(0, None):
+        expected = model(inputs_embeds=inputs, attention_mask=mask, use_cache=True)
+
+        def unused(*args):
+            raise AssertionError("KV-only prefix must skip final attention/MLP/norm")
+
+        hooks = [
+            module.register_forward_pre_hook(unused)
+            for module in (
+                model.layers[-1].self_attn.o_proj,
+                model.layers[-1].mlp,
+                model.norm,
+            )
+        ]
+        try:
+            actual = model(
+                inputs_embeds=inputs,
+                attention_mask=mask,
+                use_cache=True,
+                prefix_kv_only=True,
+            )
+        finally:
+            for hook in hooks:
+                hook.remove()
+    assert actual.last_hidden_state is None
+    assert expected.last_hidden_state.shape == inputs.shape
+    for (keys, values, _), (expected_keys, expected_values, _) in zip(
+        actual.past_key_values, expected.past_key_values, strict=True
+    ):
+        torch.testing.assert_close(keys, expected_keys, rtol=0, atol=0)
+        torch.testing.assert_close(values, expected_values, rtol=0, atol=0)

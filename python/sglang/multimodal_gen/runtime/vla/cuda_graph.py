@@ -5,15 +5,13 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
+from weakref import ReferenceType, ref
 
 import msgspec
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.vla.prefix_cache import (
-    PrefixContext,
-    VLADensePrefixCache,
-)
+from sglang.multimodal_gen.runtime.vla.prefix_cache import PrefixContext
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -58,7 +56,8 @@ class _CapturedDenoiseGraph:
     static_x_t: torch.Tensor
     static_timestep: torch.Tensor
     static_output: torch.Tensor
-    current_context_id: int | None = None
+    current_context_ref: ReferenceType[PrefixContext] | None = None
+    current_context_revision: int = 0
     current_context_digest: str | None = None
 
 
@@ -171,31 +170,12 @@ class _BoundedCaptureCache:
         )
 
 
-def _clone_past_key_values(past_key_values: Any) -> Any:
-    return VLADensePrefixCache(
-        tuple(
-            (keys.detach().clone(), values.detach().clone(), sliding_window)
-            for keys, values, sliding_window in past_key_values
-        )
-    )
-
-
 def _copy_past_key_values_(dst: Any, src: Any) -> None:
     for (dst_keys, dst_values, _), (src_keys, src_values, _) in zip(
         dst, src, strict=True
     ):
         dst_keys.copy_(src_keys)
         dst_values.copy_(src_values)
-
-
-def _clone_prefix_context(prefix_context: PrefixContext) -> PrefixContext:
-    return PrefixContext(
-        past_key_values=_clone_past_key_values(prefix_context.past_key_values),
-        prefix_pad_masks=prefix_context.prefix_pad_masks.detach().clone(),
-        prefix_len=prefix_context.prefix_len,
-        layout=dict(prefix_context.layout),
-        cache_key_digest=prefix_context.cache_key_digest,
-    )
 
 
 def _copy_prefix_context_(dst: PrefixContext, src: PrefixContext) -> None:
@@ -305,6 +285,7 @@ class VLAPrefixGraphRunner:
                 ):
                     static_input.copy_(current_input)
             captured.graph.replay()
+            captured.static_output.revision += 1
             torch.get_device_module(inputs[0].device).current_stream(
                 device=inputs[0].device
             ).synchronize()
@@ -360,7 +341,6 @@ class VLADenoiseGraphRunner:
         captured: _CapturedDenoiseGraph,
         prefix_context: PrefixContext,
     ) -> None:
-        context_id = id(prefix_context.past_key_values)
         context_digest = prefix_context.cache_key_digest
         mutable_graph_output = bool(
             prefix_context.layout.get("mutable_graph_output", False)
@@ -369,12 +349,23 @@ class VLADenoiseGraphRunner:
             context_digest is not None
             and captured.current_context_digest == context_digest
         ):
-            captured.current_context_id = context_id
+            captured.current_context_ref = ref(prefix_context)
             return
-        if not mutable_graph_output and captured.current_context_id == context_id:
+        same_context = (
+            captured.current_context_ref is not None
+            and captured.current_context_ref() is prefix_context
+        )
+        if same_context and (
+            not mutable_graph_output
+            or (
+                prefix_context.revision > 0
+                and captured.current_context_revision == prefix_context.revision
+            )
+        ):
             return
         _copy_prefix_context_(captured.static_prefix_context, prefix_context)
-        captured.current_context_id = context_id
+        captured.current_context_ref = ref(prefix_context)
+        captured.current_context_revision = prefix_context.revision
         captured.current_context_digest = context_digest
 
     def _capture(
@@ -385,7 +376,7 @@ class VLADenoiseGraphRunner:
         x_t: torch.Tensor,
         timestep: torch.Tensor,
     ) -> _CapturedDenoiseGraph:
-        static_prefix_context = _clone_prefix_context(prefix_context)
+        static_prefix_context = prefix_context.clone()
         static_x_t = x_t.detach().clone()
         static_timestep = timestep.detach().clone()
 
@@ -428,7 +419,8 @@ class VLADenoiseGraphRunner:
             static_x_t=static_x_t,
             static_timestep=static_timestep,
             static_output=static_output,
-            current_context_id=id(prefix_context.past_key_values),
+            current_context_ref=ref(prefix_context),
+            current_context_revision=prefix_context.revision,
             current_context_digest=prefix_context.cache_key_digest,
         )
         logger.info(

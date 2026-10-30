@@ -60,7 +60,7 @@ def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
 
 @dataclass
 class PiGemmaModelOutput:
-    last_hidden_state: torch.Tensor
+    last_hidden_state: torch.Tensor | None
     past_key_values: object | None = None
     hidden_states: tuple[torch.Tensor, ...] | None = None
     attentions: tuple[torch.Tensor, ...] | None = None
@@ -615,6 +615,7 @@ class PiGemmaModel(nn.Module):
         output_hidden_states: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         adarms_cond: torch.Tensor | None = None,
+        prefix_kv_only: bool = False,
         **kwargs,
     ) -> PiGemmaModelOutput:
         output_attentions = (
@@ -628,6 +629,10 @@ class PiGemmaModel(nn.Module):
             else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if prefix_kv_only and (
+            not use_cache or output_attentions or output_hidden_states
+        ):
+            raise ValueError("prefix_kv_only requires KV output without hidden states")
 
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -677,10 +682,24 @@ class PiGemmaModel(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for layer_index, decoder_layer in enumerate(
+            self.layers[: self.config.num_hidden_layers]
+        ):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             self._layer_to_compute_device(decoder_layer)
+            if prefix_kv_only and layer_index == self.config.num_hidden_layers - 1:
+                # Only final-layer K/V is consumed; preserve QKV/RoPE and skip attention/MLP.
+                normalized, _ = decoder_layer.input_layernorm(
+                    hidden_states, adarms_cond
+                )
+                query, key, value = decoder_layer.self_attn.project_qkv(normalized)
+                _, key = native_apply_rotary_pos_emb(
+                    query, key, *position_embeddings, unsqueeze_dim=1
+                )
+                past_key_values.update(key, value, layer_index)
+                self._layer_to_cpu_after_compute(decoder_layer)
+                return PiGemmaModelOutput(None, past_key_values=past_key_values)
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -1122,6 +1141,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor | None],
         use_cache: bool | None,
         adarms_cond: list[torch.Tensor | None] | None = None,
+        prefix_kv_only: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -1133,6 +1153,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0],
+                prefix_kv_only=prefix_kv_only,
             )
             return [
                 prefix_output.last_hidden_state,
@@ -1448,6 +1469,7 @@ class Pi05CoreModel(nn.Module):
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
+                prefix_kv_only=True,
             )
         self._offload_prefix_language_layers_after_prefix()
         return (
