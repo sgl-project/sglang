@@ -114,6 +114,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler._engine_paused = False
                 scheduler.running_batch = batch
                 scheduler.pending_finishes = PendingFinishes()
+                scheduler.chunked_req = None
                 scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
                 scheduler.run_batch = MagicMock(return_value=result)
                 scheduler._apply_war_barrier = MagicMock()

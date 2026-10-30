@@ -1166,6 +1166,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.ingest_requests = lambda: []
         scheduler.pending_finishes = PendingFinishes()
+        scheduler.chunked_req = None
         scheduler.drain_pending_finishes = MethodType(
             Scheduler.drain_pending_finishes, scheduler
         )
