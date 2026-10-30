@@ -30,6 +30,28 @@ _PARAM_WITH_NAME_REGEX = re.compile(
     r"<param\s+name=[\'\"]([^\'\"]+)[\'\"]>([\s\S]*?)</param>", re.DOTALL
 )
 _PARAM_MISSING_NAME_REGEX = re.compile(r"<param(?![^>]*\bname=)[^>]*>", re.DOTALL)
+_FUNCTION_BOUNDARY_REGEX = re.compile(
+    r"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)|</function>", re.DOTALL
+)
+
+
+def _find_function_end(text: str, start: int = 0) -> int:
+    # CDATA and comments contain data, not function boundaries. An unfinished
+    # section holds the call until a later chunk supplies its terminator.
+    for match in _FUNCTION_BOUNDARY_REGEX.finditer(text, start):
+        if match.group(0) == "</function>":
+            return match.end()
+    return -1
+
+
+def _iter_function_blocks(text: str):
+    start = text.find("<function")
+    while start != -1:
+        end = _find_function_end(text, start)
+        if end == -1:
+            return
+        yield start, end
+        start = text.find("<function", end)
 
 
 def get_argument_type(
@@ -68,7 +90,6 @@ class MiniCPM5Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<function"
         self.eot_token = "</function>"
-        self.func_call_regex = r"<function.*?</function>"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a MiniCPM-4 V3 XML-styled tool call."""
@@ -96,11 +117,11 @@ class MiniCPM5Detector(BaseFormatDetector):
 
         try:
             last_end = 0
-            for m in re.finditer(self.func_call_regex, text, re.DOTALL):
-                if m.start() > last_end:
-                    normal_parts.append(text[last_end : m.start()])
+            for block_start, block_end in _iter_function_blocks(text):
+                if block_start > last_end:
+                    normal_parts.append(text[last_end:block_start])
 
-                block = m.group(0)
+                block = text[block_start:block_end]
                 func_name = None
                 arguments = {}
                 parsed_ok = False
@@ -227,7 +248,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                 else:
                     normal_parts.append(block)
 
-                last_end = m.end()
+                last_end = block_end
 
             if last_end < len(text):
                 normal_parts.append(text[last_end:])
@@ -285,13 +306,13 @@ class MiniCPM5Detector(BaseFormatDetector):
                 normal_parts.append(current_text[:start])
                 current_text = current_text[start:]
 
-            end = current_text.find(self.eot_token)
+            end = _find_function_end(current_text)
             if end == -1:
                 self._buffer = current_text
                 break
 
-            block = current_text[: end + len(self.eot_token)]
-            self._buffer = current_text[end + len(self.eot_token) :]
+            block = current_text[:end]
+            self._buffer = current_text[end:]
 
             result = self.detect_and_parse(block, tools=tools)
             for call in result.calls:
