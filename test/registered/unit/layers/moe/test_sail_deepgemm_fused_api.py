@@ -27,6 +27,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         SiLU or writing a wrong FP4 layout."""
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         for limit, swiglu, swizzle, message in (
@@ -65,7 +66,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     gemm1_clamp_limit=None,
                 )
             )
-            runner = runner_module.DeepGemmRunnerCore(
+            runner = ep_module.SailDeepGemmEpRunnerCore(
                 MoeRunnerConfig(
                     gemm1_alpha=1.702,
                     gemm1_clamp_limit=7.0,
@@ -96,6 +97,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         and clamp must not modify the GEMM1 buffer."""
         from sglang.kernels.ops.quantization import fp8_kernel, int8_kernel, sail_mxfp4
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         gate = torch.tensor([-10, -1, 0.5, 10], dtype=torch.bfloat16).repeat(64)
@@ -134,7 +136,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     use_mxfp4=variant == "fp4",
                     use_mxfp4_w4a16=variant == "w4a16",
                 )
-                runner = object.__new__(runner_module.DeepGemmRunnerCore)
+                runner = object.__new__(ep_module.SailDeepGemmEpRunnerCore)
                 runner.config = MoeRunnerConfig(
                     gemm1_alpha=1.702,
                     gemm1_clamp_limit=7.0,
@@ -171,14 +173,15 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     stack.enter_context(
                         self.subTest(variant=variant, interleaved=interleaved)
                     )
-                    for name, value in (
-                        ("_is_sail", True),
-                        ("dispose_tensor", lambda x: None),
-                        ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
-                        ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
-                        ("is_allocation_symmetric", lambda: False),
-                    ):
-                        stack.enter_context(patch.object(runner_module, name, value))
+                    for module in (runner_module, ep_module):
+                        for name, value in (
+                            ("_is_sail", True),
+                            ("dispose_tensor", lambda x: None),
+                            ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
+                            ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
+                            ("is_allocation_symmetric", lambda: False),
+                        ):
+                            stack.enter_context(patch.object(module, name, value))
                     stack.enter_context(
                         patch.object(runner_module.deep_gemm_wrapper, gemm_name, gemm)
                     )
@@ -243,6 +246,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         down to the actual launch."""
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         for variant, dtype, gemm_name in (
@@ -263,7 +267,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     use_int8=variant == "int8",
                     use_mxfp4_w4a16=variant == "w4a16",
                 )
-                runner = object.__new__(runner_module.DeepGemmRunnerCore)
+                runner = object.__new__(ep_module.SailDeepGemmEpRunnerCore)
                 runner.config = MoeRunnerConfig(
                     gemm1_alpha=alpha, gemm1_clamp_limit=7.0
                 )
@@ -289,14 +293,15 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
 
                 with ExitStack() as stack:
                     stack.enter_context(self.subTest(variant=variant, alpha=alpha))
-                    for name, value in (
-                        ("_is_sail", True),
-                        ("dispose_tensor", lambda x: None),
-                        ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
-                        ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
-                        ("is_allocation_symmetric", lambda: False),
-                    ):
-                        stack.enter_context(patch.object(runner_module, name, value))
+                    for module in (runner_module, ep_module):
+                        for name, value in (
+                            ("_is_sail", True),
+                            ("dispose_tensor", lambda x: None),
+                            ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
+                            ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
+                            ("is_allocation_symmetric", lambda: False),
+                        ):
+                            stack.enter_context(patch.object(module, name, value))
                     stack.enter_context(
                         patch.object(runner_module.deep_gemm_wrapper, gemm_name, gemm)
                     )
@@ -340,6 +345,80 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                 )
                 self.assertEqual(kw["GEMM1_ALPHA"], alpha or 0.0)
                 self.assertEqual(kw["GEMM1_CLAMP_LIMIT"], 7.0)
+
+    def test_masked_bf16_situ_never_falls_through_to_oai_swiglu(self):
+        """SiTU reuses gemm1_alpha as beta, so the forked masked bf16 path must
+        reach the SiTU kernel instead of the oai-swiglu branch of
+        ``silu_and_mul_masked_fwd``."""
+        from sglang.kernels.ops import activation as activation_ops
+        from sglang.kernels.ops.moe import ep_moe_kernels as kernels
+        from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+        situ_calls = []
+        quant = runner_module.DeepGemmMoeQuantInfo(
+            w13_weight=torch.empty((2, 512, 32), dtype=torch.bfloat16),
+            w2_weight=torch.empty((2, 64, 128), dtype=torch.bfloat16),
+        )
+        runner = object.__new__(ep_module.SailDeepGemmEpRunnerCore)
+        runner.config = MoeRunnerConfig(
+            activation="situ", gemm1_alpha=4.0, gemm1_clamp_limit=6.0, top_k=1
+        )
+        runner.swiglu_limit = None
+        counts = torch.tensor([1, 2], dtype=torch.int32)
+
+        def gemm(lhs, rhs, out, *args, **kw):
+            weight = rhs[0] if isinstance(rhs, tuple) else rhs
+            if weight is quant.w13_weight:
+                out.fill_(1)
+            else:
+                out.copy_(lhs[..., : out.shape[-1]])
+            return None
+
+        def situ_masked(gateup, down, masked_m, beta, linear_beta, top_k, expected_m):
+            situ_calls.append((beta, linear_beta, top_k, expected_m))
+            down.fill_(3)
+
+        def oai(*args, **kw):
+            raise AssertionError("masked bf16 SiTU must not run oai-swiglu")
+
+        with ExitStack() as stack:
+            for module in (runner_module, ep_module):
+                for name, value in (
+                    ("_is_sail", True),
+                    ("dispose_tensor", lambda x: None),
+                    ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
+                    ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
+                    ("is_allocation_symmetric", lambda: False),
+                ):
+                    stack.enter_context(patch.object(module, name, value))
+            stack.enter_context(
+                patch.object(
+                    runner_module.deep_gemm_wrapper,
+                    "grouped_gemm_nt_bf16_masked",
+                    gemm,
+                )
+            )
+            stack.enter_context(
+                patch.object(activation_ops, "situ_and_mul_masked", situ_masked)
+            )
+            stack.enter_context(patch.object(kernels, "silu_and_mul_masked_fwd", oai))
+            payload = runner_module.DeepGemmRunnerInput(
+                torch.empty((2, 3, 64), dtype=torch.bfloat16),
+                torch.ones((2, 3, 1)),
+                True,
+                masked_m=counts,
+                expected_m=1,
+            )
+            state = {
+                "hidden_states_device": torch.device("cpu"),
+                "meta_overlap_args": {},
+            }
+            result = runner.run(payload, quant, state).hidden_states
+
+        torch.testing.assert_close(result, torch.full_like(result, 3))
+        self.assertEqual(situ_calls, [(4.0, 6.0, 1, 1)])
 
     def test_launch_scale_capacity_and_non_power_of_two_channel_width(self):
         """The per-token scale write bound must not exceed the capacity; a 1536-wide
@@ -825,6 +904,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         CPU numerics only at the boundary."""
         from sglang.kernels.ops import activation
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         for variant in ("mma", "valu", "int4"):
@@ -848,7 +928,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
                 use_mxfp4_w4a16=variant != "int4",
                 use_int4_w4a16=variant == "int4",
             )
-            runner = object.__new__(runner_module.DeepGemmRunnerCore)
+            runner = object.__new__(ep_module.SailDeepGemmEpRunnerCore)
             runner.config = MoeRunnerConfig(
                 activation="situ", top_k=2, gemm1_alpha=4.0, gemm1_clamp_limit=25.0
             )
@@ -886,6 +966,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
                 self.subTest(variant=variant),
                 patch.object(runner_module, "_is_sail", True),
                 patch.object(runner_module, "dispose_tensor"),
+                patch.object(ep_module, "_is_sail", True),
+                patch.object(ep_module, "dispose_tensor"),
                 patch.object(
                     runner_module.deep_gemm_wrapper,
                     "grouped_gemm_nt_bf16i4bf16_nopad",
@@ -1221,6 +1303,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         GEMM2 after t/permute."""
         from sglang.kernels.ops import activation
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         quant = runner_module.DeepGemmMoeQuantInfo(
@@ -1230,7 +1313,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
             w2_scale=torch.empty((2, 64, 4), dtype=torch.uint16),
             use_mxfp4=True,
         )
-        runner = object.__new__(runner_module.DeepGemmRunnerCore)
+        runner = object.__new__(ep_module.SailDeepGemmEpRunnerCore)
         runner.config = MoeRunnerConfig(
             activation="situ", top_k=2, gemm1_clamp_limit=None
         )
@@ -1270,6 +1353,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         with (
             patch.object(runner_module, "_is_sail", True),
             patch.object(runner_module, "dispose_tensor"),
+            patch.object(ep_module, "_is_sail", True),
+            patch.object(ep_module, "dispose_tensor"),
             patch.dict(
                 sys.modules,
                 {"deep_gemm": SimpleNamespace(preprocess_mxfp4_scales=lambda x: x)},
