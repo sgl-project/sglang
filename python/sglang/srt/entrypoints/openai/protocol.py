@@ -39,6 +39,7 @@ from typing import (
 
 import msgspec
 from openai.types.responses import (
+    ResponseCustomToolCall,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseOutputItem,
@@ -1887,6 +1888,45 @@ class ResponseTool(BaseModel):
     def validate_function_tool(self) -> ResponseTool:
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
+        if self.type == "namespace" and self.tools is not None:
+            if not self.name:
+                raise ValueError("Namespace tools must include a name")
+            for definition in self.tools:
+                definition = definition.get("function", definition)
+                child = ResponseTool.model_validate({"type": "function", **definition})
+                if child.type not in ("function", "custom") or not child.name:
+                    raise ValueError(
+                        "Namespace entries must be named function or custom tools"
+                    )
+        return self
+
+
+class ResponseAdditionalTools(BaseModel):
+    type: Literal["additional_tools"]
+    role: Literal["developer"]
+    tools: List[ResponseTool]
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> ResponseAdditionalTools:
+        for tool in self.tools:
+            if tool.type not in ("function", "custom", "namespace"):
+                raise ValueError(
+                    "additional_tools supports function, custom and namespace tools, "
+                    f"got {tool.type!r}"
+                )
+            if not tool.name:
+                raise ValueError("additional_tools entries must include a name")
+            if tool.type == "namespace":
+                if tool.tools is None:
+                    raise ValueError("Namespace tools must include a tools list")
+                for definition in tool.tools:
+                    child = ResponseTool.model_validate(
+                        {"type": "function", **definition.get("function", definition)}
+                    )
+                    if child.type not in ("function", "custom") or not child.name:
+                        raise ValueError(
+                            "Namespace entries must be named function or custom tools"
+                        )
         return self
 
 
@@ -1918,6 +1958,7 @@ ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    ResponseCustomToolCall,
 ]
 
 
@@ -2057,6 +2098,11 @@ class ResponsesRequest(PDRoutingFields):
     def _normalize_input_item_for_validation(item):
         if not isinstance(item, dict):
             return item
+
+        if item.get("type") == "additional_tools":
+            return ResponseAdditionalTools.model_validate(item).model_dump(
+                exclude_none=True
+            )
 
         # an output item replayed into input carries a string id; without this it'd
         # be read as an item-reference, drop its content, and fail as an empty {}.
@@ -2478,6 +2524,7 @@ ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    ResponseCustomToolCall,
 ]
 
 

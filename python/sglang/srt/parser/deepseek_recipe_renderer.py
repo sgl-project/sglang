@@ -8,6 +8,7 @@ import functools
 import json
 from types import ModuleType
 from typing import Any, Optional, Union
+from uuid import uuid4
 
 DEEPSEEK_RECIPE_INSTALL_HINT = (
     "Serving DeepSeek-V4 / V4.1 requires the `deepseek-recipe` package (DeepSeek's "
@@ -95,6 +96,43 @@ def pre_normalize(body: dict[str, Any]) -> dict[str, Any]:
     return request
 
 
+def recipe_conversation(recipe: ModuleType, body: dict, options):
+    """Keep inline tool declarations at their original conversation positions."""
+    body = copy.deepcopy(body)
+    declarations = {}
+    for message in body["messages"]:
+        if message.get("tools"):
+            marker = f"sglang-inline-tools-{uuid4().hex}"
+            declarations[marker] = recipe.SystemMessage(
+                message.get("content") or "",
+                tools=[
+                    recipe.ToolDefinition(**tool["function"])
+                    for tool in message["tools"]
+                ],
+            )
+            message["content"] = marker
+            message.pop("tools")
+    converted = recipe.ChatCompletionRequest(body).convert(options)
+    conversation = converted.conversation
+    if not declarations:
+        return conversation
+    return recipe.Conversation(
+        messages=[
+            declarations.get(message.content, message)
+            if message.role == "system"
+            else message
+            for message in conversation.messages
+        ],
+        thinking_mode=conversation.thinking_mode,
+        tools=conversation.tools,
+        tool_choice=conversation.tool_choice,
+        reasoning_effort=conversation.reasoning_effort,
+        response_format=conversation.response_format,
+        response_schema=conversation.response_schema,
+        response_regex=conversation.response_regex,
+    )
+
+
 def _error_message(body: Any) -> str:
     try:
         return json.loads(body)["error"]["message"]
@@ -152,12 +190,12 @@ class DeepSeekRecipe:
         if effort_budget is not None:
             normalized["reasoning_effort"] = BUDGET_TIER
         try:
-            converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
+            conversation = recipe_conversation(recipe, normalized, self._options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
-        prompt_ids = self._encoding.encode(converted.conversation)
+        prompt_ids = self._encoding.encode(conversation)
         if image_urls is not None:
-            rendered = self._encoding.render_conversation(converted.conversation)
+            rendered = self._encoding.render_conversation(conversation)
             image_urls.extend(
                 source.url or source.data_url for source in rendered.image_sources
             )
