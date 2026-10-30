@@ -1051,6 +1051,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self._publish(nvfp4)
         self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
 
+    def test_routed_experts_capture_selects_routed_trtllm(self):
+        """flashinfer_trtllm routes inside the kernel, so routed-experts capture
+        must move to the routed variant or it records nothing."""
+        qwen = ("Qwen3MoeForCausalLM", "qwen3_moe")
+        with override_platform(is_sm100=True):
+            serving = self._construct(*qwen)
+            capture = self._construct(*qwen, enable_return_routed_experts=True)
+            explicit = self._construct(
+                *qwen, enable_return_routed_experts=True, moe_runner_backend="triton"
+            )
+
+        b = "moe_runner_backend"
+        self.assertEqual(self._resolved(serving, b), "flashinfer_trtllm")
+        self.assertEqual(self._resolved(capture, b), "flashinfer_trtllm_routed")
+        self.assertEqual(self._resolved(explicit, b), "triton")
+
+        from sglang.srt.arg_groups.overrides import _moe_runner_routed_experts_capture
+
+        unsupported = SimpleNamespace(
+            enable_return_routed_experts=True,
+            moe_runner_backend="flashinfer_trtllm",
+            quantization="compressed-tensors",
+        )
+        with self.assertRaisesRegex(ValueError, "routed variant"):
+            _moe_runner_routed_experts_capture(unsupported)
+
     # ---- Command-A-Plus (Cohere2Moe) MoE runner gate ----
 
     _NVFP4_QUANT = {
