@@ -464,6 +464,41 @@ class TestVmmExportAndImport(CustomTestCase):
         self.assertIsNone(daemon.model)
         daemon.transport_backend.close()
 
+    def test_transformers_moe_layer_registry_is_released_before_packing(self):
+        from sglang.srt.models import transformers as transformers_backend
+
+        model = _TinyModel()
+        tensors = dict(model.named_parameters(remove_duplicate=False))
+        tensors.update(model.named_buffers(remove_duplicate=False))
+        originals = {
+            name: StorageWeakRef(tensor.untyped_storage())
+            for name, tensor in tensors.items()
+            if tensor.untyped_storage().nbytes()
+        }
+        del tensors
+        # The Transformers backend registers each MoE layer, which holds the
+        # experts' weights, in a module-level dict.
+        moe_layer = torch.nn.Module()
+        moe_layer.experts = model.proj
+        registry = {"model.layers.0.mlp": moe_layer}
+        daemon = _make_daemon(
+            model,
+            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+        )
+        del model, moe_layer
+        with (
+            mock.patch.object(
+                transformers_backend, "_TRANSFORMERS_MOE_LAYERS", registry
+            ),
+            _host_vmm(),
+        ):
+            daemon._export_state()
+        self.assertEqual(
+            [name for name, ref in originals.items() if not ref.expired()], []
+        )
+        self.assertEqual(registry, {})
+        daemon.transport_backend.close()
+
     def test_export_log_reports_the_allocations(self):
         # vmm_fd entries carry no handle blob, so a handle-size estimate would
         # always read zero.

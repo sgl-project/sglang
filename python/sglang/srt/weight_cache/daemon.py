@@ -490,10 +490,15 @@ class WeightCacheDaemon:
             # the model, so release its object graph before moving any bytes.
             self.model = None
             from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+            from sglang.srt.models.transformers import _TRANSFORMERS_MOE_LAYERS
 
             # This process-wide cache also owns model buffers. The standalone
             # daemon loads one model and does not need to construct another.
             _ROPE_DICT.clear()
+            # The Transformers backend registers every MoE layer in this dict,
+            # which would keep the experts' original weights alive next to
+            # their packed copies.
+            _TRANSFORMERS_MOE_LAYERS.clear()
             gc.collect()
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
