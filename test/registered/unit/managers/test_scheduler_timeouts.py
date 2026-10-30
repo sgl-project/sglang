@@ -48,6 +48,7 @@ class _FakeReq:
         self._finished = is_finished
         self.output_ids = []
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -78,6 +79,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.rust_server = None
+    s.output_streamer = MagicMock()
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
