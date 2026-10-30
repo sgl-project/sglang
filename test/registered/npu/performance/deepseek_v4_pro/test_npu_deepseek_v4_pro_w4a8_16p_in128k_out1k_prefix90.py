@@ -143,6 +143,8 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
     output_len = 1024
     request_rate = float("inf")
     seed = 42
+    tpot = 20
+    output_token_throughput = 128
 
     def test_npu_deepseek_v4_pro_w4a8_mix_16p_in128k_out1k_prefix_90_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
