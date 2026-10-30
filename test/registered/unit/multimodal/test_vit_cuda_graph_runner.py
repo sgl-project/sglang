@@ -106,6 +106,22 @@ def test_vit_graph_keeps_rotary_workspace_address_after_growth():
     assert len(runner._retired_sin_cos_ws) == 1
 
 
+def test_vit_graph_replay_output_survives_the_next_replay():
+    """Callers cache a replay's result and may replay again before consuming it,
+    so replay must not hand out the graph's static output buffer."""
+    runner = _runner(use_data_parallel=True)
+    runner.block_input["key"] = torch.empty(4, 1, 2)
+    runner.block_output["key"] = torch.empty(4, 1, 2)
+    runner.block_graphs["key"] = SimpleNamespace(
+        replay=lambda: runner.block_output["key"].copy_(runner.block_input["key"] * 2)
+    )
+
+    first = runner.replay(graph_key="key", x_3d=torch.ones(4, 1, 2))
+    runner.replay(graph_key="key", x_3d=torch.full((4, 1, 2), 3.0))
+
+    assert torch.equal(first, torch.full((4, 1, 2), 2.0))
+
+
 def test_internvl_graph_runner_caches_resolved_backend_name():
     attention = SimpleNamespace(
         qkv_backend_name="triton_attn",

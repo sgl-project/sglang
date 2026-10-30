@@ -38,6 +38,8 @@ Everything "parameter-like" becomes a static buffer:
 
 In this way to solve the underlying requirement: during replay, not allowed to swap tensors, can only modify tensor contents.
 
+The next replay of a graph overwrites its block_output, so replay returns a copy of it (Qwen2.5-VL's window reordering already allocates a new tensor): callers cache the embedding and may encode again before consuming it.
+
 ### Attention backend arguments
 Attention backend arguments are fixed inside the graph:
 
