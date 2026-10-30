@@ -1280,6 +1280,7 @@ class ModelRunner:
                 num_tokens=self.runner_ids.capture_token_capacity(
                     self.max_token_pool_size
                 ),
+                max_req_len=self.max_req_len,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )

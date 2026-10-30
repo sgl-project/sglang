@@ -1,4 +1,8 @@
-"""RoutedExpertsCapturer: how many device-cache rows one forward can route."""
+"""Device-cache sizing: how many rows one forward can route.
+
+Both top-k capturers share ``device_cache_rows``; the routed-experts one scales
+it by DP ranks and the indexer one does not, since its capture is per-rank-local.
+"""
 
 import unittest
 from types import SimpleNamespace
@@ -7,8 +11,13 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.state_capturer import indexer_topk as ix_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
-from sglang.srt.state_capturer.base import BaseDeviceCache, BaseTopkCapturer
+from sglang.srt.state_capturer.base import (
+    BaseDeviceCache,
+    BaseTopkCapturer,
+    device_cache_rows,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,7 +40,7 @@ def _rows(**override):
         num_dp_ranks=1,
     )
     bounds.update(override)
-    return re_mod._device_cache_rows(**bounds)
+    return device_cache_rows(**bounds)
 
 
 def _bound_on_main(chunked_prefill_size, max_running_requests, num_dp_ranks):
@@ -78,7 +87,7 @@ class TestDeviceCacheRows(CustomTestCase):
                         )
 
 
-class TestConstructorWiring(CustomTestCase):
+class TestRoutedExpertsConstructorWiring(CustomTestCase):
     """The live config must reach the budget through the constructor."""
 
     MODEL_CONFIG = SimpleNamespace(
@@ -129,6 +138,46 @@ class TestConstructorWiring(CustomTestCase):
         self.assertEqual(
             self._rows(chunked_prefill_size=4096, max_req_len=24576, dp_ranks=2), 8192
         )
+
+
+class TestIndexerTopkConstructorWiring(CustomTestCase):
+    """IndexerTopkCapturer shares the budget and never scales it by DP."""
+
+    def _rows(self, *, chunked_prefill_size, max_req_len):
+        seen = {}
+
+        def record(self, **kwargs):
+            seen.update(kwargs)
+
+        with (
+            mock.patch.object(
+                ix_mod,
+                "get_schedule",
+                return_value=SimpleNamespace(
+                    chunked_prefill_size=chunked_prefill_size,
+                    max_prefill_tokens=MAX_PREFILL_TOKENS,
+                ),
+            ),
+            mock.patch.object(
+                ix_mod, "get_parallel", return_value=SimpleNamespace(attn_tp_size=1)
+            ),
+            mock.patch.object(BaseTopkCapturer, "__init__", record),
+        ):
+            ix_mod.IndexerTopkCapturer(
+                num_tokens=8,
+                num_indexer_layers=LAYERS,
+                index_topk=TOPK,
+                max_req_len=max_req_len,
+                max_running_requests=MAX_RUNNING_REQUESTS,
+                device="cpu",
+            )
+        return seen["max_batch_size"]
+
+    def test_unchunked_dsa_prefill_scales_with_the_request_cap(self):
+        self.assertEqual(self._rows(chunked_prefill_size=-1, max_req_len=24576), 24576)
+
+    def test_chunked_dsa_prefill_scales_with_the_chunk(self):
+        self.assertEqual(self._rows(chunked_prefill_size=4096, max_req_len=24576), 4096)
 
 
 class TestCaptureAtTheBudget(CustomTestCase):
