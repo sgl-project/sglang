@@ -424,6 +424,14 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                 f"num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )
+        # the adapters were trained at video shift 12 / audio shift 3
+        for name, trained in (("flow_shift", 12.0), ("audio_flow_shift", 3.0)):
+            value = getattr(self, name)
+            if value is not None and float(value) != trained:
+                raise ValueError(
+                    f"Pika H3 Flex adapters were trained at {name}={trained:g}; "
+                    f"got {value}"
+                )
 
 
 __all__ = [

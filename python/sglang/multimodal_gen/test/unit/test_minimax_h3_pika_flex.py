@@ -38,6 +38,10 @@ def test_registry_overlay_and_six_step_contract() -> None:
     assert PikaH3FlexSamplingParams(prompt="p").num_inference_steps == 6
     with pytest.raises(ValueError, match="fixed six-step schedule"):
         PikaH3FlexSamplingParams(prompt="p", num_inference_steps=8)
+    PikaH3FlexSamplingParams(prompt="p", flow_shift=12.0, audio_flow_shift=3.0)
+    for shifts in ({"flow_shift": 10.0}, {"audio_flow_shift": 6.0}):
+        with pytest.raises(ValueError, match="trained at"):
+            PikaH3FlexSamplingParams(prompt="p", **shifts)
 
 
 def test_release_metadata_fields() -> None:
