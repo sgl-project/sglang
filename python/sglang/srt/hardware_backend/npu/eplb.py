@@ -34,7 +34,10 @@ def get_eplb_device_group() -> dist.ProcessGroup:
     """Reuse TP's device group and its existing communication configuration."""
     from sglang.srt.runtime_context import get_parallel
 
-    tp_group = get_parallel().tp_group
+    parallel = get_parallel()
+    if parallel.tp_size != parallel.moe_ep_size:
+        raise ValueError("NPU EPLB requires TP size to equal EP size.")
+    tp_group = parallel.tp_group
     # Shared statistics and migration use WORLD ranks, including root rank 0.
     if tp_group.ranks != list(range(dist.get_world_size())):
         raise ValueError(
