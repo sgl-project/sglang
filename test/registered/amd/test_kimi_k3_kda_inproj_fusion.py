@@ -1,6 +1,6 @@
 """Layout check for the ROCm fused Kimi-K3 KDA input projection.
 
-Below SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS the whole in-proj is one GEMM
+Below SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS the whole in-proj is one GEMM
 over ``[q,k,v,g | f_a | b | pad]`` instead of a wide GEMM plus a tiny [f_a|b]
 GEMV. Both layouts are views over the same buffer, so the two paths have to
 agree; this pins the slice offsets, the tail view the split path still reads,
@@ -256,7 +256,7 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
         self.assertEqual(weight.shape[1] % 64, 0)
 
     def test_merged_matches_split_projections(self):
-        # Spans SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS, which Quark FP8 ignores.
+        # Spans SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS, which Quark FP8 ignores.
         for tokens in (1, 8, 64, 256, 257, 1024, 4096):
             with self.subTest(tokens=tokens):
                 x = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")

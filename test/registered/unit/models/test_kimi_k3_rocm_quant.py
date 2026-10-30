@@ -245,7 +245,7 @@ class TestMergeKdaInprojFp8(CustomTestCase):
         self.assertIsNone(k3_merge_kda_inproj_fp8(qkvg_sizes=[24, 8], **mods))
 
     def test_env_disables_the_tail(self):
-        with envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.override(False):
+        with envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.override(False):
             mods = _kda_inproj_linears()
         self.assertEqual(mods["qkvg_proj"].weight.shape[0], 32)
         self.assertIsNone(k3_merge_kda_inproj_fp8(**mods))
@@ -278,7 +278,7 @@ class TestMergeKdaInprojFp8(CustomTestCase):
 
         self.assertEqual(attn.fused_qkvg_proj.weight.shape[0], 64)
         self.assertIn(
-            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0",
+            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0",
             _unsupported_derived_weight_cache_error(model),
         )
 

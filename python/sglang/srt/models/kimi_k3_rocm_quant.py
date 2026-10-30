@@ -109,7 +109,7 @@ def k3_kda_inproj_fp8_tail_rows(
     one per layer, which strands caching-allocator segments that empty_cache
     cannot return (~1 GB per GPU at Kimi-K3 TP8).
     """
-    if not envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get():
+    if not envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get():
         return 0
     if not all(_is_quark_channel_fp8(m) for m in (f_a_proj, b_proj, f_b_proj)):
         return 0
