@@ -96,6 +96,7 @@ class TestMediaArtifactProcessor(CustomTestCase):
         )
         processor = MediaArtifactCacheMixin()
         processor.gpu_image_decode = False
+        processor.apply_exif_orientation = True
 
         with self.assertRaisesRegex(ValueError, "Could not decode image"):
             processor.decode_media_snapshot(

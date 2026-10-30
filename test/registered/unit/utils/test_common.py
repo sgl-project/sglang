@@ -5,8 +5,9 @@ import unittest
 from array import array
 from unittest import mock
 
+import numpy as np
 import torch
-from PIL import Image
+from PIL import ExifTags, Image, ImageOps
 
 from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
@@ -15,6 +16,8 @@ from sglang.srt.utils.common import (
     freeze_gc,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    is_cuda,
+    load_image,
 )
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -183,6 +186,87 @@ class TestLoadImage(CustomTestCase):
                         image_bytes=image_bytes,
                         gpu_image_decode=False,
                     )
+
+
+def _gradient_jpeg(size=(64, 32), mode="RGB", orientation=None) -> bytes:
+    width, height = size
+    x = np.linspace(0, 255, width, dtype=np.uint8)[None, :].repeat(height, axis=0)
+    y = np.linspace(0, 255, height, dtype=np.uint8)[:, None].repeat(width, axis=1)
+    img = Image.fromarray(np.stack([x, y, 255 - x], axis=-1), "RGB").convert(mode)
+    kwargs = {}
+    if orientation is not None:
+        exif = Image.Exif()
+        exif[ExifTags.Base.Orientation] = orientation
+        kwargs["exif"] = exif
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95, **kwargs)
+    return buf.getvalue()
+
+
+@unittest.skipUnless(is_cuda(), "GPU JPEG decoding requires CUDA")
+class TestLoadImageGpuJpeg(CustomTestCase):
+    def test_grayscale_jpeg_decodes_to_rgb(self):
+        """Non-regression test for https://github.com/sgl-project/sglang/issues/44748.
+
+        A grayscale JPEG must come back with 3 channels like every other image;
+        a 1-channel tensor breaks stacking and RGB normalization downstream.
+        """
+        image, _ = load_image(_gradient_jpeg(mode="L"), gpu_image_decode=True)
+        self.assertIsInstance(image, torch.Tensor)
+        self.assertTrue(image.is_cuda)
+        self.assertEqual(tuple(image.shape), (3, 32, 64))
+
+    def test_exif_orientation_matches_pil(self):
+        """Non-regression test for https://github.com/sgl-project/sglang/issues/33464 (GPU path).
+
+        GPU and PIL decodes of the same photo must agree on its orientation.
+        """
+        data = _gradient_jpeg(size=(128, 64), orientation=6)
+        image, _ = load_image(data, gpu_image_decode=True)
+        reference = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        reference = torch.from_numpy(np.array(reference)).permute(2, 0, 1)
+
+        self.assertIsInstance(image, torch.Tensor)
+        self.assertEqual(image.shape, reference.shape)
+        # nvJPEG and PIL upsample chroma differently (~1 mean abs diff here);
+        # the opposite rotation is ~128 off.
+        diff = (image.cpu().int() - reference.int()).abs().float().mean().item()
+        self.assertLess(diff, 10.0)
+
+    def test_decode_waits_for_work_queued_on_the_current_stream(self):
+        """Non-regression test for https://github.com/sgl-project/sglang/issues/43075.
+
+        The decoder may be handed memory that queued kernels still read; writing
+        it before they run corrupts their results (e.g. NaN pixel_values).
+        """
+        data = _gradient_jpeg(size=(512, 512))
+        num_bytes = 3 * 512 * 512
+        values = (1, 2, 3, 4)
+        expected = float(sum(value * num_bytes for value in values))
+
+        landed_on_freed = 0
+        for _ in range(10):
+            victims = [
+                torch.full((num_bytes,), value, dtype=torch.uint8, device="cuda")
+                for value in values
+            ]
+            pointers = {victim.data_ptr() for victim in victims}
+            torch.cuda.synchronize()
+
+            torch.cuda._sleep(100_000_000)
+            total = torch.zeros((), dtype=torch.float64, device="cuda")
+            for victim in victims:
+                total = total + victim.sum(dtype=torch.float64)
+            victims.clear()
+
+            image, _ = load_image(data, gpu_image_decode=True)
+            self.assertIsInstance(image, torch.Tensor)
+            landed_on_freed += image.data_ptr() in pointers
+            torch.cuda.synchronize()
+            self.assertEqual(float(total), expected)
+
+        if not landed_on_freed:
+            self.skipTest("the allocator never reused a freed block")
 
 
 class _FakePynvml:

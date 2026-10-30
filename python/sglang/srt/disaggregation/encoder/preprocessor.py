@@ -334,7 +334,13 @@ class EncoderPreprocessor:
                     if self.use_image_processor_gpu
                     else False
                 )
-                img, _ = load_image(data, gpu_image_decode)
+                img, _ = load_image(
+                    data,
+                    gpu_image_decode,
+                    apply_exif_orientation=(
+                        self.encoder_media_processor_config.apply_exif_orientation
+                    ),
+                )
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)
