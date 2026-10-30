@@ -5,11 +5,11 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
 )
-from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -20,11 +20,11 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     _WeightUpdateSession,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.mem_cache.kv_weight_version_tracker import (
     KvWeightVersionRecord,
     KvWeightVersionTracker,
 )
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
