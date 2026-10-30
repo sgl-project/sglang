@@ -2202,6 +2202,13 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # GLM-5.3-Flash
+    # ===================================================================
+    # Opt-in: overlap BF16 KDA gate projections with QKV on tuned SM90 shapes.
+    # Standalone projection gains have not translated into a serving speedup.
+    SGLANG_GLM5_KDA_PROJ_OVERLAP = EnvBool(False)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
