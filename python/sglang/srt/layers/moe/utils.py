@@ -48,6 +48,7 @@ class MoeA2ABackend(Enum):
     PPLX = "pplx"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
     CUSTOMIZED = "customized"
+    MSCCLPP = "mscclpp"
 
     @classmethod
     def _missing_(cls, value):
@@ -99,6 +100,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_mscclpp(self):
+        return self == MoeA2ABackend.MSCCLPP
 
     def supports_aiter(self) -> bool:
         return self in (
@@ -372,6 +376,31 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
+class MSCCLPPMode(Enum):
+    """MSCCL++ EP transport mode.
+
+    The configuration surface is retained so additional modes can be added
+    without introducing a new flag.
+    """
+
+    LATENCY = "latency"
+    THROUGHPUT = "throughput"
+
+    def is_latency(self) -> bool:
+        return self == MSCCLPPMode.LATENCY
+
+    def is_throughput(self) -> bool:
+        return self == MSCCLPPMode.THROUGHPUT
+
+
+class MSCCLPPEPLayout(str, Enum):
+    """MSCCL++ EP dispatch layout."""
+
+    RANK_MAJOR = "rank_major"
+    EXPERT_MAJOR = "expert_major"
+    TOKEN_MAJOR = "token_major"
+
+
 class DispatcherOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
@@ -484,12 +513,8 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     return DispatcherOutputDtype.FP8
 
 
-def get_ascend_dispatcher_output_dtype(dispatcher):
-    """
-    Automatically choose the dispatch output dtype for Ascend.
-    """
-
-    # 1. Parse quant config to determine the output dtype of dispatcher
+def get_ascend_dispatcher_output_dtype(dispatcher) -> DispatcherOutputDtype:
+    """Choose the dispatch output dtype for Ascend."""
     if dispatcher.quant_config is not None:
         dispatcher_output_dtype = dispatcher.quant_config.get(
             "dispatcher_output_dtype", None
@@ -497,7 +522,6 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 2. Ascend dispatch defaults to BF16
     return DispatcherOutputDtype.BF16
 
 
@@ -554,6 +578,20 @@ def _default_speculative_moe_runner_backend(
     return target_runner_backend
 
 
+def _validate_mscclpp_ep_spanning(a2a_backend: MoeA2ABackend) -> None:
+    if not a2a_backend.is_mscclpp():
+        return
+
+    parallel = get_parallel()
+    if parallel.moe_ep_size != parallel.tp_size:
+        raise ValueError(
+            "MSCCL++ currently requires --ep-size to equal --tp-size because "
+            "the SGLang dispatcher uses the tensor-parallel process group for "
+            f"A2A communication. Got --ep-size {parallel.moe_ep_size} and "
+            f"--tp-size {parallel.tp_size}."
+        )
+
+
 def initialize_moe_config():
     """Seed the MoE runtime flags from the published configuration.
 
@@ -579,6 +617,42 @@ def initialize_moe_config():
         else _default_speculative_a2a_backend(moe.a2a_backend)
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
+    moe.mscclpp_mode = MSCCLPPMode(exec_moe.mscclpp_mode)
+    moe.mscclpp_ep_layout = MSCCLPPEPLayout(exec_moe.mscclpp_ep_layout)
+    _validate_mscclpp_ep_spanning(moe.a2a_backend)
+    if moe.a2a_backend.is_mscclpp():
+        if overlap.enable_two_batch_overlap or overlap.enable_single_batch_overlap:
+            raise ValueError(
+                "MSCCL++ MoE does not support TBO/SBO overlap. Disable "
+                "--enable-two-batch-overlap and --enable-single-batch-overlap "
+                "when using --moe-a2a-backend mscclpp."
+            )
+        get_mscclpp_ep_layout()
+        mscclpp_supported_configs = (
+            (
+                MSCCLPPMode.LATENCY,
+                MSCCLPPEPLayout.RANK_MAJOR,
+                MoeRunnerBackend.FLASHINFER_CUTLASS,
+            ),
+            (
+                MSCCLPPMode.LATENCY,
+                MSCCLPPEPLayout.EXPERT_MAJOR,
+                MoeRunnerBackend.TRITON,
+            ),
+        )
+        if (
+            moe.mscclpp_mode,
+            moe.mscclpp_ep_layout,
+            moe.runner_backend,
+        ) not in mscclpp_supported_configs:
+            raise ValueError(
+                "MSCCL++ requires --mscclpp-mode latency with either "
+                f"--mscclpp-ep-layout rank_major --moe-runner-backend flashinfer_cutlass "
+                f"or --mscclpp-ep-layout expert_major --moe-runner-backend triton. "
+                f"Got --mscclpp-mode {moe.mscclpp_mode.value}, "
+                f"--mscclpp-ep-layout {moe.mscclpp_ep_layout.value}, "
+                f"--moe-runner-backend {moe.runner_backend.value}."
+            )
     moe.deepep_config = exec_moe.deepep_config or ""
     moe.moe_ascend_ops_config = AscendOpsConfig.from_json_str(
         exec_moe.moe_ascend_ops_config
@@ -710,6 +784,29 @@ def get_deepep_mode() -> DeepEPMode:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
         moe.deepep_mode = DeepEPMode.AUTO
     return moe.deepep_mode
+
+
+def get_mscclpp_mode() -> MSCCLPPMode:
+    moe = get_flags().moe
+    if moe.mscclpp_mode is None:
+        logger.warning("MSCCLPP_MODE is not initialized, using latency mode")
+        moe.mscclpp_mode = MSCCLPPMode.LATENCY
+    return moe.mscclpp_mode
+
+
+def get_mscclpp_ep_layout() -> MSCCLPPEPLayout:
+    moe = get_flags().moe
+    if moe.mscclpp_ep_layout is None:
+        logger.warning(
+            "MSCCLPP_EP_LAYOUT is not initialized, using expert-major layout"
+        )
+        moe.mscclpp_ep_layout = MSCCLPPEPLayout.EXPERT_MAJOR
+    return moe.mscclpp_ep_layout
+
+
+def get_mscclpp_format_name() -> str:
+    """Return the registered permutation format for the active mode and layout."""
+    return f"mscclpp_{get_mscclpp_mode().value}_{get_mscclpp_ep_layout().value}"
 
 
 def get_deepep_config() -> str:
@@ -868,7 +965,12 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
     # combine, sum each token's expert outputs back to its source rank.
-    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+    return (
+        a2a.is_flashinfer()
+        or a2a.is_pplx()
+        or a2a.is_flashinfer_megamoe()
+        or get_moe_a2a_backend().is_mscclpp()
+    )
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
