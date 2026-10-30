@@ -449,6 +449,7 @@ class Lfm3ShortConv(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.linear_layer_idx = config.linear_layer_ids.index(layer_idx)
         self.conv_kernel = int(config.conv_L_cache)
         self.use_bias = bool(config.conv_bias)
         self.hidden_size = config.hidden_size
@@ -636,7 +637,9 @@ class Lfm3ShortConv(nn.Module):
             return hidden_states
 
         req_to_token_pool = get_req_to_token_pool()
-        layer_cache = req_to_token_pool.mamba2_layer_cache(self.layer_idx)
+        layer_cache = req_to_token_pool.mamba_pool.mamba2_layer_cache(
+            self.linear_layer_idx
+        )
         conv_state = layer_cache.conv[0]
         metadata = get_attn_backend().linear_attn_backend.forward_metadata
         mamba_indices = metadata.mamba_cache_indices
