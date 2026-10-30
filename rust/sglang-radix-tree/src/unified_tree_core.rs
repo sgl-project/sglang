@@ -1,6 +1,8 @@
 //! The radix prefix tree of cached KV.
 #![allow(unused_variables)]
 
+pub use crate::cache_action::{BackupKV, CacheAction, CacheActions};
+use crate::cache_action::{FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -12,7 +14,7 @@ use crate::components::{
     self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
 };
 use crate::components::{
-    BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
+    BASE_COMPONENT_TYPE, ComponentType, FULL, Family, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
 use crate::node::Node;
 use crate::node::NodeArena;
@@ -139,6 +141,12 @@ pub struct MatchResult {
     pub last_host_node_id: NodeId,
     /// Deepest node accepted by all component validators; anchors host->device load-back.
     pub best_match_node_id: NodeId,
+    /// Deepest node stepped into, even if rejected; None when no node was stepped into.
+    pub last_visited_node_id: Option<NodeId>,
+    /// Optional reusable prefix length in the FULL validator's device-value scan,
+    /// before node-boundary or auxiliary constraints. None means no shorter prefix
+    /// was reported.
+    pub full_device_match_len: Option<usize>,
     /// Full-KV tokens that hit on host and must be loaded back to device.
     pub host_hit_length: usize,
     /// SWA tokens that hit on host (within the sliding window) and will be
@@ -154,7 +162,7 @@ pub struct MatchResult {
     /// of other components.
     pub full_kv_hit_length: usize,
     /// Actions for the controller to apply.
-    pub cache_actions: Vec<CacheAction>,
+    pub cache_actions: CacheActions,
 }
 
 /// Params for a prefix match; the key is borrowed from the caller.
@@ -223,7 +231,7 @@ pub struct InsertResult {
     /// Incoming ranges retained by each component, in key-relative atom offsets.
     pub adopted_ranges: Option<HashMap<ComponentType, Vec<(usize, usize)>>>,
     /// Actions for the controller to apply.
-    pub cache_actions: Vec<CacheAction>,
+    pub cache_actions: CacheActions,
 }
 
 impl InsertResult {
@@ -254,7 +262,7 @@ impl InsertResult {
 /// One step of a resumable insert: the Controller executes `actions`, then
 /// resumes while `result` is None; `result` is set on the final step.
 pub struct InsertStepResult {
-    pub actions: Vec<CacheAction>,
+    pub actions: CacheActions,
     pub result: Option<InsertResult>,
 }
 
@@ -299,7 +307,7 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     target_node_id: Option<NodeIdx_>,
     result: Option<InsertResult>,
     /// Emitted actions awaiting the next barrier flush (or the final step).
-    pub(crate) pending_actions: Vec<CacheAction>,
+    pub(crate) pending_actions: CacheActions,
 }
 
 /// A new walk or the result of an empty or declined insert.
@@ -325,14 +333,9 @@ impl<K: ChildKeyType> InsertWalkState<K> {
 
     /// Free and split bookkeeping can wait; other actions pause the walk.
     pub(crate) fn has_barrier_actions_since(&self, start: usize) -> bool {
-        self.pending_actions[start..].iter().any(|action| {
-            !matches!(
-                action,
-                CacheAction::FreeDeviceKV(_)
-                    | CacheAction::FreeDeviceKVFullOnly(_)
-                    | CacheAction::UpdatePendingBackupOnNodeSplit { .. }
-            )
-        })
+        self.pending_actions[start..]
+            .iter()
+            .any(|action| action.requires_insert_barrier())
     }
 }
 
@@ -344,61 +347,6 @@ pub struct KvCanaryWalkResult {
     pub positions: Vec<i64>,
     /// The preceding device slot on the path (-1 at a chain start).
     pub prev_slot_indices: Vec<i64>,
-}
-
-/// A queued cache IO action.
-#[derive(Debug)]
-pub enum CacheAction {
-    /// Duplicate device KV slices the cache frees after the insert.
-    FreeDeviceKV(Vec<Tensor>),
-    /// Free the full side only, for a tombstoned node whose SWA peers are gone;
-    /// FreeDeviceKV would release the SWA side twice.
-    FreeDeviceKVFullOnly(Vec<Tensor>),
-    /// A device->host backup work item (the write-through threshold fired).
-    BackupKV(BackupKV),
-    /// Update cache-side write bookkeeping after a node split:
-    ///
-    ///     parent -> node    =>    parent -> new_node -> new_child
-    ///
-    /// old_node_id (the pre-split node) is replaced by new_node_id + new_child_node_id.
-    UpdatePendingBackupOnNodeSplit {
-        /// None when buffer-only bookkeeping has no tree-tracked write.
-        ack_id: Option<usize>,
-        old_node_id: NodeId,
-        new_node_id: NodeId,
-        new_child_node_id: NodeId,
-    },
-    /// Per-path Mamba state-cap eviction from the tail's root path; applied at
-    /// the insert's commit barrier, after the walk-time backups whose
-    /// write-through locks shield the backed-up chain.
-    MambaEvictExcessPathStates { tail_node_id: NodeId },
-    /// Free only the given component's device KV slots.
-    FreeComponentDeviceSlot {
-        component_type: ComponentType,
-        indices: Vec<Tensor>,
-    },
-    /// Free the given component's host KV pages.
-    FreeComponentHostSlot {
-        component_type: ComponentType,
-        host_indices: Vec<Tensor>,
-    },
-    /// Rebuild the SWA allocator's full->swa index mapping for loaded chunks.
-    RebuildFullToSwaMapping {
-        full_indices: Vec<Tensor>,
-        swa_indices: Vec<Tensor>,
-    },
-    /// Recover an SWA tombstone whose full is locked: keep the locked full, remap
-    /// it onto the incoming full's SWA translation, and free only the incoming full.
-    RecoverSwaWithLockedFull {
-        node_id: NodeId,
-        kept_full: Tensor,
-        incoming_full: Tensor,
-    },
-    /// Rebuild a node's SWA value by translating its source full value, then store it.
-    SwaRebuild {
-        node_id: NodeId,
-        source_value: Tensor,
-    },
 }
 
 /// A HiCache pool transfer descriptor.
@@ -474,15 +422,6 @@ pub struct PoolTransferResult {
     pub kv_hit_pages: usize,
     /// Completed pages per auxiliary pool.
     pub extra_pool_hit_pages: HashMap<PoolName, usize>,
-}
-
-/// A device->host backup work item for the cache to execute.
-#[derive(Default, Debug)]
-pub struct BackupKV {
-    /// Backup these nodes device->host in order, stopping at the first failure; the
-    /// caller orders them parent-before-child for write-through and child-first for
-    /// write-back. External handles: the list crosses to the orchestrator.
-    pub node_ids: Vec<NodeId>,
 }
 
 /// A device->storage backup spec.
@@ -648,7 +587,7 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
-    pub cache_actions: Vec<CacheAction>,
+    pub cache_actions: CacheActions,
     pub backup_kv: Option<BackupKV>,
     /// Full device tokens freed without a host copy during this device step.
     pub unbacked_tokens: usize,
@@ -669,6 +608,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     components: Vec<Arc<dyn TreeComponent<K> + Send + Sync>>,
     /// Prebuilt per-type driver lookup, indexed by `ComponentType::idx`.
     components_by_type: [Option<Arc<dyn TreeComponent<K> + Send + Sync>>; NUM_COMPONENT_TYPES],
+    /// Each family's slot, indexed by `Family::idx`: the core finds the window
+    /// or state slot by its family, never by its id.
+    slot_of_family: [Option<ComponentType>; Family::COUNT],
     /// Per-component bookkeeping, indexed by `ComponentType::idx`.
     pub(crate) component_states: [ComponentState; NUM_COMPONENT_TYPES],
     /// Nodes currently eligible for device eviction (D-leaves).
@@ -962,20 +904,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Validate the component configuration used by the public bindings.
     pub fn validate_init_params(
         params: &CacheInitParams,
-        component_types: &[ComponentType],
+        slots: &[(ComponentType, Family)],
     ) -> Result<(), String> {
-        if component_types != [FULL]
-            && component_types != [FULL, SWA]
-            && component_types != [FULL, MAMBA]
-            && component_types != [FULL, SWA, MAMBA]
+        let families: Vec<Family> = slots.iter().map(|&(_, family)| family).collect();
+        if families != [Family::Token]
+            && families != [Family::Token, Family::Window]
+            && families != [Family::Token, Family::State]
+            && families != [Family::Token, Family::Window, Family::State]
         {
-            return Err("only the [Full], [Full, Swa], [Full, Mamba], and [Full, Swa, Mamba] component sets are supported".to_owned());
+            return Err("only the [token], [token, window], [token, state], and [token, window, state] slot families are supported".to_owned());
         }
-        if component_types.contains(&SWA) && params.swa_sliding_window_size.is_none() {
-            return Err("the Swa component requires swa_sliding_window_size".to_owned());
+        if let Some(&(slot, family)) = slots
+            .iter()
+            .find(|&&(slot, family)| slot != components::native_slot(family))
+        {
+            return Err(format!(
+                "the native {family:?} driver serves slot {:?}, not {slot:?}",
+                components::native_slot(family)
+            ));
         }
-        if component_types.contains(&MAMBA) && params.mamba_cache_chunk_size.is_none() {
-            return Err("the Mamba component requires mamba_cache_chunk_size".to_owned());
+        if families.contains(&Family::Window) && params.swa_sliding_window_size.is_none() {
+            return Err("the window slot requires swa_sliding_window_size".to_owned());
+        }
+        if families.contains(&Family::State) && params.mamba_cache_chunk_size.is_none() {
+            return Err("the state slot requires mamba_cache_chunk_size".to_owned());
         }
         if params.page_size == 0 {
             return Err("page_size must be at least 1".to_owned());
@@ -993,18 +945,38 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
-    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
-        Self::validate_components_(&component_types, params.page_size);
-        let mut components = Vec::with_capacity(component_types.len());
-        for ct in &component_types {
-            let component: Arc<dyn TreeComponent<K> + Send + Sync> = match ct {
-                ComponentType::Full => Arc::new(FullComponent),
-                ComponentType::Swa => Arc::new(SwaComponent::new(&params)),
-                ComponentType::Mamba => Arc::new(MambaComponent::new(&params)),
+    /// Build a core for `slots`, each slot's id and family as the plan gives
+    /// them: the family chooses the driver, the id names its slot.
+    pub fn new_with_slots(params: CacheInitParams, slots: Vec<(ComponentType, Family)>) -> Self {
+        let slot_ids: Vec<ComponentType> = slots.iter().map(|&(slot, _)| slot).collect();
+        Self::validate_components_(&slot_ids, params.page_size);
+        let mut components = Vec::with_capacity(slots.len());
+        for &(slot, family) in &slots {
+            let component: Arc<dyn TreeComponent<K> + Send + Sync> = match family {
+                Family::Token => Arc::new(FullComponent),
+                Family::Window => Arc::new(SwaComponent::new(&params)),
+                Family::State => Arc::new(MambaComponent::new(&params)),
             };
+            assert_eq!(
+                component.component_type(),
+                slot,
+                "the native {family:?} driver serves slot {:?}",
+                component.component_type()
+            );
             components.push(component);
         }
         Self::new_with_components_(params, components)
+    }
+
+    /// A core for `component_types`, each named slot given the family its
+    /// native driver serves.
+    #[cfg(test)]
+    pub fn new(params: CacheInitParams, component_types: Vec<ComponentType>) -> Self {
+        let slots = component_types
+            .into_iter()
+            .map(|slot| (slot, components::native_family(slot)))
+            .collect();
+        Self::new_with_slots(params, slots)
     }
 
     /// Construct a core from a fixed set of native component drivers.
@@ -1019,6 +991,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             arena,
             components: Vec::new(),
             components_by_type: Default::default(),
+            slot_of_family: Default::default(),
             component_states: Default::default(),
             evictable_device_leaves: NodeSet::new(),
             evictable_host_leaves: NodeSet::new(),
@@ -1206,7 +1179,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         skip_swa_and_below: bool,
     ) {
         let swa_priority = if skip_swa_and_below {
-            self.try_component_by_type_(SWA)
+            self.slot_of_family(Family::Window)
+                .and_then(|window| self.try_component_by_type_(window))
                 .map(|swa| swa.eviction_priority(/* is_leaf = */ false))
         } else {
             None
@@ -1218,7 +1192,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 continue;
             }
             if let Some(swa_priority) = swa_priority
-                && (ct == SWA || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
+                && (Some(ct) == self.slot_of_family(Family::Window)
+                    || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
             {
                 continue;
             }
@@ -1252,7 +1227,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> Result<(), NodeAccessError> {
         let node_idx = self.arena.resolve(node_id)?;
         self.assert_receipt_anchor_(node_idx, params);
@@ -1280,11 +1255,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> Result<(), NodeAccessError> {
         let node_idx = self.arena.resolve(node_id)?;
         self.assert_receipt_anchor_(node_idx, params);
-        let Some(swa) = self.try_component_by_type_(SWA) else {
+        let Some(swa) = self
+            .slot_of_family(Family::Window)
+            .and_then(|window| self.try_component_by_type_(window))
+        else {
             return Ok(());
         };
         swa.release_window_lock(
@@ -1323,7 +1301,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<EvictionStepResult, NodeAccessError> {
         let tail_node_id = self.arena.resolve(tail_node_id)?;
         let mut result = EvictionStepResult::default();
-        let component = self.component_by_type_(MAMBA);
+        let component = self.component_by_type_(self.family_slot_(Family::State));
         component.evict_excess_path_states(
             self,
             tail_node_id,
@@ -1398,6 +1376,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id,
             best_match_device_value_len,
             full_kv_hit_length,
+            last_visited_node_id,
             action,
         ) = self.match_prefix_helper_(
             root_id,
@@ -1415,6 +1394,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id,
             best_match_device_value_len,
             full_kv_hit_length,
+            last_visited_node_id,
             action,
         )
     }
@@ -1501,7 +1481,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         NodeIdx_,
         usize,
         usize,
-        Option<CacheAction>,
+        Option<NodeId>,
+        Option<UpdatePendingBackupOnNodeSplit>,
     ) {
         // Non-HiCache mode has only device-resident matches, so the scheduler
         // device anchor follows the best match. In HiCache mode, host-backed
@@ -1515,7 +1496,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut best_match_device_node_id = node_id;
         let mut best_match_device_value_len = 0;
         let mut full_kv_hit_length = 0;
-        let mut action: Option<CacheAction> = None;
+        let mut action: Option<UpdatePendingBackupOnNodeSplit> = None;
         let separate_device_match = self.enable_hicache;
 
         fn update_best_if_valid<K: ChildKeyType>(
@@ -1607,12 +1588,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             offset += prefix_len;
         }
 
+        let last_visited_node_id = (node_id != root_id).then(|| self.arena.node(node_id).id);
         (
             value,
             best_match_node_id,
             best_match_device_node_id,
             best_match_device_value_len,
             full_kv_hit_length,
+            last_visited_node_id,
             action,
         )
     }
@@ -1627,7 +1610,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         best_match_device_node_id: NodeIdx_,
         best_match_device_value_len: usize,
         full_kv_hit_length: usize,
-        action: Option<CacheAction>,
+        last_visited_node_id: Option<NodeId>,
+        action: Option<UpdatePendingBackupOnNodeSplit>,
     ) -> MatchResult {
         for i in 0..self.components.len() {
             // Full uses last_access ticks, not LRU.
@@ -1671,6 +1655,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             last_device_node_id: self.arena.node(best_match_device_node_id).id,
             last_host_node_id: self.arena.node(last_host_node_id).id,
             best_match_node_id: self.arena.node(best_match_node_id).id,
+            last_visited_node_id,
+            full_device_match_len: None,
             host_hit_length: 0,
             mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
@@ -1691,7 +1677,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 best_match_device_value_len,
             );
         }
-        result.cache_actions = action.into_iter().collect();
+        result.cache_actions = action
+            .into_iter()
+            .map(|action| Box::new(action) as Box<dyn CacheAction>)
+            .collect();
         result
     }
 
@@ -1703,6 +1692,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             last_device_node_id: root_id,
             last_host_node_id: root_id,
             best_match_node_id: root_id,
+            last_visited_node_id: None,
+            full_device_match_len: None,
             host_hit_length: 0,
             swa_host_hit_length: 0,
             swa_branching_seqlen: None,
@@ -1792,7 +1783,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<InsertResult, TreeCoreRuntimeError> {
         // Single-shot pump over the resumable walk: run every step inline and
         // fold the step actions into the result for the caller to apply.
-        let mut actions = Vec::new();
+        let mut actions: CacheActions = Vec::new();
         let mut step = self.try_begin_insert(params)?;
         loop {
             actions.append(&mut step.actions);
@@ -1972,7 +1963,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Finish the insert (idempotent); returns still-pending actions to drain.
-    pub fn end_insert(&mut self) -> Vec<CacheAction> {
+    pub fn end_insert(&mut self) -> CacheActions {
         self.ongoing_insert_walk_state
             .take()
             .map(|state| state.pending_actions)
@@ -2034,7 +2025,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let (split_node_id, action) = self.split_node_(node_id, prefix_len);
             node_id = split_node_id;
             if let Some(action) = action {
-                state.pending_actions.push(action);
+                state.pending_actions.push(Box::new(action));
             }
         }
         {
@@ -2150,22 +2141,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 .saturating_sub(cursor + dup_start)
                 .min(dup_len);
             if swa_already_freed > 0 {
-                state
-                    .pending_actions
-                    .push(CacheAction::FreeDeviceKVFullOnly(vec![value_slice.narrow(
+                state.pending_actions.push(Box::new(FreeDeviceKVFullOnly {
+                    indices: vec![value_slice.narrow(
                         0,
                         dup_start as i64,
                         swa_already_freed as i64,
-                    )]));
+                    )],
+                }));
             }
             if swa_already_freed < dup_len {
-                state
-                    .pending_actions
-                    .push(CacheAction::FreeDeviceKV(vec![value_slice.narrow(
+                state.pending_actions.push(Box::new(FreeDeviceKV {
+                    indices: vec![value_slice.narrow(
                         0,
                         (dup_start + swa_already_freed) as i64,
                         (dup_len - swa_already_freed) as i64,
-                    )]));
+                    )],
+                }));
             }
         }
         state.overlap_node_id = None;
@@ -2184,7 +2175,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
-            state.pending_actions.push(CacheAction::BackupKV(backup));
+            state.pending_actions.push(Box::new(backup));
         }
         state.node_id = node_id;
         state.total_prefix_length += prefix_len;
@@ -2319,7 +2310,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if self.should_backup_after_insert_(state, target_node_id) {
             let backup =
                 self.build_backup_kv_action_(self.arena.node(target_node_id), self.is_write_back);
-            state.pending_actions.push(CacheAction::BackupKV(backup));
+            state.pending_actions.push(Box::new(backup));
         }
     }
 
@@ -2328,7 +2319,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         child_id: NodeIdx_,
         split_len: usize,
-    ) -> (NodeIdx_, Option<CacheAction>) {
+    ) -> (NodeIdx_, Option<UpdatePendingBackupOnNodeSplit>) {
         assert!(
             split_len > 0 && split_len.is_multiple_of(self.page_size),
             "split_node_: split_len {split_len} must be a nonzero page multiple"
@@ -2413,7 +2404,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         // Buffer-only writes are tracked by the cache rather than a node ack.
         let action = if ack_id.is_some() || self.is_host_memory_buffer_only {
-            Some(CacheAction::UpdatePendingBackupOnNodeSplit {
+            Some(UpdatePendingBackupOnNodeSplit {
                 ack_id,
                 old_node_id: self.arena.node(child_id).id,
                 new_node_id: self.arena.node(new_node_id).id,
@@ -2630,7 +2621,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             "duplicate component type {component_type:?}"
         );
         *slot = Some(Arc::clone(&component));
+        let family = component.family();
+        assert!(
+            self.slot_of_family[family.idx()].is_none(),
+            "a second {family:?} slot ({component_type:?}); the native core keeps one per family"
+        );
+        self.slot_of_family[family.idx()] = Some(component_type);
         self.components.push(component);
+    }
+
+    /// The tree's slot of `family`, if it has one.
+    pub(crate) fn slot_of_family(&self, family: Family) -> Option<ComponentType> {
+        self.slot_of_family[family.idx()]
+    }
+
+    /// The tree's slot of `family`; panics when it has none.
+    fn family_slot_(&self, family: Family) -> ComponentType {
+        self.slot_of_family(family)
+            .unwrap_or_else(|| panic!("the tree has no {family:?} slot"))
     }
 
     /// Panics if the component is not enabled, matching the python KeyError.
@@ -2703,9 +2711,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             );
         result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         let state = self.component_state(component_type);
-        if component_type == MAMBA {
+        if Some(component_type) == self.slot_of_family(Family::State) {
             result.mamba_backup_node_id = state.evict_device_pending_node;
-        } else if component_type == SWA {
+        } else if Some(component_type) == self.slot_of_family(Family::Window) {
             result.swa_backup_node_id = state.evict_device_pending_node;
             result.swa_backup_num_tokens = state.evict_device_pending_num_tokens;
         }
@@ -2722,12 +2730,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// and acknowledged its host backup. A failed backup still drops the
     /// state so an imminent device allocation can make progress.
     pub fn finish_mamba_state_eviction(&mut self, node_id: NodeId) -> EvictionStepResult {
-        self.finish_internal_component_eviction_(MAMBA, node_id)
+        self.finish_internal_component_eviction_(self.family_slot_(Family::State), node_id)
     }
 
     /// Finish an internal SWA eviction after its best-effort host backup.
     pub fn finish_swa_state_eviction(&mut self, node_id: NodeId) -> EvictionStepResult {
-        self.finish_internal_component_eviction_(SWA, node_id)
+        self.finish_internal_component_eviction_(self.family_slot_(Family::Window), node_id)
     }
 
     fn finish_internal_component_eviction_(
@@ -2753,6 +2761,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let Ok(node_idx) = self.arena.resolve(node_id) else {
             return result;
         };
+        let is_state = Some(component_type) == self.slot_of_family(Family::State);
         let node = self.arena.node(node_idx);
         // Own-component locks protect DMA sources; another component's
         // transfer may mark this node without using its restored state.
@@ -2760,13 +2769,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // evicted outside a pending Full load-back's restored SWA window.
         if !node.has_device_value(component_type)
             || self.arena.device_lock_ref(node_idx, component_type) > 0
-            || (component_type == MAMBA && node.is_load_back_pending())
+            || (is_state && node.is_load_back_pending())
             || !self.device_lru_list(component_type).in_list(Some(node_idx))
         {
             return result;
         }
         if self.evictable_device_leaves.contains(node_idx)
-            || (component_type == MAMBA && !node.has_device_value(FULL))
+            || (is_state && !node.has_device_value(FULL))
         {
             // Re-select through the ordinary walk if the victim's shape has
             // changed; an internal-state finish must never demote Full KV.
@@ -2935,7 +2944,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         self.record_remove_event_(node_id, medium);
         for i in 0..self.components.len() {
@@ -2961,7 +2970,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         self.release_all_component_layers_(
             node_id,
@@ -3050,7 +3059,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         assert!(
             self.can_reclaim_coexisting_host_value_(node_id, component_type),
@@ -3086,7 +3095,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         assert!(
             self.is_evictable_host_leaf_(self.arena.node(node_id)),
@@ -3154,7 +3163,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         {
             let node = self.arena.node(node_id);
@@ -3199,7 +3208,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) {
         let is_leaf = match target {
@@ -3331,7 +3340,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
         tracker: Option<&mut HashMap<ComponentType, usize>>,
     ) -> (usize, usize) {
@@ -3388,7 +3397,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = BASE_COMPONENT_TYPE;
         let mut cur = deleted_node_parent_id;
@@ -3879,7 +3888,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut host_prefix_len = 0;
         let mut refilled_unbacked_node = false;
         let mut inserted_host_node = None;
-        let mut cache_actions: Vec<CacheAction> = Vec::new();
+        let mut cache_actions: CacheActions = Vec::new();
         while matched_length < total_len {
             let Some(child_id) = self.arena.child_on_page_in_namespace(
                 node_id,
@@ -3900,7 +3909,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 let (split_node_id, action) = self.split_node_(node_id, prefix_len);
                 node_id = split_node_id;
                 if let Some(action) = action {
-                    cache_actions.push(action);
+                    cache_actions.push(Box::new(action));
                 }
             }
 
@@ -4456,7 +4465,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         phase: CacheTransferPhase,
         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         mut insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) -> Result<(), NodeAccessError> {
@@ -4494,7 +4503,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<(), NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
-        let mut cache_actions: Vec<CacheAction> = Vec::new();
+        let mut cache_actions: CacheActions = Vec::new();
         if host_indices.numel() > 0 {
             let kv_xfer = PoolTransfer {
                 name: PoolName::Kv,
@@ -4539,7 +4548,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         device_indices: Tensor,
         mut kv_xfer: PoolTransfer,
         comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
-    ) -> Result<Vec<CacheAction>, NodeAccessError> {
+    ) -> Result<CacheActions, NodeAccessError> {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
         let loaded_node_indices = kv_xfer
@@ -4549,7 +4558,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .map(|&loaded_id| self.arena.resolve(loaded_id))
             .collect::<Result<Vec<_>, _>>()?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
-        let mut cache_actions: Vec<CacheAction> = Vec::new();
+        let mut cache_actions: CacheActions = Vec::new();
         kv_xfer.device_indices = Some(device_indices);
         let nodes_to_load = kv_xfer.nodes_to_load.clone();
         if self.is_write_back {
@@ -4822,7 +4831,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     fn validate_swa_span_(&self, key: &K, start: usize, end: usize) -> Result<(), String> {
-        if self.components_by_type[SWA.idx()].is_none() {
+        if self.slot_of_family(Family::Window).is_none() {
             return Err("SWA component is not enabled".into());
         }
         if start > end || end > key.atom_len() {
@@ -4844,13 +4853,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         end: usize,
     ) -> Result<Vec<(usize, usize)>, String> {
         self.validate_swa_span_(key, start, end)?;
+        let window = self.family_slot_(Family::Window);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         if start == end {
             return Ok(ranges);
         }
         for (child_id, pos, prefix_len) in self.collect_matched_spans_(key, namespace, end) {
             let seg_end = pos + prefix_len;
-            if seg_end <= start || self.arena.has_device_value(child_id, SWA) {
+            if seg_end <= start || self.arena.has_device_value(child_id, window) {
                 continue;
             }
             let lo = start.max(pos);
@@ -4878,8 +4888,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         window_start: usize,
         window_end: usize,
         swa_values: &Tensor,
-    ) -> Result<Vec<CacheAction>, String> {
+    ) -> Result<CacheActions, String> {
         self.validate_swa_span_(key, window_start, window_end)?;
+        let window = self.family_slot_(Family::Window);
         if swa_values.kind() != Kind::Int64 || swa_values.device() != self.device {
             return Err(format!(
                 "attach_swa_window requires int64 values on {:?}",
@@ -4909,7 +4920,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if pos + prefix_len <= window_start {
                 continue;
             }
-            if self.arena.has_device_value(child_id, SWA) {
+            if self.arena.has_device_value(child_id, window) {
                 return Err(format!(
                     "attach_swa_window over live SWA at [{}, {})",
                     window_start.max(pos),
@@ -4924,7 +4935,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ));
         }
 
-        let mut actions = Vec::new();
+        let mut actions: CacheActions = Vec::new();
         for (child_id, pos, prefix_len) in spans {
             let seg_end = window_end.min(pos + prefix_len);
             if seg_end <= window_start {
@@ -4935,11 +4946,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if seg_start > pos {
                 // The original handle remains on the suffix, our target.
                 let (_, action) = self.split_node_(target, seg_start - pos);
-                actions.extend(action);
+                if let Some(action) = action {
+                    actions.push(Box::new(action));
+                }
             }
             if seg_start + self.arena.node(target).key.atom_len() > seg_end {
                 let (fragment, action) = self.split_node_(target, seg_end - seg_start);
-                actions.extend(action);
+                if let Some(action) = action {
+                    actions.push(Box::new(action));
+                }
                 target = fragment;
             }
             let values = swa_values
@@ -4949,7 +4964,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     (seg_end - seg_start) as i64,
                 )
                 .copy();
-            self.set_component_device_value_(target, SWA, values);
+            self.set_component_device_value_(target, window, values);
         }
         Ok(actions)
     }
@@ -6046,24 +6061,30 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.protected_size()
     }
 
+    /// `size_of` the tree's slot of `family`; 0 when it has none.
+    fn family_size_(&self, family: Family, size_of: fn(&Self, ComponentType) -> usize) -> usize {
+        self.slot_of_family(family)
+            .map_or(0, |slot| size_of(self, slot))
+    }
+
     /// SWA component evictable token count.
     pub fn swa_evictable_size(&self) -> usize {
-        self.evictable_size_(SWA)
+        self.family_size_(Family::Window, Self::evictable_size_)
     }
 
     /// Mamba component evictable token count.
     pub fn mamba_evictable_size(&self) -> usize {
-        self.evictable_size_(MAMBA)
+        self.family_size_(Family::State, Self::evictable_size_)
     }
 
     /// SWA component protected token count.
     pub fn swa_protected_size(&self) -> usize {
-        self.protected_size_(SWA)
+        self.family_size_(Family::Window, Self::protected_size_)
     }
 
     /// Mamba component protected token count.
     pub fn mamba_protected_size(&self) -> usize {
-        self.protected_size_(MAMBA)
+        self.family_size_(Family::State, Self::protected_size_)
     }
 
     /// (full_tokens, aux_tokens) summed across the whole tree.
@@ -6099,7 +6120,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         unlocked_only: bool,
         swa_resident_only: bool,
     ) -> KvCanaryWalkResult {
-        let swa_filter = swa_resident_only && self.components_by_type[SWA.idx()].is_some();
+        let window_slot = self.slot_of_family(Family::Window);
+        let swa_filter = swa_resident_only && window_slot.is_some();
         let mut slot_indices: Vec<i64> = Vec::new();
         let mut positions: Vec<i64> = Vec::new();
         let mut prev_slot_indices: Vec<i64> = Vec::new();
@@ -6121,13 +6143,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 // hold Full KV for a running request while its SWA slots are unused.
                 emit = emit
                     && if swa_filter {
-                        node.device_lock_ref(SWA) == 0
+                        window_slot.is_some_and(|window| node.device_lock_ref(window) == 0)
                     } else {
                         node.device_lock_ref(FULL) == 0
                     };
             }
             if swa_filter {
-                emit = emit && node.has_device_value(SWA);
+                emit = emit && window_slot.is_some_and(|window| node.has_device_value(window));
             }
 
             // Skipped nodes still advance the chain/depth so descendants stay consistent.
@@ -6160,7 +6182,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Every Mamba device value in the tree, concatenated.
     pub fn all_mamba_values_flatten(&self) -> Tensor {
-        components::all_values_flatten(self, MAMBA)
+        match self.slot_of_family(Family::State) {
+            Some(state) => components::all_values_flatten(self, state),
+            None => self.empty_device_indices.shallow_clone(),
+        }
     }
 }
 

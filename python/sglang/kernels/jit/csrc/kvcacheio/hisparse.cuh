@@ -259,7 +259,7 @@ void transfer_cache_dsv4_mla(
   auto N = SymbolicSize{"num_items"};
   auto L = SymbolicSize{"num_layers"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   TensorMatcher({L}).with_dtype<uint64_t>().with_device(device).verify(src_ptrs).verify(dst_ptrs);
   TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(src_indices).verify(dst_indices);
 

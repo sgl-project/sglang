@@ -34,6 +34,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
@@ -49,6 +52,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+    PrefixPad,
     QwenImage21Attention,
     QwenImage21TransformerBlock,
     build_layout,
@@ -87,6 +91,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
 
 
 @pytest.fixture
@@ -579,6 +586,25 @@ def test_latent_pack_decode_contract():
     )
 
 
+def test_decode_latent_stats_are_uploaded_once():
+    # decode normalizes with the first request's device tensors: a per-request
+    # upload would stall the host until the denoising loop drains
+    config = QwenImage21PipelineConfig()
+    ac = config.vae_config.arch_config
+    device = torch.device("cpu")
+    first = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    second = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    mean = torch.tensor(ac.latents_mean, dtype=torch.bfloat16)
+    std = torch.tensor(ac.latents_std, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        first[0], std.view(1, ac.z_dim, 1, 1, 1).reciprocal(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        first[1], mean.view(1, ac.z_dim, 1, 1, 1), atol=0, rtol=0
+    )
+    assert first[0] is second[0] and first[1] is second[1]
+
+
 @pytest.mark.parametrize("gfx1151", [False, True])
 @pytest.mark.parametrize("override", [None, False, True])
 def test_vae_tiling_platform_default_and_python_override(
@@ -778,6 +804,48 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
     assert actual.stride() == expected.stride()
 
 
+def test_condition_latents_reuse_uploaded_latent_stats(monkeypatch):
+    module = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21"
+    monkeypatch.setattr(f"{module}.get_local_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(f"{module}.set_forward_context", lambda **kwargs: nullcontext())
+    image = Image.frombytes("RGBA", (32, 32), bytes(range(256)) * 16)
+    latent = torch.randn(
+        1, 64, 1, 2, 2, generator=torch.Generator().manual_seed(0)
+    ).bfloat16()
+    vae = Mock()
+    vae.encode.return_value.mode.return_value = latent
+    processor = Mock()
+    processor.apply_chat_template.return_value = [[1]]
+    stage = QwenImage21EncodingStage(Mock(), processor, vae, SimpleNamespace(config={}))
+    stage.use_declared_component = Mock(return_value=nullcontext(vae))
+    stage.encode_prompt = Mock(
+        return_value=(torch.zeros(3, 8), torch.tensor([False, True, False]))
+    )
+    server_args = SimpleNamespace(pipeline_config=QwenImage21PipelineConfig())
+    ac = server_args.pipeline_config.vae_config.arch_config
+    mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
+    std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+    expected = ((latent - mean) / std).flatten(2).transpose(1, 2)
+    stats = []
+    for _ in range(2):
+        batch = SimpleNamespace(
+            height=32,
+            width=32,
+            condition_image=image,
+            prompt="edit",
+            negative_prompt=None,
+            num_outputs_per_prompt=1,
+            do_classifier_free_guidance=False,
+            extra={},
+        )
+        stage.forward(batch, server_args)
+        actual = batch.extra["qwen21_positive"]["condition_latents"]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        stats.append(stage.latent_stats[(latent.dtype, latent.device)])
+    # the second request normalizes with the first request's device tensors
+    assert stats[0] is stats[1]
+
+
 def test_condition_image_loading_preserves_alpha(tmp_path):
     path = tmp_path / "condition.png"
     Image.new("RGBA", (32, 32), (12, 34, 56, 78)).save(path)
@@ -831,3 +899,33 @@ def test_packed_qkv_projection_is_skipped_under_compile():
     # plain projections instead of breaking in every attention.
     with patch.object(torch.compiler, "is_compiling", return_value=True):
         assert QwenImage21Attention._project_qkv_packed(object(), None, [], []) is None
+
+
+def test_prefix_pad_replay_writes_the_captured_output():
+    def attend(q, k, v, attn_metadata):
+        return q + k.shape[1]
+
+    attention = SimpleNamespace(
+        target_attn=SimpleNamespace(attn_impl=SimpleNamespace(forward=attend))
+    )
+    prefix_pad = PrefixPad(torch.tensor(2))
+    q, kv = torch.zeros(1, 3, 2, 4), torch.zeros(1, 6, 2, 4)
+    graph = bcg.BreakableCUDAGraph()
+    capture = SimpleNamespace(
+        cuda_graph=graph,
+        _end_current_segment=lambda: None,
+        _begin_new_segment=lambda: None,
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.qwen_image21.get_forward_context",
+        return_value=SimpleNamespace(attn_metadata=None),
+    ):
+        token = bcg._current_capture_var.set(capture)
+        try:
+            out = QwenImage21Attention.attend_target(attention, q, kv, kv, prefix_pad)
+        finally:
+            bcg._current_capture_var.reset(token)
+        prefix_pad.rows.fill_(1)
+        with replay_token_scope():
+            assert graph._break_fns[0]() is None
+    assert torch.all(out == 5)

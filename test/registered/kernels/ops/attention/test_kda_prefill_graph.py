@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -64,13 +65,13 @@ def _backend(conv_pool, ssm_pool, prefill_backend=LinearAttnKernelBackend.TRITON
     """The production backend on test pools: slot of request i is i + 1."""
     backend = KDAAttnBackend.__new__(KDAAttnBackend)
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
+    backend.state_layer_cache = lambda layer_id: cache
     backend.req_to_token_pool = SimpleNamespace(
-        mamba2_layer_cache=lambda layer_id: cache,
         get_mamba_indices=lambda req_pool_indices: (req_pool_indices + 1).to(
             torch.int32
         ),
-        translate_mamba_indices=lambda indices: indices,
     )
+    backend._state_ids = IdSpace(key=("mamba", None))
     backend.device = torch.device("cuda")
     backend._mamba_chunk_size = CHUNK
     backend.conv_states_shape = conv_pool.transpose(-1, -2).shape
@@ -149,6 +150,11 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.a = torch.zeros(1, BUCKET, HEADS * HEAD_DIM, device="cuda")
         self.a = self.a.to(torch.bfloat16)
         self.b = torch.zeros(1, BUCKET, HEADS, device="cuda", dtype=torch.bfloat16)
+        self.gate_4d = False
+
+    def _gate(self, num_tokens):
+        a = self.a[:, :num_tokens]
+        return a.unflatten(-1, (HEADS, HEAD_DIM)) if self.gate_4d else a
 
     def _fill(self, meta, batch):
         with patch(
@@ -179,7 +185,7 @@ class TestKDAPrefillGraph(CustomTestCase):
                 self.layer,
                 capture_batch,
                 self.mixed[:num_tokens],
-                self.a[:, :num_tokens],
+                self._gate(num_tokens),
                 self.b[:, :num_tokens],
             )
 
@@ -221,7 +227,7 @@ class TestKDAPrefillGraph(CustomTestCase):
             self.layer,
             ref_batch,
             self.mixed[:total],
-            self.a[:, :total],
+            self._gate(total),
             self.b[:, :total],
         )
 
@@ -286,6 +292,21 @@ class TestKDAPrefillGraph(CustomTestCase):
                     track=track,
                     seed=100 + i,
                 )
+
+    def test_replays_match_eager_4d_gate(self):
+        """Kimi passes the gate as [1, T, H, K]; the graph must still apply the
+        beta sigmoid the eager extend applies."""
+        self.gate_4d = True
+        meta, graph, out = self._capture()
+        self._check_replay(
+            meta,
+            graph,
+            out,
+            lens=[37, 100, 5, 192],
+            prefixes=[0, 64, 130, 0],
+            track={1: 70, 3: 192},
+            seed=200,
+        )
 
     def test_capacity(self):
         meta = KDAPrefillGraphMetadata.allocate(

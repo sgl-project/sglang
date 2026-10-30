@@ -37,7 +37,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=37, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
 
@@ -365,6 +365,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -382,6 +383,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -491,6 +493,9 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.staging_handler = None
     q.tree_cache = MagicMock()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
+    q.metadata_buffers.clear_slot = lambda idx: (
+        q.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+    )
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
         enable_decode_hicache=False,
@@ -525,15 +530,22 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         hicache_restore_lock=None,
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        awaiting_publish=False,
     )
+
+
+def _run_as_single_rank(test: unittest.TestCase) -> None:
+    # The transfer queue sizes its release collectives from the gloo group;
+    # these tests have no process group, so answer as one rank.
+    world_size = patch.object(dist, "get_world_size", return_value=1)
+    world_size.start()
+    test.addCleanup(world_size.stop)
 
 
 class TestResolveDeferredReleases(CustomTestCase):
     def setUp(self):
         super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
         mgr = _make_manager()
@@ -843,6 +855,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         metadata_buffer_index=idx,
         hicache_restore_status=None,
         host_staged=False,
+        awaiting_publish=False,
     )
 
 
@@ -855,9 +868,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        world_size = patch.object(dist, "get_world_size", return_value=1)
-        world_size.start()
-        self.addCleanup(world_size.stop)
+        _run_as_single_rank(self)
 
     def _pop(self, q):
         released = []
@@ -902,6 +913,26 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
 
+    def test_failure_before_deferred_publish_releases_immediately(self):
+        # A request can join the transfer queue before its destination is sent;
+        # an abort in that window leaves nothing for prefill to drain.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(mgr, room=10, idx=6, abort_notified=False)
+        entry.awaiting_publish = True
+        q.queue = [entry]
+        # Under prefill_complete, clear() of a failed receiver that decode did not
+        # abort notifies prefill and arms drain tracking no ACK will resolve.
+        entry.kv_receiver.clear = lambda: mgr.register_deferred_abort_room(10)
+
+        released = self._pop(q)
+
+        self.assertEqual(released, [entry])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [6])
+        self.assertNotIn(10, mgr._deferred_abort_ack_tracker)
+
     def test_backend_optout_keeps_immediate_release_and_sends_no_abort(self):
         mgr = _make_manager()
         mgr.enable_deferred_decode_kv_release = False
@@ -915,6 +946,64 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertFalse(receiver.abort_notified)
         self.assertEqual(released, [entry])
         self.assertEqual(q._deferred_releases, [])
+
+
+class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
+    """Under HiSparse the transfer writes into the coordinator's host pages."""
+
+    def setUp(self):
+        super().setUp()
+        world_size = patch.object(dist, "get_world_size", return_value=1)
+        world_size.start()
+        self.addCleanup(world_size.stop)
+
+    def _queue(self, mgr, log):
+        q = _make_pop_queue(mgr)
+        q.scheduler.enable_hisparse = True
+        q.scheduler.hisparse_coordinator = SimpleNamespace(
+            request_finished=lambda req: log.append(("hisparse", req.rid))
+        )
+        return q
+
+    def _pop_and_resolve(self, q, mgr, room, log):
+        release = lambda req, *args, **kwargs: log.append(("kv", req.rid))
+        with (
+            patch.object(decode_mod, "prepare_abort"),
+            patch.object(decode_mod, "release_kv_cache", side_effect=release),
+        ):
+            q.pop_transferred()
+            at_failure = list(log)
+            generation = mgr.register_deferred_abort_room(room)
+            for prefill_rank in (0, 1):
+                mgr.note_abort_ack(room, prefill_rank, generation)
+            q.resolve_deferred_releases()
+        return at_failure
+
+    def test_deferred_failure_keeps_the_destination_until_release(self):
+        mgr = _make_manager()
+        log = []
+        q = self._queue(mgr, log)
+        q.queue = [_make_failed_req(mgr, room=12, idx=6, abort_notified=False)]
+
+        at_failure = self._pop_and_resolve(q, mgr, 12, log)
+
+        self.assertEqual(at_failure, [])
+        self.assertEqual(log, [("hisparse", "r12"), ("kv", "r12")])
+
+    def test_immediate_failure_frees_the_destination_once(self):
+        mgr = _make_manager()
+        log = []
+        q = self._queue(mgr, log)
+        q.queue = [
+            _make_failed_req(
+                mgr, room=13, idx=7, abort_notified=False, notifiable=False
+            )
+        ]
+
+        at_failure = self._pop_and_resolve(q, mgr, 13, log)
+
+        self.assertEqual(at_failure, [("hisparse", "r13"), ("kv", "r13")])
+        self.assertEqual(log, at_failure)
 
 
 class TestBackendOptIn(CustomTestCase):

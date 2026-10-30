@@ -222,7 +222,7 @@ struct SmallGemmKernel {
     using namespace host;
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({M, Trait1::K}).with_strides({-1, 1}).with_dtype<bf16_t>().with_device(device).verify(a);
     TensorMatcher({Trait1::N, Trait1::K}).with_dtype<bf16_t>().with_device(device).verify(b);
     TensorMatcher({M, Trait1::N}).with_dtype<bf16_t>().with_device(device).verify(out);

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
@@ -15,7 +16,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReqToTokenPool:
@@ -29,10 +30,11 @@ class _FakeReqToTokenPool:
 class _FakeAllocator:
     """Rows routed to the full side are skipped: all-SWA has no full pool."""
 
-    page_size = 1
     device = "cpu"
+    storage = None
 
-    def __init__(self):
+    def __init__(self, page_size=1):
+        self.page_size = page_size
         self.freed = []
         self.skipped = []
         self.window_freed = []
@@ -59,7 +61,7 @@ def _make_cache(*, disable, num_tokens, page_size=1):
             req_to_token_pool=_FakeReqToTokenPool(
                 torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0)
             ),
-            token_to_kv_pool_allocator=_FakeAllocator(),
+            token_to_kv_pool_allocator=_FakeAllocator(page_size),
             page_size=page_size,
             sliding_window_size=4,
         )
@@ -135,7 +137,7 @@ class TestDisabledPureSWARadixCache(CustomTestCase):
         cache = _make_cache(disable=True, num_tokens=20, page_size=8)
         req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
 
-        cache.evict_sliding_windows(req, 20)
+        retire_window(req, 20, cache)
 
         # pre_len 20 - window 4 = 16, page-aligned: [0, 16) slides out. A
         # prefix-sharing cache would keep max(window, page) and stop at 8.

@@ -1,4 +1,5 @@
-// Muse Spark Open Deployment recipes omit checkpoint/hardware-derived defaults.
+// Muse Spark Open Deployment recipes omit checkpoint/hardware-derived defaults
+// and select unified KV memory by strategy.
 // Deployment selects hardware, quantization, and strategy; further tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
 // Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
@@ -51,10 +52,10 @@ export const config = {
     int4: "intel-ai/Muse-Spark-Open-816B-A42B-INT4",
   },
   dockerImages: {
-    b300: "lmsysorg/sglang:dev-muse-spark-open",
-    gb300: "lmsysorg/sglang:dev-muse-spark-open",
-    b200: "lmsysorg/sglang:dev-muse-spark-open",
-    h200: "lmsysorg/sglang:dev-muse-spark-open",
+    b300: "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
+    b200: "lmsysorg/sglang:latest",
+    h200: "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:muse-spark-open",
     xeon: "lmsysorg/sglang:muse-spark-1.2-xeon",
   },
@@ -194,6 +195,18 @@ export const config = {
       },
     },
     flagSelects: [
+      {
+        id: "unifiedMemory", title: "Unified Memory",
+        stripPrefixes: ["--enable-unified-memory"],
+        options: [
+          {
+            id: "enable", label: "Enable", flags: ["--enable-unified-memory"],
+            disable: { hw: ["mi355x", "xeon"] },
+            disableReason: "The aiter and intel_amx attention backends do not support the unified KV layout.",
+          },
+          { id: "disable", label: "Disable" },
+        ],
+      },
       {
         id: "prefillSp", title: "Prefill Sequence Parallel",
         showWhen: (s) => s.pdMode !== "decode",
@@ -338,6 +351,7 @@ export const config = {
         "--tp-size 8",
         "--ep-size 8",
         "--dtype bfloat16",
+        "--moe-runner-backend flashinfer_trtllm",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -374,12 +388,15 @@ export const config = {
     {
       match: { hw: "gb300", quant: "bf16" },
       nnodes: 2,
-      env: [],
+      // Expandable segments admit the two-node NVL72 TP8 group to custom
+      // all-reduce v2; without them decode all-reduce falls back to NCCL.
+      env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
         "--dtype bfloat16",
+        "--moe-runner-backend flashinfer_trtllm",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -423,6 +440,7 @@ export const config = {
         "--tp-size 8",
         "--ep-size 8",
         "--dtype bfloat16",
+        "--moe-runner-backend flashinfer_trtllm",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -579,7 +597,11 @@ export const config = {
       ...cell,
       match: { ...cell.match, strategy: "high-throughput" },
       verified: false,
-      flags: cell.flags.filter((flag) => !flag.startsWith("--speculative-")),
+      flags: [
+        ...cell.flags.filter((flag) => !flag.startsWith("--speculative-")),
+        ...(["b300", "gb300", "b200", "h200"].includes(cell.match.hw)
+          ? ["--enable-unified-memory"] : []),
+      ],
     },
   ]),
 };
