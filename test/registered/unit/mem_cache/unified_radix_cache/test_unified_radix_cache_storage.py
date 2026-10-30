@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
@@ -81,6 +82,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
@@ -210,7 +212,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             origin_input_ids=stored + array("q", range(100, 104)),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
         self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
         req.lock = cache.lock(first.last_device_node)
@@ -1047,7 +1049,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
@@ -1652,7 +1656,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=cons.tree_core.empty_match_result.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=ReqKvInfo(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         surfaced_swa_hit = req.swa_host_hit_length
