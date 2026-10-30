@@ -1240,38 +1240,12 @@ class C4Indexer(nn.Module):
             )
             return (q_fp4, q_scale), weight
         if self.use_fp4_indexer and is_xpu():
+            # Same signature and return layout as the CUDA op below.
             from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
 
-            q_fp4 = torch.empty(
-                (*q.shape[:-1], self.head_dim // 2),
-                dtype=torch.uint8,
-                device=q.device,
+            return fused_q_indexer_rope_hadamard_fp4_quant(
+                q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
-            q_scale_bytes = torch.empty(
-                (*q.shape[:-1], self.head_dim // 32),
-                dtype=torch.uint8,
-                device=q.device,
-            )
-            weights_out = torch.empty(
-                (*weight.shape, 1), dtype=torch.float32, device=weight.device
-            )
-            # The SYCL op expects the rope cache as real float32 [max_pos, rope_dim],
-            # not the complex64 [max_pos, rope_dim // 2] freqs_cis storage.
-            rope_cache = torch.view_as_real(self.freqs_cis).flatten(-2)
-            fused_q_indexer_rope_hadamard_fp4_quant(
-                q.contiguous(),
-                q_fp4,
-                q_scale_bytes,
-                weight,
-                weights_out,
-                self.weight_scale,
-                rope_cache,
-                positions,
-            )
-            # Callers expect one packed int32 scale per (token, head), matching
-            # the CUDA kernel's q_sf layout, not the raw per-group uint8 bytes.
-            q_scale = q_scale_bytes.view(torch.int32).squeeze(-1)
-            return (q_fp4, q_scale), weights_out
         if self.use_fp4_indexer:
             from sglang.kernels.ops.attention.dsv4 import (
                 fused_q_indexer_rope_hadamard_fp4_quant,
