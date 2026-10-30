@@ -1,7 +1,8 @@
 # Proposal: remote shared Engram tables
 
-> Discussion draft. The interface below is illustrative, not implemented or
-> available as a serving option in this branch.
+> Discussion draft. This branch contains an experimental adapter for an
+> external research runtime; it is not a standalone or production feature.
+> The provider interface below is illustrative, not the implemented API.
 
 ## Motivation
 
@@ -39,6 +40,19 @@ checkpoint identity, table ownership, cancellation, graph lifetime, and
 shutdown/drain behavior also need review. An inaccessible remote table must not
 silently return incorrect data. Fallback policy needs an explicit design, since
 readers that omit local weights cannot automatically fall back to a local table.
+
+### Experimental adapter in this draft
+
+Setting `SGLANG_EXPERIMENTAL_REMOTE_ENGRAM=1` and selecting
+`--engram-config '{"placement":"cpu","replication":"none"}'` routes
+TP-owned rows through the research adapter. The option is off by default.
+The adapter requires the external `shared_model_adapter`, `row264_kernels`,
+owner service, and experimental NIXL/GPUNETIO library used in the prior
+research runtime. It currently only supports 256-wide Engram layers 1 and 14;
+the old prefetch path is rejected. It is not a self-contained installation,
+nor does this draft provide the owner, NIXL GET implementation or setup script.
+The experimental runtime validates checkpoint identity and registered table
+metadata. This branch has not yet passed a full model or 1P1D run.
 
 ## Research evidence and limits
 
