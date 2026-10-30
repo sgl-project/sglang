@@ -385,16 +385,14 @@ class _GenerationStreamAccumulator:
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
-    # OutputSink.TOKENIZER only: every row's http_worker_ipc; see BatchTokenIDOutput.
-    http_worker_ipcs: Optional[list] = None
+    # By row, the route the row carries, else None; see BatchTokenIDOutput.
+    http_worker_ipcs: list = field(default_factory=list)
+    has_row_route: bool = False
     finished_reasons: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     # OutputSink.DETOKENIZER only.
     detokenize_headers: list = field(default_factory=list)
     has_detokenize_header: bool = False
-    # OutputSink.DETOKENIZER only: by row index, a finished row's
-    # http_worker_ipc, sent as a sparse http_worker_ipcs; see BatchTokenIDOutput.
-    finished_row_ipcs: dict = field(default_factory=dict)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
     request_stats: list = field(default_factory=list)
@@ -448,8 +446,6 @@ class _GenerationStreamAccumulator:
             self.image_tokens = []
             self.audio_tokens = []
             self.video_tokens = []
-        elif self.output_sink is OutputSink.TOKENIZER:
-            self.http_worker_ipcs = []
         if self.return_hidden_states:
             self.output_hidden_states = []
         if self.return_routed_experts:
@@ -545,8 +541,14 @@ class _GenerationStreamAccumulator:
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)
+            # A finished row carries its route, so it reaches its tokenizer
+            # worker even with no stored state.
+            route = req.http_worker_ipc if req.finished() else None
+            self.http_worker_ipcs.append(route)
+            self.has_row_route = self.has_row_route or route is not None
         elif self.output_sink is OutputSink.TOKENIZER:
             self.http_worker_ipcs.append(req.http_worker_ipc)
+            self.has_row_route = True
 
         if self.output_sink is OutputSink.RUST:
             # Per-step header columns of `push_generation`.
@@ -584,8 +586,6 @@ class _GenerationStreamAccumulator:
                 latency = _scheduler_decode_latency(req.time_stats)
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
-            if self.output_sink is OutputSink.DETOKENIZER:
-                self.finished_row_ipcs[len(self.rids) - 1] = req.http_worker_ipc
         else:
             self.weight_versions.append(None)
 
@@ -757,13 +757,7 @@ class _GenerationStreamAccumulator:
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
-            http_worker_ipcs=(
-                # OutputSink.DETOKENIZER: finished rows only.
-                [self.finished_row_ipcs.get(i) for i in range(len(self.rids))]
-                if self.finished_row_ipcs
-                # OutputSink.TOKENIZER: every row; None under the other sinks.
-                else self.http_worker_ipcs
-            ),
+            http_worker_ipcs=self.http_worker_ipcs if self.has_row_route else None,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
