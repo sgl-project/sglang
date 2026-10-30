@@ -103,6 +103,28 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             layer_id_override=self.view_layer_id,
         )
 
+    def store_prefix_valid(
+        self,
+        layer,
+        loc_info,
+        commit_lens,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+    ) -> None:
+        write_loc = self._write_loc(layer, loc_info)
+        self.view.set_kv_buffer_prefix_valid(
+            layer,
+            write_loc.loc,
+            commit_lens,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=self.view_layer_id,
+        )
+
     def _write_loc(self, layer, loc_info):
         # Imported here: memory_pool imports this module for its routers.
         from sglang.srt.mem_cache.memory_pool import (

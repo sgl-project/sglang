@@ -62,7 +62,7 @@ DCP index kernels select them.
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import msgspec
 import torch
@@ -85,6 +85,9 @@ from sglang.srt.mem_cache.kv.alloc.iteration_ids import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
 _is_npu = is_npu()
 
@@ -225,6 +228,16 @@ class RunnerIds:
                 }
 
         self._token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        window = self.space(IdSpaceKind.SLIDING_WINDOW)
+        self._context_swa_write = (
+            None
+            if window is None
+            else (
+                token_to_kv_pool_allocator.translate_physical_full_to_swa
+                if self.is_translating
+                else window.ids
+            )
+        )
 
         self._rows: Optional[torch.Tensor] = (
             torch.arange(req_to_token.shape[0], dtype=torch.int64, device=device)
@@ -237,6 +250,20 @@ class RunnerIds:
         names the iteration's slots, or None when its pool has no such
         sub-pool."""
         return self._spaces.get(kind)
+
+    def context_kv_write_loc(self, full_loc: torch.Tensor) -> KVWriteLoc:
+        """Pair the context writer's FULL ids with this runner's SWA ids."""
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        return KVWriteLoc(
+            full_loc,
+            swa_loc=(
+                None
+                if self._context_swa_write is None
+                else self._context_swa_write(full_loc)
+            ),
+            physical=True,
+        )
 
     def ids_in(self, kind: str, virtual_ids: torch.Tensor) -> torch.Tensor:
         """``virtual_ids`` as this runner's ``kind`` sub-pool indexes them, for

@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -73,7 +74,7 @@ class Spark2_5MLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
         )
-        self.act_fn = GeluAndMul()
+        self.act_fn = GeluAndMul(approximate="none")
 
     def forward(
         self,
@@ -314,6 +315,7 @@ class Spark2_5Model(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.pp_group = get_parallel().pp_group
+        self.layers_to_capture = ()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -365,12 +367,20 @@ class Spark2_5Model(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[i](positions, hidden_states, forward_batch)
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    residual_batch.snapshot(hidden_states, forward_batch)
+                )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        return residual_batch.final_norm(
+        hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
+        )
+        return (
+            (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
         )
 
 
@@ -405,6 +415,7 @@ class Spark2_5ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -425,6 +436,9 @@ class Spark2_5ForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -432,6 +446,7 @@ class Spark2_5ForCausalLM(nn.Module):
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             return hidden_states
@@ -491,6 +506,8 @@ class Spark2_5ForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            if name.startswith("draft_model."):
+                continue
             original_name = name
             layer_id = get_layer_id(name)
             if (
@@ -541,6 +558,21 @@ class Spark2_5ForCausalLM(nn.Module):
                 continue
             else:
                 logger.warning(f"Parameter {name} not found in params_dict")
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.pp_group.world_size != 1:
+            raise NotImplementedError("Spark2.5 DSpark hidden capture requires PP=1.")
+        if (
+            not layer_ids
+            or layer_ids != sorted(set(layer_ids))
+            or layer_ids[0] < 0
+            or layer_ids[-1] >= self.config.num_hidden_layers
+        ):
+            raise ValueError(
+                "Spark2.5 DSpark requires sorted, unique target layer IDs."
+            )
+        self.model.layers_to_capture = tuple(layer_ids)
+        self.capture_aux_hidden_states = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

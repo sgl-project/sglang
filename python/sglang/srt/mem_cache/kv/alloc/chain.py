@@ -458,6 +458,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         cuda-graph buffer stability."""
         return self.full_attn_allocator.ids.translate(loc, out=out)
 
+    def translate_physical_full_to_swa(self, loc: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        owner_ids = self.full_attn_allocator.ids
+        virtual = translate_token_ids(
+            loc=loc,
+            v2p=owner_ids.physical_to_virtual,
+            page_size=owner_ids.unit_tokens,
+        )
+        return self.swa_attn_allocator.ids.translate(virtual)
+
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the owner; kernels that build a
