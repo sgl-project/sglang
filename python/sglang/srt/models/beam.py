@@ -1288,7 +1288,7 @@ def _packs_attention_projection(
             ignore=quant_config.ignore,
             fused_mapping=quant_config.packed_modules_mapping,
         )
-        for proj in ("q_proj", "k_proj", "v_proj", "gate_proj")
+        for proj in ("qkv_proj", "gate_proj")
     )
 
 

@@ -128,18 +128,20 @@ class TestBeamFp8AttentionPacking(CustomTestCase):
             return [f"model.layers.{layer}.self_attn.{p}" for p in projections]
 
         quant_config = fp8_dynamic(
-            ignored(2, ("gate_proj",))
+            ignored(1, ("qkv_proj",))
+            + ignored(2, ("gate_proj",))
             + ignored(3, ("q_proj", "k_proj", "v_proj", "gate_proj"))
         )
-        _, gate_only = self.build(2, quant_config)
-        self.assertFalse(gate_only.use_packed_projection)
-        self.assertIsInstance(
-            gate_only.qkv_proj.quant_method, CompressedTensorsLinearMethod
-        )
-        self.assertIsInstance(gate_only.gate_proj.quant_method, UnquantizedLinearMethod)
-        _, whole = self.build(3, quant_config)
-        self.assertFalse(whole.use_packed_projection)
-        self.assertIsInstance(whole.qkv_proj.quant_method, UnquantizedLinearMethod)
+        for layer_id, qkv_method, gate_method in (
+            (1, UnquantizedLinearMethod, CompressedTensorsLinearMethod),
+            (2, CompressedTensorsLinearMethod, UnquantizedLinearMethod),
+            (3, UnquantizedLinearMethod, UnquantizedLinearMethod),
+        ):
+            with self.subTest(layer_id=layer_id):
+                _, attn = self.build(layer_id, quant_config)
+                self.assertFalse(attn.use_packed_projection)
+                self.assertIsInstance(attn.qkv_proj.quant_method, qkv_method)
+                self.assertIsInstance(attn.gate_proj.quant_method, gate_method)
 
         nvfp4 = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
