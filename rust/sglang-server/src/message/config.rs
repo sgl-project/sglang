@@ -482,6 +482,8 @@ pub struct DeploymentInfo {
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
+    /// Every Rust listener of this launch on this node; the same table on each.
+    pub node_listeners: Vec<NodeRustListener>,
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
@@ -497,6 +499,14 @@ pub struct KvEventSource {
     pub endpoint: String,
     pub topic: String,
     pub block_size: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NodeRustListener {
+    pub port_offset: u16,
+    pub dp_rank: u32,
+    pub http_port: u16,
+    pub grpc_port: Option<u16>,
 }
 
 impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
