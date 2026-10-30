@@ -35,6 +35,9 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # Logical-page KV sharding: the worker narrows prefill_kv_indices and
+    # index_slice to this rank's pages once the indices have landed.
+    shard_filter: bool = False
 
 
 def bind_thread_to_device(gpu_id: int) -> None:

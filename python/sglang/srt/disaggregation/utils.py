@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -821,6 +822,21 @@ def filter_kv_indices_for_shard_rank(
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]
+
+
+def wait_ready_event(event) -> None:
+    """Wait for a deferred-index event while sleeping, not spinning.
+
+    The event carries no blocking-sync flag: the driver stalls
+    ``cudaEventRecord`` once about 56 blocking-sync events are outstanding,
+    so a batch of deferred sends behind an in-flight forward would block the
+    scheduler again. Without that flag ``synchronize()`` spins a core per
+    waiting transfer worker; a short, growing sleep keeps it off the CPU.
+    """
+    delay = 20e-6
+    while not event.query():
+        time.sleep(delay)
+        delay = min(delay * 2, 200e-6)
 
 
 def filter_kv_indices_for_cp_rank(

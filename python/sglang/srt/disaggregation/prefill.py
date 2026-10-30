@@ -1617,6 +1617,14 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
+        # The schedule stream may wait on the in-flight forward. Senders that
+        # take host indices still being copied wait for them on their transfer
+        # worker instead of the scheduler; under KV sharding the worker also
+        # applies the page filter, and the CP filter is positional.
+        defer_indices = getattr(
+            req.disagg_kv_sender, "supports_host_tensor_indices", False
+        )
+
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1677,13 +1685,17 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return kv_to_page_indices(
+                    window_kv_indices_swa, page_size, non_blocking=defer_indices
+                )
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full, page_size)
+                return kv_to_page_indices(
+                    kv_indices_full, page_size, non_blocking=defer_indices
+                )
 
             def _minimax_payload():
                 return minimax_index_transfer_pages(
@@ -1814,25 +1826,15 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             )
             sender = req.disagg_kv_sender
+            page_indices = kv_to_page_indices(
+                kv_indices, page_size, non_blocking=defer_indices
+            )
             indices_event = None
-            if getattr(sender, "supports_host_tensor_indices", False) and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            ):
-                # The schedule stream may wait on the in-flight forward; move the
-                # D2H wait to the transfer worker so scheduling can continue.
-                page_indices_dev = kv_indices[::page_size] // page_size
-                page_indices = torch.empty(
-                    page_indices_dev.shape,
-                    dtype=page_indices_dev.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                page_indices.copy_(page_indices_dev, non_blocking=True)
+            if defer_indices:
+                # Recorded after this segment's copy and the state payload
+                # copies above, so it covers every deferred value it ships.
                 indices_event = self.device_module.Event()
                 indices_event.record(self.device_module.current_stream())
-            else:
-                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue

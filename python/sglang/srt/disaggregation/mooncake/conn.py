@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
-import torch
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -60,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
+    wait_ready_event,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -2494,6 +2494,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
+    def _land_chunk_indices(self, kv_chunk: TransferKVChunk) -> None:
+        """Wait for the chunk's index copy, then apply any deferred shard filter."""
+        if kv_chunk.indices_event is not None:
+            wait_ready_event(kv_chunk.indices_event)
+            kv_chunk.indices_event = None
+        if kv_chunk.shard_filter:
+            # Deferred from send() so the scheduler never waits for the copy.
+            kv_chunk.prefill_kv_indices, kv_chunk.index_slice = (
+                filter_kv_indices_for_shard_rank(
+                    kv_indices=kv_chunk.prefill_kv_indices,
+                    index_slice=kv_chunk.index_slice,
+                    shard_rank=self.kv_shard_rank,
+                    shard_size=self.kv_shard_size,
+                )
+            )
+            kv_chunk.shard_filter = False
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2545,11 +2562,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
-                if kv_chunk.indices_event is not None:
-                    kv_chunk.indices_event.synchronize()
-                    kv_chunk.indices_event = None
-                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
-                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+                self._land_chunk_indices(kv_chunk)
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -3099,6 +3112,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         *,
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
+        shard_filter: bool = False,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -3141,6 +3155,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                shard_filter=shard_filter,
             )
         )
 
@@ -3319,6 +3334,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
+    defers_shard_filter = True
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -3339,6 +3355,7 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List],
+        indices_event: Optional[object] = None,
     ):
         metric_state_indices = state_indices
         if metric_state_indices and get_parallel().enable_kv_cache_sharding:
@@ -3354,7 +3371,9 @@ class MooncakeKVSender(CommonKVSender):
                     metric_state_indices[i] = pages[
                         pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
                     ]
-        super()._record_transfer_indices(kv_indices, metric_state_indices)
+        super()._record_transfer_indices(
+            kv_indices, metric_state_indices, indices_event
+        )
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
