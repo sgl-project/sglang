@@ -87,6 +87,43 @@ def maybe_dcp_kernel_indices(
     return indices[dcp_rank::dcp_size] // dcp_size
 
 
+def get_extend_query_order_indices(
+    prefix_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    num_prefix_rows: int,
+    num_extend_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scatter indices interleaving per-request prefix and extend rows into query
+    order: ``[seq0 prefix | seq0 extend | seq1 prefix | seq1 extend | ...]``.
+
+    ``num_*_rows`` are the source row counts (``tensor.shape[0]``); passing them
+    in keeps the index build free of a device-to-host sync.
+    """
+    device = prefix_lens.device
+    prefix_lens = prefix_lens.to(torch.int64)
+    extend_lens = extend_lens.to(torch.int64)
+    seq_ids = torch.arange(prefix_lens.shape[0], device=device, dtype=torch.int64)
+    seq_of_prefix = torch.repeat_interleave(
+        seq_ids, prefix_lens, output_size=num_prefix_rows
+    )
+    seq_of_extend = torch.repeat_interleave(
+        seq_ids, extend_lens, output_size=num_extend_rows
+    )
+    # Seq i's prefix block starts after all earlier extend rows; its extend block
+    # starts after its own prefix block, i.e. after every prefix row of seqs 0..i.
+    prefix_base = torch.cumsum(extend_lens, dim=0) - extend_lens
+    extend_base = torch.cumsum(prefix_lens, dim=0)
+    prefix_index = (
+        torch.arange(num_prefix_rows, device=device, dtype=torch.int64)
+        + prefix_base[seq_of_prefix]
+    )
+    extend_index = (
+        torch.arange(num_extend_rows, device=device, dtype=torch.int64)
+        + extend_base[seq_of_extend]
+    )
+    return prefix_index, extend_index
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     """Keep this rank's share of a read-index tensor, still WIDENED.
 
