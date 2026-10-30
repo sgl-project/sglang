@@ -19,6 +19,7 @@ from array import array
 from itertools import chain
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import msgspec
 import orjson
@@ -79,6 +80,35 @@ def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
         return _is_loopback(NetworkAddress.parse(dist_init_addr).host)
     except ValueError:
         return False
+
+
+def _refuse_loopback_endpoints(
+    table: List[Dict[str, Any]], dist_init_addr: Optional[str]
+) -> None:
+    """Fail a multi-node startup whose table has a loopback listener entry.
+
+    Listener ports are node-local offsets, so another node dialing a loopback
+    entry reaches its own listener at that offset and serves the wrong rank.
+    """
+    # Nodes that rendezvous on loopback share this machine.
+    if _rendezvous_is_loopback(dist_init_addr):
+        return
+    unreachable = [
+        entry
+        for entry in table
+        if _is_loopback(urlsplit(entry["endpoint"]).hostname or "")
+    ]
+    if unreachable:
+        listed = ", ".join(
+            f"dp rank {entry['dp_rank']} at {entry['endpoint']}"
+            for entry in unreachable
+        )
+        raise ValueError(
+            f"SGLANG_RUST_SERVER: loopback control endpoints ({listed}) are "
+            f"unreachable from the other nodes, which rendezvous at "
+            f"{dist_init_addr!r}; bind --host to an address they reach, "
+            "or set SGLANG_HOST_IP"
+        )
 
 
 class RustServer:
@@ -198,24 +228,16 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        multi_node = get_parallel().nnodes > 1
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
-            # An unspecified bind address is not reachable from another
-            # node; advertise the address the interfaces answer on.
-            host = get_local_ip_auto(fallback="127.0.0.1")
-        # Nodes that rendezvous on loopback share this machine, so a loopback
-        # listener reaches them; otherwise it is a likely misconfiguration.
-        if get_parallel().nnodes > 1 and _is_loopback(host):
-            dist_init_addr = get_parallel().dist_init_addr
-            if not _rendezvous_is_loopback(dist_init_addr):
-                logger.warning(
-                    "SGLANG_RUST_SERVER: this rank listens on loopback %r but the "
-                    "%d nodes rendezvous at %r; a node on another machine cannot "
-                    "reach this rank's control endpoint",
-                    host,
-                    get_parallel().nnodes,
-                    dist_init_addr,
-                )
+            # An unspecified bind address is not reachable from another node;
+            # advertise the interface that reaches the rendezvous, which the
+            # other nodes share.
+            host = get_local_ip_auto(
+                fallback="127.0.0.1",
+                towards=get_parallel().dist_init_addr if multi_node else None,
+            )
         config = None
         if hosts_listener:
             port = get_serving().port + cls._port_offset()
@@ -228,10 +250,17 @@ class RustServer:
                 "endpoint": NetworkAddress(host, port).to_url(),
             }
         gathered = get_parallel().world_group.all_gather_object(config)
-        return sorted(
+        table = sorted(
             (entry for entry in gathered if entry is not None),
             key=lambda entry: entry["dp_rank"],
         )
+        if multi_node:
+            # Checked on the gathered table so every rank fails together
+            # rather than leaving the others blocked in the collective.
+            _refuse_loopback_endpoints(
+                table=table, dist_init_addr=get_parallel().dist_init_addr
+            )
+        return table
 
     @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:

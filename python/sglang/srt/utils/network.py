@@ -388,7 +388,19 @@ def get_local_ip_by_remote() -> Optional[str]:
     return None
 
 
-def get_local_ip_auto(fallback: str = None) -> str:
+def get_local_ip_towards(addr: str) -> Optional[str]:
+    """The local address of the interface that routes to ``host:port`` *addr*."""
+    # UDP connect sends no packets; it only selects the source address.
+    try:
+        target = NetworkAddress.parse(addr).resolved()
+        with socket.socket(target.family, socket.SOCK_DGRAM) as s:
+            s.connect(target.to_bind_tuple())
+            return s.getsockname()[0]
+    except (ValueError, OSError):
+        return None
+
+
+def get_local_ip_auto(fallback: str = None, towards: Optional[str] = None) -> str:
     """
     Automatically detect the local IP address using multiple fallback strategies.
 
@@ -400,6 +412,9 @@ def get_local_ip_auto(fallback: str = None) -> str:
             methods fail. For server applications, explicitly set this to
             "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
             Defaults to None.
+        towards (str, optional): A ``host:port`` peers are known to reach; when
+            given, the address of the interface that routes to it is preferred
+            over interface enumeration. Defaults to None.
 
     Returns:
         str: The detected local IP address, or the fallback value if detection fails.
@@ -418,6 +433,8 @@ def get_local_ip_auto(fallback: str = None) -> str:
     if host_ip:
         return host_ip
     logger.debug("get_ip failed")
+    if towards and (ip := get_local_ip_towards(towards)):
+        return ip
     # Fallback
     if ip := get_local_ip_by_nic():
         return ip

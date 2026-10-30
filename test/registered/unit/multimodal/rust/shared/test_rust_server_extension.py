@@ -788,37 +788,105 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
-    def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
-        """A multi-node launch whose listener is loopback warns, naming the
-        host and rendezvous address, unless the nodes rendezvous on loopback
-        too (several nodes emulated on one machine), and still gathers."""
-        all_gather_object = Mock(return_value=[None, None])
-        for dist_init_addr, warns in (
+    def test_gather_server_endpoints_refuses_a_loopback_endpoint_across_nodes(self):
+        """A multi-node table with a loopback entry fails startup on every rank,
+        listener or not, naming the rank, endpoint and rendezvous address,
+        unless the nodes rendezvous on loopback too (emulated on one machine)."""
+        loopback = {"dp_rank": 1, "endpoint": "http://127.0.0.1:30001"}
+        routable = {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
+        for dist_init_addr, raises in (
             ("10.0.0.1:5000", True),
+            ("node-0:5000", True),
+            (None, True),
             ("127.0.0.1:5000", False),
             ("[::1]:5000", False),
-            (None, True),
         ):
             parallel = SimpleNamespace(
                 nnodes=2,
                 dist_init_addr=dist_init_addr,
-                world_group=SimpleNamespace(all_gather_object=all_gather_object),
+                world_group=SimpleNamespace(
+                    all_gather_object=Mock(return_value=[routable, None, loopback])
+                ),
             )
             with (
                 patch.object(server_module, "get_parallel", return_value=parallel),
                 patch.object(
                     server_module,
                     "get_serving",
-                    return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+                    return_value=SimpleNamespace(host="10.0.0.2", port=30000),
                 ),
-                patch.object(server_module.logger, "warning") as warning,
             ):
-                RustServer.gather_server_endpoints(hosts_listener=False)
-            self.assertEqual(warning.called, warns, dist_init_addr)
-            if warns:
-                self.assertIn("127.0.0.1", warning.call_args.args[1])
-                self.assertEqual(warning.call_args.args[3], dist_init_addr)
-        self.assertEqual(all_gather_object.call_count, 4)
+                if not raises:
+                    table = RustServer.gather_server_endpoints(hosts_listener=False)
+                    self.assertEqual(table, [routable, loopback], dist_init_addr)
+                    continue
+                with self.assertRaises(ValueError, msg=dist_init_addr) as raised:
+                    RustServer.gather_server_endpoints(hosts_listener=False)
+            message = str(raised.exception)
+            self.assertIn("dp rank 1", message)
+            self.assertIn("http://127.0.0.1:30001", message)
+            self.assertIn(repr(dist_init_addr), message)
+            self.assertNotIn("10.0.0.1:30000", message)
+
+    def test_gather_server_endpoints_advertises_the_rendezvous_facing_address(self):
+        """A wildcard-bound listener on a multi-node launch advertises the local
+        address that routes to the rendezvous, not whichever interface address
+        enumeration finds first; SGLANG_HOST_IP still overrides it."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [obj]
+
+        parallel = SimpleNamespace(
+            nnodes=2,
+            dist_init_addr="127.0.0.1:5000",
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("SGLANG_HOST_IP", "HOST_IP")
+        }
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            # A container bridge listed before the interface the nodes share.
+            patch(
+                "sglang.srt.utils.network.get_local_ip_by_nic",
+                return_value="172.17.0.1",
+            ),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            RustServer.gather_server_endpoints(hosts_listener=True)
+            os.environ["SGLANG_HOST_IP"] = "10.0.0.9"
+            RustServer.gather_server_endpoints(hosts_listener=True)
+
+        self.assertEqual(
+            [entry["endpoint"] for entry in gathered],
+            ["http://127.0.0.1:30000", "http://10.0.0.9:30000"],
+        )
 
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a
