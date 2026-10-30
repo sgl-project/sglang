@@ -36,4 +36,4 @@ a real `AttributeError` if the field is ever renamed:
 revision=getattr(server_args, "revision", None),   # BAD
 revision=server_args.revision,                     # GOOD
 ```
-(see `python/sglang/srt/managers/template_detection.py`)
+(see `python/sglang/srt/parser/template_detection.py`)

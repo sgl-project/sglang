@@ -17,6 +17,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -50,13 +51,13 @@ def _strided_device_pool():
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestHiCacheStridedDeviceRows(unittest.TestCase):
+class TestHiCacheStridedDeviceRows(CustomTestCase):
     def test_backup_and_load_keep_every_slot(self):
         for layout in ("layer_first", "page_first"):
             with self.subTest(layout=layout):
                 device = _strided_device_pool()
                 host = MHATokenToKVPoolHost(
-                    device_pool=device,
+                    buffer_info=device.get_device_pool_infos()[0].buffer_info,
                     host_to_device_ratio=2.0,
                     host_size=0,
                     page_size=1,
@@ -64,7 +65,14 @@ class TestHiCacheStridedDeviceRows(unittest.TestCase):
                     pin_memory=True,
                     device="cpu",
                     allocator_type="default",
+                    device_capacity_tokens=device.size
+                    if device.host_capacity_tokens is None
+                    else device.host_capacity_tokens,
+                    start_layer=device.start_layer,
+                    end_layer=device.end_layer,
+                    write_back_staging=device.hicache_write_back_staging,
                 )
+                self.addCleanup(host.destroy)
                 if not host.can_use_jit:
                     self.skipTest("strided device rows need the JIT HiCache kernels")
 

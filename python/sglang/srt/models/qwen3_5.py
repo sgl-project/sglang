@@ -184,6 +184,11 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
+)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -347,6 +352,9 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
+        triton_split_qkv_rmsnorm_mrope,
+    )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
@@ -524,6 +532,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -1029,8 +1053,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The strided views feed only prefill GDN; DP-relabeled decode rows
+            # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                _is_cuda
+                and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1538,6 +1565,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def forward_prepare_npu_prefill(self, positions, hidden_states):
+        rotary_emb = self.rotary_emb
+        if not getattr(rotary_emb, "mrope_section", None):
+            return self.forward_prepare_native(positions, hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        if positions.ndim == 1:
+            positions = positions.expand(3, -1)
+        cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
+        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            mrope_section=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+            rope_dim=rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
+        )
+        return q, k, v, gate if self.attn_output_gate else None
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.refreshes_rope_cos_sin:
@@ -1573,11 +1625,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        if _is_npu and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            return self.forward_prepare_npu_prefill(positions, hidden_states)
+        if not _is_npu or not self.attn_output_gate:
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1849,13 +1899,24 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+            if _gdn_online_mxfp4:
+                logger.info(
+                    "Online MXFP4 GDN %s: %d projections",
+                    ",".join(_gdn_online_mxfp4),
+                    mxfp4,
+                )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
