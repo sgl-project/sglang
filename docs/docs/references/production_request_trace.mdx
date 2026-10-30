@@ -85,7 +85,12 @@ The span belongs to the request trace and carries:
 - `cache.checkpoint.succeeded`: whether the checkpoint call returned normally.
 
 The interval includes CPU insertion work and any blocking waits performed by
-the selected cache backend. It does not wait for an asynchronous copy just to
+the selected cache backend. Timestamps are captured around the backend call
+before creating or exporting the span, so tracing setup and export time are not
+included in this interval. Tracing can still affect end-to-end latency; the
+span does not measure that observer overhead. A tracing failure does not skip
+the cache call or replace its exception. The interval does not wait for an
+asynchronous copy just to
 measure it, and it is not GPU DMA time or proof of Host/Store recovery. A backend
 that drains shared work may include waits for other requests in this interval.
 Compare it with the request's prefill and output timeline; do not add overlapping

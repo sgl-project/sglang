@@ -34,6 +34,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang.srt.observability.req_time_stats as time_stats_mod
 import sglang.srt.observability.trace as trace_mod
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -60,7 +61,7 @@ from sglang.test.separate_buffer_allocator_double import (
 from sglang.test.test_utils import CustomTestCase
 
 try:
-    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
         InMemorySpanExporter,
@@ -707,6 +708,63 @@ class TestCheckpointTracing(CustomTestCase):
                 self.assertEqual(req.prefix_len, 4)
                 self.assertFalse(self.checkpoint_spans())
                 req.time_stats.trace_ctx.trace_req_finish()
+
+    def test_checkpoint_span_excludes_observer_creation_time(self):
+        """A slow span processor must not inflate the measured cache call."""
+        req, cache = self.make_request_and_cache()
+        clock = [time_stats_mod.monotonic_time()]
+
+        class SlowObserver(SpanProcessor):
+            def on_start(self, span, parent_context=None):
+                clock[0] += 0.25
+
+        self.provider.add_span_processor(SlowObserver())
+        checkpoint = cache.checkpoint
+
+        def timed_checkpoint(*args, **kwargs):
+            checkpoint(*args, **kwargs)
+            clock[0] += 0.002
+
+        with (
+            patch.object(time_stats_mod, "monotonic_time", lambda: clock[0]),
+            patch.object(
+                trace_mod,
+                "get_cur_time_ns",
+                lambda: time_stats_mod.convert_time_to_realtime_ns(clock[0]),
+            ),
+            patch.object(cache, "checkpoint", side_effect=timed_checkpoint),
+        ):
+            checkpoint_kv_cache(req, cache)
+
+        span = self.checkpoint_spans()[0]
+        self.assertAlmostEqual(
+            (span.end_time - span.start_time) / 1e9, 0.002, delta=1e-6
+        )
+        self.assertEqual(req.prefix_len, 4)
+        req.time_stats.trace_ctx.trace_req_finish(
+            ts=time_stats_mod.convert_time_to_realtime_ns(clock[0])
+        )
+
+    def test_observer_failure_preserves_checkpoint_and_backend_error(self):
+        """An exporter failure cannot skip a checkpoint or mask its error."""
+        req, cache = self.make_request_and_cache()
+
+        class FailingObserver(SpanProcessor):
+            def on_start(self, span, parent_context=None):
+                raise RuntimeError("observer failed")
+
+        self.provider.add_span_processor(FailingObserver())
+        checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.prefix_len, 4)
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])))
+        )
+        self.assertEqual(result.device_prefix_len, 4)
+        with patch.object(cache, "checkpoint", side_effect=ValueError("copy failure")):
+            with self.assertRaisesRegex(ValueError, "copy failure"):
+                checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.prefix_len, 4)
+        req.time_stats.trace_ctx.trace_req_finish()
 
 
 if __name__ == "__main__":

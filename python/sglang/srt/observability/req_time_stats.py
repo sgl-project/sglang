@@ -334,23 +334,31 @@ class ReqTimeStatsBase:
             return
 
         stage = RequestStage.CACHE_CHECKPOINT_CPU
-        self.trace_ctx.trace_slice_start(stage.stage_name, stage.level)
+        start_time = monotonic_time()
         succeeded = False
         try:
             yield
             succeeded = True
         finally:
-            # This is CPU call time, including any waits inside checkpoint().
-            # It is not a DMA timer and must not add device synchronization.
-            self.trace_ctx.trace_slice_end(
-                stage.stage_name,
-                stage.level,
-                attrs={
-                    "cache.checkpoint.phase": phase,
-                    "cache.checkpoint.up_to": up_to,
-                    "cache.checkpoint.succeeded": succeeded,
-                },
-            )
+            # Capture the backend interval before any span creation or export.
+            # This is CPU call time, not DMA time; add no device synchronization.
+            end_time = monotonic_time()
+            try:
+                self.trace_slice(
+                    stage,
+                    start_time,
+                    end_time,
+                    attrs={
+                        "cache.checkpoint.phase": phase,
+                        "cache.checkpoint.up_to": up_to,
+                        "cache.checkpoint.succeeded": succeeded,
+                    },
+                )
+            except Exception:
+                # Diagnostics must not skip a checkpoint or mask its exception.
+                logger.debug(
+                    "Failed to record cache checkpoint CPU trace", exc_info=True
+                )
 
     def __getstate__(self) -> object:
         # The object is propagated to other processes via serialization and deserialization methods,
