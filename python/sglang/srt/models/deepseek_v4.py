@@ -75,7 +75,6 @@ from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
-    cp_gather_after_forward,
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
     is_cp_active,
@@ -4936,74 +4935,26 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
-        return self._postprocess_output(hidden_states, input_ids, forward_batch)
-
-    def _get_dspark_prefill_tail(self, forward_batch):
-        if (
-            self.capture_aux_hidden_states
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
-        return None
-
-    def postprocess_cp_output(self, hidden_states, forward_batch):
-        """Gather the model's output layout before logits and DSpark KV injection."""
-        tail = self._get_dspark_prefill_tail(forward_batch)
-        full_cp_metadata = forward_batch.attn_cp_metadata
-        if tail is not None:
-            if tail.cp_metadata is None or tail.global_token_indices is None:
-                raise RuntimeError(
-                    "CP bounded replay output is missing its tail layout"
-                )
-            forward_batch.attn_cp_metadata = tail.cp_metadata
-        try:
-            aux_hidden_states = None
-            if self.capture_aux_hidden_states:
-                hidden_states, aux_hidden_states = hidden_states
-            stream = torch.cuda.current_stream()
-            hidden_states = cp_gather_after_forward(
-                hidden_states, forward_batch, stream
-            )
-            if aux_hidden_states is not None:
-                aux_hidden_states = cp_gather_after_forward(
-                    aux_hidden_states, forward_batch, stream
-                )
-        finally:
-            forward_batch.attn_cp_metadata = full_cp_metadata
-        if self.capture_aux_hidden_states:
-            hidden_states = hidden_states, aux_hidden_states
-        return self._postprocess_output(
-            hidden_states, forward_batch.input_ids, forward_batch
-        )
-
-    def _postprocess_output(self, hidden_states, input_ids, forward_batch):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
         logits_metadata = forward_batch
-        tail = self._get_dspark_prefill_tail(forward_batch)
-        token_indices = None
-        if tail is not None:
-            # CP output has been gathered into compact global request order.
-            # Ordinary prefill retains the rank-local/graph tail selector.
-            token_indices = tail.global_token_indices
-            input_ids = (
-                input_ids[token_indices]
-                if token_indices is not None
-                else tail.rows(input_ids)
-            )
-            if token_indices is None:
-                token_indices = tail.token_indices
+        tail = None
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+            input_ids = tail.rows(input_ids)
             if tail.real_rows_count is not None:
                 # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
                 n = tail.real_rows_count
                 input_ids = input_ids[:n]
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]
-                token_indices = token_indices[:n]
                 if aux_hidden_states is not None:
                     aux_hidden_states = aux_hidden_states[:n]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
@@ -5034,7 +4985,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = token_indices
+            output.hidden_states_token_indices = (
+                tail.token_indices[: tail.real_rows_count]
+                if tail.real_rows_count is not None
+                else tail.token_indices
+            )
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
