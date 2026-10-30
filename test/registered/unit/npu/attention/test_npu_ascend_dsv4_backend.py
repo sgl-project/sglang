@@ -653,7 +653,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         backend.forward_metadata = SimpleNamespace(
             dsv4_cycle_state_block_table=table,
             positions_cmp_padding_c128=torch.empty(0, dtype=torch.int64),
-            actual_seq_lengths_q_pa=torch.tensor([0, 1, 2], dtype=torch.intg32),
+            actual_seq_lengths_q_pa=torch.tensor([0, 1, 2], dtype=torch.int32),
             seqused=torch.ones(2, dtype=torch.int32),
             start_pos=torch.zeros(2, dtype=torch.int32),
             c128_loc=None,
