@@ -52,6 +52,9 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             "weight_scale_mx_e8m0",
             ue8m0_weight_scale(layer.weight_scale_inv.data),
         )
+        # This route leaves [N, K] where the native one rebinds to
+        # [N/16, K/128, 2048], and the shape does not say which ran.
+        layer.mxfp8_aiter_ready = True
         _prepare_flydsl_mxfp8(layer)
         from aiter.ops.shuffle import shuffle_weight
 
