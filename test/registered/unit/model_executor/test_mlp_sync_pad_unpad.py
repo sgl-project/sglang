@@ -20,7 +20,11 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -289,6 +293,101 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # sample() derives prefill sampling positions from seq_lens - 1, so the
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
+
+    def test_prefill_hidden_rows_can_feed_a_smaller_draft_bucket(self):
+        # Target FlashInfer A2A can use a global bucket while the DeepEP draft
+        # uses its local one. Cached prefixes must not retain target pad rows.
+        for target_bucket, draft_bucket in ((64, 32), (80, 32), (64, 48)):
+            with self.subTest(target=target_bucket, draft=draft_bucket):
+                fb = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=2,
+                    input_ids=torch.arange(32),
+                    req_pool_indices=torch.tensor([0, 1]),
+                    seq_lens=torch.tensor([144, 272]),
+                    out_cache_loc=torch.arange(32),
+                    seq_lens_sum=416,
+                    positions=torch.arange(32),
+                    extend_num_tokens=32,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                fb._pad_inputs_to_size(
+                    _mock_model_runner(), num_tokens=target_bucket, bs=2
+                )
+                # FULL capture keeps every target row; logits are per request.
+                hidden = torch.arange(target_bucket * 4).reshape(target_bucket, 4)
+                output = SimpleNamespace(
+                    next_token_logits=torch.randn(2, 16),
+                    hidden_states=hidden,
+                    last_hidden_states=hidden + 1000,
+                )
+                fb.post_forward_mlp_sync_batch(output)
+
+                draft = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=2,
+                    input_ids=torch.arange(32),
+                    req_pool_indices=torch.tensor([0, 1]),
+                    seq_lens=torch.tensor([144, 272]),
+                    out_cache_loc=torch.arange(32),
+                    seq_lens_sum=416,
+                    positions=torch.arange(32),
+                    spec_info=SimpleNamespace(
+                        hidden_states=output.hidden_states,
+                        is_draft_input=lambda: True,
+                        pad_batch=MagicMock(),
+                    ),
+                )
+                # Before the fix this raises a negative-dimension error.
+                draft._pad_inputs_to_size(
+                    _mock_model_runner(), num_tokens=draft_bucket, bs=2
+                )
+                torch.testing.assert_close(output.hidden_states, hidden[:32])
+                torch.testing.assert_close(
+                    output.last_hidden_states, (hidden + 1000)[:32]
+                )
+                self.assertEqual(output.next_token_logits.shape[0], 2)
+                torch.testing.assert_close(
+                    draft.spec_info.hidden_states[:32], hidden[:32]
+                )
+                self.assertEqual(draft.spec_info.hidden_states.shape[0], draft_bucket)
+                self.assertEqual(
+                    torch.count_nonzero(draft.spec_info.hidden_states[32:]).item(), 0
+                )
+
+    def test_extend_output_rows_exclude_cached_prefixes(self):
+        for prefix in (0, 3, 128):
+            for padded_rows in (7, 16):
+                with self.subTest(prefix=prefix, padded_rows=padded_rows):
+                    fb = ForwardBatch(
+                        forward_mode=ForwardMode.EXTEND,
+                        batch_size=1,
+                        input_ids=torch.arange(7),
+                        req_pool_indices=torch.tensor([0]),
+                        seq_lens=torch.tensor([prefix + 7]),
+                        out_cache_loc=torch.arange(7),
+                        seq_lens_sum=prefix + 7,
+                        positions=torch.arange(prefix, prefix + 7),
+                    )
+                    fb._pad_inputs_to_size(
+                        _mock_model_runner(), num_tokens=padded_rows, bs=1
+                    )
+                    for hidden_rows in (None, 1, padded_rows):
+                        output = SimpleNamespace(
+                            next_token_logits=torch.randn(padded_rows, 16),
+                            hidden_states=(
+                                None
+                                if hidden_rows is None
+                                else torch.ones(hidden_rows, 4)
+                            ),
+                            last_hidden_states=None,
+                        )
+                        fb.post_forward_mlp_sync_batch(output)
+                        self.assertEqual(output.next_token_logits.shape[0], 7)
+                        if hidden_rows is not None:
+                            self.assertEqual(
+                                output.hidden_states.shape[0], min(7, hidden_rows)
+                            )
 
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()

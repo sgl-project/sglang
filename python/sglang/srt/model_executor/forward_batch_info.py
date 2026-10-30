@@ -2257,7 +2257,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # seq_lens_sum includes cached prefixes, which have no output rows
+            # in this forward. Restore the pre-padding token count so a draft
+            # with a smaller DP graph bucket never receives target pad rows.
+            num_tokens = (
+                self._original_num_tokens
+                if self._original_num_tokens is not None
+                else self.seq_lens_sum
+            )
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
