@@ -738,6 +738,7 @@ _EXPORTS: dict[str, str] = {
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
     "can_use_aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
+    "can_use_aten_head_rmsnorm_rope": "norm.aten_head_rmsnorm_triton",
     "can_use_rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",
     "can_use_rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",

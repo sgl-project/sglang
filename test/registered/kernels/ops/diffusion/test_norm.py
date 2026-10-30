@@ -984,6 +984,34 @@ def test_aten_head_rmsnorm_matches_rocm_rms_norm(shape, varying_exponent):
     assert torch.equal(out, F.rms_norm(q, (128,), weight, 1e-6))
 
 
+@torch.no_grad()
+@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
+@pytest.mark.parametrize("rot_dim", [96, 128, 64])
+def test_aten_head_rmsnorm_rope_matches_rms_norm_then_rotary_embedding(rot_dim):
+    from sgl_kernel import rotary_embedding
+
+    from sglang.kernels.ops.diffusion import (
+        aten_head_rmsnorm,
+        can_use_aten_head_rmsnorm_rope,
+    )
+
+    tokens, heads = 1031, 14
+    qkv = torch.randn(tokens, 3 * heads * 128, device=DEVICE, dtype=torch.bfloat16)
+    q = qkv[:, : heads * 128].view(tokens, heads, 128)
+    weight = torch.randn(128, device=DEVICE, dtype=q.dtype)
+    angles = torch.rand(2 * tokens, rot_dim // 2, device=DEVICE) * 100
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(q.dtype)
+    positions = torch.randperm(2 * tokens, device=DEVICE)[:tokens]
+    assert can_use_aten_head_rmsnorm_rope(q, cache, positions)
+    expected = F.rms_norm(q, (128,), weight, 1e-5)
+    key = expected.clone()
+    rotary_embedding(
+        positions, expected.view(tokens, -1), key.view(tokens, -1), 128, cache, True
+    )
+    out = aten_head_rmsnorm(q, weight, 1e-5, cache, positions)
+    assert torch.equal(out, expected)
+
+
 @pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
 def test_aten_head_rmsnorm_guards():
     from sglang.kernels.ops.diffusion import can_use_aten_head_rmsnorm
