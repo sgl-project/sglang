@@ -222,6 +222,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.tree_cache.token_to_kv_pool_allocator = (
             scheduler.token_to_kv_pool_allocator
         )
+        scheduler.tree_cache.logical_page_size = 1
         scheduler.tree_cache.req_to_token_pool.free.side_effect = lambda released_req: (
             setattr(released_req.kv, "req_pool_idx", None)
         )
