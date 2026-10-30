@@ -873,6 +873,12 @@ class BaseMultimodalProcessor(ABC):
         processor, tokenizer = self._resolve_processor(processor)
 
         if images:
+            if self.disable_fast_image_processor:
+                # PIL backends convert tensors to NumPy and require CPU storage.
+                images = [
+                    image.cpu() if isinstance(image, torch.Tensor) else image
+                    for image in images
+                ]
             kwargs["images"] = images
             if self.image_config:
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)

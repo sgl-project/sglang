@@ -211,6 +211,45 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
         )
 
+    def test_only_pil_preprocessing_moves_tensor_inputs_to_cpu(self):
+        class InputTensor:
+            device = SimpleNamespace(type="npu")
+
+            def cpu(self):
+                copies.append(self)
+                return cpu_copy
+
+        class Processor:
+            image_processor = object()
+            tokenizer = SimpleNamespace(bos_token=None)
+
+            def __call__(self, **kwargs):
+                captured.append(kwargs["images"])
+                return {}
+
+        for use_pil in (False, True):
+            with self.subTest(use_pil=use_pil):
+                copies, captured = [], []
+                cpu_copy, non_tensor = object(), object()
+                decoded = InputTensor()
+                original_images = [decoded, non_tensor]
+                processor = self._processor()
+                processor._processor = Processor()
+                processor._tokenizer = processor._processor.tokenizer
+                processor._tokenizer_auto_adds_specials = False
+                processor.disable_fast_image_processor = use_pil
+                processor.image_config = {}
+                processor.video_config = {}
+                processor.audio_config = {}
+                processor.FEATURE_NAMES = []
+                with patch(f"{BASE}.torch.Tensor", InputTensor):
+                    processor.process_mm_data("test", images=original_images)
+                self.assertEqual(copies, [decoded] if use_pil else [])
+                self.assertIs(captured[0][0], cpu_copy if use_pil else decoded)
+                self.assertIs(captured[0][1], non_tensor)
+                # A CPU staging copy must not replace the caller's decoded input.
+                self.assertIs(original_images[0], decoded)
+
 
 if __name__ == "__main__":
     unittest.main()

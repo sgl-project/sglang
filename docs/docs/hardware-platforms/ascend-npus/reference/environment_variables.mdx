@@ -77,6 +77,7 @@ If you maintain a custom processor, rename its `gpu_image_decode` override to `d
 - PNG, progressive JPEG, grayscale, CMYK, other chroma sampling, unsupported dimensions, and JPEGs with EXIF or ICC metadata retain the existing PIL path.
 - Processors that disable tensor decoding or request `nvjpeg_fancy` keep their existing loading behavior.
 - The HF `Glm4vProcessor` keeps image preprocessing on CPU because its patch reshapes exceed Ascend's dimension limit. Device JPEG decoding and the placement of later preprocessing are separate choices.
+- When you select the PIL image-processing backend, the base processor transfers device-decoded image tensors to CPU before calling the HF processor.
 - JPEGD produces NV12; VPC converts it to RGB888 with full-range BT.601. A device copy and Torch layout conversion produce an owned contiguous `uint8` CHW RGB tensor on the worker's current NPU.
 - Device execution failures are surfaced as request errors. The decoder borrows the caller's NPU context and releases its own stream, channel, and buffers.
 
