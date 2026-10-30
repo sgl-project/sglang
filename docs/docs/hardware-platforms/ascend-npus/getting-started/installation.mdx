@@ -282,7 +282,10 @@ and so does a package from a release that predates this module; check with
 
 #### DeepEP-compatible Library
 
-We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check
+the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+It is optional and needed only when serving MoE models with expert parallelism through
+`--moe-a2a-backend deepep`; plain TP deployments can skip it.
 
 #### Additional dependencies
 
