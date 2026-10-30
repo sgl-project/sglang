@@ -91,7 +91,6 @@ from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -1390,7 +1389,6 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
-        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3895,71 +3893,31 @@ class Scheduler(
 
     def _finish_pending(self, req: Req, reason: BaseFinishReason) -> None:
         """Finish req, release what it holds and stream its last output."""
-        if req.beam_group is not None:
-            self.beam_coordinator.abort_group(req, reason)
+        if req is self.chunked_req:
+            # Mid-prefill: its next chunk never launches, and its partial KV is
+            # not cached. The commit of a chunk in flight skips it.
+            self.chunked_req = None
+            prepare_abort(req, reason.message, reason.status_code)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+            self._release_aborted_request(req)
+            # No member rows exist before the leader's prefill ends.
+            self.beam_coordinator.retire_group(req)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.release_aborted_prefill_waiting_req(req)
+            else:
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
         else:
-            req.finish_outside_step(reason)
-        # With no step result, nothing tells whether a mamba tree could
-        # cache the state (_mamba_can_cache_finished_req): it keeps none.
-        self.batch_result_processor.retire_outside_step(
-            req,
-            checkpoint=not self.tree_cache.supports_mamba(),
-        )
-        self.output_streamer.stream_output([req], req.return_logprob)
-
-    def process_pending_chunked_abort(self) -> None:
-        """Abort an in-flight chunked-prefill request once it is safe to do so.
-
-        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
-        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
-        the top of the scheduling step stops the next chunk from launching; the
-        chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
-        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
-        ``process_batch_result_prefill`` via its chunked branch (the finished req
-        is excluded from streaming and its logprob offset is still accounted).
-        Mirrors ``handle_bootstrap_failure``.
-        """
-        req = self._pending_chunked_abort_req
-        if req is None:
-            return
-        if self.chunked_req is not req:
-            # Already past chunked prefill; the running-batch abort path handles
-            # it. Drop the marker once the request is actually gone.
-            if req.finished() or not req.kv.holds_kv:
-                self._pending_chunked_abort_req = None
-                return
-            # The request moved to another scheduler queue after abort_request
-            # deferred it, so retry against its current location.
-            self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
-            return
-
-        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
-        prepare_abort(req, reason.message, reason.status_code)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.clear_requested_finish()
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+            if req.beam_group is not None:
+                self.beam_coordinator.abort_group(req, reason)
+            else:
+                req.finish_outside_step(reason)
+            # With no step result, nothing tells whether a mamba tree could
+            # cache the state (_mamba_can_cache_finished_req): it keeps none.
+            self.batch_result_processor.retire_outside_step(
+                req,
+                checkpoint=not self.tree_cache.supports_mamba(),
             )
-            req.pending_bootstrap = False
-        self._release_aborted_request(req)
-        # No member rows exist before the leader's prefill ends.
-        self.beam_coordinator.retire_group(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
-
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
-        self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
-        )
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -4028,7 +3986,6 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        self.process_pending_chunked_abort()
         self._process_hicache_events()
 
         if self.dllm_config is not None:
@@ -5090,7 +5047,9 @@ class Scheduler(
             if self.chunked_req in failed:
                 # Result processing finishes the others; a chunked one is
                 # released like a client abort so its next chunk never runs.
-                self._pending_chunked_abort_req = self.chunked_req
+                self.pending_finishes.add(
+                    self.chunked_req, self.chunked_req.discard_output_reason
+                )
 
         self._maybe_report_active_ranks()
 
@@ -5872,11 +5831,6 @@ class Scheduler(
         # A PD prefill queue keeps the requests it aborts until their sender
         # concludes; method 3 leaves those to it.
         taken: Set[Req] = set()
-        if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
-                # process_pending_chunked_abort finishes it, not method 3.
-                taken.add(chunked_req)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -6001,10 +5955,14 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Abort method 3: record the finish of a running request; the drain
-        # finishes it. A PD prefill request keeps its own exit: the commit of
-        # its prefill step retires it (`_retire_aborted_prefill_result`).
-        for req in self.collect_admitted_reqs():
+        # Abort method 3: record the finish of a running or chunked request;
+        # the drain finishes it. A PD prefill request past its chunks keeps its
+        # own exit: the commit of its prefill step retires it
+        # (`_retire_aborted_prefill_result`).
+        running_reqs = self.collect_admitted_reqs()
+        if self.chunked_req is not None:
+            running_reqs = [self.chunked_req, *running_reqs]
+        for req in running_reqs:
             if (
                 req not in taken
                 and not req.finished()
@@ -6018,7 +5976,10 @@ class Scheduler(
                     )
                 else:
                     reason = FINISH_ABORT()
-                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and req is not self.chunked_req
+                ):
                     req.request_finish(reason)
                 else:
                     self.pending_finishes.add(req, reason)

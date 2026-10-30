@@ -222,7 +222,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.maybe_send_health_check_signal = Mock()
         self.disagg_prefill_inflight_queue = []
         self.send_kv_chunk = Mock()
-        self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )

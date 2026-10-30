@@ -658,7 +658,6 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
-        self.process_pending_chunked_abort()
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )

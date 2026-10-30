@@ -59,7 +59,6 @@ def _scheduler(*, chunked_req=None) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.pending_finishes = PendingFinishes()
     s.chunked_req = chunked_req
-    s._pending_chunked_abort_req = None
     s.disaggregation_mode = DisaggregationMode.NULL
     s.batch_result_processor = Mock()
     s.output_streamer = Mock()
@@ -116,6 +115,22 @@ class TestSchedulerPendingFinishes(CustomTestCase):
                 retire.assert_called_once_with(req, checkpoint=checkpoint)
                 s.output_streamer.stream_output.assert_called_once_with([req], False)
                 self.assertFalse(s.pending_finishes)
+
+    def test_chunked_request_finishes_at_the_drain_with_its_reason(self):
+        req = _FakeReq("chunked")
+        s = _scheduler(chunked_req=req)
+        s.pending_finishes.add(req, FINISH_ABORT("External KV cache load failed", 503))
+
+        with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
+            s.drain_pending_finishes()
+
+        # Its next chunk never launches.
+        self.assertIsNone(s.chunked_req)
+        self.assertEqual(req.finished_reason.status_code, 503)
+        release.assert_called_once_with(req, s.tree_cache, checkpoint=False)
+        # A beam leader aborted mid-prefill retires its group.
+        s.beam_coordinator.retire_group.assert_called_once_with(req)
+        s.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 class TestAbortRunningRequest(CustomTestCase):

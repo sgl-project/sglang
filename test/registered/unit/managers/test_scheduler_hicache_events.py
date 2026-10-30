@@ -28,13 +28,13 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
         s.pending_finishes = PendingFinishes()
+        s.chunked_req = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.enable_hicache_storage = True
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
-        s.process_pending_chunked_abort = Mock()
         s.process_prefill_chunk = Mock()
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
