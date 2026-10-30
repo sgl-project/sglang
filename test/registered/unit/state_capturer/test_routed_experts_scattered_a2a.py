@@ -1,5 +1,5 @@
 """RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
-and the output-rank host cache."""
+and routed-layer host storage."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.state_capturer import base as base_mod
@@ -77,6 +78,7 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
     def _capturer(self):
         cap = object.__new__(re_mod.RoutedExpertsCapturer)
         cap.num_fused_shared_experts = 1
+        cap._slot_of_layer = {0: 0, 1: 1}
         cap.device_cache = BaseDeviceCache(
             max_batch_size=8,
             num_layers=2,
@@ -150,18 +152,22 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
         self.assertEqual(seen["num_fused_shared_experts"], 1)
 
 
-class TestOutputRankHostCache(CustomTestCase):
-    NUM_LAYERS = 3
+class TestRoutedLayerHostStorage(CustomTestCase):
+    PATTERN = "ME*EM"
     K = 2
     NUM_TOKENS = 16
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
-    def _capturer(self, attn_tp_rank):
+    @staticmethod
+    def _fake_host_alloc(dims, dtype, **_):
+        # Like the real mmap-backed allocator, reject a zero-byte mapping.
+        if torch.Size(dims).numel() == 0:
+            raise OSError("Invalid argument")
+        return torch.empty(dims, dtype=dtype)
+
+    def _capturer(self, hf_text_config, attn_tp_rank=0):
         parallel = SimpleNamespace(
             num_dp_ranks=1, pp_rank=0, attn_tp_rank=attn_tp_rank, attn_cp_rank=0
-        )
-        hf_text_config = SimpleNamespace(
-            num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
         with (
             mock.patch.object(re_mod, "get_parallel", return_value=parallel),
@@ -174,8 +180,7 @@ class TestOutputRankHostCache(CustomTestCase):
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
             ),
             mock.patch.dict(
-                base_mod.ALLOC_MEMORY_FUNCS,
-                {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
+                base_mod.ALLOC_MEMORY_FUNCS, {"cpu": self._fake_host_alloc}
             ),
         ):
             return re_mod.RoutedExpertsCapturer(
@@ -186,15 +191,18 @@ class TestOutputRankHostCache(CustomTestCase):
                 device="cpu",
             )
 
-    def _run_forward(self, cap, topk):
+    def _run_forward(self, cap, routed_layers):
         with (
             mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=False),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
             ),
         ):
-            for layer_id in range(self.NUM_LAYERS):
-                cap.capture(layer_id=layer_id, topk_indices=topk[:, layer_id])
+            for layer_id in routed_layers:
+                topk = torch.randint(
+                    0, 64, (len(self.OUT_CACHE_LOC), self.K), dtype=torch.int32
+                )
+                cap.capture(layer_id=layer_id, topk_indices=topk)
             return cap.on_forward_end(
                 SimpleNamespace(
                     out_cache_loc=self.OUT_CACHE_LOC, out_cache_loc_virtual=None
@@ -209,27 +217,49 @@ class TestOutputRankHostCache(CustomTestCase):
             req_pool_idx=0, seqlen=5, req_to_token_pool=pool, start_len=1
         )
 
-    def test_only_output_rank_keeps_host_cache(self):
-        """Only the rank that sends outputs to the detokenizer stores routed
-        experts on the host; every other rank pinned a full copy whose rows
-        were never sent."""
-        topk = torch.randint(
-            0,
-            64,
-            (len(self.OUT_CACHE_LOC), self.NUM_LAYERS, self.K),
-            dtype=torch.int32,
+    def _nemotron_h(self, pattern):
+        return NemotronHConfig(
+            hybrid_override_pattern=pattern, num_experts_per_tok=self.K
         )
 
-        output_rank = self._capturer(attn_tp_rank=0)
-        self.assertTrue(output_rank.has_host_cache)
-        self.assertIsNone(self._run_forward(output_rank, topk))
-        self.assertTrue(torch.equal(self._read(output_rank), topk[1:4]))
+    def test_routed_layers_read_back_like_all_layer_storage(self):
+        config = self._nemotron_h(self.PATTERN)
+        all_layers_config = SimpleNamespace(
+            num_hidden_layers=len(self.PATTERN), num_experts_per_tok=self.K
+        )
+        routed = self._capturer(config)
+        oracle = self._capturer(all_layers_config)
+        self.assertEqual(routed.host_cache.buffer.shape[1], self.PATTERN.count("E"))
 
-        other_rank = self._capturer(attn_tp_rank=1)
-        self.assertFalse(other_rank.has_host_cache)
-        self.assertIsNone(self._run_forward(other_rank, topk))
+        torch.manual_seed(0)
+        self._run_forward(routed, config.moe_layer_ids)
+        torch.manual_seed(0)
+        self._run_forward(oracle, config.moe_layer_ids)
+        # A 2-token chunk splits the 3 returned tokens across a chunk boundary.
+        with mock.patch.object(re_mod, "_READBACK_CHUNK_TOKENS", 2):
+            routed_out = self._read(routed)
+        self.assertEqual(routed_out.shape, (3, len(self.PATTERN), self.K))
+        self.assertTrue(torch.equal(routed_out, self._read(oracle)))
+
+    def test_model_without_routed_layers_returns_zeros(self):
+        """A Nemotron-H pattern with no MoE layer still returns all-zero rows."""
+        pattern = "M*-M"
+        cap = self._capturer(self._nemotron_h(pattern))
+        self._run_forward(cap, routed_layers=[])
+        self.assertTrue(
+            torch.equal(
+                self._read(cap),
+                torch.zeros((3, len(pattern), self.K), dtype=torch.int32),
+            )
+        )
+
+    def test_only_output_rank_keeps_host_cache(self):
+        config = self._nemotron_h(self.PATTERN)
+        cap = self._capturer(config, attn_tp_rank=1)
+        self.assertFalse(cap.has_host_cache)
+        self.assertIsNone(self._run_forward(cap, config.moe_layer_ids))
         with self.assertRaises(RuntimeError):
-            self._read(other_rank)
+            self._read(cap)
 
 
 if __name__ == "__main__":
