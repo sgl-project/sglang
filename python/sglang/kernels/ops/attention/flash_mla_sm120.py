@@ -498,24 +498,25 @@ def _split_kv_pages_to_64(
 
     from sglang.srt.runtime_context import get_resources
 
-    # Pre-allocated grow-only buffer for page-split output per device.
+    # The output buffer and page mask are keyed by their size and never
+    # replaced: captured CUDA graphs keep writing to their addresses. Pools of
+    # different sizes (a target and a draft model's) each get their own.
     dev = kv_u8.device
     buffers = get_resources().buffers
-    key = f"flash_mla_sm120_split:{dev}"
-    buf = buffers.get(key)
-    if buf is None or buf.shape[0] < num_dst_pages:
+    key = f"flash_mla_sm120_split:{dev}:{num_dst_pages}"
+    out = buffers.get(key)
+    if out is None:
         # The first allocation can happen under inference mode (autotune), but
         # the buffer is written again during CUDA graph capture outside
         # inference mode, where an inference tensor cannot be mutated.
         with torch.inference_mode(False):
-            buf = torch.empty(
+            out = torch.empty(
                 num_dst_pages,
                 _BYTES_PER_DST_PAGE_PADDED,
                 dtype=torch.uint8,
                 device=dev,
             )
-        buffers[key] = buf
-    out = buf[:num_dst_pages]
+        buffers[key] = out
 
     # Get raw 2D view of source
     src_2d = kv_u8
@@ -528,19 +529,18 @@ def _split_kv_pages_to_64(
     use_mask = touched_indices is not None and touched_indices.numel() > 0
     mask_ptr = src_2d  # dummy, never dereferenced when HAS_MASK is False
     if use_mask:
-        # Persistent per-device int8 mask, zeroed each call (cheap memset,
+        # Persistent int8 mask, zeroed each call (cheap memset,
         # captured cleanly by CUDA graph). 1 = page is referenced this step.
-        mkey = f"flash_mla_sm120_mask:{dev}"
-        mbuf = buffers.get(mkey)
-        if mbuf is None or mbuf.shape[0] < N:
+        mkey = f"flash_mla_sm120_mask:{dev}:{N}"
+        mask = buffers.get(mkey)
+        if mask is None:
             # The first allocation can happen under inference mode (autotune),
             # but the buffer is zeroed again later during CUDA graph capture
             # outside inference mode -- an inference tensor cannot be mutated
             # there, so force a normal tensor.
             with torch.inference_mode(False):
-                mbuf = torch.empty(N, dtype=torch.int8, device=dev)
-            buffers[mkey] = mbuf
-        mask = mbuf[:N]
+                mask = torch.empty(N, dtype=torch.int8, device=dev)
+            buffers[mkey] = mask
         mask.zero_()
         idx_flat = touched_indices.reshape(-1).contiguous()
         if idx_flat.dtype != torch.int32:
