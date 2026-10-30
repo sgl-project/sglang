@@ -326,3 +326,7 @@ def test_main_process_raises_on_an_unreaped_scheduler(restore_sigterm, monkeypat
         if wedged.exitcode is None:
             os.kill(wedged.pid, signal.SIGKILL)
         wedged.join()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
