@@ -459,13 +459,14 @@ if [[ "${NEED_REBUILD}" == "true" && ( "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GF
            /sgl-workspace/aiter/hsa/gfx950/mla_v4/
     "
 
-    # Every gfx942/gfx950 stage sets BUILD_AITER_ALL=1 and BUILD_LLVM=0, so
-    # prebuild the kernels, then install editable. GPU_ARCH_LIST in the image is
-    # the stage's gfx name.
-    echo "[CI-AITER-CHECK] Building AITER with PREBUILD_KERNELS=1 GPU_ARCHS=${IMAGE_GFX}"
+    # Same editable install as the Dockerfile, with GPU_ARCHS set to the stage's
+    # gfx name (the image's GPU_ARCH_LIST). Kernels are deliberately not
+    # prebuilt: the Dockerfile's PREBUILD_KERNELS=1 build_ext step takes about
+    # 2 hours per arch, longer than the job timeouts. They JIT-compile on first
+    # use instead, as in the other rebuild path below.
+    echo "[CI-AITER-CHECK] Installing AITER with GPU_ARCHS=${IMAGE_GFX}; kernels JIT-compile on first use (no PREBUILD_KERNELS, ~2h, exceeds job timeouts)"
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 PREBUILD_KERNELS=1 GPU_ARCHS=${IMAGE_GFX} python3 setup.py build_ext --inplace && \
         AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${IMAGE_GFX} pip install --config-settings editable_mode=compat -e .
     "
 
