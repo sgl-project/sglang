@@ -159,6 +159,7 @@ class Spec(msgspec.Struct):
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            resolvable=True,
         ),
     ] = None
     speculative_draft_window_size: A[
@@ -180,7 +181,7 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support).",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config.",
             choices=[
                 "none",
                 "deepep",
@@ -192,7 +193,7 @@ class Spec(msgspec.Struct):
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
             ],
             resolvable=True,
         ),
@@ -217,6 +218,7 @@ class Spec(msgspec.Struct):
         Arg(
             help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
         ),
     ] = None
     # Internal provenance used after the public draft quantization inherits the

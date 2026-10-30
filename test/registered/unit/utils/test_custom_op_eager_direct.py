@@ -15,7 +15,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
 if __name__ == "__main__":

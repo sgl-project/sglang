@@ -5,6 +5,8 @@
 //! `dynamo-renderer`, `dynamo-tokenizers`, and `dynamo-parsers`. Hosts own
 //! request types, sampling, validation, transport, and runtime.
 
+#[cfg(all(feature = "render", feature = "openai"))]
+mod deepseek_output;
 mod error;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod kimi_k3_format;
@@ -13,7 +15,8 @@ mod model_files;
 pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
-#[cfg(any(feature = "parser", feature = "openai"))]
+#[cfg(any(feature = "parser", feature = "openai", feature = "render"))]
+#[cfg_attr(not(any(feature = "parser", feature = "openai")), allow(dead_code))]
 mod py;
 #[cfg(feature = "render")]
 mod render;
@@ -24,6 +27,11 @@ mod tokenizer;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod tool_call;
 
+#[cfg(all(feature = "render", feature = "openai"))]
+pub use deepseek_output::{
+    DeepSeekDelta, DeepSeekFinish, DeepSeekOutput, DeepSeekOutputOptions, DeepSeekOutputParser,
+    DeepSeekStopMatch, DeepSeekToolCall, DeepSeekToolCallDelta,
+};
 pub use error::ProcessorError;
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
@@ -34,17 +42,21 @@ pub use parser::{
 };
 #[cfg(feature = "render")]
 pub use render::{
-    ChatFormatter, ChatFormatterOptions, DeepSeekV4Profile, OneOrMany, TemplateError,
-    ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
-    select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
+    ThinkingTemplates, continues_final_message, load_chat_formatter, requested_effort,
+    requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+#[cfg(any(feature = "parser", feature = "openai"))]
+pub use tool_call::tool_call_id;
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
+#[cfg(feature = "parser")]
+pub use dynamo_parsers;
 #[cfg(any(feature = "parser", feature = "render"))]
 pub use dynamo_protocols;
 #[cfg(feature = "render")]

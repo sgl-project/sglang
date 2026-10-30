@@ -498,6 +498,22 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # checked at construction; keep in step with their branches.
         _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
+    def backup_tokens_from_device_all_layer(self, host_indices, device_indices):
+        """Copy individual tokens; the page path below would copy whole pages."""
+        if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        # Token-granular DSV4 C4 copy needs this helper because a token is
+        # not one contiguous byte range in the paged row:
+        # [value0..value63][scale0..scale63].
+        if self.page_aligned_only:
+            raise self._unaligned_transfer_error(host_indices, device_indices)
+        transfer_cache_dsv4_mla(
+            src_ptrs=self.device_ptrs,
+            dst_ptrs=self.data_ptrs,
+            src_indices=device_indices.to(dtype=torch.int64),
+            dst_indices=host_indices.to(dtype=torch.int64),
+        )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
@@ -507,19 +523,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            # Whole C4 pages can use the normal HiCache page-row copy below.
-            # Token-granular DSV4 C4 copy needs this helper because a token is
-            # not one contiguous byte range in the paged row:
-            # [value0..value63][scale0..scale63].
-            if self.page_aligned_only:
-                raise self._unaligned_transfer_error(host_indices, device_indices)
-            transfer_cache_dsv4_mla(
-                src_ptrs=self.device_ptrs,
-                dst_ptrs=self.data_ptrs,
-                src_indices=device_indices.to(dtype=torch.int64),
-                dst_indices=host_indices.to(dtype=torch.int64),
-            )
+            self.backup_tokens_from_device_all_layer(host_indices, device_indices)
             return
+        # Whole C4 pages can use the normal HiCache page-row copy below.
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":

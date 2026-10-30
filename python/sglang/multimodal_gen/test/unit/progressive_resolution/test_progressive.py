@@ -500,6 +500,7 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
             "ideogram4_neg_attn_mask": neg_attn_mask,
             "ideogram4_neg_attn_mask_meta": None,
             "ideogram4_neg_llm_features": neg_llm_features,
+            "ideogram4_llm_cond": {"positive": torch.zeros(1)},
         }
 
     def test_resolution_change_doubles_image_tokens(self):
@@ -560,6 +561,8 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
             ctx.extra["ideogram4_neg_llm_features"].shape,
             (B, new_num_img, self._LLM_DIM),
         )
+        # LLM conditioning projected at the old sequence length is dropped
+        self.assertEqual(ctx.extra["ideogram4_llm_cond"], {})
 
     def test_text_portion_is_unchanged_after_resolution_change(self):
         B = 1
