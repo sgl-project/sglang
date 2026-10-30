@@ -87,13 +87,13 @@ auto make_plan(
   CHECK_HOST(input_storage_bytes >= 0) << "input_storage_bytes must be non-negative";
   TensorMatcher({B, -1})
       .with_strides({-1, 1})
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .with_dtype<ValueT>()
       .ensure_alignment(kInputAlignmentBytes)
       .verify(input);
   TensorMatcher({B, topk})
       .with_strides({-1, 1})
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .with_dtype<OutIdxT>()
       .ensure_alignment(kOutputAlignmentBytes)
       .verify(output_index);
@@ -105,7 +105,7 @@ auto make_plan(
     const auto output_value_ = output_value.value();
     TensorMatcher({B, topk})
         .with_strides({-1, 1})
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .with_dtype<ValueT>()
         .ensure_alignment(kOutputAlignmentBytes)
         .verify(output_value_);
@@ -118,12 +118,12 @@ auto make_plan(
 
   int* end_ptr = nullptr;
   if (end.has_value()) {
-    TensorMatcher({B}).with_device<kDLCUDA>(device_).with_dtype<int32_t>().verify(end.value());
+    TensorMatcher({B}).with_device<kDLGPU>(device_).with_dtype<int32_t>().verify(end.value());
     end_ptr = static_cast<int*>(end.value().data_ptr());
   }
   int* index_offset_ptr = nullptr;
   if (output_index_offset.has_value()) {
-    TensorMatcher({B}).with_device<kDLCUDA>(device_).with_dtype<int32_t>().verify(output_index_offset.value());
+    TensorMatcher({B}).with_device<kDLGPU>(device_).with_dtype<int32_t>().verify(output_index_offset.value());
     index_offset_ptr = static_cast<int*>(output_index_offset.value().data_ptr());
   }
 
@@ -137,7 +137,7 @@ auto make_plan(
   if constexpr (Config::page_transform) {
     CHECK_HOST(page_table.has_value() && !output_index_offset.has_value());
     const auto page_table_ = page_table.value();
-    TensorMatcher({B, -1}).with_strides({-1, 1}).with_device<kDLCUDA>(device_).with_dtype<int>().verify(page_table_);
+    TensorMatcher({B, -1}).with_strides({-1, 1}).with_device<kDLGPU>(device_).with_dtype<int>().verify(page_table_);
     const auto num_pages = page_table_.size(1);
     CHECK_HOST(num_pages >= 1 && num_pages * page_size >= static_cast<int64_t>(vocab_size));
     CHECK_HOST(page_size > 0 && is_pow2(page_size)) << page_size;

@@ -36,6 +36,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class _FakeReq:
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+    request_finish = Req.request_finish
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid

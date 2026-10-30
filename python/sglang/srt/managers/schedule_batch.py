@@ -1277,7 +1277,7 @@ class Req(ReqDllmMixin):
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
-        # set to_finish instead of directly setting finished_reason.
+        # call request_finish instead of finish_outside_step.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
@@ -1482,10 +1482,6 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
-        # Decode-local: the already-emitted boundary token to replay when a
-        # retracted request is rebootstrapped. Set in pause_generation(retract)
-        # and consumed in the decode transfer commit; never plumbed to prefill.
-        self.pd_rebootstrap_forced_output_id: Optional[int] = None
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -2091,6 +2087,24 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
             self.finished_len = max_new_tokens
 
+    def request_finish(self, reason: BaseFinishReason) -> None:
+        """Finish with reason at the request's next commit."""
+        self.to_finish = reason
+
+    def request_discard(self, reason: FINISH_ABORT) -> None:
+        """Drop the output of the request's in-flight step and finish with reason."""
+        self.discard_output_reason = reason
+
+    def clear_requested_finish(self) -> None:
+        """Drop the finish requested for the next commit."""
+        self.to_finish = None
+
+    def finish_outside_step(self, reason: BaseFinishReason) -> None:
+        """Finish now, not through update_finish_state: the request is queued
+        or transferring (an abort, a PD handoff), or its result is decided
+        elsewhere (a beam group, the dLLM context limit)."""
+        self.finished_reason = reason
+
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -2229,10 +2243,9 @@ class Req(ReqDllmMixin):
         JSON-serializable even when ``origin_input_ids``/``output_ids`` hold
         numpy scalars. The sampling-param allow-list forces ``max_new_tokens=1``
         and drops stop/grammar/min_new_tokens so the recompute only re-derives
-        the prefix KV and samples a single handoff token. The already-emitted
-        boundary token is replayed on the *decode* side (the transfer commit
-        overrides the sampled handoff with it), so it is intentionally not sent
-        to the prefill here.
+        the prefix KV and samples a single handoff token. The last output id is
+        not sent: like a handoff token it is the pending decode input, so the
+        decode commit keeps it and ignores the token the prefill samples.
         """
         # TODO: multi-modal requests are not supported here. The payload only
         # carries token ``input_ids`` and drops any image/audio/video inputs, so
@@ -2241,7 +2254,7 @@ class Req(ReqDllmMixin):
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
-            + [int(x) for x in self.output_ids],
+            + [int(x) for x in self.output_ids[:-1]],
             "sampling_params": {
                 "max_new_tokens": 1,
                 "temperature": sp.temperature,
@@ -2309,7 +2322,7 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
+        self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
@@ -3543,11 +3556,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.beam_group is not None:
                 # Free member rows before release_req: they need the leader's kv
                 # info, which still carries the lockstep allocated length.
-                req.to_finish = FINISH_ABORT(
-                    "Beam search group aborted: KV cache pool is full. Beam "
-                    "groups cannot be retracted, so they are aborted instead "
-                    "of being requeued.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                req.request_finish(
+                    FINISH_ABORT(
+                        "Beam search group aborted: KV cache pool is full. Beam "
+                        "groups cannot be retracted, so they are aborted instead "
+                        "of being requeued.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 )
                 reqs_to_abort.append(req)
                 free_member_rows(
@@ -3574,7 +3589,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "backup. Retry later."
                     )
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                req.to_finish = FINISH_ABORT(message, status_code=status_code)
+                req.request_finish(FINISH_ABORT(message, status_code=status_code))
                 reqs_to_abort.append(req)
                 logger.warning(
                     "retract_decode: aborted request %s: %s", req.rid, message
@@ -3587,10 +3602,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Instead of crashing the scheduler, gracefully abort it.
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
-            last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
-                "in the decode batch. Aborting the last request.",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            last_req.request_finish(
+                FINISH_ABORT(
+                    "Out of memory even after retracting all other requests "
+                    "in the decode batch. Aborting the last request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
             )
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
