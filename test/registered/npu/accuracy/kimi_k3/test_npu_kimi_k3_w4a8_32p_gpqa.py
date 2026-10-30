@@ -24,10 +24,8 @@ KIMI_K3_W4A8_32P_ENVS = {
     "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE": "1",
     "TRITON_CACHE_DIR": "/tmp/triton_cache",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     "SGLANG_DSPARK_FOLDED_PROPOSAL": "0",
-    "SGLANG_DSPARK_FOLDED_SAMPLING": "0",
     "SGLANG_DSPARK_STACKED_CTX_KV": "0",
     "SGLANG_DSPARK_EMBED_IN_GRAPH": "0",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -36,6 +34,7 @@ KIMI_K3_W4A8_32P_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_BUFFSIZE": "2000",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
@@ -60,8 +59,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     4,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
@@ -70,7 +68,7 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     0.72,
     "--chunked-prefill-size",
     8192,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     4,
     16,
@@ -114,6 +112,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     accuracy = 0.935
+    max_retries = 1
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 32

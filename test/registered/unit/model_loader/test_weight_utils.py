@@ -1,15 +1,28 @@
 """Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
 
+import io
 import json
 import os
+import pickle
+import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
+import torch
+
+from sglang.srt.model_loader.weight_utils import (
+    _load_pt_file,
+    filter_duplicate_safetensors_files,
+    initialize_dummy_weights,
+    maybe_add_mtp_safetensors,
+)
+from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 INDEX_NAME = "model.safetensors.index.json"
 
@@ -85,17 +98,19 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
                 "vit": "vision_encoder/model.safetensors",
             },
         )
-        transformer = _touch(
-            self.folder, "transformer/diffusion_pytorch_model.safetensors"
-        )
+        shard = "transformer/diffusion_pytorch_model.safetensors"
+        _touch(self.folder, shard)
 
-        result = filter_duplicate_safetensors_files(
-            hf_weights_files=[transformer],
-            hf_folder=self.folder,
-            index_file=INDEX_NAME,
-            allow_patterns=["transformer/*.safetensors"],
-        )
-        self.assertEqual(result, [transformer])
+        for folder in (self.folder, "s3://bucket/model"):
+            with self.subTest(folder=folder):
+                transformer = os.path.join(folder, shard)
+                result = filter_duplicate_safetensors_files(
+                    hf_weights_files=[transformer],
+                    hf_folder=folder,
+                    index_file=os.path.join(self.folder, INDEX_NAME),
+                    allow_patterns=["transformer/*.safetensors"],
+                )
+                self.assertEqual(result, [transformer])
 
     def test_missing_shard_inside_allow_patterns_raises(self):
         _write_index(
@@ -106,18 +121,34 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
                 "vit": "vision_encoder/model.safetensors",
             },
         )
-        transformer = _touch(
-            self.folder, "transformer/model-00001-of-00002.safetensors"
-        )
+        shard = "transformer/model-00001-of-00002.safetensors"
+        _touch(self.folder, shard)
 
-        with self.assertRaises(RuntimeError) as cm:
-            filter_duplicate_safetensors_files(
-                hf_weights_files=[transformer],
-                hf_folder=self.folder,
-                index_file=INDEX_NAME,
-                allow_patterns=["transformer/*.safetensors"],
-            )
-        self.assertIn("model-00002-of-00002.safetensors", str(cm.exception))
+        for folder in (self.folder, "s3://bucket/model"):
+            with (
+                self.subTest(folder=folder),
+                self.assertRaisesRegex(
+                    RuntimeError, r"model-00002-of-00002\.safetensors"
+                ),
+            ):
+                filter_duplicate_safetensors_files(
+                    hf_weights_files=[os.path.join(folder, shard)],
+                    hf_folder=folder,
+                    index_file=os.path.join(self.folder, INDEX_NAME),
+                    allow_patterns=["transformer/*.safetensors"],
+                )
+
+    def test_local_index_allows_subset_of_existing_shards(self):
+        _write_index(
+            self.folder,
+            {"w1": "first.safetensors", "w2": "second.safetensors"},
+        )
+        first = _touch(self.folder, "first.safetensors")
+        _touch(self.folder, "second.safetensors")
+
+        result = filter_duplicate_safetensors_files([first], self.folder, INDEX_NAME)
+
+        self.assertEqual(result, [first])
 
     def test_single_file_model_no_index_returns_unchanged(self):
         # No index on disk (single-file / dummy / object-storage): early return.
@@ -129,6 +160,112 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+
+class TestMaybeAddMtpSafetensors(CustomTestCase):
+    def test_remote_mtp_guards(self):
+        folder = "s3://bucket/model"
+        model = f"{folder}/model.safetensors"
+        mtp = f"{folder}/mtp.safetensors"
+        cases = (
+            ("Glm4MoeForCausalLM", 1, [model, mtp], [model, mtp], False),
+            ("Glm4MoeForCausalLM", 1, [model], [model], True),
+            ("Glm4MoeForCausalLM", 0, [model], [model, mtp], False),
+            ("LlamaForCausalLM", 1, [model], [model, mtp], False),
+        )
+        for arch, nextn, selected, available, may_list in cases:
+            with (
+                self.subTest(arch=arch, nextn=nextn, selected=selected),
+                patch.object(
+                    runai_utils, "list_safetensors", return_value=available
+                ) as listing,
+            ):
+                config = SimpleNamespace(
+                    architectures=[arch], num_nextn_predict_layers=nextn
+                )
+                self.assertEqual(
+                    maybe_add_mtp_safetensors(selected, folder, INDEX_NAME, config),
+                    selected,
+                )
+                if not may_list:
+                    listing.assert_not_called()
+
+    def test_local_unindexed_mtp(self):
+        with tempfile.TemporaryDirectory() as folder:
+            model = _touch(folder, "model.safetensors")
+            mtp = _touch(folder, "mtp.safetensors")
+            config = SimpleNamespace(
+                architectures=["Glm4MoeLiteForCausalLMNextN"],
+                num_nextn_predict_layers=1,
+            )
+            with patch.object(runai_utils, "list_safetensors") as listing:
+                self.assertEqual(
+                    maybe_add_mtp_safetensors([model], folder, INDEX_NAME, config),
+                    [model, mtp],
+                )
+                listing.assert_not_called()
+
+
+class _OpenOnUnpickle:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+def _write_legacy_tar_checkpoint(path, payload):
+    members = {
+        "storages": pickle.dumps(0) + pickle.dumps([]),
+        "tensors": pickle.dumps(0),
+        "pickle": pickle.dumps(payload),
+    }
+    with tarfile.open(path, "w") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+
+class TestLoadPtFile(CustomTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_tensor_state_dict_loads(self):
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        torch.save({"w": torch.arange(4)}, path)
+        loaded = _load_pt_file(path)
+        self.assertTrue(torch.equal(loaded["w"], torch.arange(4)))
+
+    def test_legacy_tar_pickle_payload_is_not_executed(self):
+        marker = os.path.join(self.folder, "pwned")
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        _write_legacy_tar_checkpoint(path, _OpenOnUnpickle(marker))
+        with self.assertRaises(RuntimeError):
+            _load_pt_file(path)
+        self.assertFalse(os.path.exists(marker))
+
+
+class TestInitializeDummyWeights(CustomTestCase):
+    def test_nvfp4_dummy_scales_are_neutral(self):
+        model = torch.nn.Linear(8, 4, bias=False)
+        for name, shape in (
+            ("w13_weight_scale_2", (4, 2)),
+            ("w2_weight_scale_2", (4,)),
+        ):
+            model.register_parameter(
+                name, torch.nn.Parameter(torch.empty(shape), requires_grad=False)
+            )
+
+        initialize_dummy_weights(model, low=0.25, high=0.75)
+
+        self.assertTrue(torch.equal(model.w13_weight_scale_2, torch.ones(4, 2)))
+        self.assertTrue(torch.equal(model.w2_weight_scale_2, torch.ones(4)))
+        self.assertTrue(torch.all((model.weight >= 0.25) & (model.weight <= 0.75)))
 
 
 if __name__ == "__main__":

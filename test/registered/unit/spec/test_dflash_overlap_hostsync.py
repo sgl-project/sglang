@@ -47,6 +47,19 @@ class TestCompactSeqLensHostBound(CustomTestCase):
                 f"host bound under-shoots exact at window={window} page={page}",
             )
 
+    def test_without_host_lengths_uses_window_bound(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        seq = torch.arange(16385)
+        for page in (1, 64):
+            worker = SimpleNamespace(draft_window_size=2048, page_size=page)
+            bound = torch.empty(seq.numel(), dtype=torch.int32)
+            DFlashWorkerV2._fill_compact_seq_lens_cpu_bound(
+                worker, batch_seq_lens_cpu=None, nxt_kv_lens_cpu=None, out=bound
+            )
+            exact = _compact_lens_exact(seq, 2048, page)
+            self.assertTrue(bool((bound >= exact).all()))
+
     def test_sawtooth_counterexample(self):
         # exact(4160) = 4096 < exact(4100) = 4100 at window=4096 page=64:
         # a host mirror of the exact math fed the reserved over-estimate
@@ -235,7 +248,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=None,
             req_to_token_pool=None,
-            kv_index_translator=None,
+            runner_ids=None,
             model_config=SimpleNamespace(context_len=2048),
         )
         # The backend takes the mode from the published configuration, not from

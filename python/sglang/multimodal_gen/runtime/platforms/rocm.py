@@ -7,6 +7,7 @@ This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
 
+import os
 import types
 from functools import lru_cache
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -23,6 +25,11 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_gfx1250_supported,
+)
 
 logger = init_logger(__name__)
 
@@ -50,22 +57,21 @@ class RocmPlatform(Platform):
 
     @classmethod
     @lru_cache(maxsize=1)
+    def get_gcn_arch_name(cls, device_id: int = 0) -> str:
+        """Return the GCN architecture string (e.g. "gfx1151", "gfx950")."""
+        return str(torch.cuda.get_device_properties(device_id).gcnArchName)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_gfx1151(cls) -> bool:
+        return torch.cuda.is_available() and cls.get_gcn_arch_name().startswith(
+            "gfx1151"
+        )
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA graph. "
-                "Since enforce-eager is enabled, async output processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
-    def log_warnings(cls) -> None:
-        pass  # ROCm-specific warnings can be added here
 
     @classmethod
     def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
@@ -130,6 +136,26 @@ class RocmPlatform(Platform):
                     "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
                     dtype,
                 )
+
+        elif selected_backend == AttentionBackendEnum.AITER_QUANT:
+            # Arch family only; whether the selected quant format has a kernel
+            # row on this arch is checked when the impl is constructed.
+            if not (is_gfx95_supported() or is_gfx942_supported()):
+                raise ValueError(
+                    "aiter_quant requires a gfx950- or gfx942-class arch, got "
+                    f"{cls.get_device_name()}."
+                )
+            if dtype is not torch.bfloat16:
+                # mha_v4 quantizes from BF16 operands and rejects every other
+                # input dtype, fp16 included.
+                logger.warning(
+                    "AITER quant backend takes BF16 inputs, which it quantizes "
+                    "to the selected format, but got dtype=%s. Proceeding "
+                    "anyway; aiter will reject the call.",
+                    dtype,
+                )
+            logger.info("Using aiter_quant attention backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_quant.AITERQuantBackend"
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
@@ -231,6 +257,30 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
+        if is_gfx1250_supported():
+            count = cls._force_math_sdpa_in_attention(vae)
+            if count > 0:
+                logger.info(
+                    "Pinned %d VAE attention modules to the math SDPA backend "
+                    "(AOTriton fails above head_dim 256 on gfx1250)",
+                    count,
+                )
+
+        if is_gfx1250_supported():
+            try:
+                from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+                    maybe_optimize_qwen_image_vae,
+                    maybe_optimize_wan_vae,
+                )
+
+                vae = maybe_optimize_wan_vae(vae)
+                vae = maybe_optimize_qwen_image_vae(vae)
+            except Exception:
+                logger.warning(
+                    "Failed to apply the Wan VAE fast path; using the unmodified VAE.",
+                    exc_info=True,
+                )
+
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
@@ -245,6 +295,35 @@ class RocmPlatform(Platform):
                 )
 
         return vae
+
+    @staticmethod
+    def _force_math_sdpa_in_attention(module: torch.nn.Module) -> int:
+        """Wrap VAE attention forwards so SDPA resolves to the math backend.
+
+        On gfx1250, AOTriton's flash and mem_efficient SDPA backends fail when
+        head_dim > 256. On ROCm 10.0 (AOTriton 0.13.50) the VAE returns wrong
+        values with no error. On ROCm 10.1 (0.14.50) it raises
+        hipErrorProfilerNotInitialized after the full denoise.
+        """
+        count = 0
+        for child in module.modules():
+            if getattr(child, "_sgl_math_sdpa", False):
+                continue
+            has_qkv = hasattr(child, "to_qkv") or all(
+                getattr(child, a, None) is not None for a in ("to_q", "to_k", "to_v")
+            )
+            if not has_qkv:
+                continue
+            original = child.forward
+
+            def wrapped(*args, _orig=original, **kwargs):
+                with sdpa_kernel(SDPBackend.MATH):
+                    return _orig(*args, **kwargs)
+
+            child.forward = wrapped
+            child._sgl_math_sdpa = True
+            count += 1
+        return count
 
     @staticmethod
     def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
@@ -297,6 +376,30 @@ class RocmPlatform(Platform):
         stride_t, stride_h, stride_w = stride
 
         T_out = (T - kt) // stride_t + 1
+
+        if weight_2d.is_contiguous(memory_format=torch.channels_last):
+            # NHWC: gather the Kt frames (and cast) in one copy into
+            # [N*T_out, H, W, Kt*C_in]; the conv output then folds back to a
+            # channels_last_3d tensor without another copy.
+            compute_dtype = torch.bfloat16 if compute_bf16 else weight_2d.dtype
+            unfolded = torch.empty(
+                (N, T_out, H, W, kt, C_in),
+                dtype=compute_dtype,
+                device=x_padded.device,
+            )
+            unfolded.copy_(
+                x_padded.permute(0, 2, 3, 4, 1)
+                .unfold(1, kt, stride_t)
+                .permute(0, 1, 2, 3, 5, 4)
+            )
+            unfolded = unfolded.view(N * T_out, H, W, kt * C_in).permute(0, 3, 1, 2)
+            w = weight_2d.to(compute_dtype)
+            b = bias.to(compute_dtype) if bias is not None else None
+            out = F.conv2d(unfolded, w, b, stride=(stride_h, stride_w))
+            if out.dtype != orig_dtype:
+                out = out.to(orig_dtype)
+            _, _, H_out, W_out = out.shape
+            return out.reshape(N, T_out, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
 
         # (N, C_in, T, H, W) -> (N, T_out, Kt, C_in, H, W) -> (N*T_out, Kt*C_in, H, W)
         unfolded = x_padded.unfold(2, kt, stride_t)
@@ -375,6 +478,16 @@ class RocmPlatform(Platform):
                 .reshape(child.out_channels, kt * child.in_channels, kh, kw)
                 .contiguous()
             )
+            if is_gfx1250_supported() and child.weight.is_contiguous(
+                memory_format=torch.channels_last_3d
+            ):
+                weight_2d = weight_2d.to(memory_format=torch.channels_last)
+                if use_bf16:
+                    weight_2d = weight_2d.to(torch.bfloat16)
+                # PyTorch only runs MIOpen convs in NHWC under this flag (read
+                # per call); without it the channels_last conv2d transposes to
+                # NCHW and back and runs 1.4-2.9x slower on these shapes.
+                os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
             child.register_buffer("_weight_2d", weight_2d)
 
             def _patched_forward(
@@ -382,6 +495,8 @@ class RocmPlatform(Platform):
                 x,
                 cache_x=None,
                 *,
+                residual=None,
+                skip_bias=False,
                 _padding=padding,
                 _stride=stride,
                 _kt=kt,
@@ -394,14 +509,17 @@ class RocmPlatform(Platform):
                     pad[4] -= cache_x.shape[2]
                 x = F.pad(x, pad)
                 x = x.to(self.weight.dtype)
-                return RocmPlatform._conv3d_as_batched_conv2d(
+                # Same contract as WanCausalConv3d.forward: skip_bias leaves the bias
+                # to a following fused norm, residual is added to the conv output.
+                out = RocmPlatform._conv3d_as_batched_conv2d(
                     x,
                     self._weight_2d,
-                    self.bias,
+                    None if skip_bias else self.bias,
                     _stride,
                     _kt,
                     compute_bf16=_bf16,
                 )
+                return out if residual is None else out + residual
 
             def _patched_halo_conv_forward(
                 self,

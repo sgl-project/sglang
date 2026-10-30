@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
+from sglang.multimodal_gen.runtime import platforms
 from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
@@ -22,9 +23,40 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl_wrapp
 )
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import current_stream
 
 logger = init_logger(__name__)
+
+
+_previous_set_stream = torch.cuda.set_stream
+
+_current_stream = None
+
+
+def _patched_set_stream(stream: torch.cuda.Stream | None) -> None:
+    global _current_stream
+    _current_stream = stream
+    if stream is not None:
+        _previous_set_stream(stream)
+
+
+torch.cuda.set_stream = _patched_set_stream
+
+
+def _get_current_stream() -> torch.cuda.Stream | None:
+    # cache the stream object to avoid constructing it for every collective;
+    # callers must change streams through torch.cuda.set_stream
+    if not platforms.current_platform.is_cuda_alike():
+        return None
+
+    global _current_stream
+    if _current_stream is None:
+        # RCCL performs better on a dedicated stream than the default stream
+        _current_stream = (
+            torch.cuda.Stream()
+            if platforms.current_platform.is_rocm()
+            else torch.cuda.current_stream()
+        )
+    return _current_stream
 
 
 class PyNcclCommunicator:
@@ -110,7 +142,7 @@ class PyNcclCommunicator:
                 self.world_size, self.unique_id, self.rank
             )
 
-            stream = current_stream()
+            stream = _get_current_stream()
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
             self.all_reduce(data)
@@ -134,7 +166,7 @@ class PyNcclCommunicator:
         out_tensor = torch.empty_like(in_tensor)
 
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclAllReduce(
             buffer_type(in_tensor.data_ptr()),
             buffer_type(out_tensor.data_ptr()),
@@ -159,7 +191,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclAllGather(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -186,7 +218,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclReduceScatter(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -205,7 +237,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -223,7 +255,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -272,7 +304,7 @@ class PyNcclCommunicator:
                 f"got {input_.numel()} elements over {self.world_size} ranks"
             )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         # dist.all_to_all_single defines split sizes along dim 0; convert rows
         # to element counts so n-D tensors split identically to torch
         in_row = input_.numel() // input_.size(0) if input_.dim() else 1
@@ -341,7 +373,7 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = current_stream()
+            stream = _get_current_stream()
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,23 +22,30 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.kernels.ops.diffusion import (
+    FLUX2_NVFP4_SWIGLU_QUANT,
     BitExactFusionGate,
     can_defer_flux2_gated_residual,
+    can_defer_xpu_gated_residual,
     can_use_flux2_gated_resnorm,
+    can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    can_use_xpu_layernorm_modulate,
     flux2_gated_resnorm_raw,
-    flux2_nvfp4_swiglu_quant_active,
+    flux2_strided_qknorm_rope,
     fused_layernorm_modulate_fp8_quant_raw,
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
-    mark_flux2_nvfp4_swiglu_quant_site,
     residual_gate_add,
+    tensors_equal,
     try_flux2_token_cat_fp8,
     try_flux2_token_cat_nvfp4,
     try_fused_flux2_qkv_epilogue,
+    xpu_gated_resnorm,
+    xpu_layernorm_modulate,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -74,8 +81,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     apply_nvfp4_gemm_prequantized,
     apply_nvfp4_gemm_swiglu_quant,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    NDRotaryEmbedding,
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
+    FluxPosEmbed as Flux2PosEmbed,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -95,6 +102,11 @@ _get_qkv_projections = get_qkv_projections
 _FLUX2_LN_MOD = BitExactFusionGate("FLUX.2 fused LN+modulate", per_signature=True)
 _FLUX2_LN_MOD_SIGS = _FLUX2_LN_MOD.verified_sigs
 assert _FLUX2_LN_MOD_SIGS is not None
+# The CUDA gated-resnorm kernel is exact by construction; the XPU one replicates
+# torch-xpu's LayerNorm and is verified once per signature like LN+modulate.
+_FLUX2_XPU_GATED_RESNORM = BitExactFusionGate(
+    "FLUX.2 fused gated residual+LN+modulate (XPU)", per_signature=True
+)
 _FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
 _FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
 assert _FLUX2_SWIGLU_SIGS is not None
@@ -103,6 +115,54 @@ _FLUX2_LN_FP8 = BitExactFusionGate(
 )
 _FLUX2_LN_FP8_SIGS = _FLUX2_LN_FP8.verified_sigs
 assert _FLUX2_LN_FP8_SIGS is not None
+_FLUX2_STRIDED_QK_ROPE = BitExactFusionGate(
+    "FLUX.2 Klein strided QK RMSNorm+RoPE", per_signature=True
+)
+
+
+def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
+    def reference():
+        return apply_qk_norm_with_optional_rope(
+            q=q,
+            k=k,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=cache,
+            freqs_complex=complex_freqs,
+            is_neox=False,
+            allow_inplace=True,
+            allow_strided_qk=current_platform.is_rocm(),
+        )
+
+    if (
+        head_dim != 128
+        or type(q_norm) is not RMSNorm
+        or type(k_norm) is not RMSNorm
+        or q_norm.variance_epsilon != k_norm.variance_epsilon
+        or any(
+            norm.variance_size_override is not None
+            or getattr(norm._forward_method, "__func__", None)
+            is not RMSNorm.forward_cuda
+            for norm in (q_norm, k_norm)
+        )
+        or not envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
+        or not can_use_flux2_strided_qknorm_rope(
+            q, k, q_norm.weight, k_norm.weight, cache
+        )
+    ):
+        return reference()
+    return _FLUX2_STRIDED_QK_ROPE.run(
+        lambda: flux2_strided_qknorm_rope(
+            q, k, q_norm.weight, k_norm.weight, cache, q_norm.variance_epsilon
+        ),
+        reference,
+        sig=(q.device, q.shape, q.stride(), cache.stride(), q_norm.variance_epsilon),
+        equal=lambda a, b: all(
+            torch.equal(x.view(torch.int16), y.view(torch.int16)) for x, y in zip(a, b)
+        ),
+        logger=logger,
+    )
 
 
 def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
@@ -143,9 +203,10 @@ def _try_flux2_norm_modulate_fp8(
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
     if (
         _FLUX2_LN_FP8.disabled
+        or not x.is_cuda
         or x.shape[-1] != 6144
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     ):
         return None
 
@@ -179,10 +240,6 @@ def _try_flux2_norm_modulate_fp8(
         reference,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX.2 fused LN+modulate+FP8 quant fast path is not bit-exact "
-            "on this platform; falling back to the split path"
-        ),
     )
 
 
@@ -197,9 +254,48 @@ def _materialize_gated_residual(pending: PendingGatedResidual) -> torch.Tensor:
 def _defer_gated_residual(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor | PendingGatedResidual:
-    if can_defer_flux2_gated_residual(residual, update, gate):
+    if can_defer_flux2_gated_residual(residual, update, gate) or _can_defer_xpu(
+        residual, update, gate
+    ):
         return residual, update, gate
     return residual_gate_add(residual, update, gate)
+
+
+def _can_defer_xpu(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    return (
+        residual.is_xpu
+        and not _FLUX2_XPU_GATED_RESNORM.disabled
+        and can_defer_xpu_gated_residual(residual, update, gate)
+    )
+
+
+def _flux2_derive_rope_tensors(
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """(cos_sin_cache, complex_freqs) from one (cos, sin) pair.
+
+    Called once per Flux2Transformer2DModel.forward() instead of once per
+    block: freqs_cis is identical across every block in a forward pass, so
+    deriving it per-attention-call recomputed the same tensors up to 56x
+    per denoising step.
+    """
+    if freqs_cis is None:
+        return None, None
+    cos, sin = freqs_cis
+    cos_sin_cache = torch.cat(
+        [
+            cos.to(dtype=torch.float32).contiguous(),
+            sin.to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
+    # is_neox=False here, so this can hit the NPU _apply_rotary_emb_complex
+    # fast path in RotaryEmbedding instead of the interleaved fallback (no
+    # fused NPU kernel for it).
+    complex_freqs = torch.complex(cos.to(torch.float32), sin.to(torch.float32))
+    return cos_sin_cache, complex_freqs
 
 
 def _flux2_gated_resnorm(
@@ -214,9 +310,51 @@ def _flux2_gated_resnorm(
         residual, update, gate, scale, shift
     ):
         return flux2_gated_resnorm_raw(residual, update, gate, scale, shift, norm.eps)
+    if residual.is_xpu and is_plain_layer_norm(norm, residual.shape[-1]):
+        fused = _xpu_gated_resnorm(norm, residual, update, gate, scale, shift)
+        if fused is not None:
+            return fused
 
     residual = residual_gate_add(residual, update, gate)
     return _flux2_norm_modulate(norm, residual, scale, shift), residual
+
+
+def _xpu_gated_resnorm(
+    norm: nn.Module,
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Bit-exact single-kernel ``r = residual + update * gate; LN(r) * (1 + scale) + shift``."""
+    if (
+        torch.compiler.is_compiling()
+        or _FLUX2_XPU_GATED_RESNORM.disabled
+        or not can_use_xpu_layernorm_modulate(residual.dtype, residual.shape[-1])
+    ):
+        return None
+    # Exactness depends on the reduction width and row layouts, not on row count.
+    sig = (residual.dtype, residual.device, residual.shape[-1], norm.eps)
+    verified = _FLUX2_XPU_GATED_RESNORM.is_verified(sig)
+    if not verified and torch.xpu.is_current_stream_capturing():
+        return None
+    try:
+        out = xpu_gated_resnorm(residual, update, gate, scale, shift, norm.eps)
+    except Exception as exc:
+        _FLUX2_XPU_GATED_RESNORM.on_exception(exc, logger=logger)
+        return None
+    if verified:
+        return out
+    ref_residual = residual_gate_add(residual, update, gate)
+    ref = (norm(ref_residual) * (1 + scale) + shift, ref_residual)
+    return _FLUX2_XPU_GATED_RESNORM.accept_or_fallback(
+        out,
+        ref,
+        sig=sig,
+        equal=tensors_equal,
+        logger=logger,
+    )
 
 
 def _can_use_nvfp4_swiglu_quant_fusion(capability: Any) -> bool:
@@ -279,10 +417,12 @@ def _flux2_norm_modulate(
 
     scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
+    use_xpu = x.is_xpu and can_use_xpu_layernorm_modulate(x.dtype, x.shape[-1])
+    use_cuda = x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
     if (
         _FLUX2_LN_MOD.disabled
         or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+        or not (use_xpu or use_cuda)
     ):
         return norm(x) * (1 + scale) + shift
 
@@ -300,11 +440,12 @@ def _flux2_norm_modulate(
         norm.eps,
     )
     verified = sig in _FLUX2_LN_MOD_SIGS
-    if not verified and torch.cuda.is_current_stream_capturing():
+    if not verified and torch.get_device_module(x.device).is_current_stream_capturing():
         return norm(x) * (1 + scale) + shift
+    kernel = xpu_layernorm_modulate if use_xpu else fused_layernorm_modulate_raw
     try:
         # Direct dispatch avoids custom-op overhead on this eager-only path.
-        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
+        out = kernel(x, scale_row, shift_row, norm.eps)
     except Exception as exc:
         _FLUX2_LN_MOD.on_exception(exc, logger=logger)
         return norm(x) * (1 + scale) + shift
@@ -316,15 +457,24 @@ def _flux2_norm_modulate(
         ref,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX.2 fused LN+modulate fast path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 
-def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
-    """Bit-exact fused SwiGLU for the packed FLUX.2 FFN projection."""
+def _flux2_swiglu(x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Bit-exact fused SwiGLU for the packed FLUX.2 FFN projection.
+
+    With ``out`` (e.g. a column slice of the next GEMM's input) the result is
+    written there and ``out`` is returned.
+    """
+    if out is None:
+        return _flux2_swiglu_impl(x, None)
+    result = _flux2_swiglu_impl(x, out)
+    if result.data_ptr() != out.data_ptr():
+        out.copy_(result)
+    return out
+
+
+def _flux2_swiglu_impl(x: torch.Tensor, out: Optional[torch.Tensor]) -> torch.Tensor:
     half = x.shape[-1] // 2
     # Let Inductor fuse the reference expression in torch.compile mode.
     if torch.compiler.is_compiling():
@@ -336,7 +486,7 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     verified = sig in _FLUX2_SWIGLU_SIGS
     can_fuse = (
         not _FLUX2_SWIGLU.disabled
-        and x.is_cuda
+        and (x.is_cuda or x.is_xpu)
         and x.dtype is torch.bfloat16
         and x.dim() == 3
         and x.stride(-1) == 1
@@ -347,11 +497,15 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     )
     # Per-signature verification may compare tensors and synchronize.  Never
     # verify a new layout while a CUDA graph is being captured.
-    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+    if (
+        can_fuse
+        and not verified
+        and torch.get_device_module(x.device).is_current_stream_capturing()
+    ):
         return F.silu(x[..., :half]) * x[..., half:]
     if can_fuse:
         try:
-            out = fused_packed_silu_mul_bitexact(x)
+            out = fused_packed_silu_mul_bitexact(x, out)
         except Exception as exc:
             _FLUX2_SWIGLU.on_exception(exc, logger=logger)
         else:
@@ -362,10 +516,6 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
                 F.silu(x[..., :half]) * x[..., half:],
                 sig=sig,
                 logger=logger,
-                mismatch_msg=(
-                    "FLUX.2 fused SwiGLU fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
             )
     return F.silu(x[..., :half]) * x[..., half:]
 
@@ -376,8 +526,10 @@ class Flux2SwiGLU(nn.Module):
     layer fused into the first linear layer of the FF sub-block. Thus, this module has no trainable parameters.
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _flux2_swiglu(x)
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        return _flux2_swiglu(x, out)
 
 
 class Flux2FeedForward(nn.Module):
@@ -430,11 +582,11 @@ class Flux2FeedForward(nn.Module):
             # available.
             self.linear_in._interleave_for_swiglu_fusion = True
             self.linear_out._accepts_prequantized_fp4 = True
-            mark_flux2_nvfp4_swiglu_quant_site(self)
+            FLUX2_NVFP4_SWIGLU_QUANT.mark(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            flux2_nvfp4_swiglu_quant_active(self)
+            FLUX2_NVFP4_SWIGLU_QUANT.is_enabled(self)
             and getattr(self.linear_in, "_swiglu_fusion_ready", False)
             and not torch.compiler.is_compiling()
             and not torch.cuda.is_current_stream_capturing()
@@ -479,7 +631,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.dropout = dropout
 
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         # Packed NVFP4 checkpoints already serialize QKV together. ModelOpt
         # FP8 exports separate Diffusers tensors, but the loader can merge
@@ -611,7 +762,8 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[Dict[str, int]] = None,
@@ -633,17 +785,6 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.local_heads, -1))
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
-
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
 
         joint_qkv = None
         sp_txt_pad = 0
@@ -686,6 +827,13 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                         tensor.contiguous()
                         for tensor in (encoder_query, encoder_key, encoder_value)
                     ]
+                # complex_freqs covers [text, image] positions in order (same
+                # table cos_sin_cache/positions index into); slice per call the
+                # same way position_offset selects rows below — the class's
+                # complex_freqs path does not do positional indexing itself.
+                text_freqs_complex = (
+                    complex_freqs[:text_seq_len] if complex_freqs is not None else None
+                )
                 encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
                     q=encoder_query,
                     k=encoder_key,
@@ -693,8 +841,15 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     k_norm=self.norm_added_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=cos_sin_cache,
+                    freqs_complex=text_freqs_complex,
                     is_neox=False,
                     allow_inplace=True,
+                )
+                img_seq_len = query.shape[1]
+                img_freqs_complex = (
+                    complex_freqs[text_seq_len : text_seq_len + img_seq_len]
+                    if complex_freqs is not None
+                    else None
                 )
                 query, key = apply_qk_norm_with_optional_rope(
                     q=query,
@@ -703,6 +858,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     k_norm=self.norm_k,
                     head_dim=self.head_dim,
                     cos_sin_cache=cos_sin_cache,
+                    freqs_complex=img_freqs_complex,
                     is_neox=False,
                     position_offset=text_seq_len,
                     allow_inplace=True,
@@ -717,6 +873,10 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 query, key, value = [
                     tensor.contiguous() for tensor in (query, key, value)
                 ]
+            seq_len = query.shape[1]
+            joint_freqs_complex = (
+                complex_freqs[:seq_len] if complex_freqs is not None else None
+            )
             query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
@@ -724,6 +884,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
+                freqs_complex=joint_freqs_complex,
                 is_neox=False,
                 allow_inplace=True,
             )
@@ -819,13 +980,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Fused attention output + MLP output projection.
-        # Input is [attn_shard | mlp_shard] (independently sharded by
-        # MergedColumnParallelLinear), so patch weight loader to pick the
-        # correct non-contiguous columns per rank.
+        # each rank consumes independently sharded attention and MLP inputs
         self.to_out = RowParallelLinear(
             self.inner_dim + self.mlp_hidden_dim,
             self.out_dim,
+            input_sizes=[self.inner_dim, self.mlp_hidden_dim],
             bias=out_bias,
             input_is_parallel=True,
             quant_config=quant_config,
@@ -843,8 +1002,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
         ):
             self._enable_nvfp4_token_cat = True
-        if self.tp_size > 1:
-            self._patch_to_out_weight_loader()
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
@@ -855,32 +1012,34 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             supported_attention_backends=supported_attention_backends,
         )
 
-    def _patch_to_out_weight_loader(self) -> None:
-        inner_dim, mlp_dim = self.inner_dim, self.mlp_hidden_dim
-        tp_size, tp_rank = self.tp_size, self.to_out.tp_rank
+    def revalidate_fp8_fast_paths(self) -> None:
+        """Recompute fused FP8/NVFP4 fast-path eligibility after submodule changes.
 
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                a = inner_dim // tp_size
-                m = mlp_dim // tp_size
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
-                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        self.to_out.weight_loader = _loader
-        if hasattr(self.to_out.weight, "_weight_loader"):
-            self.to_out.weight._weight_loader = _loader
-        else:
-            self.to_out.weight.weight_loader = _loader
+        LoRA wrapping replaces quantized linears with wrappers that do not
+        expose ``quant_method``/``input_scale``; flags decided at ``__init__``
+        against the raw modules then go stale and ``forward`` would read those
+        attributes off the wrapper and crash. Read them defensively here so a
+        recheck after wrapping disables the fusion instead.
+        """
+        self._enable_fp8_token_cat = self.tp_size == 1 and isinstance(
+            getattr(self.to_out, "quant_method", None), ModelOptFp8LinearMethod
+        )
+        capability = current_platform.get_device_capability()
+        self._enable_nvfp4_token_cat = (
+            self.tp_size == 1
+            and capability is not None
+            and (capability.major, capability.minor) == (10, 3)
+            and isinstance(
+                getattr(self.to_out, "quant_method", None), ModelOptFp4LinearMethod
+            )
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         **kwargs,
     ) -> torch.Tensor:
@@ -907,28 +1066,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.local_heads, -1))
         value = value.unflatten(-1, (self.local_heads, -1))
 
-        cos_sin_cache = None
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
+        if complex_freqs is not None:
+            complex_freqs = complex_freqs[: query.shape[1]]
 
-        # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used
-        # here too — the single-stream block previously ran norm and RoPE as separate ops.
-        query, key = apply_qk_norm_with_optional_rope(
-            q=query,
-            k=key,
-            q_norm=self.norm_q,
-            k_norm=self.norm_k,
-            head_dim=self.head_dim,
-            cos_sin_cache=cos_sin_cache,
-            is_neox=False,
-            allow_inplace=True,
+        # Packed QKV/MLP projection views can be normalized and rotated
+        # without materializing contiguous Q/K inputs on the supported path.
+        query, key = _flux2_single_qk_rope(
+            query,
+            key,
+            self.norm_q,
+            self.norm_k,
+            self.head_dim,
+            cos_sin_cache,
+            complex_freqs,
         )
         hidden_states = self.attn(
             query,
@@ -940,6 +1090,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+
+        # BF16: build the output projection's [attn | mlp] input in place. SwiGLU
+        # writes its columns directly and only the narrower attention output is
+        # copied, instead of a full-width cat; the GEMM input is byte-identical.
+        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
+            attn_dim = hidden_states.shape[-1]
+            gemm_input = hidden_states.new_empty(
+                (*hidden_states.shape[:-1], attn_dim + mlp_hidden_states.shape[-1] // 2)
+            )
+            self.mlp_act_fn(mlp_hidden_states, out=gemm_input[..., attn_dim:])
+            gemm_input[..., :attn_dim].copy_(hidden_states)
+            hidden_states, _ = self.to_out(gemm_input)
+            return hidden_states
 
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
@@ -1019,7 +1182,8 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor | PendingGatedResidual,
         encoder_hidden_states: Optional[torch.Tensor],
         temb_mod_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
@@ -1046,7 +1210,8 @@ class Flux2SingleTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
-            freqs_cis=freqs_cis,
+            cos_sin_cache=cos_sin_cache,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1164,7 +1329,8 @@ class Flux2TransformerBlock(nn.Module):
         temb_mod_params_txt: Tuple[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...
         ],
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        complex_freqs: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         num_replicated_prefix: int = 0,
     ) -> Tuple[
@@ -1230,7 +1396,8 @@ class Flux2TransformerBlock(nn.Module):
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
-            freqs_cis=freqs_cis,
+            cos_sin_cache=cos_sin_cache,
+            complex_freqs=complex_freqs,
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
@@ -1351,33 +1518,6 @@ class Flux2Modulation(nn.Module):
         )
 
 
-class Flux2PosEmbed(nn.Module):
-    def __init__(self, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.rope = NDRotaryEmbedding(
-            rope_dim_list=axes_dim,
-            rope_theta=theta,
-            use_real=False,
-            repeat_interleave_real=False,
-            dtype=(
-                torch.float64
-                if (
-                    current_platform.is_float64_supported()
-                    if hasattr(current_platform, "is_float64_supported")
-                    else True
-                )
-                else torch.float32
-            ),
-        )
-
-    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        pos = ids.float()
-        # TODO: potential error: flux use n_axes = ids.shape[-1]
-        # see: https://github.com/huggingface/diffusers/blob/17c0e79dbdf53fb6705e9c09cc1a854b84c39249/src/diffusers/models/transformers/transformer_flux.py#L509
-        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
-        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
-
-
 class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux 2.
@@ -1433,6 +1573,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.AITER_QUANT,
     }
 
     def post_load_weights(self) -> None:
@@ -1476,6 +1617,18 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 enabled,
                 total,
             )
+
+    def revalidate_fp8_fast_paths(self) -> None:
+        """Recheck FP8 fast paths after LoRA (or other) submodule replacement.
+
+        ``configure_fp8_norm_quant`` is getattr-safe, so a wrapper that hides
+        the quant attributes simply turns each flag off.
+        """
+        for block in self.transformer_blocks:
+            block.configure_fp8_norm_quant()
+        for block in self.single_transformer_blocks:
+            block.configure_fp8_norm_quant()
+            block.attn.revalidate_fp8_fast_paths()
 
     def __init__(
         self,
@@ -1676,6 +1829,14 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         join_seqs(sin[:t_loc], sin[t_loc:], sp_txt_pad, dim=0),
                     )
 
+        # freqs_cis/singles_freqs_cis are fixed for the rest of this forward
+        # pass, so derive cos_sin_cache/complex_freqs once here instead of
+        # once per block (56x per full denoising step).
+        cos_sin_cache, complex_freqs = _flux2_derive_rope_tensors(freqs_cis)
+        singles_cos_sin_cache, singles_complex_freqs = _flux2_derive_rope_tensors(
+            singles_freqs_cis
+        )
+
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -1683,7 +1844,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
-                freqs_cis=freqs_cis,
+                cos_sin_cache=cos_sin_cache,
+                complex_freqs=complex_freqs,
                 joint_attention_kwargs=joint_attention_kwargs,
                 num_replicated_prefix=num_replicated_prefix,
             )
@@ -1703,7 +1865,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
-                freqs_cis=singles_freqs_cis,
+                cos_sin_cache=singles_cos_sin_cache,
+                complex_freqs=singles_complex_freqs,
                 joint_attention_kwargs=joint_attention_kwargs,
                 text_seq_len=txt_real,
                 num_replicated_prefix=num_replicated_prefix,

@@ -17,6 +17,9 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BackupDramReq,
+    BatchEmbeddingOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     ChecksumInfo,
     CheckWeightsReqOutput,
     DumperControlReqInput,
@@ -26,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     ParallelismInfo,
+    RequestOutputStats,
     RpcReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -34,7 +38,11 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    _merge_checksum_payloads,
+)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
 from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
@@ -65,9 +73,17 @@ def _contains_dataclass(obj) -> bool:
     return False
 
 
-def _parallelism_info() -> ParallelismInfo:
+def _parallelism_info(role: str = "target") -> ParallelismInfo:
     return ParallelismInfo(
-        tp_rank=0, tp_size=2, dp_rank=0, dp_size=1, pp_rank=0, pp_size=1, rank=0, size=2
+        role=role,
+        tp_rank=0,
+        tp_size=2,
+        dp_rank=0,
+        dp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        rank=0,
+        size=2,
     )
 
 
@@ -75,7 +91,7 @@ def _checksum_info(tag: str) -> ChecksumInfo:
     return ChecksumInfo(
         checksums={f"model.layers.{tag}": "deadbeef"},
         per_gpu_checksum="cafef00d",
-        parallelism_info=_parallelism_info(),
+        parallelism_info=[_parallelism_info("target"), _parallelism_info("draft")],
     )
 
 
@@ -194,29 +210,41 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertEqual(len(decoded.payload), 2)
         as_dict = msgspec_to_builtins(decoded.payload[0])
         self.assertEqual(as_dict["per_gpu_checksum"], "cafef00d")
-        self.assertIn("tp_rank", as_dict["parallelism_info"])
+        self.assertEqual(
+            [pi["role"] for pi in as_dict["parallelism_info"]], ["target", "draft"]
+        )
+        self.assertIn("tp_rank", as_dict["parallelism_info"][0])
 
     def test_check_weights_producer_conversion(self):
-        # Mirrors weight_updater.check_weights: WeightChecker returns
-        # ChecksumInfo.model_dump() (a dict), converted to the msgspec struct via
-        # msgspec.convert, and the result round-trips as the payload.
-        pydantic_checksum = PydanticChecksumInfo(
-            checksums={"model.layers.0": "deadbeef"},
-            per_gpu_checksum="cafef00d",
-            parallelism_info=PydanticParallelismInfo(
-                tp_rank=0,
-                tp_size=2,
-                dp_rank=0,
-                dp_size=1,
-                pp_rank=0,
-                pp_size=1,
-                rank=0,
-                size=2,
-            ),
+        # the merged per-role payload is what msgspec.convert has to accept
+        def _dump(role):
+            return PydanticChecksumInfo(
+                checksums={"model.layers.0": "deadbeef"},
+                per_gpu_checksum="cafef00d",
+                parallelism_info=PydanticParallelismInfo(
+                    role=role,
+                    tp_rank=0,
+                    tp_size=2,
+                    dp_rank=0,
+                    dp_size=1,
+                    pp_rank=0,
+                    pp_size=1,
+                    rank=0,
+                    size=2,
+                ),
+            ).model_dump()
+
+        merged = _merge_checksum_payloads(
+            [("target", _dump("target")), ("draft", _dump("draft"))]
         )
-        converted = msgspec.convert(pydantic_checksum.model_dump(), ChecksumInfo)
-        self.assertEqual(converted.per_gpu_checksum, "cafef00d")
-        self.assertEqual(converted.parallelism_info.tp_rank, 0)
+        converted = msgspec.convert(merged, ChecksumInfo)
+        self.assertEqual(
+            sorted(converted.checksums), ["draft.model.layers.0", "model.layers.0"]
+        )
+        self.assertEqual(
+            [pi.role for pi in converted.parallelism_info], ["target", "draft"]
+        )
+        self.assertEqual(converted.parallelism_info[0].tp_rank, 0)
         output = CheckWeightsReqOutput(success=True, message="ok", payload=[converted])
         self.assertEqual(_round_trip(output), output)
 
@@ -266,6 +294,43 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
     def test_abort_req_defaults_to_no_spans(self):
         """The field is optional on the wire, so an abort without spans decodes to None."""
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
+
+
+class TestRequestStatsRoundTrip(CustomTestCase):
+    """Per-row request stats, with their time stats, decode back to typed
+    structs, not plain lists."""
+
+    def test_batch_outputs_carry_request_stats(self):
+        time_stats = SchedulerOutputTimeStats(
+            queue_time=0.5, forward_entry_time=1.7e9, storage_staging_wait=0.0
+        )
+        stats = RequestOutputStats(
+            prompt_tokens=7,
+            cached_tokens=3,
+            cached_tokens_details={"device": 3, "host": 0, "storage_backend": "X"},
+            retraction_count=1,
+            image_tokens=4,
+            audio_tokens=0,
+            video_tokens=0,
+            time_stats=time_stats,
+        )
+        for cls in (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput):
+            # Embedding rows always carry their stats.
+            request_stats = [stats, stats if cls is BatchEmbeddingOutput else None]
+            with self.subTest(type=cls.__name__):
+                required = {
+                    f.name: [] for f in msgspec.structs.fields(cls) if f.required
+                }
+                obj = cls(**{**required, "rids": ["a", "b"]})
+                obj.request_stats = request_stats
+
+                decoded = _double_hop(obj)
+
+                self.assertEqual(decoded.request_stats, request_stats)
+                self.assertIsInstance(decoded.request_stats[0], RequestOutputStats)
+                self.assertIsInstance(
+                    decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
+                )
 
 
 if __name__ == "__main__":

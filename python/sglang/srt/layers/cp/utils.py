@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -36,10 +38,130 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.runtime_context import get_parallel, get_schedule, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def get_cp_sharded_padded(value):
+    """Convert a global KV count to local storage for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value // strategy.cp_size
+
+
+def from_cp_sharded(value):
+    """Convert a local KV count back to global for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value * strategy.cp_size
+
+
+def get_cp_sharded_padded_cache_indices(value):
+    """Recover complete reserved local pages from actual cache-group rows."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    # The interval starts at a group boundary; its last group may be partial.
+    representatives = value[:: c * p]
+    pages = (
+        get_cp_sharded_padded_cache_transfer_indices(representatives.to(torch.int64))
+        // p
+    )
+    local = pages[:, None] * p + torch.arange(p, device=value.device)
+    return torch.where(
+        representatives[:, None] > 0,
+        local.to(value.dtype),
+        representatives[:, None],
+    ).reshape(-1)
+
+
+def from_cp_sharded_expanded_indices(value):
+    """Expand complete local pages into every CP column in cache-row order."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    pages = value[::p] // p
+    columns = torch.arange(c, device=value.device)
+    offsets = torch.arange(p, device=value.device)
+    return (
+        ((pages[:, None, None] - 1) * c + 1 + columns[None, :, None]) * p
+        + offsets[None, None, :]
+    ).reshape(-1)
+
+
+def _ceil_group_count(value, group_size):
+    """Count complete groups needed to cover a token endpoint."""
+    return (value + group_size - 1) // group_size
+
+
+def get_cp_sharded_padded_allocation_tokens(value, *, prefix_tokens):
+    """Convert raw request tokens to fresh KV capacity for sharded CP storage."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return (
+        _ceil_group_count(prefix_tokens + value, group_size) * group_size
+        - _ceil_group_count(prefix_tokens, group_size) * group_size
+    )
+
+
+def get_cp_sharded_padded_cache_transfer_indices(value):
+    """Project cache rows to local rows, preserving shape, dtype and sentinels."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    shifted = value.to(torch.int64) + (c - 1) * p
+    local = (shifted // (c * p)) * p + shifted % p
+    return torch.where(value > 0, local.to(value.dtype), value)
+
+
+def get_cp_sharded_padded_allocation_lengths(value):
+    """Convert request endpoints to reserved local capacity for allocation."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return _ceil_group_count(value, group_size) * page_size
+
+
+def get_cp_sharded_padded_allocation_size(value, *, prefix_lens, extend_lens):
+    """Count fresh local rows from the existing CPU request endpoints."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    seq_lens = prefix_lens + extend_lens
+    group_size = strategy.cp_size * page_size
+    pages = _ceil_group_count(seq_lens, group_size) - _ceil_group_count(
+        prefix_lens, group_size
+    )
+    return int(pages.sum()) * page_size
+
+
+def get_cp_sharded_padded_chunk_tokens(value, *, prefix_tokens):
+    """Align a chunk to complete fresh groups, retaining its reserved prefix tail."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    tail = _ceil_group_count(prefix_tokens, group_size) * group_size - prefix_tokens
+    groups = max(0, int((value - tail) // group_size))
+    return min(max(value, 0), tail + groups * group_size)
+
+
+def get_cp_sharded_padded_available_tokens(value, *, reserved_tokens=0):
+    """Adapt free capacity before the existing chunk headroom subtraction.
+
+    The resource group is C times the strategy's physical token page size.
+    Without a prefix, allow at most one partial group's tail. A request-aware
+    geometry entry bounds that allowance by the actual reserved tail.
+    """
+    strategy = get_cp_strategy()
+    if value < 0:
+        return value
+    group_size = strategy.cp_size * get_schedule().page_size
+    return (
+        reserved_tokens
+        + max(0, (value - reserved_tokens) // group_size) * group_size
+        + group_size
+        - 1
+    )
 
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
@@ -118,17 +240,8 @@ def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) ->
     )
 
 
-def enable_cp_v2() -> bool:
-    """Return whether the strategy-based generic prefill CP path is available."""
-    from sglang.srt.utils import is_hip, is_musa, is_npu
-
-    return not (is_hip() or is_npu() or is_musa())
-
-
-def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
-    if not enable_cp_v2():
-        return False
+def is_cp_active(forward_batch) -> bool:
+    """Return whether the current forward batch is running through CP."""
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is None or not forward_mode.is_context_parallel_extend():
         return False
@@ -144,19 +257,19 @@ def is_cp_v2_active(forward_batch) -> bool:
     return strategy.can_apply(len(input_ids), forward_batch)
 
 
-def is_mla_prefill_cp_enabled() -> bool:
+def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
-    return enable_cp_v2() and is_cp_enabled() and uses_mla_backend()
+    return is_cp_enabled() and uses_mla_backend()
 
 
-def mla_use_prefill_cp(forward_batch) -> bool:
+def is_mla_cp_active(forward_batch) -> bool:
     """Return whether this MLA forward batch is using prefill CP."""
-    return is_mla_prefill_cp_enabled() and is_cp_v2_active(forward_batch)
+    return is_mla_cp_enabled() and is_cp_active(forward_batch)
 
 
 def prepare_cp_forward(forward_batch) -> None:
-    """Build CP-v2 metadata for an active context-parallel prefill batch."""
-    assert is_cp_v2_active(forward_batch)
+    """Build CP metadata for an active context-parallel prefill batch."""
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
 
@@ -175,7 +288,12 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+    # Under CP-TP group sharing the model owns the CP row layout and gathers
+    # full rows for its MLPs, so their buffers keep the full-batch length.
+    if (
+        not get_parallel().enable_cp_tp_group_sharing
+        and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
+    ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(
@@ -191,8 +309,8 @@ def cp_split_before_forward(
     complete_position_ids: Any,
     forward_batch,
 ) -> Tuple[Optional[Any], Optional[Any]]:
-    """Shard embeddings and positions for CP-v2 model-runner forwarding."""
-    assert is_cp_v2_active(forward_batch)
+    """Shard embeddings and positions for CP model-runner forwarding."""
+    assert is_cp_active(forward_batch)
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
     return (
@@ -202,7 +320,7 @@ def cp_split_before_forward(
 
 
 def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
-    assert is_cp_v2_active(forward_batch)
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_hidden_states is not None
@@ -210,8 +328,18 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
     return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
 
 
+def cp_gather_full_sequence_states(sharded_states, forward_batch, stream=None):
+    """Gather CP-sharded states into the full logical sequence order."""
+    assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    assert sharded_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return strategy.gather_hidden_states(sharded_states, forward_batch, stream)
+
+
 def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
-    assert is_cp_v2_active(forward_batch)
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     assert complete_position_ids is not None
@@ -219,8 +347,8 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     return strategy.shard_position_ids(complete_position_ids, forward_batch)
 
 
-def cp_round_robin_input_ids_v2(input_ids: Any, forward_batch):
-    assert is_cp_v2_active(forward_batch)
+def cp_interleave_input_ids(input_ids: Any, forward_batch):
+    assert is_cp_active(forward_batch)
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
@@ -231,8 +359,8 @@ def cp_round_robin_input_ids_v2(input_ids: Any, forward_batch):
 
 
 def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None):
-    """Gather CP-v2 hidden states at the model boundary when this batch is active."""
-    assert is_cp_v2_active(forward_batch)
+    """Gather CP hidden states at the model boundary when this batch is active."""
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
 
@@ -257,7 +385,7 @@ def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
     """Materialize a CP tensor in the global logical token order."""
-    assert is_cp_v2_active(forward_batch)
+    assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
     return strategy.gather_kv_cache(x, forward_batch, stream)
@@ -271,9 +399,11 @@ def cp_shard_model_inputs(
     complete_input_ids: Optional[Any] = None,
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
-    assert is_cp_v2_active(forward_batch)
-    sharded_hidden_states = cp_shard_hidden_states(
-        complete_hidden_states, forward_batch
+    assert is_cp_active(forward_batch)
+    sharded_hidden_states = (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch)
+        if complete_hidden_states is not None
+        else None
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
     model_input_ids = (
@@ -285,7 +415,7 @@ def cp_shard_model_inputs(
     had_input_ids_global = hasattr(forward_batch, "input_ids_global")
     input_ids_global_backup = getattr(forward_batch, "input_ids_global", None)
     if complete_input_ids is not None:
-        forward_batch.input_ids_global = cp_round_robin_input_ids_v2(
+        forward_batch.input_ids_global = cp_interleave_input_ids(
             complete_input_ids, forward_batch
         )
 
@@ -294,6 +424,7 @@ def cp_shard_model_inputs(
     spec_hidden_states_backup = None
     if (
         spec_hidden_states is not None
+        and complete_hidden_states is not None
         and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
     ):
         spec_hidden_states_backup = spec_hidden_states
@@ -330,14 +461,13 @@ __all__ = [
     "InterleaveContextParallelMetadata",
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
-    "enable_cp_v2",
     "get_cp_strategy",
-    "is_cp_v2_active",
-    "is_mla_prefill_cp_enabled",
-    "mla_use_prefill_cp",
+    "is_cp_active",
+    "is_mla_cp_enabled",
+    "is_mla_cp_active",
     "cp_gather_after_forward",
     "cp_materialize_global_token_order",
-    "cp_round_robin_input_ids_v2",
+    "cp_interleave_input_ids",
     "cp_shard_hidden_states",
     "cp_shard_model_inputs",
     "cp_shard_position_ids",

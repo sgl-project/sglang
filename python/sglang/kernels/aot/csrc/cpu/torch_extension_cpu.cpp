@@ -43,12 +43,41 @@ at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps,
 at::Tensor
 layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps);
 
+// fused_scale_shift
+at::Tensor
+fused_scale_shift_cpu(const at::Tensor& input, const at::Tensor& scale, const at::Tensor& shift, double scale_constant);
+
+// fused_norm_scale_shift
+at::Tensor fused_norm_scale_shift_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps);
+
+// fused_scale_residual_norm_scale_shift
+std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
+    const at::Tensor& residual,
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& gate,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps);
+
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
 
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
+
+std::tuple<at::Tensor, at::Tensor> fused_dual_residual_rmsnorm_cpu(
+    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& weight1, const at::Tensor& weight2, double eps);
 
 // fused_add_layernorm
 at::Tensor fused_add_layernorm_cpu(
@@ -57,6 +86,20 @@ at::Tensor fused_add_layernorm_cpu(
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias,
     double eps);
+
+// fused_qk_norm (per-head, in place)
+void fused_qk_norm_cpu(
+    at::Tensor& q, at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
+void fused_qk_norm_rope_cpu(
+    at::Tensor& q,
+    at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    bool is_neox,
+    const at::Tensor& position_ids,
+    const at::Tensor& cos_sin_cache,
+    int64_t rotary_dim);
 
 // fused_qk_rmsnorm
 std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
@@ -87,7 +130,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
     double eps,
     int64_t head_dim,
     int64_t num_head);
-
 // speculative decoding
 void verify_tree_greedy_cpu(
     at::Tensor predicts,
@@ -177,6 +219,13 @@ std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
     bool renormalize,
     const std::optional<at::Tensor>& correction_bias);
 std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias);
+std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
+    double moe_softcapping,
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
@@ -303,6 +352,14 @@ at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat2,
     at::Tensor& scales2,
     std::vector<int64_t> block_size,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
+
+at::Tensor fp8_per_tensor_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
@@ -461,17 +518,23 @@ at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, c
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
-// shared mmeory all_reduce
-void shm_allreduce(at::Tensor& data, int64_t op);
+// group shared memory init
+int64_t shm_group_initialize(const std::string& group_name, int64_t group_size, int64_t group_rank);
+
+// shared memory all_reduce
+void shm_allreduce(at::Tensor& data, int64_t op, int64_t handle = -1);
 
 // shared memory all_gather
-at::Tensor shm_allgather(at::Tensor& data, int64_t dim);
+at::Tensor shm_allgather(at::Tensor& data, int64_t dim, int64_t handle = -1);
+
+// group shared memory all_to_all
+void shm_alltoall(at::Tensor& output_tensor, at::Tensor& data, int64_t handle);
 
 // shared memory all_gather_into_tensor
-void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
+void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t handle = -1);
 
 // shared memory reduce_scatter_tensor
-void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
+void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op, int64_t handle = -1);
 
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
@@ -609,9 +672,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
   m.def(
+      "fused_dual_residual_rmsnorm_cpu(Tensor x, Tensor residual, Tensor w1, Tensor w2, float eps) -> "
+      "(Tensor, Tensor)");
+  m.impl("fused_dual_residual_rmsnorm_cpu", torch::kCPU, &fused_dual_residual_rmsnorm_cpu);
+  m.def(
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
+  m.def("fused_qk_norm_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps) -> ()");
+  m.impl("fused_qk_norm_cpu", torch::kCPU, &fused_qk_norm_cpu);
+  m.def(
+      "fused_qk_norm_rope_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps, "
+      "bool is_neox, Tensor position_ids, Tensor cos_sin_cache, int rotary_dim) -> ()");
+  m.impl("fused_qk_norm_rope_cpu", torch::kCPU, &fused_qk_norm_rope_cpu);
   m.def(
       "fused_qk_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps) -> "
       "(Tensor, Tensor)");
@@ -631,6 +704,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "head_dim, int num_head) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("fused_qk_gemma_rmsnorm_with_gate_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_with_gate_cpu);
+  m.def("fused_scale_shift_cpu(Tensor input, Tensor scale, Tensor shift, float scale_constant) -> Tensor");
+  m.impl("fused_scale_shift_cpu", torch::kCPU, &fused_scale_shift_cpu);
+  m.def(
+      "fused_norm_scale_shift_cpu("
+      "Tensor input, "
+      "Tensor? weight, "
+      "Tensor? bias, "
+      "Tensor scale, "
+      "Tensor shift, "
+      "str norm_type, "
+      "float eps"
+      ") -> Tensor");
+
+  m.impl("fused_norm_scale_shift_cpu", torch::kCPU, &fused_norm_scale_shift_cpu);
+  m.def(
+      "fused_scale_residual_norm_scale_shift_cpu("
+      "Tensor residual, "
+      "Tensor input, "
+      "Tensor? gate, "
+      "Tensor? weight, "
+      "Tensor? bias, "
+      "Tensor scale, "
+      "Tensor shift, "
+      "str norm_type, "
+      "float eps"
+      ") -> (Tensor, Tensor)");
+
+  m.impl("fused_scale_residual_norm_scale_shift_cpu", torch::kCPU, &fused_scale_residual_norm_scale_shift_cpu);
 
   // speculative decoding
   m.def(
@@ -700,6 +801,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
+      "fused_moe_router_cpu(float moe_softcapping, Tensor hidden_states, Tensor gating_output, int topk, bool "
+      "renormalize, "
+      "Tensor? correction_bias=None) -> (Tensor, Tensor)");
+  m.impl("fused_moe_router_cpu", torch::kCPU, &fused_moe_router_cpu);
+  m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
       "int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, Tensor? num_token_non_padded) -> "
       "(Tensor, Tensor)");
@@ -766,6 +872,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+  m.def(
+      "fp8_per_tensor_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType "
+      "out_dtype, bool is_vnni) -> Tensor");
+  m.impl("fp8_per_tensor_scaled_mm_cpu", torch::kCPU, &fp8_per_tensor_scaled_mm_cpu);
 
   // mxfp4 gemm
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
@@ -857,16 +967,31 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
   m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
-  // all reduce
+  // shared memory
   m.def("initialize(int size, int rank) -> ()");
-  m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
+
+  // all_reduce
+  m.def("shm_allreduce(Tensor(a!) data, int reduce_op, int handle=-1) -> ()");
   m.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
-  m.def("shm_allgather(Tensor data, int dim) -> Tensor");
+
+  // all_gather
+  m.def("shm_allgather(Tensor data, int dim, int handle=-1) -> Tensor");
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
-  m.def("shm_allgather_into_tensor(Tensor(a!) output_tensor, Tensor data) -> ()");
+
+  // all_gather_into_tensor
+  m.def("shm_allgather_into_tensor(Tensor(a!) output_tensor, Tensor data, int handle=-1) -> ()");
   m.impl("shm_allgather_into_tensor", torch::kCPU, &shm_allgather_into_tensor);
-  m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op) -> ()");
+
+  // reduce_scatter_tensor
+  m.def("shm_reduce_scatter_tensor(Tensor(a!) output_tensor, Tensor data, int reduce_op, int handle=-1) -> ()");
   m.impl("shm_reduce_scatter_tensor", torch::kCPU, &shm_reduce_scatter_tensor);
+
+  // explicit group context initialization
+  m.def("shm_group_initialize(str group_name, int group_size, int group_rank) -> int");
+
+  // all_to_all
+  m.def("shm_alltoall(Tensor(a!) output_tensor, Tensor data, int handle) -> ()");
+  m.impl("shm_alltoall", torch::kCPU, &shm_alltoall);
 
   // rope
   m.def(
@@ -942,6 +1067,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
   m.impl("initialize", &initialize);
+  m.impl("shm_group_initialize", &shm_group_initialize);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -7,7 +7,7 @@ from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=346, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
@@ -29,7 +29,7 @@ def _mtp_args(*, strategy, steps, topk, draft_tokens, track_interval):
         "4",
         "--chunked-prefill-size",
         "2048",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         strategy,
         "--mamba-track-interval",
         str(track_interval),
@@ -62,7 +62,7 @@ class TestQwen3NextMTPTopk(
         "4",
         "--chunked-prefill-size",
         "2048",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--mamba-track-interval",
         "128",
@@ -94,7 +94,7 @@ class TestQwen3NextMTPV2(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
         "4",
         "--chunked-prefill-size",
         "2048",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         "--mamba-track-interval",
         "128",

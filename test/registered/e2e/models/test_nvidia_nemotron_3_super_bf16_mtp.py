@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=165, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=180, stage="extra-b", runner_config="8-gpu-h200")
 
 NEMOTRON_3_SUPER_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 
@@ -72,7 +72,7 @@ class TestNvidiaNemotron3SuperBF16MTP(CustomTestCase):
             temperature=1.0,
             top_p=0.95,
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)

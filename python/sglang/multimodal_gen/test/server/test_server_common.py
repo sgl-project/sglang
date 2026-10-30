@@ -8,10 +8,12 @@ Each collected request prints a performance log before validation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +28,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
+    pop_realtime_e2e_ms,
     pop_realtime_key_frames,
     pop_realtime_perf_stats,
     validate_realtime_perf_stats,
@@ -40,6 +43,9 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
+    OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF,
+    OUTPUT_MATCH_MAX_MEAN_ABS_DIFF,
+    OUTPUT_MATCH_MIN_PSNR,
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
@@ -54,6 +60,8 @@ from sglang.multimodal_gen.test.test_utils import (
     audio_gt_exists,
     compare_audio_with_gt,
     compare_with_gt,
+    compute_mean_abs_diff,
+    compute_psnr,
     encode_audio_gt_wav,
     extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
@@ -101,6 +109,10 @@ _SERVER_FATAL_LOG_PATTERNS = (
 _CASE_LOG_SEPARATOR = "=" * 88
 
 
+class PerformanceValidationError(AssertionError):
+    """A terminal performance failure, including across repeated requests."""
+
+
 def _print_case_log_separator(case_id: str, state: str) -> None:
     print(
         f"\n{_CASE_LOG_SEPARATOR}\n"
@@ -108,6 +120,22 @@ def _print_case_log_separator(case_id: str, state: str) -> None:
         f"{_CASE_LOG_SEPARATOR}",
         flush=True,
     )
+
+
+def _key_frame_distances(
+    case_id: str, label: str, frames: list[np.ndarray], reference: list[np.ndarray]
+) -> tuple[list[float], list[float]]:
+    """Per-key-frame mean_abs_diff and PSNR of ``frames`` against ``reference``."""
+    pairs = list(zip(frames, reference, strict=True))
+    mean_abs_diffs = [compute_mean_abs_diff(frame, ref) for frame, ref in pairs]
+    psnrs = [compute_psnr(frame, ref) for frame, ref in pairs]
+    print(
+        f"[Output Reference] {case_id}: {label}: "
+        f"mean_abs_diff=[{', '.join(f'{value:.3f}' for value in mean_abs_diffs)}] "
+        f"psnr=[{', '.join(f'{value:.2f}' for value in psnrs)}]",
+        flush=True,
+    )
+    return mean_abs_diffs, psnrs
 
 
 @pytest.fixture
@@ -371,21 +399,34 @@ class DiffusionServerBase:
 
         log_path = ctx.perf_log_path
         log_wait_timeout = 30
-        req_perf_record = wait_for_req_perf_record(
-            rid,
-            log_path,
-            timeout=log_wait_timeout,
-        )
+        try:
+            req_perf_record = wait_for_req_perf_record(
+                rid,
+                log_path,
+                timeout=log_wait_timeout,
+            )
+        except AssertionError as exc:
+            raise PerformanceValidationError(f"[performance] {case_id}: {exc}") from exc
 
         return (req_perf_record, content)
 
     def _validate_and_record(
         self,
+        ctx: ServerContext,
         case: DiffusionTestCase,
         perf_record: RequestPerfRecord,
         request_index: int = 1,
     ) -> None:
-        """Validate metrics and record results."""
+        """Validate metrics and record results.
+
+        The load duration is read off ``ctx`` rather than passed separately:
+        recording a result requires it, and a caller that has the server always
+        has the measurement.
+        """
+        if perf_record is None:
+            raise PerformanceValidationError(
+                f"[performance] {case.id}: request performance record is missing"
+            )
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
@@ -412,22 +453,25 @@ class DiffusionServerBase:
         )
 
         summary = validator.collect_metrics(perf_record)
-        self._print_performance_log(case, summary, scenario)
+        summary.load_time_ms = ctx.load_time_ms
         self._record_performance_result(case, summary, request_index)
+        self._print_performance_log(case, summary, scenario)
+
+        if is_baseline_generation_mode:
+            _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
+            return
+
+        if missing_scenario:
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
+
+        # disabling stage checks must not disable the request's e2e guard
+        validator.validate_e2e(summary)
+        validator.validate_load(summary)
 
         if case.run_perf_check:
-            if is_baseline_generation_mode:
-                _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
-                return
-
-            if missing_scenario:
-                self._dump_baseline_for_testcase(case, summary, missing_scenario)
-                if missing_scenario:
-                    pytest.fail(
-                        f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
-                    )
-                return
-
             if current_platform.is_cuda():
                 expected_load_peak_vram_mb = scenario.load_peak_vram_mb
                 expected_runtime_peak_vram_mb = scenario.runtime_peak_vram_mb
@@ -476,6 +520,57 @@ class DiffusionServerBase:
         chunk_stats: list[RealtimeChunkStats],
         request_index: int = 1,
     ) -> None:
+        e2e_ms = pop_realtime_e2e_ms(case.id)
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        summary = PerformanceSummary(e2e_ms, 0, 0, {}, [], {}, {})
+        check_memory = case.run_perf_check and current_platform.is_cuda()
+        if check_memory:
+            request_id = next(
+                (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
+                None,
+            )
+            if request_id is None:
+                pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
+
+            perf_record = wait_for_req_perf_record(
+                request_id, ctx.perf_log_path, timeout=30
+            )
+            if perf_record is None:
+                pytest.fail(
+                    f"{case.id}: realtime request performance record is missing"
+                )
+            if scenario is None:
+                pytest.fail(
+                    f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+                )
+            validator = PerformanceValidator(
+                scenario=scenario,
+                tolerances=BASELINE_CONFIG.tolerances,
+                step_fractions=BASELINE_CONFIG.step_fractions,
+            )
+            summary = validator.collect_metrics(perf_record)
+            # the last chunk's record supplies memory peaks, not the session's e2e
+            summary.e2e_ms = e2e_ms
+
+        summary.load_time_ms = ctx.load_time_ms
+        self._record_performance_result(case, summary, request_index)
+        self._print_performance_log(case, summary, scenario)
+        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+            _PENDING_BASELINE_DUMPS.setdefault(case.id, []).append(summary)
+            return
+
+        if scenario is None:
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
+        if not check_memory:
+            validator = PerformanceValidator(
+                scenario=scenario,
+                tolerances=BASELINE_CONFIG.tolerances,
+                step_fractions=BASELINE_CONFIG.step_fractions,
+            )
+        validator.validate_e2e(summary)
+        validator.validate_load(summary)
         validate_realtime_perf_stats(
             case.id,
             chunk_stats,
@@ -484,48 +579,7 @@ class DiffusionServerBase:
                 case.sampling_params.realtime_perf_ignore_initial_chunks
             ),
         )
-        if not case.run_perf_check or not current_platform.is_cuda():
-            return
-
-        request_id = next(
-            (stat.request_id for stat in reversed(chunk_stats) if stat.request_id),
-            None,
-        )
-        if request_id is None:
-            pytest.fail(f"{case.id}: realtime chunk stats are missing request IDs")
-
-        perf_record = wait_for_req_perf_record(
-            request_id,
-            ctx.perf_log_path,
-            timeout=30,
-        )
-        if perf_record is None:
-            pytest.fail(f"{case.id}: realtime request performance record is missing")
-
-        scenario = BASELINE_CONFIG.scenarios.get(case.id)
-        if scenario is None:
-            pytest.fail(
-                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
-            )
-
-        validator = PerformanceValidator(
-            scenario=scenario,
-            tolerances=BASELINE_CONFIG.tolerances,
-            step_fractions=BASELINE_CONFIG.step_fractions,
-        )
-        summary = validator.collect_metrics(perf_record)
-        self._print_performance_log(case, summary, scenario)
-        self._record_performance_result(case, summary, request_index)
-
-        if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
-            logger.info(
-                "%s realtime peak VRAM baseline: load=%.0fMiB, runtime=%.0fMiB, "
-                "warmup=%.0fMiB",
-                case.id,
-                summary.load_peak_vram_mb,
-                summary.runtime_peak_vram_mb,
-                summary.warmup_peak_vram_mb,
-            )
+        if not check_memory:
             return
 
         if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
@@ -555,12 +609,28 @@ class DiffusionServerBase:
         summary: PerformanceSummary,
         request_index: int = 1,
     ) -> None:
+        if not isinstance(summary.e2e_ms, (int, float)) or not (
+            math.isfinite(summary.e2e_ms) and summary.e2e_ms > 0
+        ):
+            raise PerformanceValidationError(
+                f"[performance] {case.id}: E2E duration missing or invalid: "
+                f"{summary.e2e_ms!r}"
+            )
+        if summary.load_time_ms is None or not (
+            math.isfinite(summary.load_time_ms) and summary.load_time_ms > 0
+        ):
+            raise PerformanceValidationError(
+                f"[performance] {case.id}: Load duration missing or invalid: "
+                f"{summary.load_time_ms!r}"
+            )
         result = {
             "class_name": type(self).__name__,
             "test_name": case.id,
             "request_index": request_index,
             "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
+            "load_time_ms": summary.load_time_ms,
+            "load_inclusive_e2e_ms": summary.load_time_ms + summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
             "load_peak_vram_mb": summary.load_peak_vram_mb,
@@ -595,6 +665,8 @@ class DiffusionServerBase:
             f"--- Performance Log: {case.id} ---",
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
+                f"load={summary.load_time_ms:.2f}ms, "
+                f"load_inclusive_e2e={summary.load_time_ms + summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
                 f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
@@ -662,6 +734,7 @@ class DiffusionServerBase:
             "stages_ms": stages_formatted,
             "denoise_step_ms": denoise_steps_formatted,
             "expected_e2e_ms": round(max(s.e2e_ms for s in summaries), 2),
+            "expected_load_ms": round(max(s.load_time_ms for s in summaries), 2),
             "expected_avg_denoise_ms": round(
                 max(s.avg_denoise_ms for s in summaries), 2
             ),
@@ -699,6 +772,13 @@ class DiffusionServerBase:
 
         if measured_full_time is not None:
             baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
+
+        # a per-case timing tolerance is a deliberate property of the case, not a
+        # measurement: carry it into the suggested entry so a baseline refresh
+        # cannot silently drop it
+        existing = BASELINE_CONFIG.scenarios.get(case.id)
+        if existing is not None and existing.timing_tolerance is not None:
+            baseline["timing_tolerance"] = existing.timing_tolerance
 
         # Video-specific metrics
         if case.server_args.modality == "video":
@@ -1405,6 +1485,85 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
 
+    def _key_frames(self, case: DiffusionTestCase, content: bytes) -> list[np.ndarray]:
+        if case.server_args.modality == "video":
+            return extract_key_frames_from_video(content)
+        return [image_bytes_to_numpy(content)]
+
+    def _generate_key_frames(
+        self, ctx: ServerContext, case: DiffusionTestCase, **extras: Any
+    ) -> list[np.ndarray]:
+        """Key frames of the case's request with ``extras`` overriding its own."""
+        generate_fn = get_generate_fn(
+            model_path=case.server_args.model_path,
+            modality=case.server_args.modality,
+            sampling_params=replace(
+                case.sampling_params,
+                extras={**case.sampling_params.extras, **extras},
+            ),
+        )
+        _, content = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, self._client(ctx)
+        )
+        return self._key_frames(case, content)
+
+    def _test_output_references(
+        self, ctx: ServerContext, case: DiffusionTestCase, content: bytes
+    ) -> None:
+        """Compare the case's output with other requests to the same server.
+
+        Same prompt and seed, so a reference differs from the case's request
+        only in its quality level, or in the LoRA adapter being off.
+        """
+        compared = [("output", self._key_frames(case, content))]
+        failures = []
+        if case.reference_quality is not None:
+            label = f"quality={case.reference_quality}"
+            reference = self._generate_key_frames(
+                ctx, case, quality=case.reference_quality
+            )
+            mean_abs_diffs, psnrs = _key_frame_distances(
+                case.id, f"output vs {label}", compared[0][1], reference
+            )
+            if (
+                max(mean_abs_diffs) > OUTPUT_MATCH_MAX_MEAN_ABS_DIFF
+                or min(psnrs) < OUTPUT_MATCH_MIN_PSNR
+            ):
+                failures.append(
+                    f"output does not match {label}: "
+                    f"max mean_abs_diff={max(mean_abs_diffs):.3f} "
+                    f"(<= {OUTPUT_MATCH_MAX_MEAN_ABS_DIFF}), "
+                    f"min psnr={min(psnrs):.2f} (>= {OUTPUT_MATCH_MIN_PSNR})"
+                )
+            compared.append((label, reference))
+
+        if case.run_lora_effect_check:
+            base_url = f"http://localhost:{ctx.port}/v1"
+            # unmerge turns the adapter off in every merge mode; merge restores it
+            resp = requests.post(
+                f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
+            )
+            assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
+            try:
+                without_lora = self._generate_key_frames(ctx, case)
+            finally:
+                resp = requests.post(
+                    f"{base_url}/merge_lora_weights",
+                    timeout=_CONTROL_API_TIMEOUT_SECS,
+                )
+            assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
+            for label, frames in compared:
+                mean_abs_diffs, _ = _key_frame_distances(
+                    case.id, f"{label} vs LoRA off", frames, without_lora
+                )
+                if min(mean_abs_diffs) < OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF:
+                    failures.append(
+                        f"{label} barely changes with the LoRA off: "
+                        f"min mean_abs_diff={min(mean_abs_diffs):.3f} "
+                        f"(>= {OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF})"
+                    )
+        assert not failures, "\n".join(failures)
+
     def _test_v1_models_endpoint(
         self, ctx: ServerContext, case: DiffusionTestCase
     ) -> None:
@@ -1430,8 +1589,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         assert model["object"] == "model", (
             f"Expected object='model', got {model.get('object')}"
         )
-        assert model["id"] == case.server_args.model_path, (
-            f"Model ID mismatch: expected {case.server_args.model_path}, got {model['id']}"
+        expected_model_id = case.expected_model_id or case.server_args.model_path
+        assert model["id"] == expected_model_id, (
+            f"Model ID mismatch: expected {expected_model_id}, got {model['id']}"
         )
 
         # Verify extended diffusion-specific fields
@@ -1566,6 +1726,42 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             self._test_dynamic_lora_loading(diffusion_server, case)
 
         failures = []
+        if case.lead_sampling_params is not None:
+            label = "lead request"
+            _print_case_log_separator(case.id, f"BEGIN {label}")
+            try:
+                self._test_lead_request(case, diffusion_server)
+            except pytest.skip.Exception as exc:
+                failures.append(f"[{label}] Required request skipped: {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            except (Exception, pytest.fail.Exception) as exc:
+                failures.append(f"[{label}] {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            else:
+                _print_case_log_separator(case.id, f"PASSED {label}")
+
+        for warmup_index in range(case.perf_warmup_requests):
+            label = f"request warmup {warmup_index + 1}/{case.perf_warmup_requests}"
+            _print_case_log_separator(case.id, f"BEGIN {label}")
+            generate_fn = get_generate_fn(
+                model_path=case.server_args.model_path,
+                modality=case.server_args.modality,
+                sampling_params=case.sampling_params,
+            )
+            record, _ = self.run_and_collect(
+                diffusion_server, case.id, generate_fn, collect_perf=True
+            )
+            if record is None or not (
+                math.isfinite(record.total_duration_ms) and record.total_duration_ms > 0
+            ):
+                raise PerformanceValidationError(
+                    f"[performance] {case.id}: {label} E2E duration missing or invalid"
+                )
+            print(
+                f"[server-test] {case.id}: {label} e2e={record.total_duration_ms:.4f}ms"
+            )
+            _print_case_log_separator(case.id, f"END {label}")
+
         for request_index in range(1, case.perf_repeat_requests + 1):
             label = f"request {request_index}/{case.perf_repeat_requests}"
             _print_case_log_separator(case.id, f"BEGIN {label}")
@@ -1578,6 +1774,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                             str(Path(artifact_dir) / f"request-{request_index}"),
                         )
                     self._test_diffusion_request(case, diffusion_server, request_index)
+            except PerformanceValidationError as exc:
+                _print_case_log_separator(case.id, f"FAILED {label}")
+                raise PerformanceValidationError(f"[{label}] {exc}") from exc
             except pytest.skip.Exception as exc:
                 if request_index == 1:
                     raise
@@ -1592,6 +1791,26 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         if failures:
             pytest.fail("\n\n".join(failures), pytrace=False)
+
+    def _test_lead_request(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ) -> None:
+        """Send the lead request; check it against its own golden."""
+        lead = case.lead_case()
+        generate_fn = get_generate_fn(
+            model_path=lead.server_args.model_path,
+            modality=lead.server_args.modality,
+            sampling_params=lead.sampling_params,
+        )
+        _, content = self.run_and_collect(
+            diffusion_server, lead.id, generate_fn, collect_perf=False
+        )
+        if os.environ.get("SGLANG_GEN_GT", "0") == "1":
+            self._save_gt_output(lead, content)
+        elif lead.run_consistency_check:
+            self._validate_consistency(lead, content)
 
     def _test_diffusion_request(
         self,
@@ -1627,6 +1846,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
+                if name == "performance" and isinstance(
+                    exc, (AssertionError, pytest.fail.Exception)
+                ):
+                    raise PerformanceValidationError(f"[performance] {exc}") from exc
                 failures.append((name, str(exc)))
 
         if is_realtime_case:
@@ -1643,7 +1866,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         else:
             run_case_check(
                 "performance",
-                lambda: self._validate_and_record(case, perf_record, request_index),
+                lambda: self._validate_and_record(
+                    diffusion_server, case, perf_record, request_index
+                ),
             )
 
         if case.server_args.custom_validator == "mesh":
@@ -1683,6 +1908,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     "audio consistency",
                     lambda: self._validate_audio_consistency(case, content),
                 )
+
+        # before the LoRA checks below, which change the server's adapter state
+        if case.reference_quality is not None or case.run_lora_effect_check:
+            run_case_check(
+                "output references",
+                lambda: self._test_output_references(diffusion_server, case, content),
+            )
 
         if case.run_lora_basic_api_check:
             run_case_check(

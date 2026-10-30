@@ -10,6 +10,7 @@ import random
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Dict
 from urllib.parse import urlparse
@@ -20,18 +21,16 @@ from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=191, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=100, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -103,6 +102,7 @@ class HiCacheStorageBaseMixin:
 
         additional_server_args, env_vars = cls._get_additional_server_args_and_env()
         env_vars["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+        env_vars["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         server_args = cls._get_base_server_args()
         if additional_server_args:
             server_args.update(additional_server_args)
@@ -225,33 +225,6 @@ class HiCacheStorageBaseMixin:
         )
 
 
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHiCacheStoragePageFirstLayout(HiCacheStorageBaseMixin, CustomTestCase):
-    """Page first layout tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--hicache-mem-layout": "page_first"}
-        return server_args, {}
-
-
-@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
-class TestHiCacheStorageMLA(HiCacheStorageBaseMixin, CustomTestCase):
-    """MLA Model tests for HiCache Storage functionality"""
-
-    @classmethod
-    def _get_model_name(cls):
-        """Use MLA model for testing"""
-        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {"--tp-size": 2}
-        return server_args, {}
-
-
 class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCase):
     """Page first direct tests for HiCache Storage functionality"""
 
@@ -266,23 +239,72 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
         return server_args, {}
 
 
-class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
-    """Accuracy tests for HiCache Storage functionality"""
+class TestHiCacheStorageRandomDelay(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random storage delays must change only latency, never hit semantics;
+    the rank consensus checker (enabled by the mixin) fails the server if the
+    skewed storage IO timing causes cross-rank divergence."""
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {
-            "--tp-size": 2,
-            "--hicache-ratio": 1.5,
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY": "0.1",
         }
+        return server_args, env_vars
 
-        return server_args, {}
+    def test_delayed_storage_hits_concurrent_requests(self):
+        base_prompt = self.gen_prompt(768)
+        self.send_request(base_prompt, max_tokens=8)
+        self.trigger_offloading_and_flush()
 
-    @unittest.skipIf(is_in_ci(), "To skip flaky test")
-    def test_eval_accuracy(self):
-        """Test eval accuracy with cache persistence across cache flushes"""
-        run_eval_accuracy_test(self)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            responses = list(
+                executor.map(
+                    lambda _: self.send_request(base_prompt, max_tokens=8), range(4)
+                )
+            )
+
+        for response in responses:
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+            self.assertGreater(
+                self.get_cached_tokens(response),
+                700,
+                "Delayed storage IO must not turn a stored prefix into a miss",
+            )
+
+
+class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):
+    """Random backend failures must degrade to plain cache misses: every
+    request still completes, and the server stays healthy; the rank
+    consensus checker (enabled by the mixin) fails the server if per-rank
+    failure draws cause cross-rank divergence."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--tp-size": 2}
+        env_vars = {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE": "0.05",
+        }
+        return server_args, env_vars
+
+    # The inherited test requires a storage hit, but an injected failure turns
+    # the prefetch into a miss; test_random_failures_degrade_to_cache_misses
+    # covers this configuration instead.
+    test_basic_backup_and_prefetch = None
+
+    def test_random_failures_degrade_to_cache_misses(self):
+        base_prompt = self.gen_prompt(768)
+        for _ in range(10):
+            self.send_request(base_prompt, max_tokens=8)
+            self.trigger_offloading_and_flush()
+
+            response = self.send_request(base_prompt, max_tokens=8)
+            self.assertEqual(response["meta_info"]["completion_tokens"], 8)
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
 
 
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):

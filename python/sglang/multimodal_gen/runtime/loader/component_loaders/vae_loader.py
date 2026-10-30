@@ -4,12 +4,12 @@ import os
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -46,10 +46,10 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
     resolve_decode_precision,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -113,16 +113,17 @@ def _backfill_ltx2_audio_vae_latent_stats(
         loaded["latents_std"] = loaded[std_key]
 
 
-def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
+def _convert_conv3d_weights_to_channels_last_3d(
+    module: nn.Module, prefix: str = ""
+) -> int:
     """
-    Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
+    Convert Conv3d weights whose module name starts with ``prefix`` to
+    channels_last_3d (NDHWC) memory format.
     Returns the number of Conv3d modules converted.
     """
-    if not hasattr(torch, "channels_last_3d"):
-        return 0
     num_converted = 0
-    for m in module.modules():
-        if isinstance(m, nn.Conv3d):
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Conv3d) and name.startswith(prefix):
             try:
                 m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
                 num_converted += 1
@@ -138,11 +139,14 @@ def _should_use_channels_last_3d(
     if component_type not in (
         "vae",
         "video_vae",
-    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
+    ) or not (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    ):
         return False
 
-    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
-    if override is not None and override.strip().lower() != "auto":
+    if _channels_last_3d_overridden():
         return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
 
     if server_args is None:
@@ -151,23 +155,66 @@ def _should_use_channels_last_3d(
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
-    if (
-        isinstance(pipeline_config, (WanT2V480PConfig, LTX2PipelineConfig))
-        and server_args.num_gpus == 1
-    ):
+    # Wan's spatial-parallel decode exchanges halos in either layout
+    if isinstance(pipeline_config, (WanT2V480PConfig, Cosmos3Config)):
+        return True
+    if isinstance(pipeline_config, LTX2PipelineConfig) and server_args.num_gpus == 1:
         return True
     return False
 
 
+def _channels_last_3d_overridden() -> bool:
+    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
+    return override is not None and override.strip().lower() != "auto"
+
+
+def _channels_last_3d_prefix(server_args: ServerArgs | None) -> str:
+    """Module-name prefix of the Conv3d weights to convert to channels_last_3d."""
+    # by default multi-GPU Wan / Cosmos3 convert only their decoder:
+    # channels_last_3d convs round differently, and the encode output seeds I2V
+    # sampling; an explicit override converts the whole VAE
+    if (
+        not _channels_last_3d_overridden()
+        and server_args is not None
+        and server_args.num_gpus > 1
+        and isinstance(server_args.pipeline_config, (WanT2V480PConfig, Cosmos3Config))
+    ):
+        return "decoder."
+    return ""
+
+
 def _decode_dtype_store_path(
-    component_model_path: str, component_name: str, dtype: torch.dtype
+    component_model_path: str, component_name: str, dtype: torch.dtype, vae=None
 ) -> str:
+    # The module layout is part of the key: two runtime versions that expose a
+    # different parameter set for the same checkpoint must not share a store.
+    layout = ""
+    if vae is not None:
+        layout = "|" + ",".join(
+            f"{name}:{tuple(tensor.shape)}" for name, tensor in vae.state_dict().items()
+        )
     key = hashlib.sha1(
-        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}".encode()
+        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}{layout}".encode()
     ).hexdigest()[:16]
     return os.path.join(
         envs.SGLANG_DIFFUSION_CACHE_ROOT, "decode_dtype_store", f"{key}.safetensors"
     )
+
+
+def _load_safetensors_file(path: str) -> dict:
+    """The VAE checkpoint itself: read-only where host copies are redundant."""
+    from sglang.multimodal_gen.runtime.loader.utils import (
+        _load_safetensors_file as _load,
+    )
+
+    return _load(path)
+
+
+def _load_store(path: str) -> dict:
+    """Map the store read-only where host copies are redundant (see loader.utils)."""
+    from sglang.multimodal_gen.runtime.loader.utils import _load_safetensors_file
+
+    return _load_safetensors_file(path)
 
 
 def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
@@ -196,10 +243,10 @@ def _rehome_cast_weights_to_file(
 
     Returns (weights held, file-backed?).
     """
-    path = _decode_dtype_store_path(component_model_path, component_name, dtype)
+    path = _decode_dtype_store_path(component_model_path, component_name, dtype, vae)
     try:
         if os.path.exists(path):
-            mapped = safetensors_load_file(path)
+            mapped = _load_store(path)
             if mapped and _assign_matching_store(vae, mapped, dtype):
                 return len(mapped), True
             raise ValueError("existing decode-dtype store does not match the module")
@@ -215,7 +262,7 @@ def _rehome_cast_weights_to_file(
         tmp = f"{path}.tmp.{os.getpid()}"
         safetensors_save_file({k: v.contiguous() for k, v in cast_state.items()}, tmp)
         os.replace(tmp, path)
-        mapped = safetensors_load_file(path)
+        mapped = _load_store(path)
         if set(mapped) != set(cast_state):
             raise ValueError("decode-dtype store does not match the cast weights")
         vae.load_state_dict(mapped, strict=False, assign=True)
@@ -598,7 +645,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
             if _should_use_channels_last_3d(server_args, component_type):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                n = _convert_conv3d_weights_to_channels_last_3d(
+                    vae, _channels_last_3d_prefix(server_args)
+                )
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
@@ -661,7 +710,9 @@ class VAELoader(WeightOverrideComponentLoader):
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                n = _convert_conv3d_weights_to_channels_last_3d(
+                    vae, _channels_last_3d_prefix(server_args)
+                )
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
@@ -671,7 +722,7 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(safetensors_load_file(sf_path))
+            loaded.update(_load_safetensors_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()
@@ -721,7 +772,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
         if _should_use_channels_last_3d(server_args, component_type):
-            n = _convert_conv3d_weights_to_channels_last_3d(vae)
+            n = _convert_conv3d_weights_to_channels_last_3d(
+                vae, _channels_last_3d_prefix(server_args)
+            )
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 

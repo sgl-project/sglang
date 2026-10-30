@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=575, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=662, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -27,7 +27,6 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
             "--json-model-override-args",
@@ -48,15 +47,14 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=20,
-            data_path=None,
-            num_questions=1400,
-            parallel=1400,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
+            eval_name="gsm8k",
+            num_examples=1400,
+            num_threads=1400,
+            max_tokens=512,
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
@@ -95,15 +93,14 @@ class TestDeepseekV32IndexFreq(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
-            num_shots=20,
-            data_path=None,
-            num_questions=1400,
-            parallel=1400,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
+            eval_name="gsm8k",
+            num_examples=1400,
+            num_threads=1400,
+            max_tokens=512,
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

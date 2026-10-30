@@ -1,13 +1,14 @@
 """Nothing under layers/attention may translate KV ids for itself.
 
-Ownership is exactly two places: `KVIndexTranslator` for READS and the
-ForwardBatch rebind (`rebind_write_loc`) for WRITES. Virtual and physical ids
-share a value range, so a backend that forgets a translate -- or does one
-twice -- reads the wrong rows and nothing crashes.
+Ownership is exactly one place: the iteration's `IterationIds`, built through
+`RunnerIds`, translates the WRITE window and the READ table once, and
+backends read the result. Virtual and physical ids share a value range, so a
+backend that forgets a translate -- or does one twice -- reads the wrong rows
+and nothing crashes.
 
 Deliberately out of scope: the allocator-internal implementations
 (`allocator/unified_*`, `unified_memory_pool`), which ARE the mechanism the
-translator calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
+runner_ids calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
 which stages for RDMA outside the forward path; and the STATIC SWA pool's
 legacy full->swa slot map, a different mapping kind with no virtual/physical
 ambiguity.
@@ -37,7 +38,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 # The attention package is a namespace package (no __init__), so anchor the
 # scan on a concrete module inside it.
@@ -116,8 +117,8 @@ class _Inner(AttentionBackend):
     """Stand-in for a wrapped backend, carrying only what the wrappers' __init__
     bodies read off their inners."""
 
-    def __init__(self, translator=None):
-        self.kv_index_translator = translator
+    def __init__(self, runner_ids=None):
+        self.runner_ids = runner_ids
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
         self.needs_cpu_seq_lens = False
@@ -129,25 +130,25 @@ class _InnerModelConfig:
 
 
 class _Runner:
-    """HybridAttnBackend takes its translator from the runner, not an inner."""
+    """HybridAttnBackend takes its `RunnerIds` from the runner, not an inner."""
 
-    def __init__(self, translator):
-        self.kv_index_translator = translator
+    def __init__(self, runner_ids):
+        self.runner_ids = runner_ids
         self.kv_cache_dtype = None
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
         self.model_config = _InnerModelConfig()
 
 
-def _build_wrappers(translator):
+def _build_wrappers(runner_ids):
     """One live instance per wrapper. Only the inner that MUST supply the
-    translator carries it, so a wrapper copying off the linear / sparse / DSA
+    runner_ids carries it, so a wrapper copying off the linear / sparse / DSA
     side ends up with None and fails."""
-    carrier = _Inner(translator)
+    carrier = _Inner(runner_ids)
     # HybridAttnBackend reads the spec bag in __init__; the bag is unpublished
     # outside a launched server.
     with get_context().override_server_args(speculative_attention_mode="decode"):
-        hybrid = HybridAttnBackend(_Runner(translator), _Inner(), _Inner())
+        hybrid = HybridAttnBackend(_Runner(runner_ids), _Inner(), _Inner())
     return {
         "DotsSWAMLAAttnBackend": DotsSWAMLAAttnBackend(carrier),
         "DotsHybridAttnBackend": DotsHybridAttnBackend(_Inner(), carrier),
@@ -162,23 +163,23 @@ def _build_wrappers(translator):
 
 
 class TestWrapperBackendsForwardTranslator(CustomTestCase):
-    """Bug regression: `AttentionBackend.kv_index_translator` defaults to None,
+    """Bug regression: `AttentionBackend.runner_ids` defaults to None,
     so a wrapper that does not re-expose its inner's copy makes producers skip
-    the virtual->kernel-facing translation instead of failing."""
+    the virtual->physical translation instead of failing."""
 
     def test_every_wrapper_is_constructed_here(self):
         self.assertEqual(
             _derive_wrapper_names(),
             set(_build_wrappers(object())),
             "a wrapper backend has no instance in _build_wrappers; add one so "
-            "its translator forwarding is checked",
+            "its `RunnerIds` forwarding is checked",
         )
 
     def test_wrappers_forward_the_translator(self):
-        translator = object()
-        for name, wrapper in _build_wrappers(translator).items():
+        runner_ids = object()
+        for name, wrapper in _build_wrappers(runner_ids).items():
             with self.subTest(wrapper=name):
-                self.assertIs(wrapper.kv_index_translator, translator)
+                self.assertIs(wrapper.runner_ids, runner_ids)
 
 
 if __name__ == "__main__":
