@@ -1858,9 +1858,9 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
         if info is None:
             mod_info[mod] = [start, end, shape[0], shape[1]]
         else:
-            assert (
-                info[3] == shape[1]
-            ), f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            assert info[3] == shape[1], (
+                f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            )
             assert info[1] == start, f"non-contiguous parts in modality {mod}"
             info[1] = end
             info[2] += shape[0]
