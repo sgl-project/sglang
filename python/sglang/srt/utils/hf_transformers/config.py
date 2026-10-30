@@ -158,10 +158,13 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
-    config_dict, _ = PretrainedConfig.get_config_dict(
-        model, revision=revision, **kwargs
-    )
+def _try_load_longcat_config(
+    model, revision: Optional[str], config_dict=None, **kwargs
+):
+    if config_dict is None:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
     architectures = config_dict.get("architectures") or []
     if not any(arch in _LONGCAT_ARCHS for arch in architectures):
         return None
@@ -221,7 +224,22 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+        if config_dict.get(
+            "speculators_model_type"
+        ) == "dspine" or "DSpineDraftModel" in (config_dict.get("architectures") or []):
+            from transformers import Qwen3Config
+
+            from sglang.srt.configs.dspine import normalize_dspine_config
+
+            config = Qwen3Config(**normalize_dspine_config(config_dict))
+            config._name_or_path = str(model)
+            return config
+        config = _try_load_longcat_config(
+            model, revision, config_dict=config_dict, **kwargs
+        )
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:

@@ -109,6 +109,13 @@ def _resolve_speculative_algorithm_alias(
             "not supported for this draft architecture."
         )
 
+    if speculative_algorithm == "DSPINE":
+        if not speculative_draft_model_path or "DSpineDraftModel" not in (
+            getattr(cfg, "architectures", None) or []
+        ):
+            raise ValueError("DSPINE requires a DSpineDraftModel checkpoint")
+        return "DFLASH"
+
     if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
         if is_gemma4_draft:
             logger.info(

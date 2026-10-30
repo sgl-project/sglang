@@ -687,6 +687,56 @@ Both keys default to `0`, so a checkpoint whose config lost them builds no convo
 
 ---
 
+## DSpine decoding
+
+[DSpine](https://github.com/Tencent/DSpine) injects each position's predicted
+predecessor feature between draft layers, then refines the last write for each
+candidate pair. SGLang loads native and speculators-format `DSpineDraftModel`
+checkpoints directly; the external `sglang-dspine` plugin is not required.
+
+`DSPINE` selects the DFlash runtime with the DSpine model and refinement head.
+The scheduler, context KV cache, overlap execution, graph sampler, and rejection
+sampling remain on the existing DFlash path. Sampled proposals publish their
+realized conditional probabilities to verification, including mixed greedy and
+sampled batches.
+
+The initial implementation supports NVIDIA CUDA on Linux, Qwen3 draft
+backbones, TP=DP=PP=1, and a complete unquantized BF16/FP32 target output head.
+Draft quantization, reduced vocabularies, LoRA, and disaggregated serving are
+rejected. The trained block size must be used in full; unlike vLLM's
+`num_speculative_tokens`, SGLang's `speculative_num_draft_tokens` includes the
+anchor row. The published block-16 checkpoint therefore uses **16**, not 15.
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --speculative-algorithm DSPINE \
+  --speculative-draft-model-path tencent/Qwen3-8B-DSpine-b16 \
+  --speculative-num-draft-tokens 16 \
+  --tp-size 1 --dtype bfloat16 \
+  --attention-backend flashinfer --page-size 1 \
+  --mem-fraction-static 0.65 --context-length 8192 \
+  --max-running-requests 32
+```
+
+The bridge uses fused CUDA kernels on BF16 inputs and a Torch reference path
+otherwise. Final refinement keeps the sender states implicit in rank space;
+its FP32 weights and Gram matrix are prepared once before graph capture.
+Same-shape draft weight reloads refresh these buffers in place.
+
+To validate a deployment, run the CPU numerical/configuration tests and the
+CUDA bridge and real-weight tests:
+
+```bash
+python -m pytest test/registered/unit/spec/test_dspine.py
+python -m pytest test/registered/spec/dspine/
+```
+
+The real-weight test compares target-only greedy token IDs with eager and
+graph/overlap decoding, changes batch sizes across rounds, and checks mixed
+sampling and acceptance counters. Throughput and acceptance baselines must be
+measured on the deployment GPU; no unmeasured speedup is assumed.
+
 ## Standalone Speculative Decoding (Small Draft Model)
 
 Besides EAGLE/MTP, SGLang also supports **token-level speculative decoding** using a smaller **draft model**. Enable it with `--speculative-algorithm STANDALONE` and provide a draft model via `--speculative-draft-model-path`.
