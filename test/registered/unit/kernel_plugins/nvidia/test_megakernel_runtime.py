@@ -153,6 +153,11 @@ class TestMegakernelRuntime(CustomTestCase):
                     contexts.append(context)
                     return SimpleNamespace(
                         widths=context.widths,
+                        draft_sampler=None,
+                        draft_loop=None,
+                        draft_extend=None,
+                        begin_draft_round=None,
+                        graph_variants=None,
                         summary=lambda: "uniform verify",
                         plan=lambda ids, fb: registry.Step(
                             "target_verify", ids.numel()
@@ -287,6 +292,10 @@ class TestMegakernelRuntime(CustomTestCase):
         zero = SimpleNamespace(
             widths=(),
             draft_sampler=print,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
             summary=lambda: "draft sampler",
         )
         spec = replace(
@@ -396,8 +405,12 @@ class TestMegakernelRuntime(CustomTestCase):
         the batch sizes that capture its variants are those rows over the width."""
         labels = SimpleNamespace(capture_labels=("short", "long"))
         lm = Lm()
-        lm.__dict__["_megakernel"] = SimpleNamespace(
-            widths=(7, 14), graph_variants={"target_verify": labels}
+        lm.__dict__["_megakernel"] = binding._InstalledMegakernel(
+            built=SimpleNamespace(
+                widths=(7, 14), graph_variants={"target_verify": labels}
+            ),
+            binding=None,
+            prepare=None,
         )
         self.assertEqual(
             binding.megakernel_verify_variants(
