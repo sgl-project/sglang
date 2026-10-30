@@ -300,7 +300,9 @@ def _muse_verify_attention(
     ):
         if ("fly", num_seqs) not in _muse_verify_v2_logged:
             _muse_verify_v2_logged.add(("fly", num_seqs))
-            logger.info("Muse verify FlyDSL full layers: num_seqs=%d mode=exact", num_seqs)
+            logger.info(
+                "Muse verify FlyDSL full layers: num_seqs=%d mode=exact", num_seqs
+            )
         _defer_or_merged(
             gqa_verify_flydsl(
                 q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,

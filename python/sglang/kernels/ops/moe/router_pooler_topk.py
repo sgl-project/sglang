@@ -118,9 +118,16 @@ def _route_preproject_epilogue(
         tl.store(Y + row * DN + n, result, n // (DN // REPS) == replica)
         if QUANT:
             # The compact A4 experts' per-row MXFP4 input, from the BF16 row as stored.
-            q, qs = _mxfp4_quant_op(result.to(tl.bfloat16).to(tl.float32)[None, :], DN, 1, 32)
-            tl.store(Q + row * (DN // 2) + tl.arange(0, DN // 2), tl.reshape(q, (DN // 2,)))
-            tl.store(QS + row * (DN // 32) + tl.arange(0, DN // 32), tl.reshape(qs, (DN // 32,)))
+            q, qs = _mxfp4_quant_op(
+                result.to(tl.bfloat16).to(tl.float32)[None, :], DN, 1, 32
+            )
+            tl.store(
+                Q + row * (DN // 2) + tl.arange(0, DN // 2), tl.reshape(q, (DN // 2,))
+            )
+            tl.store(
+                QS + row * (DN // 32) + tl.arange(0, DN // 32),
+                tl.reshape(qs, (DN // 32,)),
+            )
 
 
 @triton.jit
@@ -179,7 +186,9 @@ def _joint_epilogue(
         tl.store(Y + row * 4096 + dn, result)
         if QUANT:
             # The compact A4 experts' per-row MXFP4 input, from the BF16 row as stored.
-            q, qs = _mxfp4_quant_op(result.to(tl.bfloat16).to(tl.float32)[None, :], 4096, 1, 32)
+            q, qs = _mxfp4_quant_op(
+                result.to(tl.bfloat16).to(tl.float32)[None, :], 4096, 1, 32
+            )
             tl.store(Q + row * 2048 + tl.arange(0, 2048), tl.reshape(q, (2048,)))
             tl.store(QS + row * 128 + tl.arange(0, 128), tl.reshape(qs, (128,)))
 
@@ -353,7 +362,9 @@ def joint_router_pooler_applies(x, packed) -> bool:
     )
 
 
-def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps, quant_out=None):
+def joint_router_pooler_topk(
+    x, packed, bias, norm, multiplier, scale, eps, quant_out=None
+):
     """Same outputs as ``router_pooler_topk`` from the packed joint weight (``joint_router_pooler_applies`` rows).
     ``quant_out`` as in ``router_pooler_topk``."""
     m, k = x.shape
@@ -379,7 +390,9 @@ def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps, quan
 JOINT_EPILOGUE_WARPS = 4
 
 
-def _joint_finish(partial, sk, m, bias, norm, multiplier, scale, eps, quant_out, fp8_scales=None):
+def _joint_finish(
+    partial, sk, m, bias, norm, multiplier, scale, eps, quant_out, fp8_scales=None
+):
     """The shared epilogue over the joint partials ``[SK, M, 4608]``; ``fp8_scales`` = (row activation scales,
     pooler channel scales) when the pooler tiles came from the FP8 GEMM."""
     assert partial.dtype == torch.float32 and sk & (sk - 1) == 0

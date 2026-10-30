@@ -2076,7 +2076,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     commit_lens,
                     cache_k,
                     cache_v,
-                    attn.k_scale if attn.k_scale is not None else 1.0,  # the fused fp8 write
+                    attn.k_scale
+                    if attn.k_scale is not None
+                    else 1.0,  # the fused fp8 write
                     attn.v_scale if attn.v_scale is not None else 1.0,
                 )
             else:

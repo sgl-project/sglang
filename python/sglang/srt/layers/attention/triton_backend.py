@@ -1787,32 +1787,29 @@ class TritonAttnBackend(AttentionBackend):
         # used to copy them twice per layer).
         if try_verify or self.dllm_attention is None:
             k_contig, v_contig = k.contiguous(), v.contiguous()
-        if (
-            try_verify
-            and verify_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_contig,
-                v_contig,
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                self.forward_metadata.qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.forward_metadata.custom_mask,
-                causal,
-                self.forward_metadata.mask_indptr,
-                self.forward_metadata.max_extend_len,
-                k_descale,
-                v_descale,
-                layer.scaling,
-                logit_cap=logits_soft_cap,
-                sliding_window_size=sliding_window_size,
-                sinks=sinks,
-                window_kv_offsets=window_kv_offsets,
-                xai_temperature_len=layer.xai_temperature_len,
-                max_bs=self.req_to_token_pool.size,
-            )
+        if try_verify and verify_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k_contig,
+            v_contig,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            self.forward_metadata.custom_mask,
+            causal,
+            self.forward_metadata.mask_indptr,
+            self.forward_metadata.max_extend_len,
+            k_descale,
+            v_descale,
+            layer.scaling,
+            logit_cap=logits_soft_cap,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            window_kv_offsets=window_kv_offsets,
+            xai_temperature_len=layer.xai_temperature_len,
+            max_bs=self.req_to_token_pool.size,
         ):
             return o
 

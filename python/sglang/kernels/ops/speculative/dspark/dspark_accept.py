@@ -23,9 +23,10 @@ try:
     )
 except ImportError:  # pragma: no cover - a tree without the split kernels
     chain_speculative_sampling_split = None
-_SPLIT_ACCEPT = chain_speculative_sampling_split is not None and __import__("os").environ.get(
-    "SGLANG_DSPARK_SPLIT_ACCEPT", "1"
-) == "1"
+_SPLIT_ACCEPT = (
+    chain_speculative_sampling_split is not None
+    and __import__("os").environ.get("SGLANG_DSPARK_SPLIT_ACCEPT", "1") == "1"
+)
 
 _is_npu = is_npu()
 
@@ -113,8 +114,16 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    plain = not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
-    if _SPLIT_ACCEPT and plain and not block_verification and not _is_npu and target_logits.is_cuda:
+    plain = (
+        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
+    )
+    if (
+        _SPLIT_ACCEPT
+        and plain
+        and not block_verification
+        and not _is_npu
+        and target_logits.is_cuda
+    ):
         # the vocabulary split over CTAs (one CTA a request walks 202k twice otherwise:
         # ~340 us a step at any batch size); the softmax is folded in
         (
@@ -136,7 +145,9 @@ def _accept_sampling_core(
             candidates=candidates,
             retrive_index=retrieve_index,
             uniform_samples=torch.rand((bs, gamma), dtype=torch.float32, device=device),
-            uniform_samples_for_final_sampling=torch.rand((bs,), dtype=torch.float32, device=device),
+            uniform_samples_for_final_sampling=torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            ),
             target_logits=target_logits,
             temperatures=sampling_info.temperatures,
             draft_probs=draft_probs,

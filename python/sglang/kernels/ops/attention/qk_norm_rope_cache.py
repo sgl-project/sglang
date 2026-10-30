@@ -260,7 +260,7 @@ def qkv_proj_qk_norm_rope_cache(
     assert x.is_contiguous() and weight.is_contiguous()
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
-    # Split-K 8 / block_n 32 were tuned at N 2304 (TP8); not retuned for N 4608.
+    # Split-K 8 / block_n 32 were tuned at N 2304 (TP8); not re-tuned for N 4608.
     partials = torch.empty((8, m, n), device=x.device, dtype=torch.float32)
     bf16_splitk_gemm_partials(x, weight, partials, block_n=32, block_k=128, split_k=8)
     qo = torch.empty((m, hq * d), device=x.device, dtype=torch.bfloat16)
