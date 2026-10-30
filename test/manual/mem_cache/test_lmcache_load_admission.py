@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 import requests
@@ -30,6 +31,7 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
         cls.tp_size = int(os.environ.get("SGLANG_TEST_LMCACHE_TP_SIZE", "1"))
         if torch.cuda.device_count() < cls.tp_size:
             raise unittest.SkipTest(f"Requires {cls.tp_size} GPUs")
+        cls.use_shm = os.environ.get("SGLANG_TEST_LMCACHE_SHM") == "1"
         cls.model = os.environ.get("SGLANG_TEST_LMCACHE_MODEL", "Qwen/Qwen3-0.6B")
         port = int(os.environ.get("SGLANG_TEST_LMCACHE_BASE_PORT", "31700"))
         cls.engine_port = port + 1
@@ -62,28 +64,33 @@ class TestLMCacheLoadAdmission(unittest.TestCase):
 
     @classmethod
     def _start_cache(cls):
-        cls.processes["cache"] = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "lmcache.cli.main",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(cls.cache_port),
-                "--http-port",
-                str(cls.http_port),
-                "--l1-size-gb",
-                "1",
-                "--chunk-size",
-                "256",
-                "--eviction-policy",
-                "LRU",
-                "--supported-transfer-mode",
-                "engine_driven",
+        command = [
+            sys.executable,
+            "-m",
+            "lmcache.cli.main",
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(cls.cache_port),
+            "--http-port",
+            str(cls.http_port),
+            "--l1-size-gb",
+            "1",
+            "--chunk-size",
+            "256",
+            "--eviction-policy",
+            "LRU",
+            "--supported-transfer-mode",
+            "engine_driven",
+        ]
+        if cls.use_shm:
+            command += [
+                "--no-l1-use-lazy",
+                "--shm-name",
+                f"sglang_kv_admission_{uuid.uuid4().hex}",
             ]
-        )
+        cls.processes["cache"] = subprocess.Popen(command)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if cls.processes["cache"].poll() is not None:

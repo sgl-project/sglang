@@ -89,3 +89,8 @@ The default is TP=1. The test owns its daemon and engine, uses engine-driven
 transfers, and requires LMCache in the active Python environment. Override
 `SGLANG_TEST_LMCACHE_MODEL` or `SGLANG_TEST_LMCACHE_BASE_PORT` (default `31700`)
 to select the model or the four consecutive ports used by the test.
+
+Set `SGLANG_TEST_LMCACHE_SHM=1` to run the same checks with a named, non-lazy
+SHM pool. The daemon and workers must share `/dev/shm`. Calibrate the threshold
+using the actual transfer path; inline and SHM can have different break-even
+points.
