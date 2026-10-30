@@ -35,6 +35,7 @@ def _manager(
     *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    manager.customized_info_enabled = False
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
@@ -124,7 +125,7 @@ class TestMooncakeAbortNotification(
             manager.decode_kv_args_table[session] = MagicMock(
                 requires_dcp_relayout=False,
                 dst_aux_ptrs=[0] * 8,
-                dst_aux_item_lens=[64] * 8,
+                dst_aux_item_lens=None,
             )
             manager.transfer_infos[ROOM][(DECODE_IP, DECODE_PORT + i)] = TransferInfo(
                 room=ROOM,

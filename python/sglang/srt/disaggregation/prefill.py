@@ -1631,6 +1631,7 @@ class SchedulerDisaggregationPrefillMixin:
             try:
                 self.disagg_metadata_buffers.set_buf(req)
             except CustomizedInfoError as exc:
+                # customized_info may be unserializable or exceed the transfer buffer.
                 req.customized_info = None
                 prepare_abort(
                     req, str(exc), status_code=HTTPStatus.INTERNAL_SERVER_ERROR

@@ -11,6 +11,7 @@ import sys
 import threading
 import unittest
 from collections import defaultdict
+from itertools import product
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -54,6 +55,7 @@ def _manager(manager_class=CommonKVManager):
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager.enable_staging = False
+    manager.customized_info_enabled = False
     return manager
 
 
@@ -248,7 +250,6 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 b"",
                 struct.pack("Q", 16),
-                struct.pack("Q", 64),
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -276,7 +277,6 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"1",
                 b"0",
                 struct.pack("<IIQ", 1, 8, 512),
-                struct.pack("Q", 64),
             ],
             "mori": [
                 b"MoriMsgGuard",
@@ -299,12 +299,16 @@ class TestReceiverControlMessages(CustomTestCase):
                 layer,
             ],
         }
-        for backend in self.backends:
-            with self.subTest(backend=backend):
+        for backend, enabled in product(self.backends, (False, True)):
+            with self.subTest(backend=backend, customized_info=enabled):
                 receiver, sent = self._make_receiver(backend)
+                receiver.kv_mgr.customized_info_enabled = enabled
+                expected_frames = expected[backend]
+                if enabled and backend != "mori":
+                    expected_frames = expected_frames + [struct.pack("Q", 64)]
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
-                    sent, [(port, expected[backend]) for port in (6000, 6001, 6002)]
+                    sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
                 )
                 if backend == "mori":
                     continue
@@ -315,14 +319,11 @@ class TestReceiverControlMessages(CustomTestCase):
                 else:
                     registration_type = MooncakeKVArgsRegisterInfo
                 info = registration_type.from_zmq(frames)
-                self.assertEqual(info.dst_aux_item_lens, [64])
+                self.assertEqual(info.dst_aux_item_lens, [64] if enabled else None)
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
-                self.assertIsNone(
-                    registration_type.from_zmq(frames[:-1]).dst_aux_item_lens
-                )
 
     def test_metadata_wire_is_preserved_for_all_peers(self):
         for backend in self.backends:

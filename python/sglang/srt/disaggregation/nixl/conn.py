@@ -1888,7 +1888,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
-                        assert dst_info.dst_aux_item_lens is not None
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
@@ -2734,7 +2733,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_name: str,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
-        dst_aux_item_lens: list[int],
+        dst_aux_item_lens: Optional[List[int]],
         dst_aux_index: int,
     ):
         self.validate_aux_buffers(dst_aux_ptrs, dst_aux_item_lens)
@@ -2743,6 +2742,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if dst_aux_item_lens is None:
+            dst_aux_item_lens = prefill_aux_item_lens
 
         # Stop at the shorter list; see check_peer_aux_buffer_count.
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
@@ -3493,7 +3494,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_item_len = 0
             dst_num_slots = 0
 
-        return [
+        message = [
             GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3519,10 +3520,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_size).encode("ascii"),
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
-            struct.pack(
-                f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
-            ),
         ]
+        if self.customized_info_enabled:
+            message.append(
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+            )
+        return message
 
     def build_receiver_metadata_message(
         self,

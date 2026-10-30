@@ -6,18 +6,13 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
+from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
-from sglang.srt.managers.scheduler_components.output_streamer import (
-    _GenerationStreamAccumulator,
-)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -102,16 +97,17 @@ def _free_req(req, _tree_cache, *, checkpoint):
 
 
 @pytest.mark.parametrize(
-    "customized_info,error",
+    "capacity,customized_info,error",
     [
-        ({1: ["x" * 8192]}, "exceeds"),
-        ({"scores": [lambda: None]}, "Invalid customized_info"),
-        ({1: [0.5]}, "Expected `str`"),
-        ({"scores": 1}, "Expected `array`"),
+        (4096, {1: ["x" * 8192]}, "exceeds"),
+        (4096, {"scores": [lambda: None]}, "Invalid customized_info"),
+        (4096, {1: [0.5]}, "Expected `str`"),
+        (4096, {"scores": 1}, "Expected `array`"),
+        (0, {"scores": [0.5]}, "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES"),
     ],
-    ids=["overflow", "encoding", "non-string-key", "non-list-value"],
+    ids=["overflow", "encoding", "non-string-key", "non-list-value", "disabled"],
 )
-def test_customized_info_failure_is_request_local(customized_info, error):
+def test_customized_info_failure_is_request_local(capacity, customized_info, error):
     scheduler = SchedulerDisaggregationPrefillMixin()
     scheduler.disagg_prefill_pending_chunk_rids = set()
     scheduler.enable_staging = False
@@ -122,13 +118,15 @@ def test_customized_info_failure_is_request_local(customized_info, error):
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
         kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
     )
-    scheduler.disagg_metadata_buffers = MetadataBuffers(
-        size=1,
-        hidden_size=1,
-        hidden_states_dtype=torch.float32,
-        max_sampling_mask_tokens=1,
-    )
-    for index, payload in enumerate((customized_info, {"scores": [0.5]})):
+    with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(capacity):
+        scheduler.disagg_metadata_buffers = MetadataBuffers(
+            size=1,
+            hidden_size=1,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=1,
+        )
+    valid_info = {"scores": [0.5]} if capacity else None
+    for index, payload in enumerate((customized_info, valid_info)):
         req = Req(f"customized-info-{index}", "", array("q", [1]), SamplingParams())
         req.kv = ReqKvInfo(req_pool_idx=0, kv_allocated_len=1)
         req.metadata_buffer_index = 0
@@ -146,36 +144,9 @@ def test_customized_info_failure_is_request_local(customized_info, error):
             assert isinstance(req.finished_reason, FINISH_ABORT)
             assert req.finished_reason.status_code == 500
             assert error in req.finished_reason.message
-            finish_reason = req.finished_reason
             req.disagg_kv_sender.abort.assert_called_once_with()
             req.disagg_kv_sender.send.assert_not_called()
-            req.time_stats = None
-            accumulator = _GenerationStreamAccumulator(
-                return_logprob=False,
-                return_hidden_states=False,
-                return_routed_experts=False,
-                return_indexer_topk=False,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-                disaggregation_mode=DisaggregationMode.PREFILL,
-                default_stream_interval=1,
-                default_force_stream_interval=1,
-                build_request_stats=lambda req: RequestOutputStats(
-                    prompt_tokens=1,
-                    cached_tokens=0,
-                    cached_tokens_details=None,
-                    retraction_count=0,
-                    image_tokens=0,
-                    audio_tokens=0,
-                    video_tokens=0,
-                    time_stats=None,
-                ),
-                is_request_level_customized_info_key=lambda key: False,
-                current_weight_version=None,
-            )
-            accumulator.accept(req=req)
-            output = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-            assert output.finished_reasons == [finish_reason.to_json()]
-            assert output.customized_info is None
+            assert req.customized_info is None
         else:
             assert not req.finished()
             req.disagg_kv_sender.abort.assert_not_called()

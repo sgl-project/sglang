@@ -145,6 +145,7 @@ class TestDisaggregationWire(unittest.TestCase):
             for outcome in ("mismatch", "cleared", "transport_failure"):
                 with self.subTest(layer_ids=layer_ids, outcome=outcome):
                     manager = object.__new__(MooncakeKVManager)
+                    manager.customized_info_enabled = False
                     manager.kv_args = SimpleNamespace(
                         kv_data_ptrs=[],
                         state_types=[StateType.SWA, StateType.DSA],
@@ -209,7 +210,7 @@ class TestDisaggregationWire(unittest.TestCase):
                                 dst_state_layer_ids=[layer_ids, layer_ids],
                                 dst_attn_tp_size=1,
                                 dst_aux_ptrs=[0x6000],
-                                dst_aux_item_lens=[8],
+                                dst_aux_item_lens=None,
                             )
                         )
                         queue.put(
@@ -633,12 +634,18 @@ class TestDisaggregationWire(unittest.TestCase):
                     ack.assert_called_once()
 
     def test_aux_buffer_validation_allows_decode_only_speculation(self):
-        """Non-spec prefill and EAGLE decode have different hidden-state strides."""
-        prefill = MetadataBuffers(1, 16, torch.float32, 0)
-        decode = MetadataBuffers(1, 128, torch.float16, 0)
+        config = get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        )
+        config.install()
+        self.addCleanup(config.restore)
+        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096):
+            prefill = MetadataBuffers(1, 16, torch.float32, 0)
+            decode = MetadataBuffers(1, 128, torch.float16, 0)
         src_ptrs, _, src_lens = prefill.get_buf_infos()
         dst_ptrs, _, dst_lens = decode.get_buf_infos()
         manager = object.__new__(CommonKVManager)
+        manager.customized_info_enabled = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
         )
@@ -663,9 +670,58 @@ class TestDisaggregationWire(unittest.TestCase):
                 ):
                     manager.validate_aux_buffers(peer_ptrs, peer_lens)
 
+    def test_aux_buffer_validation_preserves_optional_checksum_and_legacy_peers(self):
+        for prefill_enabled, decode_enabled in (
+            (False, False),
+            (True, True),
+            (False, True),
+            (True, False),
+        ):
+            for prefill_checksum in (False, True):
+                with (
+                    self.subTest(
+                        prefill=prefill_enabled,
+                        decode=decode_enabled,
+                        prefill_checksum=prefill_checksum,
+                    ),
+                    get_context().override_server_args(
+                        disaggregation_enable_kv_checksum=prefill_checksum
+                    ),
+                ):
+                    layouts = []
+                    for enabled, checksum in (
+                        (prefill_enabled, prefill_checksum),
+                        (decode_enabled, not prefill_checksum),
+                    ):
+                        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(
+                            4096 if enabled else 0
+                        ):
+                            layouts.append(
+                                MetadataBuffers(
+                                    1,
+                                    16,
+                                    torch.float32,
+                                    0,
+                                    kv_checksum_enabled=checksum,
+                                ).get_buf_infos()
+                            )
+                    (src_ptrs, _, src_lens), (dst_ptrs, _, dst_lens) = layouts
+                    manager = object.__new__(CommonKVManager)
+                    manager.customized_info_enabled = prefill_enabled
+                    manager.kv_args = SimpleNamespace(
+                        aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
+                    )
+                    peer_lens = dst_lens if decode_enabled else None
+                    if prefill_enabled == decode_enabled:
+                        manager.validate_aux_buffers(dst_ptrs, peer_lens)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "metadata buffer layout mismatch"
+                        ):
+                            manager.validate_aux_buffers(dst_ptrs, peer_lens)
+
     def test_mooncake_aux_transfer_uses_destination_row_stride(self):
         source = np.arange(192, dtype=np.uint8).reshape(3, 64)
-        destination = np.full((3, 128), 255, dtype=np.uint8)
         manager = object.__new__(MooncakeKVManager)
         manager.enable_custom_mem_pool = False
         manager.kv_args = SimpleNamespace(
@@ -679,17 +735,24 @@ class TestDisaggregationWire(unittest.TestCase):
 
         manager._transfer_data = copy_aux
         req = SimpleNamespace(mooncake_session_id="peer", dst_aux_index=1)
-        with patch.object(envs.SGLANG_MOONCAKE_SEND_AUX_TCP, "get", return_value=False):
-            self.assertEqual(
-                manager.send_aux(req, 2, [destination.ctypes.data], [128]), 0
-            )
+        for peer_lens, stride in ((None, 64), ([128], 128)):
+            with self.subTest(peer_lens=peer_lens):
+                destination = np.full((3, stride), 255, dtype=np.uint8)
+                with patch.object(
+                    envs.SGLANG_MOONCAKE_SEND_AUX_TCP, "get", return_value=False
+                ):
+                    self.assertEqual(
+                        manager.send_aux(req, 2, [destination.ctypes.data], peer_lens),
+                        0,
+                    )
 
-        expected = np.full_like(destination, 255)
-        expected[1, :64] = source[2]
-        np.testing.assert_array_equal(destination, expected)
+                expected = np.full_like(destination, 255)
+                expected[1, :64] = source[2]
+                np.testing.assert_array_equal(destination, expected)
 
     def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.customized_info_enabled = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=[0x1000] * 8,
             aux_item_lens=[64] * 6 + [4096, 64],
@@ -746,9 +809,12 @@ class TestDisaggregationWire(unittest.TestCase):
             for room in (21, 22)
         ]
 
-        manager.transfer_worker(
-            SimpleNamespace(get=Mock(side_effect=[*chunks, None])), None
-        )
+        with get_context().override_server_args(
+            disaggregation_enable_kv_checksum=False
+        ):
+            manager.transfer_worker(
+                SimpleNamespace(get=Mock(side_effect=[*chunks, None])), None
+            )
 
         self.assertEqual(manager.request_status[21], KVPoll.Failed)
         self.assertIn("metadata buffer layout mismatch", manager.failure_records[21])
@@ -1900,6 +1966,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096):
+            buffers = self._make_buffers()
         req = self._make_req(None)
         for value in (None, {}):
             with self.subTest(customized_info=value):
@@ -1908,6 +1976,44 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 req.customized_info = value
                 buffers.set_buf(req)
                 self.assertEqual(buffers.get_customized_info(0), value)
+
+    def test_customized_info_buffers_are_opt_in(self):
+        for capacity in (None, 0, 4096):
+            with (
+                self.subTest(capacity=capacity),
+                patch.dict(os.environ),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(False),
+            ):
+                envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.clear()
+                if capacity is not None:
+                    envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.set(capacity)
+                buffers = self._make_buffers()
+                ptrs, _, item_lens = buffers.get_buf_infos()
+                if capacity:
+                    self.assertEqual(item_lens[6:8], [4096, 64])
+                    self.assertEqual(buffers.output_customized_info.shape, (2, 4096))
+                    self.assertEqual(buffers.output_customized_info_len.shape, (2, 16))
+                else:
+                    self.assertIsNone(buffers.output_customized_info)
+                    self.assertIsNone(buffers.output_customized_info_len)
+                    self.assertEqual(
+                        ptrs[6:],
+                        [
+                            buf.data_ptr()
+                            for buf in (
+                                buffers.output_topk_p,
+                                buffers.output_topk_index,
+                                buffers.output_hidden_states,
+                                buffers.output_dsa_topk_indices,
+                                buffers.bootstrap_room,
+                            )
+                        ],
+                    )
+                    req = self._make_req(None)
+                    for value in (None, {}):
+                        req.customized_info = value
+                        buffers.set_buf(req)
+                        self.assertIsNone(buffers.get_customized_info(0))
 
     def test_customized_info_capacity_override_and_overflow(self):
         with patch.dict(os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES="8192"):
@@ -1921,7 +2027,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             buffers.set_buf(req)
 
     def test_customized_info_tensor_roundtrip(self):
-        buffers = self._make_buffers()
+        with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096):
+            buffers = self._make_buffers()
         req = self._make_req(None)
         tensor = torch.tensor([0.25, 0.5], dtype=torch.bfloat16, requires_grad=True)
         req.customized_info = {"tensor": [tensor]}
@@ -1931,7 +2038,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(restored.device.type, "cpu")
 
     def test_customized_info_capacity_rejects_invalid_values(self):
-        for capacity in ("0", "many"):
+        for capacity in ("-1", "many"):
             with (
                 self.subTest(capacity=capacity),
                 patch.dict(
@@ -2066,20 +2173,23 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
     def test_rebootstrap_commit_keeps_emitted_output(self):
         """A PD rebootstrap with output keeps its output ids and their sampling-mask
         rows; the prefill worker's fresh token and row are dropped."""
-        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+        with (
+            envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(4096),
+        ):
             buffers = MetadataBuffers(
                 size=1,
                 hidden_size=2,
                 hidden_states_dtype=torch.float32,
                 max_sampling_mask_tokens=4,
             )
-            buffers.set_buf(
-                self._make_req(
-                    None,
-                    sampling_mask=[7, 8, 9],
-                    sampling_logprobs=[-1.25, -1.5, -2.0],
-                )
+            prefill_req = self._make_req(
+                None,
+                sampling_mask=[7, 8, 9],
+                sampling_logprobs=[-1.25, -1.5, -2.0],
             )
+            prefill_req.customized_info = {"token_ids": [101]}
+            buffers.set_buf(prefill_req)
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.scheduler = SimpleNamespace(
                 kv_checksum_computer=None,
@@ -2101,6 +2211,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,
                 output_ids=[5, 6],
+                customized_info={"token_ids": [5, 6]},
                 return_logprob=False,
                 return_sampling_mask=True,
                 sampling_logprobs_mode="support",
@@ -2118,6 +2229,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
 
             self.assertEqual(req.output_ids, [5, 6])
+            self.assertEqual(req.customized_info, {"token_ids": [5, 6]})
             self.assertEqual(
                 req.sampling_mask_rows.take().to_lists(support_logprobs=True),
                 ([[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),

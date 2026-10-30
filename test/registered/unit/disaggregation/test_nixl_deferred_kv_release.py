@@ -37,6 +37,7 @@ def _manager(
     *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
 ) -> NixlKVManager:
     manager = NixlKVManager.__new__(NixlKVManager)
+    manager.customized_info_enabled = False
     manager.enable_deferred_decode_kv_release = enabled
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
@@ -184,7 +185,7 @@ class TestNixlAbortNotification(
                 dst_homogeneous_mem_kind="VRAM",
                 dst_kv_ptrs=[0x2000],
                 dst_aux_ptrs=[0x4000],
-                dst_aux_item_lens=[64],
+                dst_aux_item_lens=None,
                 dst_num_slots=None,
                 gpu_id=0,
             )

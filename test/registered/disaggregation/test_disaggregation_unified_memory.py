@@ -17,7 +17,10 @@ KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
 # Smallest in-tree GDN hybrid: MHA full attention + gated-delta-net linear
 # layers, i.e. the unified pool's MHA sub-pool rather than the MLA one.
 QWEN_GDN_MODEL = "Qwen/Qwen3.5-0.8B"
-SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
+SERVER_ENV = {
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0",
+    "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES": "4096",
+}
 
 # --attention-backend and --enable-deterministic-inference are deliberately
 # absent: bytes are backend-independent and both paths run identical shapes.
@@ -60,15 +63,13 @@ class TestUnifiedMemoryDisaggregation(PDLogprobParityMixin, PDDisaggregationServ
     ]
     extra_decode_args = extra_prefill_args
 
-    def generate(self, base_url):
-        meta_info = super().generate(base_url)
-        if self.process_decode is not None:
-            token_ids = [item[1] for item in meta_info["output_token_logprobs"]]
-            self.assertEqual(meta_info[CUSTOMIZED_INFO_FIELD], token_ids)
-            self.assertEqual(
-                meta_info[CUSTOMIZED_INFO_ARRAY_FIELD], [[token] for token in token_ids]
-            )
-        return meta_info
+    def _assert_logprob_parity(self, *, reference, actual, label):
+        super()._assert_logprob_parity(reference=reference, actual=actual, label=label)
+        token_ids = [item[1] for item in actual["output_token_logprobs"]]
+        self.assertEqual(actual[CUSTOMIZED_INFO_FIELD], token_ids, label)
+        self.assertEqual(
+            actual[CUSTOMIZED_INFO_ARRAY_FIELD], [[token] for token in token_ids], label
+        )
 
 
 class TestUnifiedMemoryDisaggregationChunkedPrefill(TestUnifiedMemoryDisaggregation):

@@ -92,6 +92,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def manager(self, ip, port):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.customized_info_enabled = False
         mgr.local_ip, mgr.rank_port = ip, port
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
@@ -612,7 +613,7 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.enable_deferred_decode_kv_release = True
         mgr.decode_kv_args_table = {
             "session": SimpleNamespace(
-                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=[]
+                requires_dcp_relayout=False, dst_aux_ptrs=[], dst_aux_item_lens=None
             )
         }
         mgr._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))

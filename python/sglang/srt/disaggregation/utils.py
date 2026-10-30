@@ -403,8 +403,6 @@ class CustomizedInfoError(ValueError):
 
 
 class MetadataBuffers:
-    # Positions of output_customized_info and output_customized_info_len in
-    # get_buf_infos; the PD layout check compares only these strides.
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
 
     def __init__(
@@ -430,9 +428,9 @@ class MetadataBuffers:
             if customized_info_capacity_env.is_set()
             else customized_info_capacity_env.get()
         )
-        if customized_info_capacity <= 0:
+        if customized_info_capacity < 0:
             raise ValueError(
-                f"{customized_info_capacity_env.name} must be positive "
+                f"{customized_info_capacity_env.name} must be non-negative "
                 f"(got {customized_info_capacity})"
             )
         bootstrap_room_dtype = torch.uint64
@@ -472,12 +470,15 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
-            self.output_customized_info = torch.zeros(
-                (size, customized_info_capacity), dtype=torch.uint8, device=device
-            )
-            self.output_customized_info_len = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
-            )
+            self.output_customized_info = None
+            self.output_customized_info_len = None
+            if customized_info_capacity:
+                self.output_customized_info = torch.zeros(
+                    (size, customized_info_capacity), dtype=torch.uint8, device=device
+                )
+                self.output_customized_info_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
             self.output_token_sampling_logprobs = None
@@ -573,10 +574,11 @@ class MetadataBuffers:
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
         bufs = [buf for buf in bufs if buf is not None]
-        assert bufs[self.CUSTOMIZED_INFO_SLOTS] == [
-            self.output_customized_info,
-            self.output_customized_info_len,
-        ]
+        if self.output_customized_info is not None:
+            assert bufs[self.CUSTOMIZED_INFO_SLOTS] == [
+                self.output_customized_info,
+                self.output_customized_info_len,
+            ]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
@@ -617,6 +619,8 @@ class MetadataBuffers:
         )
 
     def get_customized_info(self, idx: int) -> dict[str, list[object]] | None:
+        if self.output_customized_info is None:
+            return None
         length = int(self.output_customized_info_len[idx, 0].item())
         if not 0 <= length <= self.output_customized_info.shape[1]:
             raise ValueError(f"Invalid disaggregation customized_info length: {length}")
@@ -627,7 +631,15 @@ class MetadataBuffers:
             payload, type=dict[str, list[object]], ext_hook=ext_hook
         )
 
-    def set_buf(self, req: Req):
+    def _set_customized_info(self, req: Req):
+        if self.output_customized_info is None:
+            if req.customized_info:
+                raise CustomizedInfoError(
+                    "customized_info transfer is disabled. Set "
+                    "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES to the same positive "
+                    "capacity on both prefill and decode."
+                )
+            return
         try:
             payload = (
                 b""
@@ -651,7 +663,6 @@ class MetadataBuffers:
         idx = req.metadata_buffer_index
         if payload:
             try:
-                # Reject schema errors before they can abort the decode scheduler.
                 msgspec.msgpack.decode(
                     payload, type=dict[str, list[object]], ext_hook=ext_hook
                 )
@@ -662,6 +673,8 @@ class MetadataBuffers:
             )
         self.output_customized_info_len[idx, 0] = len(payload)
 
+    def set_buf(self, req: Req):
+        self._set_customized_info(req)
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
