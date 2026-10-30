@@ -2573,8 +2573,8 @@ class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):
     lora_id: Optional[str] = None
     # Replace a same-name adapter in place (same lora_id, served slot rewritten)
     # instead of rejecting the duplicate name; a fresh name loads as usual.
-    # Cached prefixes are keyed by lora_id, so the caller pauses and flushes
-    # the cache around the swap, as it does for end_weight_update.
+    # The caller coordinates generation and KV/prefix-cache invalidation around
+    # the swap; same-name path updates currently require PP=1.
     upsert: bool = False
 
     def to_ref(self) -> LoRARef:

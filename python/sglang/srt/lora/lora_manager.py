@@ -338,7 +338,7 @@ class LoRAManager:
             config = LoRAConfig(
                 lora_ref.lora_path, base_vocab_size=self.base_hf_config.vocab_size
             )
-            tensors = self._read_adapter_tensors(lora_ref.lora_path, config)
+            tensors = self._read_adapter_tensors(lora_ref.lora_path)
         except Exception as e:
             return self.create_lora_update_result(success=False, error_message=str(e))
         return self._load_lora_adapter_from_tensors(
@@ -349,12 +349,10 @@ class LoRAManager:
             upsert=True,
         )
 
-    def _read_adapter_tensors(
-        self, lora_path: str, config: LoRAConfig
-    ) -> Dict[str, torch.Tensor]:
+    def _read_adapter_tensors(self, lora_path: str) -> Dict[str, torch.Tensor]:
         loader = DefaultModelLoader(self.load_config)
         source = DefaultModelLoader.Source(
-            lora_path, revision=config.hf_config.get("revision"), fall_back_to_pt=True
+            lora_path, revision=None, fall_back_to_pt=True
         )
         return dict(loader._get_weights_iterator(source))
 
@@ -1131,6 +1129,12 @@ class LoRAManager:
                     self.embed_tokens_module,
                     self.lm_head_module,
                 )
+                # The pool owns invalidation during the install. Keep a completed
+                # write invalid until derived operands and metadata are committed.
+                self.memory_pool.invalid_uids.add(uid)
+                self._notify_lora_slots_updated(
+                    {self.memory_pool.uid_to_buffer_id[uid]}
+                )
             except Exception as e:
                 return self.create_lora_update_result(
                     success=False, error_message=str(e)
@@ -1156,6 +1160,7 @@ class LoRAManager:
                     self.embed_tokens_module,
                     self.lm_head_module,
                 )
+                self._notify_lora_slots_updated({buffer_id})
             except Exception as e:
                 # Roll back so the adapter keeps serving its previous weights
                 # instead of a torn half-old/half-new buffer.
@@ -1170,7 +1175,9 @@ class LoRAManager:
                         self.embed_tokens_module,
                         self.lm_head_module,
                     )
+                    self._notify_lora_slots_updated({buffer_id})
                 except Exception:
+                    self.memory_pool.invalid_uids.add(uid)
                     logger.exception(
                         f"Failed to restore previous weights for LoRA adapter "
                         f"{lora_ref.lora_name} (buffer slot {buffer_id}) after a "
@@ -1188,6 +1195,8 @@ class LoRAManager:
         # ref so the counter stays consistent with lora_refs.
         old_pinned = int(bool(old_ref.pinned)) if is_update else 0
         self.num_pinned_loras += int(bool(lora_ref.pinned)) - old_pinned
+        if getattr(self, "memory_pool", None) is not None:
+            self.memory_pool.invalid_uids.discard(uid)
 
         return self.create_lora_update_result(success=True)
 

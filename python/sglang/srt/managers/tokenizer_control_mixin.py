@@ -783,6 +783,13 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
+                # A fresh name uses ordinary load-failure cleanup; it has no
+                # readers whose weights could disagree across ranks.
+                obj.upsert = reused
+                if reused and get_parallel().pp_size > 1:
+                    raise ValueError(
+                        "LoRA path upsert is not supported with pipeline parallelism"
+                    )
                 rank_results = await self.update_lora_adapter_communicator(obj)
                 result = _merge_lora_update_results(rank_results)
                 if result.success:
