@@ -2262,6 +2262,7 @@ class ResponsesResponse(BaseModel):
 
     # OpenAI compatibility fields. not all are used at the moment.
     # Recommend checking https://platform.openai.com/docs/api-reference/responses
+    background: Optional[bool] = None
     error: Optional[dict] = None
     incomplete_details: Optional[dict] = None  # TODO(v) support this input
     instructions: Optional[str] = None
@@ -2386,6 +2387,7 @@ class ResponsesResponse(BaseModel):
                 else request.tools
             ),
             # fields for parity with v1/responses
+            background=request.background,
             error=None,
             incomplete_details=(
                 {"reason": "max_output_tokens"} if status == "incomplete" else None
