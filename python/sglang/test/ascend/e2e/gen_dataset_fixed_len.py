@@ -332,6 +332,72 @@ def generate_gsm8k_dataset(
             f.write("\n")
 
 
+def generate_gsm8k_shared_prefix_dataset(
+    model_path,
+    source_dataset_path,
+    test_dataset_path,
+    batch_size,
+    input_len,
+    output_file,
+):
+    """Generate a natural-text shared-prefix dataset from GSM8K.
+
+    bench_serving's generated-shared-prefix dataset builds system prompts
+    from random token ids, which the DSPARK draft cannot predict - the
+    acceptance length collapses to ~1.6 vs the dev-measured 3.9 on natural
+    text. This generator instead builds a byte-identical natural-text
+    prefix (one GSM8K question repeated to ~input_len tokens) shared by
+    every row, plus a short unique GSM8K question as the per-row suffix,
+    so radix-cache sharing stays near 100% while the draft sees real
+    language.
+
+    Output is a JSON array in the ShareGPT "conversations" layout that
+    bench_serving --dataset-name random consumes via
+    sample_random_requests.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    train_data = load_jsonl(source_dataset_path)
+    test_data = load_jsonl(test_dataset_path)
+    if batch_size > len(test_data):
+        multiplier = (batch_size // len(test_data)) + 1
+        test_data = (test_data * multiplier)[:batch_size]
+    else:
+        test_data = test_data[:batch_size]
+
+    # Shared prefix: repeat the first QA pair's tokens up to 99% of input_len.
+    prefix_text = format_qa(train_data[0])
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    target_prefix = int(input_len * 0.99)
+    repeat = (target_prefix // len(prefix_ids)) + 1
+    prefix_ids = (prefix_ids * repeat)[:target_prefix]
+    prefix_text = tokenizer.decode(prefix_ids)
+
+    output_data = []
+    for item in test_data:
+        question = item["question"]
+        answer = item["answer"]
+        full_text = (
+            f"{prefix_text}Question: {question}\n"
+            f"Let's think step by step\nAnswer:\n{answer}"
+        )
+        output_data.append(
+            {
+                "conversations": [
+                    {"from": "human", "value": full_text},
+                    {"from": "gpt", "value": "none"},
+                ]
+            }
+        )
+
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, ensure_ascii=False)
+    print(f"Shared-prefix GSM8K dataset saved to {output_file} ({len(output_data)} rows)")
+
+
 def generate_random_dataset(
     model_path,
     source_dataset_path,

@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     generate_gsm8k_dataset,
+    generate_gsm8k_shared_prefix_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
@@ -406,6 +407,27 @@ def run_bench_serving(
     logger.info(f"The metrics result file: {result_file}")
 
     write_pkg_info_to_file(result_file)
+
+    if dataset_name == "gsm8k-shared-prefix":
+        # Natural-text shared-prefix dataset: bench_serving's built-in
+        # generated-shared-prefix prompts are random token ids, which the
+        # DSPARK draft cannot predict (accept len ~1.6, run 40993824705).
+        # Build a GSM8K question repeated to ~99% of input_len shared by
+        # every row with a unique short question suffix per row, then send
+        # it through the plain random-dataset path like the dev scripts do.
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix.json"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                test_dataset_path=GSM8K_DATASET_TEST_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+            )
+        dataset_path = dataset_file
+        dataset_name = "random"
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     if dataset_name == "generated-shared-prefix":
         cmd_args = [
@@ -1262,7 +1284,8 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
@@ -1397,7 +1420,8 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()
@@ -1566,7 +1590,8 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
-                self.dataset_name == "generated-shared-prefix"
+                self.dataset_name
+                in ("generated-shared-prefix", "gsm8k-shared-prefix")
                 and self.pop_sglang_is_in_ci_for_gsp
             ):
                 bench_env = os.environ.copy()

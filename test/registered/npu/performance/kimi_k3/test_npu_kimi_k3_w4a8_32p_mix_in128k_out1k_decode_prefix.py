@@ -179,7 +179,11 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = BENCHSERVING
-    dataset_name = "generated-shared-prefix"
+    # Natural-text shared prefix from GSM8K: the built-in
+    # generated-shared-prefix prompts are random token ids the DSPARK draft
+    # cannot predict (accept len ~1.6); GSM8K question text keeps the draft
+    # acceptance in the dev 3-4 range (dev confirmed, run 40993824705).
+    dataset_name = "gsm8k-shared-prefix"
     dataset_path = None
     input_len = 131072
     output_len = 1024
@@ -187,10 +191,9 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     max_concurrency = 12
     random_range_ratio = 1
     request_rate = 0
-    # 95% of the input is the shared system prompt; the rest is a distinct
-    # per-request question (dev's 100-cache dataset is the same shape: one
-    # long natural prefix + a short unique tail per request).
-    repeat_rate = 0.95
+    # repeat_rate is GSP-only; the gsm8k-shared-prefix generator fixes the
+    # prefix at ~99% of input_len and gives each row its own short question.
+    repeat_rate = None
     # One warmup request per DP rank primes the shared prefix everywhere
     # before the measured pass (bench_serving caps warmup output at 32).
     warmup_requests = 4
