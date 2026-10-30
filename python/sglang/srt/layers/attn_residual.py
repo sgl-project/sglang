@@ -606,12 +606,8 @@ class AttnResidual:
         write: bool,
         comm,
     ) -> torch.Tensor:
-        """Finish this rank's TP8 column slice of the next stream from the
-        column-parallel latent tail's partials, all-gather the stream and
-        stage the attention read of it (the next forward() with these scoring
-        parameters); returns the stream. The caller checked gather_covers()
-        and k3_attn_res_read_hip.tail_covered(); ``comm`` is
-        k3_ll_comm_hip.get_comm()."""
+        """All-gather the next stream from the column tail's partials and stage its
+        attention read; the caller checked gather_covers() and tail_covered()."""
         from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
 
         normed, stream = hip.gather_tail_attn_res_read(

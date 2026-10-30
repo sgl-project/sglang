@@ -1,10 +1,7 @@
-"""The communicator of Kimi-K3's TP8 LL collectives on gfx950 (csrc/kimi_k3/comm/ll_hip.cuh):
-the attention-residual read's stream gather and the attention output's all-reduce
-read (attention/k3_attn_res_read_hip).
+"""Scratch for Kimi-K3's gfx950 TP8 LL collectives (csrc/kimi_k3/comm/ll_hip.cuh).
 
-Their scratch is the meta buffer tail of a dedicated aiter CustomAllreduce,
-which is never used for anything else: one region and one row of flags per
-collective.
+The scratch is the meta buffer tail of a dedicated aiter CustomAllreduce that nothing else
+uses: one region and one row of flags per collective.
 """
 
 from __future__ import annotations

@@ -1,9 +1,7 @@
-"""Kimi-K3 TP8 collectives fused with an attention-residual read on gfx950 (see
-csrc/kimi_k3/attn_res/read_hip.cuh), over communication/k3_ll_comm_hip's
-scratch: the all-gather of the next stream, whose every rank finishes one
-[T, H / 8] column slice in-kernel from the column-parallel latent-MoE tail's
-split-K partials; and the attention output's all-reduce with the residual
-add, ahead of the FFN-side read.
+"""Kimi-K3 gfx950 TP8 collectives fused with an attention-residual read (csrc/kimi_k3/attn_res).
+
+Two collectives: the next stream's all-gather, each rank finishing its [T, H / 8] column slice
+from the latent tail's split-K partials; and the attention output's all-reduce ahead of the FFN read.
 """
 
 from __future__ import annotations

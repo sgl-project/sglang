@@ -8,10 +8,7 @@ residual prefix):
 The per-row 1/rms commutes with the GEMM, so it is accumulated in the same pass
 over the latent and applied in the epilogue; the GEMM input is rounded to bf16
 before the row scale instead of after it, within bf16 noise of the unfused chain.
-
-Decode M is tiny, so this is a skinny GEMM bound by streaming up_weight once:
-each program owns BLOCK_N output columns for all M rows and walks K in full,
-with the weight tile as the MFMA A operand in its natural [N, K] layout.
+Each program owns BLOCK_N output columns for all M rows, so up_weight streams once.
 """
 
 from __future__ import annotations

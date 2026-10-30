@@ -1078,9 +1078,8 @@ class Envs:
     # Kimi-K3 TP8 on gfx950: run the latent-MoE tail (latent RMSNorm, up-projection,
     # shared + residual add) as one kernel for decode-sized batches.
     SGLANG_ROCM_K3_FUSED_LATENT_TAIL = EnvBool(True)
-    # Run that tail column-parallel (each rank reads 1/8 of the replicated up_proj)
-    # and fuse its all-gather with the next layer's attention read, up to 64 tokens
-    # (LL collectives, layers/communication/k3_ll_comm_hip.py).
+    # Run that tail column-parallel (1/8 of the up_proj per rank), its all-gather fused
+    # with the next layer's attention read, up to 64 tokens.
     SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
