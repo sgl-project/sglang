@@ -103,28 +103,45 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
     print(f"Downloading from {url} to {filename}")
 
-    # Stream the response to show the progress bar
-    response = requests.get(url, stream=True)
-    response.raise_for_status()  # Check for request errors
+    # Keep incomplete downloads separate from the cache path. A failed
+    # streamed response must not leave a file that a later call mistakes for
+    # a complete cached dataset.
+    temporary_filename = filename + ".part"
 
-    # Total size of the file in bytes
-    total_size = int(response.headers.get("content-length", 0))
-    chunk_size = 1024  # Download in chunks of 1KB
+    try:
+        # Stream the response to show the progress bar
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Check for request errors
 
-    # Use tqdm to display the progress bar
-    with (
-        open(filename, "wb") as f,
-        tqdm(
-            desc=filename,
-            total=total_size,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar,
-    ):
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            f.write(chunk)
-            bar.update(len(chunk))
+        # Total size of the file in bytes
+        total_size = int(response.headers.get("content-length", 0))
+        chunk_size = 1024  # Download in chunks of 1KB
+
+        # Use tqdm to display the progress bar. Publish the final cache path
+        # only after the complete response has been written successfully.
+        with (
+            open(temporary_filename, "wb") as f,
+            tqdm(
+                desc=filename,
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as bar,
+        ):
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                bar.update(len(chunk))
+
+        os.replace(temporary_filename, filename)
+    except Exception:
+        try:
+            os.remove(temporary_filename)
+        except FileNotFoundError:
+            pass
+        raise
 
     return filename
 
