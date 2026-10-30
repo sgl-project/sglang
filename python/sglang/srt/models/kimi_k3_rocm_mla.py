@@ -24,7 +24,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention import mla_q_cache_aiter_hip
 from sglang.srt.runtime_context import get_buffer
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils.common import is_device_stream_capturing, print_warning_once
 
 # With save_kv_cache=False, these backends read only the BF16 Q and the KV cache;
 # Triton target-verify runs its extend kernel, which also reads k.
@@ -42,7 +42,7 @@ class _ZeroPositions:
     def get(self, tokens: int, device: torch.device) -> torch.Tensor:
         buf = self.buf
         if buf is None or buf.numel() < tokens or buf.device != device:
-            if torch.cuda.is_current_stream_capturing():
+            if is_device_stream_capturing(device):
                 # A memset recorded into a graph runs only at replay,
                 # so it cannot seed the shared buffer.
                 return torch.zeros((tokens,), dtype=torch.int64, device=device)
