@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -283,6 +284,10 @@ class SarvamMoESparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.gate = ReplicatedLinear(
@@ -640,7 +645,7 @@ class SarvamMoEMLAAttention(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        get_token_to_kv_pool().set_mla_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
             self.attn_mha,
             KVWriteLoc.for_batch(forward_batch),
             k_nope,

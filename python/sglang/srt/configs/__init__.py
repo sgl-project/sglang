@@ -1,6 +1,7 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig, BailingMoeV3VLConfig
 from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
+from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.cosmos3 import (
@@ -17,6 +18,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.flint import FlintConfig
 from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
@@ -99,6 +101,7 @@ __all__ = [
     "BailingHybridConfig",
     "BailingMM2Config",
     "BailingMoeV3VLConfig",
+    "BeamConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "Cosmos3Config",
@@ -137,6 +140,7 @@ __all__ = [
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
     "IQuestQ1Config",
+    "FlintConfig",
     "IQuestQ1MTPConfig",
     "InternS2MobiusConfig",
     "InternS2MobiusTextConfig",

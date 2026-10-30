@@ -36,7 +36,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
@@ -461,6 +460,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             ),
             fused_shared_experts_scaling_factor=1,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -649,10 +652,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1394,16 +1393,22 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if not mtp_excluded:
             return quant_config
 
+        apply_ptpc = should_apply_glm_nextn_moe_ptpc(
+            quant_config, config.num_hidden_layers
+        )
+        routed_experts_prefix = "model.decoder.mlp.experts."
         names = set(quant_config.exclude_layers)
         for name in mtp_excluded:
-            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+            mapped = self._map_mtp_ckpt_name(name, layer_prefix)
+            # Keep checkpoint excludes for the loader, but let the converted
+            # runtime experts use the PTPC scheme below.
+            if apply_ptpc and mapped.startswith(routed_experts_prefix):
+                continue
+            names.add(mapped)
 
-        # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
-        # do not match. So that module needs its own entry: bf16 as in the
-        # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
-        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
-        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+        # Match the runtime scheme to the weight-loader cast; otherwise keep
+        # the checkpoint's BF16 routed experts excluded.
+        if apply_ptpc:
             mtp_layer_quant_config = quant_config.quant_config.setdefault(
                 "layer_quant_config", {}
             )
