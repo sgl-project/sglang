@@ -237,7 +237,14 @@ class PipelineExecutor(ABC):
         with self._stage_execution_context(stage, server_args):
             self.component_residency_manager.begin_stage()
             try:
-                return run_stage(stage, payload)
+                profiler = SGLDiffusionProfiler.get_instance()
+                profile_context = (
+                    profiler.profile_denoising_stage()
+                    if profiler is not None and stage.role_affinity == RoleType.DENOISER
+                    else contextlib.nullcontext()
+                )
+                with profile_context:
+                    return run_stage(stage, payload)
             finally:
                 self.component_residency_manager.end_stage()
 

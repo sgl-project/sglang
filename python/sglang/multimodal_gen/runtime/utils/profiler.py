@@ -58,6 +58,7 @@ class SGLDiffusionProfiler:
     2. otherwise, profile up to num_profiled_timesteps denoising steps after
        one warmup step. Omit warmup when recording every available step;
        num_profiled_timesteps=-1 records all steps, including the first one.
+       Collection starts at the denoising stage and ends when it exits.
     """
 
     _instance = None
@@ -143,14 +144,31 @@ class SGLDiffusionProfiler:
 
         logger.info(f"Profiling request: {request_id} for {self.profile_mode_id}...")
 
+        self.has_started = False
         self.has_stopped = False
 
         SGLDiffusionProfiler._instance = self
-        self.start()
+        if self.full_profile:
+            self.start()
 
     def start(self):
+        if self.has_started or self.has_stopped:
+            return
         logger.info("Starting Profiler...")
         self.profiler.start()
+        self.has_started = True
+
+    @contextlib.contextmanager
+    def profile_denoising_stage(self):
+        """Bound sampled profiling to the stage, including an early stage exit."""
+        if self.full_profile:
+            yield
+            return
+        self.start()
+        try:
+            yield
+        finally:
+            self.stop(dump_rank=0)
 
     def _step(self):
         self.profiler.step()
@@ -160,7 +178,7 @@ class SGLDiffusionProfiler:
             self._step()
 
     def step_denoising_step(self):
-        if not self.full_profile and not self.has_stopped:
+        if not self.full_profile and self.has_started and not self.has_stopped:
             self._step()
             self.num_active_steps -= 1
             if self.num_active_steps == 0:
@@ -175,6 +193,10 @@ class SGLDiffusionProfiler:
         if self.has_stopped:
             return
         self.has_stopped = True
+        if not self.has_started:
+            # A request may fail or be cancelled before reaching its denoiser.
+            SGLDiffusionProfiler._instance = None
+            return
         logger.info("Stopping Profiler...")
         if torch.cuda.is_available() or (
             hasattr(torch, "musa") and torch.musa.is_available()
