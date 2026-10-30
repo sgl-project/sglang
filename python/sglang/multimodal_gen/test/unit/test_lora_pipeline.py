@@ -40,6 +40,8 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
         lora_alpha=None,
         lora_merge_mode="dynamic",
         model_path="/model",
+        tp_size=1,
+        use_fsdp_inference=False,
     )
     pipeline.lora_initialized = True
     pipeline.lora_adapters = defaultdict(dict)
@@ -141,6 +143,26 @@ def test_merge_cache_only_accepts_cpu_backed_weights():
         enabled=True,
     )
     assert resident_cache is None
+
+
+def test_merge_cache_serves_replicated_replicas_only():
+    """Sequence-/data-parallel ranks hold the same weights, so they share one
+    cache entry; sharded ranks would all collide on one entry and must not."""
+    pipeline = _make_pipeline(_make_layer())
+
+    def cache():
+        return pipeline._merge_cache_for(
+            "transformer", pipeline.lora_layers, ["/adapter"], [1.0], enabled=True
+        )
+
+    assert cache() is not None
+
+    pipeline.server_args.tp_size = 2
+    assert cache() is None
+
+    pipeline.server_args.tp_size = 1
+    pipeline.server_args.use_fsdp_inference = True
+    assert cache() is None
 
 
 def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
