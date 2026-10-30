@@ -234,7 +234,9 @@ def glm_moe_topk_output(moe, hidden_states):
     )
     from sglang.srt.runtime_context import get_parallel
 
-    cfg = moe.topk.topk_config
+    cfg = getattr(moe.topk, "topk_config", None)
+    if cfg is None:
+        return None
     ok = getattr(moe, "_smallm_router_glm_ok", None)
     if ok is None:
         gw, bias, backend = (

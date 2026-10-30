@@ -178,6 +178,9 @@ class TestSmallMRouterGfx950(CustomTestCase):
         # expert-location dispatch (EPLB, non-trivial placement) needs the unfused remap
         routing[0] = (n, object())
         self.assertIsNone(R.glm_moe_topk_output(moe, x))
+        # a topk that is a plain callable, as in DeepSeek-V4's MoE stub, has no config to route with
+        moe.topk = lambda *a, **kw: None
+        self.assertIsNone(R.glm_moe_topk_output(moe, x))
 
     def test_glm_router_matches_unfused_path(self):
         from sglang.kernels.ops.moe import smallm_router_gfx950 as R
