@@ -14,6 +14,7 @@ standing in for the VMM allocations:
   - engine-side layout validation
   - fd passing, including that every fd is closed on success, on error and on
     a malformed message, and that received fds are close-on-exec
+  - a client that breaks off a fetch part-way, followed by a healthy one
   - a loaded model keeps its transport mappings after the model object goes
   - --weight-cache-transport selection and the non-fatal daemon-exit watcher
 """
@@ -41,7 +42,7 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from sglang.srt.utils import cuda_vmm_utils
 from sglang.srt.weight_cache import ipc_loader, transport
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
-from sglang.srt.weight_cache.protocol import recv_msg
+from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     VMM_FD_BACKEND,
@@ -131,6 +132,23 @@ def _close_all(fds):
         os.close(fd)
 
 
+class _FdExportDriver:
+    """Stand-in for the CUDA driver in the daemon's fd export: each export of a
+    retained allocation handle opens a fresh memfd that names the handle."""
+
+    CUresult = SimpleNamespace(CUDA_SUCCESS=0)
+    CUmemAllocationHandleType = SimpleNamespace(
+        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR=1
+    )
+
+    def __init__(self):
+        self.exported = 0  # fds opened so far
+
+    def cuMemExportToShareableHandle(self, handle, handle_type, flags):
+        self.exported += 1
+        return self.CUresult.CUDA_SUCCESS, _memfds([handle.encode()])[0]
+
+
 class _TinyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -149,6 +167,33 @@ class _TinyModel(torch.nn.Module):
         )
 
 
+def _cache_config() -> CacheConfig:
+    return CacheConfig(
+        model_path="tiny",
+        model_arch="TinyModel",
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        dp_size=1,
+        ep_size=1,
+        moe_dp_size=1,
+        moe_dp_rank=0,
+        moe_ep_rank=0,
+        attn_dp_size=1,
+        enable_dp_lm_head=False,
+        attn_cp_size=1,
+        moe_dense_tp_size=None,
+        moe_a2a_backend="none",
+        quant_method="",
+        quant_config_hash="",
+        dtype="torch.float32",
+        revision="",
+        device_capability="",
+        torch_version="2.0.0",
+    )
+
+
 def _make_daemon(model, backend) -> WeightCacheDaemon:
     """A daemon with a loaded model, without the GPU/distributed setup."""
     daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
@@ -157,6 +202,8 @@ def _make_daemon(model, backend) -> WeightCacheDaemon:
     daemon.transport_name = backend.name
     daemon.transport_backend = backend
     daemon.state_entries = {}
+    daemon.config = _cache_config()
+    daemon.preloaded_weights_bytes = 0
     return daemon
 
 
@@ -709,6 +756,185 @@ class TestFdPassing(CustomTestCase):
         backend.close()
         reservation.close.assert_called_once_with()
         self.assertEqual(backend._storages, {})
+
+
+class TestAttachAfterAFailedAttach(CustomTestCase):
+    """A client that breaks off a fetch_state part-way leaves the daemon able
+    to serve the next one: every fd exported or received for the broken
+    request is closed, the daemon keeps its allocation handles, and the next
+    client gets fresh fds for them and reads every tensor.
+
+    The daemon handles each connection with its request handler, as serve()
+    does; memfds and host memory stand in for the driver's fd export and the
+    engine's mapping, so the handles here are placeholders (the GPU tests map
+    real allocations). Both sides run in this process, so the fd count covers
+    both."""
+
+    # Where the client gives up, in the order of the exchange.
+    BREAK_OFF_POINTS = (
+        "after_request",  # before the daemon answers: its send fails
+        "after_response",  # whatever fds were sent are left on the socket
+        "midway_through_fds",  # the daemon's send fails after half of them
+        "mapping_fails",  # after every fd arrived
+        "after_mapping",  # without importing any tensor
+    )
+    # The daemon's send fails at these points; at the others it may finish.
+    DAEMON_SEND_FAILS = ("after_request", "midway_through_fds")
+
+    def setUp(self):
+        torch.manual_seed(0)
+        model = _TinyModel()
+        tensors = dict(model.named_parameters(remove_duplicate=False))
+        tensors.update(model.named_buffers(remove_duplicate=False))
+        self.expected = {name: t.detach().clone() for name, t in tensors.items()}
+        del tensors
+        # One slot per allocation, so that a fetch passes several fds.
+        backend = VmmFdTransportBackend(
+            device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
+        )
+        self.daemon = _make_daemon(model, backend)
+        del model
+        with _host_vmm():
+            self.daemon._export_state()
+        self.addCleanup(backend.close)
+        self.driver = _FdExportDriver()
+        for patcher in (
+            mock.patch.object(
+                cuda_vmm_utils, "_get_cuda_driver", return_value=self.driver
+            ),
+            mock.patch.object(
+                cuda_vmm_utils, "tensor_from_pointer", _cpu_tensor_from_pointer
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # Per mapping, the handle that each received fd was exported from.
+        self.mapped = []
+
+    def _serve(self, conn, errors):
+        """Handle one connection in a thread, as WeightCacheDaemon.serve() does."""
+
+        def handle():
+            try:
+                self.daemon._handle_connection(conn)
+            except Exception as e:  # serve() logs it and goes on
+                errors.append(e)
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=handle)
+        thread.start()
+        return thread
+
+    def _map(self, client, fds, sizes):
+        """Stand-in for import + cuMemMap: note the handles the fds name, then
+        map the daemon's host memory."""
+        self.mapped.append([os.pread(fd, 64, 0).decode() for fd in fds])
+        client._reservation = SimpleNamespace(
+            base=self.daemon.transport_backend._reservation.base, close=lambda: None
+        )
+        client._device = CPU
+        client._alloc_sizes = list(sizes)
+        client._alloc_offsets = transport._prefix_offsets(sizes)
+
+    def _attach(self, break_off=None):
+        """One fetch_state on a fresh connection, which the client gives up at
+        ``break_off``. Returns copies of every tensor the client imported
+        (None if it gave up) and the errors the daemon raised."""
+        daemon_sock, client_sock = socket.socketpair()
+        for sock in (daemon_sock, client_sock):
+            sock.settimeout(10)
+        half = len(self.daemon.transport_backend._handles) // 2
+        client_gone = threading.Event()
+        send_fd = transport._send_fd
+
+        def send_fd_after_half_waits_for_the_client(sock, fd, index):
+            if break_off == "midway_through_fds" and index == half:
+                # Not an OSError, so that the test cannot mistake it for the
+                # failed send it expects.
+                if not client_gone.wait(10):
+                    raise AssertionError("the client did not close its socket")
+            send_fd(sock, fd, index)
+
+        request = {"type": "fetch_state", "config": _cache_config().to_dict()}
+        send_msg(client_sock, request)
+        if break_off == "after_request":
+            client_sock.close()
+        errors = []
+        client = VmmFdTransportBackend()
+        with mock.patch.object(
+            transport, "_send_fd", send_fd_after_half_waits_for_the_client
+        ):
+            thread = self._serve(daemon_sock, errors)
+            try:
+                if break_off == "after_request":
+                    return None, errors
+                response = recv_msg(client_sock)
+                self.assertEqual(response["status"], "ok")
+                if break_off == "after_response":
+                    return None, errors
+                if break_off == "midway_through_fds":
+                    _close_all(recv_fds(client_sock, half))
+                    client_sock.close()
+                    return None, errors
+                if break_off == "mapping_fails":
+                    with (
+                        mock.patch.object(
+                            client,
+                            "_map_imported",
+                            side_effect=RuntimeError("map failed"),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "map failed"),
+                    ):
+                        client.recv_fetch_state_response(client_sock, response)
+                    return None, errors
+                with mock.patch.object(
+                    client,
+                    "_map_imported",
+                    side_effect=lambda fds, sizes: self._map(client, fds, sizes),
+                ):
+                    client.recv_fetch_state_response(client_sock, response)
+                if break_off == "after_mapping":
+                    return None, errors
+                # Copy the values out while the mapping is still valid.
+                imported = {
+                    name: client.import_tensor(entry).clone()
+                    for name, entry in response["entries"].items()
+                }
+                return imported, errors
+            finally:
+                client.close()
+                client_sock.close()
+                client_gone.set()
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+
+    def test_a_failed_attachment_is_followed_by_a_healthy_one(self):
+        backend = self.daemon.transport_backend
+        handles = list(backend._handles)
+        self.assertGreater(len(handles), 1)
+        before = _open_fd_count()
+        for break_off in self.BREAK_OFF_POINTS:
+            with self.subTest(break_off=break_off):
+                exported = self.driver.exported
+                _, errors = self._attach(break_off)
+                if break_off in self.DAEMON_SEND_FAILS:
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], OSError)  # e.g. EPIPE
+                # The broken request got fresh fds, and all of them are closed.
+                self.assertEqual(self.driver.exported - exported, len(handles))
+                self.assertEqual(_open_fd_count(), before)
+
+                self.mapped.clear()
+                imported, errors = self._attach()
+                self.assertEqual(errors, [])
+                self.assertEqual(_open_fd_count(), before)
+                # Fresh fds for the same retained handles, in order.
+                self.assertEqual(backend._handles, handles)
+                self.assertEqual(self.mapped, [handles])
+                self.assertEqual(set(imported), set(self.expected))
+                for name, tensor in self.expected.items():
+                    torch.testing.assert_close(imported[name], tensor, rtol=0, atol=0)
 
 
 class TestTransportSelection(CustomTestCase):
