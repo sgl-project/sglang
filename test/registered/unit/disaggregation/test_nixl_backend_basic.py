@@ -1220,8 +1220,6 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr.pp_size = 1
         mgr.src_mem_kind = "VRAM"
         mgr._num_slots_src = 4
-        mgr._prepared_src_layouts = set()
-        mgr._kv_layout_peers = set()
         mgr._prepared_state_plans = {}
         mgr._prepared_state_components = frozenset()
         mgr._state_layout_rejections = {}

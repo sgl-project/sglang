@@ -443,6 +443,17 @@ class NixlTransport(Transport):
         descs = self._agent.get_xfer_descs(_expand_runs(array), kind)
         return self._agent.prep_xfer_dlist(peer_name, descs, kind)
 
+    def is_prepared(self, *, remote: Optional[NixlRemoteBuffers], layout: str) -> bool:
+        """False while reload() rebuilds the peer's dlists."""
+        side = "" if remote is None else remote.agent_name
+        return layout in self._layouts.get(side, {})
+
+    def discard_prepared(
+        self, *, remote: Optional[NixlRemoteBuffers], layout: str
+    ) -> None:
+        side = "" if remote is None else remote.agent_name
+        self._layouts.get(side, {}).pop(layout, None)
+
     def write_prepared(
         self,
         *,

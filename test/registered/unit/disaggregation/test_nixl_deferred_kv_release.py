@@ -175,8 +175,6 @@ class TestNixlAbortNotification(
         attach_nixl_transport(
             manager, self.agent, kv=[0x1000], peers=agent_names, peer_kv=[0x2000]
         )
-        manager._prepared_src_layouts = set()
-        manager._kv_layout_peers = set()
         manager._init_equal_tp_prep_handle("", manager._local_keys.kv, num_slots=4)
         manager.decode_kv_args_table = {}
         manager.transfer_infos = {ROOM: {}}
