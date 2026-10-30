@@ -11,6 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -24,14 +25,13 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
 )
-from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
@@ -73,9 +73,6 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
-    req.set_extend_range = lambda start, end: setattr(
-        req, "extend_range", Range(start, end)
-    )
     return req
 
 
@@ -241,7 +238,7 @@ class TestHiSparseUnit(unittest.TestCase):
         req.kv.kv_allocated_len = fill_len
         req.kv.kv_committed_len = fill_len
         req.full_untruncated_fill_ids = array("q", range(fill_len))
-        req.extend_range = Range(0, fill_len)
+        req.extend_end = fill_len
         return kv_loc
 
     # ==================================================================
@@ -773,6 +770,7 @@ class TestHiSparseUnit(unittest.TestCase):
         queue.tree_cache = SimpleNamespace(
             evictable_size=lambda: 0,
             protected_size=lambda: 0,
+            maybe_hand_to_session=lambda req: None,
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
@@ -790,7 +788,7 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_range.length, fill_len)
+        self.assertEqual(req.extend_end - req.prefix_len, fill_len)
 
         rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
         self.assertEqual(
@@ -866,6 +864,52 @@ class TestHiSparseUnit(unittest.TestCase):
             self._cleanup_req(req, kv_locs[i], logical_only=is_long)
 
         self._assert_sizes_restored(initial, "batch_multiple")
+
+
+class TestDSV4HiSparseEagerBackup(unittest.TestCase):
+    @unittest.skipUnless(is_cuda(), "DSV4 HiSparse runs on CUDA.")
+    def test_page_sized_batch_uses_token_copy(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        # 64 requests produce 64 scattered C4 tokens, not one contiguous page.
+        batch_size = 64
+        device_locs = torch.arange(batch_size, device=DEVICE) * 3 + 1
+        host_locs = torch.arange(batch_size, device=DEVICE) * 64
+        host_pool = Mock()
+        host_pool.alloc_paged_token_slots.side_effect = host_locs.split(1)
+
+        # Only the eager-backup state is needed; no model pools or TP group.
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.device = DEVICE
+        coordinator.is_dsv4_hisparse = True
+        coordinator.compress_ratio = 4
+        coordinator.device_buffer_size = DEVICE_BUFFER_SIZE
+        coordinator._skip_first_backup = [False] * batch_size
+        coordinator.req_to_device_buffer = device_locs[:, None]
+        coordinator.req_to_host_pool = None
+        coordinator.req_to_host_pool_allocated_len = None
+        coordinator.mem_pool_host = host_pool
+        coordinator.mem_pool_device = None
+        coordinator.decode_backup_stream = get_device_module().Stream()
+        coordinator.decode_producer_stream = None
+        coordinator._backup_done_event = get_device_module().Event()
+        coordinator._has_pending_backup = False
+
+        # seq_len 5 produced compressed token 0, held in device-buffer slot 0.
+        req_indices = torch.arange(batch_size)
+        seq_lens = torch.full((batch_size,), 5, dtype=torch.int64)
+        coordinator._eager_backup_previous_token(
+            seq_lens.to(DEVICE), req_indices.to(DEVICE), seq_lens, req_indices
+        )
+        coordinator.wait_for_pending_backup()
+
+        host_pool.backup_from_device_all_layer.assert_not_called()
+        host_pool.backup_tokens_from_device_all_layer.assert_called_once()
+        got_host, got_device = (
+            host_pool.backup_tokens_from_device_all_layer.call_args.args
+        )
+        self.assertTrue(torch.equal(got_host, host_locs))
+        self.assertTrue(torch.equal(got_device, device_locs))
 
 
 if __name__ == "__main__":

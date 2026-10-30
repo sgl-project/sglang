@@ -8,6 +8,7 @@ import torch
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mock_model.utils import MOCK_MODEL_PATH
 from sglang.test.test_utils import CustomTestCase
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-register_cuda_ci(est_time=26, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=27, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -83,6 +84,11 @@ class _CustomizedInfoEngine(Engine):
     )
 
 
+@unittest.skipIf(
+    current_platform.is_mps(),
+    "The standard Torch MPS path only supports the pytorch sampling backend, "
+    "so the customized-info probe backend cannot be installed there.",
+)
 class TestCustomizedInfoStreaming(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -30,7 +30,7 @@ def _cache():
 
 
 def _call(kv, b, s_q, topk, topk_length, *, extra=None, meta=None):
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention import flash_mla_interface
 
     g = torch.Generator(device="cuda").manual_seed(b * 7 + s_q * 13 + topk)
     q = torch.randn(
@@ -48,10 +48,10 @@ def _call(kv, b, s_q, topk, topk_length, *, extra=None, meta=None):
             extra_indices_in_kvcache=extra_indices,
             extra_topk_length=extra_topk_length,
         )
-    sched = flash_mla.FlashMLASchedMeta()
+    sched = flash_mla_interface.FlashMLASchedMeta()
     if meta is not None:
         sched.tile_scheduler_metadata, sched.num_splits = meta
-    out, lse = flash_mla.flash_mla_with_kvcache(
+    out, lse = flash_mla_interface.flash_mla_with_kvcache(
         q,
         kv,
         None,
@@ -161,6 +161,52 @@ def test_extra_cache_schedule(b: int, topk: int, extra_topk: int):
     out, lse, _ = _call(kv, b, s_q, topk, topk_length, extra=extra, meta=(meta, splits))
     assert torch.equal(out.view(torch.int16), ref_out.view(torch.int16))
     assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+def test_schedule_at_shared_memory_boundary(offset):
+    parts = torch.cuda.get_device_properties(0).multi_processor_count
+    b = (48 * 1024 // 4 - 1 - parts * 8) // 5 - offset
+    meta = torch.empty((parts, 8), dtype=torch.int32, device="cuda")
+    splits = torch.empty((b + 1,), dtype=torch.int32, device="cuda")
+    lengths = torch.full((b,), 128, dtype=torch.int32, device="cuda")
+    meta, splits = _ours(meta, splits, lengths, 128)
+    torch.cuda.synchronize()
+    # Each request costs two KV blocks plus five overhead blocks. At these
+    # shapes every partition fits whole requests, so no request is split.
+    payload = (7 * b + parts - 1) // parts + 5
+    assert payload % 7 <= 5
+    per_part = payload // 7
+    expected = []
+    for i in range(parts):
+        begin, end = min(i * per_part, b), min((i + 1) * per_part, b)
+        expected.append([begin, end - 1, 0, 2, 0, 0, 0])
+    torch.testing.assert_close(
+        meta[:, DEFINED].cpu(), torch.tensor(expected, dtype=torch.int32)
+    )
+    torch.testing.assert_close(splits.cpu(), torch.arange(b + 1, dtype=torch.int32))
+
+
+def test_precompute_skips_oversized_schedule(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as backend
+
+    monkeypatch.setattr(backend, "_fast_flashmla_sched_shape", lambda q: True)
+    monkeypatch.setattr(backend, "_num_sms", lambda _: 148)
+    max_batch = (48 * 1024 // 4 - 1 - 148 * 8) // 5
+    for b in (max_batch + 1, 5000, 16384):
+        meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
+        backend._maybe_precompute_flashmla_sched_meta(
+            meta,
+            q=SimpleNamespace(shape=(b, 1, 64, 512), device=SimpleNamespace(index=0)),
+            indices=None,
+            topk_length=None,
+            extra_indices=None,
+            extra_topk_length=None,
+        )
+        assert meta.tile_scheduler_metadata is None
+        assert meta.num_splits is None
 
 
 if __name__ == "__main__":

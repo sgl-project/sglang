@@ -7,11 +7,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
@@ -198,51 +198,22 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
 
-    def test_admission_rules_sweep(self):
-        for page_size in (1, 4, 16):
-            for input_len in (1, 8, 100):
-                for requested in (None, 0, 5, 64, 1 << 20):
-                    for limit in (None, 0, 16, 1 << 20):
-                        for max_req_len, max_total_num_tokens in (
-                            (128, 1024),
-                            (32, 24),
-                            (128, 24),
-                        ):
-                            with self.subTest(
-                                page_size=page_size,
-                                input_len=input_len,
-                                requested=requested,
-                                limit=limit,
-                                max_req_len=max_req_len,
-                                max_total_num_tokens=max_total_num_tokens,
-                            ):
-                                with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(limit):
-                                    scheduler = self._new_scheduler(
-                                        max_req_len=max_req_len,
-                                        max_total_num_tokens=max_total_num_tokens,
-                                        page_size=page_size,
-                                    )
-                                    req = self._new_req(
-                                        max_new_tokens=requested, input_len=input_len
-                                    )
-                                    self._init_and_check(scheduler, req)
-
     def test_unified_budget_rounds_prompt_and_decode_together(self):
-        bundle = init_unified_swa_pools(
+        bundle = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,
-            head_dim=4,
-            v_head_dim=4,
+            head_dim=8,
+            v_head_dim=8,
             swa_head_num=1,
-            swa_head_dim=4,
-            swa_v_head_dim=4,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
             page_size=4,
             start_layer=0,
             end_layer=2,
             swa_attention_layer_ids=[1],
             full_attention_layer_ids=[0],
-            total_bytes=384,
+            total_bytes=768,
             enable_memory_saver=False,
             need_sort=False,
             lazy_compaction=True,

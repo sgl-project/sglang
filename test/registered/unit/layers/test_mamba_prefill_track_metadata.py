@@ -5,11 +5,17 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    Mamba2Metadata,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -19,7 +25,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class NoHostRead(torch.Tensor):
@@ -67,11 +73,39 @@ def make_metadata_backend():
     backend = object.__new__(MambaAttnBackendBase)
     backend.device = "cpu"
     backend.topk = 1
-    backend.req_to_token_pool = SimpleNamespace(
-        get_mamba_indices=lambda rows: rows,
-        translate_mamba_indices=lambda slots: slots,
-    )
+    backend.req_to_token_pool = SimpleNamespace(get_mamba_indices=lambda rows: rows)
+    backend.state_pool = None
+    backend._state_ids = IdSpace(key=("mamba", None))
     return backend
+
+
+def make_relabeled_decode_batch(seq_lens, num_tokens, track_mask=None):
+    """A decoding DP rank after MAX_LEN padding: EXTEND, one token per decode row.
+
+    ``num_tokens`` pads the token-indexed inputs to the cross-rank max, as
+    ``_pad_inputs_to_size`` does; the per-row extend lists stay at one token.
+    """
+    bs = len(seq_lens)
+    batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=bs,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
+        req_pool_indices=torch.arange(bs),
+        seq_lens=torch.tensor(seq_lens),
+        seq_lens_sum=sum(seq_lens),
+        out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
+        extend_num_tokens=bs,
+        extend_start_loc=torch.arange(bs, dtype=torch.int32),
+        extend_seq_lens=torch.ones(bs, dtype=torch.int32),
+        extend_prefix_lens=torch.tensor(seq_lens) - 1,
+        extend_seq_lens_cpu=[1] * bs,
+        extend_prefix_lens_cpu=[n - 1 for n in seq_lens],
+        # Decode sets the mask on track boundaries but never mamba_track_seqlens.
+        mamba_track_mask=None if track_mask is None else torch.tensor(track_mask),
+        mamba_track_indices=None if track_mask is None else torch.arange(bs) + 10,
+    )
+    batch._original_forward_mode = ForwardMode.DECODE
+    return batch
 
 
 class TestMambaPrefillTrackMetadata(unittest.TestCase):
@@ -182,9 +216,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     lengths, [0, 3][: len(lengths)], [100, 200], mode
                 )
                 if mode == ForwardMode.TARGET_VERIFY:
-                    batch.spec_info = SimpleNamespace(
-                        ragged_verify_layout=None, draft_token_num=3
-                    )
+                    batch.spec_info = SimpleNamespace(draft_token_num=3)
                 with patch.object(
                     torch.Tensor,
                     "__int__",
@@ -202,7 +234,16 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
         batch = ScheduleBatch(
-            reqs=[SimpleNamespace(rid="one", lora_id=None, token_type_ids=None)],
+            reqs=[
+                SimpleNamespace(
+                    rid="one",
+                    lora_id=None,
+                    token_type_ids=None,
+                    kv=SimpleNamespace(kv_committed_len=64),
+                    extend_end=65,
+                    full_untruncated_fill_ids=[3] * 65,
+                )
+            ],
             device="cpu",
             forward_mode=ForwardMode.EXTEND,
             input_ids=torch.tensor([3]),
@@ -221,14 +262,19 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         )
         runner = SimpleNamespace(
             device="cpu",
+            is_draft_worker=False,
             model_config=SimpleNamespace(
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
-            kv_index_translator=SimpleNamespace(rebind_write_loc=lambda forward: None),
+            # A pass-through runner: its plan hands the batch its ids untouched.
+            runner_ids=SimpleNamespace(
+                own_plan=lambda batch: SimpleNamespace(
+                    bind=lambda batch, reader, cols=None: None
+                )
+            ),
             prefill_attention_backend_str="torch_native",
             ngram_embedding_manager=SimpleNamespace(enabled=False),
             lora_manager=None,
-            attn_dcp_size=1,
             attn_backend=SimpleNamespace(
                 get_cpu_graph_seq_len_fill_value=lambda: 1,
                 get_cuda_graph_seq_len_fill_value=lambda: 1,
@@ -296,6 +342,185 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 self.assertEqual(snapshot.mamba_prefill_track_mask_cpu, [True])
                 self.assertEqual(snapshot.mamba_track_seqlens_cpu, [65])
                 self.assertIsNone(snapshot.mamba_track_mask_cpu)
+
+
+class TestDpDecodeRelabel(unittest.TestCase):
+    """Decode rows relabeled as 1-token extends for DP MAX_LEN padding must keep
+    decode semantics on the mamba side."""
+
+    def test_forward_metadata_on_a_track_boundary_stays_decode(self):
+        backend = make_metadata_backend()
+        backend.conv_states_shape = (1, 8, 4)
+        # A peer's prefill pads the 2 decode rows to 697 tokens; the metadata
+        # must still cover only the real rows.
+        batch = make_relabeled_decode_batch(
+            [256, 9], num_tokens=697, track_mask=[True, False]
+        )
+        metadata = backend._forward_metadata(batch)
+        torch.testing.assert_close(
+            metadata.query_start_loc, torch.arange(3, dtype=torch.int32)
+        )
+        self.assertIsNone(metadata.logical_num_tokens)
+        self.assertIsNone(metadata.track_conv_indices)
+
+    def test_prepare_mixed_builds_decode_metadata(self):
+        metadata = Mamba2Metadata.prepare_mixed(
+            ForwardMetadata(
+                query_start_loc=torch.arange(4, dtype=torch.int32),
+                mamba_cache_indices=torch.arange(3, dtype=torch.int32),
+            ),
+            64,
+            make_relabeled_decode_batch([8, 8, 8], num_tokens=64),
+        )
+        self.assertEqual(metadata.num_decodes, 3)
+        self.assertEqual(metadata.num_prefills, 0)
+        self.assertIsNone(metadata.mixed_metadata)
+
+    def test_two_batch_overlap_rejects_relabeled_batches(self):
+        with self.assertRaisesRegex(AssertionError, "Two-batch overlap"):
+            TboForwardBatchPreparer.filter_batch(
+                make_relabeled_decode_batch([8, 8], num_tokens=4),
+                start_token_index=0,
+                end_token_index=1,
+                start_seq_index=0,
+                end_seq_index=1,
+                out_num_token_non_padded=torch.zeros(1, dtype=torch.int32),
+            )
+
+    def test_prepare_mixed_keeps_real_extends_as_prefills(self):
+        batch = make_forward_batch([4, 3], [0, 4], [4, 3])
+        batch.extend_num_tokens = 7
+        batch.extend_prefix_lens = torch.zeros(2, dtype=torch.int64)
+        metadata = Mamba2Metadata.prepare_mixed(
+            ForwardMetadata(
+                query_start_loc=torch.tensor([0, 4, 7], dtype=torch.int32),
+                mamba_cache_indices=torch.arange(2, dtype=torch.int32),
+            ),
+            64,
+            batch,
+        )
+        self.assertEqual(metadata.num_prefills, 2)
+        self.assertEqual(metadata.num_decodes, 0)
+        self.assertIsNotNone(metadata.mixed_metadata)
+
+    def test_logical_mode_ignores_idle_relabels(self):
+        # Idle ranks also set _original_forward_mode; their fabricated rows stay
+        # in the relabeled mode.
+        for mode in (ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                batch = make_forward_batch([1], [0], [1], mode)
+                batch._original_forward_mode = ForwardMode.IDLE
+                self.assertEqual(batch.logical_forward_mode, mode)
+
+
+def track_mapping(batch):
+    return batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+
+
+def make_verify_batch():
+    mapping = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    return SimpleNamespace(
+        reqs=[
+            SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=p))
+            for p in (0, None, 1)
+        ],
+        req_pool_indices=torch.tensor([2, 0, 1]),
+        req_to_token_pool=SimpleNamespace(
+            req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+        ),
+        mamba_lazy_spec_track_positions_cpu=[1, 0, 0],
+    )
+
+
+class TestVerifyTrackIndexReuse(unittest.TestCase):
+    """Verify track indices reused from the last round must equal freshly built ones
+    after any change to what they are built from."""
+
+    def setUp(self):
+        self.builds = 0
+        build, tensor = spec_utils.set_mamba_track_indices_from_reqs, torch.tensor
+
+        def build_unpinned(batch, track_positions=None):
+            self.builds += 1
+            # no pinned host memory on CPU-only machines
+            with patch.object(
+                torch, "tensor", lambda *a, pin_memory=False, **k: tensor(*a, **k)
+            ):
+                build(batch, track_positions)
+
+        patcher = patch.object(
+            spec_utils, "set_mamba_track_indices_from_reqs", build_unpinned
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _prepare(self, batch, reuse, lazy=False):
+        settings = SimpleNamespace(
+            mamba=SimpleNamespace(
+                enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
+            )
+        )
+        # reuse: the process's indices under SGLANG_Q35MF_MKH_N3B, None without it
+        with (
+            patch.object(spec_utils, "get_exec", return_value=settings),
+            patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),
+        ):
+            spec_utils.prepare_mamba_track_for_verify(batch)
+        return batch.mamba_track_indices.tolist(), batch.mamba_track_buffer_indices
+
+    def test_reuse_matches_a_fresh_build(self):
+        changes = {
+            "nothing": lambda b: None,
+            "slots replaced": lambda b: setattr(
+                b, "req_pool_indices", torch.tensor([0, 2, 1])
+            ),
+            "slots written": lambda b: b.req_pool_indices.copy_(
+                torch.tensor([1, 2, 0])
+            ),
+            "mapping replaced": lambda b: setattr(
+                b.req_to_token_pool,
+                "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                torch.tensor([[40, 41], [50, 51], [60, 61]]),
+            ),
+            "mapping written": lambda b: track_mapping(b)[0, 1].fill_(19),
+            "position moved": lambda b: setattr(
+                b.reqs[2].kv, "mamba_next_track_idx", 0
+            ),
+            "request freed": lambda b: setattr(
+                b.reqs[0].kv, "mamba_next_track_idx", None
+            ),
+            "indices written": lambda b: b.mamba_track_indices.fill_(0),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+                self._prepare(batch, reuse)
+                last_indices, builds = batch.mamba_track_indices, self.builds
+                change(batch)
+                got = self._prepare(batch, reuse)
+                # reused, the very same tensor, exactly when nothing changed
+                self.assertEqual(self.builds == builds, name == "nothing")
+                self.assertEqual(
+                    batch.mamba_track_indices is last_indices, name == "nothing"
+                )
+                self.assertEqual(got, self._prepare(batch, None))
+
+    def test_inference_tensors_are_rebuilt_every_round(self):
+        # SGLANG_ENABLE_TORCH_INFERENCE_MODE: inference tensors keep no version
+        with torch.inference_mode():
+            batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+            want = self._prepare(batch, None)
+            for _ in range(2):
+                builds = self.builds
+                self.assertEqual(self._prepare(batch, reuse), want)
+                self.assertEqual(self.builds, builds + 1)
+
+    def test_lazy_plan_is_never_reused_over(self):
+        batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+        self._prepare(batch, reuse)
+        self.assertEqual(
+            self._prepare(batch, reuse, lazy=True), ([31, -1, 20], [1, 0, 0])
+        )
 
 
 if __name__ == "__main__":

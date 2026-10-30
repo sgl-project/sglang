@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -33,6 +34,10 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    ShmTagExchange,
+    get_shm_exchange,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
@@ -63,13 +68,6 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    tp_group: Any
-    tp_cpu_group: Any
-    attn_tp_group: Any
-    attn_tp_cpu_group: Any
-    attn_cp_group: Any
-    attn_cp_cpu_group: Any
-    world_group: Any
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
@@ -159,7 +157,7 @@ class SchedulerRequestReceiver:
                 recv_reqs = point_to_point_pyobj(
                     [],
                     get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
-                    self.world_group.cpu_group,
+                    get_parallel().world_group.cpu_group,
                     (get_parallel().pp_rank - 1) * get_parallel().tp_size + dp_offset,
                     get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 )
@@ -175,7 +173,7 @@ class SchedulerRequestReceiver:
         rank 0 and would overwrite every DP group's aborts but the first.
         """
         local_reqs = local_reqs or []
-        if get_parallel().enable_dp_attention:
+        if get_parallel().attn_dp_enabled:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)
@@ -197,23 +195,31 @@ class SchedulerRequestReceiver:
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif get_parallel().tp_size != 1:
+                tp_group = get_parallel().tp_group
                 control_reqs = broadcast_pyobj(
                     control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
+                    tp_group.rank,
+                    tp_group.cpu_group,
+                    src=tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
         else:
             if recv_reqs is not None:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                tp_group = get_parallel().tp_group
+                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                if exchange is not None:
+                    recv_reqs = _broadcast_via_exchange(
+                        recv_reqs, exchange=exchange, tp_group=tp_group
+                    )
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        tp_group.cpu_group,
+                        src=tp_group.ranks[0],
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
@@ -268,13 +274,13 @@ class SchedulerRequestReceiver:
 
         # 1. wait until every rank has opened the shared feature segments
         parallel = get_parallel()
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
-                barrier(group=self.attn_tp_cpu_group)
+                barrier(group=parallel.attn_tp_group.cpu_group)
             if parallel.attn_cp_size > 1:
-                barrier(group=self.attn_cp_cpu_group)
+                barrier(group=parallel.attn_cp_group.cpu_group)
         elif parallel.tp_size > 1:
-            barrier(group=self.tp_cpu_group)
+            barrier(group=parallel.tp_group.cpu_group)
 
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
@@ -292,13 +298,17 @@ class SchedulerRequestReceiver:
                 failed[index] = 1
 
         # 3. all ranks reject the same requests before entering model collectives
-        if parallel.enable_dp_attention:
+        if parallel.attn_dp_enabled:
             if parallel.attn_tp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
+                all_reduce(
+                    failed, op=ReduceOp.MAX, group=parallel.attn_tp_group.cpu_group
+                )
             if parallel.attn_cp_size > 1:
-                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
+                all_reduce(
+                    failed, op=ReduceOp.MAX, group=parallel.attn_cp_group.cpu_group
+                )
         elif parallel.tp_size > 1:
-            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+            all_reduce(failed, op=ReduceOp.MAX, group=parallel.tp_group.cpu_group)
 
         error = MMInputsProcessError(
             "Failed to materialize shared-memory multimodal features on a scheduler rank."
@@ -336,3 +346,24 @@ class SchedulerRequestReceiver:
             )
         ]
         return work_reqs, control_reqs
+
+
+def _broadcast_via_exchange(
+    recv_reqs: Optional[List], *, exchange: ShmTagExchange, tp_group
+) -> List:
+    """Same result as broadcast_pyobj; the size travels through shared memory and
+    only a non-empty payload goes over the cpu group."""
+    is_src = tp_group.rank == tp_group.ranks[0]
+    payload = pickle.dumps(recv_reqs) if is_src and recv_reqs else b""
+    size = exchange.allgather([len(payload)])[0][0]
+    if size == 0:
+        return recv_reqs if is_src else []
+    if is_src:
+        data = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        torch.distributed.broadcast(
+            data, src=tp_group.ranks[0], group=tp_group.cpu_group
+        )
+        return recv_reqs
+    data = torch.empty(size, dtype=torch.uint8)
+    torch.distributed.broadcast(data, src=tp_group.ranks[0], group=tp_group.cpu_group)
+    return pickle.loads(data.numpy().tobytes())

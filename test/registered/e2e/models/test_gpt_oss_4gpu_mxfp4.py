@@ -3,7 +3,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
-register_cuda_ci(est_time=119, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=250, stage="extra-b", runner_config="4-gpu-b200")
 
 
 class TestGptOss4GpuMxfp4(BaseTestGptOss):
@@ -32,11 +32,10 @@ class TestGptOss4GpuMxfp4(BaseTestGptOss):
             other_args=[
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--ep",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "none",
                 "--cuda-graph-max-bs-decode",

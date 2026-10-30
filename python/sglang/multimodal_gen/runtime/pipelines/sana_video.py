@@ -62,18 +62,13 @@ class SanaVideoTextEncodingStage(TextEncodingStage):
         return [item.lower().strip() for item in text]
 
     def _encode_negative_text(self, batch, server_args, all_indices):
-        cache_key = self._build_negative_text_cache_key(batch, server_args, all_indices)
-        cached = self._get_cached_negative_text_embedding(cache_key)
-        if cached is not None:
-            return cached
         outputs = self.encode_text(
             self._normalize_text(batch.negative_prompt),
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
-            max_length=300,
+            max_length=batch.max_sequence_length or 300,
         )
-        self._maybe_cache_negative_text_embedding(cache_key, outputs)
         return outputs
 
     @torch.no_grad()

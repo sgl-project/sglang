@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=221, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
@@ -91,6 +91,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
             top_ps=torch.full((batch_size,), top_p, device="cuda"),
             min_ps=torch.full((batch_size,), min_p, device="cuda"),
+            max_top_k=top_k,
             sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
         )
         with patch.object(
