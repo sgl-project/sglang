@@ -803,7 +803,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 is_nextn=False,
             )
 
-        metadata_op = npu_ops.sparse_attn_sharedkv_metadata_host
         metadata_op.assert_called_once()
         self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
         self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)
