@@ -50,7 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
 )
-from sglang.srt.utils import add_prefix, get_device_module, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -742,7 +742,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             device_index = device.index
             dest_device_type = "npu" if is_npu() else "cuda"
             if device.type == dest_device_type and device_index is None:
-                device_index = get_device_module().current_device()
+                device_index = torch.cuda.current_device()
 
             features = []
             for image_index in image_indices:
