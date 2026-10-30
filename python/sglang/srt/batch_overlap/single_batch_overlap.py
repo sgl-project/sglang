@@ -22,6 +22,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
 from sglang.srt.layers.moe.utils import is_sbo_enabled
 from sglang.srt.utils import is_blackwell, is_sail
 
@@ -84,6 +85,13 @@ def compute_overlap_args(dispatch_output, alt_stream):
         SboFlags.enable_combine_down_gemm_two_stream_overlap()
         or SboFlags.enable_combine_shared_two_stream_overlap()
     ):
+        return None, None, {}
+
+    # The rest of this function reads the layout DeepEP's low-latency mode
+    # produces, (num_local_experts, num_tokens, hidden). Normal mode dispatches
+    # a plain (num_tokens, hidden) tensor, which would not even unpack, and it
+    # has its own receive layout anyway, so there is nothing to overlap.
+    if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
         return None, None, {}
 
     hidden_states = dispatch_output.hidden_states
