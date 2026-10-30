@@ -219,6 +219,9 @@ OpenAI layer:
   `tests/scripts/generate_tool_parity.py`: SGLang's `FunctionCallParser` on
   chunked outputs, replayed by the test in `src/tool_call/models/mod.rs`. A tool
   parser is served once `src/tool_call/models/` ports it.
+- DeepSeek-V4 and V4.1 have neither: deepseek-recipe parses their output ids
+  (`src/deepseek_output.rs`), as `serving_deepseek_recipe.py` does, and the
+  openai fixture checks it.
 - `tests/fixtures/openai_parity/<model-id>.json`, from
   `tests/scripts/generate_openai_parity.py --model <dir> --engine-url <engine>`:
   the `/generate` body `OpenAIServingChat` builds for each case, a live engine's
