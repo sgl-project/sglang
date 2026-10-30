@@ -4,11 +4,12 @@ import unittest
 
 from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestNemotronHLayerAliases(unittest.TestCase):
+class TestNemotronHLayerAliases(CustomTestCase):
     def test_transformers_5_names_become_legacy_names(self):
         config = NemotronHConfig(
             layers_block_type=["linear_attention", "full_attention", "mlp", "moe"],
