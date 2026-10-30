@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -130,7 +129,6 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
@@ -2614,14 +2612,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
 
-    # For split prefill
-    split_index: int = 0
-    split_prefill_finished: bool = False
-    split_forward_count: int = 1
-    split_forward_batch: ForwardBatch = None
-    # A full prefill has one result but can span several run_batch calls.
-    split_prefill_start: Optional[Tuple[int, float]] = None
-
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
     # hicache pointer for synchronizing data loading from CPU to GPU
@@ -3378,11 +3368,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             torch.cat(cow_dst_tensors) if cow_dst_tensors else None
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
-
-    def prepare_for_split_prefill(self):
-        self.prepare_for_extend()
-        # For split prefill, we need to set the forward mode to SPLIT_PREFILL
-        self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
@@ -4160,7 +4145,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
-            split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
         )
 

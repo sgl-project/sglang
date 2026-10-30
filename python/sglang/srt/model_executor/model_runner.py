@@ -202,7 +202,6 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
-    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -368,7 +367,6 @@ class ModelRunner:
             not self.is_draft_worker
             and self.is_generation
             and not use_mlx()
-            and not get_disagg().enable_pdmux
             and get_exec().dllm.dllm_algorithm is None
             and self.spec_algorithm.is_none()
             and get_parallel().pp_size == 1
@@ -1156,11 +1154,7 @@ class ModelRunner:
         self.decode_attention_backend_str = resolved.decode
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
-        self.decode_attn_backend = backends.decode_attn_backend
-        self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.runner_ids.bind_and_verify_backends(
-            [self.attn_backend, self.decode_attn_backend]
-        )
+        self.runner_ids.bind_and_verify_backends([self.attn_backend])
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
@@ -1734,9 +1728,6 @@ class ModelRunner:
             model=self.model, device=self.device, tp_size=get_parallel().tp_size
         )
 
-    def update_decode_attn_backend(self, stream_idx: int):
-        self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
-
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
         # Dummy runs bypass the MLP-sync/scatter passes that stamp real batches.
@@ -1820,38 +1811,11 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
-    def forward_split_prefill(
-        self,
-        forward_batch: ForwardBatch,
-        reinit_attn_backend: bool = False,
-        forward_count: int = 1,
-    ) -> LogitsProcessorOutput:
-        if forward_batch.split_index == 0 or reinit_attn_backend:
-            self.attn_backend.init_forward_metadata(forward_batch)
-        next_split_index = min(
-            forward_batch.split_index + forward_count,
-            self.model_config.num_hidden_layers,
-        )
-        with (
-            get_model().override(shared_experts=self.model.shared_experts_config),
-            device_timer_ctx(self.device_timer, "split_prefill"),
-        ):
-            ret = self.model.forward_split_prefill(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                (forward_batch.split_index, next_split_index),
-            )
-        forward_batch.split_index = next_split_index
-        return ret
-
     def forward(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -1892,19 +1856,10 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
+            output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
+                    output, forward_batch, pp_proxy_tensors
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
@@ -2011,8 +1966,6 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         prepare = getattr(self.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -2059,10 +2012,10 @@ class ModelRunner:
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
-            # early; split prefill, the prefill cuda graph, and the eager
-            # forward all run the live batch and need this first — it sets
-            # global_dp_buffer_len / padded token counts that graph eligibility
-            # and the collectives depend on.
+            # early; the prefill cuda graph and the eager forward both run the
+            # live batch and need this first -- it sets global_dp_buffer_len /
+            # padded token counts that graph eligibility and the collectives
+            # depend on.
             self._prepare_eager_forward_batch(forward_batch)
 
             # Deferred mamba COW/clear on the forward stream, before the extend
@@ -2073,14 +2026,7 @@ class ModelRunner:
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
 
-            if forward_batch.forward_mode.is_split_prefill():
-                # Layer-split mode; stays on ModelRunner, not the eager runner.
-                ret = self.forward_split_prefill(
-                    forward_batch,
-                    reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
-                )
-            elif (
+            if (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
@@ -2630,16 +2576,9 @@ class ModelRunner:
         output: ModelRunnerOutput,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
     ) -> ModelRunnerOutput:
         if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
+            output = self._forward_raw(forward_batch, pp_proxy_tensors)
         return output
 
     def update_model_fields(

@@ -311,7 +311,6 @@ from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_o
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -453,7 +452,6 @@ _is_hip = is_hip()
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
-    SchedulerMultiplexMixin,
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
@@ -511,7 +509,6 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
-        self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -554,10 +551,6 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-
-        # Init PD-multiplexing context
-        if self.enable_pdmux:
-            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -4769,11 +4762,7 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
-        is_split_prefill = batch.forward_mode.is_split_prefill()
-        if not is_split_prefill or batch.split_index == 0:
-            batch.after_idle_gap = self._sched_idled
-            if is_split_prefill:
-                batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
+        batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
@@ -4902,12 +4891,6 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
-                batch.input_ids = None
-                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
@@ -5283,10 +5266,7 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
-        if is_prefill and mode.is_split_prefill():
-            start_iter, start_ts = batch.split_prefill_start
-        else:
-            start_iter, start_ts = batch.forward_iter, batch.launch_ts
+        start_iter, start_ts = batch.forward_iter, batch.launch_ts
         prev = self._prev_step
         self._prev_step = (batch.forward_iter, batch.launch_ts, is_prefill)
         # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
@@ -6396,9 +6376,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
-        if scheduler.enable_pdmux:
-            scheduler.event_loop_pdmux()
-        elif get_parallel().pp_size > 1:
+        if get_parallel().pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
