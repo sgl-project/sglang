@@ -564,7 +564,10 @@ class Pi05PolicyModel(nn.Module):
                 if shape:
                     config.state_dim = int(shape[0])
         config.empty_cameras = int(payload.get("empty_cameras", 0) or 0)
-        image_keys.extend(f"empty_camera_{i}" for i in range(config.empty_cameras))
+        for index in range(config.empty_cameras):
+            key = f"empty_camera_{index}"
+            if key not in image_keys:
+                image_keys.append(key)
         if image_keys:
             config.image_keys = tuple(image_keys)
 
@@ -580,7 +583,24 @@ class Pi05PolicyModel(nn.Module):
         config: Pi05PipelineConfig,
     ) -> Pi05CheckpointManifest:
         path = Path(model_path)
-        safetensor_files = sorted(str(p) for p in path.glob("*.safetensors"))
+        processor_state_files = set()
+        for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+            processor_path = path / name
+            if processor_path.is_file():
+                with processor_path.open(encoding="utf-8") as f:
+                    processor = json.load(f)
+                processor_state_files.update(
+                    (path / step["state_file"]).resolve()
+                    for step in processor.get("steps", [])
+                    if step.get("state_file")
+                )
+        # LeRobot stores normalization state beside the neural network weights.
+        # Its pre/postprocessor files can contain the same tensor names.
+        safetensor_files = sorted(
+            str(p)
+            for p in path.glob("*.safetensors")
+            if p.resolve() not in processor_state_files
+        )
         component_keys = {name: [] for name in config.loader_component_map}
         skipped_lm_head_keys: list[str] = []
 

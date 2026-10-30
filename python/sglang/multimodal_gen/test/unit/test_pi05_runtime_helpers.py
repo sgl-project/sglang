@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -491,6 +492,43 @@ def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
 
     model.runtime_role = "idle"
     assert model._should_stream_weights_to_gpu(target_state, {})
+
+
+def test_pi05_checkpoint_excludes_declared_processor_state(tmp_path):
+    from safetensors.torch import save_file
+
+    model_file = tmp_path / "model.safetensors"
+    save_file({"action_in_proj.weight": torch.ones(2, 2)}, model_file)
+    for kind in ("pre", "post"):
+        state_file = f"policy_{kind}processor_step_0.safetensors"
+        save_file({"action.mean": torch.zeros(7)}, tmp_path / state_file)
+        (tmp_path / f"policy_{kind}processor.json").write_text(
+            json.dumps({"steps": [{"state_file": state_file}, {"config": {}}]})
+        )
+
+    manifest = Pi05PolicyModel._inspect_checkpoint(str(tmp_path), Pi05PipelineConfig())
+
+    assert manifest.safetensor_files == [str(model_file)]
+    assert "action_in_proj.weight" in manifest.component_keys["action_heads"]
+
+
+@pytest.mark.parametrize("declared_empty_camera", [False, True])
+def test_pi05_checkpoint_does_not_duplicate_empty_cameras(
+    tmp_path, declared_empty_camera
+):
+    features = {"observation.images.image": {"type": "VISUAL", "shape": [3, 224, 224]}}
+    if declared_empty_camera:
+        features["observation.images.empty_camera_0"] = {
+            "type": "VISUAL",
+            "shape": [3, 224, 224],
+        }
+    (tmp_path / "config.json").write_text(
+        json.dumps({"input_features": features, "empty_cameras": 1})
+    )
+    config = Pi05PipelineConfig()
+    for _ in range(2):
+        Pi05PolicyModel._apply_checkpoint_config(str(tmp_path), config)
+        assert config.image_keys == ("image", "empty_camera_0")
 
 
 def test_pi05_loader_maps_unfused_prefix_weights_to_parallel_targets():
