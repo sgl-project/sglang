@@ -31,6 +31,8 @@ from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 
 register_cpu_ci(est_time=35, suite="base-a-test-cpu")
 
+_TEST_CLOCK_DOMAIN = bytes(range(24))
+
 
 def _run_child(errors, target, args):
     try:
@@ -200,6 +202,10 @@ class TestClockDomainGating(CustomTestCase):
             with (
                 self.subTest(endpoint=endpoint),
                 patch(
+                    "sglang.srt.managers.scheduler_components.ipc_channels.read_clock_domain",
+                    return_value=_TEST_CLOCK_DOMAIN,
+                ),
+                patch(
                     "sglang.srt.managers.scheduler_components.ipc_channels.zmq.Context"
                 ),
                 patch(
@@ -288,6 +294,10 @@ class TestProductionHistogram(CustomTestCase):
                     "sglang.srt.managers.multi_tokenizer_mixin.get_zmq_socket",
                     return_value=receiver,
                 ),
+                patch(
+                    "sglang.srt.managers.multi_tokenizer_mixin.read_clock_domain",
+                    return_value=_TEST_CLOCK_DOMAIN,
+                ),
             ):
                 router = MultiDetokenizerRouter(
                     ["worker"],
@@ -298,9 +308,9 @@ class TestProductionHistogram(CustomTestCase):
             with patch.object(
                 io_struct.time, "monotonic_ns", side_effect=lambda: clock_ns[0]
             ):
-                SenderWrapper(sender, timestamped=True).send_output(
-                    AbortReq(rid="timed")
-                )
+                SenderWrapper(
+                    sender, timestamped=True, clock_domain=_TEST_CLOCK_DOMAIN
+                ).send_output(AbortReq(rid="timed"))
             clock_ns[0] += 1_000_000_000
             with (
                 patch.object(
@@ -393,11 +403,15 @@ def _worker(endpoint, ready, result_queue):
 
 
 def _router(endpoint, worker_endpoints, ready, start_event, observations):
-    router = MultiDetokenizerRouter(
-        worker_endpoints,
-        SimpleNamespace(detokenizer_ipc_name=endpoint),
-        enable_metrics=True,
-    )
+    with patch(
+        "sglang.srt.managers.multi_tokenizer_mixin.read_clock_domain",
+        return_value=_TEST_CLOCK_DOMAIN,
+    ):
+        router = MultiDetokenizerRouter(
+            worker_endpoints,
+            SimpleNamespace(detokenizer_ipc_name=endpoint),
+            enable_metrics=True,
+        )
     router.delivery_seconds = _RecordingHistogram(observations)
     ready.set()
     assert start_event.wait(5), "producer did not send"
@@ -465,7 +479,9 @@ def _delivery_case(pickle_ipc):
             push = context.socket(zmq.PUSH)
             push.connect(router_endpoint)
             time.sleep(0.10)
-            sender = SenderWrapper(push, timestamped=True)
+            sender = SenderWrapper(
+                push, timestamped=True, clock_domain=_TEST_CLOCK_DOMAIN
+            )
             messages = [
                 AbortReq(rid="delivery-a", http_worker_ipc="worker-a"),
                 ConfigureLoggingReq(log_level="debug"),
@@ -556,7 +572,11 @@ def _overhead_case(timestamped):
             push = context.socket(zmq.PUSH)
             push.connect(endpoint)
             time.sleep(0.05)
-            sender = SenderWrapper(push, timestamped=timestamped)
+            sender = SenderWrapper(
+                push,
+                timestamped=timestamped,
+                clock_domain=_TEST_CLOCK_DOMAIN if timestamped else None,
+            )
             messages = [AbortReq(rid=f"overhead-{i}") for i in range(count)]
             if not timestamped:
 
@@ -618,11 +638,15 @@ class TestRouterDeliveryIntegration(CustomTestCase):
 
     def test_router_late_failure_preserves_traceback(self):
         def fail_after_fanout(endpoint, worker_endpoints, ready, start, observations):
-            router = MultiDetokenizerRouter(
-                worker_endpoints,
-                SimpleNamespace(detokenizer_ipc_name=endpoint),
-                enable_metrics=True,
-            )
+            with patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.read_clock_domain",
+                return_value=_TEST_CLOCK_DOMAIN,
+            ):
+                router = MultiDetokenizerRouter(
+                    worker_endpoints,
+                    SimpleNamespace(detokenizer_ipc_name=endpoint),
+                    enable_metrics=True,
+                )
             router.delivery_seconds = _RecordingHistogram(observations)
             original_send = router._send
             send_count = [0]

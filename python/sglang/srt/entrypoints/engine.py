@@ -1181,6 +1181,22 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
+            # Only this launcher owns both the local schedulers and the Python
+            # router. This is a candidate, not proof of the receiver's clock:
+            # the router validates each timestamp's clock-domain identity.
+            port_args.detokenizer_router_local_endpoint = None
+            if (
+                cls is Engine
+                and not envs.SGLANG_RUST_SERVER.get()
+                and get_parallel().node_rank == 0
+                and not get_exec().moe.is_ep_joiner
+                and get_observability().enable_metrics
+                and get_serving().detokenizer_worker_num > 1
+                and not get_serving().skip_tokenizer_init
+            ):
+                port_args.detokenizer_router_local_endpoint = (
+                    port_args.detokenizer_ipc_name
+                )
             logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
             # Start the engine info bootstrap server if per-rank info is needed.

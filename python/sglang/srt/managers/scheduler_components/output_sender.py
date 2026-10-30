@@ -11,9 +11,16 @@ from sglang.srt.managers.io_struct import (
 
 
 class SenderWrapper:
-    def __init__(self, socket: zmq.Socket, *, timestamped: bool = False):
+    def __init__(
+        self,
+        socket: zmq.Socket,
+        *,
+        timestamped: bool = False,
+        clock_domain: Optional[bytes] = None,
+    ):
         self.socket = socket
         self.timestamped = timestamped
+        self.clock_domain = clock_domain
 
     def send_output(
         self,
@@ -33,6 +40,8 @@ class SenderWrapper:
             output.http_worker_ipc = http_worker_ipc
 
         if self.timestamped:
-            sock_send_with_timestamp(self.socket, output)
+            sock_send_with_timestamp(
+                self.socket, output, clock_domain=self.clock_domain
+            )
         else:
             sock_send(self.socket, output)

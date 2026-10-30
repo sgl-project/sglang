@@ -2747,31 +2747,42 @@ def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
 
 
 _IPC_TIMESTAMP_FRAME_BYTES = 8
+_IPC_CLOCK_DOMAIN_BYTES = 24
+_IPC_CLOCK_DOMAIN_VERSION = 1
 
 
-def sock_send_with_timestamp(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+def sock_send_with_timestamp(
+    socket: zmq.Socket,
+    obj: Any,
+    flags: int = 0,
+    *,
+    clock_domain: Optional[bytes] = None,
+) -> None:
     """Send an IPC payload with a pre-serialization monotonic timestamp.
 
     The timestamp follows the payload only for the metrics-enabled
     scheduler-to-detokenizer-router path. Encoding completes before the
     atomic multipart send starts.
     """
+    if clock_domain is not None and len(clock_domain) != _IPC_CLOCK_DOMAIN_BYTES:
+        raise ValueError("Invalid monotonic clock-domain identity length")
     send_time_ns = time.monotonic_ns()
     if _USE_PICKLE_IPC:
         payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     else:
         payload = msgpack_encode(obj)
-    socket.send_multipart(
-        [
-            payload,
-            send_time_ns.to_bytes(_IPC_TIMESTAMP_FRAME_BYTES, byteorder="big"),
-        ],
-        flags=flags,
-    )
+    timestamp_frame = send_time_ns.to_bytes(_IPC_TIMESTAMP_FRAME_BYTES, byteorder="big")
+    if clock_domain is not None:
+        timestamp_frame += bytes([_IPC_CLOCK_DOMAIN_VERSION]) + clock_domain
+    socket.send_multipart([payload, timestamp_frame], flags=flags)
 
 
 def sock_recv_with_timestamp(
-    socket: zmq.Socket, flags: int = 0
+    socket: zmq.Socket,
+    flags: int = 0,
+    *,
+    expected_clock_domain: Optional[bytes] = None,
+    require_clock_domain: bool = False,
 ) -> Tuple[Optional[int], Any]:
     """Receive a timestamped payload, accepting legacy single-frame IPC.
 
@@ -2786,12 +2797,25 @@ def sock_recv_with_timestamp(
     timestamp_frame = socket.recv(flags=flags)
     if socket.getsockopt(zmq.RCVMORE):
         raise ValueError("Expected at most two frames in a timestamped IPC message")
-    if len(timestamp_frame) != _IPC_TIMESTAMP_FRAME_BYTES:
+    if len(timestamp_frame) == _IPC_TIMESTAMP_FRAME_BYTES:
+        # Older timestamp frames have no clock identity. A router requiring
+        # verification must still route the payload, but cannot observe it.
+        if require_clock_domain:
+            return None, obj
+    elif (
+        len(timestamp_frame) == _IPC_TIMESTAMP_FRAME_BYTES + 1 + _IPC_CLOCK_DOMAIN_BYTES
+    ):
+        version = timestamp_frame[_IPC_TIMESTAMP_FRAME_BYTES]
+        domain = timestamp_frame[_IPC_TIMESTAMP_FRAME_BYTES + 1 :]
+        if version != _IPC_CLOCK_DOMAIN_VERSION or domain != expected_clock_domain:
+            return None, obj
+    else:
         raise ValueError(
-            "Invalid timestamp frame length: "
-            f"{len(timestamp_frame)} (expected {_IPC_TIMESTAMP_FRAME_BYTES})"
+            f"Invalid timestamp frame length: {len(timestamp_frame)} (expected 8 or 33)"
         )
-    return int.from_bytes(timestamp_frame, byteorder="big"), obj
+    return int.from_bytes(
+        timestamp_frame[:_IPC_TIMESTAMP_FRAME_BYTES], byteorder="big"
+    ), obj
 
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:

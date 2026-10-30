@@ -41,6 +41,7 @@ import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
+from sglang.srt.managers.delivery_clock import read_clock_domain
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -748,6 +749,7 @@ class MultiDetokenizerRouter:
         self.ipc_name_list = ipc_name_list
         self.num_workers = len(ipc_name_list)
         self.delivery_seconds = None
+        self.delivery_clock_domain = read_clock_domain() if enable_metrics else None
         if enable_metrics:
             from prometheus_client import Histogram
 
@@ -812,7 +814,9 @@ class MultiDetokenizerRouter:
                 recv_obj = sock_recv(self.recv_from_scheduler)
             else:
                 send_time_ns, recv_obj = sock_recv_with_timestamp(
-                    self.recv_from_scheduler
+                    self.recv_from_scheduler,
+                    expected_clock_domain=self.delivery_clock_domain,
+                    require_clock_domain=True,
                 )
                 if send_time_ns is not None:
                     self.delivery_seconds.observe((monotonic_ns() - send_time_ns) / 1e9)

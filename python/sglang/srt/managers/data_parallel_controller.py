@@ -427,6 +427,9 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.detokenizer_router_local_endpoint = getattr(
+                port_args, "detokenizer_router_local_endpoint", None
+            )
             tmp_port_args.instance_id = port_args.instance_id
 
             # This port is checked free in PortArgs.init_new.
@@ -739,6 +742,14 @@ class DataParallelController:
                         rank_port_args.detokenizer_ipc_name = NetworkAddress(
                             primary_addr.host, primary_port_base + 1
                         ).to_tcp()
+                    # Carry the candidate only with the unchanged router target.
+                    if (
+                        rank_port_args.detokenizer_ipc_name
+                        == port_args.detokenizer_ipc_name
+                    ):
+                        rank_port_args.detokenizer_router_local_endpoint = getattr(
+                            port_args, "detokenizer_router_local_endpoint", None
+                        )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port

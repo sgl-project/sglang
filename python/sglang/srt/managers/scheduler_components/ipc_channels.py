@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 import zmq
 
+from sglang.srt.managers.delivery_clock import read_clock_domain
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
@@ -90,17 +91,28 @@ class SchedulerIpcChannels:
 
             send_to_tokenizer = SenderWrapper(send_to_tokenizer_raw)
             timestamped = detokenizer_router_metrics_enabled and not skip_tokenizer_init
-            if timestamped and not _has_local_clock_domain(
-                port_args.detokenizer_ipc_name
-            ):
-                logger.warning(
-                    "Scheduler-to-detokenizer-router delivery latency is not "
-                    "recorded for endpoint %s: monotonic clock domains may differ.",
-                    port_args.detokenizer_ipc_name,
+            clock_domain = None
+            if timestamped:
+                endpoint = port_args.detokenizer_ipc_name
+                local_candidate = (
+                    getattr(port_args, "detokenizer_router_local_endpoint", None)
+                    == endpoint
+                    and endpoint.startswith("tcp://")
+                    and ";" not in endpoint
                 )
-                timestamped = False
+                if _has_local_clock_domain(endpoint) or local_candidate:
+                    clock_domain = read_clock_domain()
+                if clock_domain is None:
+                    logger.warning(
+                        "Scheduler-to-detokenizer-router delivery latency is not "
+                        "recorded for endpoint %s: monotonic clock domain is unknown.",
+                        endpoint,
+                    )
+                    timestamped = False
             send_to_detokenizer = SenderWrapper(
-                send_to_detokenizer_raw, timestamped=timestamped
+                send_to_detokenizer_raw,
+                timestamped=timestamped,
+                clock_domain=clock_domain,
             )
         else:
             recv_from_tokenizer = None

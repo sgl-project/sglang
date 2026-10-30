@@ -761,6 +761,10 @@ class PortArgs:
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
 
+    # Native Engine's candidate router endpoint. The receiver still verifies
+    # the actual sender's clock domain before recording a delivery observation.
+    detokenizer_router_local_endpoint: str | None = None
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
