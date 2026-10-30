@@ -1,0 +1,167 @@
+---
+title: Qwen3-VL-Reranker
+metatags:
+    description: "Serve Qwen3-VL-Reranker with SGLang - multimodal decoder-only reranking over text, images, and videos with yes/no logprob scoring."
+---
+
+## 1. Model Introduction
+
+[Qwen3-VL-Reranker](https://huggingface.co/Qwen/Qwen3-VL-Reranker-2B) extends Qwen3-Reranker to support multimodal content, allowing reranking of documents containing text, images, and videos. Like Qwen3-Reranker, it uses decoder-only yes/no logprob scoring.
+
+<Note>
+Currently only `Qwen3-VL-Reranker-2B` is tested and supported. The 8B model may have different behavior and is not guaranteed to work with this template.
+</Note>
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+
+## 3. Model Deployment
+
+### 3.1 Launch Command
+
+```shell
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-Reranker-2B \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --chat-template examples/chat_template/qwen3_vl_reranker.jinja
+```
+
+### 3.2 Common Pitfalls
+
+- Always use `--chat-template examples/chat_template/qwen3_vl_reranker.jinja` for Qwen3-VL-Reranker.
+- Do NOT launch with `--is-embedding` (it uses decoder-only logprob scoring like Qwen3-Reranker).
+- For best results, use `--disable-radix-cache` to avoid caching issues with multimodal content.
+
+## 4. Model Invocation
+
+### 4.1 Text-Only Reranking (backward compatible)
+
+```python
+import requests
+
+url = "http://127.0.0.1:30000/v1/rerank"
+
+payload = {
+    "model": "Qwen3-VL-Reranker-2B",
+    "query": "What is machine learning?",
+    "documents": [
+        "Machine learning is a branch of artificial intelligence that enables computers to learn from data.",
+        "The weather in Paris is usually mild with occasional rain.",
+        "Deep learning is a subset of machine learning using neural networks with many layers.",
+    ],
+    "instruct": "Retrieve passages that answer the question.",
+    "return_documents": True
+}
+
+response = requests.post(url, json=payload)
+results = response.json()
+
+for item in results:
+    print(f"Score: {item['score']:.4f} - {item['document'][:60]}...")
+```
+
+### 4.2 Image Reranking (text query, image/mixed documents)
+
+```python
+import requests
+
+url = "http://127.0.0.1:30000/v1/rerank"
+
+payload = {
+    "query": "A woman playing with her dog on a beach at sunset.",
+    "documents": [
+        # Document 1: Text description
+        "A woman shares a joyful moment with her golden retriever on a sun-drenched beach at sunset.",
+        # Document 2: Image URL
+        [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/beach_dog.jpeg"
+                }
+            }
+        ],
+        # Document 3: Text + Image (mixed)
+        [
+            {"type": "text", "text": "A joyful scene at the beach:"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/beach_dog.jpeg"
+                }
+            }
+        ]
+    ],
+    "instruct": "Retrieve images or text relevant to the user's query.",
+    "return_documents": False
+}
+
+response = requests.post(url, json=payload)
+results = response.json()
+
+for item in results:
+    print(f"Index: {item['index']}, Score: {item['score']:.4f}")
+```
+
+### 4.3 Multimodal Query Reranking (query with image)
+
+```python
+import requests
+
+url = "http://127.0.0.1:30000/v1/rerank"
+
+payload = {
+    # Query with text and image
+    "query": [
+        {"type": "text", "text": "Find similar images to this:"},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/reference_image.jpeg"
+            }
+        }
+    ],
+    "documents": [
+        "A cat sleeping on a couch.",
+        "A woman and her dog enjoying the sunset at the beach.",
+        "A busy city street with cars and pedestrians.",
+        [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/similar_image.jpeg"
+                }
+            }
+        ]
+    ],
+    "instruct": "Find images or descriptions similar to the query image."
+}
+
+response = requests.post(url, json=payload)
+results = response.json()
+
+for item in results:
+    print(f"Index: {item['index']}, Score: {item['score']:.4f}")
+```
+
+### 4.4 Request Parameters (Multimodal)
+
+- `query` (required): Can be a string (text-only) or a list of content parts:
+  - `&#123;"type": "text", "text": "..."&#125;` for text
+  - `&#123;"type": "image_url", "image_url": &#123;"url": "..."&#125;&#125;` for images
+  - `&#123;"type": "video_url", "video_url": &#123;"url": "..."&#125;&#125;` for videos
+- `documents` (required): List where each document can be a string or list of content parts (same format as query)
+- `instruct` (optional): Instruction text for the reranker
+- `top_n` (optional): Maximum number of documents to return
+- `return_documents` (optional): Whether to return documents in the response (default: `false`)
+
+## 5. References
+
+- [Qwen3-VL-Reranker-2B](https://huggingface.co/Qwen/Qwen3-VL-Reranker-2B) on Hugging Face
+- [SGLang rerank models documentation](https://docs.sglang.ai/supported_models/retrieval_ranking/rerank_models.html)
