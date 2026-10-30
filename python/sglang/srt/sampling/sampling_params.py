@@ -389,26 +389,53 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.is_normalized = True
 
 
-# This function gets a strict upperbound on the maximum number of tokens that would need
-# to be buffered to match the input regex string
-# NOTE: in the worst case, one character that needs to be buffered corresponds to one
-# token
+# Upper bound on the tokens that must be buffered to match the regex, counted in UTF-8
+# bytes because a byte-level tokenizer can spend one token per byte.
+# Not counted: under (?i) a letter can match a wider case variant, e.g. U+212A for "k".
 def get_max_seq_length(regex_str: str):
     return _max_length_from_subpattern(sre_parse.parse(regex_str))
 
 
 MAX_LEN = 2**30
 
+# Longest UTF-8 encoding of a single character.
+MAX_UTF8_CHAR_LEN = 4
+
+
+def _utf8_len(code_point: int) -> int:
+    # Computed from the code point, so a lone surrogate like \ud800 does not raise.
+    if code_point < 0x80:
+        return 1
+    if code_point < 0x800:
+        return 2
+    if code_point < 0x10000:
+        return 3
+    return 4
+
+
+def _max_utf8_len_of_class(items) -> int:
+    # Only literals and ranges have a known width; a negated class or a category
+    # such as \d, \w or \s is Unicode-aware for str patterns and can match any width.
+    max_len = 0
+    for op, av in items:
+        if op == sre_parse.LITERAL:
+            max_len = max(max_len, _utf8_len(av))
+        elif op == sre_parse.RANGE:
+            max_len = max(max_len, _utf8_len(av[1]))
+        else:
+            return MAX_UTF8_CHAR_LEN
+    return max_len
+
 
 def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
     total = 0
     for token, value in subpattern:
-        if token in {
-            sre_parse.LITERAL,  # `value` is any one character
-            sre_parse.IN,  # Any character within `value`
-            sre_parse.ANY,  # "."
-        }:
-            total += 1
+        if token == sre_parse.LITERAL:  # `value` is any one character
+            total += _utf8_len(value)
+        elif token == sre_parse.IN:  # Any character within `value`
+            total += _max_utf8_len_of_class(value)
+        elif token == sre_parse.ANY:  # "."
+            total += MAX_UTF8_CHAR_LEN
         elif token == sre_parse.SUBPATTERN:
             # EG: (a\d+) ->
             # [(SUBPATTERN,
