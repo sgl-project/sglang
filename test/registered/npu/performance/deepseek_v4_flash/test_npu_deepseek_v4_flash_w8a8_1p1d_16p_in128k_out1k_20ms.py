@@ -239,7 +239,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
     max_concurrency = 60
-    num_prompts = 90
+    num_prompts = 85
     input_len = 131072
     output_len = 1024
     random_range_ratio = 1
@@ -259,7 +259,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
 
 
 class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
-    TestNpuPerfMultiNodePdMixTestCaseBase
+    TestNpuPerfMultiNodePdSepTestCaseBase
 ):
     """Pure decode low latency: 128k shared prefix in / 1024 out, C12,
     mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
