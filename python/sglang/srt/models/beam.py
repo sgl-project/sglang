@@ -513,10 +513,10 @@ class BeamAttention(nn.Module):
         self.apply_rope = config.layer_types[layer_id] == "sliding_attention"
         self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
         # MergedColumnParallelLinear shards each projection independently, but
-        # does not replicate KV heads. Keep the existing quantized/replicated
-        # paths until their loading and backend contracts are validated.
-        self.use_packed_projection = (
-            quant_config is None and config.num_key_value_heads >= self.tp_size
+        # does not replicate KV heads.
+        # TODO(ischencheng): pack NVFP4's BF16 attention too after a B300 accuracy run.
+        self.use_packed_projection = config.num_key_value_heads >= self.tp_size and (
+            get_beam_quantization(quant_config) in ("bf16", "fp8")
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -528,6 +528,7 @@ class BeamAttention(nn.Module):
                     config.num_attention_heads * self.head_dim,
                 ],
                 bias=False,
+                quant_config=quant_config,
                 parallel_group="attn_tp",
                 prefix=add_prefix("qkv_gate_proj", prefix),
             )
@@ -1283,6 +1284,7 @@ def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ..
 class BeamForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_gate_proj": ["q_proj", "k_proj", "v_proj", "gate_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
@@ -1397,7 +1399,7 @@ class BeamForCausalLM(nn.Module):
         )
         params = dict(self.named_parameters())
         # Select by the actual destination parameter so PP shards and the
-        # replicated-KV/quantized fallback retain their existing loaders.
+        # replicated-KV/NVFP4 fallback retain their existing loaders.
         attention_shards = {"q_proj": 0, "k_proj": 1, "v_proj": 2, "gate_proj": 3}
         loaded = set()
         for name, weight in weights:
