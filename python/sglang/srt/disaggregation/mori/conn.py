@@ -329,22 +329,17 @@ class GroupedIndexPlan:
             counts=(ends - starts).tolist(),
         )
 
-    def materialize(self, item_len: int) -> BatchTransferPlan:
-        return BatchTransferPlan(
-            local_offsets=[start * item_len for start in self.src_starts],
-            remote_offsets=[start * item_len for start in self.dst_starts],
-            sizes=[count * item_len for count in self.counts],
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class BatchTransferPlan:
-    local_offsets: List[int]
-    remote_offsets: List[int]
-    sizes: List[int]
-
-    def empty(self) -> bool:
-        return not self.sizes
+    def materialize(self, item_len: int) -> npt.NDArray[np.uint64]:
+        """(N, 3) rows of (src_offset, dst_offset, length) for a Copy."""
+        return np.array(
+            [
+                (src * item_len, dst * item_len, count * item_len)
+                for src, dst, count in zip(
+                    self.src_starts, self.dst_starts, self.counts
+                )
+            ],
+            dtype=np.uint64,
+        ).reshape(-1, 3)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1254,19 +1249,19 @@ class MoriKVManager(CommonKVManager):
         self,
         src_desc: MemoryDesc,
         dst_desc: MemoryDesc,
-        plan: BatchTransferPlan,
+        plan: npt.NDArray[np.uint64],
     ) -> List[TransferStatus]:
-        if plan.empty():
+        if not len(plan):
             return []
 
         transfer_uid = self.engine.allocate_transfer_uid()
 
         statuses = self.engine.batch_write(
             [src_desc],
-            [plan.local_offsets],
+            [plan[:, 0].tolist()],
             [dst_desc],
-            [plan.remote_offsets],
-            [plan.sizes],
+            [plan[:, 1].tolist()],
+            [plan[:, 2].tolist()],
             [transfer_uid],
         )
         self._record_submitted_statuses(statuses)
@@ -1279,7 +1274,7 @@ class MoriKVManager(CommonKVManager):
 
     def _build_contiguous_transfer_plan(
         self, grouped_plan: GroupedIndexPlan, item_len: int
-    ) -> BatchTransferPlan:
+    ) -> npt.NDArray[np.uint64]:
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
 
@@ -1344,13 +1339,13 @@ class MoriKVManager(CommonKVManager):
         kv_indices: npt.NDArray[np.int32],
         dst_indices: npt.NDArray[np.int32],
         tp_cfg: TPSliceConfig,
-    ) -> BatchTransferPlan:
+    ) -> npt.NDArray[np.uint64]:
         if kv_indices.size == 0 or dst_indices.size == 0:
-            return BatchTransferPlan([], [], [])
+            return np.empty((0, 3), dtype=np.uint64)
 
         limit = min(kv_indices.size, dst_indices.size)
         if not limit:
-            return BatchTransferPlan([], [], [])
+            return np.empty((0, 3), dtype=np.uint64)
 
         src_pages = kv_indices[:limit].astype(np.int64)
         dst_pages = dst_indices[:limit].astype(np.int64)
@@ -1363,35 +1358,26 @@ class MoriKVManager(CommonKVManager):
         dst_token_offsets = token_slots * tp_cfg.bytes_per_token_dst
 
         local_offsets = (
-            (
-                src_page_bases[:, np.newaxis]
-                + src_token_offsets
-                + tp_cfg.src_head_slice_offset
-            )
-            .flatten()
-            .tolist()
-        )
+            src_page_bases[:, np.newaxis]
+            + src_token_offsets
+            + tp_cfg.src_head_slice_offset
+        ).flatten()
         remote_offsets = (
-            (
-                dst_page_bases[:, np.newaxis]
-                + dst_token_offsets
-                + tp_cfg.dst_head_slice_offset
-            )
-            .flatten()
-            .tolist()
-        )
+            dst_page_bases[:, np.newaxis]
+            + dst_token_offsets
+            + tp_cfg.dst_head_slice_offset
+        ).flatten()
 
         num_transfers = limit * tp_cfg.page_size
-        sizes = [tp_cfg.heads_bytes_per_token_to_send] * num_transfers
 
-        if not local_offsets:
-            return BatchTransferPlan([], [], [])
+        if not local_offsets.size:
+            return np.empty((0, 3), dtype=np.uint64)
 
-        return BatchTransferPlan(
-            local_offsets=local_offsets,
-            remote_offsets=remote_offsets,
-            sizes=sizes,
-        )
+        plan = np.empty((num_transfers, 3), dtype=np.uint64)
+        plan[:, 0] = local_offsets
+        plan[:, 1] = remote_offsets
+        plan[:, 2] = tp_cfg.heads_bytes_per_token_to_send
+        return plan
 
     def send_kvcache(
         self,
@@ -1523,7 +1509,7 @@ class MoriKVManager(CommonKVManager):
         desc_pairs = zip(src_descs[:num_layers], dst_descs[:num_layers])
 
         statuses: List[TransferStatus] = []
-        plan_cache: Dict[tuple[bool, int], BatchTransferPlan] = {}
+        plan_cache: Dict[tuple[bool, int], npt.NDArray[np.uint64]] = {}
         for entry_idx, (src_desc, dst_desc) in enumerate(desc_pairs):
             item_len = token_item_lens[entry_idx]
             is_draft = entry_idx >= num_target
