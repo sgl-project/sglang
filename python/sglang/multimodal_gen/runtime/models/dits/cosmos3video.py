@@ -2006,7 +2006,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     def post_load_weights(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
         """Cast non-quantized parameters to their preferred dtypes and rebuild
-        meta-device buffers.
+        the RoPE buffer.
 
         Time-embedder stays in float32 for numerical stability; embeddings and
         the VAE/LLM bridge linears go to ``target_dtype``. Quantized modules
@@ -2014,8 +2014,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         on them would cast their FP8 weights back to BF16/FP32 and break the
         quant kernels.
 
-        Also re-materializes the RoPE ``inv_freq`` buffer, which can land on
-        the meta device when the model is constructed under a meta context.
+        Also rebuilds the RoPE ``inv_freq`` buffer on ``get_local_torch_device()``
+        and moves it to the DiT's device.
         """
         # Get the actual device from a loaded parameter
         device = next(self.parameters()).device
