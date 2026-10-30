@@ -57,16 +57,16 @@ class _Rank:
     _check_hicache_events_deferred = UnifiedRadixCache._check_hicache_events_deferred
     _drop_deferred_ready_sync = UnifiedRadixCache._drop_deferred_ready_sync
     _consume_deferred_ready_sync = UnifiedRadixCache._consume_deferred_ready_sync
-    _deferred_ready_sync_group = UnifiedRadixCache._deferred_ready_sync_group
+    _async_ready_sync_active = UnifiedRadixCache._async_ready_sync_active
 
     def __init__(self, rank, group):
         self.rank = rank
         self.group = group
         self.enable_storage = False
-        self._hcs_state = object()
+        self._async_ready_sync_group = object()
         self.cache_controller = SimpleNamespace(ack_write_queue=[], ack_load_queue=[])
         self.tree_core = SimpleNamespace(write_back_duplicate_reclaim_digest=0)
-        self._hcs_pending = None
+        self._async_ready_sync_pending = None
         self.written = []
         self.loaded = []
 
@@ -96,7 +96,7 @@ class _Rank:
             return self.group.all_reduce(self.rank, tensor)
 
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
-            self._check_hicache_events_deferred(group=None)
+            self._check_hicache_events_deferred()
 
 
 def _ranks(n=2):
@@ -219,25 +219,90 @@ def test_runtime_storage_attach_falls_back_to_sync():
         per_rank[0].ready = True
     _step_all(ranks)
     for r in ranks:
-        assert r._deferred_ready_sync_group() is r._hcs_state
+        assert r._async_ready_sync_active()
 
     for r in ranks:
         r.enable_storage = True
     for r in ranks:
-        assert r._deferred_ready_sync_group() is None
+        assert not r._async_ready_sync_active()
         assert r.written == ["w0"]
-        assert r._hcs_pending is None
+        assert r._async_ready_sync_pending is None
+        assert r._async_ready_sync_group is None
         r.enable_storage = False
-        assert r._deferred_ready_sync_group() is None
+        assert not r._async_ready_sync_active()
 
 
 def test_drop_waits_and_clears_pending():
     ranks = _ranks()
     _step_all(ranks)
     for r in ranks:
-        assert r._hcs_pending is not None
+        assert r._async_ready_sync_pending is not None
         r._drop_deferred_ready_sync()
-        assert r._hcs_pending is None
+        assert r._async_ready_sync_pending is None
+
+
+class _SizedGroup:
+    def __init__(self, size):
+        self.size = size
+
+
+class _GroupCfg:
+    _create_async_ready_sync_group = UnifiedRadixCache._create_async_ready_sync_group
+
+    def __init__(self, **overrides):
+        self.cache_controller = object()
+        self.pp_size = 1
+        self.enable_storage = False
+        self.host_memory_mode = "cache"
+        self.attn_cp_group = None
+        self.attn_tp_group = _SizedGroup(4)
+        self.tp_group = _SizedGroup(4)
+        for k, v in overrides.items():
+            setattr(self, k, v)
+
+
+def _create_group(cfg, flag=True):
+    new_group = mock.MagicMock(return_value="async-group")
+    with (
+        mock.patch(
+            "sglang.srt.mem_cache.unified_radix_cache.get_memory",
+            return_value=SimpleNamespace(hicache_async_ready_sync=flag),
+        ),
+        mock.patch.object(
+            torch.distributed, "get_world_size", lambda group: group.size
+        ),
+        mock.patch.object(
+            torch.distributed, "get_process_group_ranks", lambda g: [0, 1, 2, 3]
+        ),
+        mock.patch.object(torch.distributed, "new_group", new_group),
+    ):
+        return cfg._create_async_ready_sync_group(), new_group
+
+
+@pytest.mark.parametrize(
+    "overrides, flag",
+    [
+        pytest.param({}, False, id="flag-off"),
+        pytest.param({"cache_controller": None}, True, id="no-host-cache"),
+        pytest.param({"pp_size": 2}, True, id="pipeline-parallel"),
+        pytest.param({"enable_storage": True}, True, id="storage-at-startup"),
+        pytest.param({"host_memory_mode": "buffer_only"}, True, id="buffer-only"),
+        pytest.param({"attn_cp_group": _SizedGroup(2)}, True, id="attention-cp"),
+        pytest.param({"attn_tp_group": _SizedGroup(1)}, True, id="single-attn-rank"),
+    ],
+)
+def test_ineligible_setups_keep_sync_path(overrides, flag):
+    group, new_group = _create_group(_GroupCfg(**overrides), flag=flag)
+    assert group is None
+    new_group.assert_not_called()
+
+
+def test_eligible_setup_creates_dedicated_gloo_group():
+    group, new_group = _create_group(_GroupCfg())
+    assert group == "async-group"
+    new_group.assert_called_once_with(
+        [0, 1, 2, 3], backend="gloo", use_local_synchronization=True
+    )
 
 
 if __name__ == "__main__":
