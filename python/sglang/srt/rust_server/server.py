@@ -516,6 +516,7 @@ class RustServer:
         decode_latencies: Dict[int, float],
         cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
         storage_backend: Optional[str] = None,
+        request_stats: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
@@ -537,8 +538,10 @@ class RustServer:
             ``meta_info`` as Python's TokenizerManager does,
             ``cached_tokens_split`` (by row: the request's cached tokens per
             cache tier, ``(device, host, storage)``, when the cache has more
-            tiers than the device) and, for the whole frame, the attached
-            ``storage_backend``.
+            tiers than the device), for the whole frame, the attached
+            ``storage_backend``, and ``request_stats`` (by row: a finished
+            request's ``meta_info`` keys from scheduler state, which the
+            frontend reports as they are).
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -672,14 +675,19 @@ class RustServer:
         # for the others), a multimodal model's media token counts, the
         # finished requests' decode latencies, the customized_info columns and
         # the cached tokens by tier, each empty when nothing in the batch
-        # carries it, then the frame's storage backend. Only the latencies are
-        # built here, for finished rows; the header stops at its last non-empty
-        # column.
+        # carries it, then the frame's storage backend and the finished
+        # requests' stats. Only the latency and stats columns are built here,
+        # for finished rows; the header stops at its last non-empty column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
             for row, latency in decode_latencies.items():
                 latencies[row] = latency
+        stats = []
+        if request_stats:
+            stats = [None] * len(rids)
+            for row, row_stats in request_stats.items():
+                stats[row] = row_stats
         media = self._multimodal_enabled
         trailing = [
             payload.weight_versions or [],
@@ -691,6 +699,7 @@ class RustServer:
             self._customized_info_json(payload.customized_info),
             cached_tokens_split or [],
             storage_backend,
+            stats,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()

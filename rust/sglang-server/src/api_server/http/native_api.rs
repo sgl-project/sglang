@@ -21,7 +21,7 @@ use crate::message::ids::Rid;
 #[cfg(test)]
 use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
-use crate::message::response::CustomizedInfo;
+use crate::message::response::{CustomizedInfo, RequestStats};
 use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
@@ -74,6 +74,16 @@ impl RequestTiming {
             .get_or_insert_with(|| self.created_at.elapsed());
     }
 
+    /// The terminal output arrived; when no output came before it, it is
+    /// also the first, at the same instant: Python's TokenizerManager reuses
+    /// the first output's arrival time as the finish time, so a request that
+    /// finishes in its first output has no decode interval.
+    fn observe_terminal_output(&mut self) {
+        let now = self.created_at.elapsed();
+        self.time_to_first_token.get_or_insert(now);
+        self.e2e_latency.get_or_insert(now);
+    }
+
     fn terminal_latencies(&self) -> Option<(Duration, Duration)> {
         Some((self.time_to_first_token?, self.e2e_latency?))
     }
@@ -95,6 +105,9 @@ pub(super) struct RequestState {
     /// `SGLANG_FORCE_STREAM_INTERVAL` tokens late, not when its first token
     /// was sampled.
     scheduler_decode_latency: Option<Duration>,
+    /// Metrics are on, so the terminal frame reports the decode throughput
+    /// after the scheduler's request stats, as Python's TokenizerManager does.
+    report_decode_throughput: bool,
     customized_info: CustomizedInfoState,
     hook: Option<RequestHook>,
 }
@@ -110,6 +123,7 @@ impl RequestState {
         Self {
             timing,
             scheduler_decode_latency: None,
+            report_decode_throughput: state.server_args.metrics.is_some(),
             customized_info: CustomizedInfoState::default(),
             hook: state.generate_hook.as_ref().map(|hook| RequestHook {
                 hook: hook.clone(),
@@ -126,8 +140,9 @@ impl RequestState {
     }
 
     fn finish(&mut self, terminal: &mut CoreOutput) {
-        self.observe(terminal);
-        self.timing.finish();
+        self.customized_info
+            .observe(terminal.take_customized_info());
+        self.timing.observe_terminal_output();
         self.scheduler_decode_latency = terminal.scheduler_decode_latency();
     }
 
@@ -141,11 +156,11 @@ impl RequestState {
 
     /// One frame as the client receives it, from `output`: the request's
     /// cumulative output, or one step's delta in an incremental stream. The
-    /// schema's keys, then the `customized_info` keys it reports, then the
-    /// hook's keys.
+    /// schema's keys, then a finished request's stats, then the
+    /// `customized_info` keys it reports, then the hook's keys.
     fn frame(
         &mut self,
-        output: CoreOutput,
+        mut output: CoreOutput,
         mode: FrameMode,
         id: &str,
         index: Option<u32>,
@@ -157,6 +172,13 @@ impl RequestState {
         } else {
             None
         };
+        let mut request_stats = output.take_request_stats();
+        if self.report_decode_throughput
+            && let Some(RequestStats(stats)) = request_stats.as_mut()
+            && let Some(throughput) = decode_throughput(decode_latency, output.completion_tokens)
+        {
+            stats.insert("decode_throughput".into(), throughput.into());
+        }
         let frame = output.frame(id, index, e2e_latency);
         let mut keys = None;
         if let Some(RequestHook { frames, .. }) = &mut self.hook {
@@ -172,11 +194,13 @@ impl RequestState {
         }
         let hook = self.hook.as_ref().map(|request| &request.hook);
         let hook_keys = keys.as_deref().map(|keys| &keys.meta_info);
+        let stats_keys = request_stats.as_ref().map(|RequestStats(stats)| stats);
         let customized_info = self.customized_info.report(mode, |key| {
             if hook.is_some_and(|hook| hook.consumes_customized_info_key(key)) {
                 return false;
             }
             let repeated = SCHEMA_META_INFO_KEYS.contains(&key)
+                || stats_keys.is_some_and(|stats| stats.contains_key(key))
                 || hook_keys.is_some_and(|keys| keys.contains_key(key));
             if repeated && !REPEATED_KEY_WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -188,10 +212,19 @@ impl RequestState {
         });
         NativeFrame {
             frame,
+            request_stats,
             customized_info,
             keys,
         }
     }
+}
+
+/// Python's `get_decode_throughput`: one over the time per output token after
+/// the first, for a request with more than one and a positive decode latency.
+fn decode_throughput(decode_latency: Option<Duration>, completion_tokens: u64) -> Option<f64> {
+    let decode_latency = decode_latency?.as_secs_f64();
+    (completion_tokens > 1 && decode_latency > 0.0)
+        .then(|| 1.0 / (decode_latency / (completion_tokens - 1) as f64))
 }
 
 /// The keys `api::GenerateMetaInfo` writes. A `customized_info` key of the
@@ -338,11 +371,12 @@ impl serde::Serialize for ReportedCustomizedInfo {
 }
 
 /// One native `/generate` frame: the `api.v1` frame, then in its `meta_info`
-/// the request's `customized_info` keys and the keys a model package's hook
-/// added.
+/// a finished request's stats, the request's `customized_info` keys and the
+/// keys a model package's hook added.
 #[derive(Debug)]
 pub(super) struct NativeFrame {
     frame: api::GenerateResponse,
+    request_stats: Option<RequestStats>,
     customized_info: ReportedCustomizedInfo,
     keys: Option<Box<GenerateFrameKeys>>,
 }
@@ -357,12 +391,15 @@ impl serde::Serialize for NativeFrame {
             #[serde(flatten)]
             schema: &'a T,
             #[serde(flatten)]
+            request_stats: Option<&'a RequestStats>,
+            #[serde(flatten)]
             customized_info: &'a ReportedCustomizedInfo,
             #[serde(flatten)]
             added: &'a serde_json::Map<String, serde_json::Value>,
         }
 
-        if self.keys.is_none() && self.customized_info.0.is_empty() {
+        if self.request_stats.is_none() && self.keys.is_none() && self.customized_info.0.is_empty()
+        {
             return self.frame.serialize(serializer);
         }
         let no_keys = GenerateFrameKeys::default();
@@ -383,6 +420,7 @@ impl serde::Serialize for NativeFrame {
         if let Some(meta_info) = meta_info {
             let meta_info = WithKeys {
                 schema: meta_info,
+                request_stats: self.request_stats.as_ref(),
                 customized_info: &self.customized_info,
                 added: &keys.meta_info,
             };
@@ -934,6 +972,7 @@ mod tests {
                     e2e_latency: None,
                 },
                 scheduler_decode_latency: None,
+                report_decode_throughput: false,
                 customized_info: CustomizedInfoState::default(),
                 hook: None,
             },
@@ -1340,6 +1379,14 @@ mod tests {
             Some((recorded_ttft, e2e_latency)),
             "later terminal handling must not overwrite E2E latency"
         );
+
+        let mut first_is_terminal = RequestTiming::new();
+        first_is_terminal.observe_terminal_output();
+        assert_eq!(
+            first_is_terminal.decode_latency(),
+            Some(Duration::ZERO),
+            "a request that finishes in its first output has no decode interval"
+        );
     }
 
     /// A model package's hook: the request's `top_p` on every frame, a
@@ -1376,18 +1423,23 @@ mod tests {
         }
     }
 
-    /// A hook's keys reach every native frame of every batch item — unary,
-    /// cumulative and incremental streams — each item's hook started from its
-    /// own sampling params, with the scheduler's decode latency for a unary
-    /// item and this frontend's for a streamed one; without a hook the frames
-    /// are the schema's.
+    /// A hook's keys reach every native frame of every request — unary,
+    /// cumulative and incremental streams, single and batch — each request's
+    /// hook started from its own sampling params, with the scheduler's decode
+    /// latency for a unary request and this frontend's for a streamed one;
+    /// without a hook the frames are the schema's. A finished request's stats
+    /// reach its terminal frame only, after the schema's keys and before the
+    /// hook's, with the decode throughput when metrics are on; a request whose
+    /// terminal output carries no stats (an older scheduler) reports neither.
     #[tokio::test]
     async fn generate_hook_keys_reach_every_frame() {
-        for (stream, incremental, hook) in [
-            (false, false, true),
-            (true, false, true),
-            (true, true, true),
-            (true, true, false),
+        for (stream, incremental, hook, batch, metrics) in [
+            (false, false, true, true, true),
+            (false, false, false, false, false),
+            (true, false, true, true, false),
+            (true, false, false, false, true),
+            (true, true, true, true, true),
+            (true, true, false, false, true),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
@@ -1409,6 +1461,16 @@ mod tests {
                 core,
                 server_args: Arc::new(crate::message::config::ServerArgs {
                     incremental_streaming_output: incremental,
+                    metrics: metrics.then(|| crate::message::config::MetricsConfig {
+                        multiproc_dir: String::new(),
+                        labels: Default::default(),
+                        priority_label: false,
+                        bucket_time_to_first_token: None,
+                        bucket_inter_token_latency: None,
+                        bucket_e2e_request_latency: None,
+                        bucket_prompt_tokens: None,
+                        bucket_generation_tokens: None,
+                    }),
                     ..Default::default()
                 }),
                 generation_policy: GenerationPolicy::default(),
@@ -1416,11 +1478,13 @@ mod tests {
                 generate_hook: hook.then(|| Arc::new(TopPHook) as Arc<dyn crate::GenerateHook>),
                 openai_chat: None,
             });
-            // Both items' delta, then both terminals: an incremental stream
-            // emits two frames per item.
+            let items = if batch { 2 } else { 1 };
+            // Every item's delta, then every terminal: a stream emits two
+            // frames per item. The first item's terminal output carries its
+            // stats.
             let responder = tokio::spawn(async move {
                 let mut sinks = Vec::new();
-                for _ in 0..2 {
+                for _ in 0..items {
                     let TmEvent::Intake { request, admission } =
                         intake_rx.recv_async().await.unwrap()
                     else {
@@ -1436,25 +1500,39 @@ mod tests {
                     chunk.rid = rid.clone();
                     sink.try_send(ResponseItem::Frame(chunk)).unwrap();
                 }
-                for (rid, sink) in &sinks {
+                // A streamed item's decode latency runs from this frontend's
+                // first output, so let the stream take that first.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                for (item, (rid, sink)) in sinks.iter().enumerate() {
                     let ResponseItem::Done(mut chunk) = done(0, "b") else {
                         unreachable!()
                     };
                     chunk.rid = rid.clone();
-                    // The scheduler times non-streaming requests only.
-                    chunk.extras = (!stream).then(|| {
-                        Box::new(crate::message::response::ChunkExtras {
-                            decode_latency: Some(0.25),
-                            ..Default::default()
-                        })
-                    });
+                    let mut stats = serde_json::Map::new();
+                    stats.insert("num_retractions".into(), serde_json::json!(1));
+                    stats.insert("queue_time".into(), serde_json::json!(0.5));
+                    let extras = crate::message::response::ChunkExtras {
+                        // The scheduler times non-streaming requests only.
+                        decode_latency: (!stream).then_some(0.25),
+                        request_stats: (item == 0).then(|| RequestStats(stats)),
+                        ..Default::default()
+                    };
+                    chunk.extras = Some(Box::new(extras));
                     sink.try_send(ResponseItem::Done(chunk)).unwrap();
                 }
             });
+            let (text, sampling_params) = if batch {
+                (
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([{"top_p": 0.5}, {"top_p": 0.25}]),
+                )
+            } else {
+                (serde_json::json!("x"), serde_json::json!({"top_p": 0.5}))
+            };
             let body = serde_json::json!({
-                "text": ["x", "y"],
+                "text": text,
                 "stream": stream,
-                "sampling_params": [{"top_p": 0.5}, {"top_p": 0.25}],
+                "sampling_params": sampling_params,
             });
             let request = Request::builder()
                 .method("POST")
@@ -1474,18 +1552,53 @@ mod tests {
                     .filter(|data| *data != "[DONE]")
                     .map(parse)
                     .collect()
-            } else {
+            } else if batch {
                 parse(body).as_array().unwrap().clone()
+            } else {
+                vec![parse(body)]
             };
 
-            let case = format!("stream={stream} incremental={incremental} hook={hook}");
-            assert_eq!(frames.len(), if incremental { 4 } else { 2 }, "{case}");
+            let case = format!(
+                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics}"
+            );
+            // A stream takes each delta before its terminal output arrives.
+            assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
             let mut seen = [0usize; 2];
             for (position, frame) in frames.iter().enumerate() {
-                // A unary batch is an array in request order, without `index`.
-                let index = frame["index"].as_u64().map_or(position, |i| i as usize);
-                let meta = &frame["meta_info"];
+                // A unary batch is an array in request order, without `index`;
+                // a single request has none either.
+                let index = frame["index"]
+                    .as_u64()
+                    .map_or(if batch { position } else { 0 }, |i| i as usize);
+                let meta = frame["meta_info"].as_object().unwrap();
                 let terminal = !meta["finish_reason"].is_null();
+                let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+                let stats = terminal && index == 0;
+                assert_eq!(meta.get("num_retractions").is_some(), stats, "{case}");
+                assert_eq!(
+                    meta.get("decode_throughput").is_some(),
+                    stats && metrics,
+                    "{case}"
+                );
+                if stats {
+                    let at = keys
+                        .iter()
+                        .position(|key| *key == "num_retractions")
+                        .unwrap();
+                    assert_eq!(
+                        keys[at..at + 2],
+                        ["num_retractions", "queue_time"],
+                        "{case}"
+                    );
+                    assert_eq!(meta["queue_time"], 0.5, "{case}");
+                    if metrics {
+                        assert_eq!(keys[at + 2], "decode_throughput", "{case}");
+                        // Two tokens, 0.25 s apart by the scheduler's clock.
+                        if !stream {
+                            assert_eq!(meta["decode_throughput"], 4.0, "{case}");
+                        }
+                    }
+                }
                 if !hook {
                     assert!(meta.get("top_p").is_none() && frame.get("first").is_none());
                     continue;
@@ -1495,6 +1608,11 @@ mod tests {
                 assert_eq!(meta.get("decode_s").is_some(), terminal, "{case}");
                 if terminal && !stream {
                     assert_eq!(meta["decode_s"], 0.25, "{case}");
+                }
+                if stats {
+                    let stats_at = keys.iter().position(|key| *key == "num_retractions");
+                    let hook_at = keys.iter().position(|key| *key == "top_p");
+                    assert!(stats_at < hook_at, "{case}");
                 }
                 seen[index] += 1;
             }
@@ -1727,9 +1845,10 @@ mod tests {
         assert_eq!(meta["seen"], json!({"probe": [2], "aux": ["y"]}));
     }
 
-    /// A `customized_info` key that repeats a key the schema or the hook
-    /// writes gives way, so `meta_info` never has a key twice; the hook still
-    /// sees it. `SCHEMA_META_INFO_KEYS` names every key the schema writes.
+    /// A `customized_info` key that repeats a key the schema, the request's
+    /// stats or the hook writes gives way, so `meta_info` never has a key
+    /// twice; the hook still sees it. `SCHEMA_META_INFO_KEYS` names every key
+    /// the schema writes.
     #[tokio::test]
     async fn repeated_customized_info_keys_give_way() {
         use serde_json::json;
@@ -1776,21 +1895,41 @@ mod tests {
         let info = [
             ("id", json!([1])),
             ("top_p", json!([2])),
+            ("queue_time", json!([4])),
             ("kept", json!([3])),
         ];
-        tx.send(customized(1, &info, true)).await.unwrap();
+        let ResponseItem::Done(mut terminal) = customized(1, &info, true) else {
+            unreachable!()
+        };
+        let stats = serde_json::Map::from_iter([("queue_time".into(), json!(0.5))]);
+        terminal.extras.as_mut().unwrap().request_stats = Some(RequestStats(stats));
+        tx.send(ResponseItem::Done(terminal)).await.unwrap();
         let (_, item) = drain_unary(&mut call, "rid", request).await;
         let text = json_string(&item);
         assert_eq!(text.matches(r#""id":"#).count(), 1, "{text}");
         assert_eq!(text.matches(r#""top_p":"#).count(), 1, "{text}");
+        assert_eq!(text.matches(r#""queue_time":"#).count(), 1, "{text}");
         let meta = &parse(&text)["meta_info"];
         assert_eq!(meta["id"], "rid");
         assert_eq!(meta["top_p"], 1.0);
+        assert_eq!(meta["queue_time"], 0.5);
         assert_eq!(meta["kept"], json!([3]));
     }
 
-    /// The hook-aware serializer writes the generated one's keys, in its
-    /// order, before the hook's.
+    /// As Python's `get_time_per_output_token`, a request reports no decode
+    /// throughput without a second token or without a positive decode
+    /// latency (its first output was also its last).
+    #[test]
+    fn decode_throughput_needs_two_tokens_and_a_decode_latency() {
+        let latency = Some(Duration::from_millis(250));
+        assert_eq!(decode_throughput(latency, 3), Some(8.0));
+        assert_eq!(decode_throughput(latency, 1), None);
+        assert_eq!(decode_throughput(Some(Duration::ZERO), 3), None);
+        assert_eq!(decode_throughput(None, 3), None);
+    }
+
+    /// The serializer writes the generated one's keys, in its order, then a
+    /// finished request's stats, then the hook's.
     #[test]
     fn native_frame_keeps_the_schema_keys_first() {
         let schema = api::GenerateResponse {
@@ -1807,6 +1946,7 @@ mod tests {
         let expected = json_string(&schema);
         let empty = NativeFrame {
             frame: schema.clone(),
+            request_stats: Some(RequestStats::default()),
             customized_info: ReportedCustomizedInfo::default(),
             keys: Some(Box::default()),
         };
@@ -1815,12 +1955,18 @@ mod tests {
         let mut keys = GenerateFrameKeys::default();
         keys.meta_info.insert("m".into(), serde_json::json!(1));
         keys.frame.insert("f".into(), serde_json::json!({"k": "v"}));
+        let mut stats = serde_json::Map::new();
+        stats.insert("num_retractions".into(), serde_json::json!(0));
+        stats.insert("queue_time".into(), serde_json::json!(0.5));
         let added = NativeFrame {
             frame: schema,
+            request_stats: Some(RequestStats(stats)),
             customized_info: ReportedCustomizedInfo::default(),
             keys: Some(Box::new(keys)),
         };
         let mut with_meta: serde_json::Value = parse(&expected);
+        with_meta["meta_info"]["num_retractions"] = serde_json::json!(0);
+        with_meta["meta_info"]["queue_time"] = serde_json::json!(0.5);
         with_meta["meta_info"]["m"] = serde_json::json!(1);
         with_meta["f"] = serde_json::json!({"k": "v"});
         assert_eq!(json_string(&added), with_meta.to_string());
@@ -1980,6 +2126,7 @@ mod tests {
         let request = RequestState {
             timing,
             scheduler_decode_latency: None,
+            report_decode_throughput: false,
             customized_info: CustomizedInfoState::default(),
             hook: None,
         };

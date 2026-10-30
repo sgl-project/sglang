@@ -32,7 +32,6 @@ from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
 from http import HTTPStatus
 from typing import (
     Any,
@@ -184,6 +183,9 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
 )
+from sglang.srt.speculative.spec_decoding_metrics import (
+    populate_spec_info,
+)
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -252,18 +254,6 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
                 "The request was not run locally in language-only mode."
             ),
         )
-
-
-@lru_cache(maxsize=1)
-def _ragged_verify_cap_accept() -> bool:
-    # The mode env is fixed at server launch; cache to keep it off the
-    # per-request metrics path.
-    from sglang.srt.speculative.ragged_verify import (
-        RaggedVerifyMode,
-        read_ragged_verify_mode,
-    )
-
-    return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
 
 
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
@@ -3201,67 +3191,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        if (
+        if not (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                get_spec().speculative_num_draft_tokens - 1
-            )
-            num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
+            return
 
-            # Calculate per-request acceptance rate and average acceptance length.
-            if num_proposed_drafts > 0:
-                # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
-                # accept_length: completion_tokens / verify_ct (includes bonus token).
-                meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
-                )
+        def row(name: str) -> Any:
+            values = getattr(recv_obj, name, None)
+            return values[i] if values is not None and len(values) > i else None
 
-                meta_info["spec_num_correct_drafts"] = num_correct_drafts
-                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-
-                if (
-                    getattr(recv_obj, "spec_num_cap_tokens", None) is not None
-                    and len(recv_obj.spec_num_cap_tokens) > i
-                    and recv_obj.spec_num_cap_tokens[i] > 0
-                ):
-                    meta_info["spec_cap_length"] = (
-                        recv_obj.spec_num_cap_tokens[i] / recv_obj.spec_verify_ct[i]
-                    )
-                if (
-                    _ragged_verify_cap_accept()
-                    and getattr(recv_obj, "spec_num_block_accept_tokens", None)
-                    is not None
-                    and len(recv_obj.spec_num_block_accept_tokens) > i
-                ):
-                    meta_info["spec_block_accept_length"] = (
-                        recv_obj.spec_num_block_accept_tokens[i]
-                        / recv_obj.spec_verify_ct[i]
-                    )
-
-            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
-            if (
-                recv_obj.spec_correct_drafts_histogram
-                and len(recv_obj.spec_correct_drafts_histogram) > i
-                and recv_obj.spec_correct_drafts_histogram[i]
-            ):
-                meta_info["spec_correct_drafts_histogram"] = (
-                    recv_obj.spec_correct_drafts_histogram[i]
-                )
-            if (
-                getattr(recv_obj, "spec_cap_lens_histogram", None)
-                and len(recv_obj.spec_cap_lens_histogram) > i
-                and recv_obj.spec_cap_lens_histogram[i]
-            ):
-                meta_info["spec_cap_lens_histogram"] = recv_obj.spec_cap_lens_histogram[
-                    i
-                ]
+        populate_spec_info(
+            meta_info,
+            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            completion_tokens=recv_obj.completion_tokens[i],
+            verify_ct=recv_obj.spec_verify_ct[i],
+            num_correct_drafts=recv_obj.spec_num_correct_drafts[i],
+            num_cap_tokens=row("spec_num_cap_tokens"),
+            num_block_accept_tokens=row("spec_num_block_accept_tokens"),
+            correct_drafts_histogram=row("spec_correct_drafts_histogram"),
+            cap_lens_histogram=row("spec_cap_lens_histogram"),
+        )
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (

@@ -2,6 +2,7 @@
 
 import json
 import os
+import pickle
 import threading
 import unittest
 from array import array
@@ -15,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
+from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
@@ -52,11 +54,86 @@ NO_EXTRAS = dict.fromkeys(
 )
 
 
+class _StreamedReq:
+    """A request as `SchedulerOutputStreamer` reads it, in either egress mode:
+    retracted, waiting on the cache and verifying drafts as the arguments say."""
+
+    def __init__(
+        self, rid, output_ids, *, finished, retractions, time_stats, spec_counters
+    ):
+        self.rid = rid
+        self.http_worker_ipc = None
+        self.beam_group = None
+        self._finished = finished
+        self.finished_reason = (
+            SimpleNamespace(to_json=lambda: {"type": "length", "length": 3})
+            if finished
+            else None
+        )
+        self.finished_output = False
+        self.finished_len = None
+        # Streamed, so the scheduler sends no decode latency.
+        self.stream = True
+        self.sampling_params = SimpleNamespace(
+            stream_interval=None,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+            no_stop_trim=False,
+        )
+        self.output_ids = self.output_ids_through_stop = array("q", output_ids)
+        self.send_token_offset = 0
+        self.send_output_token_logprobs_offset = 0
+        self.send_decode_id_offset = 0
+        self.decoded_text = ""
+        self.origin_input_ids = [1, 2]
+        self.reasoning_tokens = 0
+        self.cached_tokens = 0
+        self.cached_tokens_device = self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
+        self.mm_image_tokens = self.mm_audio_tokens = self.mm_video_tokens = 0
+        self.multimodal_inputs = None
+        self.retraction_count = retractions
+        self.request_stats_retraction_count = None
+        self.detokenize_header_sent = False
+        self.origin_input_ids_unpadded = array("q")
+        self.prefill_weight_versions = None
+        self.weight_version_events = []
+        self.time_stats = time_stats
+        (
+            self.spec_verify_ct,
+            self.spec_num_correct_drafts,
+            self.spec_num_cap_tokens,
+            self.spec_num_block_accept_tokens,
+            self.spec_correct_drafts_histogram,
+            self.spec_cap_lens_histogram,
+        ) = spec_counters
+        self.customized_info = None
+        self.return_hidden_states = False
+        self.return_routed_experts = False
+        self.return_indexer_topk = False
+        self.return_sampling_mask = False
+
+    def finished(self):
+        return self._finished
+
+    take_request_stats_due = Req.take_request_stats_due
+    take_detokenize_header_due = Req.take_detokenize_header_due
+
+    def get_mm_token_counts(self):
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
+    def init_incremental_detokenize(self):
+        return self.output_ids_through_stop, 0
+
+    def check_match_stop_str_prefix(self):
+        return False
+
+
 def build_rust_frame_metadata_fixture() -> dict:
     """The headers `push_generation` and `push_abort` send for the weight-version,
-    media-count, decode-latency and cached-token-split columns, and the
-    `meta_info` keys Python's TokenizerManager derives from the same values,
-    with "launch" as the server's weight version, plus the
+    media-count, decode-latency, cached-token-split and request-stats columns,
+    and the `meta_info` keys Python's TokenizerManager derives from the same
+    values, with "launch" as the server's weight version, plus the
     `sglang:cached_tokens_total` increments by `cache_source` its metrics
     collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
@@ -66,9 +143,11 @@ def build_rust_frame_metadata_fixture() -> dict:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.observability.metrics_collector import (
         TokenizerMetricsCollector,
     )
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils.weight_versions import (
         WeightVersionSpan,
@@ -99,13 +178,18 @@ def build_rust_frame_metadata_fixture() -> dict:
         decode_latencies,
         cached_tokens_split=None,
         storage_backend=None,
+        request_stats=None,
         **columns,
     ):
         server = RustServer(Mock(), http_port=0)
         server._multimodal_enabled = multimodal
         payload = SimpleNamespace(**{**NO_EXTRAS, **columns})
         server.push_generation(
-            payload, decode_latencies, cached_tokens_split, storage_backend
+            payload,
+            decode_latencies,
+            cached_tokens_split,
+            storage_backend,
+            request_stats,
         )
         header, data = server.server.push_decode_result_batch.call_args.args
         return {
@@ -271,6 +355,116 @@ def build_rust_frame_metadata_fixture() -> dict:
             "unsplit": (2, 0, 0, 0),
         },
     )
+
+    def stats_batch():
+        """A speculative scheduler's frame with metrics on, in cap-accept
+        ragged verify mode, for a finished request and a running one: the
+        header the Rust egress sends, and the finished request's `meta_info`
+        keys Python's TokenizerManager derives from its own copy of the batch
+        output (`_handle_batch_output`: `num_retractions`, the scheduler time
+        stats, `_calculate_spec_decoding_metrics`). The running request
+        reports none in Rust mode."""
+
+        def reqs():
+            return [
+                _StreamedReq(
+                    "done",
+                    [1, 2, 3],
+                    finished=True,
+                    retractions=2,
+                    time_stats=SchedulerReqTimeStats(
+                        enable_metrics=True,
+                        forward_entry_time=100.25,
+                        prefill_finished_time=100.75,
+                        queue_duration_s=0.125,
+                        storage_prefetch_wait_s=0.5,
+                    ),
+                    spec_counters=(3, 4, 5, 7, [0, 1, 2], [0, 3]),
+                ),
+                _StreamedReq(
+                    "running",
+                    [4],
+                    finished=False,
+                    retractions=0,
+                    time_stats=SchedulerReqTimeStats(enable_metrics=True),
+                    spec_counters=(1, 1, 0, 0, [0, 1], []),
+                ),
+            ]
+
+        def streamer(rust_server, send_to_detokenizer):
+            return SchedulerOutputStreamer(
+                send_to_detokenizer=send_to_detokenizer,
+                tree_cache=None,
+                server_args=SimpleNamespace(
+                    enable_hierarchical_cache=False, enable_lmcache=False
+                ),
+                is_generation=True,
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
+                enable_hicache_storage=lambda: False,
+                rust_server=rust_server,
+            )
+
+        streamer_module = "sglang.srt.managers.scheduler_components.output_streamer"
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
+        )
+        with (
+            patch(
+                f"{streamer_module}.get_serving",
+                return_value=SimpleNamespace(
+                    stream_interval=1, weight_version="launch"
+                ),
+            ),
+            patch(
+                f"{streamer_module}.get_observability",
+                return_value=SimpleNamespace(
+                    enable_request_time_stats_logging=False, enable_metrics=True
+                ),
+            ),
+            patch(
+                f"{streamer_module}.get_parallel",
+                return_value=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+            ),
+            patch(f"{streamer_module}.get_spec", return_value=spec),
+            patch("sglang.srt.managers.tokenizer_manager.get_spec", return_value=spec),
+            patch(
+                "sglang.srt.speculative.spec_decoding_metrics.ragged_verify_cap_accept",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.observability.req_time_stats.global_diff_realtime_monotonic",
+                1_760_000_000.0,
+            ),
+        ):
+            rust_server = RustServer(Mock(), http_port=0)
+            streamer(rust_server, None)._stream_output_generation(reqs(), False)
+            header, data = rust_server.server.push_decode_result_batch.call_args.args
+
+            # Python mode: the batch output crosses to TokenizerManager's
+            # process.
+            detokenizer = Mock()
+            streamer(None, detokenizer)._stream_output_generation(reqs(), False)
+            recv_obj = pickle.loads(
+                pickle.dumps(detokenizer.send_output.call_args.args[0])
+            )
+            meta = {"num_retractions": recv_obj.request_stats[0].retraction_count}
+            meta.update(recv_obj.request_stats[0].time_stats.to_meta_info())
+            TokenizerManager._calculate_spec_decoding_metrics(None, meta, recv_obj, 0)
+        return {
+            "header": header.hex(),
+            "data": b"".join(data).hex(),
+            "decode_latencies": {},
+            "meta_info": {
+                "done": meta_info(
+                    [WeightVersionSpan(version="launch", start=0, end=3)], 3
+                ),
+                "running": meta_info(None, 1),
+            },
+            "request_stats": {"done": meta},
+        }
+
     # The scheduler's spans run past the three tokens the client received.
     aborted = [
         WeightVersionSpan(version="old", start=0, end=2),
@@ -285,6 +479,7 @@ def build_rust_frame_metadata_fixture() -> dict:
         "logprob_batch": logprob_batch,
         "host_tier": host_tier,
         "storage_tier": storage_tier,
+        "request_stats": stats_batch(),
         "abort": {
             "header": abort_header.hex(),
             "completion_tokens": 3,
