@@ -8,10 +8,79 @@ from sglang.kernels.ops.diffusion import (
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+def _partial_neox_reference(x, weight, cache, positions, rope_dim, eps):
+    normalized = (
+        x.float()
+        * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        * weight.float()
+    ).to(x.dtype)
+    half = rope_dim // 2
+    cos, sin = cache.index_select(0, positions).chunk(2, dim=-1)
+    first = normalized[..., :half].float()
+    second = normalized[..., half:rope_dim].float()
+    output = normalized.clone()
+    output[..., :half] = (
+        first * cos[:, None].float() - second * sin[:, None].float()
+    ).to(x.dtype)
+    output[..., half:rope_dim] = (
+        second * cos[:, None].float() + first * sin[:, None].float()
+    ).to(x.dtype)
+    return output
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm wave64 coverage")
+def test_rocm_partial_neox_matches_torch_reference() -> None:
+    """Partial-RoPE shuffles stay inside each logical warp on wave64."""
+    tokens, q_heads, kv_heads, head_dim, rope_dim = 33, 7, 3, 128, 96
+    eps = 1e-5
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    q = torch.randn(tokens, q_heads, head_dim, generator=generator).to(
+        "cuda", torch.bfloat16
+    )
+    k = torch.randn(tokens, kv_heads, head_dim, generator=generator).to(
+        "cuda", torch.bfloat16
+    )
+    q_weight = (torch.rand(head_dim, generator=generator) + 0.5).to(
+        "cuda", torch.bfloat16
+    )
+    k_weight = (torch.rand(head_dim, generator=generator) + 0.5).to(
+        "cuda", torch.bfloat16
+    )
+    angles = torch.randn(tokens, rope_dim // 2, generator=generator)
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(
+        "cuda", torch.bfloat16
+    )
+    positions = torch.randperm(tokens, generator=generator).to("cuda")
+    q_expected = _partial_neox_reference(
+        q, q_weight, cache, positions, rope_dim, eps
+    )
+    k_expected = _partial_neox_reference(
+        k, k_weight, cache, positions, rope_dim, eps
+    )
+
+    fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cache,
+        positions,
+        is_neox=True,
+        eps=eps,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+    )
+
+    torch.testing.assert_close(q, q_expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k, k_expected, atol=2e-2, rtol=2e-2)
 
 
 def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
