@@ -88,10 +88,8 @@ def _cpu_staging_environment(*, dcp_size=1, **memory_overrides):
         stack.enter_context(
             mock.patch.object(
                 kv_cache_builder,
-                "get_disagg",
-                return_value=SimpleNamespace(
-                    disaggregation_decode_retraction_backup=None
-                ),
+                "decode_attaches_hicache_host_stack",
+                return_value=False,
             )
         )
         stack.enter_context(

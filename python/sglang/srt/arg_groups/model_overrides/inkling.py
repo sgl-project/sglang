@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    keeps_mamba_checkpoints_of,
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
@@ -56,7 +57,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
     # The generic resolution never sets the arch-derived leaf for Inkling, and
     # handle_mamba_radix_cache rejects extra_buffer on a model without it.
-    if not cfg.disable_radix_cache:
+    if keeps_mamba_checkpoints_of(cfg):
         overrides["uses_mamba_radix_cache"] = True
     # Inkling attention runs only on the fa4 (Hopper/Blackwell) or triton backends --
     # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
