@@ -2,6 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
+# The most elements of one field a launch copies: up to this size, a copy riding in the
+# group's launch costs less than a launch of its own (DMA copies included).
+MAX_FIELD_NUMEL = 65536
+
 
 @triton.jit(
     do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
@@ -75,7 +79,7 @@ def try_small_copy(dsts, srcs):
             or src.device != device
             or dst.shape != src.shape
             or dst.ndim not in (1, 2)
-            or dst.numel() > 8192
+            or dst.numel() > MAX_FIELD_NUMEL
             or dst.requires_grad
             or src.requires_grad
             or src.is_neg()

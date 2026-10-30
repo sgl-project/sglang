@@ -345,6 +345,9 @@ class FutureMap:
         self.accept_lens_buf: Optional[torch.Tensor] = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
+        # Off when every reader of the published lengths is ordered on the forward
+        # stream (the scheduler decides), so no event is recorded for them.
+        self.record_publish = True
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
@@ -666,7 +669,7 @@ class FutureMap:
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
-        if self.spec_algo.is_some():
+        if self.spec_algo.is_some() and self.record_publish:
             if self.publish_ready is None:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()

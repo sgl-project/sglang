@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.kernels.ops.memory.small_copy import (
+    MAX_FIELD_NUMEL as SMALL_COPY_MAX_FIELD_NUMEL,
+)
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
@@ -30,6 +33,7 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     model_capture_mode,
 )
+from sglang.srt.model_executor.runner.eager_runner import eager_inputs_in_place
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
@@ -541,12 +545,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states_backup = forward_batch.spec_info.hidden_states
             dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            # the steps' inputs are this runner's capture buffers
+            with eager_inputs_in_place():
+                ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
-            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            # The steps leave the positions advanced; every replay loads them again.
             return ret
 
         with forward_context(
@@ -684,26 +690,38 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
-
-        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
-        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
+        # hidden_states and the DSA seed are large + contiguous: copy_() uses the
+        # cudaMemcpyAsync DMA engine, and foreach would force the ~3x slower
+        # compute-kernel copy. A small batch's rows ride in the grouped copy instead.
+        large = []
         if (
             buffers.draft_probs is not None
             and forward_batch.spec_info.draft_probs is not None
         ):
-            buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
+            large.append(
+                (buffers.draft_probs[:raw_bs], forward_batch.spec_info.draft_probs)
+            )
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
         ):
-            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+            large.append(
+                (buffers.hidden_states[:raw_bs], forward_batch.spec_info.hidden_states)
+            )
         if buffers.dsa_seed_topk is not None:
             seed = forward_batch.spec_info.dsa_topk_indices
             if seed is not None:
-                buffers.dsa_seed_topk[:raw_bs].copy_(seed)
+                large.append((buffers.dsa_seed_topk[:raw_bs], seed))
             else:
                 buffers.dsa_seed_topk[:raw_bs].zero_()
+        for dst, src in large:
+            if dst.numel() <= SMALL_COPY_MAX_FIELD_NUMEL:
+                copy_dsts.append(dst)
+                copy_srcs.append(src)
+        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        for dst, src in large:
+            if dst.numel() > SMALL_COPY_MAX_FIELD_NUMEL:
+                dst.copy_(src)
         # Only rejection sampling reads temperatures (renorm_draft_probs); skip
         # the copy otherwise to keep the non-RS path free of extra work.
         if (

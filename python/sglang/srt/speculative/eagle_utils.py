@@ -10,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative.chain_verify import greedy_chain_verify
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -687,38 +688,65 @@ def eagle_sample(
             )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
-        rows=math.prod(predict_shape),
-        bs=bs,
-        depth=verify_input.max_tree_depth,
-        device=device,
-        packed=_PACKED_VERIFY_BCAST,
-    )
-
-    # Sample tokens
-    target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    greedy = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
+    )
+    # A greedy top-1 chain on GPU f32 logits: argmax and verify in one launch, the
+    # results packed for one broadcast
+    chain = (
+        greedy
+        and verify_input.tree_topk == 1
+        and next_token_logits.is_cuda
+        and next_token_logits.dtype == torch.float32
+        and next_token_logits.stride(-1) == 1
+    )
+    target_predict = None
+    # accept_lens written by the verify launch (and a simulated acceptance after it),
+    # else num_correct_drafts + 1 below
+    accept_lens = None
+    if chain:
+        accept_lens = torch.empty((bs,), dtype=torch.int32, device=device)
+        predict, accept_index, num_correct_drafts, target_predict, verify_out = (
+            greedy_chain_verify(
+                next_token_logits,
+                candidates,
+                verify_input.retrieve_index,
+                verify_input.retrieve_next_token,
+                verify_input.max_tree_depth,
+                accept_lens=accept_lens,
+            )
         )
+    else:
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
+            rows=math.prod(predict_shape),
+            bs=bs,
+            depth=verify_input.max_tree_depth,
+            device=device,
+            packed=_PACKED_VERIFY_BCAST,
+        )
+
+    # Sample tokens
+    if greedy:
+        if not chain:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
@@ -731,9 +759,13 @@ def eagle_sample(
                 else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+                if verify_out is not None:
+                    tp_group.broadcast(verify_out, src=0)
+                else:
+                    tp_group.broadcast(predict, src=0)
+                    tp_group.broadcast(accept_index, src=0)
+                    tp_group.broadcast(num_correct_drafts, src=0)
+            accept_lens = None
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
@@ -895,6 +927,7 @@ def eagle_sample(
                     bs, verify_input.draft_token_num
                 )
         if simulated_acc_len is not None:
+            accept_lens = None
             accept_index = generate_simulated_accept_index_device(
                 accept_index=accept_index,
                 predict=predict,  # mutable
@@ -918,12 +951,14 @@ def eagle_sample(
                 bs=bs,
                 spec_steps=verify_input.max_tree_depth - 1,
                 generator=simulated_acc_len_rng,
+                accept_lens=accept_lens,
             )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    accept_lens = num_correct_drafts + 1
+    if accept_lens is None:
+        accept_lens = num_correct_drafts + 1
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,
@@ -998,15 +1033,16 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         )
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
-    # barrier has chained to the prev forward -> host stalls a full forward.
-    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    # barrier has chained to the prev forward -> host stalls a full forward. Only an
+    # allocation reads them: most steps fit in the pages already allocated.
+    cur_kv_lens = nxt_kv_lens = None
+    if num_needed_tokens > 0:
+        cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     tree_cache = batch.tree_cache
     req_to_token_pool = batch.req_to_token_pool
     req_pool_indices = batch.req_pool_indices
     reqs = batch.reqs
-    cur_kv_lens = cur_kv_lens_device
-    nxt_kv_lens = nxt_kv_lens_device
     alloc_for_spec_decode(
         tree_cache,
         req_to_token_pool,

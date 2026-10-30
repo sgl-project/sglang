@@ -821,7 +821,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 dtype=topk_index.dtype,
                 device=topk_index.device,
             )
-            draft_tokens_topk1[:, :1].copy_(topk_index)
+            # with more than one step, the first step's top-1 launch writes column 0
+            if self.speculative_num_steps == 1:
+                draft_tokens_topk1[:, :1].copy_(topk_index)
 
         # Forward multiple steps
         scores = None
@@ -896,6 +898,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            first_tokens=(
+                                topk_index
+                                if i == 0 and draft_tokens_topk1 is not None
+                                else None
+                            ),
                         )
                     else:
                         topk_index = torch.argmax(
@@ -1140,6 +1147,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch_result: GenerationBatchResult,
         *,
         iteration_ids: Optional[IterationIds] = None,
+        prepared_layout: Optional[tuple] = None,
     ):
         if self.megakernel is not None:
             self.megakernel.note_draft_extend()
@@ -1200,6 +1208,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
                 iteration_ids=iteration_ids,
+                prepared_layout=prepared_layout,
             )
 
         if self.plan_stream:
@@ -1340,6 +1349,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
+    # A top-1 chain's verify writes the new lengths into the overlap scheduler's
+    # relay itself (FutureRelayBuffers); built with the graphs, before the FutureMap
+    # that adopts it.
+    _future_relay = None
 
     @property
     def draft_parallel_layout(self):
@@ -1460,6 +1473,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        if self._draft_worker is not None and self.topk == 1 and (_is_cuda or _is_hip):
+            from sglang.srt.managers.overlap_utils import (
+                FutureRelayBuffers,
+                offer_future_relay_buffers,
+            )
+
+            self._future_relay = FutureRelayBuffers(
+                req_pool_size=self.req_to_token_pool.req_to_token.shape[0],
+                device=self.device,
+            )
+            offer_future_relay_buffers(self._future_relay)
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1575,7 +1599,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(
-                        batch, batch_output, iteration_ids=verify_input.iteration_ids
+                        batch,
+                        batch_output,
+                        iteration_ids=verify_input.iteration_ids,
+                        prepared_layout=verify_input.prepared_draft_extend_layout,
                     )
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
@@ -2077,4 +2104,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             sparse_bonus_argmax=max_top_k is not None,
+            future_relay=self._future_relay,
         )

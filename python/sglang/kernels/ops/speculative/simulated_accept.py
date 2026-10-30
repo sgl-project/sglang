@@ -28,6 +28,8 @@ def _simulated_accept_kernel(
     BS,
     WIDTH: tl.constexpr,
     NUM_ACCEPT_TOKENS,
+    accept_lens,
+    WITH_ACCEPT_LENS: tl.constexpr,
     PREDICT_SIZE,
     NUM_CORRECT_DRAFTS_SIZE,
     INDEX_ROW,
@@ -55,6 +57,8 @@ def _simulated_accept_kernel(
         NUM_ACCEPT_TOKENS - 1,
         offset < NUM_CORRECT_DRAFTS_SIZE,
     )
+    if WITH_ACCEPT_LENS:
+        tl.store(accept_lens + offset, NUM_ACCEPT_TOKENS, offset < BS)
     if REAL_TOKENS:
         draft = tl.load(
             candidate_tokens + row * CANDIDATE_ROW + (col + 1) * CANDIDATE_COL,
@@ -85,7 +89,10 @@ def simulated_accept(
     width,
     num_accept_tokens,
     real_tokens,
+    accept_lens=None,
 ):
+    """accept_lens (optional, [bs]): also written, the accepted tokens with the
+    bonus."""
     assert predict_tokens.dim() == 1
     assert num_correct_drafts.dim() == 1
     bs = accept_indices.shape[0]
@@ -104,6 +111,8 @@ def simulated_accept(
             BS=bs,
             WIDTH=width,
             NUM_ACCEPT_TOKENS=num_accept_tokens,
+            accept_lens=output_indices if accept_lens is None else accept_lens,
+            WITH_ACCEPT_LENS=accept_lens is not None,
             PREDICT_SIZE=predict_tokens.numel(),
             NUM_CORRECT_DRAFTS_SIZE=num_correct_drafts.numel(),
             INDEX_ROW=accept_indices.stride(0),
