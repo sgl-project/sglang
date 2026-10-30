@@ -8,6 +8,7 @@ from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.runtime_context import (
+    decode_cuda_graph_max_bs,
     get_exec,
     get_schedule,
     get_spec,
@@ -76,6 +77,8 @@ class CanaryLaunchCapacities:
             raise ValueError(
                 f"kv-canary: cuda_graph_max_bs must be non-negative, got {cuda_graph_max_bs}"
             )
+        # The padded decode top bucket can exceed both max_bs and the pool.
+        cuda_graph_max_bs = decode_cuda_graph_max_bs()
 
         spec_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if spec_num_draft_tokens is None:

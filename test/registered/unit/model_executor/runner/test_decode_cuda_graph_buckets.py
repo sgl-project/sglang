@@ -5,6 +5,7 @@ import pytest
 from sglang.srt.arg_groups.cuda_graph_hook import (
     generate_decode_cuda_graph_batch_sizes,
 )
+from sglang.srt.model_executor.cuda_graph_config import decode_capture_max_bs
 from sglang.srt.model_executor.runner import base_cuda_graph_runner as graph_runner
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -28,6 +29,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
         # Without padding, only exact configured sizes are captured.
         (15, 256, 1, 4, False, False, 12),
         (15, 256, 4, 4, False, False, 15),
+        # No configured size is aligned below the pool: keep the aligned endpoint.
+        (1, 2, 1, 2, False, False, 2),
     ],
 )
 def test_capture_buckets_cover_every_serviceable_batch(
@@ -75,6 +78,12 @@ def test_capture_buckets_cover_every_serviceable_batch(
     assert all(bs * (1 if tbo else width) % alignment == 0 for bs in capture)
     assert compile_bs == [bs for bs in capture if bs <= 8]
     assert max(buckets) == configured_max  # The phase config list is not mutated.
+    # Graph-static buffers size from this bound, so it must cover every bucket.
+    assert max(capture) <= decode_capture_max_bs(
+        configured_max,
+        tp_size=alignment // (2 if tbo else 1),
+        enable_two_batch_overlap=tbo,
+    )
     if padding:
         assert all(
             any(bucket >= bs for bucket in capture)
@@ -82,3 +91,35 @@ def test_capture_buckets_cover_every_serviceable_batch(
         )
     else:
         assert set(capture) <= set(buckets)
+
+
+@pytest.mark.parametrize(
+    "max_bs,tp_size,tbo,expected",
+    [(15, 4, False, 16), (16, 4, False, 16), (15, 4, True, 16), (17, 4, True, 24)],
+)
+def test_published_bound_covers_padded_top_bucket(max_bs, tp_size, tbo, expected):
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        CudaGraphConfig,
+        PhaseConfig,
+    )
+    from sglang.srt.runtime_context import (
+        cutedsl_moe_max_num_tokens,
+        decode_cuda_graph_max_bs,
+        get_context,
+    )
+
+    with get_context().override_server_args(
+        cuda_graph_config=CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=max_bs),
+            prefill=PhaseConfig(backend=Backend.DISABLED),
+        ),
+        tp_size=tp_size,
+        enable_two_batch_overlap=tbo,
+        max_prefill_tokens=1,
+        speculative_algorithm="EAGLE",
+        speculative_num_draft_tokens=4,
+    ):
+        assert decode_cuda_graph_max_bs() == expected
+        # CuteDSL MoE buffers hold the padded top bucket's verify rows.
+        assert cutedsl_moe_max_num_tokens() == expected * 4

@@ -48,6 +48,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    decode_cuda_graph_max_bs,
     get_exec,
     get_parallel,
     get_schedule,
@@ -919,7 +920,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 block_size=self.block_size,
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=decode_cuda_graph_max_bs(),
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
             )
@@ -959,7 +960,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 vocab_size=int(self.model_runner.model_config.vocab_size),
                 block_size=self.block_size,
                 shift_label=self.draft_model.shift_label,
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=decode_cuda_graph_max_bs(),
                 candidate_pool_size=self.domino_candidate_pool_size,
                 tp_group=tp_group,
                 lm_head_org_vocab_start=(
@@ -994,7 +995,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=decode_cuda_graph_max_bs(),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 

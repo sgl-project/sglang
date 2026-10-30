@@ -29,6 +29,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
         max_seq_len: int,
         max_total_num_tokens: int | None = None,
         speculative_num_draft_tokens: int | None = 0,
+        tp_size: int = 1,
     ) -> CanaryLaunchCapacities:
         """`from_args` reads the published configuration, so publish one.
 
@@ -45,6 +46,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             chunked_prefill_size=None,
             max_prefill_tokens=128,
+            tp_size=tp_size,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -88,6 +90,13 @@ class TestComputeLaunchCapacities(CustomTestCase):
                 per_forward_write_req_capacity=1,
                 per_forward_write_entry_capacity=1,
             )
+
+    def test_write_req_capacity_covers_padded_top_bucket(self) -> None:
+        """max_bs = pool = 15 under TP 4 captures a 16 bucket; capacity must hold it."""
+        capacities = self._from_args(
+            max_bs=15, max_seq_len=8, max_total_num_tokens=120, tp_size=4
+        )
+        self.assertEqual(capacities.per_forward_write_req_capacity, 16)
 
     def test_from_args_rejects_empty_pool_capacity(self) -> None:
         """Verify derived launch capacities reject invalid pool sizing."""

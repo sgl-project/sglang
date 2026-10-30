@@ -29,7 +29,12 @@ from sglang.srt.configs.moe_model_registry import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import AscendOpsConfig
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    decode_capture_max_bs,
+    with_phase,
+)
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -732,6 +737,12 @@ def _decode_graph_dispatch_tokens_per_rank(server_args: Any) -> tuple[int, int]:
     if view.max_running_requests is not None:
         per_rank_pool_bs = max(1, view.max_running_requests // view.attn_dp_size)
         graph_bs = min(graph_bs, per_rank_pool_bs)
+    # Capture pads the top bucket to the attention-TP alignment.
+    graph_bs = decode_capture_max_bs(
+        graph_bs,
+        tp_size=max(1, view.tp_size // view.attn_dp_size),
+        enable_two_batch_overlap=view.enable_two_batch_overlap,
+    )
     tokens_per_req = (
         max_speculative_num_draft_tokens(server_args) or 1
         if view.speculative_algorithm

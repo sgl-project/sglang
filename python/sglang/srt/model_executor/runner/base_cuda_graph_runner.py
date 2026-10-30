@@ -71,8 +71,10 @@ def get_batch_sizes_to_capture(
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
-    Filters cuda_graph_config[decode].bs by attention-tp/cp alignment
-    constraints and clamps to req_to_token_pool.size.
+    Filters cuda_graph_config[decode].bs by attention-tp/cp alignment and caps
+    it at req_to_token_pool.size. With padding, the top bucket is padded up to
+    the alignment, so it can exceed both the pool and the configured max_bs;
+    graph-static buffers size from runtime_context.decode_cuda_graph_max_bs().
     """
 
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
@@ -107,8 +109,17 @@ def get_batch_sizes_to_capture(
         if bs % request_alignment == 0 and bs <= num_max_requests
     ]
     capture_bs = list(sorted(set(capture_bs)))
+    if not capture_bs:
+        # Without padding no configured size may be aligned below the pool;
+        # keep the aligned endpoint so the runner still has a valid shape.
+        capture_bs = [ceil_align(num_max_requests, request_alignment)]
+        logger.warning(
+            f"No configured decode CUDA graph batch size is a multiple of "
+            f"{request_alignment} within {num_max_requests} requests; capturing "
+            f"{capture_bs} only."
+        )
 
-    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+    assert capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= get_exec().graph.torch_compile_max_bs]
         if get_flags().capture.enable_torch_compile

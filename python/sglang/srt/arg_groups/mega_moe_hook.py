@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import decode_capture_max_bs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import ceil_align, parse_connector_type
 
@@ -93,7 +94,12 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
 
 def mega_moe_decode_tokens_per_rank(cfg) -> int:
     cg_config = cfg.cuda_graph_config
-    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    # Capture pads the top bucket to the attention-TP alignment.
+    decode_max_bs = decode_capture_max_bs(
+        (cg_config.decode.max_bs if cg_config is not None else 0) or 0,
+        tp_size=cfg.tp_size // cfg.attn_dp_size,
+        enable_two_batch_overlap=cfg.enable_two_batch_overlap,
+    )
     if cfg.max_running_requests is not None:
         per_rank_requests = ceil_align(
             cfg.max_running_requests // cfg.attn_dp_size,

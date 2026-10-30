@@ -2053,9 +2053,10 @@ def cutedsl_moe_max_num_tokens() -> int:
     """Largest token count one forward routes through a CuteDSL MoE layer on one
     DP rank; sizes the standard-allgather wrapper, MegaMoE, and AR fusion buffers.
 
-    Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
-    this follows a post-publish override. Max over the prefill bound, the
-    piecewise-prefill capture, and the decode/verify bound.
+    Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``,
+    ``exec.overlap``) plus the configured TP size, so this follows a
+    post-publish override. Max over the prefill bound, the piecewise-prefill
+    capture, and the padded decode/verify bound.
     """
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -2067,8 +2068,27 @@ def cutedsl_moe_max_num_tokens() -> int:
     cg_config = get_exec().graph.cuda_graph_config
     if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
         prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-    return max(prefill_tokens, decode_max_bs * num_tokens_per_req)
+    return max(prefill_tokens, decode_cuda_graph_max_bs() * num_tokens_per_req)
+
+
+def decode_cuda_graph_max_bs() -> int:
+    """Upper bound of every decode-family capture bucket, or 0 without a graph
+    config.
+
+    Buffers baked into decode graphs size from this rather than the configured
+    ``max_bs``, which the padded top bucket can exceed. Inputs are the published
+    ``exec.graph`` / ``exec.overlap`` leaves and the configured TP size, so it
+    holds before the parallel groups exist.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import decode_capture_max_bs
+
+    cg_config = get_exec().graph.cuda_graph_config
+    max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    return decode_capture_max_bs(
+        max_bs,
+        tp_size=get_parallel().tp_size,
+        enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+    )
 
 
 def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
