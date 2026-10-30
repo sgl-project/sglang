@@ -549,10 +549,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
         full_page_representatives = free_index[::ps]
-        if (
-            not _is_npu
-            and current_platform.capabilities.supports_triton
-            and free_index.device.type != "cpu"
+        # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
+        if not _is_npu and (
+            free_index.is_cuda
+            or (
+                current_platform.is_out_of_tree()
+                and current_platform.capabilities.supports_triton
+                and not free_index.is_cpu
+            )
         ):
             swa_pages = self._free_swa_pages_cuda(full_page_representatives)
         else:
