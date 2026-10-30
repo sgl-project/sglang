@@ -113,21 +113,55 @@ def _load_adaptive_config(
     else:
         cfg = DEFAULT_ADAPTIVE_CONFIG
 
+    if not isinstance(cfg, dict):
+        raise ValueError("speculative_adaptive_config must be a JSON object")
+
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
         if not key.isdigit():
             continue
+        if not isinstance(entry, dict):
+            raise ValueError(f"BS {key}: configuration must be a JSON object")
 
         steps = entry.get("candidate_steps")
         if (
             not isinstance(steps, list)
             or not steps
-            or not all(isinstance(s, int) and s >= 0 for s in steps)
+            or not all(type(s) is int and s >= 0 for s in steps)
         ):
             raise ValueError(
                 f"BS {key}: candidate_steps must be a list of non-negative ints, "
                 f"got {steps!r}"
             )
+
+        # Validate the effective slot here, including global defaults, so invalid
+        # policies fail during argument resolution rather than after warmup in
+        # the scheduler's verify-result callback.
+        slot_cfg = {**cfg, **entry}
+        for name, minimum in (("update_interval", 1), ("warmup_batches", 0)):
+            if name in slot_cfg:
+                value = slot_cfg[name]
+                if type(value) is not int or value < minimum:
+                    raise ValueError(
+                        f"BS {key}: {name} must be an integer >= {minimum}, "
+                        f"got {value!r}"
+                    )
+        for name in ("ema_alpha", "up_hysteresis", "down_hysteresis", "ceiling_coeff"):
+            if name not in slot_cfg:
+                continue
+            value = slot_cfg[name]
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(
+                    f"BS {key}: {name} must be a finite number, got {value!r}"
+                )
+            if name == "ema_alpha" and not 0 <= value <= 1:
+                raise ValueError(
+                    f"BS {key}: ema_alpha must be between 0 and 1, got {value!r}"
+                )
+            if name == "ceiling_coeff" and value < 0:
+                raise ValueError(
+                    f"BS {key}: ceiling_coeff must be non-negative, got {value!r}"
+                )
         bs_entries[int(key)] = entry
 
     if not bs_entries:
