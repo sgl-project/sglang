@@ -273,7 +273,7 @@ auto verify_matvec_inputs(
 
   TensorMatcher({rows, input_size})  //
       .with_dtype<fp16_t, bf16_t>(dtype)
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(input);
 
   CHECK_HOST(input_size > 0 && input_size % kQuantBlock == 0)
@@ -282,11 +282,11 @@ auto verify_matvec_inputs(
 
   TensorMatcher({slots, cache_bytes})  //
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(cache);
   TensorMatcher({records})  //
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(slot_ids);
 
   CHECK_HOST(records.unwrap() == rows.unwrap() * records_per_input)

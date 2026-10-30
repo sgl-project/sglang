@@ -1219,6 +1219,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
+        target_logits, watermark_rows = self._force_watermark(
+            batch=batch,
+            logits_output=logits_output,
+            verify_ids_2d=verify_ids_2d,
+            positions_2d=verify_window.positions_2d,
+            sampling_info=sampling_info,
+        )
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
@@ -1242,7 +1249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
             region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=logits_output.next_token_logits
+                bs=bs, target_logits=target_logits
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
@@ -1255,7 +1262,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 folded_accept=folded_accept,
                 bs=bs,
                 verify_ids_2d=verify_ids_2d,
-                target_logits=logits_output.next_token_logits,
+                target_logits=target_logits,
                 draft_block=draft_block,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
@@ -1263,6 +1270,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        if watermark_rows is not None:
+            self.target_worker.model_runner.watermark_state.commit_speculative_chain(
+                req_pool_indices=batch.req_pool_indices,
+                context_hashes=watermark_rows[0],
+                selected=watermark_rows[1],
+                accept_tokens=accept.out_tokens,
+                accept_lens=accept.commit_lens,
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
@@ -1319,16 +1334,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
-            self._verify_executor.commit_hidden(
-                batch=batch,
-                layout=layout,
-                hidden_strided=hidden_strided,
-                verify_window=verify_window,
-                logits_output=logits_output,
-                commit_lens=accept.commit_lens,
-                bs=bs,
-                run_compact=run_compact,
-            )
+            with self._draft_context():
+                self._verify_executor.commit_hidden(
+                    batch=batch,
+                    layout=layout,
+                    hidden_strided=hidden_strided,
+                    verify_window=verify_window,
+                    logits_output=logits_output,
+                    commit_lens=accept.commit_lens,
+                    bs=bs,
+                    run_compact=run_compact,
+                )
         logits_output.hidden_states = None
 
         self._observers.observe_verify_step(
@@ -1378,6 +1394,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _force_watermark(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output,
+        verify_ids_2d: torch.Tensor,
+        positions_2d: torch.Tensor,
+        sampling_info,
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        target_logits = logits_output.next_token_logits
+        watermark_state = self.target_worker.model_runner.watermark_state
+        if (
+            watermark_state is None
+            or sampling_info is None
+            or not sampling_info.has_watermark_candidates
+        ):
+            return target_logits, None
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after acceptance.
+            target_logits = target_logits.clone()
+        watermark_rows = watermark_state.force_speculative_chain(
+            logits=target_logits,
+            req_pool_indices=batch.req_pool_indices,
+            chain_tokens=verify_ids_2d,
+            positions=positions_2d,
+            sampling_info=sampling_info,
+        )
+        return target_logits, watermark_rows
 
     def _sampling_graph_eligible(
         self,

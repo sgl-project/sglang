@@ -712,6 +712,9 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Most per-request states the detokenizer keeps; past it, the oldest is
+    # evicted. See https://github.com/sgl-project/sglang/issues/2812
+    SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -742,6 +745,8 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in: retire finished prefill KV transfers while a forward result is pending.
+    SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 

@@ -75,6 +75,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind, state_id_space
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import (
@@ -152,6 +153,11 @@ class RunnerIds:
         self._spaces: Dict[str, IdSpace] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
+            if is_cp_sharded_padded():
+                # Translated ids skip the sharded projection and rank filter below.
+                raise ValueError(
+                    "A sharded --cp-kv-layout does not support --enable-unified-memory."
+                )
             alloc = token_to_kv_pool_allocator
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
@@ -193,6 +199,25 @@ class RunnerIds:
                     dcp_rank=parallel.dcp_rank,
                     interleave_size=page_size,
                 )
+                self._call_spaces = self._spaces
+                self._spaces = {
+                    name: _localized(name, space, localize)
+                    for name, space in self._spaces.items()
+                }
+            elif is_cp_sharded_padded():
+                # Keep the plan's global rows; each sub-pool writes only owned pages.
+                strategy = get_cp_strategy()
+                c, p = strategy.cp_size, page_size
+
+                def localize(ids):
+                    shifted = ids.to(torch.int64) + (c - 1) * p
+                    local = (shifted // (c * p)) * p + shifted % p
+                    return torch.where(
+                        (ids > 0) & ((shifted // p) % c == strategy.cp_rank),
+                        local,
+                        0,
+                    )
+
                 self._call_spaces = self._spaces
                 self._spaces = {
                     name: _localized(name, space, localize)
