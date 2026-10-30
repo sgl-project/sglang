@@ -30,7 +30,7 @@ use crate::utils::{
     response::{error_response, error_value},
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -59,8 +59,12 @@ pub(super) struct RequestTiming {
 
 impl RequestTiming {
     pub(super) fn new() -> Self {
+        Self::starting_at(Instant::now())
+    }
+
+    fn starting_at(created_at: Instant) -> Self {
         Self {
-            created_at: Instant::now(),
+            created_at,
             time_to_first_token: None,
             e2e_latency: None,
         }
@@ -583,6 +587,7 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
+    start: Option<Extension<crate::RequestStart>>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
@@ -614,8 +619,12 @@ async fn generate(
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
-    // and every downstream stage are still ahead of us.
-    let timing = RequestTiming::new();
+    // and every downstream stage are still ahead of us. An HTTP layer that did
+    // some of that work before this handler ran set where it started.
+    let timing = match start {
+        Some(Extension(crate::RequestStart(at))) => RequestTiming::starting_at(at),
+        None => RequestTiming::new(),
+    };
     // Shared core admission performs media I/O (URL downloads, file reads)
     // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
@@ -1184,6 +1193,8 @@ mod tests {
         assert!(response.headers().get("x-custom-header").is_none());
     }
 
+    /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's
+    /// timing, so `e2e_latency` covers the layer's work too.
     #[tokio::test]
     async fn unary_http_generate_round_trips_through_frontend_handle() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -1240,10 +1251,14 @@ mod tests {
                 .unwrap();
         });
 
+        let layer_work = Duration::from_secs(5);
         let request = Request::builder()
             .method("POST")
             .uri("/generate")
             .header("content-type", "application/json")
+            .extension(crate::RequestStart(
+                Instant::now().checked_sub(layer_work).unwrap(),
+            ))
             .body(Body::from(
                 r#"{"rid":"client-rid","input_ids":[1,2],"sampling_params":{"max_new_tokens":1}}"#,
             ))
@@ -1260,6 +1275,8 @@ mod tests {
         assert_eq!(value["meta_info"]["id"], "client-rid");
         assert_eq!(value["meta_info"]["prompt_tokens"], 2);
         assert_eq!(value["meta_info"]["completion_tokens"], 1);
+        let e2e_latency = value["meta_info"]["e2e_latency"].as_f64().unwrap();
+        assert!(e2e_latency >= layer_work.as_secs_f64(), "{e2e_latency}");
         assert!(abort_rx.try_recv().is_err());
     }
 
@@ -1547,7 +1564,9 @@ mod tests {
     /// terminal output carries no stats (an older scheduler) reports neither.
     /// The hook starts from each item's request, the HTTP headers and the
     /// sampling params the client sent for it (without the launch-time
-    /// preferred ones), and sees each terminal frame once.
+    /// preferred ones), and sees each terminal frame once. An HTTP layer's
+    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
+    /// but neither decode latency.
     #[tokio::test]
     async fn generate_hook_keys_reach_every_frame() {
         for (stream, incremental, hook, batch, metrics) in [
@@ -1666,11 +1685,15 @@ mod tests {
                 "stream": stream,
                 "sampling_params": sampling_params,
             });
+            let layer_work = Duration::from_secs(5);
             let request = Request::builder()
                 .method("POST")
                 .uri("/generate")
                 .header("content-type", "application/json")
                 .header("x-test", "v")
+                .extension(crate::RequestStart(
+                    Instant::now().checked_sub(layer_work).unwrap(),
+                ))
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let response = routes().with_state(state).oneshot(request).await.unwrap();
@@ -1706,6 +1729,14 @@ mod tests {
                 let meta = frame["meta_info"].as_object().unwrap();
                 let terminal = !meta["finish_reason"].is_null();
                 let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+                let e2e_latency = meta.get("e2e_latency").and_then(serde_json::Value::as_f64);
+                assert_eq!(e2e_latency.is_some(), terminal, "{case}");
+                if let Some(e2e_latency) = e2e_latency {
+                    assert!(
+                        e2e_latency >= layer_work.as_secs_f64(),
+                        "{case}: {e2e_latency}"
+                    );
+                }
                 let stats = terminal && index == 0;
                 assert_eq!(meta.get("num_retractions").is_some(), stats, "{case}");
                 assert_eq!(
@@ -1741,6 +1772,15 @@ mod tests {
                 assert_eq!(meta.get("decode_s").is_some(), terminal, "{case}");
                 if terminal && !stream {
                     assert_eq!(meta["decode_s"], 0.25, "{case}");
+                }
+                // A streamed request's decode latency runs from its first
+                // output, which the layer's work came before.
+                if terminal && stream {
+                    let decode_s = meta["decode_s"].as_f64().unwrap();
+                    assert!(
+                        e2e_latency.unwrap() - decode_s >= layer_work.as_secs_f64(),
+                        "{case}: {e2e_latency:?} - {decode_s}"
+                    );
                 }
                 if stats {
                     let stats_at = keys.iter().position(|key| *key == "num_retractions");
