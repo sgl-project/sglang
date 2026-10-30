@@ -102,6 +102,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     and accumulates denoised latents. VAE decoding is left to DecodingStage.
     """
 
+    supports_denoising_step_profiling = True
+
     def __init__(self, transformer, scheduler):
         super().__init__()
         self.transformer = transformer

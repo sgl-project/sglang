@@ -240,7 +240,7 @@ class PipelineExecutor(ABC):
                 profiler = SGLDiffusionProfiler.get_instance()
                 profile_context = (
                     profiler.profile_denoising_stage()
-                    if profiler is not None and stage.role_affinity == RoleType.DENOISER
+                    if profiler is not None and stage.supports_denoising_step_profiling
                     else contextlib.nullcontext()
                 )
                 with profile_context:
