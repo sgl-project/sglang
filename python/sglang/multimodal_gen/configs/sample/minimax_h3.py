@@ -173,6 +173,11 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
             )
         if server_args.warmup_resolutions is not None:
+            # The flag names the canvas to serve: its short edge too, not only
+            # its aspect. A fixed 768 warmed a 32 GB card serving 864x480 at a
+            # larger canvas than it serves, and left a 544x960 server's first
+            # request to pay the first-shape cost.
+            target["short_edge"] = min(int(req.width), int(req.height))
             ratio = req.width / req.height
 
             def distance(name: str) -> float:
