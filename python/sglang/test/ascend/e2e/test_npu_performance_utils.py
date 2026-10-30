@@ -602,18 +602,6 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 3:
                         metrics["accept_length"] = parts[2]
-                elif stripped_line.startswith("Cache hit rate:"):
-                    # Format: "Cache hit rate:    82.2%" (from --cache-report)
-                    parts = stripped_line.split()
-                    if len(parts) >= 4:
-                        metrics["cache_hit_rate_pct"] = parts[3].rstrip("%")
-                elif stripped_line.startswith("Device:") and stripped_line.endswith(
-                    "%"
-                ):
-                    # Format: "Device:    19.7%"
-                    parts = stripped_line.split()
-                    if len(parts) >= 2:
-                        metrics["device_hit_rate_pct"] = parts[1].rstrip("%")
                 elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
                     # Format: "Host:    19.7%"
                     parts = stripped_line.split()
@@ -974,6 +962,18 @@ def assert_metrics(self, metrics):
             float(self.ttft),
             labels={"test_case": tc_name, "type": "perf"},
         )
+    host_hit_rate = getattr(self, "host_hit_rate", None)
+    if host_hit_rate and metrics.get("host_hit_rate_pct"):
+        dump_metric(
+            "host_hit_rate",
+            float(metrics["host_hit_rate_pct"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "host_hit_rate_baseline",
+            float(host_hit_rate),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
     if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
@@ -1029,6 +1029,11 @@ def assert_metrics(self, metrics):
         self.assertLessEqual(
             float(metrics["mean_ttft"]),
             self.ttft * TTFT_TOLERANCE,
+        )
+    if host_hit_rate:
+        self.assertGreater(
+            float(metrics["host_hit_rate_pct"]),
+            host_hit_rate,
         )
     if self.mean_e2e_latency:
         self.assertLessEqual(
@@ -1466,6 +1471,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    host_hit_rate = None
 
     dp = None
     generation_kwargs = None
@@ -1596,6 +1602,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 "seed": self.seed,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
+                "cache_report": self.host_hit_rate is not None,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
@@ -1638,6 +1645,7 @@ class TestNpuPerformanceTestCaseBaseV2(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    host_hit_rate = None
     # Baseline for accept_length / speculative-num-draft-tokens; None disables
     # the assertion.
     accept_rate = None
@@ -1848,6 +1856,7 @@ class TestNpuPerformanceTestCaseBaseV2(CustomTestCase):
                 "seed": self.seed,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
+                "cache_report": self.host_hit_rate is not None,
             }
             logger.info(f"Starting benchmark with parameters: {bench_params}")
             if (
