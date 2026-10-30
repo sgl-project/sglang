@@ -87,10 +87,10 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with diffusion LLM")
     if cfg.disaggregation_mode != "null":
         raise ValueError("--enable-watermark is not supported with PD disaggregation")
-    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3"}:
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3", "DSPARK"}:
         raise ValueError(
             "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
-            f"and EAGLE3, got {cfg.speculative_algorithm!r}"
+            f"EAGLE3, and DSPARK, got {cfg.speculative_algorithm!r}"
         )
     if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
         raise ValueError(
@@ -200,6 +200,22 @@ def check_server_args(server_args: Any):
         "multi-node data-parallel replicas are not supported; use attention DP "
         "(--attn-dp-size) across nodes"
     )
+
+    # Rust-mode prefill registers per-listener bootstrap rows only under attention DP;
+    # plain DP replicas all register with the --port listener.
+    if (
+        envs.SGLANG_RUST_SERVER.get()
+        and cfg.disaggregation_mode == "prefill"
+        and cfg.dp_size > 1
+        and not attn_dp_enabled_of(cfg)
+    ):
+        raise ValueError(
+            f"SGLANG_RUST_SERVER prefill does not support --dp-size {cfg.dp_size} "
+            "replicas: every replica registers its KV bootstrap rows with the "
+            "--port listener, so the other replicas' listeners advertise "
+            "registries that never become ready. Launch one prefill server per "
+            "replica, or unset SGLANG_RUST_SERVER."
+        )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
