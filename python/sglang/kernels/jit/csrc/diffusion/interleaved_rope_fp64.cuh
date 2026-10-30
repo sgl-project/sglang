@@ -100,7 +100,7 @@ struct InterleavedRopeFP64Kernel {
     auto H = SymbolicSize{"heads"};
     auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({B, S, H, D}).with_dtype<T>().with_device(device).verify(q_out).verify(k_out).verify(q).verify(k);
     TensorMatcher({1, S, 1, D}).with_dtype<double>().with_device(device).verify(cos).verify(sin);
 

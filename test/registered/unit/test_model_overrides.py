@@ -60,6 +60,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_attn_tp_input_scattered=False,
                     moe_dp_size=1,
                     cp_strategy=None,
+                    cp_kv_layout=None,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
@@ -141,6 +142,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                             enable_prefill_cp=prefill,
                             cp_size=cp_size,
                             cp_strategy=cfg.cp_strategy,
+                            cp_kv_layout=None,
                         )
 
 
@@ -217,6 +219,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
+                    "speculative_draft_model_quantization",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",

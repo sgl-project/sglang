@@ -780,17 +780,19 @@ def run_eagle_verify(
         prepared_step_indices=prepared_commit_steps,
     )
 
+    if (
+        not batch.forward_mode.is_idle()
+        and target_worker.model_runner.watermark_state is not None
+        and batch.sampling_info.has_watermark_candidates
+    ):
+        target_worker.model_runner.watermark_state.append_speculative(
+            batch.req_pool_indices,
+            predict[accept_index],
+            accept_lens,
+        )
+
     if not fused_commit_outputs and not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
-        if (
-            target_worker.model_runner.watermark_state is not None
-            and batch.sampling_info.has_watermark_candidates
-        ):
-            target_worker.model_runner.watermark_state.append_speculative(
-                batch.req_pool_indices,
-                accept_tokens,
-                accept_lens,
-            )
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
         # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
