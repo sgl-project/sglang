@@ -599,6 +599,43 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     )
                 self.assertFalse(use(moe, hidden, None))
 
+    def test_mega_gate_records_hash_routing_for_r3(self):
+        """The gate stands in for HashTopK.forward, which is where hash layers record
+        routed experts for R3; without its own capture those rows stayed stale."""
+        moe = self._mega_gate_moe(hash_routing=True)
+        moe.topk.topk_config = SimpleNamespace(allow_routed_experts_capture=True)
+        hidden = torch.ones((4, 256), dtype=torch.bfloat16)
+        input_ids = torch.tensor([7, 99, 7, 1000])
+        buf = SimpleNamespace(
+            topk_idx=torch.full((8, 2), 5, dtype=torch.int64),
+            topk_weights=torch.full((8, 2), 9.0),
+        )
+        capturer = MagicMock()
+        with (
+            self._mega_gate_env(),
+            patch.object(
+                moe.topk,
+                "routing_inputs",
+                return_value=(torch.tensor([3]), None),
+                create=True,
+            ),
+            patch.object(
+                mega_gate_runtime, "get_global_experts_capturer", return_value=capturer
+            ),
+            patch.object(
+                topk_module, "get_global_experts_capturer", return_value=capturer
+            ),
+        ):
+            routing = mega_gate_runtime.run_mega_gate(moe, hidden, input_ids, buf)
+        # capture reads the ids, so the gate cannot write them straight into the buffer
+        self.assertFalse(routing.in_buffer)
+        capturer.capture.assert_called_once()
+        captured = capturer.capture.call_args.kwargs
+        self.assertEqual(captured["layer_id"], 0)
+        torch.testing.assert_close(
+            captured["topk_indices"], torch.tensor([[6, 7]] * 3 + [[-1, -1]])
+        )
+
     def test_mega_gate_routes_vision_hash_and_padding(self):
         for is_hash in (False, True):
             for scale_in_topk in (False, True):
