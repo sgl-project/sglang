@@ -773,11 +773,12 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q_cpu = cu_seqlens_q.clone()
         seqused_kv_cpu = seqused_kv.clone()
 
+        metadata_op = MagicMock()
         with (
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
+            patch("torch.ops.npu", MagicMock(), create=True),
             patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
-                return_value=(MagicMock(), MagicMock()),
+                return_value=(metadata_op, MagicMock()),
             ),
         ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)

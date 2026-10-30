@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
 _IDX_SENTINEL = tl.constexpr(2147483647)
 _MARKOV_BLOCK_V = 256
 _MARKOV_BLOCK_R = 32
@@ -346,6 +348,10 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
 def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
     """Whether _build_stacked_wkv_weight can handle these weights; unsupported
     quant schemes fall back to the per-linear torch path in execute()."""
+    # NPU arch35 serves these linears through its own quant methods, which the
+    # Triton fused path below does not handle.
+    if is_npu_arch35():
+        return False
     if _block_quant_stack_applies(wkv_linears=wkv_linears):
         return True
     return all(_dequant_supported(linear) for linear in wkv_linears)
