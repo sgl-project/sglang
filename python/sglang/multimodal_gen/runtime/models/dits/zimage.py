@@ -1588,16 +1588,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask_meta=x_attn_mask_meta,
             )
 
-        cap_feats, _ = self.cap_embedder(cap_feats)
-        if cap_valid_mask is not None:
-            cap_feats = self._replace_padding_with_token_mask(
-                cap_feats, cap_valid_mask, self.cap_pad_token
-            )
-        else:
-            cap_feats = self._replace_padding_with_token(
-                cap_feats, cap_valid_lens, self.cap_pad_token
-            )
-
         cap_freqs_cis = freqs_cis[0]
         cap_rope_cos_sin_cache, cap_rope_positions = self._get_rope_cache(
             "cap", cap_freqs_cis
@@ -1606,15 +1596,33 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "_cached_cap_attn_mask_meta", cap_attn_lens, cap_feats.shape[1], device
         )
 
-        for layer_id, layer in enumerate(self.context_refiner):
-            cap_feats = layer(
-                cap_feats,
-                cap_freqs_cis,
-                rope_cos_sin_cache=cap_rope_cos_sin_cache,
-                rope_positions=cap_rope_positions,
-                attn_mask=cap_attn_mask,
-                attn_mask_meta=cap_attn_mask_meta,
-            )
+        def _refine_caption(cap_feats):
+            cap_feats, _ = self.cap_embedder(cap_feats)
+            if cap_valid_mask is not None:
+                cap_feats = self._replace_padding_with_token_mask(
+                    cap_feats, cap_valid_mask, self.cap_pad_token
+                )
+            else:
+                cap_feats = self._replace_padding_with_token(
+                    cap_feats, cap_valid_lens, self.cap_pad_token
+                )
+            for layer in self.context_refiner:
+                cap_feats = layer(
+                    cap_feats,
+                    cap_freqs_cis,
+                    rope_cos_sin_cache=cap_rope_cos_sin_cache,
+                    rope_positions=cap_rope_positions,
+                    attn_mask=cap_attn_mask,
+                    attn_mask_meta=cap_attn_mask_meta,
+                )
+            return cap_feats
+
+        # The caption path depends only on the prompt: once per request.
+        cap_feats = self._cached_per_request(
+            "zimage_context_refiner",
+            (*input_cap_feats, caption_valid_lens, encoder_hidden_states_mask),
+            lambda: _refine_caption(cap_feats),
+        )
 
         cap_seq_len = cap_feats.shape[1]
         unified = torch.cat([x, cap_feats], dim=1)

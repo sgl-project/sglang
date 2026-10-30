@@ -122,16 +122,8 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
             (torch.arange(x_target, device=x.device) < x_length).unsqueeze(0),
             self.x_pad_token,
         )
-        cap, _ = self.cap_embedder(encoder_hidden_states)
-        cap = torch.cat((cap, direct_embeddings), 1)
-        cap_length = cap.shape[1]
+        cap_length = encoder_hidden_states.shape[1] + direct_embeddings.shape[1]
         cap_target = math.ceil(cap_length / 32) * 32
-        cap = F.pad(cap, (0, 0, 0, cap_target - cap_length))
-        cap = self._replace_padding_with_token_mask(
-            cap,
-            (torch.arange(cap_target, device=x.device) < cap_length).unsqueeze(0),
-            self.cap_pad_token,
-        )
 
         cap_ids = self.create_coordinate_grid(
             (cap_target, 1, 1), (1, 0, 0), x.device
@@ -161,8 +153,26 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
                 attn_mask_meta=x_meta,
                 skip_sequence_parallel_override=True,
             )
-        for layer in self.context_refiner:
-            cap = layer(cap, cap_freqs, attn_mask=cap_mask, attn_mask_meta=cap_meta)
+
+        def _refine_caption():
+            cap, _ = self.cap_embedder(encoder_hidden_states)
+            cap = torch.cat((cap, direct_embeddings), 1)
+            cap = F.pad(cap, (0, 0, 0, cap_target - cap_length))
+            cap = self._replace_padding_with_token_mask(
+                cap,
+                (torch.arange(cap_target, device=x.device) < cap_length).unsqueeze(0),
+                self.cap_pad_token,
+            )
+            for layer in self.context_refiner:
+                cap = layer(cap, cap_freqs, attn_mask=cap_mask, attn_mask_meta=cap_meta)
+            return cap
+
+        # The caption path depends only on the prompt: once per request.
+        cap = self._cached_per_request(
+            "ming_context_refiner",
+            (encoder_hidden_states, direct_embeddings),
+            _refine_caption,
+        )
         if sp_size > 1:
             # masked alignment rows never contribute; learned registers must stay
             x, cap = x[:, :x_valid], cap[:, :cap_valid]

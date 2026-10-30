@@ -554,6 +554,17 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["transformer_blocks"]
 
+    def _project_text(self, x, batch_size, hidden_dim):
+        if x.device.type == "mps":
+            x = _mps_safe_linear(self.caption_projection.linear_1, x)
+            x = self.caption_projection.act_1(x)
+            x = _mps_safe_linear(self.caption_projection.linear_2, x)
+        else:
+            x = self.caption_projection(x)
+        if x.shape[0] != batch_size:
+            x = x.expand(batch_size, -1, -1).contiguous()
+        return self.caption_norm(x.view(batch_size, -1, hidden_dim))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -585,24 +596,14 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if isinstance(encoder_attention_mask, (list, tuple)):
             encoder_attention_mask = encoder_attention_mask[0]
 
-        if encoder_hidden_states.device.type == "mps":
-            encoder_hidden_states = _mps_safe_linear(
-                self.caption_projection.linear_1, encoder_hidden_states
-            )
-            encoder_hidden_states = self.caption_projection.act_1(encoder_hidden_states)
-            encoder_hidden_states = _mps_safe_linear(
-                self.caption_projection.linear_2, encoder_hidden_states
-            )
-        else:
-            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        if encoder_hidden_states.shape[0] != batch_size:
-            encoder_hidden_states = encoder_hidden_states.expand(
-                batch_size, -1, -1
-            ).contiguous()
-        encoder_hidden_states = encoder_hidden_states.view(
-            batch_size, -1, hidden_states.shape[-1]
+        # Caption projection depends only on the prompt: once per request.
+        encoder_hidden_states = self._cached_per_request(
+            "sana_caption",
+            (encoder_hidden_states,),
+            lambda: self._project_text(
+                encoder_hidden_states, batch_size, hidden_states.shape[-1]
+            ),
         )
-        encoder_hidden_states = self.caption_norm(encoder_hidden_states)
 
         if (
             encoder_attention_mask is not None

@@ -532,11 +532,17 @@ class SanaVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             batch_size, -1, embedded_timestep.shape[-1]
         )
 
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(
-            batch_size, -1, hidden_states.shape[-1]
+        hidden_dim = hidden_states.shape[-1]
+        # Caption projection depends only on the prompt: once per request.
+        encoder_hidden_states = self._cached_per_request(
+            "sana_video_caption",
+            (encoder_hidden_states,),
+            lambda: self.caption_norm(
+                self.caption_projection(encoder_hidden_states).view(
+                    batch_size, -1, hidden_dim
+                )
+            ),
         )
-        encoder_hidden_states = self.caption_norm(encoder_hidden_states)
 
         for block in self.transformer_blocks:
             hidden_states = block(
