@@ -6,7 +6,11 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from sglang_simulator.compat import validate_simulator_server_args
+from sglang_simulator.compat import (
+    request_extend_length,
+    request_prefix_length,
+    validate_simulator_server_args,
+)
 from sglang_simulator.hook import (
     BaseHook,
     is_class_hook_matched,
@@ -74,7 +78,7 @@ class C_SglangPrefillAdderHook(BaseHook):
                 **kwargs,
             )
             req_infos = request_stats_manager.get_req_stats(req.rid)
-            req_infos.before_adder_device_hit_len = req.prefix_len
+            req_infos.before_adder_device_hit_len = request_prefix_length(req)
             req_infos.final_host_hit_len = req.host_hit_length
 
             return original_add_one_req(self, *args, **kwargs)
@@ -280,6 +284,7 @@ class C_SchedulerHook(BaseHook):
     GET_NEW_BATCH_PREFILL_TIME_COST = 0
 
     SIMULATION_BATCH: SimulationScheduleBatch = None
+    REQUEST_COMPLETION_OFFSETS: dict[str, float] = {}
     OVERLAP_SCHEDULE: bool = False
     SIM_MODE = SimulationMode(Envs.simulation_mode())
     # Shared singleton instance with `C_SchedulerRequestReceiver.REQ_DISPATCHER`.
@@ -411,7 +416,7 @@ class C_SchedulerHook(BaseHook):
                 **kwargs,
             )
             req_stats = request_stats_manager.get_req_stats(req.rid)
-            req_stats.recv_device_hit_len = req.prefix_len
+            req_stats.recv_device_hit_len = request_prefix_length(req)
             req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
@@ -423,15 +428,36 @@ class C_SchedulerHook(BaseHook):
 
             if ret.__class__.__name__ == "GenerationBatchResult":
                 simulation_batch = SimulationScheduleBatch(reqs=[])
+                virtual_events = getattr(
+                    C_SchedulerHook.INFERENCE_PREDICTOR,
+                    "uses_virtual_event_time",
+                    False,
+                )
+                C_SchedulerHook.REQUEST_COMPLETION_OFFSETS = {}
+                if virtual_events:
+                    from sglang_simulator.afd.request_timing import (
+                        completion_offsets,
+                        decode_past_length,
+                    )
+                if (
+                    virtual_events
+                    and C_SchedulerHook.SIM_MODE != SimulationMode.OFFLINE
+                ):
+                    raise ValueError(
+                        "AFD request integration requires OFFLINE logical time"
+                    )
+                simulation_batch.forward_phase = (
+                    "decode" if batch.forward_mode.is_decode() else "prefill"
+                )
                 if batch.forward_mode.is_extend():
                     for req in batch.reqs:
-                        extend_length = getattr(req, "extend_input_len", None)
-                        if extend_length is None:
-                            extend_length = req.extend_len
+                        extend_length = request_extend_length(req)
                         simulation_batch.reqs.append(
                             ScheduleRequest(
                                 extend_length=extend_length,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                                past_kv_length=request_prefix_length(req)
+                                + len(req.output_ids),
+                                request_id=req.rid,
                             )
                         )
                 elif batch.forward_mode.is_decode():
@@ -439,7 +465,13 @@ class C_SchedulerHook(BaseHook):
                         simulation_batch.reqs.append(
                             ScheduleRequest(
                                 extend_length=1,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                                past_kv_length=(
+                                    decode_past_length(req)
+                                    if virtual_events
+                                    else request_prefix_length(req)
+                                    + len(req.output_ids)
+                                ),
+                                request_id=req.rid,
                             )
                         )
 
@@ -456,6 +488,12 @@ class C_SchedulerHook(BaseHook):
                         time.perf_counter() - pred_start
                     )
                     predicted_latency = float(predicted_latency)
+                    if virtual_events:
+                        C_SchedulerHook.REQUEST_COMPLETION_OFFSETS = completion_offsets(
+                            C_SchedulerHook.INFERENCE_PREDICTOR,
+                            [r.request_id for r in simulation_batch.reqs],
+                            predicted_latency,
+                        )
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
@@ -499,6 +537,7 @@ class C_SchedulerHook(BaseHook):
                 )
 
                 StateManager.step_global_clock(visible_l2_load_dur)
+                inference_start = StateManager.get_global_clock()
                 StateManager.step_global_clock(current_inference_dur)
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
@@ -507,6 +546,16 @@ class C_SchedulerHook(BaseHook):
                     now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
                     0.0,
                 )
+                virtual_events = getattr(
+                    C_SchedulerHook.INFERENCE_PREDICTOR,
+                    "uses_virtual_event_time",
+                    False,
+                )
+                if virtual_events:
+                    # CPU graph construction / RPC wall time is simulator work,
+                    # not target-device host latency. Explicit ledger costs are
+                    # already in the virtual step; do not charge interpreter time.
+                    cpu_overhead = 0.0
                 StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
 
@@ -515,11 +564,17 @@ class C_SchedulerHook(BaseHook):
                 for req in batch.reqs:
                     if len(req.output_ids) != 0:  # not chunked
                         req_stats = request_stats_manager.get_req_stats(req.rid)
+                        token_response_time = (
+                            inference_start
+                            + C_SchedulerHook.REQUEST_COMPLETION_OFFSETS[req.rid]
+                            if virtual_events
+                            else request_response_time
+                        )
                         req_stats.gen_token_latencies.append(
-                            request_response_time
+                            token_response_time
                             - req_stats.last_event_time  # queue duration
                         )
-                        req_stats.last_event_time = request_response_time
+                        req_stats.last_event_time = token_response_time
                     else:
                         # Chunked request: nothing to do
                         pass
@@ -536,6 +591,14 @@ class C_SchedulerHook(BaseHook):
                         "postprocess_latency": process_batch_result_end
                         - process_batch_result_start,
                         "cpu_overhead": cpu_overhead,
+                        **(
+                            {
+                                "afd_request_completion_offsets": C_SchedulerHook.REQUEST_COMPLETION_OFFSETS,
+                                "afd_host_wall_time_excluded": True,
+                            }
+                            if virtual_events
+                            else {}
+                        ),
                     }
                 )
             else:
