@@ -97,5 +97,20 @@ def test_gate_skips_batch_invariant_and_large_batches(monkeypatch):
     assert not _can_use_decode_post_combine(cfg, 1)
 
 
+def test_mega_mhc_follows_local_extend_mode():
+    from types import SimpleNamespace
+
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models.deepseek_v4_mhc import is_local_extend
+
+    def batch(mode):
+        return SimpleNamespace(forward_mode=mode)
+
+    assert is_local_extend(batch(ForwardMode.EXTEND))
+    assert not is_local_extend(batch(ForwardMode.TARGET_VERIFY))
+    assert not is_local_extend(batch(ForwardMode.DECODE))
+    assert not is_local_extend(None)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

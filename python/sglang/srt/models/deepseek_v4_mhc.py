@@ -252,6 +252,14 @@ class HcNextBoundary(NamedTuple):
     hc: Optional[HcSubLayer] = None
     accepts_mxfp8_deepgemm: bool = False
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
+    extend: bool = False
+
+
+def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
+    if forward_batch is None:
+        return False
+    mode = forward_batch.forward_mode
+    return mode.is_extend() and not mode.is_target_verify()
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -283,6 +291,7 @@ def make_boundary(
     hc: Optional[HcSubLayer] = None,
     accepts_mxfp8_deepgemm: bool = False,
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
+    extend: bool = False,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -300,6 +309,7 @@ def make_boundary(
         hc=hc,
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
         mega_moe_input=mega_moe_input,
+        extend=extend,
     )
 
 
@@ -663,7 +673,6 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
         and get_platform().is_sm100
         and not cfg.cp_prefill
-        and (get_forward().is_extend_in_batch or is_in_prefill_graph_scope())
     )
 
 
@@ -703,6 +712,7 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and next.hc is not None
+        and next.extend
         and _can_use_mega_mhc(cfg)
         and y.shape[0] > 0
     ):
