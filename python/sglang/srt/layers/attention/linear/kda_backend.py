@@ -6,9 +6,7 @@ import torch
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
-)
-from sglang.kernels.ops.mamba.causal_conv1d_triton import (
-    causal_conv1d_update as causal_conv1d_update_triton,
+    causal_conv1d_update,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
@@ -31,30 +29,16 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
-# Target verify needs tree mappings and per-token intermediate-state checkpoints.
-# Keep Triton as the default; platform overrides below must implement that full
-# contract before they are used for the MTP path.
-causal_conv1d_update_decode = causal_conv1d_update_triton
-causal_conv1d_update_target_verify = causal_conv1d_update_triton
+# KDA always uses the triton causal_conv1d_fn (no CUDA override).
+# Only causal_conv1d_update needs platform-specific overrides for decode.
 if is_npu():
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-    from sgl_kernel_npu.operators.mamba import (
-        causal_conv1d_target_verify,
-    )
+    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update_decode = causal_conv1d_update_npu
-    # Use the public tree-verify API for intermediate convolution checkpoints;
-    # regular decode keeps its existing sgl-kernel-npu entry point.
-    causal_conv1d_update_target_verify = causal_conv1d_target_verify
+    causal_conv1d_update = causal_conv1d_update_npu
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 
-    causal_conv1d_update_decode = causal_conv1d_update_cpu
-    causal_conv1d_update_target_verify = causal_conv1d_update_cpu
+    causal_conv1d_update = causal_conv1d_update_cpu
 
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -510,22 +494,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
-        if is_npu():
-            # Target verify reads weights a channel tile at a time. Prepare the
-            # [width, dim] layout once, before graph capture, so those loads are
-            # contiguous and no transpose/cast is introduced into each forward.
-            for module in model_runner.model.modules():
-                if not isinstance(module, RadixLinearAttention):
-                    continue
-                weight = module.conv_weights
-                if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-                    continue
-                module._npu_target_verify_conv_weights = (
-                    weight.detach()
-                    .to(dtype=model_runner.dtype)
-                    .transpose(0, 1)
-                    .contiguous()
-                )
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode
         prefill_backend = backends.prefill
@@ -981,13 +949,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         f"ssm_states {tuple(ssm_states.shape)}/{ssm_states.dtype}, "
                         f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
                     )
-        conv_weights = (
-            layer.conv_weights.to(mixed_qkv.dtype) if is_npu() else layer.conv_weights
-        )
-        qkv = causal_conv1d_update_decode(
+
+        qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states.transpose(-1, -2),
-            conv_weights,
+            layer.conv_weights,
             layer.bias,
             activation="silu",
             conv_state_indices=cache_indices,
@@ -1060,12 +1026,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
-        conv_weights = (
-            layer.conv_weights.to(mixed_qkv.dtype) if is_npu() else layer.conv_weights
-        )
         return causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
-            conv_weights,
+            layer.conv_weights,
             layer.bias,
             activation="silu",
             conv_states=conv_states,
@@ -1449,30 +1412,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 batch_size, draft_token_num, -1
             )
 
-        # The compatibility API expects x/state as [.., dim, width]. Their
-        # transposes are views over KDA's channel-last physical layout. NPU uses
-        # the prebuilt [kernel_width, dim] weight so channel-tile loads are also
-        # contiguous. KDA keeps dense conv-window scratch because the deduplicated
-        # overlapping layout cannot be transposed.
+        # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
+        # scratch because the deduplicated overlapping layout cannot be transposed.
         mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
-        if is_npu():
-            conv_weights = getattr(layer, "_npu_target_verify_conv_weights", None)
-            if conv_weights is None or conv_weights.dtype != mixed_qkv.dtype:
-                # Defensive fallback for backends constructed before model weight
-                # loading; the normal path prepares this before graph capture.
-                conv_weights = (
-                    layer.conv_weights.detach()
-                    .to(dtype=mixed_qkv.dtype)
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-                layer._npu_target_verify_conv_weights = conv_weights
-        else:
-            conv_weights = layer.conv_weights
-        mixed_qkv_processed = causal_conv1d_update_target_verify(
+        mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
             conv_states.transpose(-1, -2),
-            conv_weights,
+            layer.conv_weights,
             layer.bias,
             activation="silu",
             conv_state_indices=cache_indices[:batch_size],

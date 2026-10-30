@@ -17,7 +17,6 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_gather_supported,
     is_tf32_supported,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
@@ -934,10 +933,6 @@ def chunk_kda_fwd_intra(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
-
-    # A5 cannot execute the pre-inverted safe-gate specialization. Solve
-    # raw diagonals in inter_solve; A3 retains its original specialization.
-    safe_gate = safe_gate and not is_npu_arch35()
 
     if fuse_diagonal:
         Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)

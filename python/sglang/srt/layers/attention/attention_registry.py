@@ -439,9 +439,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         from sglang.kernels.ops.attention.fla.utils import check_environments
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            HybridLinearAttnBackend as CommunityHybridLinearAttnBackend,
-        )
         from sglang.srt.layers.attention.linear.kda_backend import (
             KDAAttnBackend,
             flashinfer_kda_prefill_default,
@@ -460,6 +457,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         if not is_npu():
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
                 Mamba2AttnBackend,
             )
             from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -472,7 +470,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     XpuGDNAttnBackend as GDNAttnBackend,
                 )
 
-            HybridLinearAttnBackend = CommunityHybridLinearAttnBackend
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -581,11 +578,16 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
-            # KDA uses the community target-verify kernels and their per-step
-            # SSM/conv intermediate caches on every device. In particular, it
-            # must not inherit the Ascend GDN wrapper's expanded-window rollback.
-            hybrid_backend_cls = CommunityHybridLinearAttnBackend
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                    AscendKDAHybridLinearAttnBackend,
+                )
+
+                linear_attn_backend = AscendKDAAttnBackend(runner)
+                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            else:
+                linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

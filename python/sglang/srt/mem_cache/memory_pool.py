@@ -674,9 +674,6 @@ class MambaPool:
 
         self.size = size
         self.device = device
-        # Exposed to the scheduler so KDA can encode checkpoint boundaries
-        # against the kernel's fixed chunk size instead of the (potentially
-        # larger) radix/page-aligned cache chunk size.
         self.is_kda = cache_params.is_kda
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
@@ -743,7 +740,7 @@ class MambaPool:
                     for conv_shape in conv_state_shape
                 ]
 
-                if _is_npu and (not cache_params.is_kda):
+                if _is_npu:
                     from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                         _init_npu_conv_state,
                     )
@@ -877,23 +874,8 @@ class MambaPool:
                     )
 
             if speculative_num_draft_tokens is not None:
-                # NPU GDN/Mamba operators use [HV, K, V], so retain the existing
-                # transpose. KDA Triton operators always access contiguous
-                # [HV, V, K] and must not apply this transpose. The current
-                # KDA V == K hides the shape difference, but a transposed view
-                # would silently redirect PyTorch assignments such as the
-                # extend track into the transposed SSM state.
-                if _is_npu and not cache_params.is_kda:
-                    temporal_state = temporal_state.transpose(-1, -2)
-                    temporal_state_shape = (
-                        *temporal_state_shape[:-2],
-                        temporal_state_shape[-1],
-                        temporal_state_shape[-2],
-                    )
-                # The intermediate SSM follows the persistent state's dimension
-                # order so target-verify writes and post-acceptance rollback use
-                # the same layout: [..., draft_tokens, HV, V, K] for KDA and
-                # [..., draft_tokens, HV, K, V] for NPU GDN/Mamba.
+                # Cache intermediate SSM states per draft token during target verify
+                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, V, K]
                 #
                 # ReplaySSM spec-verify owns rollback via the ring + cursors (the
                 # verify kernel never writes per-draft snapshots; the commit never
@@ -971,7 +953,14 @@ class MambaPool:
                     # Original dense layout (NPU/CPU, or EAGLE tree verify): one
                     # [dim, K-1] window per draft token.
                     # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
-                    dense_conv_shapes = conv_state_shape
+                    dense_conv_shapes = [
+                        (
+                            (conv_shape[1], conv_shape[0])
+                            if _is_npu and cache_params.is_kda
+                            else conv_shape
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(
