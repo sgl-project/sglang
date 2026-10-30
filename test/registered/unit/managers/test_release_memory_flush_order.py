@@ -2,8 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import torch
+
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -12,6 +15,8 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,17 +44,17 @@ class TestReleaseMemoryFlushOrder(CustomTestCase):
             running_batch=SimpleNamespace(reqs=[]),
             disaggregation_mode=DisaggregationMode.NULL,
         )
-        manager = SchedulerWeightUpdaterManager(
-            tp_worker=None,
-            draft_worker=None,
-            tp_cpu_group=None,
-            memory_saver_adapter=Mock(),
-            flush_cache=lambda empty_cache=False: Scheduler.flush_cache(
-                scheduler, empty_cache=False
-            ),
-            is_fully_idle=scheduler.is_fully_idle,
-            scheduler=scheduler,
-        )
+        with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
+            manager = SchedulerWeightUpdaterManager(
+                tp_worker=None,
+                draft_worker=None,
+                memory_saver_adapter=Mock(),
+                flush_cache=lambda empty_cache=False: Scheduler.flush_cache(
+                    scheduler, empty_cache=False
+                ),
+                is_fully_idle=scheduler.is_fully_idle,
+                scheduler=scheduler,
+            )
         scheduler.weight_updater = manager
         return scheduler, manager
 
@@ -90,6 +95,26 @@ class TestReleaseMemoryFlushOrder(CustomTestCase):
         self.assertNotIn(GPU_MEMORY_TYPE_KV_CACHE, manager.offload_tags)
         self.assertTrue(Scheduler.flush_cache(scheduler, empty_cache=False))
         self.assertEqual(scheduler.tree_cache.reset.call_count, 2)
+
+    def test_flush_and_release_drop_cached_embeddings(self):
+        """/flush_cache and a KV release must drop ViT embeddings with the other pools."""
+        mm_schedule.init_mm_embedding_cache(1 << 20)
+        self.addCleanup(mm_schedule.init_mm_embedding_cache, 0)
+        scheduler, manager = self._harness()
+        entry = EmbeddingResult(embedding=torch.ones(2, 4))
+
+        mm_schedule.embedding_cache.set(7, entry)
+        self.assertTrue(Scheduler.flush_cache(scheduler, empty_cache=False))
+        self.assertFalse(mm_schedule.embedding_cache.has(7))
+
+        mm_schedule.embedding_cache.set(7, entry)
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.torch.get_device_module"
+        ):
+            manager.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+            )
+        self.assertFalse(mm_schedule.embedding_cache.has(7))
 
 
 if __name__ == "__main__":

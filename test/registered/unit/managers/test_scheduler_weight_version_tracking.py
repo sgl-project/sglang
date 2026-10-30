@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.kv_weight_version_tracker import (
     KvWeightVersionRecord,
     KvWeightVersionTracker,
 )
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
@@ -580,6 +582,50 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("begin_weight_update", output.message)
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
+
+
+class TestWeightChangeDropsCachedEmbeddings(_WeightUpdaterManagerTestBase):
+    """A ViT embedding cached under the old weights must not serve a request
+    after any weight change, even when the caller skips the cache flush."""
+
+    def setUp(self):
+        super().setUp()
+        mm_schedule.init_mm_embedding_cache(1 << 20)
+        self.addCleanup(mm_schedule.init_mm_embedding_cache, 0)
+
+    def _assert_dropped(self, update, *, session, result=(True, "ok")):
+        manager = self._manager(_runner(result), session=session)
+        mm_schedule.embedding_cache.set(7, EmbeddingResult(embedding=torch.ones(2, 4)))
+        update(manager)
+        self.assertFalse(mm_schedule.embedding_cache.has(7))
+
+    def test_sessionless_updates(self):
+        for name, result in (
+            ("disk", (True, "ok")),
+            ("disk", (False, "boom")),
+            ("ipc", (True, "ok")),
+        ):
+            with self.subTest(path=name, result=result):
+                self._assert_dropped(
+                    lambda m: getattr(m, f"update_weights_from_{name}")(
+                        _request(flush_cache=False)
+                    ),
+                    session=False,
+                    result=result,
+                )
+
+    def test_session_updates(self):
+        for name in ("tensor", "distributed", "p2p"):
+            with self.subTest(path=name):
+
+                def update(manager):
+                    if name != "p2p":
+                        getattr(manager, f"update_weights_from_{name}")(
+                            _request(flush_cache=False)
+                        )
+                    manager.end_weight_update(EndWeightUpdateReqInput())
+
+                self._assert_dropped(update, session=True)
 
 
 if __name__ == "__main__":

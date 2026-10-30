@@ -197,6 +197,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
     MinFreeSlotsDelayer,
     resolve_min_free_slots,
 )
+from sglang.srt.managers.mm_schedule import clear_mm_embedding_cache
 from sglang.srt.managers.mm_utils import duplicate_pad_mm_input_ids
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
@@ -5378,6 +5379,7 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
+            clear_mm_embedding_cache()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
 

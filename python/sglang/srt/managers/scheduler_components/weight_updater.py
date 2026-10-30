@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.mm_schedule import clear_mm_embedding_cache
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
@@ -190,6 +191,8 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
                 target_updated |= role == "target"
+            # a failed load may still have overwritten some weights
+            clear_mm_embedding_cache()
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
             # the served weights changed even if a draft runner failed afterwards
@@ -384,6 +387,8 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
                 target_updated |= role == "target"
+            # a failed load may still have overwritten some weights
+            clear_mm_embedding_cache()
             if success:
                 self.record_weight_version_after_update(recv_req.weight_version)
             # the served weights changed even if a draft runner failed afterwards
@@ -454,6 +459,8 @@ class SchedulerWeightUpdaterManager:
             success, message = True, "Aborted: streamed adapters discarded"
         else:
             success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
+        # every session may have changed weights, including P2P writes and LoRA-only syncs
+        clear_mm_embedding_cache()
         pending_version = self._session.pending_version
         self._session = None
         if success and not recv_req.abort:
