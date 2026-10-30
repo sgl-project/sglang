@@ -251,6 +251,10 @@ class SchedulerOutputStreamer:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
+            if req.pd_rebootstrap_forced_output_id is not None and not req.finished():
+                # A PD rebootstrap popped the last output id, which the client already
+                # has, and replays it; nothing is new until the replay re-adds it.
+                continue
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)

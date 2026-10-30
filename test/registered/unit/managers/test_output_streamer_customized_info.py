@@ -74,6 +74,7 @@ class _FakeReq:
             SimpleNamespace(to_json=lambda: {"type": "stop"}) if finished else None
         )
         self.finished_output = False
+        self.pd_rebootstrap_forced_output_id = None
         self.finished_len = None
         self.beam_group = None
         self.stream = False
@@ -1021,6 +1022,27 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
             self.assertIsNone(outputs[-1].detokenize_headers)
         streamer.release_detokenize_state(req)
         self.assertEqual(len(outputs), 2)
+
+    def test_pd_rebootstrap_sends_no_row_while_its_last_id_is_popped(self):
+        """A PD rebootstrap pops the last output id and replays it later; a row
+        sent in between would shrink the count the detokenizer checks, and the
+        replay would resend an id the client already has."""
+        outputs = []
+        streamer = _streamer(outputs)
+        req = self._req()
+        req.output_ids.extend([7, 8])
+        streamer.stream_output([req], False)
+
+        req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+        streamer.stream_output([req], False)
+        self.assertEqual(len(outputs), 1)
+
+        req.output_ids.append(req.pd_rebootstrap_forced_output_id)
+        req.pd_rebootstrap_forced_output_id = None
+        req.output_ids.append(9)
+        streamer.stream_output([req], False)
+        self.assertEqual(list(outputs[-1].output_ids[0]), [9])
+        self.assertEqual(outputs[-1].completion_tokens, [3])
 
     def test_skip_tokenizer_init_idle_batch_carries_an_empty_ipc_list(self):
         """The tokenizer-side router iterates http_worker_ipcs on every batch;
