@@ -56,7 +56,8 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -119,7 +120,8 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -283,7 +285,8 @@
             "total_tokens": 13,
             "completion_tokens": 1,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -467,6 +470,7 @@
     "image_max_dynamic_patch": null,
     "video_max_dynamic_patch": null,
     "images_config": null,
+    "mm_processor_kwargs": null,
     "multi_item_delimiter_indices": null,
     "token_indices_to_pool": null,
     "cache_salt": null,

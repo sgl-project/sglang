@@ -283,6 +283,12 @@ output files. Manage output retention separately.
 
 The server implements a subset of the OpenAI Videos API under the `/v1/videos` namespace.
 
+With `--input-save-path ""`, uploads use request-owned temporary directories,
+removed on rejection or after the background job exits. Configured input and
+output directories remain persistent. Cancelling preparation waits for active
+CPU preprocessing to finish before cleanup; it does not abort queued GPU work.
+With `--output-path ""`, cloud upload must succeed before a job reports completion.
+
 **Create a video (text-to-video)**
 
 **Endpoint:** `POST /v1/videos`
@@ -411,9 +417,28 @@ job ownership, and queue admission limits require an external serving layer.
 An accepted job continues after the submitting client disconnects. For a bounded
 scheduler wait, set `--scheduler-rpc-timeout` in seconds; it includes queue time
 and generation. A timeout marks the job failed but does not cancel GPU work.
-Retrying creates another job, so clients should retain and poll the returned ID.
-Deleting a job removes its API record, but does not cancel GPU work or remove
-generated files. Manage output retention separately.
+On supported deployments, delete the job to request cancellation. Retrying
+generation creates another job, so retain and poll the returned ID.
+
+`DELETE /v1/videos/&#123;video_id&#125;` removes the API record and requests
+cancellation: a cancelled queued job does not start, and a running job stops after its
+current denoising step, on each rank of its replica. The stages that follow
+denoising, such as decoding, do not run. A job deleted after its last denoising
+step still decodes and saves or uploads its output, but the API does not return
+it. Cancelled jobs are excluded before dynamic batching. Once a batch starts,
+it runs to the end unless every member is cancelled.
+
+If a replica's cancellation channel is not connected or its queue is full,
+DELETE returns `503` with `Retry-After: 1`. The job record remains available;
+retry DELETE with the same video ID. A successful DELETE enqueues the command,
+not an acknowledgement that GPU work has already stopped. Cancellation is best
+effort: process failures or eviction from the driver's bounded history (the
+latest 4096 cancelled job IDs) can still prevent it. Cancellation supports single-node,
+monolithic serving only; in other deployments DELETE removes the API record
+without stopping GPU work. Completed jobs can be deleted without a cancellation
+channel.
+Deleting a job does not remove files that were already generated. Manage output
+retention separately.
 
 **Python Example:**
 

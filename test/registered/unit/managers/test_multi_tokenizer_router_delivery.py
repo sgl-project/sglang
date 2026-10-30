@@ -490,8 +490,7 @@ def _delivery_case(pickle_ipc):
                     http_worker_ipcs=[],
                     finished_reasons=[],
                     embeddings=[],
-                    prompt_tokens=[],
-                    cached_tokens=[],
+                    request_stats=[],
                     placeholder_tokens_idx=[],
                     placeholder_tokens_val=[],
                 ),
@@ -740,8 +739,8 @@ class TestRouterDeliveryIntegration(CustomTestCase):
                             for item in delivery["worker_results"]
                         },
                         {
-                            "worker-a.sock": ["delivery-a", "legacy"],
-                            "worker-b.sock": ["delivery-b"],
+                            "worker-a.sock": ["legacy"],
+                            "worker-b.sock": ["delivery-a", "delivery-b"],
                         },
                     )
                     self.assertTrue(all(x == 1 for x in overhead_off["frame_counts"]))
