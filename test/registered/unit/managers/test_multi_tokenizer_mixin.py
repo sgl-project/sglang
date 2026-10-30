@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.entrypoints import http_server
+from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -24,45 +25,35 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
-    unwrap_from_pickle,
-    wrap_as_pickle,
+    RequestOutputStats,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
-    TokenizerWorker,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
     _send_output_to_tokenizer_workers,
-    get_tokenizer_worker_class,
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class CustomTokenizerWorker(TokenizerWorker):
-    pass
+def _request_stats(prompt_tokens, cached_tokens, cached_tokens_details=None):
+    return RequestOutputStats(
+        prompt_tokens=prompt_tokens,
+        cached_tokens=cached_tokens,
+        cached_tokens_details=cached_tokens_details,
+        retraction_count=0,
+        image_tokens=0,
+        audio_tokens=0,
+        video_tokens=0,
+        time_stats=None,
+    )
 
 
-class NotAWorker:
-    pass
-
-
-class DefaultServerArgs:
-    def get_tokenizer_worker_class(self):
-        return TokenizerWorker
-
-
-class CustomServerArgs:
-    def get_tokenizer_worker_class(self):
-        return CustomTokenizerWorker
-
-
-class InvalidServerArgs:
-    def get_tokenizer_worker_class(self):
-        return NotAWorker
+_REQUEST_STATS_1 = _request_stats(20, 4, {"device": 1, "host": 3})
 
 
 def _make_batch_str_output() -> BatchStrOutput:
@@ -74,14 +65,10 @@ def _make_batch_str_output() -> BatchStrOutput:
         finished_reasons=[None, {"type": "length"}],
         output_strs=["first", "second"],
         output_ids=[[1], [2]],
-        prompt_tokens=[10, 20],
         completion_tokens=[1, 2],
         reasoning_tokens=[0, 0],
-        cached_tokens=[3, 4],
-        cached_tokens_details=[
-            {"device": 3, "host": 0},
-            {"device": 1, "host": 3},
-        ],
+        # Only rid-1 has new request stats in this step.
+        request_stats=[None, _REQUEST_STATS_1],
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],
@@ -112,7 +99,6 @@ def _make_batch_str_output() -> BatchStrOutput:
         indexer_topk=[None, None],
         placeholder_tokens_idx=[None, None],
         placeholder_tokens_val=[None, None],
-        retraction_counts=[0, 0],
         weight_versions=[
             [
                 WeightVersionSpan(version="v1", start=0, end=3),
@@ -146,17 +132,14 @@ def _make_batch_token_id_output() -> BatchTokenIDOutput:
         spec_num_cap_tokens=[],
         spec_cap_lens_histogram=[],
         finished_reasons=[None, None],
-        decoded_texts=["first", "second"],
         decode_ids=[[1], [2]],
         read_offsets=[0, 1],
         output_ids=[[1], [2]],
         skip_special_tokens=[True, True],
         spaces_between_special_tokens=[True, True],
         no_stop_trim=[False, False],
-        prompt_tokens=[10, 20],
         reasoning_tokens=[0, 0],
         completion_tokens=[1, 2],
-        cached_tokens=[3, 4],
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],
@@ -184,8 +167,7 @@ def _make_batch_embedding_output() -> BatchEmbeddingOutput:
         rids=["embedding-rid-0", "embedding-rid-1"],
         finished_reasons=[None, None],
         embeddings=[[0.1, 0.2], [0.3, 0.4]],
-        prompt_tokens=[10, 20],
-        cached_tokens=[3, 4],
+        request_stats=[_request_stats(10, 3), _request_stats(20, 4)],
         placeholder_tokens_idx=[None, None],
         placeholder_tokens_val=[None, None],
     )
@@ -263,17 +245,14 @@ class TestMultiTokenizerMixin(CustomTestCase):
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
                 )
 
-    def test_batch_str_output_preserves_cached_tokens_details(self):
+    def test_batch_str_output_keeps_request_stats_per_request(self):
         output = _make_batch_str_output()
 
         single_output = _handle_output_by_index(output, 1)
 
         self.assertEqual(single_output.rids, ["rid-1"])
-        self.assertEqual(single_output.cached_tokens, [4])
-        self.assertEqual(
-            single_output.cached_tokens_details,
-            [{"device": 1, "host": 3}],
-        )
+        self.assertEqual(single_output.request_stats, [_REQUEST_STATS_1])
+        self.assertEqual(_handle_output_by_index(output, 0).request_stats, [None])
 
     def test_batch_str_output_keeps_weight_versions_nested_per_request(self):
         """Per-request segment lists stay one level nested after the split."""
@@ -317,10 +296,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(grouped.rids, ["rid-1", "rid-0"])
         self.assertEqual(grouped.output_strs, ["second", "first"])
-        self.assertEqual(
-            grouped.cached_tokens_details,
-            [{"device": 1, "host": 3}, {"device": 3, "host": 0}],
-        )
+        self.assertEqual(grouped.request_stats, [_REQUEST_STATS_1, None])
         self.assertEqual(
             grouped.weight_versions,
             [
@@ -402,23 +378,18 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "detok-a")
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(sent[0][1].decoded_texts, ["first", "second"])
+        self.assertEqual(sent[0][1].output_ids, [[1], [2]])
         self.assertIsNone(sent[0][1].spec_verify_ct)
 
     def test_embedding_split_preserves_per_request_fields(self):
         output = _make_batch_embedding_output()
-        output.retraction_counts = [0, 7]
-        output.cached_tokens_details = [{"radix": 0}, {"radix": 2}]
-        output.time_stats = wrap_as_pickle(["stats-0", "stats-1"])
         output.pooled_hidden_states = [[1.0], [2.0]]
 
         split = _handle_output_by_index(output, 1)
 
         self.assertEqual(split.rids, ["embedding-rid-1"])
         self.assertEqual(split.embeddings, [[0.3, 0.4]])
-        self.assertEqual(split.retraction_counts, [7])
-        self.assertEqual(split.cached_tokens_details, [{"radix": 2}])
-        self.assertEqual(unwrap_from_pickle(split.time_stats), ["stats-1"])
+        self.assertEqual(split.request_stats, [_request_stats(20, 4)])
         self.assertEqual(split.pooled_hidden_states, [[2.0]])
 
     def test_embedding_split_takes_a_row_of_stacked_pooled_hidden_states(self):
@@ -434,8 +405,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
         split = _handle_output_by_index(_make_batch_embedding_output(), 0)
 
         self.assertEqual(split.rids, ["embedding-rid-0"])
-        self.assertIsNone(split.retraction_counts)
-        self.assertIsNone(split.time_stats)
         self.assertIsNone(split.pooled_hidden_states)
 
     def test_router_sends_embedding_output_per_request(self):
@@ -501,7 +470,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
             ],
         )
 
-    def test_return_path_groups_noncontiguous_owners(self):
+    def test_return_path_batching_preserves_owner_order(self):
         output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
         output.rids = ["rid-0", "rid-1", "rid-2"]
         output.output_strs = ["first", "second", "third"]
@@ -515,29 +484,38 @@ class TestMultiTokenizerMixin(CustomTestCase):
             )
         )
 
-        _send_output_to_tokenizer_workers(output, ipcs, mapping)
-
-        self.assertEqual(
-            sent,
-            [
-                (
-                    "worker-b",
-                    ["rid-0", "rid-2"],
-                    ["first", "third"],
-                    ["worker-b", "worker-b"],
-                    True,
-                ),
-                ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
-            ],
-        )
-        self.assertEqual(pickle.dumps(output), original)
+        expected_grouped = [
+            (
+                "worker-b",
+                ["rid-0", "rid-2"],
+                ["first", "third"],
+                ["worker-b", "worker-b"],
+                True,
+            ),
+            ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
+        ]
+        expected_individual = [
+            ("worker-b", ["rid-0"], ["first"], None, True),
+            ("worker-a", ["rid-1"], ["second"], None, True),
+            ("worker-b", ["rid-2"], ["third"], None, True),
+        ]
+        for batching in (True, False):
+            sent.clear()
+            with (
+                self.subTest(batching=batching),
+                envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.override(batching),
+            ):
+                _send_output_to_tokenizer_workers(output, ipcs, mapping)
+            self.assertEqual(
+                sent, expected_grouped if batching else expected_individual
+            )
+            self.assertEqual(pickle.dumps(output), original)
 
     def test_return_path_falls_back_before_sending_any_group(self):
         output = _make_batch_embedding_output()
         output.rids.append("embedding-rid-2")
         output.embeddings.append([0.5, 0.6])
-        output.prompt_tokens.append(30)
-        output.cached_tokens.append(5)
+        output.request_stats.append(_request_stats(30, 5))
         output.finished_reasons.append(None)
         sent = []
         mapping = SimpleNamespace(
@@ -585,19 +563,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
             worker.multi_http_worker_event_loop()
 
         self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
-
-    def test_get_tokenizer_worker_class_uses_default(self):
-        self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
-
-    def test_get_tokenizer_worker_class_resolves_custom_class(self):
-        self.assertIs(
-            get_tokenizer_worker_class(CustomServerArgs()),
-            CustomTokenizerWorker,
-        )
-
-    def test_get_tokenizer_worker_class_rejects_non_worker(self):
-        with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
-            get_tokenizer_worker_class(InvalidServerArgs())
 
 
 if __name__ == "__main__":

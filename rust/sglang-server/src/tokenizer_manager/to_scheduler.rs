@@ -10,6 +10,7 @@ use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
+pub(crate) use crate::tokenizer_manager::to_scheduler_validation::fit_input;
 use crate::tokenizer_manager::to_scheduler_validation::{
     check_total_tokens, validate, validate_input_ids,
 };
@@ -352,16 +353,18 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.sampling_params.skip_special_tokens,
             ),
             RequestKind::Control(_)
             | RequestKind::Detokenize { .. }
             | RequestKind::Tokenize { .. } => (
                 false, /* decode_logprob_text */
                 false, /* no_stop_trim */
+                true,  /* skip_special_tokens */
             ),
         };
         self.senders
@@ -371,6 +374,7 @@ impl Intake {
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
+                skip_special_tokens,
             })
             .is_ok()
     }
@@ -452,11 +456,9 @@ impl Intake {
     /// Client disconnected (or a detok terminal): deregister the sink, then push an
     /// `AbortReq(rid)` so the scheduler stops generating for it.
     ///
-    /// A failed push is logged, not retried: the scheduler keeps generating and the
-    /// chunks arrive for a rid no longer in the detok table, where they are dropped.
-    /// That wastes GPU work until the request finishes on its own, but it cannot be
-    /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it.
+    /// Aborts use the reserved scheduler-control lane, so request-ring
+    /// backpressure cannot discard cancellation after public selector state is
+    /// retired.
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
     /// abort there yet: it is marked `Aborted` and dropped when it returns.
@@ -475,19 +477,13 @@ impl Intake {
             return;
         }
 
-        // The channel is BOUNDED and drops pushes under exactly the load this matters
-        // for, so report the miss rather than assuming the scheduler was told.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
-                if !self.to_scheduler_tx.try_push(SchedulerRequest {
+                if !self.to_scheduler_tx.push_priority(SchedulerRequest {
                     header,
                     buffers: Vec::new(),
                 }) {
-                    tracing::error!(
-                        rid = %rid,
-                        "abort dropped: to_scheduler channel is full; the scheduler keeps generating \
-                         for this request until it finishes on its own"
-                    );
+                    tracing::debug!(rid = %rid, "abort ignored during scheduler shutdown");
                 }
             }
             Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),

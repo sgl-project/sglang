@@ -35,7 +35,7 @@ from sglang.srt.managers.tokenizer_manager import (
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Synthetic per-position top-k rows (k=2). The leading None mirrors the first
 # prompt position, which has no top logprobs.
@@ -730,17 +730,14 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     fields = dict(
         rids=["r0", "r1"],
         finished_reasons=[None] * n,
-        decoded_texts=["", ""],
         decode_ids=[array("q", [1]), array("q", [2])],
         read_offsets=[0] * n,
         output_ids=None,
         skip_special_tokens=[True] * n,
         spaces_between_special_tokens=[True] * n,
         no_stop_trim=[False] * n,
-        prompt_tokens=[5] * n,
         reasoning_tokens=[0] * n,
         completion_tokens=[1] * n,
-        cached_tokens=[0] * n,
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],

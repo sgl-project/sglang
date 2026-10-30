@@ -29,6 +29,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.multimodal.processors.glm4v import (
     _glm_effective_presize_budget,
+    _merge_glm_video_configs,
     glm_budget_kwargs,
     glm_decode_frames_at,
     glm_max_image_tokens_from_configs,
@@ -467,7 +468,11 @@ class EncoderPreprocessor:
         try:
             frames = await asyncio.get_running_loop().run_in_executor(
                 self.io_executor,
-                glm_decode_frames_at,
+                functools.partial(
+                    glm_decode_frames_at,
+                    # Full-clip count. local_indices is this rank's shard.
+                    budget_frame_count=len(global_indices),
+                ),
                 vr,
                 local_indices,
                 video_config,
@@ -525,9 +530,7 @@ class EncoderPreprocessor:
             mm_items, video_configs = split_glm_video_items(mm_items)
             defaults = glm_processor_video_config(self.video_processor)
             defaults.update(self.vision_config.get("video", {}))
-            video_configs = [
-                {**defaults, **dict(config or {})} for config in video_configs
-            ]
+            video_configs = _merge_glm_video_configs(defaults, video_configs)
 
         futures, _ = self._submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)

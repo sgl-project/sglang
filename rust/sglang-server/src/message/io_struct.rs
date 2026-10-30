@@ -4,12 +4,13 @@
 //! and `rmp_serde`'s default struct-as-array encoding reproduces it.
 
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
 use super::types::{Tagged, control_messages, wire_struct};
 use crate::utils::error::Error;
+use crate::utils::serialize::parse_int_opt;
 
 wire_struct! {
     /// The scheduler's `TokenizedGenerateReqInput`. Keep in lockstep with the
@@ -40,12 +41,11 @@ wire_struct! {
         return_indexer_topk: bool,
         session_id: (),
         session_params: (),
-        lora_id: (),
+        lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block. Everything after `cache_salt` (the last
-        /// field emitted) has a msgspec default in Python and is omitted
-        /// (short arrays decode with defaulted tails).
+        /// PD-disaggregation block. Everything after `kv_hints` (the last
+        /// field emitted) has a msgspec default in Python and is omitted.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,16 +53,10 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
-        /// The scheduler decodes this header by position (Python's
-        /// `TokenizedGenerateReqInput` is a msgspec `array_like` struct), so
-        /// `routing_key` is sent at its default for the fields after it to land
-        /// in their slots.
-        routing_key: (),
+        routing_key: Option<&'a str>,
         require_reasoning: bool,
         priority: Option<i64>,
         extra_key: Option<&'a str>,
-        /// Defaults, so `cache_salt`, the prefix cache's second key, lands in
-        /// its slot.
         no_logs: bool,
         return_bytes: bool,
         return_entropy: bool,
@@ -73,6 +67,7 @@ wire_struct! {
         token_indices_to_pool: (),
         time_stats: (),
         cache_salt: Option<&'a str>,
+        kv_hints: Option<&'a super::request::KvHintsEnvelope>,
     }
 }
 
@@ -106,6 +101,64 @@ control_messages! {
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
     }
+
+    /// Clear the HiCache storage backend.
+    ClearHiCacheReqInput {}
+
+    /// Detach the HiCache storage backend.
+    DetachHiCacheStorageReqInput {}
+
+    /// Attach a HiCache storage backend with optional configuration and policies.
+    AttachHiCacheStorageReqInput {
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+    }
+
+    /// `/start_profile` and `/stop_profile`'s control request, built only by
+    /// [`ProfileReq::start`] / [`ProfileReq::stop`]. The frontend fans it out
+    /// to every DP rank's scheduler, and each broadcasts it from its TP rank
+    /// 0, so every rank starts (or stops) its profiler.
+    ProfileReq {
+        /// Python's `ProfileReqType` value: 1 starts, 2 stops.
+        req_type: u8,
+        output_dir: Option<String>,
+        start_step: Option<i64>,
+        num_steps: Option<i64>,
+        activities: Option<Vec<String>>,
+        profile_by_stage: bool,
+        with_stack: Option<bool>,
+        record_shapes: Option<bool>,
+        profile_id: Option<String>,
+        merge_profiles: bool,
+        profile_prefix: Option<String>,
+        profile_stages: Option<Vec<String>>,
+        detailed_annotations: bool,
+    }
+}
+
+/// The client-settable fields of a profiling start: Python's `ProfileReq`
+/// body for `/start_profile`, every field optional and defaulted as Python
+/// defaults it. `start_step`/`num_steps` also accept a numeric string, as
+/// Python's request validation does.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProfileOptions {
+    pub(crate) output_dir: Option<String>,
+    #[serde(deserialize_with = "parse_int_opt")]
+    pub(crate) start_step: Option<i64>,
+    #[serde(deserialize_with = "parse_int_opt")]
+    pub(crate) num_steps: Option<i64>,
+    pub(crate) activities: Option<Vec<String>>,
+    pub(crate) profile_by_stage: bool,
+    pub(crate) with_stack: Option<bool>,
+    pub(crate) record_shapes: Option<bool>,
+    pub(crate) profile_id: Option<String>,
+    pub(crate) merge_profiles: bool,
+    pub(crate) profile_prefix: Option<String>,
+    pub(crate) profile_stages: Option<Vec<String>>,
+    pub(crate) detailed_annotations: bool,
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -139,7 +192,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_indexer_topk: false,
             session_id: (),
             session_params: (),
-            lora_id: (),
+            lora_id: req.lora_id.as_deref(),
             custom_logit_processor: (),
             positional_embed_overrides: (),
             bootstrap_host: req.bootstrap_host.as_deref(),
@@ -149,7 +202,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
-            routing_key: (),
+            routing_key: req.routing_key.as_deref(),
             require_reasoning: req.require_reasoning,
             priority: req.priority,
             extra_key: req.extra_key.as_deref(),
@@ -163,6 +216,37 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             token_indices_to_pool: (),
             time_stats: (),
             cache_salt: req.cache_salt.as_deref(),
+            kv_hints: req.kv_hints.as_ref(),
+        }
+    }
+}
+
+impl ClearHiCacheReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl DetachHiCacheStorageReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl AttachHiCacheStorageReqInput {
+    pub fn new(
+        rid: String,
+        hicache_storage_backend: String,
+        hicache_storage_backend_extra_config_json: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+    ) -> Self {
+        Self {
+            rid,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config_json,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
         }
     }
 }
@@ -193,6 +277,51 @@ impl CheckWeightsReqInput {
             allow_quant_error,
             skip_tensor_list,
             selector,
+        }
+    }
+}
+
+impl ProfileReq {
+    /// Start profiling with `options` (Python's `ProfileReqType.START_PROFILE`).
+    pub fn start(rid: String, options: ProfileOptions) -> Self {
+        let ProfileOptions {
+            output_dir,
+            start_step,
+            num_steps,
+            activities,
+            profile_by_stage,
+            with_stack,
+            record_shapes,
+            profile_id,
+            merge_profiles,
+            profile_prefix,
+            profile_stages,
+            detailed_annotations,
+        } = options;
+        Self {
+            rid,
+            req_type: 1,
+            output_dir,
+            start_step,
+            num_steps,
+            activities,
+            profile_by_stage,
+            with_stack,
+            record_shapes,
+            profile_id,
+            merge_profiles,
+            profile_prefix,
+            profile_stages,
+            detailed_annotations,
+        }
+    }
+
+    /// Stop profiling: Python's `ProfileReq(req_type=STOP_PROFILE)`, every
+    /// other field at its default.
+    pub fn stop(rid: String) -> Self {
+        Self {
+            req_type: 2,
+            ..Self::start(rid, ProfileOptions::default())
         }
     }
 }
@@ -276,6 +405,61 @@ mod tests {
         assert_eq!(arr[6].as_str(), Some("target"));
     }
 
+    /// `ProfileReq` decodes positionally into Python's 15-field struct: a
+    /// shift would hand the scheduler e.g. `num_steps` as `start_step`.
+    #[test]
+    fn profile_req_msgpack_shape() {
+        let start = ProfileReq::start(
+            "7".into(),
+            ProfileOptions {
+                output_dir: Some("/traces".into()),
+                start_step: Some(3),
+                num_steps: Some(5),
+                activities: Some(vec!["CPU".into(), "GPU".into()]),
+                profile_by_stage: true,
+                with_stack: Some(false),
+                record_shapes: Some(true),
+                profile_id: Some("id".into()),
+                merge_profiles: true,
+                profile_prefix: Some("pre".into()),
+                profile_stages: Some(vec!["decode".into()]),
+                detailed_annotations: true,
+            },
+        );
+        let val = rmpv::decode::read_value(&mut &start.encode().unwrap()[..]).unwrap();
+        let expected = rmpv::Value::Array(vec![
+            "ProfileReq".into(),
+            "7".into(),
+            rmpv::Value::Nil,
+            1.into(),
+            "/traces".into(),
+            3.into(),
+            5.into(),
+            rmpv::Value::Array(vec!["CPU".into(), "GPU".into()]),
+            true.into(),
+            false.into(),
+            true.into(),
+            "id".into(),
+            true.into(),
+            "pre".into(),
+            rmpv::Value::Array(vec!["decode".into()]),
+            true.into(),
+        ]);
+        assert_eq!(val, expected);
+
+        let stop = ProfileReq::stop("8".into());
+        let val = rmpv::decode::read_value(&mut &stop.encode().unwrap()[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(arr.len(), 16);
+        assert_eq!(arr[3].as_u64(), Some(2), "req_type STOP_PROFILE");
+        for i in [4, 5, 6, 7, 9, 10, 11, 13, 14] {
+            assert!(arr[i].is_nil(), "idx {i} must be a nil default");
+        }
+        for i in [8, 12, 15] {
+            assert_eq!(arr[i].as_bool(), Some(false), "idx {i} must be false");
+        }
+    }
+
     /// The header must be positionally aligned: `input_embeds` (idx 5) /
     /// `token_type_ids` (idx 7) present as nil so `sampling_params` lands at idx 8 and
     /// the array reaches msgspec's min length. Regression guard for that decode failure.
@@ -299,9 +483,8 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 46 (through
-        // `cache_salt`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 46, "header ends at cache_salt");
+        // The orchestrator controls extend the array through `kv_hints`.
+        assert_eq!(arr.len(), 47, "header ends at kv_hints");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -329,6 +512,49 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+    }
+
+    /// Python's `KvHintsEnvelope` / `KvHintAction` are dict-shaped msgspec
+    /// structs, so a positional array at the kv_hints slot fails to decode.
+    #[test]
+    fn header_kv_hints_are_map_encoded() {
+        use sglang_api_types::api::v1 as api;
+        let kv_hints = crate::message::request::KvHintsEnvelope::try_from(api::KvHintsEnvelope {
+            protocol_version: "1".into(),
+            message_id: "m".into(),
+            actions: vec![api::KvHintAction {
+                action_id: "a".into(),
+                action_type: "pin".into(),
+                action_version: "1".into(),
+                payload: Some(r#"{"blocks":[1,2]}"#.into()),
+            }],
+        })
+        .unwrap();
+        let req = GenerateRequest {
+            rid: "r1".into(),
+            input_ids: Some(vec![1]),
+            kv_hints: Some(kv_hints),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let envelope = val.as_array().expect("array")[46]
+            .as_map()
+            .expect("kv_hints must be a map");
+        let get = |map: &[(rmpv::Value, rmpv::Value)], key: &str| {
+            map.iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("missing key {key}"))
+        };
+        assert_eq!(get(envelope, "protocol_version").as_str(), Some("1"));
+        assert_eq!(get(envelope, "message_id").as_str(), Some("m"));
+        let actions = get(envelope, "actions");
+        let action = actions.as_array().unwrap()[0]
+            .as_map()
+            .expect("kv_hints action must be a map");
+        assert_eq!(get(action, "action_type").as_str(), Some("pin"));
+        assert!(get(action, "payload").is_map());
     }
 
     /// The PD block must land on Python's wire indices 25–31, with the filler

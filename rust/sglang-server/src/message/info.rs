@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::{DisaggregationMode, PreferredSamplingParams};
+use super::config::{DeploymentInfo, DisaggregationMode, PreferredSamplingParams};
 
 /// Static model metadata shared by every public transport.
 #[derive(Clone, Debug, Serialize)]
@@ -21,6 +21,21 @@ pub(crate) struct ModelInfo {
     pub(crate) reasoning_parser: Option<String>,
     pub(crate) tool_call_parser: Option<String>,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    /// Python's launch-time `/model_info` fields, which the HTTP response
+    /// carries after the fields above.
+    #[serde(skip)]
+    pub(crate) launch_fields: Arc<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ModelInfo {
+    /// The HTTP body: every field of this struct, then the launch-time fields.
+    pub(crate) fn to_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(self)?;
+        if let serde_json::Value::Object(fields) = &mut body {
+            fields.extend((*self.launch_fields).clone());
+        }
+        Ok(body)
+    }
 }
 
 /// Public server metadata plus scheduler-owned runtime metrics.
@@ -42,6 +57,11 @@ pub(crate) struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) startup_time: Option<serde_json::Value>,
     pub(crate) internal_states: Vec<InternalState>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) incremental_streaming_output: bool,
+    pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) deployment_info: DeploymentInfo,
 }
 
 impl ServerInfo {

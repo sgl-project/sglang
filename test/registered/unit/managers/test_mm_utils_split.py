@@ -15,6 +15,7 @@ import unittest
 import warnings
 from array import array
 from functools import partial
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     MultiModalityDataPaddingPatternTokenPairs,
     duplicate_pad_mm_input_ids,
+    embed_mm_inputs,
     get_new_expanded_mm_items,
     pad_mm_token_pairs,
     pad_mm_tokens,
@@ -33,10 +35,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _bundled_item(grid_key=None, grid=None, feature_len=10, num_images=2):
@@ -157,18 +160,57 @@ class TestGetNewExpandedMMItems(CustomTestCase):
 
 
 class TestMMPadding(CustomTestCase):
-    def test_padding_requires_int64_arrays(self):
-        mm_inputs = MultimodalInputs(mm_items=[])
-        for pad in (
-            pad_mm_tokens,
-            partial(pad_mm_token_pairs, data_token_pairs=[(10, 11)]),
-            MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens,
-            MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens,
-        ):
-            for input_ids in ([1, 2], array("i", [1, 2])):
-                with self.subTest(pad=pad, input_ids=input_ids):
-                    with self.assertRaisesRegex(AssertionError, "input_ids must be"):
-                        pad(input_ids, mm_inputs)
+    def test_ernie_visual_mask_recognizes_every_sentinel(self):
+        item = MultimodalDataItem(modality=Modality.IMAGE, hash=7, offsets=[(1, 6)])
+        item.set_pad_value()
+        mm_inputs = MultimodalInputs(mm_items=[item], im_token_id=9)
+        padded = pad_mm_tokens(array("q", [1] + [9] * 6 + [2]), mm_inputs)
+        model = SimpleNamespace(_visual_token_ids_tensor_cache=torch.tensor([9]))
+        batch = SimpleNamespace(mm_inputs=[None, mm_inputs])
+        Ernie4_5_VLMoeForConditionalGeneration._set_visual_token_mask(
+            model, torch.tensor(padded), batch
+        )
+        self.assertEqual(
+            model.visual_token_mask.flatten().tolist(), [False] + [True] * 6 + [False]
+        )
+
+    def test_generic_padding_reaches_embedding_scatter(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for modality in Modality.all():
+                with self.subTest(device=device, modality=modality):
+                    item = MultimodalDataItem(
+                        modality=modality,
+                        hash=7,
+                        offsets=[(1, 6)],
+                        precomputed_embeddings=torch.arange(18, device=device)
+                        .reshape(6, 3)
+                        .float(),
+                    )
+                    item.set_pad_value()
+                    mm_inputs = MultimodalInputs(
+                        mm_items=[item],
+                        im_token_id=9,
+                        audio_token_id=9,
+                        video_token_id=9,
+                    )
+                    padded = pad_mm_tokens(array("q", [1] + [9] * 6 + [2]), mm_inputs)
+                    embedding = torch.nn.Embedding(10, 3, device=device)
+                    # chunked prefill may begin at any of the four sentinels
+                    for prefix in (0, 1, 2, 3, 4):
+                        ids = torch.tensor(padded[prefix:7], device=device)
+                        actual, _ = embed_mm_inputs(
+                            [mm_inputs],
+                            [prefix],
+                            [len(ids)],
+                            ids,
+                            embedding,
+                            data_embedding_func_mapping={modality: lambda _: None},
+                        )
+                        expected = item.precomputed_embeddings[max(0, prefix - 1) :]
+                        self.assertTrue(
+                            torch.equal(actual[1:] if prefix == 0 else actual, expected)
+                        )
 
     def test_multimodal_offsets_and_input_ownership(self):
         mm_inputs = MultimodalInputs(

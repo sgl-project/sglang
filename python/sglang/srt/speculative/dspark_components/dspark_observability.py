@@ -12,11 +12,13 @@ from typing import Callable, ContextManager, Iterator, Optional, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )
@@ -769,12 +771,6 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
-        # observe_verify_step reads the full target logits (argmax, accept estimate).
-        self.reads_target_logits = (
-            bool(self._sts_collect_path)
-            or self._block_accept_recorder is not None
-            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
-        )
 
     # --- step lifecycle -------------------------------------------------
 
@@ -865,7 +861,12 @@ class DsparkStepObservers:
                 forward_ct=forward_ct,
                 rids=[req.rid for req in reqs],
                 draft_tokens=draft_tokens,
-                corrected_logits=draft_block.corrected_logits,
+                # Only rank 0 records, so it cannot gather a sharded vocab.
+                corrected_logits=(
+                    None
+                    if draft_block.vocab_shard is not None
+                    else draft_block.corrected_logits
+                ),
                 draft_temperatures=draft_block.temperatures,
                 greedy_mask=draft_block.greedy_mask,
                 target_logits=target_logits,

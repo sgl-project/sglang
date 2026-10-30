@@ -1145,7 +1145,7 @@ class InklingForConditionalGeneration(nn.Module):
         # The MTP chain needs the undivided hidden (the mup division is
         # lm_head-only); passed unconditionally because the target
         # verify/prefill forwards never set return_hidden_states_before_norm.
-        return self.llm.logits_processor(
+        output = self.llm.logits_processor(
             input_ids,
             hidden_states_for_logits,
             self.llm.lm_head,
@@ -1157,6 +1157,10 @@ class InklingForConditionalGeneration(nn.Module):
                 None if aux_hidden_states is not None else hidden_states
             ),
         )
+        if output.last_hidden_states is not None:
+            # Auxiliary capture returns post-norm states before LM-head scaling.
+            output.last_hidden_states = hidden_states
+        return output
 
     def _load_regular_param(
         self,
@@ -1840,6 +1844,16 @@ class InklingForConditionalGenerationMTP(nn.Module):
             forward_batch,
             hidden_states_before_norm=hidden_states_before_norm,
         )
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        """The trunk's convention (`InklingForConditionalGeneration`): the
+        backend window is one less than the extent, so the head reads back
+        the same span the trunk's window layers do. A banded depth runs at
+        its own extent, every other depth at the trunk's window."""
+        text_config = self.text_config
+        if self.draft_model_idx in text_config.mtp_local_layer_ids:
+            return text_config.mtp_local_extent - 1
+        return text_config.sliding_window_size - 1
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

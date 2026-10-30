@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
@@ -23,7 +24,7 @@ from sglang.test.separate_buffer_allocator_double import (
 )
 from sglang.test.test_utils import CustomTestCase, enter_override
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_model_runner(**attrs):
@@ -122,8 +123,12 @@ def _make_prealloc_queue(
     return queue
 
 
+class _Req(SimpleNamespace):
+    finish_outside_step = Req.finish_outside_step
+
+
 def _make_req(rid: str, prompt_len: int):
-    return SimpleNamespace(
+    return _Req(
         rid=rid,
         origin_input_ids=[0] * prompt_len,
         output_ids=[],
@@ -192,7 +197,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
             max_token_pool_size=100,
             max_total_num_tokens=100,
         )
-        req = SimpleNamespace(
+        req = _Req(
             rid="rebootstrap",
             origin_input_ids=[0] * 60,
             output_ids=[0] * 60,  # 60 + 60 = 120 > 100
