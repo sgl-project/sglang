@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.models import kimi_k3
@@ -56,6 +58,60 @@ class TestKimiK3PackedModulesMapping(CustomTestCase):
                 quant_config.packed_modules_mapping,
             )
         )
+
+
+class TestKimiK3PackedExpertLoader(CustomTestCase):
+    """WNA16 packed parameters must actually be written; they must not be silently
+    dropped after the name remapping."""
+
+    def test_packed_names_follow_quantization_and_npu_layout(self):
+        cases = (
+            ("mxfp4", None, False, "weight"),
+            ("compressed-tensors", "pack-quantized-mxfp4", False, "weight"),
+            ("compressed-tensors", "pack-quantized", False, "weight_packed"),
+            (None, None, False, "weight_packed"),
+            ("mxfp4", None, True, "weight_packed"),
+        )
+        for quant_name, quant_format, npu, suffix in cases:
+            with self.subTest(
+                quant_name=quant_name, quant_format=quant_format, npu=npu
+            ):
+                param = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+                expected = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+
+                def copy_expert(target, weight, name, *, expert_id, shard_id):
+                    target.data.copy_(weight)
+
+                param.weight_loader = copy_expert
+                target_name = f"model.layers.0.mlp.experts.w2_{suffix}"
+                quant_config = (
+                    SimpleNamespace(
+                        get_name=lambda: quant_name, quant_format=quant_format
+                    )
+                    if quant_name is not None
+                    else None
+                )
+                # Skip the model build and GPU post-processing while still running
+                # the real load_weights name resolution.
+                model = SimpleNamespace(
+                    config=SimpleNamespace(
+                        linear_attn_config={},
+                        is_moe=True,
+                        num_experts=1,
+                        num_hidden_layers=1,
+                    ),
+                    quant_config=quant_config,
+                    model=SimpleNamespace(start_layer=0, end_layer=1),
+                    named_parameters=lambda: [(target_name, param)],
+                    post_load_weights=lambda: None,
+                )
+                with patch.object(kimi_k3, "_is_npu", npu):
+                    loaded = KimiK3LinearForCausalLM.load_weights(
+                        model,
+                        [("model.layers.0.mlp.experts.0.w2.weight_packed", expected)],
+                    )
+                self.assertEqual(loaded, {target_name})
+                torch.testing.assert_close(param, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

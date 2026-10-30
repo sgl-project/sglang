@@ -677,10 +677,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        # DeepEP under dp attention is only wired through the SAIL DeepGEMM MoE
+        # stack; every other platform keeps the upstream allowlist.
+        supported_a2a_backends = ("none", "megamoe", "mori")
+        if get_platform().is_sail:
+            supported_a2a_backends += ("deepep",)
+        if not _is_npu and cfg.moe_a2a_backend not in supported_a2a_backends:
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "(built-in TP MoE), "
+                f"{', '.join(repr(b) for b in supported_a2a_backends[1:])}, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and (
