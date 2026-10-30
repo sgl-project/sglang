@@ -73,7 +73,11 @@ from sglang.srt.utils.flatten import (
     RaggedPairColumns,
 )
 from sglang.srt.utils.json_response import ORJSON_RESPONSE_OPTIONS
-from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_local_ip_towards,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
@@ -352,7 +356,30 @@ class RustServer:
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node.
-            detected = get_local_ip_auto(fallback="127.0.0.1")
+            # Derive the advertised IP:
+            # 1. Explicit env override (SGLANG_HOST_IP / HOST_IP).
+            # 2. When rendezvous address is known (multi-node), derive source IP
+            #    from the interface that routes towards dist_init_addr.
+            # 3. Otherwise fall back to get_local_ip_auto.
+            env_host = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+            if env_host:
+                detected = env_host
+            elif dist_init_addr := getattr(get_parallel(), "dist_init_addr", None):
+                try:
+                    target = NetworkAddress.parse(dist_init_addr)
+                    detected = get_local_ip_towards(target.host, target.port)
+                except Exception:
+                    clean_addr = (
+                        dist_init_addr.split("://", 1)[1]
+                        if "://" in dist_init_addr
+                        else dist_init_addr
+                    )
+                    detected = get_local_ip_towards(clean_addr.strip("[]"), 80)
+                if not detected:
+                    detected = get_local_ip_auto(fallback="127.0.0.1")
+            else:
+                detected = get_local_ip_auto(fallback="127.0.0.1")
+
             if (
                 host == "0.0.0.0"
                 and NetworkAddress(detected, 0).is_ipv6
@@ -379,17 +406,16 @@ class RustServer:
         bind_host = get_serving().host
         host = cls._advertised_host()
         # Nodes that rendezvous on loopback share this machine, so a loopback
-        # listener reaches them; otherwise it is a likely misconfiguration.
-        if get_parallel().nnodes > 1 and _is_loopback(host):
-            dist_init_addr = get_parallel().dist_init_addr
+        # listener reaches them; otherwise it is a configuration error that would
+        # fail or misroute all control requests across nodes.
+        if getattr(get_parallel(), "nnodes", 1) > 1 and _is_loopback(host):
+            dist_init_addr = getattr(get_parallel(), "dist_init_addr", None)
             if not _rendezvous_is_loopback(dist_init_addr):
-                logger.warning(
-                    "SGLANG_RUST_SERVER: this rank listens on loopback %r but the "
-                    "%d nodes rendezvous at %r; a node on another machine cannot "
-                    "reach this rank's control endpoint",
-                    host,
-                    get_parallel().nnodes,
-                    dist_init_addr,
+                raise ValueError(
+                    f"SGLANG_RUST_SERVER: this rank listens on loopback {host!r} but the "
+                    f"{get_parallel().nnodes} nodes rendezvous at {dist_init_addr!r}; a node on "
+                    "another machine cannot reach this rank's control endpoint. "
+                    "Specify --host or set SGLANG_HOST_IP to an externally routable IP address."
                 )
         config = None
         if hosts_listener:

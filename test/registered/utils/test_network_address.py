@@ -139,11 +139,28 @@ class TestNetworkAddressParse(unittest.TestCase):
         na = NetworkAddress("my-host", 443)
         self.assertEqual(NetworkAddress.parse(na.to_host_port_str()), na)
 
+    def test_parse_with_scheme_ipv4(self):
+        na = NetworkAddress.parse("tcp://127.0.0.1:8000")
+        self.assertEqual(na, NetworkAddress("127.0.0.1", 8000))
+
+    def test_parse_with_scheme_ipv6(self):
+        na = NetworkAddress.parse("tcp://[::1]:8000")
+        self.assertEqual(na, NetworkAddress("::1", 8000))
+        self.assertTrue(na.is_ipv6)
+
+    def test_parse_with_scheme_http(self):
+        na = NetworkAddress.parse("http://10.0.0.1:8080")
+        self.assertEqual(na, NetworkAddress("10.0.0.1", 8080))
+
 
 class TestNetworkAddressParseErrors(unittest.TestCase):
     def test_empty(self):
         with self.assertRaises(ValueError):
             NetworkAddress.parse("")
+
+    def test_empty_after_scheme(self):
+        with self.assertRaises(ValueError):
+            NetworkAddress.parse("tcp://")
 
     def test_no_port(self):
         with self.assertRaises(ValueError):
