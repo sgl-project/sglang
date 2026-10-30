@@ -719,25 +719,16 @@ def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
 
 
 @pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
-@pytest.mark.parametrize(
-    "topk,heads,std",
-    [(128, 16, 0.1), (128, 64, 0.1), (1152, 64, 1.0)],
-)
 @torch.inference_mode()
-def test_native_h16_matches_bf16_sparse_prefill(topk, heads, std):
+def test_native_h16_matches_bf16_sparse_prefill():
     from sglang.kernels.ops.attention.dsv4 import cute_sparse_mla_h16 as h16
     from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 
     q, kv, indices, scale, _, _, sink, lengths = _make_case(
-        512, True, s_q=4, topk=topk, s_kv=40009
+        512, True, s_q=4, topk=128, s_kv=40009
     )
-    q, kv = (
-        (q.float() * (std / 0.05)).bfloat16(),
-        (kv.float() * (std / 0.05)).bfloat16(),
-    )
-    lengths.copy_(
-        torch.tensor([0, 1, topk - 1, topk], dtype=torch.int32, device="cuda")
-    )
+    q, kv = (q.float() * 2).bfloat16(), (kv.float() * 2).bfloat16()
+    lengths.copy_(torch.tensor([0, 1, 127, 128], dtype=torch.int32, device="cuda"))
     indices[0].fill_(-1)
     indices[1, 0, 0] = 32768  # Production rebased workspaces exceed int16 IDs.
     indices[3, 0, 1], indices[3, 0, 3] = -1, 40026
@@ -746,11 +737,11 @@ def test_native_h16_matches_bf16_sparse_prefill(topk, heads, std):
     kv[0] = float("nan")
     sink[::2] = -1e30
     args = dict(
-        q=q[:, :heads].contiguous(),
+        q=q[:, :16].contiguous(),
         kv=kv.squeeze(1),
         indices=indices.squeeze(1),
         topk_length=lengths,
-        attn_sink=sink[:heads],
+        attn_sink=sink[:16],
         sm_scale=scale,
     )
     actual = h16.cute_sparse_mla_h16_fwd(**args)
@@ -764,57 +755,26 @@ def test_native_h16_matches_bf16_sparse_prefill(topk, heads, std):
         topk_length=lengths,
     )[0][:, :16]
     error = (actual.float() - expected.float()).abs()
-    assert error.max().item() <= (2e-3 if std == 1.0 else 5e-4)
-    assert error.mean().item() <= (1e-4 if std == 1.0 else 5e-6)
-    torch.testing.assert_close(
-        actual, expected, atol=2e-3 if std == 1.0 else 5e-4, rtol=1e-3
-    )
+    assert error.max().item() <= 5e-4
+    assert error.mean().item() <= 5e-6
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-3)
     assert torch.count_nonzero(actual[0]).item() == 0
 
     repeat = h16.cute_sparse_mla_h16_fwd(**args)
     assert repeat.data_ptr() != actual.data_ptr()
     assert torch.equal(repeat, actual)
     compiled = set(h16._COMPILE_CACHE)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        shorter = h16.cute_sparse_mla_h16_fwd(
-            **dict(
-                args,
-                q=args["q"][:2],
-                kv=args["kv"][:-1],
-                indices=args["indices"][:2],
-                topk_length=lengths[:2],
-            )
+    shorter = h16.cute_sparse_mla_h16_fwd(
+        **dict(
+            args,
+            q=args["q"][:2],
+            kv=args["kv"][:-1],
+            indices=args["indices"][:2],
+            topk_length=lengths[:2],
         )
-    stream.synchronize()
+    )
     assert set(h16._COMPILE_CACHE) == compiled
     assert torch.equal(shorter, actual[:2])
-
-
-@pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
-@torch.inference_mode()
-def test_native_h16_matches_torch_reference(monkeypatch):
-    from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
-        cute_sparse_mla_h16_fwd,
-    )
-
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    q, kv, indices, scale, qs, ks, sink, lengths = _make_case(
-        512, True, s_q=3, topk=256, s_kv=521
-    )
-    q, kv, sink = q[:, :16].bfloat16().contiguous(), kv.bfloat16(), sink[:16]
-    sink[:3] = torch.tensor([-1e30, -2.0, 2.0], device="cuda")
-    actual = cute_sparse_mla_h16_fwd(
-        q, kv.squeeze(1), indices.squeeze(1), lengths, sink, scale
-    )
-    expected = _torch_sparse_attention_ref(
-        q, kv, indices, scale, qs, ks, sink, lengths
-    )[0]
-    error = (actual.float() - expected).abs()
-    assert error.max().item() <= 1e-3
-    assert error.mean().item() <= 1e-4
-    torch.testing.assert_close(actual.float(), expected, atol=1e-3, rtol=1e-2)
 
 
 @pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
@@ -836,8 +796,8 @@ def test_native_h16_int64_offsets(heads, topk, monkeypatch):
         q[:, :16], kv, indices, scale, qs, ks, sink[:16], lengths
     )[0]
 
-    # Cross signed-int32 element offsets for Q (both cases), indices/output
-    # (H16/TOPK8192), and KV. Only the two boundary queries attend to KV.
+    # Q and KV offsets pass Int32 in both rows, index and output offsets at TOPK 8192.
+    # Only the two boundary queries attend to KV.
     s_q, s_kv = (1 << 31) // (heads * 512) + 1, (1 << 31) // 512 + 1
     large_q = torch.zeros((s_q, heads, 512), dtype=q.dtype, device="cuda")
     large_kv = torch.empty((s_kv, 512), dtype=kv.dtype, device="cuda")

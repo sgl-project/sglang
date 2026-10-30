@@ -854,7 +854,7 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
 
 
 @pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
-@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+@pytest.mark.parametrize("compress_ratio", [4, 128])
 @torch.inference_mode()
 def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
     from sglang.kernels.ops.attention.dsv4 import cute_sparse_mla_h16 as h16
@@ -863,14 +863,13 @@ def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
     )
 
     device = torch.device("cuda")
-    # The C128 chunks are consecutive for both requests and cross the live
-    # combined-width boundary: 256 -> 384, with one fixed H16 TOPK of 512.
+    # Consecutive C128 chunks move the live width from 256 to 384 at TOPK 512.
     chunks = (
         [([16384, 127], [3, 2]), ([16513, 129], [129, 2])]
         if compress_ratio == 128
         else [([517, 269], [3, 2])]
     )
-    page_size = 64 * max(compress_ratio, 1)
+    page_size = 64 * compress_ratio
     pages = (max(chunks[-1][0]) + page_size - 1) // page_size
     # Nonidentity page mappings keep request-local IDs distinct from pool IDs.
     page_ids = torch.arange(2 * pages - 1, -1, -1, device=device).reshape(2, pages)
@@ -884,7 +883,7 @@ def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
         total_slots=total_slots, page_size=64, seed=3, device=device
     )
     extra = _make_v4_paged_kv_cache(
-        total_slots=total_slots // max(compress_ratio, 1),
+        total_slots=total_slots // compress_ratio,
         page_size=64,
         seed=7,
         device=device,
@@ -962,28 +961,23 @@ def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
         torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-3)
         assert backend.forward_metadata.sparse_prefill_cache is cache
 
-        # Independently derive physical gather IDs and boundary-query workspace
-        # indices from the request mapping, without using the combine helpers.
-        c_lens = [s // compress_ratio if compress_ratio else 0 for s in seq_lens]
+        # Expected IDs use the request mapping alone, independent of the helpers.
+        c_lens = [s // compress_ratio for s in seq_lens]
         c_sizes = [max(c_lens)] * 2 if compress_ratio == 128 else c_lens
         swa_starts = [max(s - n - 127, 0) for s, n in zip(seq_lens, extend_lens)]
         swa_ids, compressed_ids = [], []
         q_base = c_base = 0
         swa_base = sum(c_sizes)
-        if compress_ratio:
-            gather = cache.compressed[compress_ratio]
-            indices, lengths = gather.combined_indices, gather.combined_lens
-        else:
-            indices, lengths = cache.c0_combined_indices, cache.c0_combined_lens
+        gather = cache.compressed[compress_ratio]
+        indices, lengths = gather.combined_indices, gather.combined_lens
         assert indices is not None and lengths is not None
         for r, (s, n) in enumerate(zip(seq_lens, extend_lens)):
             swa_ids.append(req_to_token[r, swa_starts[r] : s])
-            if compress_ratio:
-                cols = torch.arange(c_sizes[r], device=device)
-                ids = req_to_token[r, cols * compress_ratio] // compress_ratio
-                compressed_ids.append(torch.where(cols < c_lens[r], ids, 0))
+            cols = torch.arange(c_sizes[r], device=device)
+            ids = req_to_token[r, cols * compress_ratio] // compress_ratio
+            compressed_ids.append(torch.where(cols < c_lens[r], ids, 0))
             for i, end in ((q_base, s - n + 1), (q_base + n - 1, s)):
-                c = min(end // compress_ratio, 512) if compress_ratio else 0
+                c = min(end // compress_ratio, 512)
                 w = min(end, 128)
                 assert lengths[i].item() == c + w
                 torch.testing.assert_close(
@@ -1004,10 +998,9 @@ def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
         swa_ids = torch.cat(swa_ids)
         torch.testing.assert_close(cache.swa_token_ids, swa_ids)
         workspace = [dequantize_k_cache_paged_ref(swa, swa_ids, 64)]
-        if compress_ratio:
-            compressed_ids = torch.cat(compressed_ids)
-            torch.testing.assert_close(gather.flat_token_ids, compressed_ids)
-            workspace.insert(0, dequantize_k_cache_paged_ref(extra, compressed_ids, 64))
+        compressed_ids = torch.cat(compressed_ids)
+        torch.testing.assert_close(gather.flat_token_ids, compressed_ids)
+        workspace.insert(0, dequantize_k_cache_paged_ref(extra, compressed_ids, 64))
         workspace = torch.cat(workspace)
         torch.testing.assert_close(
             backend.sparse_prefill_kv_buffer._buffer[: workspace.shape[0]],

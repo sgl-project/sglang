@@ -40,8 +40,7 @@ NG_QK = 4  # four 128-channel WGMMA groups cover DQK=512
 
 # Interleaved shared-memory layout inherited from the tuned benchmark kernel.
 DB_STRIDE = 72
-# Eight 64-channel chunks.  The original DQK=576 kernel used 72 d-blocks
-# (nine chunks); DSV4-512 only needs 64 and saves 9 KiB of shared memory.
+# Each 8-row group holds 64 d-blocks of 8 channels, all 512 channels of DQK.
 NB_STRIDE = 64 * DB_STRIDE
 KV_ELEMS = 8 * NB_STRIDE
 CHUNK_SB = 8 * DB_STRIDE * 2
@@ -53,8 +52,7 @@ OT_STRIDE = DV + 8
 
 LOG2E = 1.4426950408889634
 NO_SINK = -1.0e30
-# Must stay below the conventional no-sink score after LOG2E conversion so
-# invalid rows can never raise the running maximum during the shuffle reduce.
+# Stays below NO_SINK times LOG2E, so invalid rows never raise the running maximum.
 INVALID_SCORE = -3.0e38
 
 
@@ -126,13 +124,7 @@ def _prefetch_chunk(ga, sa, predicates, chunk):
     g2s = cute.make_copy_atom(
         cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=128
     )
-    # Expose the 128-bit BF16 copy atom explicitly as ATOM_V=8 and
-    # ATOM_REST=1.  With a flat (8, 1) profile CuTe DSL 4.6 treats the vector
-    # mode as predicate-visible and rejects our one-predicate-per-row tensor.
-    # The nested profile makes the source/destination
-    # ((ATOM_V, ATOM_REST), REST) and the predicate (ATOM_REST, REST), exactly
-    # matching the documented predicated-copy contract while still emitting
-    # one 16-byte cp.async transaction.
+    # A flat (8, 1) layout needs 8 predicates per copy, so nesting gives one per row.
     l8 = cute.make_layout(((8, 1), 1))
     for c in range(4):
         cute.copy(
@@ -146,9 +138,7 @@ def _prefetch_chunk(ga, sa, predicates, chunk):
 def _prefetch_tile(ga, sa, predicates):
     for chunk in range(DQK // 64):
         _prefetch_chunk(ga, sa, predicates, chunk)
-        # Keep each cp.async group to two 64-channel chunks (eight copies per
-        # thread).  Issuing all eight chunks in one uncommitted group exceeds
-        # the conservative Hopper pipeline shape used by the proven kernel.
+        # One commit group per 128-channel QK stage, as the QK waits count groups.
         if chunk % 2 == 1:
             cute.arch.cp_async_commit_group()
 
@@ -325,8 +315,7 @@ def _kernel(
     # The output epilogue aliases the consumed KV staging storage.
     sout_ptr = skv_ptr
 
-    # Accept SGLang's native compact H64 row without materializing q[:,:16].
-    # Only the first H*DQK elements of each row are loaded.
+    # Load the first H*DQK elements of each Q row, so H64 input needs no head copy.
     q_ptr = m_q.iterator + qpos * m_q.stride[0]
     kv_ptr = m_kv.iterator
     idx_ptr = m_indices.iterator + qpos * topk
@@ -340,8 +329,7 @@ def _kernel(
     n_tiles = cutlass.max((topk_length + (BN - 1)) // BN, cutlass.Int32(1))
     scale_log2 = sm_scale * LOG2E
 
-    # Load the full 16x512 logical Q tile once.  Keep this cp.async group in
-    # flight while the four tile-0 KV groups are issued below.
+    # Q is its own cp.async group, in flight while the four tile-0 KV groups issue.
     g2s = cute.make_copy_atom(
         cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=128
     )
@@ -368,16 +356,13 @@ def _kernel(
     if tidx < H:
         sink = m_attn_sink.iterator[tidx] * LOG2E
         ssink_ptr[tidx] = sink
-        # Match FlashMLA's numerical path: the online maximum is formed from
-        # real K rows only.  The virtual zero-value sink is merged into the
-        # denominator in the epilogue, after P has been rounded to BF16.
+        # As in FlashMLA, the online maximum covers real K rows only.
+        # The sink joins the denominator in the epilogue, after P is rounded to BF16.
         smax_ptr[tidx] = cutlass.Float32(NO_SINK)
         salpha_ptr[tidx] = cutlass.Float32(1.0)
     cute.arch.barrier()
 
-    # Tile-0 prologue.  Together with Q this leaves five committed groups;
-    # _issue_qk_staged(wait=3,2,1,0) releases Q+each 128-channel KV pair just in
-    # time for the corresponding WGMMA.
+    # Q plus these four KV groups make five, so the first QK wait also releases Q.
     ga0, sa0, predicates0 = _resolve_rows(
         kv_ptr,
         idx_ptr,
@@ -404,9 +389,7 @@ def _kernel(
     sum_acc = cute.make_rmem_tensor(score_acc.shape, cutlass.Float32)
     sum_acc.fill(0.0)
 
-    # QK writes P through the C-fragment view.  PV must consume the same bytes
-    # through a distinct transposed B-fragment view; the two MMA layouts are
-    # not interchangeable even though they alias the same shared allocation.
+    # QK writes P in its C view, and PV reads the same bytes in a transposed B view.
     prob_store_view = cute.make_tensor(
         sp_ptr,
         cute.make_layout(((8, 8), (8, 2)), stride=((8, 128), (1, 64))),
@@ -438,8 +421,8 @@ def _kernel(
 
         _issue_qk_staged(mma_qk, score_acc, k_frags, q_frags)
 
-        # Hide next-index loads/address arithmetic under the four in-flight QK
-        # WGMMA groups.  The alternate mask buffer stays live until next tile.
+        # Resolve the next tile's rows here, under the four in-flight QK WGMMA groups.
+        # The alternate mask buffer stays live until the next tile.
         next_base = cutlass.min((tile + 1) * BN, cutlass.Int32(topk - BN))
         next_ga, next_sa, next_predicates = _resolve_rows(
             kv_ptr,
@@ -468,8 +451,7 @@ def _kernel(
                 else cutlass.Float32(INVALID_SCORE)
             )
         warp_max = _reduce_kq_fragment_heads(score_acc, cutlass.max)
-        # Keep this dynamic lane branch directly in @cute.kernel so its SSA
-        # values remain in the kernel's traced control flow.
+        # Keep inline in @cute.kernel so its SSA values stay in traced control flow.
         lane_partial = tidx % 32
         if lane_partial < 4:
             warp_partial = tidx // 32
@@ -497,8 +479,6 @@ def _kernel(
             for i in cutlass.range_constexpr(cute.size(score_acc)):
                 sum_acc[i] = sum_acc[i] * alpha_qk_frag[i]
 
-        # Multiplying after exp2 is essential for length=0: the uniform masked
-        # tile must contribute exactly zero to both P and the denominator.
         for i in cutlass.range_constexpr(cute.size(score_acc)):
             p = (
                 cute.math.exp2(score_acc[i] - max_frag[i], fastmath=True)
@@ -507,8 +487,7 @@ def _kernel(
             prob_acc[i] = p.to(cutlass.BFloat16)
             sum_acc[i] = sum_acc[i] + p
 
-        # PV accumulators have a different C-fragment distribution from QK;
-        # use the matching broadcast view when applying the same head alpha.
+        # PV's C fragments differ from QK's, so alpha uses its own broadcast view.
         if tile > 0:
             for i in cutlass.range_constexpr(cute.size(out_acc[0])):
                 alpha = alpha_pv_frag[i]
@@ -557,8 +536,7 @@ def _kernel(
         )
     cute.arch.barrier()
 
-    # The final tile's PV groups were deliberately left in flight while the
-    # independent denominator reduction ran above.
+    # The last tile's PV stayed in flight through the denominator reduction above.
     cute.nvgpu.warpgroup.wait_group(0)
     _store_output(thr_pv, sout_ptr, inv_den_ptr, out_acc)
     cute.arch.barrier()
