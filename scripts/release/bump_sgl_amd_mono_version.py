@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Pin sgl-amd-mono in python/pyproject_other.toml at a commit of its repository.
-
-Sets GitHub Actions output variables to indicate if a bump is needed.
-"""
+"""Pin sgl-amd-mono in python/pyproject_other.toml and report needs_bump to GitHub Actions."""
 
 import argparse
 import os
@@ -28,21 +24,15 @@ def resolve_commit(ref: str) -> str:
         text=True,
     ).stdout.split()
     if not refs:
-        print(f"Error: {ref} is neither a full commit SHA nor a branch of sgl-amd-mono")
-        sys.exit(1)
+        sys.exit(f"Error: {ref} is not a full commit SHA or an sgl-amd-mono branch")
 
     return refs[0]
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Pin sgl-amd-mono in python/pyproject_other.toml at a commit"
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "ref",
-        nargs="?",
-        default="main",
-        help="sgl-amd-mono branch or full commit SHA (default: main)",
+        "ref", nargs="?", default="main", help="sgl-amd-mono branch or full commit SHA"
     )
     args = parser.parse_args()
 
@@ -52,10 +42,7 @@ def main():
     content = pyproject_path.read_text()
     pins = PIN_PATTERN.findall(content)
     if len(pins) != 1:
-        print(
-            f"Error: expected one sgl-amd-mono pin in {pyproject_path}, found {len(pins)}"
-        )
-        sys.exit(1)
+        sys.exit(f"Error: expected one sgl-amd-mono pin, found {len(pins)}")
     old_commit = pins[0][1]
 
     needs_bump = old_commit != new_commit
@@ -68,9 +55,10 @@ def main():
     github_output = os.getenv("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
-            f.write(f"needs_bump={'true' if needs_bump else 'false'}\n")
-            f.write(f"old_commit={old_commit}\n")
-            f.write(f"new_commit={new_commit}\n")
+            f.write(
+                f"needs_bump={str(needs_bump).lower()}\n"
+                f"old_commit={old_commit}\nnew_commit={new_commit}\n"
+            )
 
 
 if __name__ == "__main__":

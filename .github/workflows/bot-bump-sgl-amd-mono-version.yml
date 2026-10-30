@@ -1,7 +1,6 @@
 name: Bot Bump sgl-amd-mono Version
 #
-# Pins sgl-amd-mono (the monokernels_hip extra in python/pyproject_other.toml)
-# at the head of its main branch once a day and opens a PR with the change.
+# Pins sgl-amd-mono (python/pyproject_other.toml) at the head of its main daily and opens a PR.
 on:
   schedule:
     - cron: '0 8 * * *'  # daily 08:00 UTC
