@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -52,7 +53,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
@@ -252,6 +253,17 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
         )
+        scheme = getattr(self.experts, "scheme", None)
+        if (
+            envs.SGLANG_GFX1250_W4A8_BYPASS_TOPK.get()
+            and getattr(scheme, "routes_from_router_logits", False)
+            and get_moe_a2a_backend().is_none()
+            and get_exec().moe.expert_distribution_recorder_mode is None
+            and not get_exec().features.enable_return_routed_experts
+        ):
+            # The experts route from the raw router logits themselves; a STANDARD
+            # TopK would compute top-k ids and weights that nothing reads.
+            self.topk.topk_config.output_format = TopKOutputFormat.BYPASSED
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.router = TinyGemmLinear(
