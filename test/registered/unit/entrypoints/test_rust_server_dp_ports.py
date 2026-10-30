@@ -33,7 +33,7 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
             is_multimodal=False,
             is_image_understandable_model=False,
             is_audio_understandable_model=False,
-            hf_config=SimpleNamespace(model_type=None),
+            hf_config=SimpleNamespace(model_type=None, architectures=None),
             get_default_sampling_params=lambda: {},
         ),
         get_init_info=MagicMock(
@@ -45,6 +45,7 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
             )
         ),
         page_size=16,
+        tree_cache=None,
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,

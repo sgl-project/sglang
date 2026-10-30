@@ -298,7 +298,14 @@ mod tests {
 
     impl Harness {
         fn new(response_capacity: usize, incremental: bool, response_timeout: Duration) -> Self {
-            Self::build(response_capacity, incremental, response_timeout, true, None)
+            Self::build(
+                response_capacity,
+                incremental,
+                response_timeout,
+                true,
+                None,
+                test_server_args(),
+            )
         }
 
         fn build(
@@ -307,6 +314,7 @@ mod tests {
             response_timeout: Duration,
             startup_ready: bool,
             preferred: Option<PreferredSamplingParams>,
+            server_args: ServerArgs,
         ) -> Self {
             let (intake_tx, intake_rx) = flume::unbounded();
             let (abort_tx, abort_rx) = flume::unbounded();
@@ -321,14 +329,7 @@ mod tests {
                     mm_limits: Default::default(),
                     multimodal: false,
                     peer_endpoints: Vec::new(),
-                    metadata: CoreMetadata::from(&ServerArgs {
-                        served_model_name: "test-model".into(),
-                        model_config: ModelConfig {
-                            context_len: 4096,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
+                    metadata: CoreMetadata::from(&server_args),
                     metrics: None,
                 },
             );
@@ -363,6 +364,17 @@ mod tests {
                 sink,
                 admission,
             }
+        }
+    }
+
+    fn test_server_args() -> ServerArgs {
+        ServerArgs {
+            served_model_name: "test-model".into(),
+            model_config: ModelConfig {
+                context_len: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
         }
     }
 
@@ -788,7 +800,14 @@ mod tests {
             "temperature": 0.25,
             "max_new_tokens": 32,
         }));
-        let harness = Harness::build(1, false, Duration::from_secs(1), true, Some(preferred));
+        let harness = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            true,
+            Some(preferred),
+            test_server_args(),
+        );
         for (max_new_tokens, expected) in [(None, (Some(32), true)), (Some(8), (Some(8), false))] {
             let mut request = ids_request(&[1], None);
             request.sampling_params = Some(api::SamplingParamsOrList {
@@ -853,7 +872,14 @@ mod tests {
     /// UNAVAILABLE, and the stalled probe is a real generation submission.
     #[tokio::test]
     async fn health_check_reports_not_ready_and_stalled_as_unavailable() {
-        let not_ready = Harness::build(1, false, Duration::from_secs(1), false, None);
+        let not_ready = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            false,
+            None,
+            test_server_args(),
+        );
         let error = not_ready
             .service
             .health_check(Request::new(api::HealthCheckRequest {}))
@@ -979,6 +1005,56 @@ mod tests {
         })
         .await
         .expect("HiCache RPC did not finish")
+    }
+
+    /// Out-of-process orchestrators read these launch facts to reproduce the
+    /// server's token admission.
+    #[tokio::test]
+    async fn server_info_reports_launch_facts_for_orchestrators() {
+        let Harness {
+            service,
+            intake_rx,
+            abort_rx: _,
+        } = Harness::build(
+            1,
+            false,
+            Duration::from_secs(1),
+            true,
+            None,
+            ServerArgs {
+                allow_auto_truncate: true,
+                skip_tokenizer_init: true,
+                num_reserved_tokens: 4,
+                ..test_server_args()
+            },
+        );
+        let request = tokio::spawn(async move {
+            service
+                .get_server_info(Request::new(api::GetServerInfoRequest {}))
+                .await
+        });
+        let TmEvent::Intake {
+            request: control,
+            admission,
+        } = intake_rx.recv_async().await.unwrap()
+        else {
+            panic!("server info must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let envelope = rmpv::Value::Map(vec![(
+            rmpv::Value::from("internal_state"),
+            rmpv::Value::Map(Vec::new()),
+        )]);
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(&mut payload, &envelope).unwrap();
+        control
+            .sink
+            .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
+            .unwrap();
+        let info = request.await.unwrap().unwrap().into_inner();
+        assert!(info.allow_auto_truncate);
+        assert!(info.skip_tokenizer_init);
+        assert_eq!(info.num_reserved_tokens, 4);
     }
 
     #[tokio::test]
