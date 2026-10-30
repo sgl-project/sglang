@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.cache_controller import storage_model_name
+from sglang.srt.mem_cache.dsv41_replay_contract import replay_storage_tag
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
@@ -64,6 +65,27 @@ class TestStorageModelName(CustomTestCase):
             f"org/model-{tag}",
         )
         self.assertEqual(storage_model_name(None, UnifiedPageEnvelopeHostPool), tag)
+
+    def test_cp_replay_tag_separates_producers_but_not_pool_capacity(self):
+        pool = SimpleNamespace(
+            kv_layout=SimpleNamespace(value="v4"),
+            compressed_kv_layout=lambda ratio: SimpleNamespace(value="v4"),
+            page_size=256,
+            compression_ratios=[0, 1, 2, 4, 128],
+            kv_source_layers=[0, 1, 2],
+            num_slots=8,
+        )
+        producer = {"parallel": {"attn_cp_size": 8}, "fp8_gemm": "triton"}
+        original = replay_storage_tag(pool, producer=producer)
+        pool.num_slots = 128
+        self.assertEqual(original, replay_storage_tag(pool, producer=producer))
+        for changed in (
+            producer | {"parallel": {"attn_cp_size": 1}},
+            producer | {"fp8_gemm": "deep_gemm"},
+        ):
+            self.assertNotEqual(original, replay_storage_tag(pool, producer=changed))
+        pool.page_size = 128
+        self.assertNotEqual(original, replay_storage_tag(pool, producer=producer))
 
     def test_untagged_page_misses_under_the_unified_name(self):
         root = tempfile.mkdtemp()
