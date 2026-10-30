@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 from mori.cpp import TransferStatus
-from mori.io import EngineDesc, MemoryDesc, MemoryLocationType, StatusCode
+from mori.io import (
+    BackendType,
+    EngineDesc,
+    IOEngine,
+    IOEngineConfig,
+    MemoryDesc,
+    MemoryLocationType,
+    PollCqMode,
+    RdmaBackendConfig,
+    StatusCode,
+)
 
 from sglang.srt.disaggregation.transport.base import (
     BufferKey,
@@ -15,6 +27,10 @@ from sglang.srt.disaggregation.transport.base import (
     Status,
     Transport,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import run_with_deadline
+
+logger = logging.getLogger(__name__)
 
 _DONE = Result(Status.DONE)
 _PENDING = Result(Status.PENDING)
@@ -32,7 +48,7 @@ class MoriHandle(Handle):
 
 
 class MoriTransport(Transport):
-    """Transport over a Mori IOEngine dedicated to one KVManager.
+    """Transport over a Mori IOEngine made by create().
 
     write() and write_all() post without waiting and status() does not block;
     wait_all() and wait() block in the engine.
@@ -44,6 +60,47 @@ class MoriTransport(Transport):
         self._engine_desc = engine.get_engine_desc()
         # The MemoryDesc each key is registered with; None for a zero-length key.
         self._registrations: Dict[BufferKey, Optional[MemoryDesc]] = {}
+
+    @classmethod
+    def create(
+        cls, *, engine_key: str, host: str, ib_device: str, init_timeout_s: float
+    ) -> MoriTransport:
+        if ib_device:
+            os.environ["MORI_RDMA_DEVICES"] = ib_device
+
+        config = IOEngineConfig(host=host, port=0)
+
+        engine = run_with_deadline(
+            lambda: IOEngine(engine_key, config),
+            timeout_s=init_timeout_s,
+            what=f"Mori IOEngine({engine_key!r}, host={host!r})",
+        )
+        poll_mode = PollCqMode.POLLING
+
+        qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
+        post_batch_size = envs.SGLANG_MORI_POST_BATCH_SIZE.get()
+        num_worker_threads = envs.SGLANG_MORI_NUM_WORKERS.get()
+
+        rdma_cfg = RdmaBackendConfig(
+            qp_per_transfer,
+            post_batch_size,
+            num_worker_threads,
+            poll_mode,
+            False,
+        )
+        engine.create_backend(BackendType.RDMA, rdma_cfg)
+        actual_port = engine.get_engine_desc().port
+        assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
+        logger.debug(
+            "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
+            engine_key,
+            host,
+            actual_port,
+            qp_per_transfer,
+            num_worker_threads,
+            poll_mode.name,
+        )
+        return cls(engine=engine)
 
     @property
     def engine_key(self) -> str:
