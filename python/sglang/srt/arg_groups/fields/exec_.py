@@ -37,6 +37,17 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.utils.common import human_readable_int
 
 
+def _paged_experts_num_resident(value: str) -> Optional[int]:
+    """``auto`` (None: as many as fit, sized after loading) or a positive count."""
+    if value == "auto":
+        return None
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    raise argparse.ArgumentTypeError(
+        f"must be 'auto' or a positive count, got {value!r}"
+    )
+
+
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
@@ -1013,16 +1024,22 @@ class ExecMoe(msgspec.Struct):
     # -------------------------------------------------------------------------
     enable_paged_experts: A[
         bool,
-        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
-        "the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
+        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
         "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
-        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
-        "--enable-paged-experts; at least the router's top-k.",
+        Arg(
+            help="Number of routed experts per MoE layer kept resident on the GPU, at least the "
+            "router's top-k; or 'auto' (the default): as many as fit in --mem-fraction-static "
+            "next to a KV cache of --max-total-tokens, else of up to --max-running-requests, if "
+            "you set it (else 1), requests of --context-length (default: the model's), at "
+            "least one.",
+            type_parser=_paged_experts_num_resident,
+        ),
     ] = None
 
     # -------------------------------------------------------------------------

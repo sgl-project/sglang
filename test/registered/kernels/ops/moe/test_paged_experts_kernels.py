@@ -246,6 +246,62 @@ class TestPagedExpertsKernels(CustomTestCase):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
 
 
+class TestPooledSlotTables(CustomTestCase):
+    def test_a_pooled_table_returns_its_memory_once_dropped(self):
+        """``auto`` keeps the K = top_k slot tables in a pool of their own so that freeing them
+        returns their segments. Negative control: while the pool lives, they stay reserved."""
+        from sglang.srt.layers.moe.paged_experts.method import pooled_empty
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved()
+        table, pool = pooled_empty(64 << 20, torch.device("cuda"))
+        self.assertGreaterEqual(torch.cuda.memory_reserved() - before, 64 << 20)
+        del table
+        torch.cuda.empty_cache()
+        self.assertGreaterEqual(torch.cuda.memory_reserved() - before, 64 << 20)
+        del pool
+        torch.cuda.empty_cache()
+        self.assertLess(torch.cuda.memory_reserved() - before, 64 << 20)
+
+    def test_released_slot_tables_return_their_memory(self):
+        """A layer that auto has sized drops its K = top_k tables (``release_slots``) and their
+        memory goes back. Negative control: a view of a table kept elsewhere holds it."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.method import (
+            PagedExpertsMoEMethod,
+            _slot_table_bytes,
+            pooled_empty,
+        )
+
+        host = torch.randn(E, 2, 1 << 17)  # 1 MiB per expert
+        nbytes = K * host[0].numel() * host.element_size()
+        for keep_a_view in (False, True):
+            with self.subTest(keep_a_view=keep_a_view):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                before = torch.cuda.memory_reserved()
+                method = PagedExpertsMoEMethod(None, None, E, K, auto_size=True)
+                method.store = SimpleNamespace(host={"w13_weight": host})
+                layer = torch.nn.Module()
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.empty(0, *host.shape[1:], device="cuda"), requires_grad=False
+                )
+                slab, method._slot_pool = pooled_empty(
+                    _slot_table_bytes(method, K), torch.device("cuda")
+                )
+                method._place(layer, K, slab, 0)
+                self.assertTrue(torch.equal(layer.w13_weight.cpu(), host[:K]))
+                del slab
+                kept = layer.w13_weight.data[0] if keep_a_view else None
+                method.release_slots(layer)
+                torch.cuda.empty_cache()
+                held = torch.cuda.memory_reserved() - before
+                self.assertEqual(held >= nbytes, keep_a_view)
+                del kept
+
+
 def _gather_args(hosts, gpus):
     return [
         torch.tensor(v, dtype=torch.int64, device="cuda")
