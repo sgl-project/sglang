@@ -60,6 +60,7 @@ from sglang.kernels.numerics import (
     round_bf16_to_fp32,
     rsqrt_approx_f32,
 )
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -249,6 +250,7 @@ def _fake_norm_scale_shift(
     mutates_args=[],
     fake_impl=_fake_norm_scale_shift,
 )
+@replay_launches
 def fused_rmsnorm_scale_shift_bitexact(
     x: torch.Tensor,
     weight: torch.Tensor,
