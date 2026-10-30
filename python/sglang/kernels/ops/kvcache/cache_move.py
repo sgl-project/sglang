@@ -270,7 +270,10 @@ def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) 
         f"store_k_slots: loc must be int32 or int64, got {loc.dtype}"
     )
     for name, t in (("k_buffer", k_buffer), ("src", src)):
-        assert t.stride(-1) == 1 and t.stride(-2) == t.shape[-1], (
+        # A single head's stride is never applied; is_contiguous() ignores it too.
+        assert t.stride(-1) == 1 and (
+            t.shape[-2] == 1 or t.stride(-2) == t.shape[-1]
+        ), (
             f"store_k_slots: {name} trailing dims must be contiguous; "
             f"got stride={t.stride()}, shape={tuple(t.shape)}"
         )

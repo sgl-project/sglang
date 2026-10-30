@@ -12,10 +12,12 @@ from sglang.kernels.ops.kvcache.cache_ops import (
     reshape_and_cache_flash,
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseMHAMainPool
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
     _as_token_head_dim,
     _has_dense_kv_rows,
 )
@@ -287,6 +289,7 @@ def test_store_k_slots_skips_out_of_range_slots(index_dtype: torch.dtype) -> Non
         (torch.bfloat16, torch.bfloat16, "contiguous"),
         (torch.bfloat16, torch.bfloat16, "token_strided"),
         (torch.bfloat16, torch.bfloat16, "head_dim_sliced"),
+        (torch.bfloat16, torch.bfloat16, "unit_head_stride"),
         (torch.float8_e4m3fn, torch.uint8, "contiguous"),
     ],
 )
@@ -310,6 +313,10 @@ def test_k_only_pool_set_k_buffer_matches_advanced_indexing(
         cache_k = cache_k[::2]
     elif layout == "head_dim_sliced":
         cache_k = cache_k[..., :head_dim]
+    elif layout == "unit_head_stride":
+        # is_contiguous() ignores the size-1 head dim, whose stride is 1 here.
+        cache_k = cache_k.view(rows, head_dim, head_num).transpose(1, 2)
+        assert cache_k.is_contiguous() and cache_k.stride(1) == 1
     # Only the sliced source is not dense, so set_k_buffer copies it first.
     assert _has_dense_kv_rows(cache_k, head_num, head_dim, batch_size) == (
         layout != "head_dim_sliced"
@@ -519,6 +526,7 @@ class _PoolStub:
         self.kv_cache_layout = "nhd"
         self.use_hnd = False
         self.is_quantized_kv_cache = False
+        self._triton_casts_fp8_e4m3 = True
         self.dtype = dtype
         self.store_dtype = torch.uint8
         self.head_num = GUARD_HEAD_NUM
@@ -633,6 +641,8 @@ def test_set_kv_buffer_divides_unless_scale_is_host_one(scale_kind: str) -> None
         (3, "use_hnd", True),
         (3, "is_quantized_kv_cache", True),
         (3, "store_dtype", DTYPE),
+        # CUDA below sm89, where the Triton cast to float8_e4m3fn does not compile.
+        (3, "_triton_casts_fp8_e4m3", False),
     ],
 )
 def test_can_store_kv_fused_cast_rejects_unsupported_pool(
@@ -777,6 +787,84 @@ def test_store_kv_fused_cast_skips_out_of_range_slots(async_assert_off) -> None:
 
     torch.testing.assert_close(k_backing, expected_k, rtol=0.0, atol=0.0)
     torch.testing.assert_close(v_backing, expected_v, rtol=0.0, atol=0.0)
+
+
+def _minimax_sparse_pool() -> MiniMaxSparseKVPool:
+    # One sparse layer whose index branch keeps only K, with one KV head of 128.
+    pool = MiniMaxSparseKVPool(
+        size=SMALL_CACHE - 128,
+        page_size=128,
+        dtype=fp8_dtype,
+        head_num=1,
+        head_dim=128,
+        idx_head_dim=128,
+        dense_layer_ids=[],
+        sparse_layer_ids=[0],
+        disable_value_sparse_layer_ids=[0],
+        device=DEVICE,
+        start_layer=0,
+        end_layer=1,
+    )
+    # On CUDA, the store that also writes index K would otherwise run first.
+    pool.use_minimax_fused_kv_index_store = False
+    return pool
+
+
+@pytest.mark.parametrize(
+    "branch,layout",
+    [
+        ("fused_cast", "qkv_split"),
+        ("fused_cast", "unit_head_stride"),
+        ("set_kv_buffer", "qkv_split"),
+    ],
+)
+def test_minimax_sparse_pool_stores_kv_and_index_k(branch: str, layout: str) -> None:
+    pool = _minimax_sparse_pool()
+    num_tokens, head_dim = 64, 128
+    if layout == "qkv_split":
+        # Slices of one projection output keep its row stride, as the model passes them.
+        qkv = torch.randn((num_tokens, 4, head_dim), dtype=DTYPE, device=DEVICE)
+        cache_k, cache_v, idx_k = qkv[:, 1:2], qkv[:, 2:3], qkv[:, 3:4]
+    else:
+        # Dense, though the size-1 head dim has stride 1, which is_contiguous() ignores.
+        cache_k, cache_v, idx_k = (
+            torch.randn(
+                (num_tokens, head_dim, 1), dtype=DTYPE, device=DEVICE
+            ).transpose(1, 2)
+            for _ in range(3)
+        )
+    # Only the set_kv_buffer branch divides by a host scale other than 1.0.
+    scale = 2.0 if branch == "set_kv_buffer" else None
+    # Slot 0 is the reserved padding slot, which both branches skip.
+    loc = torch.randperm(pool.size, device=DEVICE)[:num_tokens] + 1
+    assert pool.main_pool.can_store_kv_fused_cast(
+        0, loc, cache_k, cache_v, k_scale=scale, v_scale=scale
+    ) == (branch == "fused_cast")
+    divisor = scale or 1.0
+    caches = (
+        (pool.main_pool.k_buffer[0], cache_k / divisor),
+        (pool.main_pool.v_buffer[0], cache_v / divisor),
+        (pool.index_k_pool.k_buffer[0], idx_k),
+    )
+    expected = []
+    for buffer, src in caches:
+        want = buffer.clone()
+        want[loc] = src.to(fp8_dtype).view(torch.uint8)
+        expected.append(want)
+
+    pool.set_fused_kv_index_buffer(
+        SimpleNamespace(layer_id=0),
+        loc,
+        cache_k,
+        cache_v,
+        idx_k,
+        None,
+        k_scale=scale,
+        v_scale=scale,
+    )
+
+    for (buffer, _), want in zip(caches, expected):
+        torch.testing.assert_close(buffer, want, rtol=0.0, atol=0.0)
 
 
 def test_reshape_and_cache_flash_kernel_launches_with_original_arguments() -> None:

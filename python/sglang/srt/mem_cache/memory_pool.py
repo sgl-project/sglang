@@ -2302,6 +2302,10 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         self.quant_method = (
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
         )
+        # Triton's CUDA backend casts to float8_e4m3fn only on sm89 and newer.
+        self._triton_casts_fp8_e4m3 = _is_hip or (
+            _is_cuda and get_platform().device_sm >= 89
+        )
 
         self._create_buffers()
 
@@ -2924,6 +2928,8 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return False
         # Triton saturates E5M2 overflow; the fallback preserves infinity.
         if self.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            return False
+        if not self._triton_casts_fp8_e4m3:
             return False
         if cache_k.dtype == self.dtype or cache_k.dtype != cache_v.dtype:
             return False
