@@ -304,7 +304,8 @@ def register_custom_op_from_extern(
                           arguments as keyword args and returns the computed value.
                           Use this for arguments that vary dynamically (e.g.
                           ``tune_max_num_tokens``) to avoid torch.compile recompilation.
-    :return: The registered custom op callable (``torch.ops.sglang.<op_name>``).
+    :return: The registered custom op callable (``torch.ops.sglang.<op_name>``),
+             which calls ``fn`` directly in plain eager execution.
     """
     name = op_name or fn.__name__
     computed_args = computed_args or {}
@@ -375,11 +376,15 @@ def register_custom_op_from_extern(
 
     from sglang.srt.utils.common import direct_register_custom_op
 
+    registered_here = not hasattr(torch.ops.sglang, name)
     direct_register_custom_op(
         op_name=name,
         op_func=fn,
         mutates_args=mutates_args or [],
         fake_impl=fake_impl,
     )
-
-    return debug_torch_op(fn, name)
+    op = debug_torch_op(fn, name)
+    # Same rule as CustomOpWrapper.real_impl: only an op registered here skips the dispatcher.
+    if registered_here and not _KERNEL_API_LOG_LEVEL:
+        return _call_directly_in_eager(fn, op)
+    return op

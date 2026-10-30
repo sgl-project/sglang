@@ -26,6 +26,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr
 
+from sglang.srt.utils.custom_op import register_custom_op
+
 
 def _detect_warp_size() -> int:
     try:
@@ -408,8 +410,28 @@ def _ensure_bf16_contig(t):
     return _to_bf16(t).contiguous()
 
 
-@torch.library.custom_op(
-    "sglang::flydsl_fused_residual_norm_scale_shift", mutates_args=()
+def _fake_flydsl_fused_residual_norm(
+    residual,
+    x,
+    gate,
+    weight,
+    bias,
+    scale,
+    shift,
+    norm_type,
+    eps=1e-6,
+):
+    B, L, C = x.shape
+    bf16 = torch.bfloat16
+    y = torch.empty(B, L, C, device=x.device, dtype=bf16)
+    res_out = torch.empty(B, L, C, device=x.device, dtype=bf16)
+    return y, res_out
+
+
+@register_custom_op(
+    op_name="flydsl_fused_residual_norm_scale_shift",
+    mutates_args=[],
+    fake_impl=_fake_flydsl_fused_residual_norm,
 )
 def flydsl_fused_residual_norm_scale_shift(
     residual: torch.Tensor,
@@ -493,25 +515,6 @@ def flydsl_fused_residual_norm_scale_shift(
         )
 
     return y.view(B, L, C), res_out.view(B, L, C)
-
-
-@flydsl_fused_residual_norm_scale_shift.register_fake
-def _fake_flydsl_fused_residual_norm(
-    residual,
-    x,
-    gate,
-    weight,
-    bias,
-    scale,
-    shift,
-    norm_type,
-    eps=1e-6,
-):
-    B, L, C = x.shape
-    bf16 = torch.bfloat16
-    y = torch.empty(B, L, C, device=x.device, dtype=bf16)
-    res_out = torch.empty(B, L, C, device=x.device, dtype=bf16)
-    return y, res_out
 
 
 ###############################################################################
@@ -682,7 +685,16 @@ def _get_or_compile_nss(D, is_rms, has_weight, args):
     return _NSS_COMPILE_CACHE[key]
 
 
-@torch.library.custom_op("sglang::flydsl_norm_scale_shift", mutates_args=())
+def _fake_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps=1e-6):
+    B, L, C = x.shape
+    return torch.empty(B, L, C, device=x.device, dtype=torch.bfloat16)
+
+
+@register_custom_op(
+    op_name="flydsl_norm_scale_shift",
+    mutates_args=[],
+    fake_impl=_fake_norm_scale_shift,
+)
 def flydsl_norm_scale_shift(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -747,9 +759,3 @@ def flydsl_norm_scale_shift(
         )
 
     return y.view(B, L, C)
-
-
-@flydsl_norm_scale_shift.register_fake
-def _fake_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps=1e-6):
-    B, L, C = x.shape
-    return torch.empty(B, L, C, device=x.device, dtype=torch.bfloat16)

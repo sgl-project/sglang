@@ -16,6 +16,7 @@ from sglang.kernels.ops.diffusion.norm.cutedsl_utils import (
     WARP_SIZE,
     to_fake_cute_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _COMPILE_CACHE = {}
 
@@ -264,7 +265,15 @@ def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
     validate_scale_shift(t, B, S, D)
 
 
-@torch.library.custom_op("sglang::fused_norm_scale_shift", mutates_args=())
+def _fused_norm_scale_shift_fake(x, weight, bias, scale, shift, norm_type, eps=1e-5):
+    return x.new_empty(x.shape)
+
+
+@register_custom_op(
+    op_name="fused_norm_scale_shift",
+    mutates_args=[],
+    fake_impl=_fused_norm_scale_shift_fake,
+)
 def fused_norm_scale_shift(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -342,14 +351,16 @@ def fused_norm_scale_shift(
         raise ValueError('norm_type must be one of "layer" and "rms"')
 
 
-@fused_norm_scale_shift.register_fake
-def _fused_norm_scale_shift_fake(x, weight, bias, scale, shift, norm_type, eps=1e-5):
-    y = x.new_empty(x.shape)
-    return y
+def _fused_scale_residual_norm_scale_shift_fake(
+    residual, x, gate, weight, bias, scale, shift, norm_type, eps=1e-5
+):
+    return x.new_empty(x.shape), x.new_empty(x.shape)
 
 
-@torch.library.custom_op(
-    "sglang::fused_scale_residual_norm_scale_shift", mutates_args=()
+@register_custom_op(
+    op_name="fused_scale_residual_norm_scale_shift",
+    mutates_args=[],
+    fake_impl=_fused_scale_residual_norm_scale_shift_fake,
 )
 def fused_scale_residual_norm_scale_shift(
     residual: torch.Tensor,
@@ -438,12 +449,3 @@ def fused_scale_residual_norm_scale_shift(
         return y, resi_out
     else:
         raise ValueError('norm_type must be one of "layer" and "rms"')
-
-
-@fused_scale_residual_norm_scale_shift.register_fake
-def _fused_scale_residual_norm_scale_shift_fake(
-    residual, x, gate, weight, bias, scale, shift, norm_type, eps=1e-5
-):
-    y = x.new_empty(x.shape)
-    residual_out = x.new_empty(x.shape)
-    return y, residual_out

@@ -1,8 +1,9 @@
 """``register_custom_op`` ops skip the dispatcher in plain eager execution.
 
-Only plain device tensors under no_grad take the direct call. Tracing, dispatch and
-function modes, the profiler, autograd, tensor subclasses, host tensors and a name
-registered by another function first all keep the registered op.
+So do ops from ``register_custom_op_from_extern`` and the multimodal_gen
+``register_custom_op``. Only plain device tensors under no_grad take the direct call.
+Tracing, dispatch and function modes, the profiler, autograd, tensor subclasses, host
+tensors and a name registered by another function first all keep the registered op.
 """
 
 import sys
@@ -12,7 +13,13 @@ import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.utils.custom_op import register_custom_op
+from sglang.multimodal_gen.runtime.layers.utils import (
+    register_custom_op as register_diffusion_custom_op,
+)
+from sglang.srt.utils.custom_op import (
+    register_custom_op,
+    register_custom_op_from_extern,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
@@ -38,6 +45,22 @@ def eager_direct_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return x + y
 
 
+def _extern_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    calls.append(("eager_direct_add", sys._getframe(1).f_code.co_name))
+    return x + y
+
+
+OPS = {
+    "register_custom_op": eager_direct_add,
+    "register_custom_op_from_extern": register_custom_op_from_extern(
+        _extern_add, op_name="test_eager_direct_extern_add", out_shape=0
+    ),
+    "multimodal_gen_register_custom_op": register_diffusion_custom_op(
+        op_name="test_eager_direct_diffusion_add", fake_impl=_fake_add
+    )(_extern_add),
+}
+
+
 def _operands(device="cuda"):
     return torch.randn(8, device=device), torch.randn(8, device=device)
 
@@ -46,10 +69,11 @@ def _took_direct_call():
     return calls[-1] == ("eager_direct_add", "call")
 
 
+@pytest.mark.parametrize("registration", sorted(OPS))
 @torch.no_grad()
-def test_eager_call_skips_the_dispatcher():
+def test_eager_call_skips_the_dispatcher(registration):
     x, y = _operands()
-    assert torch.equal(eager_direct_add(x, y), x + y)
+    assert torch.equal(OPS[registration](x, y), x + y)
     assert _took_direct_call()
 
 
@@ -63,12 +87,14 @@ class _SeenOps(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
+@pytest.mark.parametrize("registration", sorted(OPS))
 @torch.no_grad()
-def test_dispatch_mode_sees_the_registered_op():
+def test_dispatch_mode_sees_the_registered_op(registration):
     x, y = _operands()
     with _SeenOps() as mode:
-        assert torch.equal(eager_direct_add(x, y), x + y)
-    assert "sglang.test_eager_direct_add.default" in mode.ops
+        assert torch.equal(OPS[registration](x, y), x + y)
+    assert not _took_direct_call()
+    assert any(op.startswith("sglang.test_eager_direct_") for op in mode.ops)
 
 
 class _Passthrough(TorchFunctionMode):
@@ -124,6 +150,41 @@ def test_a_name_registered_first_elsewhere_keeps_that_function():
     x, y = _operands()
     assert torch.equal(second(x, y), x + y)
     assert calls[-1][0] == "eager_direct_add"
+
+
+@pytest.mark.parametrize(
+    "op_name, native_name",
+    [
+        ("fused_norm_scale_shift", "try_fused_norm_scale_shift"),
+        (
+            "fused_scale_residual_norm_scale_shift",
+            "try_fused_scale_residual_norm_scale_shift",
+        ),
+    ],
+)
+@torch.no_grad()
+def test_cutedsl_norm_ops_skip_the_dispatcher(monkeypatch, op_name, native_name):
+    cutedsl = pytest.importorskip(
+        "sglang.kernels.ops.diffusion.norm.scale_residual_norm_cutedsl"
+    )
+    from sglang.kernels.kda_kernels import norm_scale_shift_jit
+
+    callers = []
+
+    def native(*args):
+        # frame 1 is the op body; frame 2 is whatever called it
+        callers.append(sys._getframe(2).f_code.co_name)
+        out = torch.empty_like(args[0])
+        return out if op_name == "fused_norm_scale_shift" else (out, out.clone())
+
+    monkeypatch.setattr(norm_scale_shift_jit, native_name, native)
+    x, scale = torch.randn(1, 4, 256, device="cuda"), torch.randn(1, 256, device="cuda")
+    if op_name == "fused_norm_scale_shift":
+        args = (x, None, None, scale, scale, "rms", 1e-6)
+    else:
+        args = (x, x.clone(), None, None, None, scale, scale, "rms", 1e-6)
+    getattr(cutedsl, op_name)(*args)
+    assert callers == ["call"]
 
 
 def test_compile_traces_the_registered_op():

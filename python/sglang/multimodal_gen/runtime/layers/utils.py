@@ -11,7 +11,8 @@ import torch
 from torch.library import Library
 
 import sglang.multimodal_gen.runtime.platforms as platforms
-from sglang.kernels.kernel_api_logging import debug_torch_op
+from sglang.kernels.kernel_api_logging import _KERNEL_API_LOG_LEVEL, debug_torch_op
+from sglang.srt.utils.custom_op import _call_directly_in_eager
 
 
 def get_group_size(group) -> int:
@@ -122,7 +123,8 @@ class CustomOpWrapper:
     @property
     def real_impl(self) -> Callable:
         if self._impl is None:
-            if not hasattr(torch.ops.sglang, self.op_name):
+            registered_here = not hasattr(torch.ops.sglang, self.op_name)
+            if registered_here:
                 # NOTE(dark): if torch compile fail here, mark the decorator as eager
                 # lazy registration does not work with torch compile
                 direct_register_custom_op(
@@ -131,7 +133,13 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = debug_torch_op(self.op_func, self.op_name)
+            op = debug_torch_op(self.op_func, self.op_name)
+            # Same rule as sglang.srt.utils.custom_op: only an op registered here skips the dispatcher.
+            self._impl = (
+                _call_directly_in_eager(self.op_func, op)
+                if registered_here and not _KERNEL_API_LOG_LEVEL
+                else op
+            )
             assert self._impl is not None
         return self._impl
 
