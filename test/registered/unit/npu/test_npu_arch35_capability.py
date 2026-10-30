@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=1, suite="base-a-test-npu")
 
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 

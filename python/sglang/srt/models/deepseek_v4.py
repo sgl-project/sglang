@@ -279,11 +279,13 @@ _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
-    block scales only; any other layout dequantizes wo_a to bf16 at load."""
-    return (
-        _FP8_WO_A_GEMM
-        and isinstance(quant_config, Fp8Config)
-        and quant_config.weight_block_size == [128, 128]
+    block scales, and on ROCm V4.1's 32x32 where _hip allows it; any other layout
+    dequantizes wo_a to bf16 at load."""
+    if not (_FP8_WO_A_GEMM and isinstance(quant_config, Fp8Config)):
+        return False
+    block = quant_config.weight_block_size
+    return block == [128, 128] or (
+        block == [32, 32] and _is_hip and _hip.wo_a_fp8_block32_enabled()
     )
 
 
@@ -910,17 +912,7 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     )
 
 
-def _low_ratio_sources_capture_stub(layer, x, q_lora, positions) -> None:
-    # A decoder tail graph's capture pass hands the break activations its
-    # segments never computed; the indexer would select candidate blocks from
-    # them and index pages past the live context. Its replay runs the body.
-    if not in_replay_tail_graph():
-        deepseek_v4_low_ratio_sources(layer, x, q_lora, positions)
-
-
-bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
-    deepseek_v4_low_ratio_sources, capture_stub=_low_ratio_sources_capture_stub
-)
+bcg_deepseek_v4_low_ratio_sources = eager_on_graph(deepseek_v4_low_ratio_sources)
 
 
 def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
@@ -948,15 +940,15 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     )
 
 
-def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
+def _write_tail_source_kv_on_capture(layer, x, positions) -> None:
     get_attn_backend().tail_source_kv_layer_id = layer.layer_id
 
 
-# The capture pass sets only the layer id by which the tail's source layer skips
-# its compressor; the KV the break writes would come from uncomputed inputs.
+# The captured tail reads this layer id to skip the source layer's compressor,
+# so the id is also set while the graph captures.
 bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
     deepseek_v4_write_tail_source_kv,
-    capture_stub=_write_tail_source_kv_capture_stub,
+    on_capture=_write_tail_source_kv_on_capture,
 )
 
 
@@ -978,32 +970,34 @@ def _engram_image_token_id(config) -> Optional[int]:
     return None
 
 
-def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_enter_late_layer_tail() -> None:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
-    # backend onto the tail metadata of the *live* batch (the captured args hold
-    # the capture-time batch). The sentinel keeps the break in the replay sequence.
+    # backend onto the tail metadata of the *live* batch.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_enter_late_layer_tail(forward_batch)
-    return sentinel
 
 
-def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_exit_late_layer_tail() -> None:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
-    return sentinel
 
 
-bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
-    deepseek_v4_enter_late_layer_tail
+# The captured tail segments read the metadata these swap in, so they also run
+# while the graph captures.
+bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(
+    deepseek_v4_enter_late_layer_tail,
+    on_capture=deepseek_v4_enter_late_layer_tail,
 )
-bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
-    deepseek_v4_exit_late_layer_tail
+bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(
+    deepseek_v4_exit_late_layer_tail,
+    on_capture=deepseek_v4_exit_late_layer_tail,
 )
 
 
 class MqaAttentionBase(nn.Module):
-    # Class-level default for subclasses that read it without running __init__.
+    # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
+    wo_a_fp8_block128: bool = False
 
     def __init__(
         self,
@@ -1275,7 +1269,7 @@ class MqaAttentionBase(nn.Module):
 
             fused = (
                 _wo_a_fp8_mxscale_prequant is not None
-                and self.wo_a_fp8
+                and self.wo_a_fp8_block128
                 and runtime.flydsl_decode_supported(q_rope.shape[1])
             )
             self._wo_a_freqs = (
@@ -4050,7 +4044,6 @@ class DeepseekV4Model(nn.Module):
                 tail_in_graph=tail_in_graph,
                 late_dp_counts=late_dp_counts,
             )
-        tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
         # its producer update explicitly before these readers below.
@@ -4107,7 +4100,7 @@ class DeepseekV4Model(nn.Module):
                     # Eager break: re-run at replay so the backend swaps onto the
                     # live batch's tail metadata; the gathers below are captured
                     # against the persistent index buffers.
-                    tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
+                    bcg_deepseek_v4_enter_late_layer_tail()
                     saved_full = attn_backend.prefill_graph_late_layer_saved
                     if (
                         self.decoder_replay_tail is not None
@@ -4133,7 +4126,7 @@ class DeepseekV4Model(nn.Module):
                         if capture_dspark:
                             dspark_aux_hidden_states.extend(aux)
                         residual_batch.clear(forward_batch)
-                        bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                        bcg_deepseek_v4_exit_late_layer_tail()
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4253,7 +4246,7 @@ class DeepseekV4Model(nn.Module):
             exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
             if tail_in_graph:
-                tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                bcg_deepseek_v4_exit_late_layer_tail()
             else:
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail

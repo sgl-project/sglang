@@ -69,7 +69,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils.common import (
+    async_d2h,
     is_cpu,
+    is_gfx1250_supported,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -79,6 +82,19 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+# On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
+_use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
+if _use_aiter_lm_head:
+    from aiter.tuned_gemm import tgemm
+
+
+def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _use_aiter_lm_head
+        and hidden_states.dim() == 2
+        and hidden_states.dtype == weight.dtype == torch.bfloat16
+    )
+
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -216,6 +232,25 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
 
 
 @dataclasses.dataclass
+class _TypedCustomizedInfo:
+    """A ``customized_info`` value with one row per request of the batch."""
+
+    # Host lists once the scheduler materializes the batch's rows.
+    rows: Union[torch.Tensor, List[Any]]
+    # Recorded after the rows' copy to the host; reading the rows waits on it.
+    ready: Optional[torch.Event] = None
+
+
+class TokenCustomizedInfo(_TypedCustomizedInfo):
+    """``[batch_size, width]``: one value per emitted token, stored at that
+    token's output position. A speculative step stores its accepted tokens'."""
+
+
+class RequestCustomizedInfo(_TypedCustomizedInfo):
+    """``[batch_size]``: one value per request, stored once at its first output."""
+
+
+@dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
@@ -291,6 +326,26 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+
+    def own_customized_info(self) -> None:
+        """Copy this forward's typed customized_info rows to the host.
+
+        Producers may publish views of CUDA-graph or persistent buffers, and a
+        graph replay hands back its capture-time dict, so the next forward
+        rewrites them before the scheduler reads the result.
+        """
+        if not self.customized_info:
+            return
+        owned = dict(self.customized_info)
+        ready = None
+        for key, value in owned.items():
+            if isinstance(value, _TypedCustomizedInfo):
+                if ready is None and value.rows.device.type != "cpu":
+                    ready = torch.get_device_module(value.rows.device).Event()
+                owned[key] = type(value)(async_d2h(value.rows), ready)
+        if ready is not None:
+            ready.record()
+        self.customized_info = owned
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
@@ -1195,6 +1250,8 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
+                logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
