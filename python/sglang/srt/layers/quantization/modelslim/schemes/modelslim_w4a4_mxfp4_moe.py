@@ -10,9 +10,8 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A4MXFP4MoEMethod,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
+from sglang.srt.layers.quantization.npu_mxfp4_utils import MXFP4_BLOCK_SIZE
 from sglang.srt.utils import set_weight_attrs
-
-MXFP4_BLOCK_SIZE = 32
 
 __all__ = ["ModelSlimW4A4MXFP4MoE"]
 
@@ -31,7 +30,8 @@ class ModelSlimW4A4MXFP4MoE(ModelSlimMoEScheme):
             )
         self.quant_config = quant_config
         self.weight_prefix = weight_prefix
-        self.kernel = NPUW4A4MXFP4MoEMethod()
+        # Keep existing offline checkpoints on the unfused execution path.
+        self.kernel = NPUW4A4MXFP4MoEMethod(weight_prefix, use_fused_gmm1=False)
 
     def create_weights(
         self,

@@ -11,6 +11,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.npu_mxfp4_utils import (
+    MXFP4_BLOCK_SIZE,
+    local_input_size,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -19,9 +23,6 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
-
-# FP4 matmul block size; keep this config free of NPU-only imports.
-MXFP4_W4A8_GROUP_SIZE = 32
 
 
 class Mxfp4W4A8Config(QuantizationConfig):
@@ -86,13 +87,14 @@ class Mxfp4W4A8Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             # FP4 matmul cannot handle a partial K block (e.g. visual K=4304).
-            if layer.input_size % MXFP4_W4A8_GROUP_SIZE != 0:
+            local_k = local_input_size(layer)
+            if local_k % MXFP4_BLOCK_SIZE != 0:
                 logger.warning(
-                    "mxfp_w4a8: skipping %s (input_size=%d not a multiple of %d); "
-                    "falling back to unquantized BF16.",
+                    "mxfp_w4a8: skipping %s (local_input_size=%d not a multiple of %d); "
+                    "falling back to unquantized precision.",
                     prefix,
-                    layer.input_size,
-                    MXFP4_W4A8_GROUP_SIZE,
+                    local_k,
+                    MXFP4_BLOCK_SIZE,
                 )
                 return UnquantizedLinearMethod()
             if is_npu():

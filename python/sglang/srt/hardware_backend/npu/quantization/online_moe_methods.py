@@ -72,8 +72,13 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         self._aiter_runner = None
 
 
-class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
-    """Online W4A8 MXFP with lazy, independent W13/W2 loading and conversion."""
+class _NPUOnlineMXFP4MoEMethodBase(UnquantizedFusedMoEMethod):
+    """Shared online MXFP4 loading; each scheme selects its per-matmul kernels."""
+
+    scheme_name: str
+
+    def _make_kernel(self, weight_prefix: str):
+        raise NotImplementedError
 
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__()
@@ -126,44 +131,30 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
         if not (backend.is_auto() or backend.is_ascend()):
             # Other runners may swap gate/up shards during loading.
             raise ValueError(
-                "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
-                f"'ascend', got {backend.value!r}."
+                f"{self.scheme_name} MoE on Ascend requires --moe-runner-backend "
+                f"'auto' or 'ascend', got {backend.value!r}."
             )
 
-        layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
-        layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+        layer.w13_kernel = self._make_kernel("w13")
+        layer.w2_kernel = self._make_kernel("w2")
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
 
 
-class NPUW4A4MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
-    """Online W4A4 MXFP4 FusedMoE entry point (``--quantization mxfp4``).
+class NPUW4A8MXFP4OnlineMoEMethod(_NPUOnlineMXFP4MoEMethodBase):
+    """Online W4A8 MXFP with lazy, independent W13/W2 conversion."""
 
-    Reuse the unquantized weight-loading lifecycle and Ascend runner, installing
-    W4A4 kernels that prepare packed FP4 experts after loading BF16/FP16 weights.
-    """
+    scheme_name = "W4A8 MXFP"
 
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
-        super().__init__()
-        self.quant_config = quant_config
+    def _make_kernel(self, weight_prefix: str):
+        return NPUW4A8MXFP4MoEMethod()
 
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):
-        backend = get_moe_runner_backend()
-        if not (backend.is_auto() or backend.is_ascend()):
-            # The unquantized base participates in FusedMoE's shard-swap logic.
-            # A flashinfer backend would silently exchange gate/up weights.
-            raise ValueError(
-                "W4A4 MXFP4 MoE on Ascend requires --moe-runner-backend 'auto' "
-                f"or 'ascend', got {backend.value!r}."
-            )
 
-        layer.w13_kernel = NPUW4A4MXFP4MoEMethod()
-        layer.w2_kernel = NPUW4A4MXFP4MoEMethod()
-        moe_runner_config.layer = layer
-        self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
-        # Inherited apply() consults this; aiter is CUDA/ROCm-only.
-        self._aiter_runner = None
+class NPUW4A4MXFP4OnlineMoEMethod(_NPUOnlineMXFP4MoEMethodBase):
+    """Online single-level W4A4 experts (``--quantization mxfp4``)."""
+
+    scheme_name = "W4A4 MXFP4"
+
+    def _make_kernel(self, weight_prefix: str):
+        return NPUW4A4MXFP4MoEMethod(weight_prefix, use_fused_gmm1=True)

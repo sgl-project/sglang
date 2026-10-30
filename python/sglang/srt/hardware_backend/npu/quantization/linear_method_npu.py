@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.layers.quantization.npu_mxfp4_utils import MXFP4_BLOCK_SIZE
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -16,8 +17,6 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
-# W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
-MXFP4_BLOCK_SIZE = 32
 
 
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported

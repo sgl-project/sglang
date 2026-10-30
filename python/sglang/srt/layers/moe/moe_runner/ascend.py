@@ -47,28 +47,32 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
     has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
 
-    if isinstance(kernel, NPUW4A4MXFP4MoEMethod):
-        if has_clamp:
+    if not isinstance(
+        kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod, NPUW4A4MXFP4MoEMethod)
+    ):
+        return False
+    if has_clamp:
+        if isinstance(kernel, NPUW4A4MXFP4MoEMethod):
             raise NotImplementedError(
                 "NPUW4A4MXFP4MoEMethod does not support swiglu_limit."
             )
-        # Fuse only plain SiLU under ascend_tp. Keep the runner's unfused
-        # activation for SiTU, custom alpha/clamp, and unvalidated DeepEP.
-        return (
-            config.activation == "silu"
-            and config.gemm1_alpha is None
-            and config.gemm1_clamp_limit is None
-            and not get_moe_a2a_backend().is_deepep()
-        )
-
+        return False  # Keep main's separate MXFP8/W4A8 clamped activation.
     if config.activation == "situ":
         return False
-    if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
-        return False
-    if has_clamp:
-        return False  # Keep the separate activation to preserve the clamp.
     if isinstance(kernel, NPUMXFP8MoEMethod):
         return True
+    if isinstance(kernel, NPUW4A4MXFP4MoEMethod):
+        # Only opt in to plain, bias-free SiLU on the no-A2A path. The fused
+        # operator cannot preserve expert bias or custom activation parameters.
+        return (
+            kernel.use_fused_gmm1
+            and config.activation == "silu"
+            and config.gemm1_alpha is None
+            and config.gemm1_clamp_limit is None
+            and get_moe_a2a_backend().is_none()
+            and getattr(config.layer, "w13_weight_bias", None) is None
+            and getattr(config.layer, "w13_scale_bias", None) is None
+        )
     return kernel.use_fused_gmm1
 
 
@@ -100,15 +104,15 @@ if TYPE_CHECKING:
         AscendOpsCombineInput,
         AscendOpsDispatchOutput,
     )
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardCombineInput,
-        StandardDispatchOutput,
-    )
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
 
 from sglang.srt.layers.moe.utils import (
@@ -160,8 +164,8 @@ class AscendRunnerCore(MoeRunnerCore):
 
         kernel = config.layer.w2_kernel
 
-        if _uses_fused_gmm1(kernel, config):
-            # Fused methods (MXFP8, W4A8, and ascend_tp W4A4) fold
+        if _uses_fused_gmm1(config.layer.w13_kernel, config):
+            # Fused methods (MXFP8, W4A8, and no-A2A W4A4) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
             # reaching for it fails loudly instead of silently applying an

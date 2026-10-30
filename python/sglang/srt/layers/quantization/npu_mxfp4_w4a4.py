@@ -29,6 +29,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.npu_mxfp4_utils import (
+    MXFP4_BLOCK_SIZE,
+    local_input_size,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -37,8 +41,6 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
-
-MXFP4_W4A4_GROUP_SIZE = 32
 
 
 class Mxfp4W4A4Config(QuantizationConfig):
@@ -111,13 +113,14 @@ class Mxfp4W4A4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             # Preserve the existing fallback for non-aligned visual Linear
             # layers, such as Qwen3.5 vision FC2 with K=4304.
-            if layer.input_size % MXFP4_W4A4_GROUP_SIZE != 0:
+            local_k = local_input_size(layer)
+            if local_k % MXFP4_BLOCK_SIZE != 0:
                 logger.warning(
-                    "mxfp4 W4A4: skipping %s (input_size=%d not a multiple of "
+                    "mxfp4 W4A4: skipping %s (local_input_size=%d not a multiple of "
                     "%d); falling back to unquantized precision.",
                     prefix,
-                    layer.input_size,
-                    MXFP4_W4A4_GROUP_SIZE,
+                    local_k,
+                    MXFP4_BLOCK_SIZE,
                 )
                 return UnquantizedLinearMethod()
             if is_npu():
