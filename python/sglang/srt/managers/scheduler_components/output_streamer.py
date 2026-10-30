@@ -104,6 +104,19 @@ class SchedulerOutputStreamer:
             storage_backend_type = "LMCache"
         return storage_backend_type
 
+    def _rust_frames_split_cached_tokens(self) -> bool:
+        """Whether Rust egress frames carry each request's cached tokens by
+        tier, from which the frontend reports what
+        ``get_cached_tokens_details`` would. Only a cache with a host or
+        storage tier, or a PD decode server (which takes the split from
+        prefill), serves hits from anywhere but the device; otherwise the
+        frontend reports every cached token on device."""
+        return self.rust_server is not None and (
+            self.server_args.enable_hierarchical_cache
+            or self.server_args.enable_lmcache
+            or self.disaggregation_mode == DisaggregationMode.DECODE
+        )
+
     def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
@@ -220,6 +233,9 @@ class SchedulerOutputStreamer:
             ),
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
+            cached_tokens_split=(
+                [] if self._rust_frames_split_cached_tokens() else None
+            ),
         )
         for req in reqs:
             if req is skip_req:
@@ -256,7 +272,16 @@ class SchedulerOutputStreamer:
         )
         if payload is not None:
             if self.rust_server is not None:
-                self.rust_server.push_generation(payload, acc.decode_latencies)
+                self.rust_server.push_generation(
+                    payload,
+                    acc.decode_latencies,
+                    acc.cached_tokens_split,
+                    (
+                        self._get_storage_backend_type()
+                        if acc.cached_tokens_split and self.enable_hicache_storage()
+                        else None
+                    ),
+                )
             else:
                 self.send_to_detokenizer.send_output(payload)
 
@@ -418,6 +443,11 @@ class _GenerationStreamAccumulator:
     # Rust server mode: by row, the decode latency of a finished non-streaming
     # request, whose first token the Rust frontend does not see.
     decode_latencies: dict = field(default_factory=dict)
+    # Rust server mode, when a hit can come from a host or storage tier (see
+    # `SchedulerOutputStreamer._rust_frames_split_cached_tokens`): by row, the
+    # request's cached tokens per tier, as (device, host, storage). None
+    # otherwise.
+    cached_tokens_split: Optional[list] = None
 
     def __post_init__(self) -> None:
         if self.rust_server_mode:
@@ -523,6 +553,14 @@ class _GenerationStreamAccumulator:
             self.image_tokens.append(image_t)
             self.audio_tokens.append(audio_t)
             self.video_tokens.append(video_t)
+            if self.cached_tokens_split is not None:
+                self.cached_tokens_split.append(
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    )
+                )
         else:
             # Everything below feeds the Python DetokenizerManager /
             # TokenizerManager (incremental detok, meta_info, per-request metrics).
