@@ -88,7 +88,7 @@ void gguf_moe_a8_vec(
   auto device = SymbolicDevice{};
   auto columns = SymbolicSize{"columns"};
   auto experts = SymbolicSize{"experts"};
-  TensorMatcher({tokens, columns}).with_dtype<scalar_t>().template with_device<kDLCUDA>(device).verify(input);
+  TensorMatcher({tokens, columns}).with_dtype<scalar_t>().template with_device<kDLGPU>(device).verify(input);
   const int64_t k = columns.unwrap();
   CHECK_HOST(k > 0 && k <= kMaxIndex - 511 && k % Format::kBlockSize == 0);
   const int64_t packed_columns = k / Format::kBlockSize * Format::kBlockBytes;

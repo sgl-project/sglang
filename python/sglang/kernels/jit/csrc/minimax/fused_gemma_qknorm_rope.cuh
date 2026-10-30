@@ -177,7 +177,7 @@ void qknorm_rope_impl(
   auto device = SymbolicDevice{};
   constexpr auto D = HEAD_DIM;
   constexpr auto R = ROTARY_DIM;
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   TensorMatcher({N, -1}).with_dtype<bf16_t>().with_device(device).verify(qkv);
   TensorMatcher({D}).with_dtype<bf16_t>().with_device(device).verify(w0).verify(w1).verify(w2).verify(w3);
   TensorMatcher({-1, R}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
