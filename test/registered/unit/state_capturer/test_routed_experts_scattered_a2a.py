@@ -1,4 +1,5 @@
-"""RoutedExpertsCapturer: DeepEP-family backend recognition and capture width."""
+"""RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
+and the output-rank host cache."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import torch
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
 from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -146,6 +148,87 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
                 device="cpu",
             )
         self.assertEqual(seen["num_fused_shared_experts"], 1)
+
+
+class TestOutputRankHostCache(CustomTestCase):
+    NUM_LAYERS = 3
+    K = 2
+    NUM_TOKENS = 16
+    OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
+
+    def _capturer(self, attn_tp_rank):
+        parallel = SimpleNamespace(
+            num_dp_ranks=1, pp_rank=0, attn_tp_rank=attn_tp_rank, attn_cp_rank=0
+        )
+        hf_text_config = SimpleNamespace(
+            num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
+        )
+        with (
+            mock.patch.object(re_mod, "get_parallel", return_value=parallel),
+            mock.patch.object(
+                re_mod,
+                "get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=8),
+            ),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.dict(
+                base_mod.ALLOC_MEMORY_FUNCS,
+                {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
+            ),
+        ):
+            return re_mod.RoutedExpertsCapturer(
+                SimpleNamespace(hf_text_config=hf_text_config),
+                num_tokens=self.NUM_TOKENS,
+                max_running_requests=4,
+                num_fused_shared_experts=0,
+                device="cpu",
+            )
+
+    def _run_forward(self, cap, topk):
+        with (
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=False),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+        ):
+            for layer_id in range(self.NUM_LAYERS):
+                cap.capture(layer_id=layer_id, topk_indices=topk[:, layer_id])
+            return cap.on_forward_end(
+                SimpleNamespace(
+                    out_cache_loc=self.OUT_CACHE_LOC, out_cache_loc_virtual=None
+                ),
+                can_run_graph=False,
+                cuda_graph_batch=None,
+            )
+
+    def _read(self, cap):
+        pool = SimpleNamespace(req_to_token=self.OUT_CACHE_LOC.unsqueeze(0))
+        return cap.get_topk(
+            req_pool_idx=0, seqlen=5, req_to_token_pool=pool, start_len=1
+        )
+
+    def test_only_output_rank_keeps_host_cache(self):
+        """Only the rank that sends outputs to the detokenizer stores routed
+        experts on the host; every other rank pinned a full copy no one read."""
+        topk = torch.randint(
+            0,
+            64,
+            (len(self.OUT_CACHE_LOC), self.NUM_LAYERS, self.K),
+            dtype=torch.int32,
+        )
+
+        output_rank = self._capturer(attn_tp_rank=0)
+        self.assertTrue(output_rank.has_host_cache)
+        self.assertIsNone(self._run_forward(output_rank, topk))
+        self.assertTrue(torch.equal(self._read(output_rank), topk[1:4]))
+
+        other_rank = self._capturer(attn_tp_rank=1)
+        self.assertFalse(other_rank.has_host_cache)
+        self.assertIsNone(self._run_forward(other_rank, topk))
+        with self.assertRaises(RuntimeError):
+            self._read(other_rank)
 
 
 if __name__ == "__main__":
