@@ -640,6 +640,8 @@ class DFlashKDAAttention(KimiDeltaAttention):
             prefix=prefix,
             safe_gate=kda.gate_lower_bound is not None,
             lower_bound=kda.gate_lower_bound,
+            # A full-rank output gate takes the target's no-LoRA fused layout.
+            no_kda_lora=kda.full_rank_output_gate,
             linear_attention_cls=partial(
                 DFlashKDALinearAttention, scans_context=kda.scans_context
             ),
@@ -649,10 +651,31 @@ class DFlashKDAAttention(KimiDeltaAttention):
         self.A_log.weight_loader = self._load_A_log
         self._load_target_conv_shard = self.qkv_conv1d.weight.weight_loader
         self.qkv_conv1d.weight.weight_loader = self._load_conv_shard
+        # The no-LoRA layout fuses a full-rank decay gate; SpecForge's low-rank
+        # one loads here and fold_decay_gate writes f_b_proj @ f_a_proj into it.
+        self.f_a_proj: Optional[ReplicatedLinear] = None
+        self.f_b_proj: Optional[ColumnParallelLinear] = None
+        if self.no_kda_lora:
+            self.f_a_proj = ReplicatedLinear(
+                self.hidden_size, self.head_dim, bias=False
+            )
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                self.num_heads * self.head_dim,
+                bias=False,
+                parallel_group="tp",
+            )
 
     @property
     def scans_context(self) -> bool:
         return self.attn.scans_context
+
+    def fold_decay_gate(self) -> None:
+        if self.f_a_proj is None:
+            return
+        decay_gate = self.f_b_proj.weight.float() @ self.f_a_proj.weight.float()
+        # Rows of this rank: q, k, v, beta, decay gate, output gate.
+        self.fused_qkvbfg_proj.weight.data.split(self.split_sizes)[-2].copy_(decay_gate)
 
     def _load_A_log(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         self._load_target_A_log(param, loaded_weight.reshape(1, 1, -1, 1))
@@ -972,7 +995,7 @@ class DFlashDraftModel(nn.Module):
             # No fused qkv_proj to slice.
             self.supports_fused_context_kv = False
         if draft_config.kda is not None:
-            if attention_cls is not DFlashAttention:
+            if self.decoder_layer_cls.attention_cls is not DFlashAttention:
                 raise ValueError(
                     f"{type(self).__name__} does not support kda draft attention."
                 )
@@ -1211,6 +1234,12 @@ class DFlashDraftModel(nn.Module):
             ("qkv_conv1d", "q_conv1d", 0),
             ("qkv_conv1d", "k_conv1d", 1),
             ("qkv_conv1d", "v_conv1d", 2),
+            # KDA layers with a full-rank output gate.
+            ("fused_qkvbfg_proj", "q_proj", 0),
+            ("fused_qkvbfg_proj", "k_proj", 1),
+            ("fused_qkvbfg_proj", "v_proj", 2),
+            ("fused_qkvbfg_proj", "b_proj", 3),
+            ("fused_qkvbfg_proj", "g_proj", 5),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -1324,6 +1353,8 @@ class DFlashDraftModel(nn.Module):
         for layer in self.layers:
             if isinstance(layer.self_attn, DFlashMLAAttention):
                 layer.self_attn.absorb_kv_b_proj()
+            elif isinstance(layer.self_attn, DFlashKDAAttention):
+                layer.self_attn.fold_decay_gate()
 
 
 class DFlashLagunaAttention(DFlashAttention):

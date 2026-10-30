@@ -25,7 +25,7 @@ NUM_SLOTS = 5
 DEVICE = "cuda"
 
 
-def _export(context_state, lower_bound):
+def _export(context_state, lower_bound, full_rank_gate):
     return dict(
         architectures=["DFlashDraftModel"],
         hidden_size=HIDDEN,
@@ -48,6 +48,7 @@ def _export(context_state, lower_bound):
             "head_dim": HEAD_DIM,
             "num_heads": HEADS,
             "short_conv_kernel_size": CONV,
+            "use_full_rank_gate": full_rank_gate,
         },
     )
 
@@ -56,7 +57,7 @@ def _bf16_exact(shape, std):
     return (torch.randn(shape) * std).bfloat16().float()
 
 
-def _specforge_weights():
+def _specforge_weights(full_rank_gate=False):
     """SpecForge Qwen3DFlashKDAAttention tensors, exactly representable in BF16."""
     w = {
         f"{name}.weight": _bf16_exact((PROJ, HIDDEN), HIDDEN**-0.5)
@@ -69,6 +70,9 @@ def _specforge_weights():
     for gate in ("f", "g"):
         w[f"{gate}_a_proj.weight"] = _bf16_exact((HEAD_DIM, HIDDEN), HIDDEN**-0.5)
         w[f"{gate}_b_proj.weight"] = _bf16_exact((PROJ, HEAD_DIM), HEAD_DIM**-0.5)
+    if full_rank_gate:
+        del w["g_a_proj.weight"], w["g_b_proj.weight"]
+        w["g_proj.weight"] = _bf16_exact((PROJ, HIDDEN), HIDDEN**-0.5)
     w["o_norm.weight"] = 1 + _bf16_exact((HEAD_DIM,), 0.1)
     w["o_proj.weight"] = _bf16_exact((HIDDEN, PROJ), PROJ**-0.5)
     return {name: tensor.to(DEVICE) for name, tensor in w.items()}
@@ -121,7 +125,11 @@ def _reference(w, context, block, lower_bound):
     )
     out, _ = _recurrence(q, k, v, raw_gate, raw_beta, w, lower_bound)
     out = out[n:]
-    gate = proj("g_b_proj", proj("g_a_proj"))[n:].view(-1, HEADS, HEAD_DIM)
+    if "g_proj.weight" in w:
+        gate = proj("g_proj")
+    else:
+        gate = proj("g_b_proj", proj("g_a_proj"))
+    gate = gate[n:].view(-1, HEADS, HEAD_DIM)
     out = out * torch.rsqrt(out.square().mean(-1, keepdim=True) + EPS)
     out = out * w["o_norm.weight"] * gate.sigmoid()
     return proj("o_proj", out.flatten(1)), state
@@ -146,7 +154,9 @@ class TestDFlashKDAKernels(CustomTestCase):
         try:
             with torch.device(DEVICE):
                 model = DFlashDraftModel(
-                    Qwen3Config(**_export(context_state, lower_bound))
+                    Qwen3Config(
+                        **_export(context_state, lower_bound, "g_proj.weight" in w)
+                    )
                 )
         finally:
             torch.set_default_dtype(dtype)
@@ -164,8 +174,8 @@ class TestDFlashKDAKernels(CustomTestCase):
         with torch.no_grad():
             return attn(positions, block, batch)
 
-    def _check_scan(self, lower_bound):
-        w = _specforge_weights()
+    def _check_scan(self, lower_bound, full_rank_gate=False):
+        w = _specforge_weights(full_rank_gate)
         attn = self._layer("scan", lower_bound, w)
         attn.allocate_context_state(num_slots=NUM_SLOTS, device=torch.device(DEVICE))
         # Stale state of earlier occupants; untouched slots must keep it.
@@ -243,6 +253,9 @@ class TestDFlashKDAKernels(CustomTestCase):
 
     def test_scan_safe_gate(self):
         self._check_scan(lower_bound=-5.0)
+
+    def test_scan_full_rank_output_gate(self):
+        self._check_scan(lower_bound=-5.0, full_rank_gate=True)
 
     def test_reset_blocks_start_from_zero(self):
         w = _specforge_weights()

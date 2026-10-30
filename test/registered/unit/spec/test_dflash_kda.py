@@ -10,7 +10,11 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _disable_radix_cache_for_dflash_kda_scan,
 )
-from sglang.srt.models.dflash import DFlashDraftModel, DFlashKDAAttention
+from sglang.srt.models.dflash import (
+    DFlashDraftModel,
+    DFlashKDAAttention,
+    DFlashMLAAttention,
+)
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_kda import committed_row_segments, roll_conv_tails
@@ -26,28 +30,36 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 HIDDEN, HEADS, HEAD_DIM, CONV = 16, 2, 8, 4
 PROJ = HEADS * HEAD_DIM
-# SpecForge's Qwen3DFlashKDAAttention parameters (external checkpoint layout).
-SPECFORGE_KDA_SHAPES = {
-    "q_proj.weight": (PROJ, HIDDEN),
-    "k_proj.weight": (PROJ, HIDDEN),
-    "v_proj.weight": (PROJ, HIDDEN),
-    "q_conv1d.weight": (PROJ, CONV),
-    "k_conv1d.weight": (PROJ, CONV),
-    "v_conv1d.weight": (PROJ, CONV),
-    "A_log": (HEADS,),
-    "f_a_proj.weight": (HEAD_DIM, HIDDEN),
-    "f_b_proj.weight": (PROJ, HEAD_DIM),
-    "dt_bias": (PROJ,),
-    "b_proj.weight": (HEADS, HIDDEN),
-    "g_a_proj.weight": (HEAD_DIM, HIDDEN),
-    "g_b_proj.weight": (PROJ, HEAD_DIM),
-    "o_norm.weight": (HEAD_DIM,),
-    "o_proj.weight": (HIDDEN, PROJ),
-}
+KV_LORA, NOPE, ROPE, VDIM = 8, 8, 8, 6
+
+
+def _specforge_kda_shapes(full_rank_gate):
+    """SpecForge's Qwen3DFlashKDAAttention parameters (external checkpoint layout)."""
+    shapes = {
+        "q_proj.weight": (PROJ, HIDDEN),
+        "k_proj.weight": (PROJ, HIDDEN),
+        "v_proj.weight": (PROJ, HIDDEN),
+        "q_conv1d.weight": (PROJ, CONV),
+        "k_conv1d.weight": (PROJ, CONV),
+        "v_conv1d.weight": (PROJ, CONV),
+        "A_log": (HEADS,),
+        "f_a_proj.weight": (HEAD_DIM, HIDDEN),
+        "f_b_proj.weight": (PROJ, HEAD_DIM),
+        "dt_bias": (PROJ,),
+        "b_proj.weight": (HEADS, HIDDEN),
+        "o_norm.weight": (HEAD_DIM,),
+        "o_proj.weight": (HIDDEN, PROJ),
+    }
+    if full_rank_gate:
+        shapes["g_proj.weight"] = (PROJ, HIDDEN)
+    else:
+        shapes["g_a_proj.weight"] = (HEAD_DIM, HIDDEN)
+        shapes["g_b_proj.weight"] = (PROJ, HEAD_DIM)
+    return shapes
 
 
 def _export(attention_modes=("kda", "gqa"), **linear_attn_config):
-    """A SpecForge hybrid KDA export (configs/qwen3-4b-dspark-kda-scan.json)."""
+    """A SpecForge hybrid KDA export."""
     return dict(
         architectures=["DFlashDraftModel"],
         hidden_size=HIDDEN,
@@ -59,6 +71,14 @@ def _export(attention_modes=("kda", "gqa"), **linear_attn_config):
         vocab_size=64,
         rms_norm_eps=1e-6,
         num_target_layers=2,
+        # MLA layers' fields; GQA and KDA layers ignore them.
+        rope_theta=1e4,
+        max_position_embeddings=4096,
+        q_lora_rank=None,
+        kv_lora_rank=KV_LORA,
+        qk_nope_head_dim=NOPE,
+        qk_rope_head_dim=ROPE,
+        v_head_dim=VDIM,
         dflash_config={
             "attention_modes": list(attention_modes),
             "block_size": 4,
@@ -96,10 +116,19 @@ class TestDFlashKDA(CustomTestCase):
             parse_dflash_draft_config(draft_hf_config=export).kda.scans_context
         )
 
+        mixed = parse_dflash_draft_config(draft_hf_config=_export(("kda", "mla")))
+        self.assertTrue(mixed.is_mla)
+        self.assertIsNotNone(mixed.kda)
+        self.assertTrue(
+            parse_dflash_draft_config(
+                draft_hf_config=_export(use_full_rank_gate=True)
+            ).kda.full_rank_output_gate
+        )
+
         for export, error in (
-            (_export(("kda", "kda")), "at least one gqa/mha"),
-            (_export(("kda", "mla")), "mix kda with mla"),
-            (_export(use_full_rank_gate=True), "use_full_rank_gate"),
+            (_export(("kda", "kda")), "at least one gqa/mha/mla"),
+            (_export(("kda", "mla", "gqa")), "mix mla with gqa/mha"),
+            (_export(use_full_rank_gate="yes"), "use_full_rank_gate"),
             (_export(context_state="bogus"), "context_state"),
             (_export(gate_lower_bound=1.0), "gate_lower_bound"),
         ):
@@ -110,55 +139,104 @@ class TestDFlashKDA(CustomTestCase):
             parse_dspark_draft_config(draft_hf_config=_export())
 
     def test_specforge_checkpoint_loads_into_target_layer(self):
-        """SpecForge's split KDA tensors land in the target's fused layout, and
-        the GQA layer's q/k/v still land in its own qkv_proj."""
-        model = DFlashDraftModel(Qwen3Config(**_export()))
-        kda = {name: torch.randn(shape) for name, shape in SPECFORGE_KDA_SHAPES.items()}
-        gqa = {
-            "q_proj.weight": torch.randn(16, HIDDEN),
-            "k_proj.weight": torch.randn(8, HIDDEN),
-            "v_proj.weight": torch.randn(8, HIDDEN),
+        """SpecForge's split KDA tensors land in the target's fused layouts, and
+        the GQA layer's q/k/v still land in its own qkv_proj. A full-rank output
+        gate takes the no-LoRA layout, whose decay gate is f_b_proj @ f_a_proj."""
+        for full_rank_gate in (False, True):
+            with self.subTest(full_rank_gate=full_rank_gate):
+                model = DFlashDraftModel(
+                    Qwen3Config(**_export(use_full_rank_gate=full_rank_gate))
+                )
+                kda = {
+                    name: torch.randn(shape)
+                    for name, shape in _specforge_kda_shapes(full_rank_gate).items()
+                }
+                gqa = {
+                    "q_proj.weight": torch.randn(16, HIDDEN),
+                    "k_proj.weight": torch.randn(8, HIDDEN),
+                    "v_proj.weight": torch.randn(8, HIDDEN),
+                }
+                model.load_weights(
+                    [(f"layers.0.self_attn.{name}", w) for name, w in kda.items()]
+                    + [(f"layers.1.self_attn.{name}", w) for name, w in gqa.items()]
+                )
+
+                attn = model.layers[0].self_attn
+                self.assertIsInstance(attn, DFlashKDAAttention)
+                qkvb = [kda[f"{name}_proj.weight"] for name in ("q", "k", "v", "b")]
+                expected = {
+                    "qkv_conv1d.weight": torch.cat(
+                        [kda[f"{qkv}_conv1d.weight"] for qkv in "qkv"]
+                    ).unsqueeze(1),
+                    "A_log": kda["A_log"].view(1, 1, HEADS, 1),
+                    "dt_bias": kda["dt_bias"],
+                    "o_norm.weight": kda["o_norm.weight"],
+                    "o_proj.weight": kda["o_proj.weight"],
+                }
+                if full_rank_gate:
+                    decay_gate = kda["f_b_proj.weight"] @ kda["f_a_proj.weight"]
+                    expected["fused_qkvbfg_proj.weight"] = torch.cat(
+                        qkvb + [decay_gate, kda["g_proj.weight"]]
+                    )
+                    expected["f_a_proj.weight"] = kda["f_a_proj.weight"]
+                    expected["f_b_proj.weight"] = kda["f_b_proj.weight"]
+                else:
+                    expected["fused_qkvbfg_a_proj.weight"] = torch.cat(
+                        qkvb + [kda["f_a_proj.weight"], kda["g_a_proj.weight"]]
+                    )
+                    expected["fused_fg_b_proj.weight"] = torch.stack(
+                        [kda["f_b_proj.weight"], kda["g_b_proj.weight"]]
+                    )
+                params = dict(attn.named_parameters())
+                self.assertEqual(set(params), set(expected))
+                for name, value in expected.items():
+                    torch.testing.assert_close(params[name], value, msg=name)
+                # The kernels read the conv weights through the linear-attention layer.
+                torch.testing.assert_close(
+                    attn.attn.conv_weights, expected["qkv_conv1d.weight"].squeeze(1)
+                )
+                torch.testing.assert_close(
+                    model.layers[1].self_attn.qkv_proj.weight,
+                    torch.cat([gqa[f"{qkv}_proj.weight"] for qkv in "qkv"]),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_kda_layers_share_a_draft_with_mla_layers(self):
+        """KDA layers own no KV, so they serve next to MLA layers, which keep the
+        MLA pool. Both read q_proj: each layer's must land in its own parameters."""
+        with patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True):
+            model = DFlashDraftModel(Qwen3Config(**_export(("kda", "mla"))))
+        kda, mla = model.layers[0].self_attn, model.layers[1].self_attn
+        self.assertIsInstance(kda, DFlashKDAAttention)
+        self.assertIsInstance(mla, DFlashMLAAttention)
+        kda_weights = {
+            name: torch.randn(shape)
+            for name, shape in _specforge_kda_shapes(full_rank_gate=False).items()
+        }
+        mla_weights = {
+            "q_proj.weight": torch.randn(HEADS * (NOPE + ROPE), HIDDEN),
+            "kv_a_proj_with_mqa.weight": torch.randn(KV_LORA + ROPE, HIDDEN),
+            "kv_a_layernorm.weight": torch.randn(KV_LORA),
+            "kv_b_proj.weight": torch.randn(HEADS * (NOPE + VDIM), KV_LORA),
+            "o_proj.weight": torch.randn(HIDDEN, HEADS * VDIM),
         }
         model.load_weights(
-            [(f"layers.0.self_attn.{name}", w) for name, w in kda.items()]
-            + [(f"layers.1.self_attn.{name}", w) for name, w in gqa.items()]
+            [(f"layers.0.self_attn.{name}", w) for name, w in kda_weights.items()]
+            + [(f"layers.1.self_attn.{name}", w) for name, w in mla_weights.items()]
         )
-
-        attn = model.layers[0].self_attn
-        self.assertIsInstance(attn, DFlashKDAAttention)
-        expected = {
-            "fused_qkvbfg_a_proj.weight": torch.cat(
-                [
-                    kda[f"{name}.weight"]
-                    for name in ("q_proj", "k_proj", "v_proj", "b_proj")
-                    + ("f_a_proj", "g_a_proj")
-                ]
-            ),
-            "fused_fg_b_proj.weight": torch.stack(
-                [kda["f_b_proj.weight"], kda["g_b_proj.weight"]]
-            ),
-            "qkv_conv1d.weight": torch.cat(
-                [kda[f"{qkv}_conv1d.weight"] for qkv in "qkv"]
-            ).unsqueeze(1),
-            "A_log": kda["A_log"].view(1, 1, HEADS, 1),
-            "dt_bias": kda["dt_bias"],
-            "o_norm.weight": kda["o_norm.weight"],
-            "o_proj.weight": kda["o_proj.weight"],
-        }
-        params = dict(attn.named_parameters())
-        self.assertEqual(set(params), set(expected))
-        for name, value in expected.items():
-            torch.testing.assert_close(params[name], value, rtol=0, atol=0, msg=name)
-        # The kernels read the conv weights through the linear-attention layer.
+        for name, value in mla_weights.items():
+            torch.testing.assert_close(
+                dict(mla.named_parameters())[name], value, rtol=0, atol=0, msg=name
+            )
         torch.testing.assert_close(
-            attn.attn.conv_weights, expected["qkv_conv1d.weight"].squeeze(1)
-        )
-        torch.testing.assert_close(
-            model.layers[1].self_attn.qkv_proj.weight,
-            torch.cat([gqa[f"{qkv}_proj.weight"] for qkv in "qkv"]),
+            kda.fused_qkvbfg_a_proj.weight[:PROJ],
+            kda_weights["q_proj.weight"],
             rtol=0,
             atol=0,
         )
+        # load_weights ran the MLA layer's post-load absorption.
+        self.assertIsNotNone(mla.w_kc)
 
     def test_verified_rows_commit_only_their_prefix(self):
         """Dense [bs, block] verify rows commit their first commit_lens rows to

@@ -563,17 +563,12 @@ def _parse_dflash_attention_modes(
     context_modes = set(modes) - {"kda"}
     if not context_modes:
         raise ValueError(
-            "DFLASH kda drafts need at least one gqa/mha layer to read the "
+            "DFLASH kda drafts need at least one gqa/mha/mla layer to read the "
             f"target context, got attention modes {list(modes)}."
         )
     if "mla" in context_modes and context_modes != {"mla"}:
         raise ValueError(
             "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
-            f"got attention modes {list(modes)}."
-        )
-    if "mla" in context_modes and "kda" in modes:
-        raise ValueError(
-            "DFLASH drafts that mix kda with mla layers are not supported, "
             f"got attention modes {list(modes)}."
         )
     return modes
@@ -592,6 +587,9 @@ class DFlashKDAConfig(msgspec.Struct, frozen=True, kw_only=True):
     # "scan": a proposal block starts from the state after the committed target
     # context. "reset": every block starts from a zero state.
     scans_context: bool
+    # SpecForge's use_full_rank_gate: a full-rank output gate g_proj; the decay
+    # gate stays low-rank (f_a_proj, f_b_proj).
+    full_rank_output_gate: bool
 
 
 def _parse_dflash_kda_config(text_config: Any) -> DFlashKDAConfig:
@@ -612,10 +610,11 @@ def _parse_dflash_kda_config(text_config: Any) -> DFlashKDAConfig:
         field_name="DFLASH kda short_conv_kernel_size",
         min_value=2,
     )
-    # The target KimiDeltaAttention fuses low-rank f/g projections only.
-    if raw.get("use_full_rank_gate", False):
+    full_rank_output_gate = raw.get("use_full_rank_gate", False)
+    if not isinstance(full_rank_output_gate, bool):
         raise ValueError(
-            "DFLASH kda layers do not support linear_attn_config.use_full_rank_gate."
+            "DFLASH kda linear_attn_config.use_full_rank_gate must be a boolean, "
+            f"got {full_rank_output_gate!r}."
         )
     gate_lower_bound = raw.get("gate_lower_bound")
     if gate_lower_bound is not None:
@@ -641,6 +640,7 @@ def _parse_dflash_kda_config(text_config: Any) -> DFlashKDAConfig:
         short_conv_kernel_size=short_conv_kernel_size,
         gate_lower_bound=gate_lower_bound,
         scans_context=context_state == "scan",
+        full_rank_output_gate=full_rank_output_gate,
     )
 
 
