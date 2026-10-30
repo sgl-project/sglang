@@ -136,6 +136,8 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+_rdna_splitk_gemv = None
+_use_rdna_splitk_gemv = None
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -305,6 +307,16 @@ def initialize_bf16_gemm_config() -> None:
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm
+    global _rdna_splitk_gemv, _use_rdna_splitk_gemv
+
+    if is_hip():
+        from sglang.kernels.ops.gemm.rdna_small_m_gemv import (
+            rdna_splitk_gemv,
+            use_rdna_splitk_gemv,
+        )
+
+        _rdna_splitk_gemv = rdna_splitk_gemv
+        _use_rdna_splitk_gemv = use_rdna_splitk_gemv
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -588,6 +600,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif (
+            # The raw Triton launch cannot be traced; compiled graphs keep the GEMM.
+            not torch.compiler.is_compiling()
+            and _use_rdna_splitk_gemv is not None
+            and bias is None
+            and x.is_contiguous()
+            and layer.weight.is_contiguous()
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and _use_rdna_splitk_gemv(
+                x.numel() // x.shape[-1],
+                layer.weight.shape[0],
+                layer.weight.shape[1],
+                layer.weight.dtype,
+            )
+        ):
+            return _rdna_splitk_gemv(x.view(-1, x.shape[-1]), layer.weight).view(
+                *x.shape[:-1], layer.weight.shape[0]
+            )
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
