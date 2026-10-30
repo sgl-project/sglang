@@ -23,7 +23,7 @@ For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/as
 
 Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
 
-```bash
+```shell Command
 docker --version && docker info
 ```
 
@@ -129,7 +129,7 @@ SGLANG_PID=$(pgrep -f "sglang serve")
 kill -SIGINT $SGLANG_PID
 ```
 
-Wait a moment for the server to shut down gracefully. The output should be like the following:
+Wait a few seconds for the server to shut down gracefully. The output should be like the following:
 
 ```log Output
 INFO:     Shutting down

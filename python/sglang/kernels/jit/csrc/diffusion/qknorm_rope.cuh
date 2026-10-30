@@ -811,7 +811,7 @@ struct QKNormRopeKernel {
     auto id_type = SymbolicDType{};
     D.set_value(kHeadDim);
     R.set_value(kRopeDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Q, D}).with_strides({Dq, Dd, 1}).with_dtype<DType>().with_device(device).verify(q);
     TensorMatcher({N, K, D}).with_strides({Dk, Dd, 1}).with_dtype<DType>().with_device(device).verify(k);
@@ -923,7 +923,7 @@ struct QKNormRopeOutOfPlaceKernel {
     auto device = SymbolicDevice{};
     auto id_type = SymbolicDType{};
     D.set_value(kHeadDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Q, D}).with_strides({Dq, Dd, 1}).with_dtype<DType>().with_device(device).verify(q);
     TensorMatcher({N, K, D}).with_strides({Dk, Dd, 1}).with_dtype<DType>().with_device(device).verify(k);
@@ -1034,7 +1034,7 @@ struct QKNormRopePackKVKernel {
     T.set_value(prefix_tokens + suffix_tokens);
     D.set_value(kHeadDim);
     R.set_value(kRopeDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Q, D}).with_strides({Dq, Dd, 1}).with_dtype<DType>().with_device(device).verify(q);
     TensorMatcher({N, K, D}).with_strides({Dk, Dd, 1}).with_dtype<DType>().with_device(device).verify(k);

@@ -627,6 +627,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
             pool.page_size = 2
             pool.layer_num = 1
+            pool.start_layer = 0
             pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
             pool.index_key_cache = SimpleNamespace(
                 buffer=[torch.zeros((4, index_width), dtype=torch.uint8)]
@@ -685,16 +686,20 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+        no_state = SimpleNamespace(
+            layer_router=SimpleNamespace(part_view=lambda part: None)
+        )
         draft = SimpleNamespace(
-            token_to_kv_pool=object(),
-            req_to_token_pool=None,
+            token_to_kv_pool=no_state,
+            runner_ids=SimpleNamespace(is_fused_draft=False),
             model_config=SimpleNamespace(
                 num_nextn_predict_layers=0,
                 hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             ),
         )
         target = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.EAGLE, req_to_token_pool=None
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            token_to_kv_pool=no_state,
         )
         worker = SimpleNamespace(
             target_worker=SimpleNamespace(model_runner=target),
@@ -758,12 +763,14 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params = SimpleNamespace(
             mtp_draft_device_pools=(),
             sidecar_draft_device_pools=(draft,),
-            req_to_token_pool=SimpleNamespace(
-                mamba_pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
-                mamba_map={0: 0, 2: 1},
-                mamba_ckpt_pool=None,
-                short_conv_pool=SimpleNamespace(enabled=False),
-                ngram_pool=SimpleNamespace(enabled=False),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(
+                    pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
+                    layer_map={0: 0, 2: 1},
+                    ckpt_pool=None,
+                    short_conv_pool=SimpleNamespace(enabled=False),
+                    ngram_pool=SimpleNamespace(enabled=False),
+                )
             ),
         )
 
@@ -812,6 +819,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         kvcache = SWAKVPool.__new__(SWAKVPool)
+        kvcache.full_kv_pool, kvcache.swa_kv_pool = object(), object()
+        kvcache.layers_mapping = {}
         with self.assertRaisesRegex(
             ValueError,
             "does not support the direct external linker: _SwaStrategy",

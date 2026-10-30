@@ -439,6 +439,38 @@ def can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
+def gather_physical_device_ids(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> List[int]:
+    """Every rank's physical GPU index (before CUDA_VISIBLE_DEVICES), gathered
+    over a CPU group."""
+    world_size = dist.get_world_size(group=group)
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible_devices:
+        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        device_ids = list(range(torch.cuda.device_count()))
+    physical_device_id = device_ids[device.index]
+    tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
+    gather_list = [
+        torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
+    ]
+    dist.all_gather(gather_list, tensor, group=group)
+    physical_device_ids = [int(t) for t in gather_list]
+    return physical_device_ids
+
+
+def in_one_nvlink_domain(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> bool:
+    """True iff every rank's GPU reaches every other's memory over NVLink: one
+    node with full NVLink, or one multi-node NVLink fabric clique."""
+    world_size = dist.get_world_size(group=group)
+    if not all(in_the_same_node_as(group, source_rank=0)):
+        return is_one_nvlink_clique(group, device)
+    return is_full_nvlink(gather_physical_device_ids(group, device), world_size)
+
+
 def can_use_custom_all_reduce_with_nvlink(
     group: torch.distributed.ProcessGroup,
     device: torch.device,
@@ -472,18 +504,7 @@ def can_use_custom_all_reduce_with_nvlink(
         )
         return
 
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
-    else:
-        device_ids = list(range(torch.cuda.device_count()))
-    physical_device_id = device_ids[device.index]
-    tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-    gather_list = [
-        torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-    ]
-    dist.all_gather(gather_list, tensor, group=group)
-    physical_device_ids = [int(t) for t in gather_list]
+    physical_device_ids = gather_physical_device_ids(group, device)
     full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
     # test nvlink first, this will filter out most of the cases
