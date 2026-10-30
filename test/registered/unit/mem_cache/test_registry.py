@@ -355,6 +355,12 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
     def test_lmcache_unified_radix_cache_when_enable_lmcache(self):
         ctx = _make_ctx(self, enable_lmcache=True)
+        enter_override(
+            self,
+            get_context().override_server_args(
+                enable_lmcache=True, lmcache_min_retrieve_tokens=512
+            ),
+        )
         fake_module = MagicMock()
         fake_components = MagicMock()
         with patch.dict(
@@ -371,6 +377,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 tp_size=ctx.tp_size,
                 tp_rank=ctx.tp_rank,
                 lmcache_config_file=None,
+                min_retrieve_tokens=512,
                 forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
             self.assertEqual(_slots(ctx), [("FULL", "token")])

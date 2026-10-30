@@ -76,3 +76,16 @@ tokens. Long prompts with short partial hits may still incur storage prefetch
 cost before SGLang can decide. Recalibrate after deployment changes and check
 held-out mixed-hit latency and throughput; fewer transfers alone do not prove
 a performance improvement.
+
+Run the manual GPU test to check lookup bypass, rejection of a short partial
+hit on a longer prompt, and successful reuse of KV stored after recomputation:
+
+```bash
+SGLANG_TEST_LMCACHE_TP_SIZE=2 \
+  python test/manual/mem_cache/test_lmcache_load_admission.py -v
+```
+
+The default is TP=1. The test owns its daemon and engine, uses engine-driven
+transfers, and requires LMCache in the active Python environment. Override
+`SGLANG_TEST_LMCACHE_MODEL` or `SGLANG_TEST_LMCACHE_BASE_PORT` (default `31700`)
+to select the model or the four consecutive ports used by the test.
