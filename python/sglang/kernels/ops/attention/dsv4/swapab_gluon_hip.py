@@ -319,6 +319,10 @@ def combine_gfx950(
     sink = tl.load(SINK + h)
     if ROPE_DIM > 0:
         pos = tl.load(POSITIONS + b)
+    # empty side-effect asm: stops the scheduler from sinking the sink and pos loads
+    # below the den, mx, vals and FREQS loads
+    tl.inline_asm_elementwise("", "=s,s", [b], tl.int32, is_pure=False, pack=1)
+    if ROPE_DIM > 0:
         cos, sin = rope_tables(d, FREQS, pos, FREQ_STRIDE, 512, ROPE_DIM)
         if ROPE_TILES:
             signed_sin = tl.where(d % 2 == 0, -sin, sin)
