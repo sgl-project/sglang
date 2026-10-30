@@ -165,8 +165,6 @@ if TYPE_CHECKING:
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
-INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
-
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
@@ -1287,18 +1285,6 @@ class Req(ReqDllmMixin):
         self.vocab_size = vocab_size
         self.priority = priority
 
-        # For incremental decoding
-        # ----- | --------- read_ids -------|
-        # ----- |   surr_ids  |
-        # xxxxx | xxxxxxxxxxx | xxxxxxxxxxx |
-        # ----- ^ ----------- ^ ----------- ^
-        # ----- 1 ----------- 2 ----------- 3
-        # 1: surr_offset
-        # 2: read_offset
-        # 3: last token
-        self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
-        self.read_offset = None
-
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
         # Pre-computed multimodal prompt token counts; populated on the prefill
@@ -1371,8 +1357,9 @@ class Req(ReqDllmMixin):
 
         # Incremental streamining
         self.send_token_offset: int = 0
-        self.send_decode_id_offset: int = 0
-        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+        # Whether the DetokenizeHeader went out, so the detokenizer holds its state.
+        self.detokenize_header_sent = False
+        # TODO (Byron): send_output_token_logprobs_offset and send_token_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
 
@@ -1890,26 +1877,11 @@ class Req(ReqDllmMixin):
             max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
-    # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
-    def init_incremental_detokenize(self):
-        first_iter = self.surr_offset is None or self.read_offset is None
-
-        output_ids = self.output_ids_through_stop
-
-        if first_iter:
-            self.read_offset = len(self.origin_input_ids_unpadded)
-            self.surr_offset = max(
-                self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
-            )
-            self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
-            )
-            self.cur_decode_ids_len = len(output_ids)
-        else:
-            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
-            self.cur_decode_ids_len = len(output_ids)
-
-        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
+    def take_detokenize_header_due(self) -> bool:
+        """Whether this output carries the DetokenizeHeader: only the first does."""
+        due = not self.detokenize_header_sent
+        self.detokenize_header_sent = True
+        return due
 
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
         max_len_tail_str = max(
