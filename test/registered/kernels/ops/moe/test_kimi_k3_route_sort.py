@@ -96,6 +96,33 @@ class TestKimiK3RouteSort(CustomTestCase):
                 self.assertTrue(bool(((ids >= 0) & (ids < E)).all()))
                 self.assertTrue(all(len(set(row)) == K for row in ids.tolist()))
 
+    @torch.inference_mode()
+    def test_fp32_bias_matches_the_fp32_router(self):
+        """With the fp32 correction bias the model passes, the fused top-k picks the
+        experts and weights of sigmoid(logits) + bias in fp32; a bf16 bias reorders them."""
+        from sglang.kernels.ops.moe.kimi_k3_route_sort import route_sort
+
+        g = torch.Generator(device="cuda").manual_seed(5)
+        bias = torch.randn(E, generator=g, device="cuda") * 0.05
+        logits = (torch.randn(16, E, generator=g, device="cuda") * 2).bfloat16()
+        got = route_sort(
+            logits, bias, topk=K, block_m=BLOCK_M, model_dim=LATENT, moe_buf=None,
+            routed_scaling_factor=1.0, renormalize=True,
+        )  # fmt: skip
+        scores = logits.float().sigmoid()
+        want_ids = torch.topk(scores + bias, K, dim=-1).indices
+        want_w = scores.gather(1, want_ids)
+        want_w = want_w / want_w.sum(-1, keepdim=True)
+        got_ids, order = got.topk_ids.long().sort(-1)
+        want_sorted, want_order = want_ids.sort(-1)
+        self.assertTrue(torch.equal(got_ids, want_sorted))
+        torch.testing.assert_close(
+            got.topk_weights.gather(1, order),
+            want_w.gather(1, want_order),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
 
 def _row_scales(scales: torch.Tensor, row: int) -> torch.Tensor:
     """The e8m0 group scales of a sorted row in aiter's shuffled layout."""

@@ -1435,7 +1435,8 @@ class KimiK3MoE(nn.Module):
         ):
             return None
         cfg = self.topk.topk_config
-        bias = cfg.correction_bias_for_dtype(router_logits.dtype)
+        # fp32 like main's router (#44797): a bf16 offset bias reorders the top-k
+        bias = cfg.correction_bias
         if not kimi_k3_route_sort.covered(router_logits, bias, cfg.top_k):
             return None
         fuse_quant = (
