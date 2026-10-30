@@ -999,7 +999,7 @@ class BaseMultimodalProcessor(ABC):
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.device_image_decode)
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
+                    return img  # JPEG already decoded to a device tensor.
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:

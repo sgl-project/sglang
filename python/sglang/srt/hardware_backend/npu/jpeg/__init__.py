@@ -1,4 +1,4 @@
-"""Opt-in DVPP JPEGD/VPC decoding; unsupported images retain PIL semantics."""
+"""DVPP JPEGD/VPC decoding; unsupported images retain PIL semantics."""
 
 import atexit
 import os

@@ -103,7 +103,9 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
     get_context,
-    get_device as get_runtime_device,
+)
+from sglang.srt.runtime_context import get_device as get_runtime_device
+from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_model,
