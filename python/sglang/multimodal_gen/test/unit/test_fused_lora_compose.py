@@ -289,6 +289,7 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline.loaded_adapter_paths = {}
     pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_configs = {}
+    pipeline.loaded_adapter_fingerprints = {}
     pipeline.loaded_adapter_alphas = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}

@@ -138,6 +138,7 @@ def _one_layer_pipeline():
     p.loaded_adapter_paths = {"A": "/A", "B": "/B"}
     p.loaded_adapter_files = {}
     p.loaded_adapter_configs = {}
+    p.loaded_adapter_fingerprints = {}
     p.loaded_adapter_alphas = {"A": None, "B": None}
     p.lora_adapters = {
         name: {

@@ -169,6 +169,8 @@ class LoRAPipeline(ComposedPipelineBase):
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
     loaded_adapter_files: dict[str, str]  # nickname -> resolved local file
     loaded_adapter_configs: dict[str, dict]  # nickname -> PEFT config at load
+    # nickname -> (size, mtime_ns) of the file at load
+    loaded_adapter_fingerprints: dict[str, tuple[int, int]]
     loaded_adapter_alphas: dict[str, int | None]
     # nickname -> adapter_config lora_alpha
     # Track current adapter per module: {"transformer": "high_lora", "transformer_2": "low_lora"}
@@ -202,6 +204,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_paths = {}
         self.loaded_adapter_files = {}
         self.loaded_adapter_configs = {}
+        self.loaded_adapter_fingerprints = {}
         self.loaded_adapter_alphas = {}
         self.cur_adapter_name = {}
         self.cur_adapter_path = {}
@@ -1014,6 +1017,8 @@ class LoRAPipeline(ComposedPipelineBase):
         if rank != 0:
             lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
+        stat = os.stat(os.path.realpath(lora_local_path))
+        adapter_fingerprint = (stat.st_size, stat.st_mtime_ns)
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(
@@ -1086,6 +1091,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_files[lora_nickname] = lora_local_path
         self.loaded_adapter_configs[lora_nickname] = adapter_config
+        self.loaded_adapter_fingerprints[lora_nickname] = adapter_fingerprint
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
 
@@ -1415,7 +1421,11 @@ class LoRAPipeline(ComposedPipelineBase):
             )
             for file, n, strength in zip(files, nicknames, strengths)
         ]
-        key = lora_merge_cache_key([self.server_args.model_path, module_name], adapters)
+        key = lora_merge_cache_key(
+            [self.server_args.model_path, module_name],
+            adapters,
+            [self.loaded_adapter_fingerprints.get(n) for n in nicknames],
+        )
         expected = sum(
             layer.weight.numel() * layer.weight.element_size()
             for layer in lora_layers.values()

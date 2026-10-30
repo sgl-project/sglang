@@ -37,6 +37,7 @@ _DISK_HEADROOM = 1.15
 def lora_merge_cache_key(
     base_paths: list[str],
     adapters: list[tuple[str, float, float | None]],
+    fingerprints: list[tuple[int, int] | None] | None = None,
 ) -> str:
     """Key of one merged-weights combination.
 
@@ -44,15 +45,22 @@ def lora_merge_cache_key(
     the revision hash); `adapters` are ordered (lora_path, strength, alpha)
     triples — order matters, merges compose in order. Include adapter file
     modification times so same-size local checkpoint updates invalidate the cache.
+    `fingerprints` are optional (size, mtime_ns) snapshots taken when each adapter
+    was loaded; they replace the merge-time stat so a file replaced after loading
+    cannot be cached under the replacement's identity.
     """
     parts = [os.path.realpath(p) for p in sorted(base_paths)]
-    for path, strength, alpha in adapters:
+    for i, (path, strength, alpha) in enumerate(adapters):
         real = os.path.realpath(path)
-        try:
-            stat = os.stat(real)
-            size, mtime_ns = stat.st_size, stat.st_mtime_ns
-        except OSError:
-            size, mtime_ns = -1, -1
+        snapshot = fingerprints[i] if fingerprints else None
+        if snapshot is not None:
+            size, mtime_ns = snapshot
+        else:
+            try:
+                stat = os.stat(real)
+                size, mtime_ns = stat.st_size, stat.st_mtime_ns
+            except OSError:
+                size, mtime_ns = -1, -1
         parts.append(f"{real}|{size}|{mtime_ns}|{strength}|{alpha}")
     return hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
 

@@ -53,6 +53,7 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
     pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_configs = {}
+    pipeline.loaded_adapter_fingerprints = {}
     pipeline.loaded_adapter_alphas = {"adapter": None}
     pipeline.cur_adapter_name = {}
     pipeline.cur_adapter_path = {}
@@ -576,3 +577,28 @@ def test_critic_offload_lookup_uses_fake_score_transformer():
         side_effect=lambda module: module is critic,
     ):
         assert pipeline._has_layerwise_offload([("critic", {})])
+
+
+def test_merge_cache_key_uses_the_fingerprint_taken_at_load(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_CACHE_ROOT", str(tmp_path / "cache"))
+    pipeline = _make_pipeline(_make_layer())
+    adapter = tmp_path / "adapter.safetensors"
+    save_file({"linear.lora_A.weight": torch.ones(1, 2)}, adapter)
+    stat = adapter.stat()
+    pipeline.loaded_adapter_files["adapter"] = str(adapter)
+    pipeline.loaded_adapter_fingerprints["adapter"] = (stat.st_size, stat.st_mtime_ns)
+
+    def cache_root():
+        cache = pipeline._merge_cache_for(
+            "transformer", pipeline.lora_layers, ["adapter"], [1.0], enabled=True
+        )
+        return cache.root
+
+    before = cache_root()
+    # Replacing the file after load must not move the key of the loaded weights.
+    save_file({"linear.lora_A.weight": torch.zeros(3, 2)}, adapter)
+    assert cache_root() == before
+    # Reloading snapshots the replacement, which then gets its own key.
+    stat = adapter.stat()
+    pipeline.loaded_adapter_fingerprints["adapter"] = (stat.st_size, stat.st_mtime_ns)
+    assert cache_root() != before
