@@ -22,7 +22,10 @@ import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import (
+    BaseReasoningFormatDetector,
+    ReasoningParser,
+)
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -41,7 +44,7 @@ _BUDGET_VARIANT_CACHE_SIZE = 32
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    """Defers constraints until a reasoning end or native tool-start sequence."""
+    """Defers grammar constraints until the reasoning end sequence is complete."""
 
     def __init__(
         self,
@@ -56,20 +59,19 @@ class ReasonerGrammarObject(BaseGrammarObject):
         apply_vocab_mask_fn=None,
         think_starts: Sequence[str] = (),
         decode: Optional[Callable[[List[int]], str]] = None,
-        tool_start_ids: Optional[List[int]] = None,
+        think_start_id: Optional[int] = None,
+        allow_tokens_fn=None,
     ):
         super().__init__()
         self.grammar = grammar
+        self.think_start_id = think_start_id
+        self.allow_tokens_fn = allow_tokens_fn
         self.think_end_ids = tuple(think_end_ids)
         # Decoded openers match every tokenization the grammar admits; without any,
         # the reasoning starts at the first token.
         self.think_starts = tuple(think_starts)
         self.decode = decode
         self._think_end_matcher = TokenSequenceMatcher(self.think_end_ids)
-        self.tool_start_ids = tuple(tool_start_ids or ())
-        self._tool_start_matcher = (
-            TokenSequenceMatcher(self.tool_start_ids) if self.tool_start_ids else None
-        )
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
         self.enable_token_filter = enable_token_filter
@@ -88,20 +90,22 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self._opening: List[int] = []
         self._opening_text = ""
         self._generated = 0
-        self._matched_tool_start_tokens = 0
-        self._tool_start_match_history: List[int] = []
-        # Unlike </think>, a tool-start marker belongs to the inner grammar.
-        # Track the replay separately from tokens emitted after the boundary.
-        self._tool_start_prefix_len = 0
-        self._tool_start_rejected: Optional[bool] = None
+        # The model may skip its reasoning block: the first token either opens it
+        # or starts the constrained answer, and rolling back to zero reopens the choice.
+        self._awaits_opener = False
+        self._opener_optional = False
+        self._num_accepted = 0
 
     def maybe_init_reasoning(self, reasoning: bool):
         self._matched_think_end_tokens = 0
         self._thinking_match_history.clear()
-        self._matched_tool_start_tokens = 0
-        self._tool_start_match_history.clear()
-        self._tool_start_prefix_len = 0
-        if reasoning:
+        self._num_accepted = 0
+        self._opener_optional = reasoning and self.think_start_id is not None
+        self._awaits_opener = self._opener_optional
+        if self._awaits_opener:
+            self.tokens_in_think = -1
+            self.tokens_after_end = -1
+        elif reasoning:
             self.tokens_in_think = 0
             self.tokens_after_end = -1
         else:
@@ -137,7 +141,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return (
             self.current_token is not None
             or bool(self._thinking_match_history)
-            or (self.tokens_in_think, self.tokens_after_end) not in ((0, -1), (-1, 0))
+            or not (
+                self._awaits_opener
+                or (self.tokens_in_think, self.tokens_after_end) in ((0, -1), (-1, 0))
+            )
         )
 
     def _grammar_active(self) -> bool:
@@ -168,36 +175,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def transfer_state(self, token: int) -> None:
         if self._is_thinking():
             previous_match = self._matched_think_end_tokens
-            matched = self._think_end_matcher.advance(previous_match, token)
-            tool_match = (
-                self._tool_start_matcher.advance(self._matched_tool_start_tokens, token)
-                if self._tool_start_matcher is not None
-                else 0
-            )
-            implicit_end = (
-                self._tool_start_matcher is not None
-                and tool_match == len(self._tool_start_matcher)
-                and matched != len(self._think_end_matcher)
-            )
-            if implicit_end and not self._accept_tool_start():
-                # A constraint that cannot start with the marker (e.g. a JSON
-                # schema) keeps it as reasoning text.
-                implicit_end = False
-                tool_match = self._tool_start_matcher.prefix_lengths[-1]
             self._thinking_match_history.append(previous_match)
-            if self._tool_start_matcher is not None:
-                self._tool_start_match_history.append(self._matched_tool_start_tokens)
-            self._matched_tool_start_tokens = tool_match
+            matched = self._think_end_matcher.advance(previous_match, token)
             if matched == len(self._think_end_matcher):
                 self._matched_think_end_tokens = 0
-                self._matched_tool_start_tokens = 0
-                self.tokens_after_end = 0
-            elif implicit_end:
-                self._matched_think_end_tokens = 0
-                self._matched_tool_start_tokens = 0
-                self._tool_start_prefix_len = (
-                    0 if self.reasoning_in_grammar else len(self.tool_start_ids)
-                )
                 self.tokens_after_end = 0
             else:
                 self.tokens_in_think += previous_match + 1 - matched
@@ -205,30 +186,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         elif self._is_generation():
             self.tokens_after_end += 1
 
-    def _accept_tool_start(self) -> bool:
-        return (
-            self.reasoning_in_grammar
-            or self.grammar is None
-            or self.grammar.try_accept_tokens(list(self.tool_start_ids))
-        )
-
-    def _can_complete_rejected_tool_start(self) -> bool:
-        if (
-            self._tool_start_matcher is None
-            or self.reasoning_in_grammar
-            or self.grammar is None
-            or self._matched_tool_start_tokens != len(self.tool_start_ids) - 1
-        ):
-            return False
-        if self._tool_start_rejected is None:
-            # While thinking the inner grammar has consumed nothing, so a copy
-            # probes its start state without touching it.
-            self._tool_start_rejected = not self.grammar.copy().try_accept_tokens(
-                list(self.tool_start_ids)
-            )
-        return self._tool_start_rejected
-
     def rollback_state(self):
+        if self._num_accepted > 0:
+            self._num_accepted -= 1
         if self._is_thinking():
             if self._thinking_match_history:
                 previous_match = self._thinking_match_history.pop()
@@ -236,22 +196,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     previous_match + 1 - self._matched_think_end_tokens
                 )
                 self._matched_think_end_tokens = previous_match
-                if self._tool_start_matcher is not None:
-                    self._matched_tool_start_tokens = (
-                        self._tool_start_match_history.pop()
-                    )
         elif self._is_generation():
             if self.tokens_after_end == 0:
                 if self._thinking_match_history:
                     self.tokens_after_end = -1
                     self._matched_think_end_tokens = self._thinking_match_history.pop()
-                    if self._tool_start_matcher is not None:
-                        self._matched_tool_start_tokens = (
-                            self._tool_start_match_history.pop()
-                        )
-                    self._tool_start_prefix_len = 0
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
+        if self._opener_optional and self._num_accepted == 0:
+            self.maybe_init_reasoning(True)
 
     def accept_token(self, token: int):
         # Track the last accepted token on the wrapper itself (mirroring
@@ -262,6 +215,13 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # grammar's is updated, not the wrapper's), so the guard never fires and
         # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
         self.current_token = token
+        if self._awaits_opener:
+            self._awaits_opener = False
+            if token == self.think_start_id:
+                self.tokens_in_think = 0
+            else:
+                self.tokens_after_end = 0
+        self._num_accepted += 1
         if self._grammar_active():
             self.grammar.accept_token(token)
         if self.reasoning_in_grammar:
@@ -286,10 +246,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 steps_after = k
             else:
                 steps_after = min(k, max(0, self.tokens_after_end))
-                if self._is_generation() and k > self.tokens_after_end:
-                    # Undo the whole marker replay even when only its last token is
-                    # rolled back; re-accepting that token replays it exactly once.
-                    steps_after += self._tool_start_prefix_len
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
         if self.reasoning_in_grammar:
@@ -336,6 +292,17 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self._do_token_filter(vocab_mask, [token], idx, is_allowed=True)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        if self._awaits_opener:
+            if self.grammar is not None:
+                self.grammar.fill_vocab_mask(vocab_mask, idx)
+                self.allow_tokens_fn(
+                    vocab_mask,
+                    [self.think_start_id],
+                    idx,
+                    is_allowed=True,
+                    reset_vocab_mask=False,
+                )
+            return
         if self.reasoning_in_grammar and self.grammar is not None:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
             if (
@@ -346,31 +313,22 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self._filter_reasoning_in_grammar(vocab_mask, idx)
             return
         if self._is_thinking():
-            if self.enable_token_filter:
-                if self._can_think_more():
-                    if self.think_excluded_token_ids is not None:
-                        self._do_token_filter(
-                            vocab_mask,
-                            self.think_excluded_token_ids,
-                            idx,
-                            is_allowed=False,
-                        )
-                else:
+            if not self.enable_token_filter:
+                return
+            if self._can_think_more():
+                if self.think_excluded_token_ids is not None:
                     self._do_token_filter(
                         vocab_mask,
-                        [self.think_end_ids[self._matched_think_end_tokens]],
+                        self.think_excluded_token_ids,
                         idx,
-                        is_allowed=True,
+                        is_allowed=False,
                     )
-            if self._can_complete_rejected_tool_start():
-                # The reasoning parser ends reasoning at the marker, but a constraint
-                # that cannot start with it would keep it as reasoning here.
-                self.token_filter_fn(
+            else:
+                self._do_token_filter(
                     vocab_mask,
-                    [self.tool_start_ids[-1]],
+                    [self.think_end_ids[self._matched_think_end_tokens]],
                     idx,
-                    is_allowed=False,
-                    reset_vocab_mask=False,
+                    is_allowed=True,
                 )
             return
         if self._is_generation() and self.grammar is not None:
@@ -409,16 +367,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
             apply_vocab_mask_fn=self.apply_vocab_mask_fn,
             think_starts=self.think_starts,
             decode=self.decode,
-            tool_start_ids=self.tool_start_ids,
+            think_start_id=self.think_start_id,
+            allow_tokens_fn=self.allow_tokens_fn,
         )
+        new_obj._awaits_opener = self._awaits_opener
+        new_obj._opener_optional = self._opener_optional
+        new_obj._num_accepted = self._num_accepted
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
         new_obj._matched_think_end_tokens = self._matched_think_end_tokens
         new_obj._thinking_match_history = list(self._thinking_match_history)
-        new_obj._matched_tool_start_tokens = self._matched_tool_start_tokens
-        new_obj._tool_start_match_history = list(self._tool_start_match_history)
-        new_obj._tool_start_prefix_len = self._tool_start_prefix_len
-        new_obj._tool_start_rejected = self._tool_start_rejected
         new_obj._finished = self._finished
         new_obj.current_token = self.current_token
         new_obj.reasoning_in_grammar = self.reasoning_in_grammar
@@ -426,11 +384,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._opening_text = self._opening_text
         new_obj._generated = self._generated
         return new_obj
-
-    def memory_size_bytes(self) -> Optional[int]:
-        if self.grammar is None:
-            return 0  # the wrapper alone holds no compiled artifact
-        return self.grammar.memory_size_bytes()
 
     @property
     def finished(self):
@@ -445,6 +398,22 @@ class ReasonerGrammarObject(BaseGrammarObject):
         else:
             self._finished = finished
 
+    def try_jump_forward(self, tokenizer):
+        if self._is_generation() and self.grammar is not None:
+            return self.grammar.try_jump_forward(tokenizer)
+        return None
+
+    def jump_forward_str_state(self, helper):
+        if self._is_generation() and self.grammar is not None:
+            return self.grammar.jump_forward_str_state(helper)
+        return None
+
+    def jump_and_retokenize(self, old_output_ids, new_output_ids, next_state):
+        if self._is_generation() and self.grammar is not None:
+            return self.grammar.jump_and_retokenize(
+                old_output_ids, new_output_ids, next_state
+            )
+
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
     def __init__(
@@ -453,13 +422,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
-        cache_limit_bytes: Optional[int] = None,
     ):
-        # This wrapper owns the cache the scheduler fills, so it takes the
-        # wrapped backend's budget unless given one explicitly.
-        if cache_limit_bytes is None:
-            cache_limit_bytes = getattr(grammar_backend, "cache_limit_bytes", None)
-        super().__init__(cache_limit_bytes=cache_limit_bytes)
+        super().__init__()
         self.grammar_backend = grammar_backend
         self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
         think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
@@ -470,27 +434,20 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_ids = think_end_ids
         detector = reasoning_parser.detector
+        # Answering without a reasoning block needs the opening token added to
+        # the grammar's mask, which only token-filter backends can do.
+        self.think_start_id = (
+            detector.get_optional_think_start_token_id(tokenizer)
+            if self.grammar_backend.is_support_token_filter
+            and isinstance(detector, BaseReasoningFormatDetector)
+            else None
+        )
         self.think_starts = ()
         if isinstance(detector, ResponseTemplateReasoningDetector):
             self.think_starts = tuple(detector.message_start_think_openers)
         self._decode = lambda token_ids: tokenizer.decode(
             token_ids, skip_special_tokens=False, spaces_between_special_tokens=False
         )
-        tool_start_token = getattr(detector, "tool_start_token", None)
-        self.tool_start_ids = None
-        # A token mask cannot see line starts, so a line-anchored marker would end
-        # thinking where the reasoning parser does not.
-        if tool_start_token and not getattr(
-            detector, "tool_start_at_line_start", False
-        ):
-            self.tool_start_ids = tokenizer.encode(
-                tool_start_token, add_special_tokens=False
-            )
-            if not self.tool_start_ids:
-                raise ValueError(
-                    f"tool_start_token '{tool_start_token}' could not be encoded "
-                    "by the tokenizer."
-                )
         self._enable_strict_thinking = enable_strict_thinking
         self._answer_frame = reasoning_parser.detector.get_answer_frame()
         if self._answer_frame is not None:
@@ -513,7 +470,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "support token filtering. Use a grammar backend that supports token "
                 "filtering (e.g., xgrammar) or disable strict reasoning mode."
             )
-        self._token_filter_fn = self.grammar_backend.set_token_filter
+        self._token_filter_fn = (
+            self.grammar_backend.set_token_filter if self.enable_token_filter else None
+        )
 
     def _get_think_excluded_token_ids(
         self,
@@ -539,15 +498,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     def _make_grammar_object(
         self, grammar: Optional[BaseGrammarObject], reasoning: bool
     ) -> ReasonerGrammarObject:
-        mask_fns = {}
-        if grammar is None:
-            # Without an inner grammar the object masks through the backend;
-            # only backends with token filtering define these.
-            mask_fns = dict(
-                allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
-                move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
-                apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
-            )
         obj = ReasonerGrammarObject(
             grammar=grammar,
             think_end_ids=self.think_end_ids,
@@ -555,10 +505,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             max_think_tokens=self.max_think_tokens,
             enable_token_filter=self.enable_token_filter,
             token_filter_fn=self._token_filter_fn,
+            allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
+            move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
+            apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
             think_starts=self.think_starts,
             decode=self._decode,
-            tool_start_ids=self.tool_start_ids,
-            **mask_fns,
+            think_start_id=self.think_start_id,
+            allow_tokens_fn=self.grammar_backend.set_token_filter,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj
@@ -612,14 +565,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self._budget_variant_keys.move_to_end(key)
         while len(self._budget_variant_keys) > _BUDGET_VARIANT_CACHE_SIZE:
             evicted, _ = self._budget_variant_keys.popitem(last=False)
-            self.discard_cache(evicted)
+            self.cache.pop(evicted, None)
 
     def reset(self):
         super().reset()
         self._budget_variant_keys.clear()
-        # /flush_cache must reach the wrapped backend too: with a reasoning
-        # parser configured, the xgrammar compiler cache lives there.
-        self.grammar_backend.reset()
 
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool

@@ -23,8 +23,6 @@ HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
 HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE = {"bfloat16": {"intel_xpu"}}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
-HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO", "DFLASH")
-
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     if get_platform().is_hip:
@@ -103,12 +101,30 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
     # A mixed batch cannot merge the HiSparse decode batch.
     if cfg.enable_mixed_chunk:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
-    # A HiSparse decode receives KV into its host pool, which the checksum does not read.
-    if cfg.disaggregation_mode == "decode" and cfg.disaggregation_enable_kv_checksum:
+    if cfg.enable_prefill_cp:
         raise ValueError(
-            "--enable-hisparse does not support --disaggregation-enable-kv-checksum "
-            "on a decode server yet."
+            "--enable-hisparse does not support --enable-prefill-cp: the CP KV "
+            "gather and layer-split pool do not translate HiSparse device locations."
         )
+    algorithm = (cfg.speculative_algorithm or "").upper()
+    if algorithm == "DFLASH":
+        raise ValueError(
+            "--enable-hisparse does not support --speculative-algorithm DFLASH: "
+            "its verify step does not run the HiSparse speculative swap hooks."
+        )
+    if algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-hisparse with DSPARK requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static: the HiSparse verify swap assumes "
+                f"a uniform verify window per request (got {ragged_mode.value!r})."
+            )
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
@@ -138,28 +154,20 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
     validate_hisparse_feature_combos(server_args)
 
-    algorithm = cfg.speculative_algorithm
-    if algorithm is not None and algorithm.upper() != "NONE":
-        if algorithm.upper() not in HISPARSE_VALIDATED_SPEC_ALGORITHMS:
-            raise ValueError(
-                f"--enable-hisparse has not validated speculative algorithm "
-                f"{algorithm!r}. Algorithms whose workers never bind HiSparse "
-                "verify slots would write target-verify KV through unmapped "
-                "device locations (silent corruption); only validated "
-                "combinations are accepted: "
-                f"{', '.join(HISPARSE_VALIDATED_SPEC_ALGORITHMS)} (linear "
-                "speculation only, --speculative-eagle-topk 1)."
-            )
-        if (cfg.speculative_eagle_topk or 1) != 1:
-            raise ValueError(
-                "The minimal HiSparse spec integration supports linear "
-                "speculation only; use --speculative-eagle-topk 1."
-            )
-        if cfg.speculative_adaptive:
-            raise ValueError(
-                "HiSparse speculative decoding uses statically sized swap "
-                "state; --speculative-adaptive is not supported."
-            )
+    enable_spec = (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_algorithm.upper() != "NONE"
+    )
+    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
+        raise ValueError(
+            "The minimal HiSparse spec integration supports linear speculation "
+            "only; use --speculative-eagle-topk 1."
+        )
+    if enable_spec and cfg.speculative_adaptive:
+        raise ValueError(
+            "HiSparse speculative decoding uses statically sized swap state; "
+            "--speculative-adaptive is not supported."
+        )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

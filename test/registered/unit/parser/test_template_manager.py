@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
+from transformers.utils.chat_template_utils import _compile_jinja_template
 
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
@@ -32,26 +33,22 @@ class _DummyTokenizer:
 
 
 def _patch_hf_transformers(get_tokenizer, get_config=None):
-    module = ModuleType("sglang.srt.hf_transformers")
+    module = ModuleType("sglang.srt.utils.hf_transformers")
+
+
+class MistralCommonBackend(_DummyTokenizer):
+    pass
+
+
+_MISTRAL_COMMON_PLACEHOLDER = "<!-- audio/image multimodal -->"
+
+
+def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
+    module = ModuleType("sglang.srt.utils.hf_transformers_utils")
     module.get_tokenizer = get_tokenizer
     if get_config is not None:
         module.get_config = get_config
     return patch.dict(sys.modules, {module.__name__: module})
-
-
-_GRANITE_THINKING_TOGGLES = (
-    "{% set enable_thinking = enable_thinking if enable_thinking is defined else True %}\n"
-    "{% set truncate_history_thinking = truncate_history_thinking"
-    " if truncate_history_thinking is defined else True %}\n"
-)
-_GRANITE_DEFERRED_TOOL_LOADING = "{%- if tool.defer_loading is not defined or not tool.defer_loading %}{%- endif %}\n"
-_XML_TOOL_CALL_BLOCK = (
-    "<tool_call>\n<function=example_function_name>\n"
-    "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>"
-)
-_GRANITE_42_TEMPLATE = (
-    _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING + _XML_TOOL_CALL_BLOCK
-)
 
 
 def _glm53_template(concat):
@@ -81,20 +78,6 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
             template, _DummyTokenizer(vocab), config, force
         )
         return force, config, parser
-
-    def test_lfm3_template_ignores_legacy_lfm2_vocab(self):
-        template = (
-            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
-            "<think><tool_call><function=get_weather><parameter=city>Warsaw"
-            "</parameter></function></tool_call>"
-        )
-        vocab = ["<|tool_call_start|>", "<|tool_call_end|>", "<tool_call>"]
-        force, config, parser = self._detect(template, vocab)
-        self.assertEqual(parser, "qwen3")
-        self.assertEqual(
-            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
-            "qwen3_coder",
-        )
 
     def test_iquest_template_wins_over_generic_think_and_xml_rules(self):
         template = "<|iquest_assistant|><think><iquest_tool_call><arg_key><arg_value>"
@@ -303,6 +286,62 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
                         toggle_param="enable_thinking", default_enabled=expected
                     ),
                 )
+
+    def test_mistral_effort_default_renders_like_omission(self):
+        """Bug regression: serving passes the detected default in place of an
+        omitted effort, so it is reported only where that renders identically."""
+        think = "{% if reasoning_effort %}[THINK]{% endif %}"
+        cases = {
+            "release guard": (
+                "{%- if reasoning_effort is not defined or reasoning_effort is none %}"
+                "{%- set reasoning_effort = 'high' %}{%- endif %}"
+                "{{ reasoning_effort }}" + think,
+                "high",
+            ),
+            "swapped guard": (
+                "{% if reasoning_effort is none or reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'none' %}{% endif %}{{ reasoning_effort }}"
+                + think,
+                "none",
+            ),
+            "conditional": (
+                "{% if enable_thinking %}{% set reasoning_effort = 'high' %}"
+                "{% endif %}" + think,
+                None,
+            ),
+            "unused macro": (
+                "{% macro unused() %}{% set reasoning_effort = 'high' %}"
+                "{% endmacro %}" + think,
+                None,
+            ),
+            "later rebinding": (
+                "{% if reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'high' %}{% endif %}"
+                "{% set reasoning_effort = fallback %}" + think,
+                None,
+            ),
+            "filter only": (
+                "{{ reasoning_effort | default('high') }}" + think,
+                None,
+            ),
+            "read before guard": (
+                "{{ reasoning_effort is defined }}"
+                "{% if reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'high' %}{% endif %}" + think,
+                None,
+            ),
+        }
+        for name, (template, default) in cases.items():
+            with self.subTest(name):
+                _, config = detect_reasoning_pattern(template)
+                self.assertEqual(config.special_case, "mistral")
+                self.assertEqual(config.default_effort, default)
+                if default is not None:
+                    render = _compile_jinja_template(template).render
+                    kwargs = {"enable_thinking": False, "fallback": None}
+                    self.assertEqual(
+                        render(**kwargs, reasoning_effort=default), render(**kwargs)
+                    )
 
     def test_pathological_template_does_not_raise(self):
         # A template jinja cannot parse (RecursionError from deep nesting) must
@@ -909,13 +948,13 @@ class TestToolCallParserDetection(unittest.TestCase):
                     "{% endfor %}"
                 ),
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm",
+                "glm45",
             ),
             (
                 "xml_kv_tool_call_via_vocab",
                 "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm",
+                "glm45",
             ),
         ]
         for name, template, vocab, expected in cases:
@@ -926,43 +965,9 @@ class TestToolCallParserDetection(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
-    def test_granite_tool_parser_needs_xml_block_and_granite_signature(self):
-        cases = [
-            ("granite_4_2", _GRANITE_42_TEMPLATE, "granite_toolcall_parser"),
-            (
-                "nemotron_3_shared_xml_block",
-                _GRANITE_THINKING_TOGGLES + _XML_TOOL_CALL_BLOCK,
-                "qwen3_coder",
-            ),
-            (
-                "granite_signature_without_xml_block",
-                _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING,
-                "qwen",
-            ),
-            (
-                "granite_4_0_json_tool_call",
-                "For each tool call, return a json object with function name and "
-                "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
-                '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>',
-                None,
-            ),
-            (
-                "granite_3_3_tool_call_token",
-                "respond only with <|tool_call|> followed by a JSON list of tools used.",
-                None,
-            ),
-        ]
-        for name, template, expected in cases:
-            with self.subTest(name=name):
-                force, config = detect_reasoning_pattern(template)
-                result = detect_tool_call_parser(
-                    template, _DummyTokenizer([]), config, force
-                )
-                self.assertEqual(result, expected)
-
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
-        # xml_kv_tool_call fallback. Both currently map to "glm", so the
+        # xml_kv_tool_call fallback. Both currently map to "glm45", so the
         # value-based test above can't catch a swap — assert positions directly.
         rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
         self.assertLess(rule_index["glm47"], rule_index["glm45"])
@@ -992,9 +997,6 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["step3p5"], tool_index["qwen3_coder"])
-        self.assertLess(
-            tool_index["granite_toolcall_parser"], tool_index["qwen3_coder"]
-        )
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
 
@@ -1141,16 +1143,6 @@ class TestResolveAutoParsers(CustomTestCase):
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
 
-    def test_tool_only_auto_selects_granite_tool_parser(self):
-        args = self._make_server_args(tool_call_parser="auto")
-        tokenizer = _DummyTokenizer([], chat_template=_GRANITE_42_TEMPLATE)
-
-        with _patch_hf_transformers(Mock(return_value=tokenizer)):
-            resolve_auto_parsers(args)
-
-        self.assertEqual(_declared(args, "tool_call_parser"), "granite_toolcall_parser")
-        self.assertIsNone(_declared(args, "reasoning_parser"))
-
     def test_response_template_fills_undetected_parsers(self):
         args = self._make_server_args(
             reasoning_parser="auto",
@@ -1288,6 +1280,90 @@ class TestResolveAutoParsers(CustomTestCase):
 
         self.assertIsNone(_declared(args, "reasoning_parser"))
         self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_mistral_common_tokenizer_resolves_parsers_from_control_tokens(self):
+        cases = (
+            (["[THINK]", "[/THINK]", "[TOOL_CALLS]"], "mistral", "mistral"),
+            (["[TOOL_CALLS]"], None, "mistral"),
+            (["[THINK]", "[/THINK]"], "mistral", None),
+        )
+        for vocab, reasoning, tool_call in cases:
+            with self.subTest(vocab=vocab):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = MistralCommonBackend(
+                    vocab, chat_template=_MISTRAL_COMMON_PLACEHOLDER
+                )
+                with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                    resolve_auto_parsers(args)
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
+
+    def test_control_tokens_do_not_resolve_parsers_for_other_tokenizers(self):
+        cases = (
+            (_MISTRAL_COMMON_PLACEHOLDER, None, None),
+            ("{% if reasoning_effort %}[THINK]{% endif %}", "mistral", "mistral"),
+        )
+        for template, reasoning, tool_call in cases:
+            with self.subTest(template=template):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer(
+                    ["[THINK]", "[/THINK]", "[TOOL_CALLS]"], chat_template=template
+                )
+                with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                    resolve_auto_parsers(args)
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
+
+    def test_explicit_non_jinja_template_disables_mistral_common_parsers(self):
+        # The explicit template, not the tokenizer vocabulary, sets the output format.
+        tokenizer = MistralCommonBackend(
+            ["[THINK]", "[/THINK]", "[TOOL_CALLS]"],
+            chat_template=_MISTRAL_COMMON_PLACEHOLDER,
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            f.write('{"name": "custom"}')
+            f.flush()
+            for chat_template in ("llama-3", f.name):
+                with self.subTest(chat_template=chat_template):
+                    args = self._make_server_args(
+                        reasoning_parser="auto",
+                        tool_call_parser="auto",
+                        chat_template=chat_template,
+                    )
+                    with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                        resolve_auto_parsers(args)
+                    self.assertIsNone(_declared(args, "reasoning_parser"))
+                    self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_detection_loads_the_serving_tokenizer(self):
+        # A dual-format checkpoint loads HF or mistral-common by tokenizer mode/path.
+        def get_tokenizer(name, tokenizer_mode="auto", **kwargs):
+            vocab = ["[THINK]", "[/THINK]", "[TOOL_CALLS]"]
+            if tokenizer_mode == "mistral" or name == "org/tekken-only":
+                return MistralCommonBackend(
+                    vocab, chat_template=_MISTRAL_COMMON_PLACEHOLDER
+                )
+            return _DummyTokenizer(vocab)
+
+        for serving in (
+            {"tokenizer_path": "org/dual-format", "tokenizer_mode": "mistral"},
+            {"tokenizer_path": "org/tekken-only", "tokenizer_mode": "auto"},
+        ):
+            with self.subTest(**serving):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                for field, value in serving.items():
+                    msgspec.Struct.__setattr__(args, field, value)
+                msgspec.Struct.__setattr__(args, "model_path", "org/dual-format")
+                with _patch_hf_transformers_utils(get_tokenizer):
+                    resolve_auto_parsers(args)
+                self.assertEqual(_declared(args, "reasoning_parser"), "mistral")
+                self.assertEqual(_declared(args, "tool_call_parser"), "mistral")
 
     def test_deepseek_v32_arch_without_chat_template_uses_custom_encoder(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")

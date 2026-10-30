@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.peer_fingerprint import collect_peer_fingerprint
 from sglang.srt.disaggregation.utils import (
     CustomizedInfoError,
     KVClassType,
@@ -471,6 +472,9 @@ class PrefillBootstrapQueue:
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
             empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
+        )
+        kv_args.peer_fingerprint = collect_peer_fingerprint(
+            self.scheduler, kv_args, self.token_to_kv_pool
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
