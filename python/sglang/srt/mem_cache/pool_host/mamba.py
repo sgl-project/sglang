@@ -19,11 +19,12 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 transfer_state_per_layer_direct_pf_lf = None
 transfer_state_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
@@ -104,6 +105,15 @@ class MambaPoolHost(HostKVCache):
             "page_first_direct",
         ], f"Unsupported layout: {layout}"
 
+        if _is_xpu:
+            raise ValueError(
+                "HiCache does not support hybrid Mamba models on XPU: the Mamba KV "
+                "transfer kernels are JIT-built from CUDA source. "
+                "Launch without HiCache host offload "
+                "(--enable-hierarchical-cache, "
+                "--disaggregation-decode-retraction-backup=host_pool)."
+            )
+
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -182,8 +192,9 @@ class MambaPoolHost(HostKVCache):
                 f"size of the hierarchical cache."
             )
         logger.info(
-            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
+            "Allocating %.2f GB host memory for hierarchical Mamba cache (%d state slots, layout=%s).",
             requested_bytes / 1e9,
+            self.size,
             self.layout,
         )
 

@@ -20,6 +20,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing.connection import Connection, wait
 
@@ -27,6 +28,12 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
+    physical_ep_size_to_dp_size,
+    validate_matching_attention_topology,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -47,6 +54,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.mem_cache.hicache_storage import merge_l3_layouts
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -85,6 +93,13 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+
+
+@dataclass(frozen=True)
+class WorkerPortHandshake:
+    worker_ports: list[int]
+    attn_tp_size: int
+    attn_cp_size: int
 
 
 class LoadBalanceMethod(Enum):
@@ -183,12 +198,22 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        self.launch_dp_size: int = get_parallel().num_dp_ranks
-        self.max_dp_size: int = (
-            get_parallel().max_ep_size or get_parallel().num_dp_ranks
-        )
+        parallel = get_parallel()
+        self.launch_dp_size: int = parallel.num_dp_ranks
+        self.attn_replica_size = attn_replica_size()
+        if (
+            get_exec().moe.elastic_ep_backend is not None
+            and parallel.max_ep_size is not None
+            and parallel.max_ep_size > parallel.tp_size
+        ):
+            self.max_dp_size = physical_ep_size_to_dp_size(
+                parallel.max_ep_size,
+                self.attn_replica_size,
+            )
+        else:
+            self.max_dp_size = parallel.num_dp_ranks
         assert self.max_dp_size >= self.launch_dp_size, (
-            f"--max-ep-size ({self.max_dp_size}) must be >= "
+            f"maximum DP size ({self.max_dp_size}) must be >= "
             f"--dp ({self.launch_dp_size})."
         )
 
@@ -205,6 +230,8 @@ class DataParallelController:
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
+        self._scheduler_init_info_lock = threading.Lock()
+        self._scheduler_init_infos: list[dict] = []
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -489,7 +516,16 @@ class DataParallelController:
             )
         else:
             # Other nodes: Receive worker ports from node 0
-            return self._receive_ports_as_client(endpoint)
+            return self._receive_ports_as_client(endpoint).worker_ports
+
+    @staticmethod
+    def _make_worker_port_handshake(worker_ports: list[int]) -> WorkerPortHandshake:
+        parallel = get_parallel()
+        return WorkerPortHandshake(
+            worker_ports=worker_ports,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_cp_size=parallel.attn_cp_size,
+        )
 
     def _broadcast_ports_as_server(
         self, endpoint: str, expected_clients: int, worker_ports: list[int]
@@ -497,6 +533,7 @@ class DataParallelController:
         """Broadcast worker ports to all client nodes."""
         logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
         logger.debug(f"Worker ports: {worker_ports}")
+        handshake = self._make_worker_port_handshake(worker_ports)
 
         rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
 
@@ -508,7 +545,7 @@ class DataParallelController:
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                sock_send(rep_socket, wrap_as_pickle(worker_ports))
+                sock_send(rep_socket, wrap_as_pickle(handshake))
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
@@ -522,14 +559,14 @@ class DataParallelController:
             else:
                 threading.Thread(
                     target=self._reply_ports_as_server,
-                    args=(rep_socket, worker_ports),
+                    args=(rep_socket, handshake),
                     daemon=True,
                 ).start()
 
-    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: list[int]):
-        """Background thread: serve the pre-bound worker-port list to
-        late-arriving elastic joiners. Publishes port numbers only; the primary
-        keeps ownership of every socket."""
+    def _reply_ports_as_server(
+        self, rep_socket: zmq.Socket, handshake: WorkerPortHandshake
+    ):
+        """Serve pre-bound worker ports and topology to elastic joiners."""
         while True:
             try:
                 client_rank = sock_recv(rep_socket)
@@ -541,10 +578,10 @@ class DataParallelController:
             logger.debug(f"Received handshake from node {client_rank}")
 
             # Send worker ports to client
-            sock_send(rep_socket, wrap_as_pickle(worker_ports))
+            sock_send(rep_socket, wrap_as_pickle(handshake))
             logger.debug(f"Sent worker ports to node {client_rank}")
 
-    def _receive_ports_as_client(self, endpoint: str) -> list[int]:
+    def _receive_ports_as_client(self, endpoint: str) -> WorkerPortHandshake:
         """Receive worker ports from the server node."""
         logger.debug("Connecting to node 0 to receive worker ports")
         node_rank = get_parallel().node_rank
@@ -558,9 +595,13 @@ class DataParallelController:
             sock_send(req_socket, wrap_as_pickle(str(node_rank)))
 
             # Receive worker ports
-            worker_ports = sock_recv(req_socket)
-            logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
-            return worker_ports
+            handshake = sock_recv(req_socket)
+            if not isinstance(handshake, WorkerPortHandshake):
+                raise RuntimeError("Invalid worker-port handshake from node 0")
+            logger.debug(
+                f"Received {len(handshake.worker_ports)} worker ports from node 0"
+            )
+            return handshake
         except zmq.Again:
             logger.error("Timeout waiting for worker ports from node 0")
             raise RuntimeError(
@@ -568,12 +609,6 @@ class DataParallelController:
             )
         finally:
             req_socket.close()
-
-    def _joiner_local_tp_span(self, server_args: ServerArgs) -> int:
-        return get_parallel().tp_size
-
-    def _joiner_slot_offset(self, server_args: ServerArgs) -> int:
-        return get_parallel().ep_join_rank_offset
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
@@ -590,10 +625,29 @@ class DataParallelController:
             primary_endpoint = NetworkAddress(
                 primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
             ).to_tcp()
-            all_ports = self._receive_ports_as_client(primary_endpoint)
-            offset = self._joiner_slot_offset(server_args)
-            local_tp_span = self._joiner_local_tp_span(server_args)
-            broadcasted_ports = all_ports[offset : offset + local_tp_span]
+            handshake = self._receive_ports_as_client(primary_endpoint)
+            parallel = get_parallel()
+            validate_matching_attention_topology(
+                primary_attn_tp_size=handshake.attn_tp_size,
+                primary_attn_cp_size=handshake.attn_cp_size,
+                joining_attn_tp_size=parallel.attn_tp_size,
+                joining_attn_cp_size=parallel.attn_cp_size,
+            )
+            primary_replica_size = handshake.attn_tp_size * handshake.attn_cp_size
+            offset = physical_ep_rank_to_dp_rank(
+                parallel.ep_join_rank_offset,
+                primary_replica_size,
+            )
+            broadcasted_ports = handshake.worker_ports[
+                offset : offset + parallel.num_dp_ranks
+            ]
+            if len(broadcasted_ports) != parallel.num_dp_ranks:
+                raise ValueError(
+                    "Primary has insufficient reserved attention-DP worker ports "
+                    f"for join offset {parallel.ep_join_rank_offset} "
+                    f"(requested {parallel.num_dp_ranks}, got "
+                    f"{len(broadcasted_ports)})."
+                )
         elif get_parallel().node_rank == 0:
             # Elastic primaries reserve sockets for the maximum DP size.
             bind_count = (
@@ -603,7 +657,7 @@ class DataParallelController:
             )
             for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
-                    self.context, zmq.PUSH, host=bind_host
+                    self.context, zmq.PUSH, host=bind_host, restrict_peers=True
                 )
                 worker_ports.append(worker_port)
                 self.workers[slot] = worker_socket
@@ -709,9 +763,10 @@ class DataParallelController:
 
                 # Scheduler internals use local ranks; logs use global ranks.
                 offset = get_parallel().ep_join_rank_offset
+                dp_offset = physical_ep_rank_to_dp_rank(offset, self.attn_replica_size)
                 display_tp_rank = tp_rank + offset
                 display_moe_ep_rank = moe_ep_rank + offset
-                display_dp_rank = dp_rank + offset if dp_rank is not None else None
+                display_dp_rank = dp_rank + dp_offset if dp_rank is not None else None
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     scheduler_args = (
@@ -758,11 +813,34 @@ class DataParallelController:
                 for source in info.get("kv_event_sources", [])
             )
 
-        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
-        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
-        self.startup_time = aggregate_scheduler_startup_times(
-            info.get("startup_time") for info in scheduler_info
-        )
+        self._record_scheduler_init_infos(scheduler_info)
+
+    def _record_scheduler_init_infos(self, infos: list[dict]) -> None:
+        with self._scheduler_init_info_lock:
+            self._scheduler_init_infos.extend(infos)
+            self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
+            self.max_req_input_len = infos[0]["max_req_input_len"]
+            self.startup_time = aggregate_scheduler_startup_times(
+                info.get("startup_time") for info in self._scheduler_init_infos
+            )
+
+    def get_init_info(self) -> dict:
+        """Build the parent handshake without dropping or choosing a replica layout."""
+        with self._scheduler_init_info_lock:
+            init_info = {
+                "max_total_num_tokens": self.max_total_num_tokens,
+                "max_req_input_len": self.max_req_input_len,
+                "startup_time": self.startup_time,
+            }
+            layout = merge_l3_layouts(
+                [
+                    info.get("hicache_object_layout")
+                    for info in self._scheduler_init_infos
+                ]
+            )
+        if layout is not None:
+            init_info["hicache_object_layout"] = layout
+        return init_info
 
     def dispatch_health_check(self, req: Req) -> None:
         # This policy routes by request metadata, not shared load-balancing state.
@@ -907,9 +985,7 @@ def run_data_parallel_controller_process(
         )
         init_info = {
             "status": "ready",
-            "max_total_num_tokens": controller.max_total_num_tokens,
-            "max_req_input_len": controller.max_req_input_len,
-            "startup_time": controller.startup_time,
+            **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
         if get_serving().grpc_port is not None and not (

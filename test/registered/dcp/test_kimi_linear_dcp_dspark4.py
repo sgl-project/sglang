@@ -1,4 +1,4 @@
-"""Four-Blackwell Kimi Linear TokenSpeed DCP + DSpark static acceptance test."""
+"""Four-Blackwell Kimi Linear CuteDSL MLA DCP + DSpark static acceptance test."""
 
 import json
 import socket
@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=201, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=221, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 GSM8K_SCORE_THRESHOLD = 0.88
@@ -96,7 +96,7 @@ def _wait_for_port_release(base_url: str, timeout: float = 30.0) -> None:
 
 @unittest.skipUnless(
     _has_four_blackwell_gpus(),
-    "Kimi Linear TokenSpeed DCP + DSpark requires four Blackwell GPUs",
+    "Kimi Linear CuteDSL MLA DCP + DSpark requires four Blackwell GPUs",
 )
 class TestKimiLinearDCPDSpark4(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
@@ -132,7 +132,7 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
             "--max-running-requests",
             str(MAX_RUNNING_REQUESTS),
             "--attention-backend",
-            "tokenspeed_mla",
+            "cutedsl_mla",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--dcp-comm-backend",
