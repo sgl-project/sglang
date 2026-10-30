@@ -2917,9 +2917,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
-        # A rebootstrap keeps its last output id as the pending decode input and
-        # ignores the token the prefill sampled; that id already carries its
-        # logprob, sampling mask, and reasoning count.
+        # A rebootstrap resumes from its last output id, already committed; the
+        # prefill's sampled token is dropped.
         resumes_output = decode_req.is_rebootstrap
         if resumes_output:
             assert len(decode_req.req.output_ids) > 0, decode_req.req.rid

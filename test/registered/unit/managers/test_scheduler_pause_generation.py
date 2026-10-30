@@ -699,9 +699,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(held, [running, staged])
 
     def test_retract_aborts_requests_the_recompute_cannot_rebuild(self):
-        """A rebootstrap sends token ids only, and an input_embeds re-prefill
-        restarts the generation: requests whose sent output that would change
-        are aborted, the rest requeued."""
         for decode in (False, True):
             with self.subTest(decode=decode):
                 scheduler = self._new_scheduler()
@@ -711,17 +708,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 if decode:
                     scheduler.disaggregation_mode = DisaggregationMode.DECODE
                     get_context().override("test", disaggregation_mode="decode")
-                plain, embeds, fresh = (
-                    self._make_req(rid) for rid in ("plain", "embeds", "fresh")
-                )
-                embeds.input_embeds = fresh.input_embeds = [[0.0]] * 3
-                plain.output_ids.append(7)
-                embeds.output_ids.append(7)
-                fresh.output_ids.append(7)
-                # Only embeds has streamed its output.
-                embeds.send_token_offset = 1
+                plain, sent, unsent = map(self._make_req, ("plain", "sent", "unsent"))
+                for req in (plain, sent, unsent):
+                    req.output_ids.append(7)
+                sent.input_embeds = unsent.input_embeds = [[0.0]] * 3
+                sent.send_token_offset = 1
                 scheduler.running_batch = self._make_batch(
-                    scheduler, reqs=[plain, embeds, fresh], with_tensors=True
+                    scheduler, reqs=[plain, sent, unsent], with_tensors=True
                 )
 
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -729,15 +722,13 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 aborted = [
                     c.args[1] for c in scheduler.send_abort_output.call_args_list
                 ]
-                held = [
-                    c.args[0]
-                    for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
-                ]
-                requeued = [entry["req"] for entry in requeue_log]
                 if decode:
-                    self.assertEqual((aborted, held), ([embeds, fresh], [plain]))
+                    queue = scheduler.disagg_decode_prealloc_queue
+                    held = [c.args[0] for c in queue.hold_rebootstrap.call_args_list]
+                    self.assertEqual((aborted, held), ([sent, unsent], [plain]))
                 else:
-                    self.assertEqual((aborted, requeued), ([embeds], [plain, fresh]))
+                    requeued = [entry["req"] for entry in requeue_log]
+                    self.assertEqual((aborted, requeued), ([sent], [plain, unsent]))
 
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and

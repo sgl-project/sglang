@@ -1611,8 +1611,7 @@ class Req(ReqDllmMixin):
 
     @property
     def resumable_by_rebootstrap(self) -> bool:
-        """A PD rebootstrap recomputes the KV from token ids alone, which do not
-        determine it for multimodal inputs or embeds."""
+        """A rebootstrap recomputes the KV from token ids alone."""
         return (
             self.multimodal_inputs is None
             and self.input_embeds is None
@@ -1621,9 +1620,8 @@ class Req(ReqDllmMixin):
 
     @property
     def resumable_by_reprefill(self) -> bool:
-        """A local re-prefill runs the multimodal inputs and embed overrides
-        again, but input_embeds cover only the prompt, so the generation
-        restarts; that is invisible only while no output has been sent."""
+        """input_embeds cover only the prompt, so a re-prefill restarts the
+        generation; that is invisible until output has been sent."""
         return self.input_embeds is None or self.send_token_offset == 0
 
     @property
@@ -2295,9 +2293,7 @@ class Req(ReqDllmMixin):
         not sent: like a handoff token it is the pending decode input, so the
         decode commit keeps it and ignores the token the prefill samples.
         """
-        # TODO: carry multimodal inputs and embeds. The payload holds token ids
-        # only, so a request without resumable_by_rebootstrap is aborted
-        # instead of rebootstrapped.
+        # TODO: carry multimodal inputs and embeds; such requests are aborted.
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
@@ -2492,7 +2488,6 @@ def set_mamba_track_indices_from_reqs(
 
 
 def unresumable_abort_message() -> str:
-    """Why release_req found a request that the recompute after it cannot resume."""
     if get_disagg().disaggregation_mode == "decode":
         return (
             "Retracted request aborted: the rebootstrap recomputes the KV from "
@@ -2514,8 +2509,7 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> bool:
-    """Returns False when the request cannot be resumed: its KV is neither
-    backed up nor rebuildable by the recompute that follows."""
+    """Returns whether the request can be resumed."""
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -2555,7 +2549,7 @@ def retract_all(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> List[Req]:
-    """Returns the requests that cannot be resumed; the caller aborts them."""
+    """Returns the requests that cannot be resumed."""
     unresumable = []
     for idx in range(len(reqs)):
         if not release_req(
@@ -3646,8 +3640,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
-                # No backup exists, the recompute cannot rebuild the KV, and the
-                # device KV is already freed, so the request cannot resume.
+                # No backup or rebuild exists and the device KV is already freed.
                 if get_disagg().disaggregation_mode != "decode":
                     message = unresumable_abort_message()
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE

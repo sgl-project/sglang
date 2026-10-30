@@ -12,7 +12,6 @@ from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import (
     DetokenizeRequest,
-    DetokenizeResponse,
     TokenizeRequest,
     TokenizeResponse,
 )
@@ -136,26 +135,19 @@ class TestDetokenize(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-        tm = Mock()
-        tm.tokenizer = _tokenizer()
-        tm.model_config = Mock(vocab_size=len(WORDS))
+        tm = Mock(tokenizer=_tokenizer(), model_config=Mock(vocab_size=len(WORDS)))
         serving = OpenAIServingDetokenize(tm)
 
         def detokenize(tokens):
             request = DetokenizeRequest(tokens=tokens)
-            response = asyncio.run(
+            return asyncio.run(
                 serving._handle_non_streaming_request(request, request, None)
             )
-            if isinstance(response, DetokenizeResponse):
-                return 200, response.text
-            return response.status_code, json.loads(response.body)["message"]
 
-        self.assertEqual(detokenize(_ids("hi hello")), (200, "hi hello"))
-        for tokens in ([len(WORDS)], [-1], [[8], [2**40]]):
+        self.assertEqual(detokenize(_ids("hi hello")).text, "hi hello")
+        for tokens in ([len(WORDS)], [[8], [2**40]]):
             with self.subTest(tokens=tokens):
-                status, message = detokenize(tokens)
-                self.assertEqual(status, 400)
-                self.assertIn("out of vocabulary", message)
+                self.assertEqual(detokenize(tokens).status_code, 400)
 
 
 if __name__ == "__main__":

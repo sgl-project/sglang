@@ -6057,11 +6057,8 @@ class Scheduler(
             self.decode_offload_manager.drain_before_retraction()
         unresumable = []
         if retract_reqs:
-            # Decode-side retract never resumes from a backup: it rebootstraps
-            # (recomputes the KV from the prefill) or aborts, so skip the
-            # device->host KV offload that release_req would otherwise do; the
-            # offloaded copy would be immediately discarded. Non-decode modes
-            # ignore offload_kv (they never offload).
+            # Decode-side retract rebootstraps or aborts, so a host backup would
+            # be discarded; non-decode modes never offload.
             unresumable = retract_all(
                 reqs=retract_reqs,
                 req_to_token_pool=self.req_to_token_pool,
