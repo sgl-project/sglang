@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import unittest
@@ -16,7 +17,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.inkling_detector import (
     InklingDetector as InklingToolDetector,
 )
@@ -32,6 +34,7 @@ from sglang.srt.parser.inkling_tokenizer import (
 )
 from sglang.srt.parser.reasoning_parser import InklingDetector
 from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -174,6 +177,10 @@ class TestReasonerGrammarBackend(CustomTestCase):
             think_start_token="<think>",
             think_end_token="</think>",
             think_excluded_tokens=["<tool_call>", "</tool_call>"],
+            get_think_end_token_ids=lambda tokenizer: tokenizer.encode(
+                "</think>", add_special_tokens=False
+            ),
+            get_answer_frame=lambda: None,
         )
         return SimpleNamespace(detector=detector)
 
@@ -472,13 +479,234 @@ class TestReasonerGrammarBackend(CustomTestCase):
                     else:
                         self.assertIs(grammar, inner_grammar)
 
+    def test_inkling_output_constraints_keep_message_framing(self):
+        """Constrained Inkling output is a framed text message after optional thinking."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        keys = {
+            ("json", '{"type":"object","properties":{"a":{"type":"integer"}}}'): (
+                '{"a": 1}'
+            ),
+            ("regex", "Answer: [0-9]+"): "Answer: 42",
+            ("ebnf", 'root ::= "yes" | "no"'): "yes",
+        }
+        thinking = (
+            [ids[MESSAGE_MODEL], ids[CONTENT_THINKING]]
+            + tokenizer.encode("reason")
+            + [ids[END_MESSAGE]]
+        )
+        for (key, payload), reasoning, prefix, strict in itertools.product(
+            keys.items(), (False, True), ([], thinking), (False, True)
+        ):
+            with self.subTest(
+                key=key, reasoning=reasoning, prefix=bool(prefix), strict=strict
+            ):
+                reasoner = ReasonerGrammarBackend(
+                    backend,
+                    SimpleNamespace(detector=InklingDetector()),
+                    tokenizer,
+                    enable_strict_thinking=strict,
+                )
+                grammar = reasoner._init_value_dispatch(key, reasoning=reasoning)
+                self._accept_allowed_tokens(grammar, prefix, backend.vocab_size)
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(mask, [ord(payload[0]), ids[MESSAGE_MODEL]]),
+                    [ids[MESSAGE_MODEL]],
+                )
+                self._accept_allowed_tokens(
+                    grammar, [ids[MESSAGE_MODEL]], backend.vocab_size
+                )
+                kinds = [ids[CONTENT_TEXT], ids[CONTENT_THINKING]]
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(mask, kinds), kinds[:1] if prefix else kinds
+                )
+                self._accept_allowed_tokens(
+                    grammar,
+                    [ids[CONTENT_TEXT]] + tokenizer.encode(payload),
+                    backend.vocab_size,
+                )
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(
+                        mask, [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]]
+                    ),
+                    [ids[END_MESSAGE]],
+                )
+                self._accept_allowed_tokens(
+                    grammar,
+                    [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+                    backend.vocab_size,
+                )
+                self.assertTrue(grammar.is_terminated())
+
+    def test_inkling_continuation_constraint_starts_inside_the_text_block(self):
+        """A prompt ending in an open text block constrains the payload directly,
+        also after an ordinary framed grammar compiled on the same backend."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), tokenizer
+        )
+        user_turn = [ids[MESSAGE_MODEL], *tokenizer.encode("hi"), ids[END_MESSAGE]]
+        open_block = [*user_turn, ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
+        key = ("regex", "yes")
+        self.assertEqual(
+            reasoner.get_request_grammar_key(
+                key, input_ids=user_turn, thinking_budget=None
+            ),
+            key,
+        )
+        turn = reasoner._init_value_dispatch(key, reasoning=True)
+        self._accept_allowed_tokens(
+            turn,
+            [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
+            + tokenizer.encode("yes")
+            + [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+            backend.vocab_size,
+        )
+
+        block_key = reasoner.get_request_grammar_key(
+            key, input_ids=open_block, thinking_budget=None
+        )
+        self.assertNotEqual(block_key, key)
+        grammar = reasoner._init_value_dispatch(block_key, reasoning=True)
+        mask = self._vocab_mask(grammar, backend.vocab_size)
+        self.assertEqual(
+            _allowed_token_ids(mask, [ord("y"), ids[MESSAGE_MODEL]]), [ord("y")]
+        )
+        self._accept_allowed_tokens(
+            grammar,
+            tokenizer.encode("yes")
+            + [ids[END_MESSAGE], ids[CONTENT_MODEL_END_SAMPLING]],
+            backend.vocab_size,
+        )
+        self.assertTrue(grammar.is_terminated())
+
+    def test_inkling_framing_tokens_never_match_payload_text(self):
+        """Control tokens decode to their spellings; inside a JSON string an Inkling
+        constraint must not admit <|end_message|>, which would close the message."""
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        key = ("json", '{"type":"object","properties":{"a":{"type":"string"}}}')
+        for inkling in (True, False):
+            with self.subTest(inkling=inkling):
+                backend, tokenizer = self._make_xgrammar_backend()
+                if inkling:
+                    parser = SimpleNamespace(detector=InklingDetector())
+                    reasoner = ReasonerGrammarBackend(backend, parser, tokenizer)
+                    head = [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]]
+                else:
+                    reasoner = ReasonerGrammarBackend(
+                        backend, self._make_parser(), tokenizer
+                    )
+                    head = tokenizer.encode("</think>")
+                grammar = reasoner._init_value_dispatch(key, reasoning=True)
+                self._accept_allowed_tokens(
+                    grammar, head + tokenizer.encode('{"a": "x'), backend.vocab_size
+                )
+                mask = self._vocab_mask(grammar, backend.vocab_size)
+                self.assertEqual(
+                    _allowed_token_ids(mask, [ord("y"), ids[END_MESSAGE]]),
+                    [ord("y")] if inkling else [ord("y"), ids[END_MESSAGE]],
+                )
+
+    def test_inkling_required_tool_tag_matches_native_markers(self):
+        """Required and named tool tags spell Inkling's markers as strings; the native
+        marker tokens must still match them while payload framing is enabled."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=InklingDetector()), tokenizer
+        )
+        tools = [Tool(type="function", function={"name": "f", "parameters": {}})]
+        request = ChatCompletionRequest(
+            model="inkling", messages=[], tools=tools, tool_choice="required"
+        )
+        params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=FunctionCallParser(
+                tools, "inkling"
+            ).get_structure_constraint("required"),
+        )
+        grammar = backend.dispatch_structural_tag(params["structural_tag"])
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        self._accept_allowed_tokens(
+            grammar,
+            [ids[MESSAGE_MODEL], *tokenizer.encode("f"), ids[CONTENT_INVOKE_TOOL_JSON]]
+            + tokenizer.encode('{"name":"f","args":{}}')
+            + [ids[END_MESSAGE]],
+            backend.vocab_size,
+        )
+
+    def test_inkling_strict_budget_caps_thinking_and_cannot_reopen_it(self):
+        """Strict thinking caps the thinking message; after its end a header may only
+        open the answer, and a turn that skips thinking is held to the payload."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        ids = INKLING_SPECIAL_TOKEN_IDS
+        with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "3"}):
+            reasoner = ReasonerGrammarBackend(
+                backend,
+                SimpleNamespace(detector=InklingDetector()),
+                tokenizer,
+                enable_strict_thinking=True,
+            )
+        grammar = reasoner._init_value_dispatch(("regex", "yes"), reasoning=True)
+        self._accept_allowed_tokens(
+            grammar,
+            [ids[MESSAGE_MODEL], ids[CONTENT_THINKING], *tokenizer.encode("xxx")],
+            backend.vocab_size,
+        )
+        mask = self._vocab_mask(grammar, backend.vocab_size)
+        self.assertEqual(
+            _allowed_token_ids(mask, [ord("x"), ids[END_MESSAGE]]), [ids[END_MESSAGE]]
+        )
+        self._accept_allowed_tokens(
+            grammar, [ids[END_MESSAGE], ids[MESSAGE_MODEL]], backend.vocab_size
+        )
+        mask = self._vocab_mask(grammar, backend.vocab_size)
+        self.assertEqual(
+            _allowed_token_ids(mask, [ids[CONTENT_TEXT], ids[CONTENT_THINKING]]),
+            [ids[CONTENT_TEXT]],
+        )
+
+        skipped = reasoner._init_value_dispatch(("regex", "yes"), reasoning=True)
+        self._accept_allowed_tokens(
+            skipped, [ids[MESSAGE_MODEL], ids[CONTENT_TEXT]], backend.vocab_size
+        )
+        mask = self._vocab_mask(skipped, backend.vocab_size)
+        self.assertEqual(_allowed_token_ids(mask, [ord("h"), ord("y")]), [ord("y")])
+
+    def test_inkling_backend_matches_native_think_end_id(self):
+        """Strict mode and other constraints must see the native END_MESSAGE id."""
+        tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                reasoner = ReasonerGrammarBackend(
+                    _DummyGrammarBackend(),
+                    SimpleNamespace(detector=InklingDetector()),
+                    tokenizer,
+                    enable_strict_thinking=strict,
+                )
+                self.assertEqual(
+                    reasoner.think_end_ids, [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]]
+                )
+
+                grammar = reasoner._make_grammar_object(MagicMock(), reasoning=True)
+                self.assertFalse(grammar._is_generation())
+                grammar.accept_token(INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE])
+                self.assertTrue(grammar._is_generation())
+
     def test_other_grammars_still_defer_until_reasoning_ends(self):
-        tag = InklingToolDetector().get_auto_tool_call_structural_tag().model_dump()
+        canonical = InklingToolDetector().get_auto_tool_call_structural_tag()
+        tag = canonical.model_dump()
         tag["format"] = {"type": "sequence", "elements": [tag["format"]]}
         keys = [
             ("json", "{}"),
             ("structural_tag", '{"structures": [], "triggers": []}'),
             ("structural_tag", json.dumps(tag)),
+            # The canonical schema owns the full turn only under the Inkling detector.
+            ("structural_tag", canonical.model_dump_json()),
         ]
         for key in keys:
             with self.subTest(key=key):
@@ -492,6 +720,21 @@ class TestReasonerGrammarBackend(CustomTestCase):
                 self.assertIsInstance(grammar, ReasonerGrammarObject)
                 self.assertIs(grammar.grammar, backend._dispatch_result)
                 self.assertFalse(grammar._is_generation())
+
+    def test_inkling_constraint_defers_on_a_backend_that_cannot_frame(self):
+        """Backends without compile_framed_grammar keep the deferred constraint."""
+        backend = _DummyGrammarBackend()
+        backend._dispatch_result = MagicMock()
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            SimpleNamespace(detector=InklingDetector()),
+            _DummyTokenizer({}),
+        )
+        grammar = reasoner._init_value_dispatch(("json", "{}"), reasoning=True)
+
+        self.assertIsInstance(grammar, ReasonerGrammarObject)
+        self.assertIs(grammar.grammar, backend._dispatch_result)
+        self.assertFalse(grammar._is_generation())
 
     def test_full_assistant_ebnf_still_owns_its_boundaries(self):
         """Whole-assistant EBNF must keep control of the reasoning prefix."""
@@ -542,6 +785,23 @@ class TestReasonerGrammarBackend(CustomTestCase):
             scheduler.model_config.think_end_ids,
             [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]],
         )
+
+    def test_response_template_reasoning_gives_the_thinking_opener(self):
+        """Output that skips the reasoning must not escape the grammar for want of a
+        thinking opener."""
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        backend._dispatch_result = MagicMock()
+        template = {
+            "start_anchor": "<assistant>",
+            "fields": {"thinking": {"open": "<think>", "close": "</think>"}},
+        }
+        detector = ResponseTemplateReasoningDetector(response_template=template)
+        reasoner = ReasonerGrammarBackend(
+            backend, SimpleNamespace(detector=detector), self._make_tokenizer()
+        )
+        grammar = reasoner._init_value_dispatch(("structural_tag", "{}"), True)
+
+        self.assertEqual(grammar.think_starts, ("<think>",))
 
     def test_accepts_multi_token_think_start_marker(self):
         """think_start_token can be multi-token (e.g., GPT-OSS) since it's not used."""
@@ -816,6 +1076,97 @@ class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
         inner_grammar.fill_vocab_mask.assert_not_called()
         # Mask should remain all zeros (no filtering)
         self.assertTrue(torch.all(mask == 0))
+
+
+class TestReasonerGrammarObjectReasoningInGrammar(CustomTestCase):
+    """A grammar that also describes the reasoning applies from the first
+    token, while the reasoning end still bounds the thinking controls."""
+
+    _PIECES = {1: "<th", 2: "ink>", 4: "<a>", 10: "a", 11: "b", 12: "<think>"}
+
+    def _make_object(self, allowed, max_think_tokens=-1, think_starts=()):
+        inner_grammar = MagicMock()
+        inner_grammar.allocate_vocab_mask.side_effect = lambda vs, bs, d: torch.zeros(
+            (bs, (vs + 31) // 32), dtype=torch.int32
+        )
+        inner_grammar.fill_vocab_mask.side_effect = lambda mask, idx: (
+            set_token_filter_torch(mask, allowed, idx)
+        )
+        obj = ReasonerGrammarObject(
+            grammar=inner_grammar,
+            think_end_ids=[7],
+            think_excluded_token_ids=[3, 5],
+            max_think_tokens=max_think_tokens,
+            enable_token_filter=True,
+            token_filter_fn=set_token_filter_torch,
+            think_starts=think_starts,
+            decode=lambda ids: "".join(self._PIECES[i] for i in ids),
+        )
+        obj.maybe_init_reasoning(True)
+        obj.set_reasoning_in_grammar()
+        return obj, inner_grammar
+
+    def test_grammar_applies_from_the_first_token(self):
+        obj, inner_grammar = self._make_object(allowed=[1, 3, 7, 10])
+        mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+        obj.fill_vocab_mask(mask, 0)
+
+        # Strict thinking only removes its excluded tokens from the grammar's.
+        self.assertEqual(_allowed_token_ids(mask, [1, 3, 5, 7, 10, 11]), [1, 7, 10])
+        for token_id in (10, 7, 11):
+            obj.accept_token(token_id)
+        self.assertEqual(
+            [call.args[0] for call in inner_grammar.accept_token.call_args_list],
+            [10, 7, 11],
+        )
+        self.assertTrue(obj._is_generation())
+        obj.rollback(3)
+        inner_grammar.rollback.assert_called_once_with(3)
+        self.assertTrue(obj._is_thinking())
+        self.assertTrue(obj.copy().reasoning_in_grammar)
+
+    def test_budget_ends_reasoning_only_where_the_grammar_allows(self):
+        for allowed, expected in (([7, 10], [7]), ([10, 11], [10, 11])):
+            with self.subTest(allowed=allowed):
+                obj, _ = self._make_object(allowed, max_think_tokens=1)
+                obj.accept_token(10)
+                mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+                obj.fill_vocab_mask(mask, 0)
+
+                self.assertEqual(_allowed_token_ids(mask, [7, 10, 11]), expected)
+
+    def test_thinking_controls_need_the_opener(self):
+        """Budget and strict thinking filters must not bound output that skipped the
+        reasoning."""
+        obj, _ = self._make_object(
+            [7, 10, 11], max_think_tokens=1, think_starts=("<think>", "<a><think>")
+        )
+        for opening, expected in (
+            ((10, 2), [7, 10, 11]),
+            ((4, 10), [7, 10, 11]),
+            ((1, 2), [7]),
+            ((12, 10), [7]),
+            ((4, 1, 2), [7]),
+        ):
+            with self.subTest(opening=opening):
+                obj.rollback(obj._generated)
+                for token_id in opening:
+                    obj.accept_token(token_id)
+                mask = obj.allocate_vocab_mask(64, 1, "cpu")
+
+                obj.fill_vocab_mask(mask, 0)
+
+                self.assertEqual(_allowed_token_ids(mask, [7, 10, 11]), expected)
+
+    def test_is_set_before_decoding(self):
+        obj = ReasonerGrammarObject(grammar=MagicMock(), think_end_ids=[7])
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(10)
+
+        with self.assertRaises(RuntimeError):
+            obj.set_reasoning_in_grammar()
 
 
 class TestReasonerGrammarObjectCurrentToken(CustomTestCase):

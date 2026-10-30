@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -89,6 +90,8 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    # Rank-local; never sent over the wire.
+    fpm_timing: Optional[FpmTiming] = None
 
 
 class SchedulerPPMixin:
@@ -247,8 +250,8 @@ class SchedulerPPMixin:
 
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
+        transferred_rids: Dict[str, bool] = {}
+        release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
 
@@ -371,7 +374,7 @@ class SchedulerPPMixin:
         tmbs = [None] * self.pp_loop_size
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None  # consensus transferred rids
+        release_rids: Optional[Dict[str, bool]] = None  # consensus {rid: failed}
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
@@ -608,30 +611,33 @@ class SchedulerPPMixin:
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+    def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
+        """Return {rid: failed} for the transfers every stage so far has concluded.
+
+        Each stage sends the KV of its own layers, so the stages can conclude the
+        same request differently: a client abort that lands after the first stage
+        finished sending fails the later stages only. The outcome travels with the
+        consensus (failed on any stage = failed on every stage) so every stage
+        releases the request through the same path and keeps its prefix cache in
+        step with the others.
+        """
+        succeeded, failed = self.get_rids(
+            self.disagg_prefill_inflight_queue,
+            True,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+        )
+        curr_transferred = dict.fromkeys(succeeded, False)
+        curr_transferred.update(dict.fromkeys(failed, True))
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
+            return curr_transferred
+        # Intersect with the previous stage's consensus; a failure anywhere wins.
+        prev_transferred = self._pp_recv_pyobj_from_prev_stage()
+        return {
+            rid: prev_transferred[rid] or rid_failed
+            for rid, rid_failed in curr_transferred.items()
+            if rid in prev_transferred
+        }
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,
@@ -958,6 +964,7 @@ class SchedulerPPMixin:
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
             skipped_output_comm=True,
+            fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
         )
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
@@ -969,8 +976,6 @@ class SchedulerPPMixin:
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
     ):
-        from sglang.srt.managers.scheduler import GenerationBatchResult
-
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
@@ -1048,6 +1053,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                fpm_timing=mb_metadata.fpm_timing,
             )
             return output_result
 
@@ -1135,6 +1141,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            fpm_timing=mb_metadata.fpm_timing,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1487,6 +1494,19 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                # An early recv spins on an SM and can stall or hang kernels that need every SM
+                # (e.g. flashinfer MLA); set SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD=1 then.
+                if (
+                    envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.get()
+                    and get_parallel().pp_async_batch_depth == 0
+                    and self.pp_group.is_first_rank
+                    and not self._pp_spec_relay
+                    and self.launch_event is not None
+                ):
+                    with self.pp_comm_stream_ctx:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
                 tensor_dict, output_recv_event = self._pp_recv_dict_from_prev_stage()
                 next_pp_outputs = PPProxyTensors(tensor_dict)
             with self.copy_stream_ctx:
@@ -1655,6 +1675,7 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    fpm_timing=result.fpm_timing,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
@@ -1762,30 +1783,33 @@ class SchedulerPPMixin:
         bad_rids = list(set(bad_rids) | set(aborted_rids))
         return good_rids, bad_rids
 
-    def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+    def _pp_pd_get_decode_transferred_ids(self: Scheduler) -> Dict[str, bool]:
+        """Return {rid: failed} for the transfers every stage so far has concluded.
+
+        Each stage receives the KV of its own layers, so the stages can conclude
+        the same request differently: a prefill abort that lands after the first
+        prefill stage finished sending fails only the later decode stages. The
+        outcome travels with the consensus (failed on any stage = failed on every
+        stage) so every stage retires the request through the same path and the
+        waiting queues stay in step with the others.
+        """
+        succeeded, failed = self.get_rids(
+            self.disagg_decode_transfer_queue.queue,
+            False,
+            [KVPoll.Success],
+            [KVPoll.Failed],
+        )
+        curr_transferred = dict.fromkeys(succeeded, False)
+        curr_transferred.update(dict.fromkeys(failed, True))
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
+            return curr_transferred
+        # Intersect with the previous stage's consensus; a failure anywhere wins.
+        prev_transferred = self._pp_recv_pyobj_from_prev_stage()
+        return {
+            rid: prev_transferred[rid] or rid_failed
+            for rid, rid_failed in curr_transferred.items()
+            if rid in prev_transferred
+        }
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -1819,18 +1843,23 @@ class SchedulerPPMixin:
         return None
 
     def process_decode_transfer_queue(
-        self: Scheduler, release_rids: Optional[List[str]]
-    ):
+        self: Scheduler, release_rids: Optional[Dict[str, bool]]
+    ) -> Optional[Dict[str, bool]]:
+        """Retire the consensus transfers and return {rid: failed} for the ones
+        this stage concluded; the next stage retires exactly those, failed ones
+        through the failure path whatever its own receiver reports."""
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
         if release_rids is not None:
-            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                release_rids
+            released_reqs, outcomes = (
+                self.disagg_decode_transfer_queue.pop_transferred_with_outcomes(
+                    release_rids
+                )
             )
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)
-            return [req.rid for req in released_reqs]
+            return outcomes
         return None

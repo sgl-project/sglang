@@ -1,15 +1,16 @@
 """Fixtures pinning the Rust frontend's ``/metrics`` to Python's.
 
 The Rust server (``rust/sglang-server``) reads prometheus_client's multiprocess
-files and renders them itself (``src/utils/prometheus.rs``). These tests fail if
-prometheus_client's file format, merge or text rendering drifts from what the
-committed fixtures record; regenerate them as each builder's docstring says,
-then update the Rust side.
+files and renders them itself (``src/utils/prometheus.rs``), and records the
+``TokenizerMetricsCollector`` families itself (``src/api_server/core/metrics.rs``).
+These tests fail if prometheus_client's file format, merge or text rendering, or
+the collector's families, drift from what the committed fixtures record;
+regenerate them as each builder's docstring says, then update the Rust side.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import json
 import os
@@ -22,12 +23,15 @@ from prometheus_client import Counter, Gauge, Histogram, Summary, values
 from prometheus_client.exposition import generate_latest
 from prometheus_client.multiprocess import MultiProcessCollector
 
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 TESTDATA = os.path.join(
     os.path.dirname(__file__), *[os.pardir] * 4, "rust/sglang-server/testdata"
 )
 MULTIPROCESS_FIXTURE = os.path.join(TESTDATA, "prometheus_multiprocess.json")
+TOKENIZER_FIXTURE = os.path.join(TESTDATA, "tokenizer_metrics.json")
 
 
 def _write_process(directory: str, pid: int, now: float, observe) -> None:
@@ -135,7 +139,46 @@ def _render_python(files: list) -> str:
         return generate_latest(_Files()).decode()
 
 
+def build_rust_tokenizer_metrics_fixture() -> dict:
+    """Every family ``TokenizerMetricsCollector`` registers under the default
+    server args, as its constructor arguments. Regenerate the fixture with
+    ``json.dump(build_rust_tokenizer_metrics_fixture(), f, indent=2)``."""
+    families = []
+
+    def recorder(kind):
+        def register(name, documentation, labelnames=(), buckets=None, **_):
+            families.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "documentation": documentation,
+                    "labelnames": list(labelnames),
+                    "buckets": (
+                        None if buckets is None else [float(b) for b in buckets]
+                    ),
+                }
+            )
+            return mock.MagicMock()
+
+        return staticmethod(register)
+
+    class _Recording(TokenizerMetricsCollector):
+        _counter_cls = recorder("counter")
+        _gauge_cls = recorder("gauge")
+        _histogram_cls = recorder("histogram")
+
+    labels = {"model_name": "model", "engine_type": "unified"}
+    with get_context().override_server_args():
+        _Recording(labels=labels)
+    return {"labels": labels, "families": families}
+
+
 class TestRustMetricsFixtures(CustomTestCase):
+    def test_tokenizer_metrics_fixture_matches_python(self):
+        with open(TOKENIZER_FIXTURE) as f:
+            fixture = json.load(f)
+        self.assertEqual(fixture, build_rust_tokenizer_metrics_fixture())
+
     def test_multiprocess_fixture_matches_python(self):
         with open(MULTIPROCESS_FIXTURE) as f:
             fixture = json.load(f)

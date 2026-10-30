@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -24,6 +25,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    RequestOutputStats,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -38,6 +40,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -45,6 +48,20 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
+
+
+def _scheduler_decode_latency(time_stats: SchedulerReqTimeStats) -> Optional[float]:
+    """A finished non-streaming request's decode latency as Python's
+    TokenizerManager measures it: from the scheduler's prefill-finished stamp
+    (`_get_scheduler_first_token_time`, which has the stamp only when metrics
+    are on) to now, its terminal output (`get_decode_latency`). None where it
+    falls back to its own first-output time, which the Rust frontend
+    measures the same way."""
+    stamp = time_stats.prefill_finished_time
+    now = time.perf_counter()
+    if time_stats.enable_metrics and 0.0 < stamp <= now:
+        return now - stamp
+    return None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -62,14 +79,18 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    # Set when the scheduler first defers a response; see deferred_output.
+    defer_outputs: bool = False
     _test_stream_output_count: int = 0
+    enable_metrics: bool = field(init=False)
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
             raise ValueError(
-                "additional customized generation output is not supported by "
-                "Rust egress"
+                "a streamer's additional customized_info needs TokenizerManager "
+                "hooks (update_request_meta_info) the Rust frontend does not run"
             )
+        self.enable_metrics = get_observability().enable_metrics
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -116,6 +137,24 @@ class SchedulerOutputStreamer:
 
         return None
 
+    def build_request_stats(self, req: Req) -> RequestOutputStats:
+        image_tokens, audio_tokens, video_tokens = req.get_mm_token_counts()
+        return RequestOutputStats(
+            prompt_tokens=len(req.origin_input_ids),
+            cached_tokens=req.cached_tokens,
+            cached_tokens_details=self.get_cached_tokens_details(req),
+            retraction_count=req.retraction_count,
+            image_tokens=image_tokens,
+            audio_tokens=audio_tokens,
+            video_tokens=video_tokens,
+            # Embedding outputs carry no time stats.
+            time_stats=(
+                req.time_stats.to_output_time_stats()
+                if self.enable_metrics and self.is_generation
+                else None
+            ),
+        )
+
     def stream_output(
         self,
         reqs: List[Req],
@@ -123,6 +162,9 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.defer_outputs:
+            # The scheduler releases held requests after their work completes.
+            reqs = [req for req in reqs if not req.defer_output]
         if self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
@@ -172,7 +214,7 @@ class SchedulerOutputStreamer:
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
-            get_cached_tokens_details=self.get_cached_tokens_details,
+            build_request_stats=self.build_request_stats,
             is_request_level_customized_info_key=(
                 self.is_request_level_customized_info_key
             ),
@@ -214,7 +256,7 @@ class SchedulerOutputStreamer:
         )
         if payload is not None:
             if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
+                self.rust_server.push_generation(payload, acc.decode_latencies)
             else:
                 self.send_to_detokenizer.send_output(payload)
 
@@ -251,11 +293,7 @@ class SchedulerOutputStreamer:
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
-        prompt_tokens = []
-        cached_tokens = []
-        cached_tokens_details = []  # Detailed breakdown by cache source
-        time_stats = []
-        retraction_counts = []
+        request_stats = []
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -264,13 +302,7 @@ class SchedulerOutputStreamer:
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
-                cached_tokens.append(req.cached_tokens)
-
-                # Collect detailed cache breakdown if available
-                cached_tokens_details.append(self.get_cached_tokens_details(req))
-                time_stats.append(req.time_stats)
-                retraction_counts.append(req.retraction_count)
+                request_stats.append(self.build_request_stats(req))
 
                 phs = req.pooled_hidden_state
                 phs_list.append(phs)
@@ -304,15 +336,11 @@ class SchedulerOutputStreamer:
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=wrap_as_pickle(time_stats),
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
-                prompt_tokens=prompt_tokens,
-                cached_tokens=cached_tokens,
-                cached_tokens_details=cached_tokens_details,
+                request_stats=request_stats,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
-                retraction_counts=retraction_counts,
                 pooled_hidden_states=stacked_phs,
             )
         )
@@ -329,44 +357,41 @@ class _GenerationStreamAccumulator:
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    build_request_stats: Callable[[Req], RequestOutputStats]
     is_request_level_customized_info_key: Callable[[str], bool]
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
-    decoded_texts: list = field(default_factory=list)
     decode_ids_list: list = field(default_factory=list)
     read_offsets: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     skip_special_tokens: list = field(default_factory=list)
     spaces_between_special_tokens: list = field(default_factory=list)
     no_stop_trim: list = field(default_factory=list)
-    prompt_tokens: list = field(default_factory=list)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
-    cached_tokens: list = field(default_factory=list)
-    cached_tokens_details: list = field(
-        default_factory=list
-    )  # Detailed breakdown by cache source
-    image_tokens: list = field(default_factory=list)
-    audio_tokens: list = field(default_factory=list)
-    video_tokens: list = field(default_factory=list)
+    request_stats: list = field(default_factory=list)
+    has_request_stats: bool = False
+    # Rust server mode only; see BatchTokenIDOutput.prompt_tokens.
+    prompt_tokens: Optional[list] = None
+    cached_tokens: Optional[list] = None
+    image_tokens: Optional[list] = None
+    audio_tokens: Optional[list] = None
+    video_tokens: Optional[list] = None
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
     spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
-    retraction_counts: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
-    time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -390,8 +415,17 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    # Rust server mode: by row, the decode latency of a finished non-streaming
+    # request, whose first token the Rust frontend does not see.
+    decode_latencies: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.rust_server_mode:
+            self.prompt_tokens = []
+            self.cached_tokens = []
+            self.image_tokens = []
+            self.audio_tokens = []
+            self.video_tokens = []
         if self.return_hidden_states:
             self.output_hidden_states = []
         if self.return_routed_experts:
@@ -471,9 +505,9 @@ class _GenerationStreamAccumulator:
         output_ids_ = req.output_ids_through_stop
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
-        self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
-        self.cached_tokens.append(req.cached_tokens)
+        # A verified token block can extend past the stop position. Report
+        # reasoning usage only within the same prefix as completion usage.
+        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -481,16 +515,22 @@ class _GenerationStreamAccumulator:
         )
         self.beam_search_output.append(beam_output)
 
-        if not self.rust_server_mode:
+        if self.rust_server_mode:
+            # Per-step header columns of `push_generation`.
+            self.prompt_tokens.append(len(req.origin_input_ids))
+            self.cached_tokens.append(req.cached_tokens)
+            image_t, audio_t, video_t = req.get_mm_token_counts()
+            self.image_tokens.append(image_t)
+            self.audio_tokens.append(audio_t)
+            self.video_tokens.append(video_t)
+        else:
             # Everything below feeds the Python DetokenizerManager /
-            # TokenizerManager (incremental detok, meta_info, per-request metrics)
-            # or gets pickled into the payload (time_stats). The Rust server
-            # replaces those stages and builds its own metadata from the
+            # TokenizerManager (incremental detok, meta_info, per-request metrics).
+            # The Rust server replaces those stages and builds its own metadata from the
             # ChunkEvent, so `push_generation` never reads these — skip the whole
             # block. The parallel lists stay empty; the payload goes straight to
-            # `push_generation`, which only indexes the fields appended above.
+            # `push_generation`, which only indexes the fields appended outside it.
             self.http_worker_ipcs.append(req.http_worker_ipc)
-            self.decoded_texts.append(req.decoded_text)
             decode_ids, read_offset = req.init_incremental_detokenize()
             self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
             req.send_decode_id_offset = len(decode_ids)
@@ -506,19 +546,12 @@ class _GenerationStreamAccumulator:
                 else len(output_ids_)
             )
 
-            # Collect detailed cache breakdown if available
-            self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+            if req.take_request_stats_due():
+                self.request_stats.append(self.build_request_stats(req))
+                self.has_request_stats = True
+            else:
+                self.request_stats.append(None)
 
-        # Multimodal prompt token counts. In disagg decode mode the prefill node
-        # already computed these and transferred them via the metadata buffer
-        # (req.mm_*), so prefer the pre-stored values; otherwise compute them
-        # from the request's multimodal items.
-        image_t, audio_t, video_t = req.get_mm_token_counts()
-        self.image_tokens.append(image_t)
-        self.audio_tokens.append(audio_t)
-        self.video_tokens.append(video_t)
-
-        self.retraction_counts.append(req.retraction_count)
         if req.finished():
             self.weight_versions.append(
                 compute_weight_version_spans(
@@ -527,10 +560,12 @@ class _GenerationStreamAccumulator:
                     num_output_tokens=len(output_ids_),
                 )
             )
+            if self.rust_server_mode and not req.stream:
+                latency = _scheduler_decode_latency(req.time_stats)
+                if latency is not None:
+                    self.decode_latencies[len(self.rids) - 1] = latency
         else:
             self.weight_versions.append(None)
-
-        self.time_stats.append(req.time_stats)
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -707,20 +742,18 @@ class _GenerationStreamAccumulator:
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
-            time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
-            decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
             read_offsets=self.read_offsets,
             output_ids=self.output_ids,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             no_stop_trim=self.no_stop_trim,
-            prompt_tokens=self.prompt_tokens,
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
+            request_stats=self.request_stats if self.has_request_stats else None,
+            prompt_tokens=self.prompt_tokens,
             cached_tokens=self.cached_tokens,
-            cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,
@@ -758,12 +791,18 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            # The Rust egress encodes the per-token lists itself.
             customized_info=(
-                wrap_as_pickle(self.customized_info) if self.customized_info else None
+                (
+                    self.customized_info
+                    if self.rust_server_mode
+                    else wrap_as_pickle(self.customized_info)
+                )
+                if self.customized_info
+                else None
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=self.retraction_counts,
             # All-None means no beam item in this batch; drop the list so
             # non-beam traffic pays no carrier cost.
             beam_search_output=(
