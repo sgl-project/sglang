@@ -41,6 +41,13 @@ Place model-specific implementations and tuning data inside the corresponding
 logical operator group, rather than creating a model-specific top-level group
 under `ops/` (a model-named file or subpackage inside a group is fine).
 
+Kernels written in TLX (`KernelBackend.TLX`) likewise live in a `tlx/`
+subpackage of their logical group, e.g. `ops/attention/tlx/`. They import
+`triton.language.extra.tlx`, which only a TLX-capable Triton provides
+(fbtriton, or Triton with the uTLX plugin), so nothing imports them until a
+caller has probed availability. Kernels vendored from fbtriton's TLX op
+library name their upstream commit, and any local change, in their header.
+
 `lora` is its own group because it has a distinct responsibility: the adapter
 kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
 their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental

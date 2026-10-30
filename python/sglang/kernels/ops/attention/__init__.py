@@ -547,6 +547,20 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
+# gfx950 only: callers check tlx.kda.prefill_available() / decode_available().
+for _fn, _mod, _backend in [
+    ("kda_paged_prefill", "gfx950_prefill", KernelBackend.TLX),
+    ("kda_recurrent_decode", "gfx950_decode", KernelBackend.TRITON),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=_backend,
+            target=f"sglang.kernels.ops.attention.tlx.kda.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _fn, _mod, _backend
 register_kernel(
     KernelSpec(
         op="attention.fp8_attention",
