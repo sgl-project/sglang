@@ -4353,6 +4353,11 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                # The asm kernel above takes bf16 Q; unified_attention wants Q in
+                # the KV dtype, as in target_verify.
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q, q_descale = self._quantize_q_fp8(q)
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
@@ -4371,7 +4376,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=de_window,
                     block_table=pt,
                     softcap=layer.logit_cap,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
