@@ -716,6 +716,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 embeds.input_embeds = fresh.input_embeds = [[0.0]] * 3
                 plain.output_ids.append(7)
                 embeds.output_ids.append(7)
+                fresh.output_ids.append(7)
+                # Only embeds has streamed its output.
+                embeds.send_token_offset = 1
                 scheduler.running_batch = self._make_batch(
                     scheduler, reqs=[plain, embeds, fresh], with_tensors=True
                 )

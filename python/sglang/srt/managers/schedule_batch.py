@@ -1622,8 +1622,9 @@ class Req(ReqDllmMixin):
     @property
     def kv_rebuildable_by_reprefill(self) -> bool:
         """A local re-prefill runs the multimodal inputs and embed overrides
-        again, but input_embeds cover only the prompt, not the output."""
-        return self.input_embeds is None or len(self.output_ids) == 0
+        again, but input_embeds cover only the prompt, so the generation
+        restarts; that is invisible only while no output has been sent."""
+        return self.input_embeds is None or self.send_token_offset == 0
 
     @property
     def is_beam_leader(self) -> bool:
@@ -3634,7 +3635,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # No backup exists, the recompute cannot rebuild the KV, and the
                 # device KV is already freed, so the request cannot resume.
-                if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+                if get_disagg().disaggregation_mode != "decode":
+                    message = (
+                        "Retracted after streaming output; an input_embeds "
+                        "request cannot be recomputed. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                elif (
+                    get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+                ):
                     message = "Retraction host KV pool exhausted. Aborting the request."
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 else:
