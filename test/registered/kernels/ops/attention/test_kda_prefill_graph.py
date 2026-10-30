@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
 )
+from sglang.srt.layers.attention.linear.kda_flashinfer_prefill_graph import (
+    FlashInferKDAPrefillGraph,
+)
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
@@ -327,6 +330,19 @@ class TestKDAPrefillGraph(CustomTestCase):
 
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
     prefill_backend = LinearAttnKernelBackend.FLASHINFER
+
+    def _capture(self, **kwargs):
+        run = FlashInferKDAPrefillGraph.run
+
+        def check_contiguous_qkv(plan, **inputs):
+            # Check the real convolution output before the wrapper can copy it.
+            # Keep running FlashInfer so replay still checks outputs and states.
+            for name in ("q", "k", "v"):
+                self.assertTrue(inputs[name].is_contiguous(), name)
+            return run(plan, **inputs)
+
+        with patch.object(FlashInferKDAPrefillGraph, "run", check_contiguous_qkv):
+            return super()._capture(**kwargs)
 
     def test_small_buckets_with_padded_sequences(self):
         for num_tokens in (1, 8, 16, 128):

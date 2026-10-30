@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.linear import kda_backend, kda_prefill_graph
+from sglang.srt.layers.attention.linear import kda_backend
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
@@ -176,19 +176,56 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
         self.assertEqual(triton_kernel.calls, 0)
 
     def test_convolution_layout_follows_the_selected_prefill_kernel(self):
-        dispatcher, _, _ = self._make_dispatcher()
-        layer = SimpleNamespace(
-            q_dim=H * K,
-            k_dim=H * K,
-            v_dim=H * V,
-            conv_weights=None,
-            bias=None,
-            lower_bound=-5.0,
+        cases = (
+            (
+                "flashinfer",
+                [2, 1],
+                H * V,
+                True,
+                LinearAttnKernelBackend.FLASHINFER,
+                H * K,
+            ),
+            (
+                "single_tokens",
+                [1, 1, 1],
+                H * V,
+                True,
+                LinearAttnKernelBackend.FLASHINFER,
+                0,
+            ),
+            (
+                "safe_gate_fallback",
+                [2, 1],
+                H * V,
+                False,
+                LinearAttnKernelBackend.FLASHINFER,
+                0,
+            ),
+            (
+                "unequal_widths",
+                [2, 1],
+                H * V // 2,
+                True,
+                LinearAttnKernelBackend.FLASHINFER,
+                0,
+            ),
+            ("triton", [2, 1], H * V, True, LinearAttnKernelBackend.TRITON, 0),
         )
-        backend = object.__new__(KDAAttnBackend)
-        backend.kernel_dispatcher = dispatcher
-        for lengths, expected_split in (([2, 1], H * K), ([1, 1, 1], 0)):
-            with self.subTest(lengths=lengths):
+        for name, lengths, v_dim, safe_gate, prefill_backend, expected_split in cases:
+            with self.subTest(case=name):
+                dispatcher, kernel, _ = self._make_dispatcher()
+                dispatcher.prefill_backend = prefill_backend
+                kernel.supports_safe_gate = safe_gate
+                layer = SimpleNamespace(
+                    q_dim=H * K,
+                    k_dim=H * K,
+                    v_dim=v_dim,
+                    conv_weights=None,
+                    bias=None,
+                    lower_bound=-5.0,
+                )
+                backend = object.__new__(KDAAttnBackend)
+                backend.kernel_dispatcher = dispatcher
                 inputs = _make_inputs(sum(lengths), lengths)
                 backend.forward_metadata = SimpleNamespace(
                     query_start_loc=inputs["query_start_loc"]
@@ -217,60 +254,12 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
                         inputs["cache_indices"],
                     )
                 torch.testing.assert_close(torch.cat(outputs, dim=-1), x)
+                self.assertEqual(
+                    [t.shape[-1] for t in outputs],
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                )
                 if expected_split:
                     self.assertTrue(all(t.is_contiguous() for t in outputs))
-
-    def test_graph_prefill_passes_contiguous_qkv_to_flashinfer(self):
-        tokens, logical_tokens = 8, 5
-        x = torch.randn(tokens, 3 * H * K)
-        layer = SimpleNamespace(
-            q_dim=H * K,
-            k_dim=H * K,
-            v_dim=H * K,
-            head_q_dim=K,
-            head_k_dim=K,
-            head_v_dim=K,
-            conv_weights=None,
-            bias=None,
-        )
-
-        def run(**kwargs):
-            for name, expected in zip(("q", "k", "v"), x.split(H * K, dim=-1)):
-                actual = kwargs[name]
-                self.assertTrue(actual.is_contiguous())
-                torch.testing.assert_close(actual.flatten(2).squeeze(0), expected)
-            return kwargs["v"].clone()
-
-        meta = SimpleNamespace(
-            track=False,
-            flashinfer=SimpleNamespace(run=run),
-            has_initial_state=None,
-            cache_indices=None,
-            cu_seqlens=None,
-            conv_block_table=object(),
-            token_index=torch.arange(tokens),
-            num_logical_tokens=logical_tokens,
-        )
-
-        def convolve(x, *args, output_split_size, block_table, **kwargs):
-            self.assertEqual(output_split_size, H * K)
-            self.assertIs(block_table, meta.conv_block_table)
-            return torch.stack(x.T.split(output_split_size, dim=-1))
-
-        with patch.object(kda_prefill_graph, "causal_conv1d_fn", side_effect=convolve):
-            output = kda_prefill_graph.kda_extend_in_graph(
-                layer=layer,
-                meta=meta,
-                conv_pool=torch.empty(1, 3, 3 * H * K),
-                ssm_states=None,
-                kernel_dispatcher=None,
-                mixed_qkv=x,
-                a=torch.zeros(1, tokens, H, K),
-                b=torch.zeros(1, tokens, H),
-            )
-        expected = x[:, 2 * H * K :].view(1, tokens, H, K).clone()
-        expected[:, logical_tokens:] = 0
-        torch.testing.assert_close(output, expected)
 
 
 if __name__ == "__main__":
