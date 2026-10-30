@@ -408,6 +408,17 @@ elif [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]
     NEED_REBUILD="true"
 elif [[ "${IMAGE_AITER_VERSION}" == "${REPO_AITER_COMMIT}" ]]; then
     echo "[CI-AITER-CHECK] AITER version matches"
+elif [[ ( "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ) && "${IMAGE_AITER_VERSION}" =~ \+g([0-9a-f]+) ]]; then
+    # Version carries the short commit it was built from (e.g. v0.1.26.dev144+g285579b62.d20261027).
+    # Compare it with the Dockerfile pin, so an image older than a pin bump gets the pinned AITER.
+    IMAGE_AITER_HASH="${BASH_REMATCH[1]}"
+    if [[ "${REPO_AITER_COMMIT}" == "${IMAGE_AITER_HASH}"* ]]; then
+        echo "[CI-AITER-CHECK] AITER commit matches: image=${IMAGE_AITER_HASH}, repo=${REPO_AITER_COMMIT} → skipping rebuild"
+    else
+        echo "[CI-AITER-CHECK] AITER commit mismatch: image=${IMAGE_AITER_HASH} (${IMAGE_AITER_VERSION}), repo=${REPO_AITER_COMMIT}"
+        echo "[CI-AITER-CHECK] The CI image was likely built before the Dockerfile AITER pin changed → rebuilding AITER at ${REPO_AITER_COMMIT} (this adds significant job time)"
+        NEED_REBUILD="true"
+    fi
 elif [[ "${IMAGE_AITER_VERSION}" =~ (dev|\+g[0-9a-f]+) ]]; then
     # Dev/patched version (contains 'dev' or git hash) → preserve it
     echo "[CI-AITER-CHECK] Dev/patched version detected: ${IMAGE_AITER_VERSION} → skipping rebuild"
@@ -419,7 +430,73 @@ fi
 #############################################
 # 4. Rebuild AITER if needed
 #############################################
-if [[ "${NEED_REBUILD}" == "true" ]]; then
+if [[ "${NEED_REBUILD}" == "true" && ( "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ) ]]; then
+    # Repeat the AITER steps docker/rocm.Dockerfile runs for this stage, so the
+    # result matches an image built at the pinned commit.
+    echo "[CI-AITER-CHECK] === AITER REBUILD START (as docker/rocm.Dockerfile, ${IMAGE_GFX}${IMAGE_STAGE_SUFFIX}) ==="
+    _aiter_rebuild_start=${SECONDS}
+
+    docker exec ci_sglang pip uninstall -y amd-aiter || true
+    docker exec ci_sglang rm -rf /sgl-workspace/aiter
+    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
+
+    # Checkout, v4 fp4 indexer fix and requirements, as in the Dockerfile.
+    docker exec ci_sglang bash -c "
+        cd /sgl-workspace/aiter && \
+        git fetch --all && \
+        git checkout -f ${REPO_AITER_COMMIT} && \
+        sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
+        sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
+        git submodule update --init --recursive && \
+        pip install -r requirements.txt
+    "
+
+    # ROCm/aiter#5195's .co for the grouped dsv4 decode, which the Dockerfile
+    # copies in from the SGLang source tree.
+    docker exec ci_sglang bash -c "
+        mkdir -p /sgl-workspace/aiter/hsa/gfx950/mla_v4 && \
+        cp /sglang-checkout/python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
+           /sgl-workspace/aiter/hsa/gfx950/mla_v4/
+    "
+
+    # Same editable install as the Dockerfile, with GPU_ARCHS set to the stage's
+    # gfx name (the image's GPU_ARCH_LIST). Kernels are deliberately not
+    # prebuilt: the Dockerfile's PREBUILD_KERNELS=1 build_ext step takes about
+    # 2 hours per arch, longer than the job timeouts. They JIT-compile on first
+    # use instead, as in the other rebuild path below.
+    echo "[CI-AITER-CHECK] Installing AITER with GPU_ARCHS=${IMAGE_GFX}; kernels JIT-compile on first use (no PREBUILD_KERNELS, ~2h, exceeds job timeouts)"
+    docker exec ci_sglang bash -c "
+        cd /sgl-workspace/aiter && \
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${IMAGE_GFX} pip install --config-settings editable_mode=compat -e .
+    "
+
+    # torch 2.11 Dynamo may pass a base torch.Stream; drop after ROCm/aiter#4817.
+    # The Dockerfile applies this in every stage.
+    docker exec -i ci_sglang python3 - <<'PY'
+from pathlib import Path
+p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
+s = p.read_text()
+old = """        elif isinstance(arg, torch.cuda.Stream):
+            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+"""
+new = """        elif isinstance(arg, torch.Stream):
+            handle = getattr(arg, "cuda_stream", None)
+            if handle is None:
+                handle = torch.cuda.Stream(
+                    stream_id=arg.stream_id,
+                    device_index=arg.device_index,
+                    device_type=arg.device_type,
+                ).cuda_stream
+            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+"""
+if old in s:
+    p.write_text(s.replace(old, new))
+PY
+
+    echo "[CI-AITER-CHECK] Installed AITER: $(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'")"
+    echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ($(( SECONDS - _aiter_rebuild_start ))s) ==="
+    unset _aiter_rebuild_start
+elif [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
     # uninstall existing aiter
