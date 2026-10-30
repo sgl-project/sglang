@@ -66,6 +66,50 @@ def test_scheduler_ingress_binds_configured_port_only(monkeypatch):
     assert calls == [("tcp://127.0.0.1:5555", True, {"same_port": True})]
 
 
+def test_scheduler_ingress_reports_the_port_it_bound(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
+
+    class _Stop(Exception):
+        pass
+
+    def _stop(**_):
+        raise _Stop
+
+    bound = []
+
+    def _bind(*args, **kwargs):
+        bound.append(get_zmq_socket(*args, **kwargs))
+        return bound[-1]
+
+    monkeypatch.setattr(scheduler_module, "set_global_server_args", lambda **_: None)
+    monkeypatch.setattr(scheduler_module, "get_zmq_socket", _bind)
+    monkeypatch.setattr(scheduler_module, "GPUWorker", _stop)
+    monkeypatch.setattr(scheduler_module, "CPUWorker", _stop)
+    server_args = SimpleNamespace(
+        num_gpus=1,
+        dp_size=1,
+        scheduler_ports=[0],
+        progress_endpoint=None,
+        scheduler_endpoint_for=lambda replica: "tcp://127.0.0.1:0",
+    )
+    with pytest.raises(_Stop):
+        scheduler_module.Scheduler(
+            server_args, gpu_id=0, port_args=SimpleNamespace(master_port=None)
+        )
+    socket, returned_endpoint = bound[0]
+    try:
+        # The bind helper echoes port 0; clients need the port the OS assigned.
+        assert returned_endpoint == "tcp://127.0.0.1:0"
+        bound_port = int(socket.getsockopt_string(zmq.LAST_ENDPOINT).rsplit(":", 1)[1])
+        assert bound_port > 0
+        assert server_args.scheduler_ports == [bound_port]
+    finally:
+        socket.close(linger=0)
+        socket.context.destroy(linger=0)
+
+
 @pytest.mark.parametrize(
     "occupied", [None, "frontend", "encoder", "denoiser", "decoder"]
 )

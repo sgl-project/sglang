@@ -257,6 +257,31 @@ class TestSchedulerEndpoints(unittest.TestCase):
                     receiver.send(b"pong")
                     self.assertEqual(sender.recv(), b"pong")
 
+    def test_unset_scheduler_port_is_left_to_the_os(self):
+        """A port probed while parsing args and bound seconds later can be taken
+        by a concurrent launch on the same host; an unset ingress has no outside
+        callers, so each scheduler binds port 0 and reports the port it got."""
+        with patch.object(server_args_module, "is_port_available", return_value=True):
+            unset = _from_dict_without_model_resolution({"model_path": "test/model"})
+            explicit = _from_dict_without_model_resolution(
+                {"model_path": "test/model", "scheduler_port": 6000}
+            )
+        self.assertEqual(unset.scheduler_ports, [0])
+        self.assertTrue(unset.scheduler_endpoint.endswith(":0"))
+        # Remote clients dial an explicit port, so it is used as given.
+        self.assertEqual(explicit.scheduler_ports, [6000])
+
+    def test_scheduler_port_stays_fixed_when_peers_dial_it(self):
+        args = _from_dict_without_model_resolution({"model_path": "test/model"})
+        self.assertTrue(args._scheduler_port_is_ephemeral())
+        for name, value in (
+            ("disagg_role", RoleType.SERVER),
+            ("disagg_mode", True),
+            ("nnodes", 2),
+        ):
+            with self.subTest(name=name), patch.object(args, name, value):
+                self.assertFalse(args._scheduler_port_is_ephemeral())
+
 
 class TestServerArgsPathExpansion(_CudaPlatformTestCase):
     def _from_dict_without_model_resolution(self, kwargs):

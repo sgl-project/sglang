@@ -165,9 +165,11 @@ class Scheduler(
             endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
             # Clients connect to the configured endpoint, so never move to another port.
-            self.receiver, actual_endpoint = get_zmq_socket(
+            self.receiver, _ = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True, same_port=True
             )
+            # Port 0 resolves only at bind time, so read back what was bound.
+            actual_endpoint = self.receiver.getsockopt_string(zmq.LAST_ENDPOINT)
             self.actual_scheduler_port = int(actual_endpoint.rsplit(":", 1)[1])
             # Readers in this process, e.g. the metrics label, see the bound port.
             server_args.scheduler_ports[self.dp_replica] = self.actual_scheduler_port

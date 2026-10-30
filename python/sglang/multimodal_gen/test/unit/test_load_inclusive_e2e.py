@@ -160,7 +160,7 @@ def test_server_load_clock_excludes_warmup(
         (message % args) + "\n"
     )
 
-    def ready(payload, ranks, name_prefix):
+    def ready(payload, ranks, name_prefix, on_ready=None):
         restored_args = payload.materialize()
         assert isinstance(restored_args, ServerArgs)
         assert restored_args.num_gpus == workers
