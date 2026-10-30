@@ -1,5 +1,5 @@
 """The persistent FlashInfer MXFP4 CUTLASS MoE workspace: one buffer per device
-and stream, sized once by FlashInfer, reused by every eager call."""
+and stream, sized by FlashInfer for the largest layer, reused by every eager call."""
 
 import types
 import unittest
@@ -32,13 +32,16 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
     def setUp(self):
         fc._MXFP4_MOE_WORKSPACES.clear()
         fc._MXFP4_MOE_WORKSPACE_REJECTED = False
+        fc._mxfp4_moe_workspace_bytes.cache_clear()
         self.addCleanup(fc._MXFP4_MOE_WORKSPACES.clear)
+        self.addCleanup(fc._mxfp4_moe_workspace_bytes.cache_clear)
         self.stream = types.SimpleNamespace(cuda_stream=7)
         self.queries, self.allocations, self.flushes = [], [], []
 
         def size(*args, **kwargs):
             self.queries.append((args, kwargs))
-            return 1000 + args[0]
+            # Grows with the token bound and with top-k.
+            return 1000 + args[0] + args[4]
 
         def empty(nbytes, **kwargs):
             buffer = types.SimpleNamespace(nbytes=nbytes)
@@ -65,12 +68,12 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         self.empty.start()
         self.addCleanup(self.empty.stop)
 
-    def workspace(self, tokens, **kwargs):
+    def workspace(self, tokens, top_k=6, **kwargs):
         return fc._mxfp4_moe_workspace(
             x=fake_x(tokens, **kwargs),
             fc1_expert_weights=types.SimpleNamespace(dtype=torch.int64),
             w2_weight=types.SimpleNamespace(shape=(64, 4096, 576)),
-            top_k=6,
+            top_k=top_k,
             runner_config=MoeRunnerConfig(layer=_Layer()),
             activation_type="swiglu",
             use_mxfp8_act_scaling=True,
@@ -91,7 +94,7 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         self.assertEqual((kwargs["ep_size"], kwargs["ep_rank"]), (2, 0))
         self.assertTrue(kwargs["use_mxfp8_act_scaling"])
         self.assertFalse(kwargs["use_w4_group_scaling"])
-        self.assertEqual(first.nbytes, 1000 + 8192)
+        self.assertEqual(first.nbytes, 1000 + 8192 + 6)
         # The allocator's unused blocks are returned once, before the buffer is taken.
         self.assertEqual(len(self.flushes), 1)
 
@@ -99,7 +102,7 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         first = self.workspace(8192)
         second = self.workspace(16384)
         self.assertIsNot(second, first)
-        self.assertEqual(second.nbytes, 1000 + 16384)
+        self.assertEqual(second.nbytes, 1000 + 16384 + 6)
         self.assertIs(self.workspace(100), second)
 
     def test_each_stream_has_its_own_buffer(self):
@@ -115,6 +118,53 @@ class TestMxfp4MoeWorkspace(CustomTestCase):
         fc._MXFP4_MOE_WORKSPACE_REJECTED = True
         self.assertIsNone(self.workspace(8192))
         self.assertEqual(self.allocations, [])
+
+    def test_layers_on_a_stream_share_the_largest_buffer(self):
+        small = self.workspace(8192, top_k=6)
+        large = self.workspace(8192, top_k=8)
+        self.assertIsNot(large, small)
+        self.assertEqual(large.nbytes, 1000 + 8192 + 8)
+        self.assertIs(self.workspace(8192, top_k=6), large)
+        # Each layer's size is queried once.
+        self.assertEqual(len(self.queries), 2)
+
+
+class TestMxfp4MoeWorkspaceFallback(CustomTestCase):
+    def setUp(self):
+        fc._MXFP4_MOE_WORKSPACES.clear()
+        fc._MXFP4_MOE_WORKSPACE_REJECTED = False
+        self.addCleanup(fc._MXFP4_MOE_WORKSPACES.clear)
+        self.addCleanup(setattr, fc, "_MXFP4_MOE_WORKSPACE_REJECTED", False)
+
+    def test_a_rejected_size_falls_back_to_per_call_scratch(self):
+        fc._MXFP4_MOE_WORKSPACES[(0, 7)] = (10, "held")
+        calls = []
+
+        def run(ws):
+            calls.append(ws)
+            if ws is not None:
+                raise RuntimeError("workspace_buffer too small: need 20 bytes, got 10")
+
+        fc._run_with_mxfp4_moe_workspace(run, "held")
+        self.assertEqual(calls, ["held", None])
+        self.assertTrue(fc._MXFP4_MOE_WORKSPACE_REJECTED)
+        self.assertEqual(fc._MXFP4_MOE_WORKSPACES, {})
+
+    def test_other_errors_propagate(self):
+        def fail(ws):
+            raise RuntimeError("illegal memory access")
+
+        with self.assertRaises(RuntimeError):
+            fc._run_with_mxfp4_moe_workspace(fail, "held")
+        self.assertFalse(fc._MXFP4_MOE_WORKSPACE_REJECTED)
+
+        def too_small(ws):
+            raise RuntimeError("workspace_buffer too small")
+
+        # Without a workspace there is nothing to fall back from.
+        with self.assertRaises(RuntimeError):
+            fc._run_with_mxfp4_moe_workspace(too_small, None)
+        self.assertFalse(fc._MXFP4_MOE_WORKSPACE_REJECTED)
 
 
 if __name__ == "__main__":

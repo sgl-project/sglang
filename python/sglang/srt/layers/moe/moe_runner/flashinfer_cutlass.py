@@ -8,6 +8,7 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -187,10 +188,55 @@ def _cutlass_moe_tune_max_num_tokens(num_tokens: int) -> int:
 # One workspace per (device, stream), reused across eager calls. Without one,
 # FlashInfer allocates scratch sized by each call's token count on every MoE
 # call (about 1 GiB for an 8K-token MXFP4 prefill chunk), so chunks of different
-# sizes leave differently sized large blocks in the caching allocator.
+# sizes leave differently sized large blocks in the caching allocator. Layers on
+# a stream run one at a time, so they share the buffer; it grows to the largest
+# size any of them needs.
 _MXFP4_MOE_WORKSPACES: dict = {}
 # Set if FlashInfer ever rejects a queried size; calls then allocate per call.
 _MXFP4_MOE_WORKSPACE_REJECTED = False
+
+
+@functools.lru_cache(maxsize=64)
+def _mxfp4_moe_workspace_bytes(
+    max_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts_total: int,
+    top_k: int,
+    x_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    activation_type,
+    tp_size: int,
+    tp_rank: int,
+    ep_size: int,
+    ep_rank: int,
+    use_mxfp8_act_scaling: bool,
+    use_fused_finalize: bool,
+    use_wfp4afp8_humming: bool,
+    device: torch.device,
+) -> int:
+    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
+
+    return cutlass_fused_moe_workspace_size(
+        max_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts_total,
+        top_k,
+        x_dtype=x_dtype,
+        weight_dtype=weight_dtype,
+        output_dtype=torch.bfloat16,
+        activation_type=activation_type,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        use_w4_group_scaling=not use_mxfp8_act_scaling,
+        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+        use_fused_finalize=use_fused_finalize,
+        use_wfp4afp8_humming=use_wfp4afp8_humming,
+        device=device,
+    )
 
 
 def _mxfp4_moe_workspace(
@@ -205,51 +251,63 @@ def _mxfp4_moe_workspace(
     use_wfp4afp8_humming: bool,
     use_fused_finalize: bool,
 ) -> Optional[torch.Tensor]:
-    """The workspace buffer for this eager call, sized by FlashInfer for the
-    largest prefill on this stream; None under graph capture, where the call's
-    own allocation belongs to the graph's pool."""
+    """The workspace buffer for this eager call, at least the size FlashInfer
+    reports for this layer's arguments at the call's tuning bound; None under
+    graph capture, where the call's own allocation belongs to the graph's pool."""
     if (
         _MXFP4_MOE_WORKSPACE_REJECTED
         or x.device.type != "cuda"
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
-    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
-
-    stream = torch.cuda.current_stream(x.device).cuda_stream
-    key = (x.device.index, stream)
-    max_tokens = max(x.shape[0], _cutlass_moe_tune_max_num_tokens(x.shape[0]))
-    held = _MXFP4_MOE_WORKSPACES.get(key)
-    if held is not None and held[0] >= x.shape[0]:
-        return held[1]
-    nbytes = cutlass_fused_moe_workspace_size(
-        max_tokens,
+    nbytes = _mxfp4_moe_workspace_bytes(
+        max(x.shape[0], _cutlass_moe_tune_max_num_tokens(x.shape[0])),
         x.shape[1],
         # w2 is packed FP4, two values a byte.
         w2_weight.shape[2] * 2,
         w2_weight.shape[0] * runner_config.moe_ep_size,
         top_k,
-        x_dtype=x.dtype,
-        weight_dtype=fc1_expert_weights.dtype,
-        output_dtype=torch.bfloat16,
-        activation_type=activation_type,
-        tp_size=runner_config.moe_tp_size,
-        tp_rank=runner_config.moe_tp_rank,
-        ep_size=runner_config.moe_ep_size,
-        ep_rank=runner_config.moe_ep_rank,
-        use_w4_group_scaling=not use_mxfp8_act_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        use_fused_finalize=use_fused_finalize,
-        use_wfp4afp8_humming=use_wfp4afp8_humming,
-        device=x.device,
+        x.dtype,
+        fc1_expert_weights.dtype,
+        activation_type,
+        runner_config.moe_tp_size,
+        runner_config.moe_tp_rank,
+        runner_config.moe_ep_size,
+        runner_config.moe_ep_rank,
+        use_mxfp8_act_scaling,
+        use_fused_finalize,
+        use_wfp4afp8_humming,
+        x.device,
     )
+    key = (x.device.index, torch.cuda.current_stream(x.device).cuda_stream)
+    held = _MXFP4_MOE_WORKSPACES.get(key)
+    if held is not None and held[0] >= nbytes:
+        return held[1]
     _MXFP4_MOE_WORKSPACES.pop(key, None)
-    # Taken once per stream: return the allocator's unused blocks first, so the
-    # buffer comes from free memory rather than an OOM retry.
+    # Taken once per stream and size: return the allocator's unused blocks first,
+    # so the buffer comes from free memory rather than an OOM retry.
     torch.cuda.empty_cache()
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
-    _MXFP4_MOE_WORKSPACES[key] = (max_tokens, workspace)
+    _MXFP4_MOE_WORKSPACES[key] = (nbytes, workspace)
     return workspace
+
+
+def _run_with_mxfp4_moe_workspace(run, workspace: Optional[torch.Tensor]) -> None:
+    """Run the MoE with the workspace; if FlashInfer rejects its size, stop using
+    workspaces for this process and run with per-call scratch instead."""
+    global _MXFP4_MOE_WORKSPACE_REJECTED
+    try:
+        run(workspace)
+    except Exception as e:  # tvm-ffi check failures are not all RuntimeError
+        if workspace is None or "workspace_buffer too small" not in str(e):
+            raise
+        # A size query that disagrees with the call must not fail serving.
+        _MXFP4_MOE_WORKSPACE_REJECTED = True
+        _MXFP4_MOE_WORKSPACES.clear()
+        logger.warning(
+            "FlashInfer MoE workspace too small; using per-call scratch: %s", e
+        )
+        run(None)
 
 
 def _activation_type(runner_config: MoeRunnerConfig):
@@ -700,19 +758,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
             **humming_kwargs,
         )
 
-    try:
-        run(workspace)
-    except Exception as e:  # tvm-ffi check failures are not all RuntimeError
-        if workspace is None or "workspace_buffer too small" not in str(e):
-            raise
-        # A size query that disagrees with the call must not fail serving.
-        global _MXFP4_MOE_WORKSPACE_REJECTED
-        _MXFP4_MOE_WORKSPACE_REJECTED = True
-        _MXFP4_MOE_WORKSPACES.clear()
-        logger.warning(
-            "FlashInfer MoE workspace too small; using per-call scratch: %s", e
-        )
-        run(None)
+    _run_with_mxfp4_moe_workspace(run, workspace)
 
     if do_pad:
         out = out[:, :origin_hidden].contiguous()
