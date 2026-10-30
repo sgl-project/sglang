@@ -53,9 +53,6 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.logprob_result_processor import (
-    SchedulerLogprobResultProcessor,
-)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -77,19 +74,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
-
-
-def _handoff_processor() -> SchedulerBatchResultProcessor:
-    fields = dict.fromkeys(
-        f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
-    )
-    fields.update(
-        model_config=SimpleNamespace(
-            think_end_ids=[999], self_opened_think_start_ids=None
-        ),
-        logprob_result_processor=SchedulerLogprobResultProcessor(model_config=None),
-    )
-    return SchedulerBatchResultProcessor(**fields)
 
 
 def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
@@ -1865,10 +1849,16 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                         sampling_logprobs_mode=mode,
                     )
                 )
+                fields = dict.fromkeys(
+                    f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                )
+                fields["model_config"] = SimpleNamespace(
+                    self_opened_think_start_ids=None
+                )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
-                    batch_result_processor=_handoff_processor(),
+                    batch_result_processor=SchedulerBatchResultProcessor(**fields),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
