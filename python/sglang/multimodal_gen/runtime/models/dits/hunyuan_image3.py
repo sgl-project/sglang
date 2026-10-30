@@ -533,8 +533,9 @@ class HunYuanSparseMoeBlock(nn.Module):
         if shared_out is not None:
             final_hidden_states = final_hidden_states + shared_out
 
-        # NPU: AscendTPDispatcher all-gathers the FusedMoE output internally;
-        # the shared MLP's down_proj all-reduces its own output.
+        # NPU: the Ascend MoE finalize all-gathers the FusedMoE output
+        # internally (moe_runner/ascend.py); the shared MLP's down_proj
+        # all-reduces its own output.
 
         return final_hidden_states.view(orig_shape)
 

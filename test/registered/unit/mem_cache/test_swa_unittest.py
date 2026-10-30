@@ -399,6 +399,7 @@ class _RowCache:
     def __init__(self, allocator, row):
         self.req_to_token_pool = SimpleNamespace(req_to_token=row.unsqueeze(0))
         self.token_to_kv_pool_allocator = allocator
+        self.logical_page_size = allocator.page_size
         self.page_size = allocator.page_size
 
 

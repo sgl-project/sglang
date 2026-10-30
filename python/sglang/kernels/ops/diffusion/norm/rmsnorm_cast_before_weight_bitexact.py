@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MOSSImage RMSNorm: FP32 statistics, BF16 rounding before learned scale.
+"""RMSNorm with FP32 statistics and BF16 rounding before learned scale.
 
-For widths 128/3072 with at least 16 rows, reproduce ATen's vectorized FP32
+For widths 128/3072/3840 with at least 16 rows, reproduce ATen's vectorized FP32
 mean reduction in one kernel. CUDA Reduce.cuh uses 32 lanes, four accumulators
 per lane, sequential fragment accumulation, then descending shuffle offsets.
 Other shapes retain ATen's mean with fused pointwise operations around it.
@@ -32,6 +32,7 @@ def _ordered_rstd(
     ROWS: tl.constexpr,
     HEADS: tl.constexpr = 1,
     TOKEN_STRIDE: tl.constexpr = 0,
+    EPS: tl.constexpr = 1e-6,
 ):
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     if TOKEN_STRIDE == 0 or TOKEN_STRIDE == HEADS * DIM:
@@ -59,7 +60,7 @@ def _ordered_rstd(
     total = _fold_halves(total, ROWS, 2)
     total = _fold_halves(total, ROWS, 1)
     mean = mul_rn_f32(tl.reshape(total, (ROWS,)), 1.0 / DIM)
-    return cuda_rsqrtf(mean + 1e-6)
+    return cuda_rsqrtf(mean + EPS)
 
 
 @triton.jit
@@ -71,9 +72,10 @@ def _ordered_norm_kernel(
     DIM: tl.constexpr,
     ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
+    EPS: tl.constexpr,
 ):
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
-    rstd = _ordered_rstd(X, M, DIM, ROWS)
+    rstd = _ordered_rstd(X, M, DIM, ROWS, EPS=EPS)
 
     cols = tl.arange(0, BLOCK)
     mask = (rows[:, None] < M) & (cols[None, :] < DIM)
@@ -163,15 +165,22 @@ def _square_kernel(X, Squared, N: tl.constexpr, BLOCK: tl.constexpr):
 
 @triton.jit
 def _normalize_kernel(
-    X, Mean, Weight, Out, N: tl.constexpr, DIM: tl.constexpr, BLOCK: tl.constexpr
+    X,
+    Mean,
+    Weight,
+    Out,
+    N: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+    EPS: tl.constexpr,
 ):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < N
     x = tl.load(X + offsets, mask, 0).to(tl.float32)
     mean = tl.load(Mean + offsets // DIM, mask, 0)
     weight = tl.load(Weight + offsets % DIM, mask, 0).to(tl.float32)
-    normalized = mul_rn_f32(x, cuda_rsqrtf(mean + 1e-6))
-    # This rounding precedes gamma in MOSSImage, unlike conventional RMSNorm.
+    normalized = mul_rn_f32(x, cuda_rsqrtf(mean + EPS))
+    # Round before gamma, as required by MOSSImage and Ming-Image.
     normalized = normalized.to(tl.bfloat16).to(tl.float32)
     tl.store(Out + offsets, mul_rn_f32(normalized, weight), mask)
 
@@ -187,7 +196,7 @@ def can_use_rmsnorm_cast_before_weight(
         is_cuda()
         and device.type == "cuda"
         and dtype == torch.bfloat16
-        and eps == 1e-6
+        and eps in (1e-6, 1e-5)
         and contiguous
     )
 
@@ -232,7 +241,7 @@ def _valid_rmsnorm_cast_before_weight(
 
 
 def _fake_rmsnorm_cast_before_weight(
-    x: torch.Tensor, weight: torch.Tensor
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -337,11 +346,14 @@ def rmsnorm_cast_before_weight_rope_bitexact(
     fake_impl=_fake_rmsnorm_cast_before_weight,
 )
 def rmsnorm_cast_before_weight_bitexact(
-    x: torch.Tensor, weight: torch.Tensor
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
-    """Match ``(x.float() * rsqrt(mean(x.float()**2) + 1e-6)).bf16() * w``."""
-    if not _valid_rmsnorm_cast_before_weight(x, weight):
-        raise ValueError("RMSNorm requires contiguous CUDA BF16 inputs and weight.")
+    """Match ``(x.float() * rsqrt(mean(x.float()**2) + eps)).bf16() * w``."""
+    if not _valid_rmsnorm_cast_before_weight(x, weight) or eps not in (1e-6, 1e-5):
+        raise ValueError(
+            "RMSNorm requires contiguous CUDA BF16 inputs and weight, "
+            "with eps=1e-6 or eps=1e-5."
+        )
     with torch.cuda.device(x.device):
         out = torch.empty_like(x)
         dim = x.shape[-1]
@@ -349,7 +361,7 @@ def rmsnorm_cast_before_weight_bitexact(
         # At least 16 rows keeps ATen's reduction width at 32 lanes for
         # these dimensions. Smaller row counts can select a different tree.
         # Larger FP32 workspaces can make TensorIterator split the reduction.
-        if dim in (128, 3072) and rows >= 16 and x.numel() < 2**29:
+        if dim in (128, 3072, 3840) and rows >= 16 and x.numel() < 2**29:
             _ordered_norm_kernel[(triton.cdiv(rows, 4),)](
                 x,
                 weight,
@@ -358,6 +370,7 @@ def rmsnorm_cast_before_weight_bitexact(
                 dim,
                 4,
                 triton.next_power_of_2(dim),
+                eps,
                 num_warps=4,
                 enable_fp_fusion=False,
             )
@@ -367,6 +380,14 @@ def rmsnorm_cast_before_weight_bitexact(
         _square_kernel[grid](x, squared, x.numel(), 1024, enable_fp_fusion=False)
         mean = squared.mean(-1, keepdim=True)
         _normalize_kernel[grid](
-            x, mean, weight, out, x.numel(), x.shape[-1], 1024, enable_fp_fusion=False
+            x,
+            mean,
+            weight,
+            out,
+            x.numel(),
+            x.shape[-1],
+            1024,
+            eps,
+            enable_fp_fusion=False,
         )
     return out

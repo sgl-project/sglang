@@ -20,6 +20,8 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -237,12 +239,19 @@ class TestKvChecksumComputer(unittest.TestCase):
         self.assertEqual(value, expected)
 
 
+def _plain_kv_pool():
+    """A one-sub-pool KV pool: no window sub-pool, no wrapped view."""
+    pool = SimpleNamespace(start_layer=0, layer_num=1)
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
     def __init__(self, computer, req_to_token):
         self.kv_checksum_computer = computer
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=lambda: SimpleNamespace()
+            page_size=1, get_kvcache=_plain_kv_pool
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
