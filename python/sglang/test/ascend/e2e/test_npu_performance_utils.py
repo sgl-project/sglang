@@ -695,28 +695,6 @@ def run_aisbench(
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
 
-    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
-        # aisbench retry of the pure-decode case (user-requested): identical
-        # natural-text rows (one GSM8K QA pool padded past input_len) through
-        # the PLAIN aisbench perf path - no prefix-tool chain involved. The
-        # known risk is dataset dedup of identical rows (run 40431214784 saw
-        # 12 rows collapse to 4 there): watch "Total data num" in the log -
-        # 12 means no dedup, fewer means collapse. The sh wrapper is fed
-        # dataset-type gsm8k; the file layout is a plain gsm8k jsonl.
-        dataset_file = "/tmp/datasets/gsm8k_shared_prefix.jsonl"
-        if not os.path.exists(dataset_file):
-            generate_gsm8k_shared_prefix_dataset(
-                model_path=model_path,
-                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
-                batch_size=num_prompts,
-                input_len=input_len,
-                output_file=dataset_file,
-                output_format="aisbench",
-            )
-        dataset_path = dataset_file
-        dataset_type = AISBENCHMARK_DATASET_GSM8K
-        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
-
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
         if not os.path.exists(dataset_file):

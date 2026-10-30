@@ -178,13 +178,12 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
-    # AISBENCH RETRY of the pure-decode case (user-requested): identical
-    # GSM8K natural-text rows through the PLAIN aisbench perf path - no
-    # prefix-tool chain involved. Proven fallback if this fails: revert to
-    # benchmark_tool = BENCHSERVING + dataset_name = "gsm8k-shared-prefix"
-    # (run 41001026946, Mean TPOT 22.10 ms SUCCESS).
-    benchmark_tool = AISBENCHMARK
-    dataset_type = "gsm8k-shared-prefix"
+    benchmark_tool = BENCHSERVING
+    # Natural-text shared prefix from GSM8K: the built-in
+    # generated-shared-prefix prompts are random token ids the DSPARK draft
+    # cannot predict (accept len ~1.6); GSM8K question text keeps the draft
+    # acceptance in the dev 3-4 range (dev confirmed, run 40993824705).
+    dataset_name = "gsm8k-shared-prefix"
     dataset_path = None
     input_len = 131072
     output_len = 1024
