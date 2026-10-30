@@ -261,7 +261,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb import isolate_npu_draft_recording
+    from sglang.srt.hardware_backend.npu.eplb_statistics import (
+        isolate_npu_draft_recording,
+    )
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()

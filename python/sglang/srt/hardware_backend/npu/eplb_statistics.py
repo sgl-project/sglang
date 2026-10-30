@@ -12,12 +12,50 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend sender-route recording and statistics communication."""
+"""Ascend EPLB statistics, communication selection, and draft isolation."""
 
 from contextlib import contextmanager
+from functools import wraps
+
+import torch.distributed as dist
 
 from sglang.srt.eplb import expert_distribution as distribution
-from sglang.srt.hardware_backend.npu.eplb import NpuEplbAccumulatorMixin
+from sglang.srt.hardware_backend.npu.eplb import (
+    get_eplb_device_group,
+    warmup_eplb_communication,
+)
+
+
+def isolate_npu_draft_recording(forward):
+    """Disable draft hooks and let the NPU recorder skip reset/append."""
+
+    @wraps(forward)
+    def wrapped(runner, *args, **kwargs):
+        if runner.is_draft_worker:
+            recorder = distribution.get_global_expert_distribution_recorder()
+            with recorder.disable_this_region():
+                return forward(runner, *args, **kwargs)
+        return forward(runner, *args, **kwargs)
+
+    return wrapped
+
+
+class NpuEplbAccumulatorMixin:
+    """Share TP communication and initialize migration channels before recording."""
+
+    def __init__(self, *args, **kwargs):
+        from sglang.srt.runtime_context import get_exec
+
+        moe = get_exec().moe
+        if moe.enable_eplb and not moe.elastic_ep_backend:
+            # Join/scale paths need their own collective initialization order.
+            warmup_eplb_communication()
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _communication_group(self) -> dist.ProcessGroup:
+        # Resolve lazily so a replaced TP group is used by subsequent dumps.
+        return get_eplb_device_group()
 
 
 class _NpuDetailAccumulator(NpuEplbAccumulatorMixin, distribution._DetailAccumulator):
@@ -56,7 +94,8 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id, forward_batch):
-        # The NPU entry-point guard disables the whole draft lifecycle.
+        # The entry guard runs before reset; model-local guards start too late.
+        # Skip append as well, so draft zeros do not evict target window entries.
         if self._disable_all:
             yield {}
         else:

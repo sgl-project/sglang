@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend EPLB adapters used by the shared recorder and weight updater.
+"""Ascend EPLB communication and expert-weight migration.
 
 Callers select these helpers after NPU distributed initialization.
 Import torch_npu only when an NPU operation actually needs it.
@@ -21,7 +21,6 @@ Import torch_npu only when an NPU operation actually needs it.
 import logging
 import time
 from collections import deque
-from functools import wraps
 from typing import Callable
 
 import torch
@@ -74,24 +73,6 @@ def warmup_eplb_communication() -> None:
         world_size,
         time.perf_counter() - start,
     )
-
-
-class NpuEplbAccumulatorMixin:
-    """Share TP communication and initialize migration channels before recording."""
-
-    def __init__(self, *args, **kwargs):
-        from sglang.srt.runtime_context import get_exec
-
-        moe = get_exec().moe
-        if moe.enable_eplb and not moe.elastic_ep_backend:
-            # Join/scale paths need their own collective initialization order.
-            warmup_eplb_communication()
-        super().__init__(*args, **kwargs)
-
-    @property
-    def _communication_group(self) -> dist.ProcessGroup:
-        # Resolve lazily so a replaced TP group is used by subsequent dumps.
-        return get_eplb_device_group()
 
 
 def prepare_expert_weight_update(
@@ -238,20 +219,3 @@ class ExpertWeightStaging:
             )
             # Keep the storage addresses referenced by captured graphs.
             weight.copy_(restored)
-
-
-def isolate_npu_draft_recording(forward):
-    """Keep target EPLB statistics untouched during NPU draft execution."""
-
-    @wraps(forward)
-    def wrapped(runner, *args, **kwargs):
-        if runner.is_draft_worker:
-            from sglang.srt.eplb.expert_distribution import (
-                get_global_expert_distribution_recorder,
-            )
-
-            with get_global_expert_distribution_recorder().disable_this_region():
-                return forward(runner, *args, **kwargs)
-        return forward(runner, *args, **kwargs)
-
-    return wrapped
