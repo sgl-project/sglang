@@ -1362,6 +1362,11 @@ class Req(ReqDllmMixin):
         # processed.
         self.inflight_middle_chunks = 0
 
+        # Set when a result of this request is processed: whether a launched
+        # (or planned) batch already runs the request again. If that result
+        # finishes it, the rerun still advances its recurrent state.
+        self.relaunched_in_flight = False
+
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
