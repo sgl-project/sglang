@@ -215,6 +215,7 @@ class TestUnifiedCacheWriteUsage(CustomTestCase):
 
     def _req(self, cache, allocator, pool, prompt, output=(), *, mamba=False):
         from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.mem_cache.static_kv_storage import acquire_rows
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         req = Req(
@@ -224,7 +225,7 @@ class TestUnifiedCacheWriteUsage(CustomTestCase):
             sampling_params=SamplingParams(temperature=0, max_new_tokens=2),
         )
         req._cache_write_tracking_enabled = True
-        pool.alloc([req])
+        self.assertIsNotNone(acquire_rows(pool, pool.state, [req]))
         req.output_ids = array("q", output)
         req.full_untruncated_fill_ids = array("q", (*prompt, *output))
         size = len(req.full_untruncated_fill_ids)

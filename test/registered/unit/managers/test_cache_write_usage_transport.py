@@ -11,7 +11,7 @@ import pickle
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import msgspec
 from pydantic import TypeAdapter
@@ -22,6 +22,10 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager  # noqa: E402
+from sglang.srt.managers.incremental_detokenize import (  # noqa: E402
+    DetokenizeHeader,
+    DetokenizeStateTable,
+)
 from sglang.srt.managers.io_struct import BatchStrOutput  # noqa: E402
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
@@ -35,14 +39,19 @@ from sglang.srt.managers.multi_tokenizer_mixin import (  # noqa: E402
     _handle_output_by_index,
 )
 from sglang.srt.managers.scheduler_components.output_streamer import (  # noqa: E402
+    OutputSink,
     _GenerationStreamAccumulator,
 )
 from sglang.srt.managers.tokenizer_manager import ReqState  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
 )
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats  # noqa: E402
+from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
+from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -59,7 +68,8 @@ def _batch(cls, values):
         rids=[f"cache-{i}" for i in range(count)],
         http_worker_ipcs=[None] * count,
         finished_reasons=[None] * count,
-        output_ids=[array("i", [1])] * count,
+        output_ids_flat=array("q", [1] * count),
+        output_ids_offsets=list(range(count + 1)),
         reasoning_tokens=[0] * count,
         completion_tokens=[1] * count,
         cache_write_tokens=values,
@@ -79,11 +89,16 @@ def _batch(cls, values):
     )
     if cls is BatchTokenIDOutput:
         fields.update(
-            decode_ids=[array("i", [1])] * count,
-            read_offsets=[0] * count,
-            skip_special_tokens=[True] * count,
-            spaces_between_special_tokens=[True] * count,
-            no_stop_trim=[False] * count,
+            detokenize_headers=[
+                DetokenizeHeader(
+                    prompt_tail_ids=array("q"),
+                    skip_special_tokens=True,
+                    spaces_between_special_tokens=True,
+                    no_stop_trim=False,
+                    http_worker_ipc=None,
+                )
+            ]
+            * count,
         )
     else:
         fields["output_strs"] = ["hello"] * count
@@ -92,11 +107,23 @@ def _batch(cls, values):
 
 def _detokenize(payload):
     manager = DetokenizerManager.__new__(DetokenizerManager)
-    manager._decode_batch_token_id_output = lambda obj: ["hello"] * len(obj.rids)
+    manager.vocab_size = None
+    manager.detokenize_state_table = DetokenizeStateTable(capacity=16)
+    manager._decode_batch_token_id_output = lambda obj, states: (
+        ["hello"] * len(obj.rids)
+    )
     return manager.handle_batch_token_id_out(payload)
 
 
-class TestCacheWriteTransport(CustomTestCase):
+class CacheWriteTransportTestCase(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", device="cpu"), role="tokenizer")
+
+
+class TestCacheWriteTransport(CacheWriteTransportTestCase):
     def test_unknown_zero_and_positive_survive_real_transport(self):
         token_output = _batch(BatchTokenIDOutput, [None, 0, 16])
         token_output = msgpack_decode(msgpack_encode(token_output))
@@ -116,7 +143,7 @@ class TestCacheWriteTransport(CustomTestCase):
             with self.subTest(payload=cls.__name__):
                 self.assertEqual(cls.__struct_fields__[-1], "cache_write_tokens")
                 wire = msgspec.msgpack.decode(msgpack_encode(_batch(cls, [16])))
-                wire.pop()  # old array-like IPC has no newly appended field
+                wire.pop()  # same-base IPC sender without the appended cache field
                 decoded = msgpack_decode(msgspec.msgpack.encode(wire))
                 self.assertIsNone(decoded.cache_write_tokens)
                 self.assertIsNone(
@@ -142,6 +169,7 @@ class TestCacheWriteTransport(CustomTestCase):
             send_output_token_logprobs_offset=0,
             send_decode_id_offset=0,
             origin_input_ids=[9] * 20,
+            origin_input_ids_unpadded=array("q", [9] * 20),
             finished_reason=None,
             decoded_text="",
             reasoning_tokens=0,
@@ -157,7 +185,7 @@ class TestCacheWriteTransport(CustomTestCase):
             time_stats=None,
             customized_info=None,
             check_match_stop_str_prefix=lambda: False,
-            init_incremental_detokenize=lambda: ([1], 0),
+            take_detokenize_header_due=Mock(side_effect=[True, False, False]),
         )
         snapshots = []
         for value in (8, 16, 16):
@@ -185,6 +213,7 @@ class TestCacheWriteTransport(CustomTestCase):
                 ),
                 is_request_level_customized_info_key=lambda key: False,
                 current_weight_version=None,
+                output_sink=OutputSink.DETOKENIZER,
             )
             acc.accept(req=req)
             snapshots.append(acc.to_payload(dp_rank=0, is_idle_batch=False))
@@ -194,7 +223,9 @@ class TestCacheWriteTransport(CustomTestCase):
         )
 
 
-class TestCacheWriteNativeMetadata(unittest.IsolatedAsyncioTestCase, CustomTestCase):
+class TestCacheWriteNativeMetadata(
+    unittest.IsolatedAsyncioTestCase, CacheWriteTransportTestCase
+):
     async def test_native_metadata_omits_unknown_and_keeps_measured_zero(self):
         for cls in (BatchTokenIDOutput, BatchStrOutput):
             for value in (None, 0, 16):
@@ -217,8 +248,16 @@ class TestCacheWriteNativeMetadata(unittest.IsolatedAsyncioTestCase, CustomTestC
                         "sglang.srt.managers.tokenizer_manager.get_serving",
                         return_value=SimpleNamespace(batch_notify_size=1),
                     ):
-                        await manager._handle_batch_output(_batch(cls, [value]))
+                        payload = _batch(cls, [value])
+                        payload.prefill_weight_versions = [
+                            [WeightVersionSpan(version="prefill-v1", start=0, end=20)]
+                        ]
+                        await manager._handle_batch_output(payload)
                     meta = state.out_list[-1]["meta_info"]
+                    self.assertEqual(
+                        meta["prefill_weight_versions"],
+                        [{"version": "prefill-v1", "start": 0, "end": 20}],
+                    )
                     if value is None:
                         self.assertNotIn("cache_write_tokens", meta)
                     else:
@@ -273,7 +312,7 @@ class TestCacheWriteNativeMetadata(unittest.IsolatedAsyncioTestCase, CustomTestC
             )
 
 
-class TestCacheWriteReportingWindowTransport(CustomTestCase):
+class TestCacheWriteReportingWindowTransport(CacheWriteTransportTestCase):
     def test_native_json_cannot_select_reporting_window(self):
         adapter = TypeAdapter(GenerateReqInput)
         name = "_cache_write_reporting_suffix_tokens"
@@ -310,9 +349,7 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
         manager.tokenizer = None
         manager.model_config = SimpleNamespace(vocab_size=100)
         manager.rid_to_state = {
-            obj.rid: SimpleNamespace(
-                time_stats=SimpleNamespace(set_tokenize_finish_time=str)
-            )
+            obj.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
         }
         with patch(
             "sglang.srt.managers.tokenizer_manager.get_disagg",
@@ -320,8 +357,9 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
         ):
             tokenized = manager._create_tokenized_object(obj, None, obj.input_ids)
         self.assertEqual(tokenized.cache_write_reporting_suffix_tokens, 3)
-        tokenized.wrap_pickle_fields()
-        encoded = msgpack_encode(tokenized)
+        with patch("sglang.srt.managers.io_struct._USE_PICKLE_IPC", False):
+            tokenized.wrap_pickle_fields()
+            encoded = msgpack_encode(tokenized)
         self.assertEqual(msgpack_decode(encoded).cache_write_reporting_suffix_tokens, 3)
         self.assertEqual(
             pickle.loads(pickle.dumps(tokenized)).cache_write_reporting_suffix_tokens, 3
