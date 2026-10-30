@@ -94,23 +94,6 @@ class SenseNovaMHCRouter(nn.Module):
         return (mixed + update).flatten(-2)
 
 
-def _stage_facts(
-    config: SenseNovaLoopTextConfig, execution_layer_id: int, *, residual=None
-):
-    physical_layer_id = config.execution_plan[execution_layer_id]
-    settings = config.mhc
-    if settings is None or not settings["start"] <= physical_layer_id < settings["end"]:
-        layer_class = qwen3_5.Qwen3_5ForCausalLM.decoder_layer_types[
-            config.layers_block_type[execution_layer_id]
-        ]
-        return layer_class.stage_facts(config, execution_layer_id)
-    residual = MHCState.facts() if residual is None else residual
-    return (
-        declare_attn(read=residual.attn_readout, update=residual.attn_update),
-        declare_ffn(read=residual.ffn_readout, update=residual.ffn_update),
-    )
-
-
 class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
     def __init__(
         self,
@@ -172,7 +155,7 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
                     hc_post=SenseNovaMHCRouter.merge,
                     is_last_layer=physical_layer_id == config.mhc["end"] - 1,
                 ).residual_ops()
-            attn, ffn = _stage_facts(config, execution_layer_id, residual=residual)
+            attn, ffn = self._stage_facts(config, execution_layer_id, residual=residual)
             layer.attn_boundary, layer.ffn_boundary = append_stages(
                 (attn, layer.input_layernorm),
                 (ffn, layer.post_attention_layernorm),
@@ -183,7 +166,7 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
             config.num_hidden_layers,
             get_layer,
             prefix=f"{prefix}.layers",
-            stage_facts=lambda execution_layer_id: _stage_facts(
+            stage_facts=lambda execution_layer_id: self._stage_facts(
                 config, execution_layer_id
             ),
         )
@@ -194,6 +177,26 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
             physical_layer_id: config.execution_plan.index(physical_layer_id)
             for physical_layer_id in range(config.physical_num_hidden_layers)
         }
+
+    @staticmethod
+    def _stage_facts(
+        config: SenseNovaLoopTextConfig, execution_layer_id: int, *, residual=None
+    ):
+        physical_layer_id = config.execution_plan[execution_layer_id]
+        settings = config.mhc
+        if (
+            settings is None
+            or not settings["start"] <= physical_layer_id < settings["end"]
+        ):
+            layer_class = qwen3_5.Qwen3_5ForCausalLM.decoder_layer_types[
+                config.layers_block_type[execution_layer_id]
+            ]
+            return layer_class.stage_facts(config, execution_layer_id)
+        residual = MHCState.facts() if residual is None else residual
+        return (
+            declare_attn(read=residual.attn_readout, update=residual.attn_update),
+            declare_ffn(read=residual.ffn_readout, update=residual.ffn_update),
+        )
 
     @staticmethod
     def _new_visit(
