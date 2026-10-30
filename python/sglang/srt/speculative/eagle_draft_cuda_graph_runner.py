@@ -392,33 +392,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 and forward_batch.can_run_dp_draft_cuda_graph
             )
 
-        if (
-            not self.eagle_worker.seed_dsa_topk_from_draft_extend
-            or self.attn_dp_size <= 1
-        ):
-            return is_bs_supported
-
-        # A PD-disagg IndexShare seed is transferred asynchronously, so seed
-        # availability is request-local: a real rank can miss it while idle
-        # ranks have no request at all. The draft forward contains TP/EP
-        # collectives, so all ranks must still choose the same graph/eager
-        # path or the mismatched collectives hang. Reduce the final decision
-        # across the model TP group, which contains all attention-DP ranks
-        # for this pipeline stage.
-        seed_ready = forward_batch.forward_mode.is_idle() or (
-            spec_info is not None and spec_info.dsa_topk_indices is not None
-        )
-        decision = torch.tensor(
-            int(is_bs_supported and seed_ready),
-            dtype=torch.int32,
-            device="cpu",
-        )
-        torch.distributed.all_reduce(
-            decision,
-            op=torch.distributed.ReduceOp.MIN,
-            group=get_parallel().tp_group.cpu_group,
-        )
-        return bool(decision.item())
+        return is_bs_supported
 
     # -----------------------------------------------------------------
     # Capture (per-shape)
