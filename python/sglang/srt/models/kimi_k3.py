@@ -369,7 +369,7 @@ _EP_FRONT_LOGGED = False
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
-    optional quant-method capability; only the unquantized method has it."""
+    optional quant-method capability (unquantized and FP8 methods have it)."""
     return getattr(o_proj.quant_method, "apply_into", None) is not None
 
 
