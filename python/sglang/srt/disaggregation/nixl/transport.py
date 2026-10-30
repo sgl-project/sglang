@@ -283,15 +283,22 @@ class NixlTransport(Transport):
         return self._agent.check_remote_metadata(remote.agent_name)
 
     def reload(self, remote: NixlRemoteBuffers) -> None:
-        """Load a dropped peer again and rebuild the dlists prepared over it, which
-        the reload invalidates. A failed rebuild leaves the peer dropped.
+        """Load a dropped peer again and rebuild the dlists prepared over it. A
+        failed load or rebuild leaves the peer dropped, its dlists kept for a later
+        reload.
 
         No write_prepared() over this peer may run concurrently."""
-        self._agent.add_remote_agent(remote.metadata)
-        layouts = self._layouts.get(remote.agent_name, {})
+        # Unreachable until rebuilt: a dlist prepared before the reload is invalid
+        # once the peer is loaded again.
+        stale = self._layouts.pop(remote.agent_name, {})
         try:
-            for name, layout in list(layouts.items()):
-                layouts[name] = msgspec.structs.replace(
+            self._agent.add_remote_agent(remote.metadata)
+        except Exception:
+            self._layouts[remote.agent_name] = stale
+            raise
+        try:
+            rebuilt = {
+                name: msgspec.structs.replace(
                     layout,
                     dlist=self._prepare_dlist(
                         remote=remote,
@@ -299,9 +306,14 @@ class NixlTransport(Transport):
                         allow_expansion=layout.allow_expansion,
                     ),
                 )
+                for name, layout in stale.items()
+            }
         except Exception:
             self.unload(remote)
+            # The peer is dropped again, so a stale dlist can only fail to post.
+            self._layouts[remote.agent_name] = stale
             raise
+        self._layouts[remote.agent_name] = rebuilt
 
     def unload(self, remote: NixlRemoteBuffers) -> None:
         self._agent.remove_remote_agent(remote.agent_name)
