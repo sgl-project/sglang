@@ -22,7 +22,7 @@ from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
 )
-from sglang.srt.runtime_context import get_context, get_exec
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
 live_rows = gfx95_dense.live_rows
@@ -168,13 +168,6 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
 
 
-def _amd_monokernel_enabled() -> bool:
-    # the model also runs without a server's config (tools, unit tests)
-    if not get_context().is_config_namespace_published("exec"):
-        return False
-    return get_exec().kernel.enable_amd_monokernel
-
-
 def fused_boundary_this_step(forward_batch) -> bool:
     """Whether this step's hc_boundary_fused layers take the fused mHC boundary.
 
@@ -186,7 +179,7 @@ def fused_boundary_this_step(forward_batch) -> bool:
     if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
         return True
     prefill = forward_batch.forward_mode.is_extend_without_speculative()
-    return _amd_monokernel_enabled() and not prefill
+    return get_exec().kernel.enable_amd_monokernel and not prefill
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:

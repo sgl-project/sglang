@@ -43,31 +43,24 @@ def _sublayer(cfg):
 
 
 class TestMegaMhcGate(unittest.TestCase):
-    def test_off_by_default_on_gfx950(self):
-        with (
-            mock.patch.object(mhc, "_is_hip", True),
-            mock.patch.object(mhc, "_is_gfx95_supported", True),
-        ):
-            self.assertFalse(mhc._can_use_mega_mhc(_cfg()))
-
-    def test_hip_gfx950_dsv41_shape(self):
-        with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
-            mock.patch.object(mhc, "_is_hip", True),
-            mock.patch.object(mhc, "_is_gfx95_supported", True),
-        ):
-            self.assertTrue(mhc._can_use_mega_mhc(_cfg()))
-            self.assertFalse(mhc._can_use_mega_mhc(_cfg(mult=2)))
-            self.assertFalse(mhc._can_use_mega_mhc(_cfg(hidden=4096)))
-            self.assertFalse(mhc._can_use_mega_mhc(_cfg(cp_prefill=True)))
-
-    def test_hip_without_gfx95_stays_off(self):
-        with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
-            mock.patch.object(mhc, "_is_hip", True),
-            mock.patch.object(mhc, "_is_gfx95_supported", False),
-        ):
-            self.assertFalse(mhc._can_use_mega_mhc(_cfg()))
+    def test_gate(self):
+        # (flag, gfx950, config, expected)
+        cases = [
+            (False, True, _cfg(), False),
+            (True, True, _cfg(), True),
+            (True, True, _cfg(mult=2), False),
+            (True, True, _cfg(hidden=4096), False),
+            (True, True, _cfg(cp_prefill=True), False),
+            (True, False, _cfg(), False),
+        ]
+        for flag, gfx95, cfg, expected in cases:
+            with (
+                self.subTest(flag=flag, gfx95=gfx95, cfg=cfg),
+                envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(flag),
+                mock.patch.object(mhc, "_is_hip", True),
+                mock.patch.object(mhc, "_is_gfx95_supported", gfx95),
+            ):
+                self.assertEqual(mhc._can_use_mega_mhc(cfg), expected)
 
 
 class TestHipFlydslDispatch(unittest.TestCase):
@@ -133,12 +126,10 @@ class TestHipFlydslDispatch(unittest.TestCase):
 
 
 class TestFusedBoundaryRouting(unittest.TestCase):
-    def _init_layer(self, mega: bool):
-        layer = mock.Mock()
-        layer.hc_pre_from_prev_sublayer = True
-        layer.hc_mult = 4
+    def test_routing(self):
+        layer = mock.Mock(hc_pre_from_prev_sublayer=True, hc_mult=4)
         with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(True),
             mock.patch.object(deepseek_v4_hip, "_is_gfx95_supported", True),
             mock.patch.object(
                 deepseek_v4_hip.gfx95_dense,
@@ -152,53 +143,39 @@ class TestFusedBoundaryRouting(unittest.TestCase):
             ),
         ):
             deepseek_v4_hip.init_decoder_layer(layer, quant_config=None)
-        return layer
-
-    def test_layer_keeps_fused_boundary_with_mega_on(self):
         # the AMD monokernel refuses a layer without it at attach
-        self.assertTrue(self._init_layer(mega=True).hc_boundary_fused)
-        self.assertTrue(self._init_layer(mega=False).hc_boundary_fused)
+        self.assertTrue(layer.hc_boundary_fused)
 
-    def _route(self, mode, *, mega: bool, monokernel: bool) -> bool:
-        with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
-            mock.patch.object(
-                deepseek_v4_hip, "_amd_monokernel_enabled", return_value=monokernel
-            ),
-        ):
-            return deepseek_v4_hip.fused_boundary_this_step(
-                types.SimpleNamespace(forward_mode=mode)
-            )
-
-    def test_mega_off_always_fused(self):
-        for monokernel in (False, True):
-            for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
-                self.assertTrue(self._route(mode, mega=False, monokernel=monokernel))
-
-    def test_mega_on_without_monokernel_every_step(self):
-        for mode in (
-            ForwardMode.EXTEND,
-            ForwardMode.MIXED,
-            ForwardMode.DECODE,
-            ForwardMode.TARGET_VERIFY,
-        ):
-            self.assertFalse(self._route(mode, mega=True, monokernel=False))
-
-    def test_mega_on_with_monokernel_prefill_only(self):
-        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
-            self.assertFalse(self._route(mode, mega=True, monokernel=True))
-        for mode in (
+        prefill = (ForwardMode.EXTEND, ForwardMode.MIXED)
+        decode = (
             ForwardMode.DECODE,
             ForwardMode.TARGET_VERIFY,
             ForwardMode.DRAFT_EXTEND_V2,
-        ):
-            self.assertTrue(self._route(mode, mega=True, monokernel=True))
-
-    def test_monokernel_off_without_server_config(self):
-        context = mock.Mock()
-        context.is_config_namespace_published.return_value = False
-        with mock.patch.object(deepseek_v4_hip, "get_context", return_value=context):
-            self.assertFalse(deepseek_v4_hip._amd_monokernel_enabled())
+        )
+        # (mega, monokernel) -> whether prefill and decode steps take the fused boundary
+        cases = {
+            (False, False): (True, True),
+            (False, True): (True, True),
+            (True, False): (False, False),
+            (True, True): (False, True),
+        }
+        for (mega, monokernel), (fused_prefill, fused_decode) in cases.items():
+            exec_cfg = types.SimpleNamespace(
+                kernel=types.SimpleNamespace(enable_amd_monokernel=monokernel)
+            )
+            for modes, expected in ((prefill, fused_prefill), (decode, fused_decode)):
+                for mode in modes:
+                    with (
+                        self.subTest(mega=mega, monokernel=monokernel, mode=mode.name),
+                        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
+                        mock.patch.object(
+                            deepseek_v4_hip, "get_exec", return_value=exec_cfg
+                        ),
+                    ):
+                        fused = deepseek_v4_hip.fused_boundary_this_step(
+                            types.SimpleNamespace(forward_mode=mode)
+                        )
+                        self.assertEqual(fused, expected)
 
 
 if __name__ == "__main__":
