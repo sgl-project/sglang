@@ -7,7 +7,6 @@ import pkgutil
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.token_space_mm_process.registry import (
-    register_token_space_classes,
     serving_spec_for,
     strategy_for,
 )
@@ -48,7 +47,6 @@ def import_processors(package_name: str, overwrite: bool = False):
                                 del PROCESSOR_MAPPING[model_cls]
                                 break
                     PROCESSOR_MAPPING[arch] = cls
-            register_token_space_classes(module)
 
 
 def get_mm_processor_cls(hf_config, model_config=None):

@@ -67,6 +67,7 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
+    register_token_space_models,
     serving_spec_for,
 )
 from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
@@ -403,7 +404,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
         """A token-space model loads and schedules media like the legacy processor it replaces."""
         import_processors("sglang.srt.multimodal.processors")
-        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
+        register_token_space_models()
         legacy = {
             model_cls.__name__: cls for model_cls, cls in PROCESSOR_MAPPING.items()
         }
