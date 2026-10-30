@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -43,8 +44,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     SWARebuild,
     UpdatePendingBackupOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
@@ -64,7 +69,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
 )
-from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
@@ -352,6 +357,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=result.last_device_node_id,
             last_host_node=result.last_host_node_id,
             best_match_node=result.best_match_node_id,
+            last_visited_node_id=result.last_visited_node_id,
+            full_device_match_len=result.full_device_match_len,
             host_hit_length=result.host_hit_length,
             swa_host_hit_length=result.swa_host_hit_length,
             swa_branching_seqlen=result.swa_branching_seqlen,
@@ -376,8 +383,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     def __init__(self, params: CacheInitParams):
-        assert params.tree_components is not None
-        self.tree_components = tuple(params.tree_components)
+        assert params.tree_slots is not None
+        self.tree_components = params.tree_components
+        families = {slot.family for slot in params.tree_slots}
+        # Each family's slot id: the adapter names a slot by its family, never
+        # by a kind.
+        self._family_slot_ids: dict[str, ComponentType] = {}
+        for slot in params.tree_slots:
+            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
 
         # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
         if params.enable_session_radix_cache:
@@ -387,14 +400,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # TODO(Jialin): Port custom component registration from #25754 and
         # C128 support from #33676.
-        unsupported_components = set(self.tree_components) - {
-            ComponentType.FULL,
-            ComponentType.SWA,
-            ComponentType.MAMBA,
-        }
+        unsupported_components = [
+            slot
+            for slot in params.tree_slots
+            if NATIVE_SLOTS.get(slot.component) != slot.family
+        ]
         if unsupported_components:
             names = ", ".join(
-                sorted(component.name for component in unsupported_components)
+                sorted(
+                    f"{slot.component} ({slot.family})"
+                    for slot in unsupported_components
+                )
             )
             raise ValueError(f"Rust TreeCore does not support components: {names}")
         if params.component_registry_override:
@@ -420,30 +436,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 tlru_float_config = _tlru_float_config(
                     self._bindings, threshold, next_prompt_estimate
                 )
-        if ComponentType.SWA in self.tree_components and (
-            params.sliding_window_size is None or params.sliding_window_size <= 0
-        ):
-            raise ValueError(
-                "the SWA tree component requires a positive sliding_window_size"
-            )
+        numbers = {slot.family: slot for slot in params.tree_slots}
+        window = numbers[TREE_WINDOW].window if TREE_WINDOW in families else None
+        if TREE_WINDOW in families and (window is None or window <= 0):
+            raise ValueError("the SWA tree component requires a positive window")
 
         self._page_size = params.page_size
         self._swa_backup_index_mapper: Optional[
             Callable[[torch.Tensor], torch.Tensor]
         ] = None
         allocator = params.token_to_kv_pool_allocator
-        if allocator is not None and ComponentType.SWA in self.tree_components:
-            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-                UnifiedSWAAllocatorBase,
-            )
-
-            if isinstance(allocator, UnifiedSWAAllocatorBase):
+        if allocator is not None and TREE_WINDOW in families:
+            if allocator.hands_out_virtual_ids:
                 self._swa_backup_index_mapper = (
                     allocator.translate_swa_indices_for_transfer
                 )
-        self.is_eagle = (
-            params.is_eagle and ComponentType.MAMBA not in self.tree_components
-        )
+        self.is_eagle = params.is_eagle and TREE_STATE not in families
 
         # The cache owns allocation; keep its allocator for resolving current
         # unified SWA addresses when building a host backup.
@@ -458,7 +466,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             self.device = torch.device("cpu")
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
-        has_mamba = ComponentType.MAMBA in self.tree_components
+        has_mamba = TREE_STATE in families
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
@@ -476,14 +484,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 enable_hicache=False,
                 write_through_threshold=256,
                 device=str(self.device),
-                # Rust's tree window has the same cache-history contract as
-                # SWAComponent, including the fused draft's front rows.
-                swa_sliding_window_size=params.swa_retain_window,
+                # The window slot's history, as SWAComponent keeps it, the
+                # fused draft's front rows included.
+                swa_sliding_window_size=window,
                 swa_req_ring=not params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
-                    mamba_cache_chunk_size() if has_mamba else None
+                    numbers[TREE_STATE].checkpoint_interval if has_mamba else None
                 ),
                 mamba_max_states_per_path=(
                     mamba_max_states_per_path
@@ -491,7 +499,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     else None
                 ),
             ),
-            [int(component) for component in self.tree_components],
+            # Each slot's id and family: the native core picks a slot's driver
+            # by its family.
+            [
+                (int(ComponentType[slot.component]), slot.family)
+                for slot in params.tree_slots
+            ],
         )
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding,
@@ -524,6 +537,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # backend-neutral APIs: sessions (#29173), C128 (#33676).
         raise NotImplementedError("node_by_id: not yet ported to the Rust tree core")
 
+    def slot_id(self, family: str) -> Optional[ComponentType]:
+        """The id of the tree's slot of ``family``; None when it has none."""
+        return self._family_slot_ids.get(family)
+
     @property
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
@@ -533,10 +550,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
-        if component_type != ComponentType.SWA:
-            raise NotImplementedError("The Rust tree core supports one SWA window")
+        if component_type != self.slot_id(TREE_WINDOW):
+            raise NotImplementedError("The Rust tree core supports one window slot")
         return self._binding.swa_tombstone_ranges(
             self._bindings.MatchParamsBinding(
                 key=_radix_key_buffer(key),
@@ -553,10 +570,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
-        if component_type != ComponentType.SWA:
-            raise NotImplementedError("The Rust tree core supports one SWA window")
+        if component_type != self.slot_id(TREE_WINDOW):
+            raise NotImplementedError("The Rust tree core supports one window slot")
         return self._cache_actions_from_tagged(
             self._binding.attach_swa_window(
                 self._bindings.MatchParamsBinding(
@@ -721,17 +738,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def full_protected_size(self) -> int:
         return self._binding.full_protected_size()
 
+    def _slot_size(self, size_of: Callable[[int], int], family: str) -> int:
+        """``size_of`` the tree's slot of ``family``; 0 when it has none."""
+        slot_id = self.slot_id(family)
+        return 0 if slot_id is None else size_of(int(slot_id))
+
     def swa_evictable_size(self) -> int:
-        return self._binding.component_evictable_size(int(ComponentType.SWA))
+        return self._slot_size(self._binding.component_evictable_size, TREE_WINDOW)
 
     def mamba_evictable_size(self) -> int:
-        return self._binding.component_evictable_size(int(ComponentType.MAMBA))
+        return self._slot_size(self._binding.component_evictable_size, TREE_STATE)
 
     def swa_protected_size(self) -> int:
-        return self._binding.component_protected_size(int(ComponentType.SWA))
+        return self._slot_size(self._binding.component_protected_size, TREE_WINDOW)
 
     def mamba_protected_size(self) -> int:
-        return self._binding.component_protected_size(int(ComponentType.MAMBA))
+        return self._slot_size(self._binding.component_protected_size, TREE_STATE)
 
     def total_size(self) -> tuple[int, int]:
         return self._binding.total_size()
@@ -813,7 +835,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
-                swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
+                swa_evicted_seqlen=params.get_evicted_seqlen(self.slot_id(TREE_WINDOW)),
                 swa_branching_seqlen=params.swa_branching_seqlen,
                 inserted_len=params.inserted_len,
                 priority=0 if params.priority is None else params.priority,
@@ -962,7 +984,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
-        self._refresh_swa_backup_indices(comp_xfers.get(ComponentType.SWA, ()))
+        self._refresh_swa_backup_indices(comp_xfers.get(self.slot_id(TREE_WINDOW), ()))
         return device_value, comp_xfers
 
     def _refresh_swa_backup_indices(self, transfers: Sequence[PoolTransfer]) -> None:
@@ -976,7 +998,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # Compaction can relocate SWA rows after the tree records them.
             # FULL virtual IDs retain their meaning across that relocation.
             full_values = [
-                self.get_component_device_value(node_id, ComponentType.FULL)
+                self.get_component_device_value(node_id, BASE_COMPONENT_TYPE)
                 for node_id in transfer.nodes_to_load
             ]
             transfer.device_indices = self._swa_backup_index_mapper(

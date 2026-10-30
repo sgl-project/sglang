@@ -15,14 +15,18 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
     """Minimal stand-in for Req: only the fields the abort paths touch."""
+
+    request_finish = Req.request_finish
+    clear_requested_finish = Req.clear_requested_finish
+    finish_outside_step = Req.finish_outside_step
 
     def __init__(self, rid: str):
         self.rid = rid
@@ -52,6 +56,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
+    sched.rust_server = None
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
     return sched

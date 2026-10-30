@@ -705,10 +705,10 @@ class TboForwardBatchPreparer:
         # Unified memory refuses two-batch overlap, so the plan's reads stay in
         # `req_to_token`, which each child indexes at its own rows; each child
         # writes its own tokens of the plan's window.
-        output_dict["kv_loc_plan"] = batch.kv_loc_plan
-        if batch.kv_loc_plan is not None:
-            output_dict["kv_loc_cols"] = batch.kv_loc_plan.cols_slice(
-                batch.kv_loc_cols, slice(start_token_index, end_token_index)
+        output_dict["iteration_ids"] = batch.iteration_ids
+        if batch.iteration_ids is not None:
+            output_dict["iteration_cols"] = batch.iteration_ids.cols_slice(
+                batch.iteration_cols, slice(start_token_index, end_token_index)
             )
 
         attention_tp_size = get_parallel().attn_tp_size
@@ -857,6 +857,8 @@ class TboForwardBatchPreparer:
                 next_token_logits_buffer=None,
                 # The aux packer runs in the parent model forward, not per child.
                 aux_hidden_states_buffer=None,
+                # A one-request batch's bound; a split batch has none to give.
+                attention_kv_len_lower_bound=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.

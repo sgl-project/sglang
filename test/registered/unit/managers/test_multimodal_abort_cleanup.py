@@ -32,7 +32,7 @@ from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @pytest.fixture
@@ -96,6 +96,7 @@ def _queued_scheduler(req):
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
+    scheduler.rust_server = None
     scheduler.grammar_manager = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
     return scheduler

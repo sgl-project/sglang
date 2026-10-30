@@ -93,6 +93,10 @@ struct MoeFinalizeAllReduceParams {
   bf16_t* normalized = nullptr;
   fp8_e4m3_t* quantized = nullptr;
   uint8_t* scales = nullptr;
+  // kNorm only: residual_out = bf16(reduced + add_residual), normalized in fp32
+  const bf16_t* add_residual = nullptr;
+  bf16_t* residual_out = nullptr;
+  float norm_weight_offset = 0.0f;  // 1.0 for Gemma RMSNorm
 };
 
 template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
@@ -183,16 +187,16 @@ SGL_DEVICE StageVec mhc_post_vec(
   return result;
 }
 
-/// Row geometry: one 16B vector per thread, one cluster per row, so the block
-/// size follows from the hidden width and the cluster size (the tuning knob).
-template <uint32_t kHiddenDim, uint32_t kClusterSize>
+/// Row geometry: kVecs 16B vectors per thread, one cluster per row, so the block
+/// size follows from the hidden width, the cluster size (the tuning knob) and kVecs.
+template <uint32_t kHiddenDim, uint32_t kClusterSize, uint32_t kVecs = 1>
 struct RowClusterTrait {
-  static constexpr uint32_t kRowVecs = kHiddenDim / 8;             // 16B vectors per row
-  static constexpr uint32_t kBlockSize = kRowVecs / kClusterSize;  // threads per block
+  static constexpr uint32_t kRowVecs = kHiddenDim / 8;                       // 16B vectors per row
+  static constexpr uint32_t kBlockSize = kRowVecs / (kClusterSize * kVecs);  // threads per block
   static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
   static_assert(kHiddenDim % 8 == 0, "hidden must be a whole number of 16B vectors");
   static_assert(1 <= kClusterSize && kClusterSize <= 8, "portable cluster sizes only");
-  static_assert(kRowVecs % kClusterSize == 0, "cluster size must divide the row's vector count");
+  static_assert(kRowVecs % (kClusterSize * kVecs) == 0, "cluster size must divide the row's vector count");
   static_assert(kBlockSize % device::kWarpThreads == 0, "block must be whole warps");
   static_assert(kBlockSize <= 1024, "block too large: raise the cluster size");
 };
@@ -284,11 +288,29 @@ finalize_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint
   return out;
 }
 
+// kTopK == 0: no finalize, `gemm2` is the rank-local [T, kHiddenDim] partial sum.
+template <uint32_t kHiddenDim, bool kUsePDL, uint32_t kWorldSize, typename WeightT>
+SGL_DEVICE StageVec
+plain_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
+  using namespace device;
+  PDLWaitPrimary<kUsePDL>();
+  StageVec in;
+  in.load(params.gemm2 + static_cast<int64_t>(token) * kHiddenDim, hvec);
+  return in;
+}
+
 // --- the kernel --------------------------------------------------------------
 // Grid dim3(num_tokens [+ 1], kClusterSize) with the cluster along y, so
 // blockIdx.x is the token row (and its phase counter) and blockIdx.y the rank
 // inside the cluster. The extra cluster (blockIdx.x == num_tokens) is the
 // bumper: it only flips the leftover counters [num_tokens, num_push_counters).
+//
+// kTwoShot: row t is owned by rank t % kWorldSize. Each rank
+// pushes its partial only to the owner (slot `src = r`), the owner reduces and
+// pushes the bf16 sum to slot `src = owner` of every other rank, and every rank
+// runs the epilogue on that sum. A non-owner never receives a partial for the
+// row, so the owner's slot in its workspace is free for the gathered sum. The
+// owner keeps its own partial in registers, so its (r, r) slot stays unused.
 template <
     uint32_t kWorldSize,
     uint32_t kHiddenDim,
@@ -301,13 +323,17 @@ template <
     bool kMhc = false,
     bool kQuant = false,
     bool kCollapse = false,
+    bool kTwoShot = false,
+    uint32_t kVecs = 1,
     bool kGatedShared = false>
-__global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSize)
+__global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
         const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
   namespace cg = cooperative_groups;
   using namespace device;
-  using T = RowClusterTrait<kHiddenDim, kClusterSize>;
+  using T = RowClusterTrait<kHiddenDim, kClusterSize, kVecs>;
+  static_assert(!kTwoShot || !kMhc, "two-shot has no mHC epilogue");
+  static_assert(kVecs == 1 || (kNorm && !kMhc), "several vectors per thread is a norm-epilogue path");
   constexpr uint32_t kRowVecs = T::kRowVecs;
   constexpr uint32_t kBlockSize = T::kBlockSize;
   constexpr uint32_t kNumWarps = T::kNumWarps;
@@ -315,8 +341,9 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
   const auto tx = threadIdx.x;
   const auto row_idx = blockIdx.x;
   const auto cluster_rank = blockIdx.y;
-  // this thread's vector within a row: cluster rank picks the block's chunk
-  const auto hvec = cluster_rank * kBlockSize + tx;
+  // this thread's first vector within a row: cluster rank picks the block's chunk,
+  // and vector v sits v * kBlockSize further so a warp's accesses stay contiguous
+  const auto hvec = cluster_rank * kBlockSize * kVecs + tx;
 
   // Reading the epoch before the PDL wait can see a predecessor all-reduce
   // mid-flip on this plane; prefetch_metadata defers the wait to finalize_vec.
@@ -345,6 +372,8 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
   // (every block of the cluster reads the same one)
   const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
   const auto r = params.rank;
+  const auto owner = row_idx % kWorldSize;
+  const bool is_owner = !kTwoShot || owner == r;
   // my slot (`src = r`) inside every peer's workspace, and every peer's slot
   // inside mine (`dst = r`), for this epoch
   void* push_ptrs[kWorldSize];
@@ -353,15 +382,35 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
     push_ptrs[i] = epoch.slot_ptr(/*dst=*/i, /*src=*/r);
   }
 
-  // stage 1: finalize this row's vector in registers and push it to every peer
-  const auto vid = row_idx * kRowVecs + hvec;
-  {
-    auto vec =
-        finalize_vec<kHiddenDim, kTopK, kHasShared, kUsePDL, kWorldSize, WeightT, kGatedShared>(params, row_idx, hvec);
-    Lamport::clear_pos_zero(vec.data());
+  // stage 1: finalize this row's vectors in registers and push them to every peer
+  // (two-shot: to the row's owner only)
+  StageVec vec[kVecs][kWorldSize];
+  uint32_t vid[kVecs];
 #pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
+  for (uint32_t v = 0; v < kVecs; ++v) {
+    vid[v] = row_idx * kRowVecs + hvec + v * kBlockSize;
+    StageVec staged;
+    if constexpr (kTopK == 0) {
+      staged = plain_vec<kHiddenDim, kUsePDL>(params, row_idx, hvec + v * kBlockSize);
+    } else {
+      staged = finalize_vec<kHiddenDim, kTopK, kHasShared, kUsePDL, kWorldSize, WeightT, kGatedShared>(
+          params, row_idx, hvec + v * kBlockSize);
+    }
+    Lamport::clear_pos_zero(staged.data());
+    if constexpr (kTwoShot) {
+      if (is_owner) {
+#pragma unroll
+        for (uint32_t i = 0; i < kWorldSize; ++i) {
+          if (i == r) vec[v][i] = staged;
+        }
+      } else {
+        ptx::st_relaxed_16B(staged, epoch.slot_ptr(/*dst=*/owner, /*src=*/r), vid[v]);
+      }
+    } else {
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        ptx::st_relaxed_16B(staged, push_ptrs[i], vid[v]);
+      }
     }
   }
 
@@ -374,53 +423,103 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
   for (uint32_t i = 0; i < kWorldSize; ++i) {
     poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
   }
-  StageVec vec[kWorldSize];
-  do {
-    bool has_zero = false;
+  if (is_owner) {
+    do {
+      bool has_zero = false;
 #pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], vid);
-    }
+      for (uint32_t v = 0; v < kVecs; ++v) {
 #pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      // the producer remapped +0.0 words, so a written word is never 0:
-      // word == 0 <=> the slot still holds the empty marker
-      has_zero |= Lamport::has_pos_zero(vec[i].data());
-    }
-    if (!has_zero) break;
-  } while (true);
+        for (uint32_t i = 0; i < kWorldSize; ++i) {
+          if (!kTwoShot || i != r) ptx::ld_relaxed_16B(vec[v][i], poll_ptrs[i], vid[v]);
+        }
+      }
+#pragma unroll
+      for (uint32_t v = 0; v < kVecs; ++v) {
+#pragma unroll
+        for (uint32_t i = 0; i < kWorldSize; ++i) {
+          // the producer remapped +0.0 words, so a written word is never 0:
+          // word == 0 <=> the slot still holds the empty marker
+          if (!kTwoShot || i != r) has_zero |= Lamport::has_pos_zero(vec[v][i].data());
+        }
+      }
+      if (!has_zero) break;
+    } while (true);
+  }
 
+  StageVec red[kVecs];
+  if constexpr (kTwoShot) {
+    if (is_owner) {
+#pragma unroll
+      for (uint32_t v = 0; v < kVecs; ++v) {
+        red[v] = reduce_vec(vec[v]);
+        // the same -0.0 remap the peers receive keeps every rank bit-identical
+        Lamport::clear_pos_zero(red[v].data());
+#pragma unroll
+        for (uint32_t i = 0; i < kWorldSize; ++i) {
+          if (i != r) ptx::st_relaxed_16B(red[v], push_ptrs[i], vid[v]);
+        }
+      }
+    } else {
+      const auto gather_ptr = epoch.slot_ptr(/*dst=*/r, /*src=*/owner);
+      bool has_zero;
+      do {
+        has_zero = false;
+#pragma unroll
+        for (uint32_t v = 0; v < kVecs; ++v) {
+          ptx::ld_relaxed_16B(red[v], gather_ptr, vid[v]);
+          has_zero |= Lamport::has_pos_zero(red[v].data());
+        }
+      } while (has_zero);
+    }
+  } else {
+#pragma unroll
+    for (uint32_t v = 0; v < kVecs; ++v) {
+      red[v] = reduce_vec(vec[v]);
+    }
+  }
   if constexpr (!kNorm) {
-    const auto red = reduce_vec(vec);
-    ptx::st_global_16B(red, params.out, vid);
+    ptx::st_global_16B(red[0], params.out, vid[0]);
     if constexpr (kMhc) {
       if constexpr (kCollapse) {
-        const auto combined = mhc_post_vec<kHiddenDim, true>(params, red, row_idx, hvec);
-        ptx::st_global_16B(combined, params.normalized, vid);
+        const auto combined = mhc_post_vec<kHiddenDim, true>(params, red[0], row_idx, hvec);
+        ptx::st_global_16B(combined, params.normalized, vid[0]);
       } else {
-        mhc_post_vec<kHiddenDim>(params, red, row_idx, hvec);
+        mhc_post_vec<kHiddenDim>(params, red[0], row_idx, hvec);
       }
     }
     // ensure epoch is consumed, so flipping it won't lead to error
     barrier_cluster_wait();
   } else {
-    // push to peer
     __shared__ float smem_sq[kClusterSize][kNumWarps];
-    auto red = reduce_vec(vec);
     if constexpr (kMhc) {
-      ptx::st_global_16B(red, params.out, vid);
-      red = mhc_post_vec<kHiddenDim, true>(params, red, row_idx, hvec);
+      ptx::st_global_16B(red[0], params.out, vid[0]);
+      red[0] = mhc_post_vec<kHiddenDim, true>(params, red[0], row_idx, hvec);
     }
-    StageVec w;
-    w.load(params.norm_weight, hvec);
     const auto cluster = cg::this_cluster();
-    fp32x2_t acc[4];
+    fp32x2_t acc[kVecs][4];
     float sq = 0.0f;
 #pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      acc[j] = cast<fp32x2_t>(red[j]);
-      sq = fmaf(acc[j].x, acc[j].x, sq);
-      sq = fmaf(acc[j].y, acc[j].y, sq);
+    for (uint32_t v = 0; v < kVecs; ++v) {
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        acc[v][j] = cast<fp32x2_t>(red[v][j]);
+      }
+      if (params.add_residual != nullptr) {
+        StageVec res;
+        res.load(params.add_residual + static_cast<int64_t>(row_idx) * kHiddenDim, hvec + v * kBlockSize);
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          const auto [ra, rb] = cast<fp32x2_t>(res[j]);
+          acc[v][j] = fp32x2_t{acc[v][j].x + ra, acc[v][j].y + rb};
+          res[j] = cast<bf16x2_t>(acc[v][j]);
+        }
+        res.store(params.residual_out + static_cast<int64_t>(row_idx) * kHiddenDim, hvec + v * kBlockSize);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        sq = fmaf(acc[v][j].x, acc[v][j].x, sq);
+        sq = fmaf(acc[v][j].y, acc[v][j].y, sq);
+      }
     }
     sq = warp::reduce_sum(sq);
     const auto lane = tx % kWarpThreads;
@@ -438,14 +537,20 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
       }
     }
     const auto factor = math::rsqrt(total / static_cast<float>(kHiddenDim) + params.norm_eps);
-    StageVec out;
+    const auto off = params.norm_weight_offset;
 #pragma unroll
-    for (uint32_t j = 0; j < 4; ++j) {
-      const auto [wa, wb] = cast<fp32x2_t>(w[j]);
-      out[j] = cast<bf16x2_t>(fp32x2_t{acc[j].x * factor * wa, acc[j].y * factor * wb});
+    for (uint32_t v = 0; v < kVecs; ++v) {
+      StageVec w;
+      w.load(params.norm_weight, hvec + v * kBlockSize);
+      StageVec out;
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const auto [wa, wb] = cast<fp32x2_t>(w[j]);
+        out[j] = cast<bf16x2_t>(fp32x2_t{acc[v][j].x * factor * (wa + off), acc[v][j].y * factor * (wb + off)});
+      }
+      ptx::st_global_16B(out, kMhc ? params.normalized : params.out, vid[v]);
+      if constexpr (kQuant) mhc_quant_vec<kHiddenDim>(params, out, row_idx, hvec);
     }
-    ptx::st_global_16B(out, kMhc ? params.normalized : params.out, vid);
-    if constexpr (kQuant) mhc_quant_vec<kHiddenDim>(params, out, row_idx, hvec);
   }
   PDLTriggerSecondary<kUsePDL>();
 
@@ -453,8 +558,15 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
   StageVec zero_vec;
   Lamport::fill_pos_zero(zero_vec.data());
 #pragma unroll
-  for (uint32_t i = 0; i < kWorldSize; ++i) {
-    ptx::st_global_16B(zero_vec, poll_ptrs[i], vid);
+  for (uint32_t v = 0; v < kVecs; ++v) {
+    if (is_owner) {
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        if (!kTwoShot || i != r) ptx::st_global_16B(zero_vec, poll_ptrs[i], vid[v]);
+      }
+    } else {
+      ptx::st_global_16B(zero_vec, epoch.slot_ptr(/*dst=*/r, /*src=*/owner), vid[v]);
+    }
   }
 
   if (cluster_rank == 0) epoch.flip();
@@ -480,7 +592,7 @@ struct MoeFinalizeAllReduceKernel {
   using Params = MoeFinalizeAllReduceParams<kWorldSize, WeightT>;
   using Trait = RowClusterTrait<kHiddenDim, kClusterSize>;
 
-  template <bool kHasShared, bool kNorm>
+  template <bool kHasShared, bool kNorm, bool kTwoShot = false, uint32_t kVecs = 1>
   static constexpr auto kernel = moe_finalize_all_reduce_kernel<
       kWorldSize,
       kHiddenDim,
@@ -493,7 +605,10 @@ struct MoeFinalizeAllReduceKernel {
       kMhc,
       kQuant,
       kCollapse,
+      kTwoShot,
+      kVecs,
       kGatedShared>;
+  static constexpr bool kTwoVecsFit = Trait::kRowVecs % (kClusterSize * 2 * device::kWarpThreads) == 0;
 
  public:
   /// out = [allreduce over ranks of] finalize(gemm2_out, idx, weights) [+ shared] [-> RMSNorm(norm_weight, eps)].
@@ -554,7 +669,93 @@ struct MoeFinalizeAllReduceKernel {
         std::nullopt,
         std::nullopt,
         std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        0.0,
+        false,
+        1,
         shared_gate);
+  }
+
+  /// run() with the norm epilogue preceded by a residual add:
+  /// residual_out = bf16(allreduce(...) + add_residual), out = RMSNorm(fp32 sum).
+  /// `residual_out` may alias `add_residual`; `weight_offset` is 1.0 for Gemma RMSNorm.
+  static void run_residual_norm(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      std::optional<TensorView> shared_output,
+      TensorView norm_weight,
+      double eps,
+      TensorView add_residual,
+      TensorView residual_out,
+      double weight_offset,
+      bool two_shot,
+      int64_t vecs_per_thread) {
+    static_assert(!kMhc && kTopK != 0);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        norm_weight,
+        eps,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        add_residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread);
+  }
+
+  /// kTopK == 0: out = allreduce(input) [-> residual add] [-> RMSNorm], no finalize.
+  static void run_plain(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView input,
+      std::optional<TensorView> norm_weight,
+      double eps,
+      std::optional<TensorView> add_residual,
+      std::optional<TensorView> residual_out,
+      double weight_offset,
+      bool two_shot,
+      int64_t vecs_per_thread) {
+    static_assert(!kMhc && kTopK == 0);
+    run_impl(
+        ref,
+        out,
+        input,
+        input,
+        input,
+        std::nullopt,
+        norm_weight,
+        eps,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        add_residual,
+        residual_out,
+        weight_offset,
+        two_shot,
+        vecs_per_thread);
   }
 
   /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
@@ -677,6 +878,11 @@ struct MoeFinalizeAllReduceKernel {
       std::optional<TensorView> normalized = std::nullopt,
       std::optional<TensorView> quantized = std::nullopt,
       std::optional<TensorView> scales = std::nullopt,
+      std::optional<TensorView> add_residual = std::nullopt,
+      std::optional<TensorView> residual_out = std::nullopt,
+      double weight_offset = 0.0,
+      bool two_shot = false,
+      int64_t vecs_per_thread = 1,
       std::optional<TensorView> shared_gate = std::nullopt) {
     using namespace host;
     const auto& comm = *ref.get();
@@ -699,13 +905,27 @@ struct MoeFinalizeAllReduceKernel {
         .with_dtype<bf16_t>()
         .with_device<kDLCUDA>(device)
         .verify(gemm2_out);
-    TensorMatcher({T, kTopK})
-        .with_strides({kTopK, 1})
-        .with_dtype<WeightT>()
-        .template with_device<kDLCUDA>(device)
-        .verify(expert_weights);
-    TK.set_value(T.unwrap() * kTopK);
-    TensorMatcher({TK}).with_strides({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
+    if constexpr (kTopK == 0) {
+      CHECK_HOST(P.unwrap() == T.unwrap()) << "plain input must be [num_tokens, hidden]";
+    } else {
+      TensorMatcher({T, kTopK})
+          .with_strides({kTopK, 1})
+          .with_dtype<WeightT>()
+          .template with_device<kDLCUDA>(device)
+          .verify(expert_weights);
+      TK.set_value(T.unwrap() * kTopK);
+      TensorMatcher({TK}).with_strides({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
+    }
+    CHECK_HOST(add_residual.has_value() == residual_out.has_value());
+    if (add_residual.has_value()) {
+      CHECK_HOST(norm_weight.has_value()) << "the residual add is part of the norm epilogue";
+      TensorMatcher({T, kHiddenDim})
+          .with_strides({kHiddenDim, 1})
+          .with_dtype<bf16_t>()
+          .with_device<kDLCUDA>(device)
+          .verify(add_residual.value())
+          .verify(residual_out.value());
+    }
     if (shared_output.has_value()) {
       TensorMatcher({T, kHiddenDim})
           .with_strides({kHiddenDim, 1})
@@ -786,15 +1006,36 @@ struct MoeFinalizeAllReduceKernel {
         .normalized = normalized.has_value() ? static_cast<bf16_t*>(normalized.value().data_ptr()) : nullptr,
         .quantized = quantized.has_value() ? static_cast<fp8_e4m3_t*>(quantized.value().data_ptr()) : nullptr,
         .scales = scales.has_value() ? static_cast<uint8_t*>(scales.value().data_ptr()) : nullptr,
+        .add_residual =
+            add_residual.has_value() ? static_cast<const bf16_t*>(add_residual.value().data_ptr()) : nullptr,
+        .residual_out = add_residual.has_value() ? static_cast<bf16_t*>(residual_out.value().data_ptr()) : nullptr,
+        .norm_weight_offset = static_cast<float>(weight_offset),
     };
 
     const auto has_shared = shared_output.has_value();
     const auto has_norm = norm_weight.has_value();
-    const auto kern = has_shared ? (has_norm ? kernel<true, true> : kernel<true, false>)
-                                 : (has_norm ? kernel<false, true> : kernel<false, false>);
+    auto kern = has_shared ? (has_norm ? kernel<true, true> : kernel<true, false>)
+                           : (has_norm ? kernel<false, true> : kernel<false, false>);
+    if constexpr (!kMhc) {
+      if (two_shot)
+        kern = has_shared ? (has_norm ? kernel<true, true, true> : kernel<true, false, true>)
+                          : (has_norm ? kernel<false, true, true> : kernel<false, false, true>);
+    }
+    uint32_t block_size = Trait::kBlockSize;
+    CHECK_HOST(vecs_per_thread == 1 || vecs_per_thread == 2) << "vecs_per_thread must be 1 or 2";
+    if (vecs_per_thread == 2) {
+      CHECK_HOST(has_norm) << "two vectors per thread is a norm-epilogue path";
+      if constexpr (!kMhc && kTwoVecsFit) {
+        kern = two_shot ? (has_shared ? kernel<true, true, true, 2> : kernel<false, true, true, 2>)
+                        : (has_shared ? kernel<true, true, false, 2> : kernel<false, true, false, 2>);
+        block_size = RowClusterTrait<kHiddenDim, kClusterSize, 2>::kBlockSize;
+      } else {
+        CHECK_HOST(false) << "cluster size " << kClusterSize << " leaves partial warps at two vectors per thread";
+      }
+    }
     // __cluster_dims__(1, kClusterSize, 1) is compiled in, so a plain launch
     // already forms the clusters along y
-    LaunchKernel(dim3(num_clusters, kClusterSize), Trait::kBlockSize, out.device()).enable_pdl(kUsePDL)(kern, params);
+    LaunchKernel(dim3(num_clusters, kClusterSize), block_size, out.device()).enable_pdl(kUsePDL)(kern, params);
   }
 };
 

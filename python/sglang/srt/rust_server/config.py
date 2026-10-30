@@ -17,6 +17,8 @@ from sglang.srt.entrypoints.v1_loads import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -32,7 +34,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_server_info
+from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
@@ -104,6 +106,8 @@ def _build_server_args(
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
+        # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
+        "rust_server_endpoints": scheduler.rust_server_endpoints,
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
@@ -114,6 +118,7 @@ def _build_server_args(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
         tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        public_tokenizer_path=get_serving().tokenizer_path,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -129,6 +134,9 @@ def _build_server_args(
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
+        default_chat_template_kwargs=json.dumps(
+            get_serving().default_chat_template_kwargs or {}
+        ),
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
@@ -184,25 +192,50 @@ def _build_server_args(
         tokenizer_model_max_length=_tokenizer_model_max_length(
             scheduler.tokenizer, mc.context_len
         ),
-        # Launch-time facts Python's /server_info reports from
-        # scheduler_info / the package — stamped here so the rust endpoint
-        # can serve them statically (no scheduler round-trip).
+        # Launch-time facts Python's /server_info and /model_info report from
+        # scheduler_info / the package / the model — stamped here so the rust
+        # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
+        launch_model_info=json.dumps(
+            msgspec_to_builtins(build_model_info_fields(mc, scheduler.server_args)),
+            default=str,
+        ),
         load_snapshot_path=shm_writer.path if shm_writer else None,
         load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
         accelerator=_accelerator_name(),
         num_accelerators=_num_accelerators_per_dp_rank(),
+        metrics=(
+            _build_metrics_config(ext) if get_observability().enable_metrics else None
+        ),
+    )
+
+
+def _build_metrics_config(ext: ModuleType):
+    """What the Rust server needs to record ``TokenizerMetricsCollector``'s
+    families as Python does, and where every process's samples live."""
+    obs = get_observability()
+
+    def token_buckets(rule: Optional[List[str]]) -> Optional[List[float]]:
+        # The default rule keeps the Rust side's copy of Python's defaults.
+        if not rule or rule[0] == "default":
+            return None
+        return generate_buckets(rule, [])
+
+    return ext.MetricsConfig(
         # Every process writes its prometheus_client samples under this
         # directory (set before the schedulers start); `/metrics` merges them.
-        metrics=(
-            ext.MetricsConfig(multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
-            if get_observability().enable_metrics
-            else None
-        ),
+        multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        labels=tokenizer_metric_labels(),
+        priority_label=get_schedule().enable_priority_scheduling,
+        bucket_time_to_first_token=obs.bucket_time_to_first_token,
+        bucket_inter_token_latency=obs.bucket_inter_token_latency,
+        bucket_e2e_request_latency=obs.bucket_e2e_request_latency,
+        bucket_prompt_tokens=token_buckets(obs.prompt_tokens_buckets),
+        bucket_generation_tokens=token_buckets(obs.generation_tokens_buckets),
     )
 
 
@@ -246,11 +279,13 @@ def _partition_cores(
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
-    Pure computation — no affinity is changed here. Both sets are a subset
-    of this rank's NUMA-local cores (when affinity/NUMA bind is on), so the
-    partition stays NUMA-local. Returns ``(None, None)`` (server runs
-    unpinned, confined only by the process affinity) when the platform has
-    no affinity API or too few cores to split.
+    ``launch_cores`` are left out of ``server_cores``, so the scheduler thread
+    always finds cores no frontend thread can take; the scheduler thread itself
+    is not pinned to them. Pure computation — no affinity is changed here.
+    Both sets are a subset of this rank's NUMA-local cores (when affinity/NUMA
+    bind is on), so the partition stays NUMA-local. Returns ``(None, None)``
+    (server runs unpinned, confined only by the process affinity) when the
+    platform has no affinity API or too few cores to split.
     """
     if not hasattr(os, "sched_getaffinity"):
         return None, None
@@ -288,7 +323,7 @@ def _partition_cores(
     )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
-        "rust server cores=%s, scheduler launch cores=%s",
+        "rust server cores=%s, cores kept free for the scheduler=%s",
         server_cores,
         launch_cores,
     )

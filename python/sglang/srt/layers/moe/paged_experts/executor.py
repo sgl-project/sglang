@@ -44,16 +44,15 @@ class EagerExecutor:
         self.device_residency = device_residency
 
     def run(self, layer, dispatch_output):
-        if self.device_residency is not None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Paged experts: a captured decode batch routes more entries than the K "
-                    "resident slots; capture batch sizes must stay at or below K // top_k"
-                )
-            self.device_residency.load_into(self.policy)
+        r = self.device_residency
+        if r is not None and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Paged experts: a captured decode batch routes more entries than the K "
+                "resident slots; capture batch sizes must stay at or below K // top_k"
+            )
         out = self._run(layer, dispatch_output)
-        if self.device_residency is not None:
-            self.device_residency.store_from(self.policy)
+        if r is not None:
+            r.store_from(self.policy)
         return out
 
     def _run(self, layer, dispatch_output):
@@ -61,15 +60,28 @@ class EagerExecutor:
 
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
-        distinct = [e for e in torch.unique(topk_ids).tolist() if e >= 0]
+        # Routed entries per expert (padding at index E), read with the device residency
+        # state in one sync.
+        ids = topk_ids.flatten().long()
+        ids = ids.masked_fill(ids < 0, self.num_experts)
+        counts = torch.zeros(self.num_experts + 1, dtype=torch.int32, device=ids.device)
+        counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int32))
+        r = self.device_residency
+        routed = counts.tolist() if r is None else r.load_into(self.policy, counts)
+        distinct = [e for e in range(self.num_experts) if routed[e]]
         merged = None
         waves = plan_waves(policy=self.policy, distinct=distinct)
-        for wave in waves:
+        # Every wave's slot map in one upload that does not wait for the GPU. Index E (and -1,
+        # which wraps to it) stays -1: padded routing entries are masked.
+        to_slot = torch.full((len(waves), self.num_experts + 1), -1, dtype=torch.int32)
+        for w, wave in enumerate(waves):
+            to_slot[w, wave.experts] = torch.tensor(wave.slots, dtype=torch.int32)
+        if topk_ids.is_cuda:
+            to_slot = to_slot.pin_memory()
+        to_slot = to_slot.to(topk_ids.device, non_blocking=True)
+        for w, wave in enumerate(waves):
             self.store.page_in(layer=layer, loads=wave.loads)
-            # Index E (and -1, which wraps to it) stays -1: padded routing entries are masked.
-            to_slot = torch.full((self.num_experts + 1,), -1, dtype=torch.int32)
-            to_slot[wave.experts] = torch.tensor(wave.slots, dtype=torch.int32)
-            slots = to_slot.to(topk_ids.device)[topk_ids]
+            slots = to_slot[w][topk_ids]
             if len(waves) == 1:  # only padding is outside the wave
                 merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
                 break
@@ -79,6 +91,7 @@ class EagerExecutor:
                 dispatch_output=dispatch_output,
                 slots=slots,
                 merged=merged,
+                num_entries=sum(routed[e] for e in wave.experts),
             )
         return StandardCombineInput(
             hidden_states=self.contract.finish(
@@ -113,9 +126,13 @@ class DeviceExecutor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         r = self.residency
-        topk_ids = dispatch_output.topk_output.topk_ids
+        topk_output = dispatch_output.topk_output
+        topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
+        run_ids = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
+        run_w = torch.empty(topk_ids.shape, dtype=torch.float32, device=topk_ids.device)
         paged_experts_decide(
             topk_ids.flatten().to(torch.int32),
+            topk_weights.flatten().to(torch.float32),
             r.step,
             r.slot_expert,
             r.expert_slot,
@@ -123,11 +140,19 @@ class DeviceExecutor:
             r.src,
             r.dst,
             r.count,
+            run_ids.view(-1),
+            run_w.view(-1),
         )
         self.store.gather(src=r.src, dst=r.dst, count=r.count)
-        # Every routed expert is now resident; padding (-1) stays masked.
-        slots = r.expert_slot[topk_ids.clamp(min=0)].masked_fill(topk_ids < 0, -1)
-        partial = run_on_slots(self.base_method, layer, dispatch_output, slots)
+        # Every routed expert is now resident; padding got slot 0 and weight 0.
+        wave_output = dispatch_output._replace(
+            topk_output=topk_output._replace(
+                topk_ids=run_ids, topk_weights=run_w.to(topk_weights.dtype)
+            )
+        )
+        partial = self.base_method.apply(
+            layer=layer, dispatch_output=wave_output
+        ).hidden_states
         return StandardCombineInput(
             hidden_states=self.contract.finish(
                 merged=partial,
