@@ -528,6 +528,8 @@ class Envs:
     # ===================================================================
     # Runtime simulations
     # ===================================================================
+    # Benchmark mode: changes only the accepted length; verify still runs every op real
+    # serving runs, at real cost (SGLANG_SIMULATE_ACC_GREEDY is the opt-out).
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
@@ -567,6 +569,10 @@ class Envs:
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
+    # With the TP-sharded markov_w2, keep each draft step's logits on the local
+    # vocab shard and run the sampling accept on the shards, instead of
+    # all-gathering the full logits every step. Same accept distribution.
+    SGLANG_DSPARK_SHARDED_ACCEPT = EnvBool(_default_hip)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
@@ -706,6 +712,9 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Most per-request states the detokenizer keeps; past it, the oldest is
+    # evicted. See https://github.com/sgl-project/sglang/issues/2812
+    SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -730,9 +739,14 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP rank 0 posts its output recv only after its own forward. Enable it if PP
+    # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
+    SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in: retire finished prefill KV transfers while a forward result is pending.
+    SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
@@ -796,6 +810,9 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Under overlap, publish decode KV destinations one iteration later instead of
+    # reading them back inline; False restores the inline publish.
+    SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1147,10 +1164,10 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time so arch35 (Atlas A5) dense linears run on the native quantized
-    # GEMM instead of the Triton emulation path. Lossy (128x128 fp32 block
-    # scales -> 1x32 UE8M0): off by default; enable explicitly for
-    # performance after validating accuracy for the workload.
+    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
+    # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
+    # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
@@ -1374,6 +1391,7 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -2229,6 +2247,7 @@ class Envs:
     # KV-Canary and Token-Oracle (testing only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_ENABLE_INFO = EnvBool(False)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
     SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
@@ -2238,6 +2257,7 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_DETOKENIZER_SWAP_AT_OUTPUT = EnvInt(-1)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
@@ -2404,6 +2424,8 @@ def third_party_cache_defaults() -> Dict[str, str]:
         # default the burst is invisible to anyone warming, mounting or baking
         # SGLANG_CACHE_DIR, and gets paid again on every cold container.
         "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
+        "HUMMING_CACHE_DIR": os.path.join(base, "humming", "cache"),
+        "HUMMING_TMP_DIR": os.path.join(base, "humming", "tmp"),
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,
@@ -2420,6 +2442,7 @@ def redirect_third_party_caches():
     - FlashInfer was imported. It resolves its workspace at import time.
     - Inductor made its first ``cache_dir()`` call. That call setdefaults
       TORCHINDUCTOR_CACHE_DIR itself.
+    - Humming resolved its cache or temporary directory for the first time.
     """
     for key, value in third_party_cache_defaults().items():
         os.environ.setdefault(key, value)
