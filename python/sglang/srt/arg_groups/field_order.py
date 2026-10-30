@@ -510,6 +510,7 @@ POSITIONAL_FIELD_ORDER = (
     "dsv4_attn_backend",
     "otlp_service_name",
     "_radix_eviction_policy_explicitly_set",
+    "hicache_swa_host_ratio",
     "hicache_host_memory_fraction",
     "enable_linker_mla_dedup",
     "_swa_full_tokens_ratio_explicitly_set",

@@ -116,6 +116,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_swa_host_ratio: A[
+        float,
+        "For a full + sliding-window model: size the HiCache HOST tiers as if the device pool had used this --swa-full-tokens-ratio, while the device pool keeps the served (smaller) ratio. 0 (the default) keeps the stock split, which follows the device ratio. A prefix hit needs the trailing sliding window of the match point on the device or on the host, so a host sliding-window tier sized by the device ratio limits prefix hits while the device sliding-window pool sits mostly idle. Ignored unless it is above the realized device ratio. The host total stays --hicache-size.",
+    ] = 0.0
     hicache_host_memory_fraction: A[
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
