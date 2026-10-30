@@ -59,9 +59,12 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
+    SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
@@ -223,6 +226,7 @@ class GenerateReqInput:
     video_config: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
+    watermark: Any = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -232,14 +236,22 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to return output-token sampling support and renormalized logprobs.
+    # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
+    # Return either the selected token's behavior logprob or behavior logprobs for
+    # the full sampling support. When omitted, selected mode is used if
+    # return_sampling_mask is enabled.
+    sampling_logprobs_mode: Optional[
+        Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
+    ] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
-    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    # Return output top logprobs the same way, on the finished response only.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
@@ -344,10 +356,16 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+    mm_processor_kwargs: Optional[dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    # Token positions for setwise pooling readout (CausalLM: label-token logprobs
+    # are read AT these positions instead of the last token).
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
@@ -445,12 +463,18 @@ class GenerateReqInput:
                 "scoring: delimiter-sparse top logprob rows have no contiguous "
                 "position mapping."
             )
-        if (
-            self.return_flat_raw_top_logprobs_b64
-            and not self.return_flat_raw_top_logprobs
+        if self.return_flat_raw_output_top_logprobs and self.stream:
+            raise ValueError(
+                "return_flat_raw_output_top_logprobs is only set on the finished "
+                "response and does not support stream=True."
+            )
+        if self.return_flat_raw_top_logprobs_b64 and not (
+            self.return_flat_raw_top_logprobs
+            or self.return_flat_raw_output_top_logprobs
         ):
             raise ValueError(
-                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs "
+                "or return_flat_raw_output_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -581,6 +605,7 @@ class GenerateReqInput:
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
+        self._normalize_watermark(num)
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
@@ -722,6 +747,16 @@ class GenerateReqInput:
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
+    def _normalize_watermark(self, num):
+        if isinstance(self.watermark, list):
+            if len(self.watermark) != self.batch_size:
+                raise ValueError(
+                    "The length of watermark should be equal to the batch size."
+                )
+            self.watermark = self.watermark * self.parallel_sample_num
+        else:
+            self.watermark = [self.watermark] * num
+
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
@@ -767,6 +802,9 @@ class GenerateReqInput:
         )
         self.return_sampling_mask = normalize_param(
             self.return_sampling_mask, False, "return_sampling_mask"
+        )
+        self.sampling_logprobs_mode = normalize_param(
+            self.sampling_logprobs_mode, None, "sampling_logprobs_mode"
         )
 
         # Handle token_ids_logprob specially due to its nested structure
@@ -943,13 +981,16 @@ class GenerateReqInput:
                 else None
             ),
             sampling_params=self.sampling_params[i],
+            watermark=self.watermark[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
+            sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_output_top_logprobs=self.return_flat_raw_output_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
@@ -970,6 +1011,7 @@ class GenerateReqInput:
                 if self.custom_logit_processor is not None
                 else None
             ),
+            mm_processor_kwargs=self.mm_processor_kwargs,
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
@@ -1009,6 +1051,11 @@ class GenerateReqInput:
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
+                else None
+            ),
+            token_indices_to_pool=(
+                self.token_indices_to_pool[i]
+                if self.token_indices_to_pool is not None
                 else None
             ),
         )
@@ -1108,6 +1155,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
 
+    # Token positions for setwise pooling readout (CausalLM)
+    token_indices_to_pool: Optional[List[int]] = None
+
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
@@ -1121,8 +1171,13 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     kv_hints: Optional[KvHintsEnvelope] = None
 
     # Internal PP control bit, set by PP0 before forwarding the request.
-    # Keep at the end to preserve the positional Rust wire schema.
+    # Keep tail fields append-only to preserve the positional Rust wire schema.
     pp_prefetch_ticketed: bool = False
+    # Shape of output_token_sampling_logprobs for each output token. This is a
+    # defaulted tail field so older IPC senders decode as selected mode.
+    sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1219,6 +1274,17 @@ class EmbeddingReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Token positions the pooler reads out AT (head / hidden states), instead of
+    # the default LAST/CLS pooling. Generic multi-position primitive (setwise
+    # scoring today). Unlike MIS, pooling is AT the position (no delimiter - 1).
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
+
+    # Question and option spans that a Clef checkpoint's joint schema head
+    # scores, as packed by layers.joint_schema_head.pack_decision_layout.
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    decision_layout: Optional[Union[List[List[int]], List[int]]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -1237,10 +1303,16 @@ class EmbeddingReqInput:
             )
 
     def normalize_batch_and_arguments(self):
-        # at least one of text, input_ids, or image should be provided
-        if self.text is None and self.input_ids is None and self.image_data is None:
+        # at least one of text, input_ids, image, video, or audio should be provided
+        if (
+            self.text is None
+            and self.input_ids is None
+            and self.image_data is None
+            and self.video_data is None
+            and self.audio_data is None
+        ):
             raise ValueError(
-                "At least one of text, input_ids, or image should be provided"
+                "At least one of text, input_ids, image, video, or audio should be provided"
             )
 
         # text and input_ids cannot be provided at the same time
@@ -1254,18 +1326,37 @@ class EmbeddingReqInput:
         # check the batch size of text
         if self.text is not None:
             if isinstance(self.text, list):
-                self.batch_size += len(self.text)
+                self.batch_size = len(self.text)
                 self.is_single = False
             else:
-                self.batch_size += 1
-
-        # check the batch size of input_ids
-        if self.input_ids is not None:
+                self.batch_size = 1
+        elif self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
-                self.batch_size += len(self.input_ids)
+                self.batch_size = len(self.input_ids)
                 self.is_single = False
             else:
-                self.batch_size += 1
+                self.batch_size = 1
+        else:
+            # Without text, a flat media list is one request carrying all items
+            # (the HF processor reading); only a list of per-request lists is a batch.
+            media = next(
+                data
+                for data in (self.image_data, self.video_data, self.audio_data)
+                if data is not None
+            )
+            if (
+                isinstance(media, list)
+                and len(media) > 0
+                and all(isinstance(item, list) for item in media)
+            ):
+                self.batch_size = len(media)
+                self.is_single = False
+            else:
+                self.batch_size = 1
+                self.is_single = True
+
+        if not self.is_single:
+            self._validate_mm_batch_lengths()
 
         # Fill in default arguments
         if self.is_single:
@@ -1290,6 +1381,19 @@ class EmbeddingReqInput:
             self._normalize_lora_paths(self.batch_size)
 
         self._validate_rid_uniqueness()
+
+    def _validate_mm_batch_lengths(self):
+        # A scalar media item is broadcast to every request; a list is per-request.
+        for field_name, data in (
+            ("image_data", self.image_data),
+            ("video_data", self.video_data),
+            ("audio_data", self.audio_data),
+        ):
+            if isinstance(data, list) and len(data) != self.batch_size:
+                raise ValueError(
+                    f"{field_name} has {len(data)} entries but the batch has "
+                    f"{self.batch_size} requests; pass one entry (or None) per request."
+                )
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -1327,6 +1431,17 @@ class EmbeddingReqInput:
         if i in cache:
             return cache[i]
 
+        # Lengths were checked in _validate_mm_batch_lengths; scalars broadcast.
+        image_item = (
+            self.image_data[i] if isinstance(self.image_data, list) else self.image_data
+        )
+        video_item = (
+            self.video_data[i] if isinstance(self.video_data, list) else self.video_data
+        )
+        audio_item = (
+            self.audio_data[i] if isinstance(self.audio_data, list) else self.audio_data
+        )
+
         if self.is_cross_encoder_request:
             sub = EmbeddingReqInput(
                 rid=self.rid[i],
@@ -1345,15 +1460,20 @@ class EmbeddingReqInput:
                     if self.multi_item_delimiter_indices is not None
                     else None
                 ),
+                token_indices_to_pool=(
+                    self.token_indices_to_pool[i]
+                    if self.token_indices_to_pool is not None
+                    else None
+                ),
             )
         else:
             sub = EmbeddingReqInput(
                 rid=self.rid[i],
                 text=self.text[i] if self.text is not None else None,
                 input_ids=self.input_ids[i] if self.input_ids is not None else None,
-                image_data=self.image_data[i] if self.image_data is not None else None,
-                video_data=self.video_data[i] if self.video_data is not None else None,
-                audio_data=self.audio_data[i] if self.audio_data is not None else None,
+                image_data=image_item,
+                video_data=video_item,
+                audio_data=audio_item,
                 embed_override_token_id=self.embed_override_token_id,
                 embed_overrides=(
                     self.embed_overrides[i]
@@ -1374,6 +1494,16 @@ class EmbeddingReqInput:
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
+                    else None
+                ),
+                token_indices_to_pool=(
+                    self.token_indices_to_pool[i]
+                    if self.token_indices_to_pool is not None
+                    else None
+                ),
+                decision_layout=(
+                    self.decision_layout[i]
+                    if self.decision_layout is not None
                     else None
                 ),
             )
@@ -1405,10 +1535,15 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
-
+    # Token positions for setwise pooling readout
+    token_indices_to_pool: Optional[List[int]] = None
+    # Question and option spans for a joint schema head
+    decision_layout: Optional[List[int]] = None
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+    # LoRA adapter name; KV events namespace this request's blocks by it.
+    lora_name: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1445,34 +1580,64 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
-def build_flat_input_top_logprobs_arrays(
-    input_top_logprobs_val: List[Optional[List[float]]],
-    input_top_logprobs_idx: List[Optional[List[int]]],
-    top_logprobs_num: int,
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Convert nested per-position prompt top logprob rows into the flat
-    arrays of the `return_flat_raw_top_logprobs` response format.
+class RequestOutputStats(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """A request's output values that change only at a few points. Sent on its
+    first output, its first after each retraction, and its finished row; a value
+    that changes at any other time shows only on the finished output."""
 
-    Returns (float32 values [rows, k], int32 token ids [rows, k],
-    null_prefix). The leading null rows are counted into null_prefix and
-    excluded from the arrays. Raises ValueError when the rows are not
-    representable by (shape, null_prefix): interior nulls or ragged k,
-    e.g. multi-item scoring.
+    prompt_tokens: int
+    cached_tokens: int
+    cached_tokens_details: Optional[CachedTokensDetails]
+    retraction_count: int
+    image_tokens: int
+    audio_tokens: int
+    video_tokens: int
+    # None when metrics are off, for embedding, or when the request's own are off.
+    time_stats: Optional[SchedulerOutputTimeStats]
+
+
+def flat_top_logprobs_layout(
+    top_logprobs_val: List[Optional[List[float]]], top_logprobs_num: int
+) -> Tuple[int, int]:
+    """(null_prefix, k) of nested per-position top logprob rows in the flat format.
+
+    Raises ValueError when the rows are not representable by (shape,
+    null_prefix): interior nulls or ragged k, e.g. multi-item scoring.
     """
-    num_rows = len(input_top_logprobs_val)
+    num_rows = len(top_logprobs_val)
     null_prefix = 0
-    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
+    while null_prefix < num_rows and not top_logprobs_val[null_prefix]:
         null_prefix += 1
-    val_rows = input_top_logprobs_val[null_prefix:]
-    idx_rows = input_top_logprobs_idx[null_prefix:]
+    val_rows = top_logprobs_val[null_prefix:]
     k = len(val_rows[0]) if val_rows else top_logprobs_num
     for offset, row in enumerate(val_rows):
         if row is None or len(row) != k:
             raise ValueError(
-                "return_flat_raw_top_logprobs requires rectangular top logprob "
-                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                "Flat top logprobs require rectangular rows with nulls only in "
+                f"the leading prefix; row {null_prefix + offset} "
                 f"has {None if row is None else len(row)} entries (expected {k})."
             )
+    return null_prefix, k
+
+
+def build_flat_top_logprobs_arrays(
+    top_logprobs_val: List[Optional[List[float]]],
+    top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Convert nested per-position top logprob rows (prompt or output) into
+    the flat arrays of the flat raw top logprob response format.
+
+    Returns (float32 values [rows, k], int32 token ids [rows, k],
+    null_prefix). The leading null rows are counted into null_prefix and
+    excluded from the arrays; see `flat_top_logprobs_layout` for the rows
+    that raise ValueError.
+    """
+    null_prefix, k = flat_top_logprobs_layout(top_logprobs_val, top_logprobs_num)
+    val_rows = top_logprobs_val[null_prefix:]
+    idx_rows = top_logprobs_idx[null_prefix:]
     val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
     idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
     return val_arr, idx_arr, null_prefix
@@ -1482,7 +1647,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # For incremental decoding
-    decoded_texts: List[str]
     decode_ids: List[array]  # List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
@@ -1493,10 +1657,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     no_stop_trim: List[bool]
 
     # Token counts
-    prompt_tokens: List[int]
     reasoning_tokens: List[int]
     completion_tokens: List[int]
-    cached_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: TokenLogprobValues
@@ -1512,12 +1674,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
-    # Per-request chunks of output-token sampling supports. None when no request
-    # in the batch asks for return_sampling_mask.
-    output_token_sampling_mask: Optional[List[List]]
-    # Per-request chunks of selected-token logprobs renormalized over the
-    # corresponding sampling supports. None when sampling masks are not returned.
-    output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_mask: Optional[List[Optional[SamplingMaskChunk]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1536,9 +1693,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
-    # Number of times each request was retracted.
-    retraction_counts: Optional[List[int]] = None
-
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
@@ -1550,16 +1704,17 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    # Per row: the request's stats when due (see RequestOutputStats), else
+    # None; None when no row carries any.
+    request_stats: Optional[List[Optional[RequestOutputStats]]] = None
 
-    # Multimodal prompt token counts (image/audio/video). None when not applicable.
+    # Rust server mode only: per-step header columns of
+    # `RustServer.push_generation`; None otherwise.
+    prompt_tokens: Optional[List[int]] = None
+    cached_tokens: Optional[List[int]] = None
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
@@ -1576,7 +1731,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Scheduler-side flat assembly of prompt top logprobs for requests with
     # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
-    # leading-null count (see build_flat_input_top_logprobs_arrays). For such
+    # leading-null count (see build_flat_top_logprobs_arrays). For such
     # requests the nested input_top_logprobs_val/idx entry is empty. None when
     # no request in the batch uses the flat format.
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
@@ -1593,10 +1748,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_ids: Optional[List[array]]
 
     # Token counts
-    prompt_tokens: List[int]
     completion_tokens: List[int]
     reasoning_tokens: List[int]
-    cached_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: TokenLogprobValues
@@ -1612,10 +1765,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
-    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
-    # None when sampling masks are not returned.
-    output_token_sampling_mask: Optional[List[List]]
-    output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_mask: Optional[List[Optional[SamplingMaskChunk]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1633,9 +1783,6 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
-    # Number of times each request was retracted.
-    retraction_counts: Optional[List[int]] = None
-
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
@@ -1647,19 +1794,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
-
-    # Multimodal prompt token counts (image/audio/video). None when not applicable.
-    image_tokens: Optional[List[int]] = None
-    audio_tokens: Optional[List[int]] = None
-    video_tokens: Optional[List[int]] = None
+    # See BatchTokenIDOutput.request_stats.
+    request_stats: Optional[List[Optional[RequestOutputStats]]] = None
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
@@ -1683,21 +1822,11 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
-    # Token counts
-    prompt_tokens: List[int]
-    cached_tokens: List[int]
+    # Each request is output once, so every row carries its stats.
+    request_stats: List[RequestOutputStats]
     # Placeholder token info
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
-
-    # Number of times each request was retracted.
-    retraction_counts: Optional[List[int]] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
-
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
 
     # Optional pooled hidden states (pre-head transformer output).
     # Two IPC formats, disambiguated by len vs len(rids):
@@ -1875,6 +2004,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -1901,8 +2032,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Optional: Determine whether to disable updating the draft model
-    disable_draft_model: Optional[bool] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -2054,15 +2185,41 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Open a weight-update session: restore in-place-packed weights so new ones can load."""
+
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
+    # Substrings of tensor names to exclude from reset/compare/checksum.
+    skip_tensor_list: Optional[List[str]] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
 # sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
+    # "target", or a draft role such as "draft" / "draft_step_0"
+    role: str
     tp_rank: int
     tp_size: int
     dp_rank: int
@@ -2076,7 +2233,8 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
-    parallelism_info: ParallelismInfo
+    # one entry per role (target plus each draft runner); all share the GPU rank
+    parallelism_info: List[ParallelismInfo]
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
@@ -2103,6 +2261,8 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     decode_cuda_graph_bs: Optional[List[int]] = None
     # Measured graph footprint from a matching decode peer.
     decode_cuda_graph_memory_gb: Optional[float] = None
+    # Internal preflight across DP workers; does not change roles.
+    prepare_only: bool = False
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
@@ -2139,10 +2299,12 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report asynchronous Elastic EP scale completion or failure."""
+    """Report scale completion in physical EP and logical DP-slot units."""
 
     success: bool
+    # Public Elastic EP state remains physical.
     effective_ep_size: int
+    # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
@@ -2181,6 +2343,18 @@ class SetInternalStateReq(BaseReq, kw_only=True):
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
+
+
+class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
+    pass
+
+
+class GetHiCacheL3LayoutReqOutput(BaseReq, kw_only=True):
+    """Carry the L3 availability envelope, including explicit disabled replies."""
+
+    # Untyped on purpose, like GetInternalStateReqOutput: the layout dict is
+    # sanitized with msgspec_to_builtins and can evolve without a migration.
+    layout: Dict[str, Any]
 
 
 class ProfileReqType(Enum):
@@ -2223,7 +2397,7 @@ class ProfileReqOutput(BaseReq, kw_only=True):
 
 
 class FreezeGCReq(BaseReq, kw_only=True):
-    pass
+    gc_threshold: Optional[List[int]] = None
 
 
 class ShutdownReq(BaseReq, kw_only=True):

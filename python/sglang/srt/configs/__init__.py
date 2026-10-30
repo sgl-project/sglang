@@ -1,6 +1,7 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig, BailingMoeV3VLConfig
 from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
+from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.cosmos3 import (
@@ -17,6 +18,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.flint import FlintConfig
 from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
@@ -33,6 +35,10 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusVisionConfig,
 )
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
+from sglang.srt.configs.iquest_q1 import (
+    IQuestQ1Config,
+    IQuestQ1MTPConfig,
+)
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -52,10 +58,15 @@ from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
 from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from sglang.srt.configs.minicpmv4_7 import MiniCPMV4_7Config
 from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
 from sglang.srt.configs.muse_glimmer import (
     MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
+)
+from sglang.srt.configs.muse_spark import (
+    MuseSparkConfig,
+    MuseSparkTextConfig,
 )
 from sglang.srt.configs.nanbeige import NanbeigeConfig
 from sglang.srt.configs.nano_nemotron_vl import (
@@ -90,6 +101,7 @@ __all__ = [
     "BailingHybridConfig",
     "BailingMM2Config",
     "BailingMoeV3VLConfig",
+    "BeamConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "Cosmos3Config",
@@ -111,6 +123,8 @@ __all__ = [
     "Olmo3Config",
     "MuseGlimmerConfig",
     "MuseGlimmerAssistantConfig",
+    "MuseSparkConfig",
+    "MuseSparkTextConfig",
     "Glm5NextConfig",
     "Glm5NextTextConfig",
     "KimiLinearConfig",
@@ -125,6 +139,9 @@ __all__ = [
     "Qwen3_5TextConfig",
     "Qwen3_5MoeTextConfig",
     "InternS2PreviewConfig",
+    "IQuestQ1Config",
+    "FlintConfig",
+    "IQuestQ1MTPConfig",
     "InternS2MobiusConfig",
     "InternS2MobiusTextConfig",
     "InternS2MobiusVisionConfig",
@@ -144,6 +161,7 @@ __all__ = [
     "LocateAnythingConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "MiniCPMV4_7Config",
     "NemotronHConfig",
     "NemotronHPuzzleConfig",
     "NemotronH_Nano_VL_V2_Config",

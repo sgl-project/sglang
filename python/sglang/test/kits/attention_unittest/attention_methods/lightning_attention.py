@@ -34,7 +34,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 _parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
 _parallel_override.__enter__()
 
-# seg_la kernel constraints (see seg_la.py:683-694):
+# seg_la kernel constraints (see `seg_la_fwd` in seg_la.py):
 #   - decode (`seg_la_d_kernel`): K_SPLIT_DIM = 128, so head_dim must be >= 128
 #     for `k_dim_block = head_dim // K_SPLIT_DIM` to be at least 1.
 #   - prefill with bs > 2 (`seg_la_p_kernel`): V_SPLIT_DIM = 64, so head_dim must
@@ -326,16 +326,21 @@ class MockLightningModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
-        self.init_kv_index_translator()
-        self.attn_cp_size = 1
+        self.req_to_token_pool.state.bind_routes(self.token_to_kv_pool.layer_router)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
+        self.is_draft_worker = False
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property
@@ -524,6 +529,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
@@ -644,7 +651,7 @@ def build_lightning_attention_fixture(
 
 
 def _ssm_states(fixture: LightningAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).temporal
 
 
 def _populate_lightning_prefix_state(fixture: LightningAttentionFixture) -> None:

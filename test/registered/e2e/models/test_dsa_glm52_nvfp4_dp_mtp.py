@@ -10,7 +10,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
 
 register_cuda_ci(
     est_time=400,
-    stage="base-c",
+    stage="extra-b",
     runner_config="4-gpu-b200",
 )
 
@@ -20,9 +20,8 @@ class TestGLM52NVFP4DPMTP(
 ):
     model = "nvidia/GLM-5.2-NVFP4"
     tp_size = 4
-    dp_size = 4
+    attn_dp_size = 4
     mem_fraction_static = 0.88
-    enable_dp_attention = True
     bs_1_speed_thres = 180
     gsm8k_accuracy_thres = 0.92
     extra_server_args = [

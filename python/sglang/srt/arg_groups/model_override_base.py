@@ -1,11 +1,7 @@
-"""What the per-model override declarations are written against.
+"""Registry and read views shared by model override providers.
 
-The declarations themselves live one directory down, in
-``arg_groups/model_overrides/``: one module per model family, mirroring the
-``models/`` naming. This module is what they all import -- the registry they
-register into, the read-only views they are handed, and the few accessors that
-answer questions about the model. It deliberately depends on nothing in
-``overrides.py``, so a family module never has to import its way back up.
+Model-family modules in ``model_overrides/`` import this module without
+creating a dependency back to ``overrides.py``.
 """
 
 import logging
@@ -18,10 +14,9 @@ from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
 logger = logging.getLogger(__name__)
 
 
-# Constant per-architecture overrides (populated by the migration sweeps).
+# Constant per-architecture overrides.
 MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    # These models run in bfloat16 regardless of the requested dtype
-    # (faithful port of the legacy unconditional arch branch).
+    # These models require bfloat16 regardless of the requested dtype.
     "MistralLarge3ForCausalLM": {"dtype": "bfloat16"},
     "PixtralForConditionalGeneration": {"dtype": "bfloat16"},
 }
@@ -31,9 +26,7 @@ MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
 _MODEL_OVERRIDE_FNS: Dict[str, List[Callable[..., dict]]] = {}
 
 
-# Predicate-keyed providers, in registration order — for legacy branches
-# matched by substring/predicate on the architecture string rather than an
-# exact name (e.g. '"Step3p5ForCausalLM" in model_arch').
+# Predicate-keyed providers, in registration order.
 _PREDICATE_OVERRIDE_FNS: List[Tuple[Callable[[str], bool], Callable[..., dict]]] = []
 
 
@@ -78,12 +71,7 @@ def _invoke_provider(
 
 
 class ResolvedView:
-    """Read-only view of the resolving configuration handed to post-process
-    passes: the accumulated declarations overlaid on the pristine
-    ``server_args`` (residual imperative writes of non-resolved fields show
-    through the fallthrough) — exactly the state the legacy handler at the
-    same slot observed. Writes are rejected: passes return declarations.
-    """
+    """Read-only snapshot of declarations over raw inputs, used by post-process passes."""
 
     __slots__ = ("_server_args", "_overlay")
 
@@ -104,14 +92,9 @@ class ResolvedView:
 
 
 class ResolvingConfig:
-    """Live read view of the resolution result: the declaration stash over the
-    record's fields, looked up per read.
+    """Live view of declarations over raw inputs.
 
-    ``ResolvedView`` snapshots the overlay when it is built, which is what a
-    post-process pass wants -- it reads the state at its slot. A resolver that
-    reads *after* declaring, or after calling something that declares, needs the
-    current answer instead, so this one walks the stash on every read. It falls
-    through to the field, which is where the raw input lives.
+    Unlike ``ResolvedView``, each read observes declarations made since construction.
     """
 
     __slots__ = ("_server_args",)
@@ -140,10 +123,7 @@ def resolving_view(server_args: Any) -> ResolvingConfig:
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
-    """What the declarations say so far, last writer wins.
-
-    Nothing writes the fields, so a mid-resolution reader needs this to see a
-    decision at all; the fields keep what the caller supplied."""
+    """Merge declarations in order, with the last writer winning."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -151,13 +131,7 @@ def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
 
 
 def resolved_view(server_args: Any) -> ResolvedView:
-    """Read-only view of the resolving configuration: the declarations
-    overlaid on the fields, snapshotted per call.
-
-    For mid-resolution code that is not a pass (``__post_init__`` handlers and
-    hooks) that must answer with what resolution decided -- a declaration-only resolver (a model-specific
-    override, a registry entry) never writes the field, so a field read there
-    answers with the raw input."""
+    """Snapshot current declarations over the record fields in a read-only view."""
     return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 
@@ -200,12 +174,7 @@ def record_of(view: Any) -> Any:
 
 
 def is_attention_backend_not_set(cfg: Any):
-    """None of the three attention backends has been decided yet.
-
-    Takes the view rather than the record: every read is a view read, and the
-    callers that hold a view (the override providers) would otherwise have to
-    reach back through it for a record.
-    """
+    """Return whether all three attention backends are unset in the resolving view."""
     return (
         cfg.attention_backend is None
         and cfg.prefill_attention_backend is None
@@ -221,12 +190,7 @@ def use_mla_backend(server_args: Any):
 
 
 def model_config_of(server_args: Any):
-    """The model configuration this record describes, built once and memoised.
-
-    Takes a view as readily as the record: a view is a read overlay of one
-    record, the memo has to live on that record either way, and the callers
-    that hold a view would otherwise all have to unwrap it themselves.
-    """
+    """Build and memoize ModelConfig on the underlying record, accepting records or views."""
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         server_args = record_of(server_args)
     # Lazy init to avoid circular import
@@ -234,21 +198,25 @@ def model_config_of(server_args: Any):
     from sglang.srt.configs.model_config import ModelConfig
 
     memo = getattr(server_args, "_model_config", None)
-    if memo is not None:
-        # The key is the path this record carried when the cache was
-        # filled. The GGUF and ModelScope handlers declare a different
-        # `model_path`, and a configuration built before them describes
-        # another checkpoint. `ModelConfig` re-points its own `model_path`
-        # at the local pull directory when the weights sit behind an
-        # object-store URI, so its field is not the key. A configuration a
-        # fixture supplied carries no key and is handed back as it is.
-        built_from = getattr(server_args, "_model_config_built_from", None)
-        if built_from is None or built_from == cfg.model_path:
-            return memo
+    built_from = getattr(server_args, "_model_config_built_from", None)
+    if memo is not None and built_from is None:
+        # A configuration a fixture supplied carries no key and is handed
+        # back as it is.
+        return memo
+    # The key is the path this record carried when the cache was filled.
+    # The GGUF and ModelScope handlers declare a different `model_path`, and
+    # a configuration built before them describes another checkpoint.
+    # `ModelConfig` re-points its own `model_path` at the local pull
+    # directory when the weights sit behind an object-store URI, so its
+    # field is not the key. An override that turns the SWA pool off changes
+    # `is_hybrid_swa`, so that flag is part of the key too.
+    key = (cfg.model_path, cfg.disable_hybrid_swa_memory)
+    if memo is not None and built_from == key:
+        return memo
 
     model_config = ModelConfig.from_server_args(server_args)
     server_args._model_config = model_config
-    server_args._model_config_built_from = cfg.model_path
+    server_args._model_config_built_from = key
     if model_config.is_hybrid_swa:
         logger.info(
             "Hybrid SWA model detected. architectures=%s",
@@ -258,14 +226,29 @@ def model_config_of(server_args: Any):
 
 
 def ep_joiner_of(cfg: Any) -> bool:
-    """Whether this process was launched as an elastic-EP joiner.
-
-    The one definition. After publish the answer is a bag leaf --
-    `get_exec().moe.is_ep_joiner` -- computed from this function by the
-    declaration in `arg_groups/fields/exec_.py`; resolution needs it before
-    there is a bag to read, which is why it is still a function.
-    """
+    """Return whether this process was launched as an elastic-EP joiner."""
     return cfg.ep_join_mode in ("scale", "recover")
+
+
+def context_parallel_attn_dp_size(cfg: Any, layout: str) -> int:
+    """The attention-DP width a DeepSeek context-parallel layout runs.
+
+    These layouts run data-parallel groups as attention DP, so `--dp-size N`
+    alone still means N attention-DP groups there. That reading is deprecated.
+    """
+    assert not (cfg.attn_dp_size > 1 and cfg.dp_size > 1), (
+        f"--dp-size {cfg.dp_size} with --attn-dp-size {cfg.attn_dp_size}: "
+        "data-parallel replicas combined with attention data parallelism "
+        "are not supported."
+    )
+    if cfg.dp_size > 1:
+        # TODO: reject `--dp-size > 1` here after 2026-12-31.
+        logger.warning(
+            f"--dp-size {cfg.dp_size} under {layout} runs {cfg.dp_size} attention "
+            "data-parallel groups. This is deprecated and will be rejected after "
+            f"2026-12-31; use --attn-dp-size {cfg.dp_size} instead."
+        )
+    return cfg.attn_dp_size * cfg.dp_size
 
 
 def ep_scale_joiner_of(cfg: Any) -> bool:
@@ -279,17 +262,20 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
-    """The predicate, read off a config-shaped object mid-resolution.
-
-    This is the one definition. After publish the answer is a bag leaf --
-    ``get_exec().mamba.enable_mamba_extra_buffer`` -- computed from this same
-    function by the declaration in ``arg_groups/fields/exec_.py``. Resolution
-    needs it before there is a bag to read, which is why it is still a
-    function."""
+    """Return whether the resolved Mamba cache strategy requires an extra buffer."""
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
     )
+
+
+def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    # DFLASH's topk is declared by _handle_dflash, which runs after this default,
+    # so it still reads None here. Matched by name, not from_string, so an
+    # unregistered algorithm keeps failing in validation rather than here.
+    return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
 
 
 def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
@@ -320,9 +306,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     if not use_mla_backend:
         # MHA architecture
 
-        if get_platform().is_hopper_with_cuda_12_3 and is_no_spec_infer_or_topk_one(
-            resolved_view(server_args)
-        ):
+        if (
+            get_platform().is_sail or get_platform().is_hopper_with_cuda_12_3
+        ) and is_no_spec_infer_or_topk_one(resolved_view(server_args)):
             # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
             # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
             # ref: https://github.com/sgl-project/sglang/issues/17411
@@ -333,6 +319,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             and (
                 cfg.speculative_algorithm is None
                 or cfg.speculative_eagle_topk is not None
+                or _forces_eagle_topk_one(cfg.speculative_algorithm)
             )
         ):
             # trtllm_mha requires equal K/V row widths; fa4 carries
@@ -368,14 +355,10 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "triton"
 
 
-def _dspark_verify_on_decode_backend(
-    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
-) -> bool:
+def _dspark_verify_on_decode_backend(backend: Optional[str], q_len: int) -> bool:
     """Whether the MLA decode backend can serve a q_len-wide target verify."""
     if backend == "trtllm_mla":
         return True
-    if backend == "tokenspeed_mla":
-        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
         # cute-dsl monolithic MLA decode folds the verify tokens into the head
         # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer

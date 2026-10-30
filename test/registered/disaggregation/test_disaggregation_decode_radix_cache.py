@@ -20,13 +20,14 @@ from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     is_in_ci,
     try_cached_model,
 )
 
-register_cuda_ci(est_time=170, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=155, stage="base-c", runner_config="8-gpu-h20")
 
 
 def _has_mooncake():
@@ -100,14 +101,12 @@ class DisaggregationDecodeRadixCacheTestMixin:
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=500,
             num_threads=100,
-            num_shots=6,
         )
 
-        metrics_first = run_eval(args)
+        metrics_first = run_sgl_eval(args)
         print(f"First run metrics: {metrics_first}")
 
         metrics_second = run_eval(args)

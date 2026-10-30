@@ -9,6 +9,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -42,38 +43,85 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
-    def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
-        """Compare the Rust wire declaration with the imported Python schema."""
-        rust_path = (
-            Path(__file__).resolve().parents[4]
-            / "rust/sglang-server/src/message/io_struct.rs"
-        )
-        source = rust_path.read_text()
-        start = source.index("pub(super) TokenizedGenerateReqInput<'a> {")
-        end = source.index("\n    }\n}", start)
-        rust_fields = (
+    _RUST_IO_STRUCT = (
+        Path(__file__).resolve().parents[4]
+        / "rust/sglang-server/src/message/io_struct.rs"
+    )
+
+    @staticmethod
+    def _rust_fields(body: str) -> tuple:
+        # `wire_struct!` emits `rid` and `http_worker_ipc` (the `BaseReq`
+        # header) before the declared fields.
+        return (
             "rid",
             "http_worker_ipc",
-            *re.findall(r"^\s*([a-z][a-z0-9_]*):", source[start:end], re.MULTILINE),
+            *re.findall(r"^\s*([a-z][a-z0-9_]*):", body, re.MULTILINE),
         )
-        python_fields = TokenizedGenerateReqInput.__struct_fields__
 
-        self.assertEqual(python_fields[: len(rust_fields)], rust_fields)
+    def _assert_lockstep(self, python_cls, rust_fields):
+        """The Rust struct encodes positionally: its fields must be a prefix of
+        the Python schema, and Python must default every field Rust omits."""
+        python_fields = python_cls.__struct_fields__
+        self.assertEqual(
+            python_fields[: len(rust_fields)], rust_fields, python_cls.__name__
+        )
         self.assertTrue(
             all(
                 default is not msgspec.NODEFAULT
-                for default in TokenizedGenerateReqInput.__struct_defaults__[
-                    len(rust_fields) :
-                ]
+                for default in python_cls.__struct_defaults__[len(rust_fields) :]
             ),
-            "Rust may omit only a defaulted suffix of the Python wire schema",
+            f"{python_cls.__name__}: Rust may omit only a defaulted suffix of "
+            "the Python wire schema",
         )
+
+    def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
+        """Compare the Rust wire declaration with the imported Python schema."""
+        source = self._RUST_IO_STRUCT.read_text()
+        start = source.index("pub(super) TokenizedGenerateReqInput<'a> {")
+        end = source.index("\n    }\n}", start)
+        self._assert_lockstep(
+            TokenizedGenerateReqInput, self._rust_fields(source[start:end])
+        )
+
+    def test_rust_control_messages_stay_in_lockstep(self):
+        """Every control message the Rust frontend sends (the
+        `control_messages!` block) must decode into its Python namesake."""
+        source = self._RUST_IO_STRUCT.read_text()
+        start = source.index("control_messages! {")
+        block = source[start : source.index("\n}\n", start)]
+        messages = re.findall(
+            # A field-less `Name {}` opens and closes on one line.
+            r"^    ([A-Z][A-Za-z0-9]*) \{(\}|.*?^    \})",
+            block,
+            re.MULTILINE | re.DOTALL,
+        )
+        # Every declaration in the block must be parsed (a drifted layout
+        # would otherwise escape the check), and the set is pinned so adding
+        # a message means extending this test.
+        declared = re.findall(r"^    ([A-Z][A-Za-z0-9]*)\b", block, re.MULTILINE)
+        names = [name for name, _ in messages]
+        self.assertEqual(names, declared)
+        self.assertEqual(
+            set(names),
+            {
+                "AbortReq",
+                "GetInternalStateReq",
+                "FlushCacheReqInput",
+                "CheckWeightsReqInput",
+                "ClearHiCacheReqInput",
+                "DetachHiCacheStorageReqInput",
+                "AttachHiCacheStorageReqInput",
+                "ProfileReq",
+            },
+        )
+        for name, body in messages:
+            self._assert_lockstep(getattr(io_struct, name), self._rust_fields(body))
 
     def _make_mm_inputs(self, device="cpu"):
         return MultimodalProcessorOutput(
@@ -411,6 +459,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
         )
+
+    def test_sampling_logprobs_mode_normalization(self):
+        default_req = copy.deepcopy(self.base_req)
+        default_req.normalize_batch_and_arguments()
+        self.assertEqual(default_req.sampling_logprobs_mode, [None, None])
+
+        req = copy.deepcopy(self.base_req)
+        req.return_sampling_mask = [True, True]
+        req.sampling_logprobs_mode = ["selected", "support"]
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            req.sampling_logprobs_mode,
+            ["selected", "support"],
+        )
+        self.assertEqual(req[0].sampling_logprobs_mode, "selected")
+        self.assertEqual(req[1].sampling_logprobs_mode, "support")
 
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
@@ -1332,6 +1398,39 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
             text=["first", "second"], lora_path=["only-one-adapter"]
         )
         with self.assertRaisesRegex(ValueError, "must match batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_media_only_flat_list_is_one_request(self):
+        """Without text, a flat media list is one request with all items, as in HF."""
+        req = EmbeddingReqInput(image_data=["a.jpg", "b.jpg"])
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.image_data, ["a.jpg", "b.jpg"])
+
+    def test_media_only_nested_list_is_a_batch(self):
+        """A list of per-request media lists is the explicit batch form."""
+        req = EmbeddingReqInput(image_data=[["a.jpg"], ["b.jpg", "c.jpg"]])
+        req.normalize_batch_and_arguments()
+        self.assertFalse(req.is_single)
+        self.assertEqual(
+            [req[0].image_data, req[1].image_data], [["a.jpg"], ["b.jpg", "c.jpg"]]
+        )
+
+    def test_media_list_pairs_with_text_batch(self):
+        """A media list pairs by position; a scalar item broadcasts to every request."""
+        req = EmbeddingReqInput(
+            text=["t0", "t1"], image_data=["a.jpg", None], audio_data="s.wav"
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [(req[i].image_data, req[i].audio_data) for i in range(2)],
+            [("a.jpg", "s.wav"), (None, "s.wav")],
+        )
+
+    def test_media_list_length_must_match_batch(self):
+        """A short media list must not be re-attached to the remaining requests."""
+        req = EmbeddingReqInput(text=["t0", "t1", "t2"], image_data=["a.jpg"])
+        with self.assertRaisesRegex(ValueError, "image_data has 1 entries"):
             req.normalize_batch_and_arguments()
 
 

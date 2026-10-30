@@ -23,12 +23,14 @@ from sglang.srt.runtime_context import attention_backends
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
+    is_hip,
     is_npu,
     is_xpu,
     support_triton,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -170,11 +172,18 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if _is_hip:
+            # On HIP, keep fp32 for the fused QSA indexer JIT kernel.
+            if self.cos_sin_cache.device != query.device:
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        else:
+            if (
+                self.cos_sin_cache.device != query.device
+                or self.cos_sin_cache.dtype != query.dtype
+            ):
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
 
     def forward_native(
         self,
@@ -291,7 +300,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert fused_set_kv_buffer_arg is None, (
             "fused_set_kv_buffer_arg is not supported for npu implementation"
         )
-        if query.shape[1] > 4096:
+        # The NPU call below selects ordinary RoPE, which requires 1D positions.
+        if positions.ndim == 2 or query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
         mrope_section = [0, 0, 0]

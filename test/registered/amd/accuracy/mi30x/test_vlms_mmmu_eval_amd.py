@@ -229,7 +229,10 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
                         eval_name="mmmu",
                         num_examples=100,
                         num_threads=64,
-                        max_tokens=30,
+                        # The MMMU prompt asks for step-by-step reasoning ending in
+                        # "Answer: X" (#21841); 30 tokens truncated it before the
+                        # answer, so the parser fell back to "A" for every model.
+                        max_tokens=1024,
                     )
 
                     # Run evaluation with timing

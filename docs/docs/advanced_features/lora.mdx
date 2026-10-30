@@ -1,7 +1,7 @@
 ---
 title: "LoRA Serving"
 metatags:
-    description: "SGLang multi-LoRA serving: S-LoRA and Punica techniques, dynamic adapter loading, GPU pinning, overlap loading, Triton and CSGMV backends."
+    description: "SGLang multi-LoRA serving: S-LoRA and Punica techniques, DP attention, dynamic adapter loading, GPU pinning, overlap loading, Triton and CSGMV backends."
 ---
 SGLang enables the use of [LoRA adapters](https://arxiv.org/abs/2106.09685) with a base model. By incorporating techniques from [S-LoRA](https://arxiv.org/pdf/2311.03285) and [Punica](https://arxiv.org/pdf/2310.18547), SGLang can efficiently support multiple LoRA adapters for different sequences within a single batch of inputs.
 
@@ -17,7 +17,7 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `lora_paths`: The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: &lt;PATH&gt; | &lt;NAME&gt;=&lt;PATH&gt; | JSON with schema &#123;"lora_name":str,"lora_path":str,"pinned":bool&#125;.
 
-* `max_loras_per_batch`: Maximum number of adaptors used by each batch. This argument can affect the amount of GPU memory reserved for multi-LoRA serving, so it should be set to a smaller value when memory is scarce. Defaults to be 8.
+* `max_loras_per_batch`: GPU pool capacity in distinct adapter IDs, including `None` for base-model requests. With pipeline parallelism, this capacity is shared across all in-flight microbatches. More slots reserve more GPU memory. Defaults to 8.
 
 * `max_loaded_loras`: If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `max-loras-per-batch`.
 
@@ -31,7 +31,7 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `max_lora_chunk_size`: Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. Please tune this value based on your hardware and workload as needed. Defaults to 16.
 
-* `lora_drain_wait_threshold`: When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).
+* `lora_drain_wait_threshold`: Once an adapter's oldest waiting request exceeds this threshold (seconds), the scheduler can drain an unpinned running adapter to make room. Multiple adapters can be drained when several waiting adapters need slots. Each drain limits new requests to a fixed running request's remaining output budget. Pinned adapters are never drained. This is best effort: the threshold starts draining without reserving a freed slot or guaranteeing a maximum waiting time. Set to 0 to disable draining (default).
 
 * `tp_size`: LoRA serving along with Tensor Parallelism is supported by SGLang. `tp_size` controls the number of GPUs for tensor parallelism. More details on the tensor sharding strategy can be found in [S-Lora](https://arxiv.org/pdf/2311.03285) paper.
 
@@ -411,6 +411,39 @@ server_process, port = launch_server_cmd(
 ```python Example
 terminate_process(server_process)
 ```
+
+## LoRA with pipeline parallelism
+
+With `--pp-size > 1`, each stage shares its LoRA GPU pool across all in-flight microbatches. `--max-loras-per-batch` limits the union of their adapter IDs, including one slot for `None` when base-model requests are present.
+
+Each stage allocates transformer-layer LoRA buffers only for its local modules. For balanced partitions of homogeneous layers at the same slot count and LoRA rank, these buffers use approximately `1 / pp_size` of their unpartitioned size per stage. Embedding and output-head buffers follow the LoRA-enabled modules present on each stage. This ratio does not describe total GPU memory usage. You can increase `--max-loras-per-batch` if your actual GPU memory budget permits.
+
+When requests target more adapters than fit in the pool, requests for additional adapters wait for a slot. To improve fairness under skewed traffic, set [`--lora-drain-wait-threshold`](/docs/advanced_features/lora#arguments-for-lora-serving) to a positive value. Its default, `0`, disables draining.
+
+## LoRA with DP attention
+
+SGLang supports LoRA serving with [data parallel attention (DPA)](/docs/advanced_features/dp_dpa_smg_guide). The model architecture must support DPA, and you must currently select the Triton LoRA backend. Other built-in LoRA backends reject this configuration at startup.
+
+The following NVIDIA CUDA example uses four attention-DP ranks:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --tp 4 \
+    --attn-dp-size 4 \
+    --enable-lora \
+    --lora-backend triton \
+    --lora-paths '{"lora_name":"ADAPTER_NAME","lora_path":"ADAPTER_PATH","pinned":true}'
+```
+
+Keep these constraints in mind:
+
+- `--attn-dp-size` must equal `--tp-size`, so every attention DP rank owns its whole token batch. The server rejects other layouts at startup.
+- All adapters must be GPU-pinned (`pinned: true`), including dynamically loaded adapters. You can pin at most `--max-loras-per-batch - 1` adapters; the remaining slot is reserved for the base model.
+- Decode CUDA graphs are supported. LoRA prefill runs eagerly when DPA is enabled.
+- `--max-loras-per-batch` limits the union of adapters active across all DP ranks in a synchronized forward, not the adapters on one rank alone.
+- Dynamic load and unload requests are sent to every DP rank. An operation succeeds only if every rank reports success. After a partially successful load, retry unloading the same adapter name before loading it again.
+- The built-in LoRA memory pool does not support `--enable-lora-overlap-loading` with DPA. The server rejects that combination rather than allowing DP ranks to assign different GPU slots.
 
 ## LoRA Overlap Loading
 

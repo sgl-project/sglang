@@ -18,8 +18,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
+    ModelOptFp8LinearMethod as StaticModelOptFp8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
@@ -28,7 +31,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -99,7 +101,7 @@ def _prepare_nvfp4_swiglu_fusion_weights(
     weight: torch.Tensor,
     scales: torch.Tensor,
 ) -> None:
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         interleave_linear_and_gate,
         swizzle_blockscale_2d,
     )
@@ -157,6 +159,53 @@ def _prepare_nvfp4_swiglu_fusion_weights(
     layer._swiglu_fusion_ready = True
 
 
+def _linear_nvfp4_scales_to_tma(scales: torch.Tensor) -> torch.Tensor:
+    """Convert row-major FP4 scales to the CUTLASS/cuDNN 128x4 TMA layout."""
+    scale_ndim = scales.ndim
+    if scale_ndim == 2:
+        scales = scales.unsqueeze(0)
+    assert scales.ndim == 3
+
+    B, M, K = scales.shape
+    M_padded = round_up(M, 128)
+    K_padded = round_up(K, 4)
+    padded = torch.zeros(
+        (B, M_padded, K_padded), dtype=scales.dtype, device=scales.device
+    )
+    padded[:B, :M, :K] = scales
+    padded = padded.reshape(B, M_padded // 128, 4, 32, K_padded // 4, 4)
+    padded = padded.permute(0, 1, 4, 3, 2, 5).contiguous()
+    padded = padded.reshape(B, M_padded, K_padded)
+    return padded.squeeze(0) if scale_ndim == 2 else padded
+
+
+def _rebase_partition_weight_scales(
+    scales: torch.Tensor,
+    logical_widths: List[int],
+    partition_scales: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fold per-partition tensorwise scales into row-major block scales."""
+    rebased = scales.float().clone()
+    offset = 0
+    for width, partition_scale in zip(logical_widths, partition_scales, strict=True):
+        rebased[offset : offset + width].mul_(partition_scale / global_scale)
+        offset += width
+    return rebased.to(torch.float8_e4m3fn)
+
+
+def _dynamic_nvfp4_input_scale(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Compute the reference tensorwise activation scale.
+
+    Row-parallel inputs are feature-sharded, so their maximum must be reduced
+    across the TP group before each rank quantizes its local input partition.
+    """
+    amax = x.abs().amax().float().clamp(min=1e-8)
+    if getattr(layer, "input_is_parallel", False) and getattr(layer, "tp_size", 1) > 1:
+        amax = layer.tp_group.all_reduce(amax, op=torch.distributed.ReduceOp.MAX)
+    return (amax / (6.0 * 448.0)).reshape(1)
+
+
 def _require_flashinfer():
     if flashinfer is None:
         raise RuntimeError(
@@ -193,9 +242,6 @@ class ModelOptQuantConfig(QuantizationConfig):
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         return ["hf_quant_config.json"]
-
-    def get_scaled_act_names(self) -> List[str]:
-        return []
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant) -> Optional[str]:
@@ -317,6 +363,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         checkpoint_uses_packed_qkv: bool = False,
         swap_weight_nibbles: bool = False,
         checkpoint_weight_scale_layout: str = "linear",
+        dynamic_input_scale: bool = False,
         checkpoint_uses_comfy_quantization: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
@@ -327,8 +374,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
+        self.dynamic_input_scale = dynamic_input_scale
         self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
-        self._comfy_int8_config: KitchenInt8Config | None = None
+        self._comfy_int8_config: ConvRotInt8Config | None = None
         self._comfy_fp8_config: ComfyFp8Config | None = None
 
     def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
@@ -346,7 +394,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if marker.get("format") == "int8_tensorwise"
         }
         self._comfy_int8_config = (
-            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+            ConvRotInt8Config(layer_markers=int8_markers) if int8_markers else None
         )
         fp8_markers = {
             prefix: marker
@@ -454,6 +502,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             checkpoint_weight_scale_layout=config.get(
                 "checkpoint_weight_scale_layout", "linear"
             ),
+            dynamic_input_scale=config.get("dynamic_input_scale", False),
             checkpoint_uses_comfy_quantization=config.get(
                 "checkpoint_uses_comfy_quantization", False
             ),
@@ -581,20 +630,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         copy_or_rebind_param(layer, "weight_scale", processed_weight_scale)
         copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
-        )
+    apply = StaticModelOptFp8LinearMethod.apply
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -678,6 +714,23 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         set_weight_attrs(weight_scale_2, {"missing_param_init": "ones"})
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
+        serialized_scale_layout = getattr(
+            self.quant_config, "checkpoint_weight_scale_layout", "linear"
+        )
+        scale_weight_loader = weight_loader
+        held_scale_layout = serialized_scale_layout
+        if serialized_scale_layout == "swizzled" and weight_loader is not None:
+
+            def scale_weight_loader(param, loaded_weight, *args, **kwargs):
+                return weight_loader(
+                    param,
+                    _swizzled_nvfp4_scales_to_linear(loaded_weight),
+                    *args,
+                    **kwargs,
+                )
+
+            held_scale_layout = "linear"
+
         weight_scale = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
@@ -686,12 +739,33 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=scale_weight_loader,
         )
-        set_weight_attrs(weight_scale, {"missing_param_init": "ones"})
+        set_weight_attrs(
+            weight_scale,
+            {
+                "missing_param_init": "ones",
+                "nvfp4_scale_layout": held_scale_layout,
+            },
+        )
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _, weight_scale_2 = self._process_global_scales(layer)
+        scales = self._logical_weight_scales(layer)
+        # Packed projections may carry one tensorwise decode scale per logical
+        # partition. Fold each relative factor into its block scales so the
+        # backend can consume one common global scale.
+        if layer.weight_scale_2.numel() > 1:
+            scales = _rebase_partition_weight_scales(
+                scales, layer.logical_widths, layer.weight_scale_2, weight_scale_2
+            )
+        self._process_backend_weights(layer, scales)
+
+    def _process_global_scales(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bind the common tensorwise scales; return ``(input, weight)`` globals."""
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -703,21 +777,34 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         layer.output_size_per_partition = layer.weight.shape[0]
+        return input_scale_2, weight_scale_2
 
-        w = layer.weight.data
+    def _logical_weight_scales(self, layer: torch.nn.Module) -> torch.Tensor:
+        """Return the loaded block scales in row-major ``[N, K / group]`` layout."""
+        scales = layer.weight_scale
+        # ``create_weights`` normalizes swizzled scales in the weight loader, so
+        # trust the layout the parameter reports rather than the serialized one.
+        if (
+            getattr(
+                scales,
+                "nvfp4_scale_layout",
+                getattr(self.quant_config, "checkpoint_weight_scale_layout", "linear"),
+            )
+            == "swizzled"
+        ):
+            scales = _swizzled_nvfp4_scales_to_linear(scales)
+        return scales
+
+    def _process_backend_weights(
+        self, layer: torch.nn.Module, scales: torch.Tensor
+    ) -> None:
+        """Convert weights and row-major scales to the selected GEMM layout."""
         w_swapped = _prepare_nvfp4_weight_bytes(
-            w,
+            layer.weight.data,
             swap_weight_nibbles=getattr(
                 self.quant_config, "swap_weight_nibbles", False
             ),
         )
-        scales = layer.weight_scale
-        if (
-            getattr(self.quant_config, "checkpoint_weight_scale_layout", "linear")
-            == "swizzled"
-        ):
-            scales = _swizzled_nvfp4_scales_to_linear(scales)
-
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
             # The regular GEMM path swizzles this tensor below.  The fused
             # GEMM+SwiGLU epilogue needs the logical row order so gate/up rows
@@ -802,6 +889,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output_size = layer.output_size_per_partition
+        alpha = None
         if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
             x_fp4, x_scale_interleaved = x
             output_dtype = layer.params_dtype
@@ -822,34 +910,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                     "No FP4 quantization kernel available. Install flashinfer."
                 )
 
-            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
-        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
-        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
-
-        w = layer.weight
-        w_scale_interleaved = layer.weight_scale_interleaved
-
-        if x_scale_interleaved.dtype == torch.uint8:
-            x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
-        if w_scale_interleaved.dtype == torch.uint8:
-            w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
-        fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
-        if fp4_gemm is None:
-            raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
-        out = fp4_gemm(
-            x_fp4,
-            w.T,
-            x_scale_interleaved,
-            w_scale_interleaved.T,
-            layer.alpha,
-            output_dtype,
-            backend=flashinfer_backend,
+            input_scale_inv = layer.input_scale_inv
+            if self.quant_config.dynamic_input_scale:
+                input_scale = _dynamic_nvfp4_input_scale(layer, x)
+                input_scale_inv = 1.0 / input_scale
+                alpha = input_scale * layer.weight_scale_2.max().to(torch.float32)
+            x_fp4, x_scale_interleaved = fp4_quantize(x, input_scale_inv)
+        out = apply_nvfp4_gemm_prequantized(
+            layer, x_fp4, x_scale_interleaved, output_dtype, bias, alpha=alpha
         )
-
-        out = slice_nvfp4_output(out, output_size)
-
-        if bias is not None:
-            out = out + bias
         return out.view(*output_shape)
 
 
@@ -859,6 +928,7 @@ def apply_nvfp4_gemm_prequantized(
     x_scale_interleaved: torch.Tensor,
     output_dtype: torch.dtype,
     bias: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run a ModelOpt NVFP4 GEMM from already packed activations and scales."""
     weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
@@ -879,7 +949,7 @@ def apply_nvfp4_gemm_prequantized(
         w.T,
         x_scale_interleaved,
         w_scale_interleaved.T,
-        layer.alpha,
+        layer.alpha if alpha is None else alpha,
         output_dtype,
         backend=flashinfer_backend,
     )
@@ -902,7 +972,7 @@ def apply_nvfp4_gemm_swiglu_quant(
     if fp4_quantize is None:
         raise RuntimeError("No FP4 quantization kernel available. Install flashinfer.")
 
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
 
