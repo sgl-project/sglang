@@ -747,24 +747,38 @@ class TestCheckpointTracing(CustomTestCase):
 
     def test_observer_failure_preserves_checkpoint_and_backend_error(self):
         """An exporter failure cannot skip a checkpoint or mask its error."""
-        req, cache = self.make_request_and_cache()
+        fail_at = ["start"]
 
         class FailingObserver(SpanProcessor):
             def on_start(self, span, parent_context=None):
-                raise RuntimeError("observer failed")
+                if span.name == "cache_checkpoint_cpu" and fail_at[0] == "start":
+                    raise RuntimeError("observer failed")
+
+            def on_end(self, span):
+                if span.name == "cache_checkpoint_cpu" and fail_at[0] == "end":
+                    raise RuntimeError("observer failed")
 
         self.provider.add_span_processor(FailingObserver())
-        checkpoint_kv_cache(req, cache)
-        self.assertEqual(req.prefix_len, 4)
-        result = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])))
-        )
-        self.assertEqual(result.device_prefix_len, 4)
-        with patch.object(cache, "checkpoint", side_effect=ValueError("copy failure")):
-            with self.assertRaisesRegex(ValueError, "copy failure"):
-                checkpoint_kv_cache(req, cache)
-        self.assertEqual(req.prefix_len, 4)
-        req.time_stats.trace_ctx.trace_req_finish()
+        for hook in ("start", "end"):
+            fail_at[0] = hook
+            for backend_error in (False, True):
+                with self.subTest(hook=hook, backend_error=backend_error):
+                    req, cache = self.make_request_and_cache()
+                    if backend_error:
+                        with patch.object(
+                            cache, "checkpoint", side_effect=ValueError("copy failure")
+                        ):
+                            with self.assertRaisesRegex(ValueError, "copy failure"):
+                                checkpoint_kv_cache(req, cache)
+                        self.assertEqual(req.prefix_len, 0)
+                    else:
+                        checkpoint_kv_cache(req, cache)
+                        self.assertEqual(req.prefix_len, 4)
+                        result = cache.match_prefix(
+                            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])))
+                        )
+                        self.assertEqual(result.device_prefix_len, 4)
+                    req.time_stats.trace_ctx.trace_req_finish()
 
 
 if __name__ == "__main__":
