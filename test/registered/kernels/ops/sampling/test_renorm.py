@@ -92,5 +92,47 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+def _top_p_float64(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """FlashInfer's top-p (keep every probability at or above the pivot, ties included),
+    the pivot found on a float64 cumulative mass."""
+    sorted_probs = torch.sort(probs.double(), dim=-1).values
+    cdf = torch.cumsum(sorted_probs, dim=-1)
+    cutoff = torch.searchsorted(cdf, (1.0 - top_ps.double()).unsqueeze(1))
+    pivots = sorted_probs.gather(1, cutoff.clamp(max=probs.shape[-1] - 1))
+    kept = torch.where(probs.double() >= pivots, probs.double(), 0.0)
+    return (kept / kept.sum(-1, keepdim=True)).float()
+
+
+@pytest.mark.skipif(not is_hip(), reason="the fused kernel serves the ROCm path")
+@pytest.mark.parametrize("rows_per_request", [5, 6])
+# one request fits the CUs: one launch, whose work words must be zero again after it
+@pytest.mark.parametrize("requests", [1, 4])
+def test_softmax_top_p_matches_softmax_then_top_p(rows_per_request, requests):
+    """A row split over many blocks keeps the same tokens as softmax then top-p, and
+    without top-p it is the temperature softmax, launch after launch."""
+    from sglang.kernels.ops.sampling.softmax_top_p import softmax_top_p_probs
+
+    torch.manual_seed(0)
+    vocab = 129280
+    rows = requests * rows_per_request
+    # strided rows, as a captured logits buffer hands them over
+    logits = (torch.randn(rows, vocab + 64, device="cuda:0") * 6)[:, :vocab]
+    for temps, top_ps in (
+        ([0.3, 0.7, 1.0, 2.5], [0.95, 0.5, 1.0, 0.9]),
+        ([2.5, 1.0, 0.7, 0.3], [0.9, 0.95, 0.5, 1.0]),
+    ):
+        temps = torch.tensor(temps[:requests], device="cuda:0")
+        top_ps = torch.tensor(top_ps[:requests], device="cuda:0")
+        probs = torch.softmax(
+            logits / temps.repeat_interleave(rows_per_request)[:, None], -1
+        )
+        soft = softmax_top_p_probs(logits, temps, None, rows_per_request)
+        torch.testing.assert_close(soft, probs, rtol=1e-4, atol=1e-7)
+        expected = _top_p_float64(probs, top_ps.repeat_interleave(rows_per_request))
+        got = softmax_top_p_probs(logits, temps, top_ps, rows_per_request)
+        assert torch.equal(got > 0, expected > 0)
+        torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-7)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

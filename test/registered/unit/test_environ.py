@@ -44,6 +44,18 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
 
+AMD_MONO_RUNTIME_CHILDREN = (
+    "SGLANG_OPT_DSV41_DSPARK_POST_FOLD",
+    "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS",
+    "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE",
+    "SGLANG_OPT_DSV41_DSPARK_MID_FOLD",
+    "SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE",
+    "SGLANG_OPT_DSV41_TARGET_METADATA_EARLY",
+    "SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH",
+    "SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P",
+    "SGLANG_OPT_ROCM_DSPARK_CHAIN_REJECTION",
+)
+
 
 class TestEnvField(unittest.TestCase):
     def setUp(self):
@@ -177,6 +189,22 @@ class TestEnvField(unittest.TestCase):
                     child = self.env_fields[name]
                     with child.override(None):
                         self.assertIsNone(child.get())
+
+    def test_amd_mono_runtime_switch_scope_and_overrides(self):
+        master = envs.SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION
+        with ExitStack() as stack:
+            for field in self.env_fields.values():
+                stack.enter_context(field.override(False))
+                field.clear()
+            defaults = {name: field.get() for name, field in self.env_fields.items()}
+            with master.override(True):
+                for name, field in self.env_fields.items():
+                    on = name == master.name or name in AMD_MONO_RUNTIME_CHILDREN
+                    with self.subTest(name=name):
+                        self.assertEqual(field.get(), True if on else defaults[name])
+                for name in AMD_MONO_RUNTIME_CHILDREN:
+                    with self.subTest(child=name), self.env_fields[name].override("0"):
+                        self.assertIs(self.env_fields[name].get(), False)
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):

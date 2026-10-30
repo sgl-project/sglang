@@ -12,14 +12,16 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 if _is_npu:
     from sgl_kernel_npu.sample import chain_speculative_sampling_triton
@@ -143,6 +145,15 @@ def _accept_sampling_core(
     if block_verification:
         # Startup validation rejects NPU, whose sampler has no block mode.
         sampling_fn = partial(sampling_fn, block_verification=True)
+    elif _is_hip and envs.SGLANG_OPT_ROCM_DSPARK_CHAIN_REJECTION.get():
+        from sglang.kernels.ops.speculative.chain_rejection import (
+            chain_rejection_sampling,
+            chain_rejection_supported,
+        )
+
+        # each request's vocabulary over many blocks, not one
+        if chain_rejection_supported(target_probs, draft_probs):
+            sampling_fn = chain_rejection_sampling
     sampling_fn(
         predicts=predicts,
         accept_index=accept_index,
@@ -282,6 +293,8 @@ class SoftmaxTemp:
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
+        if is_hip() and envs.SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P.get():
+            return cls.jit(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
     @classmethod
@@ -310,6 +323,21 @@ class SoftmaxTemp:
             logits=logits,
             temperatures=temperatures,
             rows_per_request=rows_per_request,
+        )
+
+    @classmethod
+    def jit(
+        cls,
+        *,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        rows_per_request: int,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.sampling.softmax_top_p import softmax_top_p_probs
+
+        # each row over many blocks: the Triton kernel's block a row leaves most CUs idle
+        return softmax_top_p_probs(
+            logits, temperatures.reshape(-1), None, rows_per_request=rows_per_request
         )
 
     @classmethod
