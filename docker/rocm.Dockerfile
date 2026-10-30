@@ -1251,9 +1251,10 @@ RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib
 # tests are also copied to /sgl-workspace/utlx: triton-ext lists uTLX as
 # disabled, so its conftest.py skips them in the checkout.
 ARG UTLX_REPO="https://github.com/triton-lang/triton-ext.git"
-# triton-ext main at #179, the source of triton-utlx-rocm 3.8.0.post1. Includes #177,
-# which keeps Gluon kernels (e.g. aiter's) compiling with uTLX loaded.
-ARG UTLX_COMMIT="9592ce6d40d5d6b1b80cb9304b4fcff632456a8c"
+# triton-ext main at #183. With uTLX loaded, #177 keeps Gluon kernels (e.g.
+# aiter's) compiling, and #183 tl.cat and tensor-returning noinline functions
+# (e.g. MiniMax's sparse-attention indexer).
+ARG UTLX_COMMIT="268252bcc64e13b553b7906e5b69f02fa69054fb"
 RUN if [ "${BUILD_UTLX}" = "1" ]; then \
         echo "[uTLX] building ${UTLX_COMMIT} against /sgl-workspace/triton-custom"; \
         cd /sgl-workspace/triton-custom \
