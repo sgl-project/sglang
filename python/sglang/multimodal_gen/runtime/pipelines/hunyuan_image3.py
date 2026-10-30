@@ -341,6 +341,13 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
+        transformer_attn_backend, _ = server_args.resolve_component_attention_backend(
+            "transformer"
+        )
+        if transformer_attn_backend is None:
+            transformer_attn_backend = server_args.attention_backend
+        transformer_attn_backend = str(transformer_attn_backend).lower()
+
         self.add_stage(
             HunyuanImage3AR(
                 ar_model=self.get_module("transformer"),
@@ -358,9 +365,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     if server_args.batching_max_size > 1
                     else None
                 ),
-                # --attention-backend fa3/fa4 resolves to "fa"; FA3 is not
-                # bitwise equal to masked SDPA, so it stays opt-in.
-                use_flash_segments=server_args.attention_backend == "fa",
+                # FA3 is not bitwise equal to masked SDPA, so enable it only
+                # when the effective transformer backend resolves to FA.
+                use_flash_segments=transformer_attn_backend in {"fa", "fa3", "fa4"},
             ),
             "hunyuan_image3_ar",
         )
