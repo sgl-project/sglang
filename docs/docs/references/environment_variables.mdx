@@ -1924,7 +1924,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HACK_FLASHMLA_BACKEND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 HIP decode attention kernel: <code>auto</code> takes aiter's gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere; <code>aiter_sparse</code>, <code>tilelang</code>, <code>triton</code>, <code>torch</code>, <code>comparison</code> or <code>unified_kv_triton</code> force one.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 HIP decode attention kernel: <code>auto</code> takes aiter's gluon sparse kernel on gfx950, except decode and verify calls with 1 to 16 rows on ranks with 16 heads (a 64-head model at TP4), which take the swap-AB kernel. Elsewhere it takes the tilelang partial + combine. <code>aiter_sparse</code>, <code>tilelang</code>, <code>triton</code>, <code>torch</code>, <code>comparison</code> or <code>unified_kv_triton</code> force one.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
     </tr>
     <tr>
