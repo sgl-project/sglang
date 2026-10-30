@@ -33,6 +33,8 @@ class MarlinContiguousProvider(ContiguousRowDomainProvider):
 
     # The E8M0-scale kernels have no atomic-add path: split-K reduces in FP32.
     _use_atomic_add = False
+    # A reload replaces the repacked parameters these bind.
+    derived_base_weights = "the Marlin-repacked expert weights"
 
     def __init__(
         self,

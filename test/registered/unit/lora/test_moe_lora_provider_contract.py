@@ -223,6 +223,44 @@ class TestProviderGeometry(CustomTestCase):
         module.try_get_optimal_moe_config.assert_called_once()
 
 
+class TestDerivedBaseWeights(CustomTestCase):
+    def test_runner_names_what_its_providers_derive(self):
+        from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProvider
+
+        self.assertIsNone(MoeBaseProvider.derived_base_weights)
+        source = _function(
+            (ROOT / "python/sglang/srt/lora/moe/runner.py").read_text(),
+            "derived_base_weights",
+        )
+        namespace = {}
+        exec("from __future__ import annotations\n" + source, namespace)
+        derived = namespace["derived_base_weights"]
+
+        def runner(*reasons):
+            return SimpleNamespace(
+                providers={
+                    str(i): SimpleNamespace(derived_base_weights=reason)
+                    for i, reason in enumerate(reasons)
+                }
+            )
+
+        self.assertIsNone(derived(runner(None)))
+        self.assertEqual(derived(runner("atoms", None, "atoms")), "atoms")
+        self.assertEqual(derived(runner("atoms", "tiles")), "atoms and tiles")
+
+    def test_prepared_weight_providers_declare_derived_base_weights(self):
+        # Packed scale atoms, NVFP4 alpha products, and Marlin repacks are not
+        # refreshed by an in-place base-weight update; BF16 and FP8 bind views.
+        for name in ("cutedsl_blockscaled.py", "marlin_common.py"):
+            self.assertIn(
+                "derived_base_weights = ", (PROVIDER / name).read_text(), name
+            )
+        for name in ("cutedsl_bf16.py", "cutedsl_fp8.py", "triton_bf16.py"):
+            self.assertNotIn(
+                "derived_base_weights", (PROVIDER / name).read_text(), name
+            )
+
+
 class TestCompileCache(CustomTestCase):
     def test_stage_constants_separate_compiled_code(self):
         """NVFP4 gate/up and down stages of one geometry differ only in their

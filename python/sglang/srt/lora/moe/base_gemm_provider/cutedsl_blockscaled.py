@@ -59,6 +59,7 @@ class _CuteDslBlockScaledMixin(CuteDslTileMixin):
     )
     WIDE_EXPECTED_M_THRESHOLD = 32
     SF_VEC_SIZE = 32
+    derived_base_weights = "packed block-scale atoms"
 
     def _bind_weights(self, quant_info: MoeLoraMxQuantInfo) -> None:
         from sglang.kernels.ops.lora.moe.cutedsl.api import scale_atom_bytes
@@ -223,6 +224,7 @@ class _CuteDslBlockScaledMixin(CuteDslTileMixin):
 
 class _CuteDslNvFp4Mixin(_CuteDslBlockScaledMixin):
     SF_VEC_SIZE = 16
+    derived_base_weights = "packed block-scale atoms and global-scale products"
 
     def _bind_weights(self, quant_info: MoeLoraNvFp4QuantInfo) -> None:
         super()._bind_weights(quant_info)

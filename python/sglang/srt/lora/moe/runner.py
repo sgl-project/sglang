@@ -110,6 +110,16 @@ class MoeLoraRunner:
         self.workspace = workspace if workspace is not None else LoraWorkspace()
         self.plans: dict[Phase, SelectedPlan] = {}
 
+    @property
+    def derived_base_weights(self) -> str | None:
+        """What the providers derive from the base weights, if anything."""
+        reasons = dict.fromkeys(
+            provider.derived_base_weights
+            for provider in self.providers.values()
+            if provider.derived_base_weights
+        )
+        return " and ".join(reasons) or None
+
     @classmethod
     def from_layer(
         cls,

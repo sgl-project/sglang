@@ -83,6 +83,9 @@ class MoeBaseProvider:
     """One provider per layer; logical sizes come from quant_info."""
 
     contract: MoeBaseProviderContract
+    # What the provider derives from the base weights when bound, if anything;
+    # online base-weight updates cannot refresh it, so the LoRA layer declines them.
+    derived_base_weights: str | None = None
 
     @property
     def num_local_experts(self) -> int:
