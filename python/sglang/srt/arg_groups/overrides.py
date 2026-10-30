@@ -1102,6 +1102,19 @@ def _deterministic_attention_backend(view: Any) -> dict:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
+    # A per-phase backend takes priority over --attention-backend for its phase,
+    # so it has to be one of the deterministic backends too.
+    for field in ("prefill_attention_backend", "decode_attention_backend"):
+        backend = getattr(view, field, None)
+        if (
+            backend is not None
+            and backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+        ):
+            raise ValueError(
+                f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
+                f"but --{field.replace('_', '-')} is '{backend}'."
+            )
+
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
         if get_platform().is_xpu:

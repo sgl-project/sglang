@@ -278,21 +278,6 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if get_exec().moe.elastic_ep_backend is not None:
-            if len(ranks.status) != self.max_dp_size:
-                logger.warning(
-                    "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
-                    "ignoring update",
-                    len(ranks.status),
-                    self.max_dp_size,
-                )
-                return
-            self.status = [
-                self.dp_active[i] and bool(ranks.status[i])
-                for i in range(self.max_dp_size)
-            ]
-            self._refresh_active_workers()
-            return
         if len(ranks.status) != self.max_dp_size:
             logger.warning(
                 "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
@@ -301,7 +286,11 @@ class DataParallelController:
                 self.max_dp_size,
             )
             return
-        self.status = list(ranks.status)
+
+        self.status = [
+            self.dp_active[i] and bool(ranks.status[i]) for i in range(self.max_dp_size)
+        ]
+        self._refresh_active_workers()
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -884,19 +873,11 @@ class DataParallelController:
         active = self._active_workers
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
-        attempts = 0
-        while attempts < len(active):
-            slot = active[self.round_robin_counter % len(active)]
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
-            if self.status[slot]:
-                logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
-            attempts += 1
-        raise RuntimeError(
-            f"Cannot route request: all {len(active)} active DP workers "
-            "are unavailable."
-        )
+
+        slot = active[self.round_robin_counter % len(active)]
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+        logger.debug(f"Choose worker {slot}")
+        sock_send(self.workers[slot], req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
