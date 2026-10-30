@@ -1,5 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 
 import importlib.util
@@ -10,8 +11,10 @@ import torch
 TILE_K = 128
 
 
-def _sm100():
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+def _sm90_or_sm100():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] in (9, 10)
 
 
 def _strided_replica(shape, slot_stride, dtype, device):
@@ -31,7 +34,7 @@ def _strided_replica(shape, slot_stride, dtype, device):
     return base.as_strided(tuple(shape), tuple(strides))
 
 
-@unittest.skipUnless(_sm100(), "SM100-only CuTe kernel")
+@unittest.skipUnless(_sm90_or_sm100(), "SM90/SM100-only CuTe kernel")
 @unittest.skipUnless(
     importlib.util.find_spec("cutlass") is not None, "nvidia-cutlass-dsl required"
 )
