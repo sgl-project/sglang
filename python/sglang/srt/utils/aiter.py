@@ -15,12 +15,31 @@
 
 import logging
 import os
+from functools import lru_cache
+
+import torch
 
 from sglang.srt.utils.common import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
 
 _aiter_chip_info_cached = False
+
+# AITER exposes no public architecture capability API. Keep this aligned with
+# the validator used by its compiled operators in csrc/cpp_itfs/utils.py.
+_AITER_SUPPORTED_ARCHS = frozenset(
+    {"gfx90a", "gfx940", "gfx941", "gfx942", "gfx950", "gfx1151"}
+)
+
+
+@lru_cache(maxsize=1)
+def is_aiter_supported_arch() -> bool:
+    """Whether the current ROCm GPU passes AITER's compiled-op validator."""
+    if not is_hip():
+        return False
+
+    gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return gcn_arch.split(":", 1)[0] in _AITER_SUPPORTED_ARCHS
 
 
 def maybe_pre_warm_aiter_chip_info() -> None:
