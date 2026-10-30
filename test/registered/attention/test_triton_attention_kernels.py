@@ -867,6 +867,67 @@ class TestTritonAttention(CustomTestCase):
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
 
+    def test_grouped_decode_attention_split_programs_bitwise(self):
+        """Above _MAX_SPLIT_PROGRAMS splits (deterministic mode sizes the split budget
+        by the context length) stage 1 runs a fixed number of blocks that loop over
+        the splits, and stage 2 stops at each request's own count. The output must be
+        bitwise the same as with one block per split."""
+        from sglang.kernels.ops.attention import decode_attention as da
+
+        device = get_device()
+        dtype = torch.bfloat16
+        H_Q, H_KV, D, tile, max_kv_splits = 64, 8, 64, 256, 128
+        seq_lens = [1, 255, 1500, 2049, 8000, 20000]
+        B = len(seq_lens)
+        torch.manual_seed(0)
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        total = int(lens.sum())
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(lens, dim=0)
+        kv_indices = torch.randperm(total, device=device)
+        num_kv_splits = ((lens + tile - 1) // tile).to(torch.int32)
+        sinks = torch.randn(H_Q, dtype=torch.float32, device=device)
+
+        def run(max_split_programs):
+            old = da._MAX_SPLIT_PROGRAMS
+            da._MAX_SPLIT_PROGRAMS = max_split_programs
+            try:
+                o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
+                attn_logits = torch.empty(
+                    (B, H_Q, max_kv_splits, D), dtype=torch.float32, device=device
+                )
+                attn_lse = torch.empty(
+                    (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+                )
+                decode_attention_fwd_grouped(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    o,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    attn_lse,
+                    num_kv_splits,
+                    max_kv_splits,
+                    D**-0.5,
+                    1.0,
+                    sinks=sinks,
+                )
+                return o
+            finally:
+                da._MAX_SPLIT_PROGRAMS = old
+
+        one_block_per_split = run(max_kv_splits)
+        for programs in (1, 8, 32):
+            self.assertTrue(
+                torch.equal(run(programs), one_block_per_split),
+                f"{programs} blocks per request and head tile differ",
+            )
+
     def test_decode_attention_uneven_batch_graph_replay(self):
         """One captured decode graph replayed over uniform, padded and ragged batches.
 
