@@ -101,6 +101,30 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
     # A mixed batch cannot merge the HiSparse decode batch.
     if cfg.enable_mixed_chunk:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "--enable-hisparse does not support --enable-prefill-cp: the CP KV "
+            "gather and layer-split pool do not translate HiSparse device locations."
+        )
+    algorithm = (cfg.speculative_algorithm or "").upper()
+    if algorithm == "DFLASH":
+        raise ValueError(
+            "--enable-hisparse does not support --speculative-algorithm DFLASH: "
+            "its verify step does not run the HiSparse speculative swap hooks."
+        )
+    if algorithm == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-hisparse with DSPARK requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static: the HiSparse verify swap assumes "
+                f"a uniform verify window per request (got {ragged_mode.value!r})."
+            )
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:

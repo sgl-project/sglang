@@ -16,6 +16,8 @@ import torch
 
 from sglang.srt.configs.model_config import (
     dsa_draft_shards_under_dcp,
+    dsa_shared_kv_providers,
+    dsa_supports_dense_attention,
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
@@ -130,6 +132,8 @@ def prepare_kv_for_attention(
     """Materialize KV needed before attention for the active layout."""
     if (
         defer_materialization
+        # A layer that reads another layer's cache has no KV of its own to gather.
+        or not attn_mla.save_kv_cache
         or not dsa_use_prefill_cp(forward_batch)
         or not is_cp_active(forward_batch)
     ):
@@ -549,6 +553,7 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.has_shared_kv_consumers = bool(dsa_shared_kv_providers(hf_config))
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -591,7 +596,9 @@ class DeepseekSparseAttnBackend(
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
         self.supports_mha_one_shot: bool = (
-            self.dcp_size == 1 and self._kv_shard_pool is None
+            dsa_supports_dense_attention(hf_config)
+            and self.dcp_size == 1
+            and self._kv_shard_pool is None
         )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
@@ -2422,17 +2429,32 @@ class DeepseekSparseAttnBackend(
             "triton_sparse_mla",
         ):
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+                # A shared-KV consumer's provider has already written the current rows.
+                _has_prefix = any(forward_batch.extend_prefix_lens_cpu) or (
+                    not save_kv_cache and self.has_shared_kv_consumers
+                )
                 page_table_1 = topk_indices
+                page_table_1_flattened = self.forward_metadata.page_table_1_flattened
+                if (
+                    not save_kv_cache
+                    and self.has_shared_kv_consumers
+                    and page_table_1_flattened is None
+                ):
+                    metadata = self.forward_metadata
+                    page_table_1_flattened = torch.cat(
+                        [
+                            metadata.page_table_1[i, :length]
+                            for i, length in enumerate(
+                                metadata.indexer_seq_lens_cpu.tolist()
+                            )
+                        ]
+                    )
 
                 # flashmla_sparse_q8: FP8 compute on SM90 over a bf16 or fp8_e4m3 KV
                 # cache. The helper fuses the q concat with the bf16->fp8 cast; prefix
                 # batches hand over the paged cache as-is, others pass fresh bf16 KV.
                 if dsa_impl == "flashmla_sparse_q8":
                     if _has_prefix:
-                        page_table_1_flattened = (
-                            self.forward_metadata.page_table_1_flattened
-                        )
                         assert page_table_1_flattened is not None
                         return self._forward_flashmla_sparse_q8kv8(
                             q_nope=q_nope,
@@ -2479,9 +2501,6 @@ class DeepseekSparseAttnBackend(
                 # same inputs (concatenated q, dequantized bf16 KV, top-k list
                 # as the slot table) and differ only in the kernel they call.
                 if _has_prefix:
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
-                    )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged_dsa(
                         kv_cache, page_table_1_flattened
@@ -3377,10 +3396,19 @@ class DeepseekSparseAttnBackend(
         page_table_1,
     ) -> torch.Tensor:
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        assert metadata.flashmla_metadata is not None
+        flashmla_metadata = metadata.flashmla_metadata
+        assert flashmla_metadata is not None
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        if cache_seqlens.shape[0] != q_all.shape[0]:
+            # An extend batch padded to a multiple of attention TP runs on its real
+            # rows only, while the DP-padded metadata covers the padded rows.
+            assert cache_seqlens.shape[0] > q_all.shape[0]
+            cache_seqlens = cache_seqlens[: q_all.shape[0]]
+            flashmla_metadata = self._compute_flashmla_metadata(
+                cache_seqlens=cache_seqlens, seq_len_q=1
+            )
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -3409,8 +3437,8 @@ class DeepseekSparseAttnBackend(
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+            num_splits=flashmla_metadata.num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error

@@ -233,6 +233,12 @@ try:
         model_type = "kimi_k2"
 
     _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
+
+    # Built from a native params.json by mistral_utils.adapt_config_dict.
+    class _MistralLarge4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "mistral_large_4"
+
+    _CONFIG_REGISTRY["mistral_large_4"] = _MistralLarge4ConfigAlias
 except ImportError:
     pass
 
@@ -340,6 +346,7 @@ for _cosmos3_edge_config_cls in (
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -347,7 +354,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(
+        model_path, allow_patterns=allow_patterns, revision=revision
+    )
 
 
 def resolve_runai_obj_uri(model_name_or_path: str) -> str:

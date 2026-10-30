@@ -121,6 +121,59 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def _validate_draft_window_options(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    # Consumed by DFLASH (compact draft KV cache), Llama EAGLE-3 (drafter attention
+    # SWA), and the built-in MTP/NEXTN + EAGLE draft-decode path on the Triton and
+    # FlashInfer draft attention backends (StreamingLLM sink + recent window). The
+    # EAGLE draft workers re-check against the draft path they actually build.
+    if cfg.speculative_draft_window_size is not None:
+        window_size = int(cfg.speculative_draft_window_size)
+        if window_size <= 0:
+            raise ValueError(
+                f"--speculative-draft-window-size must be positive, got {window_size}."
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_window_size=window_size,
+        )
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE", "DFLASH"):
+            raise ValueError(
+                "--speculative-draft-window-size is not supported with "
+                f"speculative_algorithm={cfg.speculative_algorithm} (honored by "
+                "DFLASH, Llama EAGLE-3, and the EAGLE/MTP/NEXTN/STANDALONE "
+                "draft-decode path on the Triton/FlashInfer draft backends)."
+            )
+
+    if cfg.speculative_draft_sink_size is not None:
+        sink_size = int(cfg.speculative_draft_sink_size)
+        if sink_size < 0:
+            raise ValueError(
+                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
+            )
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-sink-size requires --speculative-draft-window-size."
+            )
+        if sink_size > 0 and cfg.speculative_algorithm not in (
+            "EAGLE",
+            "EAGLE3",
+            "STANDALONE",
+        ):
+            raise ValueError(
+                "--speculative-draft-sink-size is not supported with "
+                f"speculative_algorithm={cfg.speculative_algorithm} (honored only by "
+                "the EAGLE/MTP/NEXTN/STANDALONE draft-decode path on the "
+                "Triton/FlashInfer draft backends)."
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_sink_size=sink_size,
+        )
+
+
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if (
@@ -197,45 +250,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 speculative_use_rejection_sampling=True,
             )
 
-    # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
-    # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
-    # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
-    # path on the Triton and FlashInfer draft attention backends (StreamingLLM sink +
-    # recent window).
-    if cfg.speculative_draft_window_size is not None:
-        window_size = int(cfg.speculative_draft_window_size)
-        if window_size <= 0:
-            raise ValueError(
-                f"--speculative-draft-window-size must be positive, got {window_size}."
-            )
-        declare_resolution(
-            server_args,
-            "handle_speculative_decoding",
-            speculative_draft_window_size=window_size,
-        )
-        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
-            logger.warning(
-                "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by DFLASH, Llama EAGLE-3, and the "
-                "EAGLE/MTP/NEXTN draft-decode path on the Triton/FlashInfer draft backends).",
-                cfg.speculative_algorithm,
-            )
-
-    if cfg.speculative_draft_sink_size is not None:
-        sink_size = int(cfg.speculative_draft_sink_size)
-        if sink_size < 0:
-            raise ValueError(
-                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
-            )
-        if cfg.speculative_draft_window_size is None:
-            raise ValueError(
-                "--speculative-draft-sink-size requires --speculative-draft-window-size."
-            )
-        declare_resolution(
-            server_args,
-            "handle_speculative_decoding",
-            speculative_draft_sink_size=sink_size,
-        )
+    _validate_draft_window_options(server_args)
 
     algo = None
     if cfg.speculative_algorithm is not None:

@@ -289,10 +289,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
                     )
+                    from sglang.srt.mem_cache.kv_cache_configurator import (
+                        dsa_shared_kv_layer_flags,
+                    )
 
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
-                    )
+                    ) - sum(dsa_shared_kv_layer_flags(kvc) or ())
                     draft_kv_size = (
                         int(target_kv_size * draft_num_layers / target_kv_num_layers)
                         * draft_loc_space_scale
@@ -351,6 +354,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if kvc.server_args.enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            dsa_shared_kv_layer_flags,
+        )
+
+        shared_kv_layers = dsa_shared_kv_layer_flags(kvc)
+        if shared_kv_layers is not None:
+            effective_num_layers -= sum(shared_kv_layers)
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size

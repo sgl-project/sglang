@@ -9,6 +9,7 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _DEEPSEEK_FAMILY_ARCHS,
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
     _dsa_kv_cache_dtype_default,
@@ -52,9 +53,13 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
+    from sglang.srt.configs.model_config import get_dsa_config
+
     cfg = resolving_view(server_args)
     if not cfg.enable_two_batch_overlap:
         return
+
+    hf_config = get_dsa_config(hf_config)
 
     index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
     index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
@@ -141,6 +146,8 @@ def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         NONCAUSAL_FULL_ATTENTION,
+        _hf_arch,
+        get_dsa_config,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
@@ -264,11 +271,24 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_deepseek_v4_defaults(server_args, model_arch)
 
+    dsa_config = get_dsa_config(hf_config)
+    if (
+        dsa_config is not hf_config
+        and is_deepseek_dsa(hf_config)
+        and model_arch not in _DEEPSEEK_FAMILY_ARCHS
+    ):
+        raise ValueError(
+            f"{model_arch} hosts the DeepSeek sparse-attention text model "
+            f"{_hf_arch(dsa_config)} but is not registered for the "
+            "DeepSeek-family argument overrides that configure its DSA backends."
+        )
+
     if model_arch in [
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "KimiK25ForConditionalGeneration",
         "MistralLarge3ForCausalLM",
+        "MistralLarge4ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",

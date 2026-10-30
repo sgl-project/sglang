@@ -84,6 +84,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    check_draft_window_honored,
     draft_pp_context,
     draft_tp_context,
     get_plan_stream,
@@ -391,6 +392,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 "multi-layer EAGLE; the draft indexer runs every step"
             )
         qsa_profile = parse_qsa_profile(hf_config)
+        check_draft_window_honored(self.draft_runner_list[0], None)
         # Create attn backends
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):

@@ -21,7 +21,7 @@ parser from chat templates and tokenizer vocabularies.
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Optional, Tuple
 
 import jinja2
@@ -69,6 +69,9 @@ class ReasoningToggleConfig:
     default_enabled: Optional[bool] = None
     special_case: Optional[str] = None
     effort_kwarg: Optional[str] = None
+    default_effort: Optional[str] = None
+    # Whether the template also applies default_effort to an explicit None.
+    default_effort_covers_null: bool = False
 
     @property
     def always_on(self) -> bool:
@@ -88,6 +91,82 @@ class _GenerationTagExtension(jinja2.ext.Extension):
         return jinja2.nodes.Scope(body).set_lineno(lineno)
 
 
+def _parse_template(template: str) -> Optional[jinja2.nodes.Template]:
+    try:
+        env = jinja2.Environment(
+            extensions=[jinja2.ext.loopcontrols, _GenerationTagExtension]
+        )
+        return env.parse(template)
+    except jinja2.TemplateError:
+        return None
+    except Exception:
+        # e.g. RecursionError on a pathologically nested template; detection
+        # must never take down server startup (mirrors
+        # detect_inline_system_support).
+        return None
+
+
+def _unset_guard_covers_none(test: jinja2.nodes.Node, param: str) -> Optional[bool]:
+    """For ``param is not defined [or param is none]`` in either order, whether
+    the ``is none`` term is present; None for any other test."""
+    terms = [test.left, test.right] if isinstance(test, jinja2.nodes.Or) else [test]
+    undefined = [
+        isinstance(t, jinja2.nodes.Not)
+        and isinstance(t.node, jinja2.nodes.Test)
+        and t.node.name == "defined"
+        and isinstance(t.node.node, jinja2.nodes.Name)
+        and t.node.node.name == param
+        for t in terms
+    ]
+    is_none = [
+        isinstance(t, jinja2.nodes.Test)
+        and t.name == "none"
+        and isinstance(t.node, jinja2.nodes.Name)
+        and t.node.name == param
+        for t in terms
+    ]
+    if not any(undefined) or not all(u or n for u, n in zip(undefined, is_none)):
+        return None
+    return any(is_none)
+
+
+def _template_omission_default(template: str, param: str) -> Optional[Tuple[str, bool]]:
+    """The constant a top-level ``{% if param is not defined %}{% set param =
+    '…' %}{% endif %}`` assigns, if nothing else binds ``param`` or reads it
+    earlier; only then does passing that value render the same as omitting it.
+    The flag says whether the guard also assigns it over an explicit None."""
+    tree = _parse_template(template)
+    if tree is None:
+        return None
+    bindings = [
+        node
+        for node in tree.find_all(jinja2.nodes.Name)
+        if node.name == param and node.ctx in ("store", "param")
+    ]
+    if len(bindings) != 1:
+        return None
+    for node in tree.body:
+        covers_none = (
+            _unset_guard_covers_none(node.test, param)
+            if isinstance(node, jinja2.nodes.If)
+            else None
+        )
+        if (
+            covers_none is not None
+            and not node.elif_
+            and not node.else_
+            and len(node.body) == 1
+            and isinstance(node.body[0], jinja2.nodes.Assign)
+            and node.body[0].target is bindings[0]
+            and isinstance(node.body[0].node, jinja2.nodes.Const)
+            and isinstance(node.body[0].node.value, str)
+        ):
+            return node.body[0].node.value, covers_none
+        if any(name.name == param for name in node.find_all(jinja2.nodes.Name)):
+            return None
+    return None
+
+
 def _has_toggle_default_assignment(
     ctx: TemplateDetectionContext, param: str, default: bool
 ) -> bool:
@@ -103,17 +182,8 @@ def _has_toggle_default_assignment(
     default-off toggle; only ``default(true, true)`` collapses the toggle
     (an explicit False is replaced by True) and is not matched.
     """
-    try:
-        env = jinja2.Environment(
-            extensions=[jinja2.ext.loopcontrols, _GenerationTagExtension]
-        )
-        tree = env.parse(ctx.template)
-    except jinja2.TemplateError:
-        return False
-    except Exception:
-        # e.g. RecursionError on a pathologically nested template; detection
-        # must never take down server startup (mirrors
-        # detect_inline_system_support).
+    tree = _parse_template(ctx.template)
+    if tree is None:
         return False
     for node in tree.find_all(jinja2.nodes.Filter):
         if node.name not in ("default", "d") or node.dyn_args or node.dyn_kwargs:
@@ -689,7 +759,16 @@ def detect_reasoning_pattern(
     )
     for rule in REASONING_MODE_RULES:
         if rule.predicate(ctx):
-            return rule.value.always_on, rule.value
+            config = rule.value
+            if config.special_case == "mistral":
+                omission = _template_omission_default(template, "reasoning_effort")
+                if omission is not None:
+                    config = replace(
+                        config,
+                        default_effort=omission[0],
+                        default_effort_covers_null=omission[1],
+                    )
+            return config.always_on, config
 
     return False, None
 
@@ -798,6 +877,33 @@ def _log_undetected_parser(attr: str, label: str) -> None:
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
         f"{label} from chat template. Disabling {label}."
     )
+
+
+_MISTRAL_COMMON_PARSERS = (
+    ("reasoning_parser", "reasoning parser", ("[THINK]", "[/THINK]")),
+    ("tool_call_parser", "tool-call parser", ("[TOOL_CALLS]",)),
+)
+
+
+def _mistral_common_auto_parsers(
+    tokenizer, needs: Tuple[str, ...]
+) -> Dict[str, Optional[str]]:
+    """The mistral parsers for the control tokens a mistral-common tokenizer defines."""
+    vocab = tokenizer.get_vocab()
+    resolved: Dict[str, Optional[str]] = {}
+    for attr, label, tokens in _MISTRAL_COMMON_PARSERS:
+        if attr not in needs:
+            continue
+        if all(token in vocab for token in tokens):
+            resolved[attr] = "mistral"
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as 'mistral' from "
+                "the mistral-common tokenizer's control tokens"
+            )
+        else:
+            _log_undetected_parser(attr, label)
+            resolved[attr] = None
+    return resolved
 
 
 def _declare_python_template_parsers(server_args, template, needs) -> None:
@@ -996,6 +1102,16 @@ def resolve_auto_parsers(server_args) -> None:
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
+
+    # A mistral-common tokenizer renders chats without Jinja; its chat_template
+    # is a placeholder that no template rule can match.
+    if chat_template_arg is None and "MistralCommon" in type(tokenizer).__name__:
+        declare_resolution(
+            server_args,
+            "template-detection",
+            **_mistral_common_auto_parsers(tokenizer, needs),
+        )
+        return
 
     template = explicit_jinja_template
     if template is None and tokenizer is not None:

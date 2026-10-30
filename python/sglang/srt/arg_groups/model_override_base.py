@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
     # These models require bfloat16 regardless of the requested dtype.
     "MistralLarge3ForCausalLM": {"dtype": "bfloat16"},
+    "MistralLarge4ForCausalLM": {"dtype": "bfloat16"},
     "PixtralForConditionalGeneration": {"dtype": "bfloat16"},
 }
 

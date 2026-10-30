@@ -45,7 +45,7 @@ dependencies = [
   "IPython",
   "kernels>=0.14.1,<0.15",
   "llguidance>=1.7.6,<2.0.0",
-  "mistral_common>=1.11.5",
+  "mistral_common>=1.13.0",
   "modelscope",
   "msgspec",
   "ninja",

@@ -2020,6 +2020,9 @@ class DeepseekV2AttentionMLA(
     DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
+    # False on layers that read another layer's latent cache without writing their own.
+    save_kv_cache = True
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2135,7 +2138,8 @@ class DeepseekV2AttentionMLA(
                     index_head_dim=get_dsa_index_head_dim(config),
                     rope_head_dim=qk_rope_head_dim,
                     index_topk=get_dsa_index_topk(config),
-                    q_lora_rank=q_lora_rank,
+                    # Without q-LoRA the indexer query projects the hidden states.
+                    q_lora_rank=q_lora_rank if q_lora_rank is not None else hidden_size,
                     max_position_embeddings=max_position_embeddings,
                     rope_theta=rope_theta,
                     scale_fmt="ue8m0",
@@ -2603,6 +2607,8 @@ def _use_mnnvl_cutedsl_fusion() -> bool:
 
 
 class DeepseekV2DecoderLayer(nn.Module):
+    attention_cls = DeepseekV2AttentionMLA
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2636,7 +2642,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             # The NextN draft must match the NoPE target layers, or its Q/K
             # and the KV it verifies against live in different spaces.
             skip_rope = True
-        self.self_attn = DeepseekV2AttentionMLA(
+        self.self_attn = self.attention_cls(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -2940,6 +2946,7 @@ def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
 
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
+    decoder_layer_cls = DeepseekV2DecoderLayer
 
     def __init__(
         self,
@@ -2977,7 +2984,7 @@ class DeepseekV2Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: DeepseekV2DecoderLayer(
+            lambda idx, prefix: self.decoder_layer_cls(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -3010,7 +3017,7 @@ class DeepseekV2Model(nn.Module):
                     else []
                 ),
             ),
-            stage_facts=lambda idx: DeepseekV2DecoderLayer.stage_facts(config, idx),
+            stage_facts=lambda idx: self.decoder_layer_cls.stage_facts(config, idx),
         )
 
         local_layer_ids = list(range(self.start_layer, self.end_layer))
@@ -3251,9 +3258,17 @@ class DeepseekV2Model(nn.Module):
             return proxy_tensors
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+            capture_final = self.end_layer in self.layers_to_capture
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = residual_batch.final_norm(
-                    hidden_states, forward_batch, self.norm
+                    hidden_states,
+                    forward_batch,
+                    self.norm,
+                    capture=aux_hidden_states.capture if capture_final else None,
+                )
+            elif capture_final:
+                aux_hidden_states.append(
+                    residual_batch.snapshot(hidden_states, forward_batch)
                 )
 
         if len(aux_hidden_states) == 0:
@@ -3264,6 +3279,7 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
     packed_modules_mapping = {}
+    model_cls = DeepseekV2Model
 
     def __init__(
         self,
@@ -3296,7 +3312,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
-        self.model = DeepseekV2Model(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 

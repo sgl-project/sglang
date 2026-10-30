@@ -143,7 +143,9 @@ class Model(msgspec.Struct):
         Arg(
             help=(
                 'Which model-config parser to use. "auto" picks "mistral" '
-                'via the is_mistral_model name heuristic, else "hf" '
+                "via the is_mistral_model name heuristic or when the checkpoint "
+                "ships params.json with no config.json or with Mistral-native "
+                'consolidated weights, else "hf" '
                 "(AutoConfig over config.json). Plugins can register additional "
                 "parsers via @register_model_config_parser."
             )
@@ -198,7 +200,13 @@ class Model(msgspec.Struct):
         str,
         Arg(
             help=(
-                'Data type for kv cache storage. "auto" will use model data type. '
+                'Data type for kv cache storage. "auto" resolves per model and '
+                "hardware: the model data type, unless the checkpoint declares "
+                "an FP8 KV cache or the model sets its own default. On CUDA, "
+                "DeepSeek sparse-attention (DSA) models resolve to fp8_e4m3 on "
+                "SM100 and newer when the checkpoint allows FP8 KV and has no "
+                "attention sinks, and to bfloat16 otherwise. Pin a dtype when "
+                "comparing precision. "
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
                 'by the FA4 backend. "nvfp4" selects '

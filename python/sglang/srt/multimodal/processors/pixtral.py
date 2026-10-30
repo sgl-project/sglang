@@ -1,7 +1,8 @@
 import copy
 import math
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
+from PIL import Image
 from transformers import PreTrainedTokenizerBase
 from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
@@ -20,6 +21,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.hf_transformers.mistral_utils import mistral_common_image_encoder
 
 
 class PixtralProcessor(BaseMultimodalProcessor):
@@ -63,6 +65,14 @@ class PixtralProcessor(BaseMultimodalProcessor):
             image_token=self.image_token,
             image_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+        self._img_break_id = tokenizer.convert_tokens_to_ids("[IMG_BREAK]")
+        self._img_end_id = tokenizer.convert_tokens_to_ids("[IMG_END]")
+        self._grid_token_ids = {
+            self.IM_TOKEN_ID,
+            self._img_break_id,
+            self._img_end_id,
+        } - {None, tokenizer.unk_token_id}
+        self._mistral_common_image_encoder = mistral_common_image_encoder(tokenizer)
         tokenizer.add_special_tokens(
             {
                 "pad_token": getattr(hf_config, "pad_token", self.PAD_TOKEN),
@@ -77,6 +87,9 @@ class PixtralProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
+        if self._is_placeholder_prompt(input_text, image_data):
+            return await self._process_placeholder_prompt(image_data, input_text)
+
         mm_data = await self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
@@ -92,6 +105,82 @@ class PixtralProcessor(BaseMultimodalProcessor):
             input_ids=input_ids.tolist(),
             im_token_id=self.IM_TOKEN_ID,
         )
+
+    def _is_placeholder_prompt(self, input_text, image_data) -> bool:
+        return (
+            self._mistral_common_image_encoder is not None
+            and isinstance(input_text, list)
+            and bool(image_data)
+            and not self._all_mm_data_is_preprocessed(image_data)
+            and input_text.count(self.IM_TOKEN_ID) == len(image_data)
+            and not any(
+                token_id in self._grid_token_ids and token_id != self.IM_TOKEN_ID
+                for token_id in input_text
+            )
+        )
+
+    async def _process_placeholder_prompt(
+        self, image_data: List[Union[str, bytes]], prompt_ids: List[int]
+    ) -> MultimodalProcessorOutput:
+        """mistral-common rendered the chat with one [IMG] per image; expand each into
+        the grid mistral-common computes for the loaded image."""
+        mm_data = await self.load_mm_data(
+            prompt=self.image_token * len(image_data),
+            multimodal_tokens=self.mm_tokens,
+            image_data=image_data,
+            return_text=True,
+        )
+        grids = []
+        for image in mm_data.images:
+            cols, rows = self._mistral_common_image_encoder._image_to_num_tokens(image)
+            grids.append((rows, cols))
+        mm_data.images = self._fit_images_to_grids(mm_data.images, grids)
+        mm_items, grid_ids, _ = await self.process_and_combine_mm_data_async(
+            mm_data, self.mm_tokens
+        )
+        grid_ids = grid_ids.tolist()
+        actual_grids = self._prompt_grids(grid_ids)
+        if actual_grids != grids:
+            raise ValueError(
+                f"Image grids {actual_grids} do not match the expected {grids}"
+            )
+        input_ids = self._expand_image_placeholders(prompt_ids, grid_ids, mm_items)
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids,
+            im_token_id=self.IM_TOKEN_ID,
+        )
+
+    def _expand_image_placeholders(
+        self,
+        prompt_ids: List[int],
+        grid_ids: List[int],
+        mm_items: List[MultimodalDataItem],
+    ) -> List[int]:
+        image_runs = []
+        run = []
+        for pos, token_id in enumerate(grid_ids):
+            if token_id in self._grid_token_ids:
+                run.append(pos)
+                if token_id == self._img_end_id:
+                    image_runs.append(run)
+                    run = []
+        input_ids = []
+        grid_to_prompt_offset = {}
+        runs = iter(image_runs)
+        for token_id in prompt_ids:
+            if token_id != self.IM_TOKEN_ID:
+                input_ids.append(token_id)
+                continue
+            for pos in next(runs):
+                grid_to_prompt_offset[pos] = len(input_ids)
+                input_ids.append(grid_ids[pos])
+        for item in mm_items:
+            item.offsets = [
+                (grid_to_prompt_offset[s], grid_to_prompt_offset[e])
+                for s, e in item.offsets
+            ]
+        return input_ids
 
     def _postprocess_mm_items_before_transport(
         self,
@@ -135,7 +224,13 @@ class PixtralProcessor(BaseMultimodalProcessor):
             item_offsets = all_offsets[offset_idx : offset_idx + num_rows]
             offset_idx += num_rows
             new_item = copy.copy(old_item)
-            new_item.feature = old_feature[image_idx : image_idx + 1]
+            feature = old_feature[image_idx : image_idx + 1]
+            if old_image_sizes is not None:
+                # The HF processor pads every image of a request to the largest one;
+                # the encoder derives the patch grid from the pixel shape.
+                height, width = (int(v) for v in old_image_sizes[image_idx])
+                feature = feature[..., :height, :width].contiguous()
+            new_item.feature = feature
             new_item.offsets = item_offsets
             new_item.model_specific_data = copy.copy(old_item.model_specific_data)
             if old_image_sizes is not None:
@@ -152,17 +247,49 @@ class PixtralProcessor(BaseMultimodalProcessor):
             )
         return split_items
 
-    def _get_image_nrows(self, images: List[Any]) -> List[int]:
-        image_nrows = []
-        for image in images:
-            width, height = image.size
-            ratio = max(width / self.image_size, height / self.image_size)
-            if ratio > 1:
-                width = int(math.floor(width / ratio))
-                height = int(math.floor(height / ratio))
-            num_rows, _ = _get_pixtral_hf_num_image_tokens(
+    def _prompt_grids(self, prompt_ids: List[int]) -> List[Tuple[int, int]]:
+        grids, rows, cols, row_width = [], 0, 0, None
+        for token_id in prompt_ids:
+            if token_id == self.IM_TOKEN_ID:
+                cols += 1
+            elif token_id in (self._img_break_id, self._img_end_id):
+                rows += 1
+                row_width = cols if row_width is None else row_width
+                cols = 0
+                if token_id == self._img_end_id:
+                    grids.append((rows, row_width))
+                    rows, row_width = 0, None
+        return grids
+
+    def _fit_images_to_grids(
+        self, images: List[Any], grids: List[Tuple[int, int]]
+    ) -> List[Any]:
+        """mistral-common rounds the downscaled size where the HF processor floors,
+        which can drop a patch row or column; resize to mistral-common's grid."""
+        patch = self._effective_patch_size
+        return [
+            (
+                image
+                if self._hf_grid(image) == grid
+                else image.resize(
+                    (grid[1] * patch, grid[0] * patch), Image.Resampling.BICUBIC
+                )
+            )
+            for image, grid in zip(images, grids)
+        ]
+
+    def _hf_grid(self, image: Any) -> Tuple[int, int]:
+        width, height = image.size
+        ratio = max(width / self.image_size, height / self.image_size)
+        if ratio > 1:
+            width = int(math.floor(width / ratio))
+            height = int(math.floor(height / ratio))
+        return tuple(
+            _get_pixtral_hf_num_image_tokens(
                 (height, width),
                 (self._effective_patch_size, self._effective_patch_size),
             )
-            image_nrows.append(num_rows)
-        return image_nrows
+        )
+
+    def _get_image_nrows(self, images: List[Any]) -> List[int]:
+        return [self._hf_grid(image)[0] for image in images]

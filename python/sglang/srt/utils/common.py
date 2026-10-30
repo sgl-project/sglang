@@ -1899,6 +1899,7 @@ def get_mm_http_session() -> requests.Session:
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
+    FileNotFoundError,
     UnidentifiedImageError,
     requests.exceptions.RequestException,
 )

@@ -75,6 +75,34 @@ class TestPixtralProcessor(CustomTestCase):
         self.assertTrue(torch.equal(wrapped_features[1], feature[1:]))
         self.assertEqual([item.feature for item in items], proxies)
 
+    def test_split_images_are_cropped_to_their_own_sizes(self):
+        """The HF processor pads every image to the largest one, while the vision
+        encoder derives the patch grid from the pixel shape."""
+        processor = self._make_processor()
+        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=[object(), object()]
+        )
+        feature = torch.arange(2 * 3 * 32 * 28, dtype=torch.float32).view(2, 3, 32, 28)
+        bundled_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=feature,
+            offsets=[(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
+            format=MultimodalInputFormat.PROCESSOR_OUTPUT,
+            model_specific_data={"image_sizes": torch.tensor([[32, 28], [16, 24]])},
+        )
+        images = [Image.new("RGB", (28, 56)), Image.new("RGB", (28, 84))]
+
+        processor._finalize_mm_items([bundled_item], images=images)
+
+        wrapped_features = [
+            call.args[0] for call in processor._wrap_tensor_for_cuda_ipc.call_args_list
+        ]
+        self.assertEqual(
+            [tuple(f.shape) for f in wrapped_features], [(1, 3, 32, 28), (1, 3, 16, 24)]
+        )
+        self.assertTrue(torch.equal(wrapped_features[0], feature[:1]))
+        self.assertTrue(torch.equal(wrapped_features[1], feature[1:, :, :16, :24]))
+
     def test_already_split_one_row_images_are_preserved(self):
         """Generic per-image splits must not be collapsed and re-sliced by Pixtral."""
         processor = self._make_processor()

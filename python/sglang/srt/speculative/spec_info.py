@@ -181,6 +181,11 @@ class SpeculativeAlgorithm(Enum):
         states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
         return self.is_eagle()
 
+    def injects_prefill_draft_kv(self) -> bool:
+        """Whether prefill writes the draft's context KV from target hidden
+        states, which a PD decode cannot rebuild from transferred metadata."""
+        return self.is_dspark()
+
     def create_future_map(
         self,
         device: torch.device,

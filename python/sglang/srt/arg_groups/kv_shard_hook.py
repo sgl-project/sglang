@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
 )
 from sglang.srt.configs.model_config import (
+    dsa_shared_kv_providers,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
     is_deepseek_dsa,
@@ -61,6 +62,13 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
             raise ValueError(
                 "DSA KV sharding requires Mooncake, uncompressed index_kpool=1 "
                 "and no DSA cache layer splitting."
+            )
+        # Reader layers read their provider's latent KV, but the two-slot
+        # prefix scratch only keeps the current and next layer resident.
+        if dsa_shared_kv_providers(hf_config):
+            raise ValueError(
+                "DSA KV sharding does not support cross-layer KV sharing "
+                "(kv_sharing_config with non-identity source layers)."
             )
         return
     if is_deepseek_dsa(model_config_of(server_args).hf_config):

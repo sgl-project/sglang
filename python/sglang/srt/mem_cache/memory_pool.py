@@ -4999,6 +4999,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
         for kv_cache in self.kv_buffer:
+            # Layers that read another layer's latent rows hold 0-row placeholders.
+            if kv_cache.shape[0] == 0:
+                continue
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
@@ -5215,11 +5218,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        skip_kv_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
+        # Set before super().__init__, which allocates the latent buffers.
+        self.skip_kv_layers = (
+            list(skip_kv_layers) if skip_kv_layers is not None else [False] * layer_num
+        )
+        assert len(self.skip_kv_layers) == layer_num
 
         super().__init__(
             size,
@@ -5297,6 +5306,28 @@ class DSATokenToKVPool(MLATokenToKVPool):
             max_running_requests=max_running_requests,
         )
         self._finalize_allocation_log(size)
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # KV-sharing consumers read their provider's latent rows, so they
+                # get a 0-row placeholder that keeps kv_buffer index-aligned by layer.
+                self.kv_buffer = [
+                    torch.zeros(
+                        (
+                            0 if skip else self.size + self.page_size,
+                            1,
+                            self.kv_cache_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for skip in self.skip_kv_layers
+                ]
 
     def _create_index_key_cache(self) -> IndexKeyCache:
         return IndexKeyCache(self, self.index_buf_size)

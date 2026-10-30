@@ -21,6 +21,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     dsa_draft_shards_under_dcp,
+    dsa_layer_reads_shared_kv,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -139,6 +140,47 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         and not is_draft_worker
         and not memory_config.enable_unified_cache_external_linker
     )
+
+
+def _should_elide_dsa_shared_kv(*, is_draft_worker: bool) -> bool:
+    # MLA host backup and PD transfer copy every latent layer, so both keep the
+    # consumers' latent buffers even where index keys are elided.
+    return (
+        _should_elide_dsa_index_k(is_draft_worker=is_draft_worker)
+        and not get_memory().enable_hierarchical_cache
+        and get_disagg().disaggregation_mode == "null"
+    )
+
+
+def selects_dsa_kv_pool(kvc: KVCacheConfigurator) -> bool:
+    hf_config = kvc.model_config.hf_config
+    return bool(
+        kvc.use_mla_backend
+        and is_deepseek_dsa(hf_config)
+        and not is_deepseek_v4(hf_config)
+        and not kvc.is_hybrid_swa
+        and not kvc.mambaish_config
+        and get_exec().kernel.attention_backend != "ascend"
+    )
+
+
+def dsa_shared_kv_layer_flags(kvc: KVCacheConfigurator) -> Optional[list[bool]]:
+    """Return None when no local latent buffer can be elided.
+    Share this allocation decision with sizing so both count the same layers."""
+    from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+    hf_config = kvc.model_config.hf_config
+    if (
+        not selects_dsa_kv_pool(kvc)
+        or not _should_elide_dsa_shared_kv(is_draft_worker=kvc.is_draft_worker)
+        or get_glm_dsa_cp_layer_shard_info(kvc)[0] is not None
+    ):
+        return None
+    flags = [
+        dsa_layer_reads_shared_kv(hf_config, layer_id)
+        for layer_id in range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+    ]
+    return flags if any(flags) else None
 
 
 _is_hip = is_hip()
@@ -1675,7 +1717,7 @@ class KVCacheConfigurator:
                 mla_pool_class=mla_pool_class,
                 dsa_pool_class=dsa_pool_class,
             )
-        elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
+        elif selects_dsa_kv_pool(self):
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
                 max_running_requests=req_to_token_pool.req_to_token.shape[0],
@@ -2185,6 +2227,9 @@ class KVCacheConfigurator:
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
             ]
+        skip_kv_layers = dsa_shared_kv_layer_flags(self)
+        if skip_kv_layers is not None:
+            pool_kwargs["skip_kv_layers"] = skip_kv_layers
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

@@ -116,6 +116,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    check_draft_window_honored,
     draft_pp_context,
     draft_tp_context,
     fast_sample,
@@ -416,6 +417,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Initialize decode attention backend
         self.draft_attn_backend = draft_backend_factory.create_decode_backend()
+        check_draft_window_honored(self.draft_runner, self.draft_attn_backend)
 
         # Initialize draft extend attention backend (respects speculative_attention_mode setting)
         self.draft_extend_attn_backend = (
