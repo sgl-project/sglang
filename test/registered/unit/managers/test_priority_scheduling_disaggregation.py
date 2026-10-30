@@ -769,19 +769,32 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         # namespace that carries the attributes it reads.
         payload = Req.build_rebootstrap_payload(req)
 
-        # origin_input_ids + output_ids, coerced to plain python ints.
-        self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
+        # origin_input_ids + output_ids[:-1], coerced to plain python ints.
+        self.assertEqual(payload["input_ids"], [1, 2, 3])
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
         self.assertIsNone(payload["cache_salt"])
         # The prefill /generate URL is derived from bootstrap info on the decode
-        # side, not sent in the payload; and the boundary token is replayed via
-        # the decode-side override, so neither belongs in the payload.
+        # side, not sent in the payload.
         self.assertNotIn("pd_rebootstrap_prefill_url", payload)
-        self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
+
+    def test_rebootstrap_lengths_match_prefill_input(self):
+        """The decode KV preallocation and admission length must equal the
+        token count the prefill recomputes, with or without emitted output."""
+        for output_ids in ([], [np.int32(3)], [np.int32(3), np.int32(4)]):
+            with self.subTest(num_output_ids=len(output_ids)):
+                req = self._new_req()
+                req.output_ids = list(output_ids)
+
+                prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
+
+                self.assertEqual(
+                    DecodePreallocQueue._pre_alloc_fill_len(req), prefill_len
+                )
+                self.assertEqual(req.output_ids, output_ids)
 
 
 class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
