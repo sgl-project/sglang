@@ -232,6 +232,13 @@ class XPUAttentionBackend(AttentionBackend):
             self.dcp_group = get_parallel().dcp_group
             self.dcp_comm_backend = get_parallel().dcp_comm_backend
             self._assert_dcp_supported()
+        # Paged KV kernels are exact only at page 1/64/128; index per token otherwise.
+        if (
+            not self.use_mla
+            and self.dcp_size == 1
+            and self.page_size not in (1, 64, 128)
+        ):
+            self.page_size = 1
 
         # Gemma-3 multimodal: per-token image-block id over whole sequences, set by
         # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
@@ -575,8 +582,13 @@ class XPUAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-            include_draft_extend_v2=True
+        # DLLM_EXTEND is excluded from is_extend_or_..._mixed(); on XPU it runs
+        # eager (not via CUDA graph), so build extend metadata for it here too.
+        elif (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+            or forward_batch.forward_mode.is_dllm_extend()
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -902,7 +914,13 @@ class XPUAttentionBackend(AttentionBackend):
                 causal=causal_arg,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                bidirectional_block_ids=bidirectional_block_ids,
+                # Only Gemma-3 image batches set this; omitting it otherwise keeps
+                # sgl-kernel-xpu builds without the kwarg working.
+                **(
+                    {"bidirectional_block_ids": bidirectional_block_ids}
+                    if bidirectional_block_ids is not None
+                    else {}
+                ),
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
