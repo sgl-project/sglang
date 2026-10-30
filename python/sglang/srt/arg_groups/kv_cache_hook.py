@@ -473,6 +473,8 @@ def handle_cache_compatibility(server_args: Any) -> None:
     if prefix_tails is not None and prefix_tails < 0:
         raise ValueError("--swa-prefix-tails should be a non-negative integer.")
 
+    if cfg.lmcache_min_retrieve_tokens < 0:
+        raise ValueError("--lmcache-min-retrieve-tokens must be non-negative")
     if cfg.enable_lmcache:
         if cfg.enable_hierarchical_cache:
             raise ValueError(

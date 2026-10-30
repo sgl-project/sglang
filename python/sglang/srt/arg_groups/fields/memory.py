@@ -308,6 +308,11 @@ class Memory(msgspec.Struct):
         Optional[str],
         "Path to the LMCache YAML configuration file",
     ] = None
+    lmcache_min_retrieve_tokens: A[
+        int,
+        "Minimum external KV tokens to retrieve from LMCache. Smaller hits are "
+        "recomputed. Tune from load/recompute measurements; 0 preserves all hits.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # FlexKV

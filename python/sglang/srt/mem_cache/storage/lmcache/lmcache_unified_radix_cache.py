@@ -51,10 +51,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         tp_rank: int,
         lmcache_config_file: Optional[str],
         forward_stream: Any,
+        min_retrieve_tokens: int = 0,
     ) -> None:
         # The parent constructor calls reset() before the connector exists.
         self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
         super().__init__(params)
+        self._min_retrieve_tokens = min_retrieve_tokens
         self._mamba_component = self._find_mamba_component()
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
@@ -202,6 +204,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         ).page_aligned(self.page_size)
         if len(key) == 0:
             return
+        # Full prompt length is common across ranks. A rank-local prefix here
+        # could make only some ranks enter the connector's collectives.
+        if (
+            len(key)
+            // self.lmcache_connector.chunk_size
+            * self.lmcache_connector.chunk_size
+            < self._min_retrieve_tokens
+        ):
+            return
         token_ids = key.raw_token_ids()[: len(key)]
         lookup = self.lmcache_connector.submit_lookup(
             req_id,
@@ -235,18 +246,24 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             total_hit = min(total_hit, len(flow.key))
             local_hit_tokens = int(local_hit.item())
+            decline = (
+                total_hit <= local_hit_tokens
+                or total_hit - local_hit_tokens < self._min_retrieve_tokens
+            )
             release_end = min(
                 total_hit,
                 local_hit_tokens
                 // self.lmcache_connector.chunk_size
                 * self.lmcache_connector.chunk_size,
             )
+            if decline:
+                release_end = total_hit
             if release_end > 0:
                 # All ranks advance state; only the leader releases remote locks.
                 self.lmcache_connector.free_lookup_locks(
                     req_id, start=0, end=release_end
                 )
-            if total_hit <= local_hit_tokens:
+            if decline:
                 self._external_flows.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid[handle] = 0
                 self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)

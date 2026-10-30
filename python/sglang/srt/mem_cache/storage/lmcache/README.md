@@ -54,3 +54,25 @@ python -m sglang.launch_server \
 ```
 
 For full LMCache config options see https://docs.lmcache.ai/api_reference/configurations.html.
+
+## Avoid loading small external hits
+
+Use `--lmcache-min-retrieve-tokens N` to recompute external hits shorter than
+`N` tokens. The default is `0`, preserving existing loading behavior. This is
+an operator-calibrated threshold, not an online cost estimator: compare loading
+and recomputation on the deployed model, hardware, KV dtype, storage tier and
+workload before choosing it.
+
+SGLang skips the lookup when even a fully cached prompt cannot reach the
+threshold. Otherwise it looks up normally and applies the threshold to the
+external tokens beyond the common rank-local GPU prefix. A rejected hit
+releases all lookup locks before GPU allocation or transfer. The local GPU
+prefix remains reusable and storing computed KV remains enabled.
+
+For example, with `--lmcache-min-retrieve-tokens 512`, a 256-token external hit
+is recomputed; a 512-token external hit can be loaded. A 768-token total hit
+with 512 tokens already resident in the engine counts as only 256 external
+tokens. Long prompts with short partial hits may still incur storage prefetch
+cost before SGLang can decide. Recalibrate after deployment changes and check
+held-out mixed-hit latency and throughput; fewer transfers alone do not prove
+a performance improvement.

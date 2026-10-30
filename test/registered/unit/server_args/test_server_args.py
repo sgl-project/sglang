@@ -2428,6 +2428,25 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_lmcache_retrieve_minimum_cli(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = ServerArgs.from_cli_args(
+            parser.parse_args(
+                ["--model-path", "dummy", "--lmcache-min-retrieve-tokens", "512"]
+            )
+        )
+        self.assertEqual(args.lmcache_min_retrieve_tokens, 512)
+
+    def test_lmcache_retrieve_minimum_must_be_non_negative(self):
+        for minimum in (0, 256, 1024):
+            args = self._make_args(
+                enable_lmcache=True, lmcache_min_retrieve_tokens=minimum
+            )
+            handle_cache_compatibility(args)
+        with self.assertRaisesRegex(ValueError, "lmcache-min-retrieve-tokens"):
+            handle_cache_compatibility(self._make_args(lmcache_min_retrieve_tokens=-1))
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (
