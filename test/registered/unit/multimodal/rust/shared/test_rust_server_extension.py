@@ -788,15 +788,18 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
-    def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
-        """A multi-node launch whose listener is loopback warns, naming the
-        host and rendezvous address, unless the nodes rendezvous on loopback
-        too (several nodes emulated on one machine), and still gathers."""
+    def test_gather_server_endpoints_refuses_unreachable_loopback_host(self):
+        """A multi-node launch whose listener is loopback raises ValueError,
+        naming the host and rendezvous address, unless the nodes rendezvous on loopback
+        too (several nodes emulated on one machine), and refuses before entering the gather."""
         all_gather_object = Mock(return_value=[None, None])
-        for dist_init_addr, warns in (
+        for dist_init_addr, raises in (
             ("10.0.0.1:5000", True),
+            ("tcp://10.0.0.1:5000", True),
             ("127.0.0.1:5000", False),
+            ("tcp://127.0.0.1:5000", False),
             ("[::1]:5000", False),
+            ("tcp://[::1]:5000", False),
             (None, True),
         ):
             parallel = SimpleNamespace(
@@ -811,14 +814,144 @@ class TestRustServerExtension(CustomTestCase):
                     "get_serving",
                     return_value=SimpleNamespace(host="127.0.0.1", port=30000),
                 ),
-                patch.object(server_module.logger, "warning") as warning,
             ):
-                RustServer.gather_server_endpoints(hosts_listener=False)
-            self.assertEqual(warning.called, warns, dist_init_addr)
-            if warns:
-                self.assertIn("127.0.0.1", warning.call_args.args[1])
-                self.assertEqual(warning.call_args.args[3], dist_init_addr)
+                if raises:
+                    with self.assertRaises(ValueError) as cm:
+                        RustServer.gather_server_endpoints(hosts_listener=False)
+                    self.assertIn("127.0.0.1", str(cm.exception))
+                    if dist_init_addr:
+                        self.assertIn(dist_init_addr, str(cm.exception))
+                else:
+                    RustServer.gather_server_endpoints(hosts_listener=False)
         self.assertEqual(all_gather_object.call_count, 4)
+
+    def test_gather_server_endpoints_derives_host_from_dist_init_addr(self):
+        """When host is wildcard and dist_init_addr is set, the advertised IP is
+        derived by probing towards dist_init_addr before falling back to get_local_ip_auto."""
+        all_gather_object = Mock(return_value=[])
+        parallel = SimpleNamespace(
+            nnodes=2,
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            dist_init_addr="tcp://10.100.0.1:25000",
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            patch.object(
+                server_module, "get_local_ip_towards", return_value="10.100.0.2"
+            ) as mock_towards,
+            patch.object(server_module, "get_local_ip_auto") as mock_auto,
+        ):
+            RustServer.gather_server_endpoints(hosts_listener=True)
+            mock_towards.assert_called_once_with("10.100.0.1", 25000)
+            mock_auto.assert_not_called()
+            sent_config = all_gather_object.call_args.args[0]
+            self.assertEqual(sent_config["endpoint"], "http://10.100.0.2:30000")
+
+    def test_gather_server_endpoints_falls_back_when_probing_towards_fails(self):
+        """When probing towards dist_init_addr fails, it falls back to get_local_ip_auto."""
+        all_gather_object = Mock(return_value=[])
+        parallel = SimpleNamespace(
+            nnodes=2,
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            dist_init_addr="10.100.0.1:25000",
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            patch.object(server_module, "get_local_ip_towards", return_value=None),
+            patch.object(
+                server_module, "get_local_ip_auto", return_value="10.100.0.5"
+            ) as mock_auto,
+        ):
+            RustServer.gather_server_endpoints(hosts_listener=True)
+            mock_auto.assert_called_once_with(fallback="127.0.0.1")
+            sent_config = all_gather_object.call_args.args[0]
+            self.assertEqual(sent_config["endpoint"], "http://10.100.0.5:30000")
+
+    def test_gather_server_endpoints_honors_sglang_host_ip_override(self):
+        """When SGLANG_HOST_IP is set, it overrides IP discovery completely."""
+        all_gather_object = Mock(return_value=[])
+        parallel = SimpleNamespace(
+            nnodes=2,
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            dist_init_addr="10.100.0.1:25000",
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        with (
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="0.0.0.0", port=30000),
+            ),
+            patch.dict(os.environ, {"SGLANG_HOST_IP": "192.168.1.99"}),
+            patch.object(server_module, "get_local_ip_towards") as mock_towards,
+            patch.object(server_module, "get_local_ip_auto") as mock_auto,
+        ):
+            RustServer.gather_server_endpoints(hosts_listener=True)
+            mock_towards.assert_not_called()
+            mock_auto.assert_not_called()
+            sent_config = all_gather_object.call_args.args[0]
+            self.assertEqual(sent_config["endpoint"], "http://192.168.1.99:30000")
 
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a
