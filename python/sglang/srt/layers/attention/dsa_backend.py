@@ -1094,6 +1094,13 @@ class DeepseekSparseAttnBackend(
 
         self.init_kernel_metadata(forward_batch)
 
+    @property
+    def requires_eager_metadata(self) -> bool:
+        return (
+            getattr(self.init_kernel_metadata, "__func__", None)
+            is not DeepseekSparseAttnBackend.init_kernel_metadata
+        )
+
     def init_kernel_metadata(self, forward_batch: ForwardBatch) -> None:
         """Refresh custom kernel state after eager or out-of-graph metadata setup."""
         pass
@@ -2185,7 +2192,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2558,7 +2564,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"

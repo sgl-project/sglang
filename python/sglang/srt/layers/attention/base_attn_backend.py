@@ -104,6 +104,11 @@ class AttentionBackend(ABC):
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
+    @property
+    def requires_eager_metadata(self) -> bool:
+        """Whether metadata preparation has host work required on every replay."""
+        return False
+
     def glue_target_verify_metadata(self) -> str:
         """Empty if the target verify prep may be captured into the metadata glue graph
         (reads only runner slots and backend buffers), else the reason it may not."""

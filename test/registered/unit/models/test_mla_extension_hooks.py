@@ -21,8 +21,9 @@ MLA = forward_mla.DeepseekMLAForwardMixin
 )
 @pytest.mark.parametrize("reuse_indices", [False, True])
 @pytest.mark.parametrize("born_fp8", [False, True])
+@pytest.mark.parametrize("interleave_cp", [False, True])
 def test_prepare_dispatches_hooks_and_preserves_index_reuse(
-    monkeypatch, mode, reuse_indices, born_fp8
+    monkeypatch, mode, reuse_indices, born_fp8, interleave_cp
 ):
     torch.manual_seed(0)
     rows, heads, rank, rope = 3, 2, 128 if born_fp8 else 4, 2
@@ -66,6 +67,9 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
     ):
         setattr(attn, name, MethodType(getattr(MLA, name), attn))
     attn.run_mla_indexer = Mock(wraps=MethodType(MLA.run_mla_indexer, attn))
+    monkeypatch.setattr(forward_mla, "is_interleave_extend", lambda _: interleave_cp)
+    cp_overlap = Mock(side_effect=AssertionError("custom indexer bypassed"))
+    monkeypatch.setattr(forward_mla, "DSAInterleaveCPIndexerOverlap", cp_overlap)
     prepared = []
 
     def prepare(pos, q, q_pe, k, k_pe, forward_batch):

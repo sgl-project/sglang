@@ -354,7 +354,11 @@ class DeepseekMLAForwardMixin:
 
         cp_overlap = (
             DSAInterleaveCPIndexerOverlap(self, forward_batch)
-            if self.use_dsa and is_interleave_extend(forward_batch)
+            if self.use_dsa
+            and is_interleave_extend(forward_batch)
+            # The overlap helper calls the native indexer CUDA entry directly.
+            and getattr(self.run_mla_indexer, "__func__", None)
+            is DeepseekMLAForwardMixin.run_mla_indexer
             else None
         )
         fuse_bmm_attention = (
