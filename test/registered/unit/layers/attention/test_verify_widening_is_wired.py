@@ -112,6 +112,7 @@ def _verify_plan(runner_ids, req_to_token, live, host_lens=None):
     return runner_ids.own_plan(
         SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
             spec_info=SimpleNamespace(draft_token_num=_NUM_DRAFT),
             batch_size=bs,
             req_pool_indices=rows,
@@ -182,8 +183,9 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
                 live.to(_DEV),
                 None,
                 ForwardMode.TARGET_VERIFY,
-                SimpleNamespace(ragged_verify_layout=None),
+                SimpleNamespace(),
                 live,
+                ragged_verify_layout=None,
             )
             self.assertTrue(
                 torch.equal(
@@ -201,14 +203,15 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
             b = _backend(runner_ids, req_to_token, page_size)
             bs = live.numel()
             for host_lens, spec_info in (
-                (live, SimpleNamespace(ragged_verify_layout=None)),
+                (live, SimpleNamespace()),
                 (
                     live + _NUM_DRAFT,
-                    SimpleNamespace(ragged_verify_layout=None, live_seq_lens_cpu=live),
+                    SimpleNamespace(live_seq_lens_cpu=live),
                 ),
             ):
                 fb = SimpleNamespace(
                     forward_mode=ForwardMode.TARGET_VERIFY,
+                    ragged_verify_layout=None,
                     batch_size=bs,
                     seq_lens=live.to(_DEV),
                     seq_lens_cpu=host_lens,

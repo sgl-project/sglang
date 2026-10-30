@@ -51,6 +51,7 @@ from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
@@ -301,7 +302,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # full-attention layers.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
@@ -400,6 +401,7 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -713,16 +715,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
+            self.query_start_loc_list[bs - 1].copy_(
+                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
-            if ragged_layout is not None:
-                # Ragged capture: qsl from the runner's synthetic layout.
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
-            else:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -773,6 +768,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -903,18 +899,17 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
-            )
-            if ragged_layout is not None:
+            if ragged_verify_layout is not None:
                 # Mamba kernels index dense [bs, N] scratch, so they need the
                 # capped variant (see padded_to_bucket). Padding rows carry
                 # mamba slot -1 and are skipped.
-                if ragged_layout.bs != bs or ragged_layout.cap is None:
-                    ragged_layout = ragged_layout.padded_to_bucket(
+                if ragged_verify_layout.bs != bs or ragged_verify_layout.cap is None:
+                    ragged_verify_layout = ragged_verify_layout.padded_to_bucket(
                         padded_bs=bs, cap=spec_info.draft_token_num
                     )
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_verify_layout.qo_indptr_device
+                )
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -1115,6 +1110,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1

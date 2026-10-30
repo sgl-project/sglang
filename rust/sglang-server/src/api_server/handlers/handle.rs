@@ -2,11 +2,11 @@
 //! cancellation ownership, and the runtime-call guard behind every operation.
 
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{SetOnce, mpsc};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
@@ -28,6 +28,9 @@ pub(crate) struct CoreConfig {
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: Vec<(String, usize)>,
+    /// A multimodal model admits no generation until its MM pool's processor
+    /// is installed ([`CoreHandle::set_mm_processor`]).
+    pub(crate) multimodal: bool,
     pub(crate) metadata: CoreMetadata,
     /// Request metrics, when `--enable-metrics` is on.
     pub(crate) metrics: Option<Arc<FrontendMetrics>>,
@@ -60,6 +63,7 @@ pub(crate) struct CoreMetadata {
     pub(super) incremental_streaming_output: bool,
     pub(super) deployment_info: crate::message::config::DeploymentInfo,
     pub(super) launch_server_info: Arc<serde_json::Map<String, serde_json::Value>>,
+    pub(super) launch_model_info: Arc<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -82,6 +86,7 @@ impl From<&ServerArgs> for CoreMetadata {
             incremental_streaming_output: args.incremental_streaming_output,
             deployment_info: args.deployment_info.clone(),
             launch_server_info: args.launch_server_info.0.clone(),
+            launch_model_info: args.launch_model_info.0.clone(),
         }
     }
 }
@@ -103,9 +108,11 @@ pub(super) struct CoreInner {
     pub(super) startup_ready: AtomicBool,
     pub(super) is_disaggregation: bool,
     pub(super) mm_limits: Vec<(String, usize)>,
+    pub(super) multimodal: bool,
     /// The MM pool's processor, whose media hooks admission runs; set once
-    /// when the pool starts (after the listeners are up).
-    pub(super) mm_processor: OnceLock<Arc<dyn MmProcessor>>,
+    /// when the pool starts (after the listeners are up), and awaited by a
+    /// multimodal model's admission.
+    pub(super) mm_processor: SetOnce<Arc<dyn MmProcessor>>,
     pub(super) metadata: CoreMetadata,
     pub(super) generations: Generations,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
@@ -130,7 +137,8 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
-                mm_processor: OnceLock::new(),
+                multimodal: config.multimodal,
+                mm_processor: SetOnce::new(),
                 metadata: config.metadata,
                 generations: Generations::default(),
                 metrics: config.metrics,
@@ -148,6 +156,13 @@ impl CoreHandle {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.inner.startup_ready.load(Ordering::Acquire)
+    }
+
+    /// Whether health may answer 200: startup warmup finished (or was
+    /// skipped) and, for a multimodal model, the MM pool's processor is
+    /// installed, so a generation would be admitted rather than wait.
+    pub(crate) fn is_serving(&self) -> bool {
+        self.is_ready() && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
     }
 
     /// The request metrics, when enabled.
@@ -232,6 +247,7 @@ pub(super) fn translate_runtime_error(error: Error) -> CoreError {
         Error::Validation(message) => {
             CoreError::InvalidArgument(format!("validation failed: {message}"))
         }
+        Error::Encode(error) => error.into(),
         Error::QueueFull => CoreError::Overloaded("to_scheduler channel full".into()),
         Error::Disconnected => CoreError::Cancelled("client disconnected".into()),
         error => CoreError::Internal(error.to_string()),
