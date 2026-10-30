@@ -200,7 +200,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _Req(
             rid="rebootstrap",
             origin_input_ids=[0] * 60,
-            output_ids=[0] * 60,  # 60 + 60 = 120 > 100
+            output_ids=[0] * 60,  # 60 + 59 = 119 > 100
             return_logprob=False,
             pd_rebootstrap_in_progress=True,
             finished_reason=None,
