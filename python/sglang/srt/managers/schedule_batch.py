@@ -1610,7 +1610,7 @@ class Req(ReqDllmMixin):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
-    def kv_rebuildable_from_token_ids(self) -> bool:
+    def resumable_by_rebootstrap(self) -> bool:
         """A PD rebootstrap recomputes the KV from token ids alone, which do not
         determine it for multimodal inputs or embeds."""
         return (
@@ -1620,7 +1620,7 @@ class Req(ReqDllmMixin):
         )
 
     @property
-    def kv_rebuildable_by_reprefill(self) -> bool:
+    def resumable_by_reprefill(self) -> bool:
         """A local re-prefill runs the multimodal inputs and embed overrides
         again, but input_embeds cover only the prompt, so the generation
         restarts; that is invisible only while no output has been sent."""
@@ -2296,7 +2296,7 @@ class Req(ReqDllmMixin):
         decode commit keeps it and ignores the token the prefill samples.
         """
         # TODO: carry multimodal inputs and embeds. The payload holds token ids
-        # only, so a request without kv_rebuildable_from_token_ids is aborted
+        # only, so a request without resumable_by_rebootstrap is aborted
         # instead of rebootstrapped.
         sp = self.sampling_params
         return {
@@ -2491,6 +2491,19 @@ def set_mamba_track_indices_from_reqs(
         batch.mamba_track_indices[freed_rows] = -1
 
 
+def unresumable_abort_message() -> str:
+    """Why release_req found a request that the recompute after it cannot resume."""
+    if get_disagg().disaggregation_mode == "decode":
+        return (
+            "Retracted request aborted: the rebootstrap recomputes the KV from "
+            "token ids, which cannot rebuild multimodal inputs or embeds. Retry later."
+        )
+    return (
+        "Retracted request aborted: an input_embeds request that has sent output "
+        "cannot be recomputed. Retry later."
+    )
+
+
 def release_req(
     *,
     req: Req,
@@ -2512,7 +2525,7 @@ def release_req(
     # pass offload_kv=False to skip the wasteful device->host copy.
     # The config bag reflects role flips; server_args keeps the launch role.
     if get_disagg().disaggregation_mode != "decode":
-        resumable = req.kv_rebuildable_by_reprefill
+        resumable = req.resumable_by_reprefill
     elif offload_kv:
         resumable = backup_kv_cache(
             req,
@@ -2522,7 +2535,7 @@ def release_req(
             get_disagg().disaggregation_decode_retraction_backup,
         )
     else:
-        resumable = req.kv_rebuildable_from_token_ids
+        resumable = req.resumable_by_rebootstrap
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -3636,10 +3649,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # No backup exists, the recompute cannot rebuild the KV, and the
                 # device KV is already freed, so the request cannot resume.
                 if get_disagg().disaggregation_mode != "decode":
-                    message = (
-                        "Retracted after streaming output; an input_embeds "
-                        "request cannot be recomputed. Retry later."
-                    )
+                    message = unresumable_abort_message()
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
                 elif (
                     get_disagg().disaggregation_decode_retraction_backup == "host_pool"

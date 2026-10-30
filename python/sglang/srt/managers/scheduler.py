@@ -221,6 +221,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    unresumable_abort_message,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -6073,8 +6074,7 @@ class Scheduler(
         for req in retract_reqs:
             if req in unresumable:
                 abort_reason = FINISH_ABORT(
-                    "Retracted request aborted: the recompute cannot rebuild the "
-                    "KV of multimodal inputs or embeds. Retry later.",
+                    unresumable_abort_message(),
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
                 self.send_abort_output(

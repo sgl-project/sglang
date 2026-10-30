@@ -699,8 +699,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(held, [running, staged])
 
     def test_retract_aborts_requests_the_recompute_cannot_rebuild(self):
-        """A rebootstrap sends token ids only, and a local re-prefill has no
-        embeds for generated tokens: such requests are aborted, not requeued."""
+        """A rebootstrap sends token ids only, and an input_embeds re-prefill
+        restarts the generation: requests whose sent output that would change
+        are aborted, the rest requeued."""
         for decode in (False, True):
             with self.subTest(decode=decode):
                 scheduler = self._new_scheduler()
