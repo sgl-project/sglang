@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -199,6 +199,44 @@ class TestGdnPrefillLayout(unittest.TestCase):
                         is_rms_norm=True,
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_strided_gate_rows_past_int32_offset(self):
+        # Past 2**31 elements of the projection, the last rows must match the
+        # same rows normed alone.
+        torch.manual_seed(0)
+        num_qk_heads, num_v_heads, head_dim = 16, 32, 128
+        width = 2 * (num_qk_heads + num_v_heads) * head_dim
+        tokens = 2**31 // width + 2
+        required = tokens * (width + 2 * num_v_heads + 2 * num_v_heads * head_dim) * 2
+        if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+            self.skipTest("Requires about 8 GiB of free GPU memory")
+        qkvz = torch.randn(tokens, width, dtype=torch.bfloat16, device="cuda")
+        ba = torch.randn(tokens, 2 * num_v_heads, dtype=torch.bfloat16, device="cuda")
+        _, z, _, _ = qwen3_5_gdn_prefill_projection_views(
+            qkvz, ba, num_qk_heads, num_v_heads, head_dim, head_dim
+        )
+        x = torch.randn(
+            tokens * num_v_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+        n = 4096
+        actual = rms_norm_gated(
+            x=x,
+            weight=weight,
+            bias=None,
+            z=z,
+            norm_before_gate=True,
+            is_rms_norm=True,
+        )
+        expected = rms_norm_gated(
+            x=x[-n * num_v_heads :],
+            weight=weight,
+            bias=None,
+            z=z[-n:],
+            norm_before_gate=True,
+            is_rms_norm=True,
+        )
+        torch.testing.assert_close(actual[-n * num_v_heads :], expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

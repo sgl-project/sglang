@@ -64,7 +64,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
 ):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)  # token * stride_qg_t overflows int32
     head = tl.program_id(1)
     is_k = head >= NUM_Q_HEADS
     local_head = tl.where(is_k, head - NUM_Q_HEADS, head)
