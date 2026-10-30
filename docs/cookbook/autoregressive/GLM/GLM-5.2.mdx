@@ -3,10 +3,6 @@ title: GLM-5.2
 description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X, plus Ascend NPU recipes."
 ---
 
-For long-context SGLang configurations, see the
-[agentic serving recipes](/cookbook/autoregressive/agentic-serving-configs#glm-5-2) and
-[benchmark evidence](/cookbook/autoregressive/agentic-serving-evidence).
-
 ## Deployment
 
 <a id="install" />
@@ -122,7 +118,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## Agentic Long-Context Deployment
 
-Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. The explorer below gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
 - **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
@@ -132,6 +128,413 @@ import { AgentX } from "/src/snippets/_agentx.jsx";
 import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
 
 <AgentX data={agentx} />
+
+### Single-node long-context tuning configurations
+
+Use Linux with NVIDIA CUDA on one node with the GPU count shown for each command;
+all recipes use pipeline parallelism 1. Follow [Install SGLang](/docs/get-started/install)
+for the hardware-specific runtime. Argument names were checked against upstream
+[`f3f23d128cd5`](https://github.com/sgl-project/sglang/tree/f3f23d128cd576352492334534be7e20fdd8fab6).
+Download the named checkpoint or replace `--model-path` with its local directory,
+and supply `HF_TOKEN` if access requires it. Pin the checkpoint revision and runtime
+for your own comparisons.
+
+<Note>
+These commands adapt configurations measured in custom runtime builds. They have not
+been rerun on the upstream revision above, and the public checkpoint names do not
+establish identical weight bytes to the recorded artifacts. Use the runtime identities
+and qualification notes in the evidence below; these commands do not change the
+Deploy panel's verification status.
+</Note>
+
+Reserve host memory beyond model loading buffers and the OS: HiCache needs 640 GB
+across eight H200 ranks or 512 GB across four B200 ranks. The commands retain
+`NCCL_NET_GDR_LEVEL=LOC`; assess that setting for your interconnect.
+
+These commands preserve the HiCache configurations tested with SGLang 0.5.20.
+Campaigns using SGLang 0.5.21 did not establish a qualified candidate gain:
+parser-preserving runs produced shortened outputs, with the `glm47` grammar
+path a candidate cause. Check returned token counts and structured tool calls
+before comparing performance.
+
+#### H200 TP8 FP8
+
+Checkpoint: [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8).
+The context cap is 250,000 tokens, with five EAGLE steps and six draft tokens.
+
+<Accordion title="Launch GLM-5.2 on H200 TP8">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path zai-org/GLM-5.2-FP8 \
+  --tp-size 8 \
+  --quantization fp8 \
+  --mem-fraction-static 0.92 \
+  --context-length 250000 \
+  --attention-backend dsa \
+  --cp-strategy interleave \
+  --dsa-prefill-backend flashmla_kv \
+  --enable-hierarchical-cache \
+  --enable-prefill-cp \
+  --flashinfer-allreduce-fusion-backend auto \
+  --fp8-gemm-backend flashinfer_deepgemm \
+  --hicache-size 80 \
+  --kv-cache-dtype fp8_e4m3 \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":32}' \
+  --moe-a2a-backend none \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+
+</Accordion>
+
+#### B200 TP4 NVFP4
+
+Checkpoint: [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
+The context cap is 500,000 tokens, with at most 128 running requests.
+
+<Accordion title="Launch GLM-5.2 on B200 TP4">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --tp-size 4 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.85 \
+  --context-length 500000 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --enable-hierarchical-cache \
+  --flashinfer-allreduce-fusion-backend auto \
+  --hicache-size 128 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-attention-mode decode \
+  --speculative-eagle-topk 1 \
+  --speculative-moe-a2a-backend none \
+  --speculative-moe-runner-backend flashinfer_cutlass \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code
+```
+
+</Accordion>
+
+#### Configuration history
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Profile</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.18</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.20 and SGLang 0.5.21</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Memory fraction 0.90; omit <code>--enable-hierarchical-cache</code> and <code>--hicache-size</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Memory fraction 0.92; HiCache 80 GB per rank</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Omit <code>--enable-hierarchical-cache</code> and <code>--hicache-size</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>HiCache 128 GB per rank; memory fraction remains 0.85</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Recorded measurements
+
+These results belong to the recorded configurations, checkpoints, and runtimes.
+They are historical measurements, not new executions of the public launch commands above.
+Throughput is **output tokens/s/GPU**; ITL and TTFT are **means**. These workload-specific
+results do not replace the deployment cards' total-token throughput benchmarks.
+
+The tuned arms use custom runtime builds. Public-image comparison arms remain
+separate controls; matching an engine version does not establish runtime or checkpoint equivalence.
+
+SGLang 0.5.18 groups include the original measurement and two later repeats.
+Their configuration, server image, checkpoint, and workload match, but client image
+digests differ. The catalog preserves those identities and the recorded client protocol.
+
+Parser-on SGLang 0.5.20 measurements emit approximately **40–47%** of requested
+output. Treat these as shortened-output results, not full-length serving performance.
+No qualified optimized SGLang 0.5.21 curve or paired accuracy gate was recovered.
+
+<Accordion title="Historical configuration comparisons">
+
+Each row aggregates all retained measurements at one configuration and client concurrency.
+The objective was output throughput under mean ITL ≤ 20 ms. Repeats exceeding that bound
+are retained. `±` is the sample standard deviation of throughput; `n` is the replicate
+count. A single measurement has no estimated standard deviation.
+
+##### Recorded SGLang 0.5.18
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Group</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model / hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Arm</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>n</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g001</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>66.28 ± 0.39</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>14.24</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>6245.54</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g002</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Stock</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>40.75 ± 0.07</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>19.54</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>12475.93</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g003</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Dynamo-derived worker</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>57.26 ± 0.53</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.05</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>6816.64</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g004</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>172.82 ± 1.38</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>10.60</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>3196.78</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g005</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Stock</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>127.60 ± 0.27</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>14.67</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2320.53</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g006</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Dynamo-derived worker</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>131.52 ± 0.78</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.83</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2902.02</td>
+    </tr>
+  </tbody>
+</table>
+
+##### Recorded SGLang 0.5.20
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Group</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model / hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Arm</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>n</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g017</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>58.78</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.40</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1494.90</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g018</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Without HiCache</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>55.97</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1760.08</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g019</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>128.22 ± 0.72</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.34</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2461.75</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g020</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Without HiCache</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>114.98 ± 2.96</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.29</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2662.53</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+#### Reproduction records
+
+The historical workload replays 942 Mooncake trace records sequentially, reconstructing
+synthetic text from hashes and lengths with `ignore_eos: true`,
+`skip_special_tokens: false`, and server token accounting.
+
+The 26 full-precision records below join to this model's configuration, runtime, protocol,
+and source catalog. `source_row` counts the CSV header as row 1. Source and metric-export
+checksums identify original artifacts; configuration and benchmark fingerprints hash the
+original JSON field text. Client-adapter fingerprints distinguish recorded adapter metadata.
+`csv_request_count` retains the exporter's value, which sometimes counts successes;
+`attempted_requests` is the replay population.
+
+Recalculate each historical group using arithmetic means of output throughput, ITL, and
+TTFT, and throughput sample standard deviation with denominator `n - 1`. Retain every
+listed repeat, including those above the latency bound.
+
+Image digests and trace hashes identify artifacts without making private assets publicly
+downloadable. Public checkpoint revision SHAs are retained; omitted custom aliases have
+fingerprints and do not establish byte equivalence to public weights. Null denotes an
+unrecorded field or an adjacent omission marker. A new public-runtime comparison must
+pin image, checkpoint, effective arguments, trace, concurrency, output lengths, and cache
+state, and measure natural acceptance separately from simulations.
+
+<Accordion title="Configuration, runtime, workload, and source identities">
+
+```json Evidence catalog
+{
+  "sources": {
+    "s001": {"sha256":"3ef006e83ee38381bdb86195d44dd63904dde54fa7e5e24cf5487c0ce59d5c30"},
+    "s002": {"sha256":"1d73a4d081e4ed138ddf77abe3b5177177f070bfb022f4096b4608d0c05626f1"},
+    "s003": {"sha256":"96751460cb678ff144b571681f6adeb13e3dc8067b8eda30408aa6ff4495380b"},
+    "s004": {"sha256":"debe3427d2fca0492cde0d295e322f885c8987b5855b44460648f834d93ec6fc"},
+    "s005": {"sha256":"1ae4ee226c85ad09773fce17de82160f532da52945a614eeced0ac5c50d0494a"},
+    "s006": {"sha256":"0c4b5dc7eb70750ac5c3b70f4b082eeb9e3da18fd6c063399c31f7383548e80f"},
+    "s007": {"sha256":"357040a4552a8a54471e94889235141641c6037743807b5e6fc6643cfbb9c0ce"},
+    "s008": {"sha256":"3ea22ea28a614b334c37affccd452a907ebdb6069f976e32b9589419f807da30"},
+    "s021": {"sha256":"bd0df09900eab91cd4906971083892685b7acbf5e9f0a96be40fd71392f2b017"},
+    "s022": {"sha256":"9eaa0a937b8c67aa6e69a7faa55e98407c2f15d6b778aa835e5c4d965da64b30"}
+  },
+  "runtimes": {
+    "r001": {"checkpoint":"zai-org/GLM-5.2-FP8","client_image_digest":"sha256:b86b5507855cf495ee7cbecc041692960db2b8e364b376318b2f7ba81c88c33e","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":null,"image_digest":"sha256:a54333d38383875a8dbce5b6188e125091988cecc8e4fdb0828f5b1f09cde832","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"a0754995fb1fade0701c45176fa72f0e33cffe850fd5186bea7ba23811497030","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r002": {"checkpoint":"zai-org/GLM-5.2-FP8","client_image_digest":"sha256:922ef47c53e3ff3274e7bb98e4fb2583ab7794556c7e1cbb133f7a807b4bbb17","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":null,"image_digest":"sha256:a54333d38383875a8dbce5b6188e125091988cecc8e4fdb0828f5b1f09cde832","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"a0754995fb1fade0701c45176fa72f0e33cffe850fd5186bea7ba23811497030","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r003": {"checkpoint":"zai-org/GLM-5.2-FP8","client_image_digest":"sha256:922ef47c53e3ff3274e7bb98e4fb2583ab7794556c7e1cbb133f7a807b4bbb17","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":"docker.io/lmsysorg/sglang@sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","image_digest":"sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"a0754995fb1fade0701c45176fa72f0e33cffe850fd5186bea7ba23811497030","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r004": {"checkpoint":"zai-org/GLM-5.2-FP8","client_image_digest":"sha256:b86b5507855cf495ee7cbecc041692960db2b8e364b376318b2f7ba81c88c33e","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":"docker.io/lmsysorg/sglang@sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","image_digest":"sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"a0754995fb1fade0701c45176fa72f0e33cffe850fd5186bea7ba23811497030","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r005": {"checkpoint":"nvidia/GLM-5.2-NVFP4","client_image_digest":"sha256:b86b5507855cf495ee7cbecc041692960db2b8e364b376318b2f7ba81c88c33e","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":null,"image_digest":"sha256:a54333d38383875a8dbce5b6188e125091988cecc8e4fdb0828f5b1f09cde832","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"6dc7de3f858007c24d9345b5529cf5c6711aceef4ac363876e470eefd36eb9a1","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r006": {"checkpoint":"nvidia/GLM-5.2-NVFP4","client_image_digest":"sha256:922ef47c53e3ff3274e7bb98e4fb2583ab7794556c7e1cbb133f7a807b4bbb17","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":null,"image_digest":"sha256:a54333d38383875a8dbce5b6188e125091988cecc8e4fdb0828f5b1f09cde832","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"6dc7de3f858007c24d9345b5529cf5c6711aceef4ac363876e470eefd36eb9a1","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r007": {"checkpoint":"nvidia/GLM-5.2-NVFP4","client_image_digest":"sha256:922ef47c53e3ff3274e7bb98e4fb2583ab7794556c7e1cbb133f7a807b4bbb17","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":"docker.io/lmsysorg/sglang@sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","image_digest":"sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"6dc7de3f858007c24d9345b5529cf5c6711aceef4ac363876e470eefd36eb9a1","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r008": {"checkpoint":"nvidia/GLM-5.2-NVFP4","client_image_digest":"sha256:b86b5507855cf495ee7cbecc041692960db2b8e364b376318b2f7ba81c88c33e","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":"docker.io/lmsysorg/sglang@sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","image_digest":"sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"6dc7de3f858007c24d9345b5529cf5c6711aceef4ac363876e470eefd36eb9a1","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r014": {"checkpoint":"zai-org/GLM-5.2-FP8","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":null,"image_digest":"sha256:6dce2605fc2876f120bea586437abdf71a40f8c283266c86d697abfec5a3f7a0","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":"f33c6dc501ee5a2c7e35155653b1b1abbc320951","upstream_source_revision":null},
+    "r015": {"checkpoint":"nvidia/GLM-5.2-NVFP4","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":null,"image_digest":"sha256:6dce2605fc2876f120bea586437abdf71a40f8c283266c86d697abfec5a3f7a0","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":"aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa","upstream_source_revision":null}
+  },
+  "configs": {
+    "c001": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","arguments_source":"Recorded tuning configuration identified by the runtime; source CSV did not retain full launch argv.","environment":{},"measured_arguments":{},"profile_arguments":{"attention_backend":"dsa","context_length":250000,"cp_strategy":"interleave","dsa_prefill_backend":"flashmla_kv","enable_prefill_cp":true,"flashinfer_allreduce_fusion_backend":"auto","fp8_gemm_backend":"flashinfer_deepgemm","kv_cache_dtype":"fp8_e4m3","mem_fraction_static":0.9,"model_loader_extra_config":"{\"enable_multithread_load\":true,\"num_threads\":32}","moe_a2a_backend":"none","quantization":"fp8","reasoning_parser":"glm45","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":6,"speculative_num_steps":5,"tool_call_parser":"glm47","trust_remote_code":true,"watchdog_timeout":3600},"public_command":null},
+    "c002": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":250000,"host":"0.0.0.0","port":30000,"served_model_name":"zai-org/GLM-5.2-FP8","tp_size":8},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c003": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"PYTHONUNBUFFERED":"1"},"measured_arguments":{"attention_backend":"dsa","context_length":250000,"cp_strategy":"interleave","dsa_prefill_backend":"flashmla_kv","enable_metrics":true,"enable_prefill_cp":true,"ep_size":8,"fp8_gemm_runner_backend":"flashinfer_deepgemm","host":"0.0.0.0","kv_cache_dtype":"fp8_e4m3","mem_fraction_static":0.9,"model_loader_extra_config":"{\"enable_multithread_load\": true, \"num_threads\": 32}","moe_a2a_backend":"none","port":30000,"quantization":"fp8","reasoning_parser":"glm45","served_model_name":"zai-org/GLM-5.2-FP8","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":4,"speculative_num_steps":3,"tool_call_parser":"glm47","tp_size":8,"trust_remote_code":true,"watchdog_timeout":3600.0},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c004": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","arguments_source":"Recorded tuning configuration identified by the runtime; source CSV did not retain full launch argv.","environment":{},"measured_arguments":{},"profile_arguments":{"context_length":500000,"cuda_graph_max_bs_decode":128,"flashinfer_allreduce_fusion_backend":"auto","max_running_requests":128,"mem_fraction_static":0.85,"quantization":"modelopt_fp4","reasoning_parser":"glm45","speculative_algorithm":"EAGLE","speculative_attention_mode":"decode","speculative_eagle_topk":1,"speculative_moe_a2a_backend":"none","speculative_moe_runner_backend":"flashinfer_cutlass","speculative_num_draft_tokens":6,"speculative_num_steps":5,"tool_call_parser":"glm47","trust_remote_code":true},"public_command":null},
+    "c005": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":500000,"host":"0.0.0.0","port":30000,"served_model_name":"nvidia/GLM-5.2-NVFP4","tp_size":4},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c006": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":500000,"cuda_graph_max_bs_decode":128,"dp_size":4,"enable_dp_attention":true,"enable_dp_lm_head":true,"enable_hierarchical_cache":true,"enable_metrics":true,"flashinfer_allreduce_fusion_backend":"auto","fp4_gemm_runner_backend":"flashinfer_trtllm","hicache_size":200,"host":"0.0.0.0","kv_cache_dtype":"fp8_e4m3","max_running_requests":128,"mem_fraction_static":0.927,"model_loader_extra_config":"{\"enable_multithread_load\": true, \"num_threads\": 32}","moe_a2a_backend":"none","moe_runner_backend":"flashinfer_trtllm","port":30000,"quantization":"modelopt_fp4","reasoning_parser":"glm45","served_model_name":"nvidia/GLM-5.2-NVFP4","speculative_algorithm":"EAGLE","speculative_attention_mode":"decode","speculative_eagle_topk":1,"speculative_moe_a2a_backend":"none","speculative_moe_runner_backend":"flashinfer_cutlass","speculative_num_draft_tokens":4,"speculative_num_steps":3,"tool_call_parser":"glm47","tp_size":4,"trust_remote_code":true,"watchdog_timeout":3600.0},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c017": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"attention_backend":"dsa","context_length":250000,"cp_strategy":"interleave","dsa_prefill_backend":"flashmla_kv","enable_hierarchical_cache":true,"enable_prefill_cp":true,"flashinfer_allreduce_fusion_backend":"auto","fp8_gemm_backend":"flashinfer_deepgemm","hicache_size":80,"kv_cache_dtype":"fp8_e4m3","mem_fraction_static":0.92,"model_loader_extra_config":"{\"enable_multithread_load\":true,\"num_threads\":32}","moe_a2a_backend":"none","pipeline_parallel_size":1,"quantization":"fp8","reasoning_parser":"glm45","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":6,"speculative_num_steps":5,"tensor_parallel_size":8,"tool_call_parser":"glm47","trust_remote_code":true,"watchdog_timeout":3600},"public_command":null},
+    "c018": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"attention_backend":"dsa","context_length":250000,"cp_strategy":"interleave","dsa_prefill_backend":"flashmla_kv","enable_prefill_cp":true,"flashinfer_allreduce_fusion_backend":"auto","fp8_gemm_backend":"flashinfer_deepgemm","kv_cache_dtype":"fp8_e4m3","mem_fraction_static":0.9,"model_loader_extra_config":"{\"enable_multithread_load\":true,\"num_threads\":32}","moe_a2a_backend":"none","pipeline_parallel_size":1,"quantization":"fp8","reasoning_parser":"glm45","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":6,"speculative_num_steps":5,"tensor_parallel_size":8,"tool_call_parser":"glm47","trust_remote_code":true,"watchdog_timeout":3600},"public_command":null},
+    "c019": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"context_length":500000,"cuda_graph_max_bs_decode":128,"enable_flashinfer_allreduce_fusion":true,"enable_hierarchical_cache":true,"flashinfer_allreduce_fusion_backend":"auto","hicache_size":128,"max_running_requests":128,"mem_fraction_static":0.85,"pipeline_parallel_size":1,"quantization":"modelopt_fp4","reasoning_parser":"glm45","speculative_algorithm":"EAGLE","speculative_attention_mode":"decode","speculative_eagle_topk":1,"speculative_moe_a2a_backend":"none","speculative_moe_runner_backend":"flashinfer_cutlass","speculative_num_draft_tokens":6,"speculative_num_steps":5,"tensor_parallel_size":4,"tool_call_parser":"glm47","trust_remote_code":true},"public_command":null},
+    "c020": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"context_length":500000,"cuda_graph_max_bs_decode":128,"flashinfer_allreduce_fusion_backend":"auto","max_running_requests":128,"mem_fraction_static":0.85,"pipeline_parallel_size":1,"quantization":"modelopt_fp4","reasoning_parser":"glm45","speculative_algorithm":"EAGLE","speculative_attention_mode":"decode","speculative_eagle_topk":1,"speculative_moe_a2a_backend":"none","speculative_moe_runner_backend":"flashinfer_cutlass","speculative_num_draft_tokens":6,"speculative_num_steps":5,"tensor_parallel_size":4,"tool_call_parser":"glm47","trust_remote_code":true},"public_command":null}
+  },
+  "protocols": {
+    "p001": {"aiperf_version":"0.11.0","cache_isolation":"new server allocation per point; fresh cache_salt namespace per point (salt is not physical eviction)","client_options":{},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":"not available in AIPerf 0.11.0","random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":10800,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":null,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":"no injected warmup; two 128-token pre-measurement requests (the smoke and the identical return_meta_info speculation probe, ignore_eos, temperature 0) on the separate <namespace>-smoke cache_salt before the measured replay","workers":8,"client_adapter_identity_sha256":"c119bf2507ab1696ae1035ece63f94c8f335960a063e7984c8de797e6b39767c"},
+    "p004": {"aiperf_version":"0.13.0","cache_isolation":null,"client_options":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--per-chunk-usage":true,"--random-seed":42,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":250000,"--synthesis-max-osl":12000},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":true,"random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":null,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":true,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":null,"workers":null},
+    "p005": {"aiperf_version":"0.13.0","cache_isolation":null,"client_options":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--per-chunk-usage":true,"--random-seed":42,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":500000,"--synthesis-max-osl":12000},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":true,"random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":null,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":true,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":null,"workers":null}
+  },
+  "groups": {
+    "g001": {"concurrency":8,"label":"Tuned custom runtime","model":"glm-5-2","n":3,"records":["e001","e002","e003"],"sku":"H200","tp":8,"sglang_version":"0.5.18"},
+    "g002": {"concurrency":8,"label":"Upstream stock (Inkling: minimal load fixes)","model":"glm-5-2","n":3,"records":["e004","e005","e006"],"sku":"H200","tp":8,"sglang_version":"0.5.18"},
+    "g003": {"concurrency":8,"label":"Dynamo-derived worker","model":"glm-5-2","n":3,"records":["e007","e008","e009"],"sku":"H200","tp":8,"sglang_version":"0.5.18"},
+    "g004": {"concurrency":8,"label":"Tuned custom runtime","model":"glm-5-2","n":3,"records":["e010","e011","e012"],"sku":"B200","tp":4,"sglang_version":"0.5.18"},
+    "g005": {"concurrency":8,"label":"Upstream stock (Inkling: minimal load fixes)","model":"glm-5-2","n":3,"records":["e013","e014","e015"],"sku":"B200","tp":4,"sglang_version":"0.5.18"},
+    "g006": {"concurrency":8,"label":"Dynamo-derived worker","model":"glm-5-2","n":3,"records":["e016","e017","e018"],"sku":"B200","tp":4,"sglang_version":"0.5.18"},
+    "g017": {"concurrency":8,"label":"Tuned custom runtime","model":"glm-5-2","n":1,"records":["e041"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g018": {"concurrency":8,"label":"Without HiCache","model":"glm-5-2","n":1,"records":["e042"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g019": {"concurrency":8,"label":"Tuned custom runtime","model":"glm-5-2","n":3,"records":["e043","e044","e045"],"sku":"B200","tp":4,"sglang_version":"0.5.20"},
+    "g020": {"concurrency":8,"label":"Without HiCache","model":"glm-5-2","n":3,"records":["e046","e047","e048"],"sku":"B200","tp":4,"sglang_version":"0.5.20"}
+  },
+  "accuracy": {
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Full-precision measurement records">
+
+```csv Measurement records
+id,group,sglang_version,cell,arm,c,replicate,output_tok_s_per_gpu,output_tok_s,mean_itl_ms,mean_ttft_ms,duration_s,csv_request_count,attempted_requests,failed_requests,accepted_failures,output_token_count,synthetic_acceptance_length,csv_status,runtime_status,request_qualification,source,source_row,config,runtime,protocol,server_config_sha256,benchmark_config_sha256,metric_export_sha256
+e001,g001,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,optimized,8,1,65.91353626290535,527.3082901032428,13.858413559856642,6466.433620685022,3942.460300772,908.0,942,34.0,34.0,2078892.0,,completed,recorded custom runtime,passed,s001,3,c001,r001,p001,12a73a4acdbebf19e00fec67d33a78b8d66e86736a2ebf38d3190d9e82935f1b,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,0aef7bd823c4424871f726ea6a7bb87bb5c9dc4b53723fd8538f32e0a6df6cc3
+e002,g001,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,optimized,8,2,66.24247129052135,529.9397703241708,14.467705003994537,6225.72702205837,3922.876109312,908.0,942,34.0,34.0,2078892.0,,completed,recorded custom runtime,passed,s002,2,c001,r002,p001,12a73a4acdbebf19e00fec67d33a78b8d66e86736a2ebf38d3190d9e82935f1b,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,6b07a87db4fe4904ba47385c5b65eb5d394016349e5835327df76a6f7061692f
+e003,g001,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,optimized,8,3,66.69231619418272,533.5385295534618,14.388957016863477,6044.46858644163,3896.41227264,908.0,942,34.0,34.0,2078892.0,,completed,recorded custom runtime,passed,s002,3,c001,r002,p001,12a73a4acdbebf19e00fec67d33a78b8d66e86736a2ebf38d3190d9e82935f1b,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,64da60645e19701dbc3c32d669d3a2335e35604ef429552e3c1b5ec7c88f4248
+e004,g002,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,baseline,8,2,40.69459180916358,325.55673447330867,19.54709297807449,12510.229595015418,6385.636371968,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s002,4,c002,r003,p001,4f6c4b7cb78079763f78053c501ddeee9b7dd0f27ac78d4f3e43d187413391c1,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,1ba1cc449e4f56cd577c052e64c7a9071d116abf0b756e14ed184af6e9ee2be7
+e005,g002,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,baseline,8,3,40.716304677505065,325.7304374200405,19.347198015915705,12488.376825487883,6382.230350336001,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s002,5,c002,r003,p001,4f6c4b7cb78079763f78053c501ddeee9b7dd0f27ac78d4f3e43d187413391c1,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,4021bffd063598c31a506ddd6b198904ba907c6927ec431c527adabd0c1812ca
+e006,g002,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,baseline,8,1,40.832138304427126,326.657106435417,19.730534710907282,12429.183569098017,6364.141355091,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s003,3,c002,r004,p001,4f6c4b7cb78079763f78053c501ddeee9b7dd0f27ac78d4f3e43d187413391c1,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,c677bccd7936aeb043dea2ac1885e48a92ccb1c4c65dc7a891dc2b9e299fa1ec
+e007,g003,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,prior,8,1,57.273939079483235,458.1915126358659,15.929092353013042,6568.859009105727,4537.1682859,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s004,3,c003,r004,p001,4062432cbc0434b72935d7f501d5c6659a3318d914d95f5c7e7da6485e85a10a,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,f4cf49d40b717d719e98355869ef8ceccee37924ce4581a9e5cf2a11c8203bac
+e008,g003,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,prior,8,2,57.780721190478516,462.24576952382813,16.090736173554728,6704.2343247830395,4497.360440832001,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s002,6,c003,r003,p001,4062432cbc0434b72935d7f501d5c6659a3318d914d95f5c7e7da6485e85a10a,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,0a46e31fb8b6ec0ff91dc18631855773039dd1963ee2c6cabdcafbc221fb4336
+e009,g003,0.5.18,zai-org/GLM-5.2-FP8 H200 TP8,prior,8,3,56.71814598931751,453.7451679145401,16.117952018147868,7176.828529385462,4581.61496576,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s002,7,c003,r003,p001,4062432cbc0434b72935d7f501d5c6659a3318d914d95f5c7e7da6485e85a10a,7fdeac700873201ff929fbc64dd240b6fa4474f349faa09efa889562f631e397,294001a03c53e0c7b33046a9a1abbeee34c34d3f54a5d0b488378510ac8a0e7f
+e010,g004,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,optimized,8,1,174.37613512940473,697.5045405176189,10.293007641619624,3115.5175700225564,3160.3808605520003,931.0,942,11.0,11.0,2204380.0,,completed,recorded custom runtime,passed,s005,3,c004,r005,p001,2b16c04a138a43923acbecf020f2bbc2801fc70267774454a3ca0aebfa1d8046,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,ea92bdba7b16fd63e9cbcddca383be6918831ffbf5213eeac845b94fd9e39820
+e011,g004,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,optimized,8,2,172.31030981599764,689.2412392639906,10.968047013750713,3209.9265621009667,3198.2598481920004,931.0,942,11.0,11.0,2204380.0,,completed,recorded custom runtime,passed,s006,2,c004,r006,p001,2b16c04a138a43923acbecf020f2bbc2801fc70267774454a3ca0aebfa1d8046,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,e564e3e6fe61dcfe99d78be99ffb9f68a75a03f216a6e78df4f07e1282382a9a
+e012,g004,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,optimized,8,3,171.7679406911447,687.0717627645788,10.528666314595256,3264.8947184479052,3208.3590021120003,931.0,942,11.0,11.0,2204380.0,,completed,recorded custom runtime,passed,s006,3,c004,r006,p001,2b16c04a138a43923acbecf020f2bbc2801fc70267774454a3ca0aebfa1d8046,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,cd6bcf008573c75a1e67adf71de92253ceeac08eecdc22345e46c1bd7e5bc8a3
+e013,g005,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,baseline,8,2,127.9082328455379,511.6329313821516,14.72065609308948,2308.5018075907624,4308.491304192,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s006,4,c005,r007,p001,3ec7cf65b4f3276905d49fe5561d495d0cdba6df2526a57ce02b32843b0d37f5,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,21858b1c892fee76525967b91690359c850326d361651917a5a5ef1187877cae
+e014,g005,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,baseline,8,3,127.42585265399575,509.703410615983,14.485931463978435,2321.043082825993,4324.801354752,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s006,5,c005,r007,p001,3ec7cf65b4f3276905d49fe5561d495d0cdba6df2526a57ce02b32843b0d37f5,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,fb94902bbb7899e259f1ae95885065e2ec939a0031a01220724b3d1d3cbd9d7c
+e015,g005,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,baseline,8,1,127.45424211067112,509.81696844268447,14.801072579040842,2332.0321108732546,4323.865497717,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s007,3,c005,r008,p001,3ec7cf65b4f3276905d49fe5561d495d0cdba6df2526a57ce02b32843b0d37f5,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,6db02b28f78a7531c5aed83ecd2658d3476cc37d5dbdc3da61ff7646d7027561
+e016,g006,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,prior,8,1,131.17083643785088,524.6833457514035,16.740087273056496,3107.7853968098816,4201.353097730001,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s008,3,c006,r008,p001,e8d0a57d23bf7f5e1c93e3443bcafeb05ee5954b0aa70512d9b8fe8c7bd0baec,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,ae63ec890adee3a118ff2da2d14a9db6511bb5927b9f848ef82dbb62914b6ccd
+e017,g006,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,prior,8,2,132.42006254999896,529.6802501999958,17.347290739659964,2904.315423170784,4161.707684096,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s006,6,c006,r007,p001,e8d0a57d23bf7f5e1c93e3443bcafeb05ee5954b0aa70512d9b8fe8c7bd0baec,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,e2c743aefa2a30d75743dfb35632b08753781c437779db3ce06a3542cd57ddf5
+e018,g006,0.5.18,nvidia/GLM-5.2-NVFP4 B200 TP4,prior,8,3,130.978400931409,523.913603725636,16.416754772844286,2693.972097823845,4207.514458368,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s006,7,c006,r007,p001,e8d0a57d23bf7f5e1c93e3443bcafeb05ee5954b0aa70512d9b8fe8c7bd0baec,090301f24de7bd072fed6a51743d7552188e93ff081be22d81c116675df780e2,1ca2cd9b2939e2a2083876a6d46b843ea3ac958493eb6d5f0ad7c9bbfff4b39c
+e041,g017,0.5.20,zai-org/GLM-5.2-FP8 H200 TP8,optimized,8,1,58.7797005322395,470.237604257916,16.396817320257732,1494.898295850746,1730.193112832,938.0,942,4.0,4.0,,,completed,recorded custom runtime,passed,s021,15,c017,r014,p004,46c4753f8b40d358121b562762de1369ee86b3caf09576ffc321ec23c36d5876,457d48c26e1582032d3b116b221cf3eb93c14f75d0a1998687a94c2f489eab53,858dc70eece08d61b929cb34629a55f3492033a4fcaa25fece809a3905c80f97
+e042,g018,0.5.20,zai-org/GLM-5.2-FP8 H200 TP8,baseline,8,1,55.97053736548394,447.76429892387154,17.324697367125857,1760.0763377313433,1874.1854397440002,938.0,942,4.0,4.0,,,completed,recorded custom runtime,passed,s021,2,c018,r014,p004,a15bb67b34bec17e0063f8556b1dd1eaf962b16ff61c85f58a32469243f6435f,457d48c26e1582032d3b116b221cf3eb93c14f75d0a1998687a94c2f489eab53,087427da55032ae1597c5fd6207f1e0e94bbe5dae44a7063dde5948b5c12216e
+e043,g019,0.5.20,nvidia/GLM-5.2-NVFP4 B200 TP4,optimized,8,1,128.87672918175625,515.506916727025,14.31371079300143,2309.27003637155,1919.298770176,942.0,942,0.0,0.0,989418.0,,completed,recorded custom runtime,passed,s022,5,c019,r015,p005,ab921b1dd8ee8b43eb5878bb017896e0bd5fe2e39a557da952f47f896aaa7e82,9b54f04ece38a38c3f42033448d78d556aa4c6c11fb87f2ef2c3627865c6298e,2ac6205fe30813e937fcc54ac251167a6f023ccfbbd6e8e1552fb9d07c3c6e57
+e044,g019,0.5.20,nvidia/GLM-5.2-NVFP4 B200 TP4,optimized,8,2,127.44708662081135,509.7883464832454,12.814099075293914,2306.140374524416,1879.697873408,942.0,942,0.0,0.0,958260.0,,completed,recorded custom runtime,,s022,23,c019,r015,p005,ab921b1dd8ee8b43eb5878bb017896e0bd5fe2e39a557da952f47f896aaa7e82,9b54f04ece38a38c3f42033448d78d556aa4c6c11fb87f2ef2c3627865c6298e,471f69200db8e6fbb97e93c3ffd4ab6e37a031b4d5a4689c5f798ea643661905
+e045,g019,0.5.20,nvidia/GLM-5.2-NVFP4 B200 TP4,optimized,8,3,128.33214902368644,513.3285960947458,12.885823942819362,2769.85143377707,1938.8855431680001,942.0,942,0.0,0.0,995294.0,,completed,recorded custom runtime,,s022,25,c019,r015,p005,ab921b1dd8ee8b43eb5878bb017896e0bd5fe2e39a557da952f47f896aaa7e82,9b54f04ece38a38c3f42033448d78d556aa4c6c11fb87f2ef2c3627865c6298e,3afd7141d0a06c17f922e67bd16f0ac04aeb98ef80b93cb667a8f1d3553071c4
+e046,g020,0.5.20,nvidia/GLM-5.2-NVFP4 B200 TP4,baseline,8,1,115.28711099045178,461.1484439618071,13.290191053722891,3125.446272152866,2132.871437824,942.0,942,0.0,0.0,983576.0,,completed,recorded custom runtime,passed,s022,2,c020,r015,p005,5f83260b809ec6bf41609ee78cfb321c17291a48e1013191e9303e6eded26794,9b54f04ece38a38c3f42033448d78d556aa4c6c11fb87f2ef2c3627865c6298e,c8db55fc73adeb5dc765dc87dbb58406ce13f5b007b55a9a2311854646a95f1c
+e047,g020,0.5.20,nvidia/GLM-5.2-NVFP4 B200 TP4,baseline,8,2,111.87512492677541,447.50049970710165,17.73785041907974,2597.464441537155,2064.218248704,942.0,942,0.0,0.0,923743.0,,completed,recorded custom runtime,,s022,16,c020,r015,p005,5f83260b809ec6bf41609ee78cfb321c17291a48e1013191e9303e6eded26794,9b54f04ece38a38c3f42033448d78d556aa4c6c11fb87f2ef2c3627865c6298e,4a29c4ea1a250eca09ea1b6655899a7cc07b5156d85e631c5d6364334c3f4997
+e048,g020,0.5.20,nvidia/GLM-5.2-NVFP4 B200 TP4,baseline,8,3,117.77670613204567,471.1068245281827,14.839501562980402,2264.676174100849,2086.4115660800003,942.0,942,0.0,0.0,982927.0,,completed,recorded custom runtime,,s022,18,c020,r015,p005,5f83260b809ec6bf41609ee78cfb321c17291a48e1013191e9303e6eded26794,9b54f04ece38a38c3f42033448d78d556aa4c6c11fb87f2ef2c3627865c6298e,227edb1f0ea1c407bf39b7c3b5f5403e503996e6947fb8dfd9221b88b876a7d3
+```
+
+</Accordion>
 
 ## 1. Model Introduction
 

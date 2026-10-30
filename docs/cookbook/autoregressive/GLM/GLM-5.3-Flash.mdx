@@ -4,10 +4,6 @@ description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B20
 tag: NEW
 ---
 
-For long-context SGLang configurations, see the
-[agentic serving recipes](/cookbook/autoregressive/agentic-serving-configs#glm-5-3-flash) and
-[benchmark evidence](/cookbook/autoregressive/agentic-serving-evidence).
-
 ## Deployment
 
 <a id="install" />
@@ -102,7 +98,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} />
+<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <Note>
 Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
@@ -115,6 +111,76 @@ Use the Playground for lower-level tuning such as attention parallelism, MoE com
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic long-context deployment
+
+### Single-node NVFP4 configuration candidate
+
+Use Linux with NVIDIA CUDA on one node with the GPU count shown for each command;
+all recipes use pipeline parallelism 1. Follow [Install SGLang](/docs/get-started/install)
+for the hardware-specific runtime. Argument names were checked against upstream
+[`f3f23d128cd5`](https://github.com/sgl-project/sglang/tree/f3f23d128cd576352492334534be7e20fdd8fab6).
+Download the named checkpoint or replace `--model-path` with its local directory,
+and supply `HF_TOKEN` if access requires it. Pin the checkpoint revision and runtime
+for your own comparisons.
+
+<Note>
+This is an unmeasured configuration candidate. No retained performance curve or
+accuracy gate establishes it as a measured improvement, and it has not been rerun
+on the upstream revision above. It does not change the Deploy panel's verification
+status.
+</Note>
+
+Reserve at least 400 GB of host memory for the four HiCache ranks, in addition to
+model loading buffers and the OS. Verify complete responses and tool calls before
+measuring throughput, latency, and natural speculative acceptance.
+
+#### GB200 TP4 NVFP4
+
+Checkpoint: [nvidia/GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4).
+This configuration combines three EAGLE steps and four draft tokens
+with linear ReplaySSM speculation, a 100-GB HiCache tier per rank, and a
+64-request limit. No performance curve was recovered for this configured
+profile, so it is a candidate for reproduction rather than a measured win.
+
+<Accordion title="Launch GLM-5.3-Flash on GB200 TP4">
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/GLM-5.3-Flash-NVFP4 \
+  --tp-size 4 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.7 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 16384 \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-decode 64 \
+  --dsa-decode-backend trtllm \
+  --dsa-prefill-backend trtllm \
+  --enable-hierarchical-cache \
+  --enable-linear-replayssm-spec \
+  --enable-nccl-nvls \
+  --hicache-size 100 \
+  --kv-cache-dtype fp8_e4m3 \
+  --linear-attn-decode-backend triton \
+  --linear-attn-prefill-backend ptx_kda \
+  --linear-attn-verify-backend triton \
+  --mamba-ssm-dtype float32 \
+  --max-prefill-tokens 16384 \
+  --moe-runner-backend flashinfer_trtllm \
+  --page-size 64 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-num-steps 3 \
+  --tool-call-parser glm47 \
+  --weight-loader-prefetch-checkpoints
+```
+
+</Accordion>
+
+
 
 ## 1. Model introduction
 

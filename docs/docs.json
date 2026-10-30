@@ -1234,8 +1234,6 @@
                 "group": "Autoregressive Models",
                 "pages": [
                   "cookbook/autoregressive/intro",
-                  "cookbook/autoregressive/agentic-serving-configs",
-                  "cookbook/autoregressive/agentic-serving-evidence",
                   {
                     "group": "Reflection",
                     "pages": [

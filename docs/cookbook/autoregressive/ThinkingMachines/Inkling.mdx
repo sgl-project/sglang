@@ -4,10 +4,6 @@ description: "Deploy Inkling with SGLang — verified launch commands, tuning, a
 tag: NEW
 ---
 
-For long-context SGLang configurations, see the
-[agentic serving recipes](/cookbook/autoregressive/agentic-serving-configs#inkling) and
-[benchmark evidence](/cookbook/autoregressive/agentic-serving-evidence).
-
 ## Deployment
 
 <a id="install" />
@@ -57,7 +53,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/thinkingmachines/inkling.jsx";
 import { benchmarks } from "/src/snippets/configs/thinkingmachines/inkling-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} />
+<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
   <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
@@ -78,6 +74,591 @@ Lines highlighted **green** are added by your overrides; lines with **red strike
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic long-context deployment
+
+These single-node NVFP4 configurations target long-context, prefix-reusing workloads.
+Both retain the recorded worker's 1,048,576-token context limit.
+
+Use these configurations on one Linux/NVIDIA CUDA node with the GPU count shown
+in each heading and pipeline parallelism 1. Follow [Install SGLang](/docs/get-started/install)
+for your hardware. The argument names target upstream
+[`f3f23d128cd5`](https://github.com/sgl-project/sglang/tree/f3f23d128cd576352492334534be7e20fdd8fab6).
+Pin that runtime and your checkpoint revision when comparing results; supply `HF_TOKEN`
+if the named checkpoint requires access, or set `--model-path` to its local directory.
+
+<Note>
+The recorded measurements used custom runtime builds. These public-checkpoint commands
+have not been rerun on the pinned upstream revision, and public checkpoint names do not
+establish identical weight bytes. The recipes do not change the Deploy panel's verification
+status. Check startup, complete responses, and tool calls before comparing performance.
+</Note>
+
+The SGLang 0.5.21 measurements use simulated speculative acceptance lengths of 3.17
+on B200 and 3.18 on H200. Those throughput measurements do not qualify natural
+acceptance or multimodal accuracy; the launch commands omit the simulation settings.
+
+Checkpoint: [thinkingmachines/Inkling-NVFP4](https://huggingface.co/thinkingmachines/Inkling-NVFP4).
+
+Both recipes use eight EAGLE steps, nine draft tokens, multi-layer EAGLE, and
+rejection sampling. The commands include the multimodal and parser arguments
+used by the recorded serving worker.
+
+<Note>
+Stock SGLang 0.5.21 startup failed in the recorded comparison on both GPUs
+(a missing MoE scale attribute on B200 and a CUDA-graph replay mode error on
+H200). The custom-runtime runs therefore do not validate these commands on that
+stock image. Recheck startup on the upstream revision you install.
+</Note>
+
+### B200 TP8 NVFP4
+
+The configuration tested with SGLang 0.5.21 raises the static memory fraction from 0.65 to 0.80 and
+caps running requests at 24. It trades more queueing for the selected
+throughput point; it is not a low-TTFT recommendation.
+
+<Accordion title="Launch Inkling on B200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path thinkingmachines/Inkling-NVFP4 \
+  --tp-size 8 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.8 \
+  --context-length 1048576 \
+  --max-running-requests 24 \
+  --attention-backend fa4 \
+  --enable-multi-layer-eagle \
+  --enable-multimodal \
+  --enable-torch-symm-mem \
+  --fp4-gemm-backend flashinfer_trtllm \
+  --mamba-full-memory-ratio 0.1 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --page-size 128 \
+  --reasoning-parser inkling \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 9 \
+  --speculative-num-steps 8 \
+  --speculative-use-rejection-sampling \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser inkling \
+  --trust-remote-code
+```
+
+</Accordion>
+
+### H200 TP8 NVFP4
+
+This configuration runs the NVFP4 checkpoint through Marlin and matches the
+earlier cookbook MTP settings. Its measurements remain part of the tuning
+history; they do not establish a new optimization gain.
+
+<Accordion title="Launch Inkling on H200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path thinkingmachines/Inkling-NVFP4 \
+  --tp-size 8 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.78 \
+  --context-length 1048576 \
+  --attention-backend fa4 \
+  --enable-multi-layer-eagle \
+  --enable-multimodal \
+  --enable-torch-symm-mem \
+  --fp4-gemm-backend marlin \
+  --mamba-full-memory-ratio 0.1 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --moe-runner-backend marlin \
+  --page-size 128 \
+  --reasoning-parser inkling \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 9 \
+  --speculative-num-steps 8 \
+  --speculative-use-rejection-sampling \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser inkling \
+  --trust-remote-code
+```
+
+</Accordion>
+
+### Configuration history
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Profile</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.18 and SGLang 0.5.20</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.21</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Memory fraction 0.65; omit <code>--max-running-requests</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Memory fraction 0.80; <code>--max-running-requests 24</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Memory fraction 0.78, Marlin, EAGLE 8/1/9</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Retained unchanged</td>
+    </tr>
+  </tbody>
+</table>
+
+The older cookbook used `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`. It is not included
+here because that environment switch is absent from the upstream revision
+used for these commands.
+
+### Recorded measurements
+
+These results belong to the recorded configurations, checkpoints, and runtimes.
+They are historical measurements, not new executions of the public launch commands above.
+Throughput is **output tokens/s/GPU**; ITL and TTFT are **means**. These workload-specific
+results do not replace the deployment cards' total-token throughput benchmarks.
+
+The tuned arms use custom runtime builds. Public-image comparison arms remain
+separate controls; matching an engine version does not establish runtime or checkpoint equivalence.
+
+SGLang 0.5.18 groups include the original measurement and two later repeats.
+Their configuration, server image, checkpoint, and workload match, but client image
+digests differ. The catalog preserves those identities and the recorded client protocol.
+
+Stock comparison arms include the documented minimum loading fixes. The cookbook
+comparison uses the balanced recipe; the existing H200 MTP recipe already matched
+the tuned settings. These are whole-runtime/configuration comparisons. No paired
+semantic accuracy gate was recovered for these measurements.
+
+<Accordion title="Historical configuration comparisons">
+
+Each row aggregates all retained measurements at one configuration and client concurrency.
+The objective was output throughput under mean ITL ≤ 20 ms. Repeats exceeding that bound
+are retained. `±` is the sample standard deviation of throughput; `n` is the replicate
+count. A single measurement has no estimated standard deviation.
+
+#### Recorded SGLang 0.5.18
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Group</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model / hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Arm</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>n</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g007</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>62.25 ± 0.48</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.61</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2903.14</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g008</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Stock + load fix</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>59.00 ± 0.27</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.45</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1599.87</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g009</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Cookbook balanced</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>59.20 ± 0.04</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.89</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1732.07</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g010</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>139.93 ± 0.80</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.51</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1826.56</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g011</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Stock + load fix</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>116.65 ± 0.24</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.83</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>701.13</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g012</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Cookbook balanced</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>120.72 ± 0.17</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.73</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>695.58</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Recorded SGLang 0.5.20
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Group</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model / hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Arm</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>n</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g013</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>64.31</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.95</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2479.71</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g014</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Generic, speculation off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>58.30</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.67</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1916.50</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g015</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned custom runtime</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>150.55</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.95</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1338.76</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g016</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Inkling / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Generic, speculation off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>116.91</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.07</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>782.79</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+<Accordion title="Recorded SGLang 0.5.21 concurrency measurements">
+
+All 14 points use **synthetic speculative acceptance**, with the imposed acceptance
+length (AL) shown for each table. Each point is one measurement. These results do
+not qualify natural speculative acceptance or semantic accuracy. The launch commands
+above omit the simulation overrides.
+
+Client concurrency can exceed `max-running-requests`; queued requests can increase
+TTFT after throughput flattens. Do not assume every point satisfies the latency target
+or represents steady state.
+
+Request-receipt checksums matched the retained evidence for all 14 points.
+
+#### Inkling on B200 TP8
+
+Memory fraction 0.80 and running-request cap 24; AL 3.17. The original c32 measurement is followed by six fixed-recipe measurements. Public direct-worker comparisons used different memory and AL values, so no percentage comparison is transferred. Stock public SGLang 0.5.21 failed startup with a missing MoE scale attribute.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Failed / accepted failures</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>78.48</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>5.99</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>698.35</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>113.71</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8.18</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>812.91</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>150.70</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>12.95</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>981.32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>181.42</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.48</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>13381.85</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>180.80</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>61034.75</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>128</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>180.71</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>15.87</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>151995.66</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>256</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>181.79</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.06</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>313845.88</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Inkling on H200 TP8
+
+Retained memory fraction 0.78 and Marlin; AL 3.18. Only c4 and c8 satisfy the 20 ms mean-ITL target. At c64, one non-context request failure was accepted by the source campaign; that exception remains visible. Stock public SGLang 0.5.21 failed CUDA-graph startup.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Failed / accepted failures</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>48.09</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>9.12</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2152.76</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>61.59</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>14.22</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2683.73</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>69.29</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>26.33</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>5876.72</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>74.61</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32.45</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>48444.57</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>73.28</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>34.10</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>167054.34</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1 / 1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>128</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>73.94</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>33.81</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>389761.02</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>256</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>75.10</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>33.60</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>777053.07</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+### Reproduction records
+
+The historical workload replays 942 Mooncake trace records sequentially, reconstructing
+synthetic text from hashes and lengths with `ignore_eos: true`,
+`skip_special_tokens: false`, and server token accounting.
+
+The 36 full-precision records below join to this model's configuration, runtime, protocol,
+and source catalog. `source_row` counts the CSV header as row 1. Source and metric-export
+checksums identify original artifacts; configuration and benchmark fingerprints hash the
+original JSON field text. Client-adapter fingerprints distinguish recorded adapter metadata.
+`csv_request_count` retains the exporter's value, which sometimes counts successes;
+`attempted_requests` is the replay population.
+
+Recalculate each historical group using arithmetic means of output throughput, ITL, and
+TTFT, and throughput sample standard deviation with denominator `n - 1`. Retain every
+listed repeat, including those above the latency bound.
+
+Image digests and trace hashes identify artifacts without making private assets publicly
+downloadable. Public checkpoint revision SHAs are retained; omitted custom aliases have
+fingerprints and do not establish byte equivalence to public weights. Null denotes an
+unrecorded field or an adjacent omission marker. A new public-runtime comparison must
+pin image, checkpoint, effective arguments, trace, concurrency, output lengths, and cache
+state, and measure natural acceptance separately from simulations.
+
+<Accordion title="Configuration, runtime, workload, and source identities">
+
+```json Evidence catalog
+{
+  "sources": {
+    "s009": {"sha256":"75bdfdf29f3dd8233e6de0ed46326d684d655142689ff47d5cc6fbbaa24bb850"},
+    "s010": {"sha256":"0931ce56ba2c8352d5fa90beab1935bc1ce22347d8dced1daf363e9cc92e5e50"},
+    "s011": {"sha256":"5e8cbf717b9ec55b0ad87863d8a852c6a569a2d820fddc3276c7acdcb39b82c8"},
+    "s012": {"sha256":"9718018ca411e4c90d38265484616aa8122003bc3af2b0723506b565c4988be3"},
+    "s013": {"sha256":"7be0220657891d48fab844d875d624cc1cfa126250008484dc1ab5c60e125914"},
+    "s014": {"sha256":"82ad92176f19b27aeadb492cc4768817d1be63df9203887982764c392e670e79"},
+    "s015": {"sha256":"0e86744a4802b43b60411fae0d49cf7976b3e3dcbf9c40b0e7a9f5b68646b3a3"},
+    "s016": {"sha256":"647dd1464e141797b0650309f725a7698e07c40e2d9f6a38c46c5234d7b75846"},
+    "s017": {"sha256":"9cf051d1f3d0e16400fa5c98c2c365c7a3228fa71c3305254c1f4a7e6960759e"},
+    "s018": {"sha256":"eab64856388353aed47e3a0c7e615261e7a23828e08005205d639c863608bd99"},
+    "s019": {"sha256":"4e433e7138131a5d399175b6360058fd28369842e5f515c9dec9689c04d19fdf"},
+    "s020": {"sha256":"bdc0d88dc7ba2bf530f63f4242e42c657b8a6ce93e13ea438e95ef98852f4173"},
+    "s035": {"sha256":"c2d1a5ad3bafaf1256ae4d72a596637dd02ca730fe256dc2d212b678a9654e37"},
+    "s036": {"sha256":"8652efb498a966e82120e5cc754efabaa0f143bc9f2bef824157b267ecc1f339"},
+    "s037": {"sha256":"9c379aa95a2e9d0bdd1532838bba9208bf51c179faf66bc4a426de9201d16359"}
+  },
+  "runtimes": {
+    "r009": {"checkpoint":"thinkingmachines/Inkling-NVFP4","client_image_digest":"sha256:b86b5507855cf495ee7cbecc041692960db2b8e364b376318b2f7ba81c88c33e","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":null,"image_digest":"sha256:0fc6ee0a6a5f3556f178e28ca10523a884e457945e52da947bd19d2eb83a30cc","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r010": {"checkpoint":"thinkingmachines/Inkling-NVFP4","client_image_digest":"sha256:922ef47c53e3ff3274e7bb98e4fb2583ab7794556c7e1cbb133f7a807b4bbb17","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":null,"image_digest":"sha256:0fc6ee0a6a5f3556f178e28ca10523a884e457945e52da947bd19d2eb83a30cc","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r011": {"checkpoint":"thinkingmachines/Inkling-NVFP4","client_image_digest":"sha256:922ef47c53e3ff3274e7bb98e4fb2583ab7794556c7e1cbb133f7a807b4bbb17","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":"docker.io/lmsysorg/sglang@sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","image_digest":"sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r012": {"checkpoint":"thinkingmachines/Inkling-NVFP4","client_image_digest":"sha256:b86b5507855cf495ee7cbecc041692960db2b8e364b376318b2f7ba81c88c33e","client_image_public":null,"client_tag":null,"engine_version":"0.5.18","image":"docker.io/lmsysorg/sglang@sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","image_digest":"sha256:87f476c9c044b5e4e12a00f56599fe74bd9607c6921234d537232676a1669527","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r013": {"checkpoint":"thinkingmachines/Inkling-NVFP4","client_image_digest":"sha256:fd4ccc2f3cd05e7c0c7a00c21cd537cfab70ec8bf25fec67ce094dde8e31e5e4","client_image_public":null,"client_tag":null,"engine_version":"0.5.20","image":null,"image_digest":"sha256:104bc8b7fe7b68face3b1f320283c41f6695ce70c7732cc6805a4e09990a84c2","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":null,"upstream_source_revision":null,"recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true,"public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established"},
+    "r026": {"client_image_digest":null,"client_image_tag":"0.13.0rc5","client_version":"0.13.0","engine_version":"0.5.21","image":null,"image_digest":"sha256:b93fe5d3f76b92c2a6ed3fa2e44189724b9aa460d74d342bd3ddda8a02992c0a","kind":"custom-runtime","measurement_scope":"custom_runtime","public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established","recorded_model_revision":null,"recorded_revision_field_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_address_omitted":false,"served_model_name":"thinkingmachines/Inkling-NVFP4","recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true},
+    "r027": {"client_image_digest":null,"client_image_tag":"0.13.0rc5","client_version":"0.13.0","engine_version":"0.5.21","image":null,"image_digest":"sha256:e9b70144ede5acaa5e3a45a037142c5211c38ed242dafa5cd7b52bd174da451c","kind":"custom-runtime","measurement_scope":"custom_runtime","public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established","recorded_model_revision":null,"recorded_revision_field_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_address_omitted":false,"served_model_name":"thinkingmachines/Inkling-NVFP4","recorded_revision_alias_sha256":"88526b48ae49e81d207ff4495c8bf5672d605e920f69c5dada4cc5cfe7903309","revision_alias_omitted":true}
+  },
+  "configs": {
+    "c007": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","arguments_source":"Recorded tuning configuration identified by the runtime; source CSV did not retain full launch argv.","environment":{},"measured_arguments":{},"profile_arguments":{"attention_backend":"fa4","enable_multi_layer_eagle":true,"enable_torch_symm_mem":true,"fp4_gemm_backend":"marlin","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.78,"moe_runner_backend":"marlin","page_size":128,"quantization":"modelopt_fp4","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":9,"speculative_num_steps":8,"speculative_use_rejection_sampling":true,"swa_full_tokens_ratio":0.1},"public_command":null},
+    "c008": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"attention_backend":"fa4","host":"0.0.0.0","page_size":128,"port":30000,"served_model_name":"thinkingmachines/Inkling-NVFP4","tp_size":8},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c009": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"SGLANG_ENABLE_UNIFIED_RADIX_TREE":"1"},"measured_arguments":{"attention_backend":"fa4","enable_multimodal":true,"enable_torch_symm_mem":true,"fp4_gemm_runner_backend":"marlin","host":"0.0.0.0","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.85,"moe_runner_backend":"marlin","page_size":128,"port":30000,"quantization":"modelopt_fp4","reasoning_parser":"inkling","served_model_name":"thinkingmachines/Inkling-NVFP4","swa_full_tokens_ratio":0.1,"tool_call_parser":"inkling","tp_size":8,"trust_remote_code":true},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c010": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","arguments_source":"Recorded tuning configuration identified by the runtime; source CSV did not retain full launch argv.","environment":{},"measured_arguments":{},"profile_arguments":{"attention_backend":"fa4","enable_multi_layer_eagle":true,"enable_torch_symm_mem":true,"fp4_gemm_backend":"flashinfer_trtllm","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.65,"moe_runner_backend":"flashinfer_trtllm_routed","page_size":128,"quantization":"modelopt_fp4","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":9,"speculative_num_steps":8,"speculative_use_rejection_sampling":true,"swa_full_tokens_ratio":0.1},"public_command":null},
+    "c011": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"host":"0.0.0.0","moe_runner_backend":"flashinfer_trtllm_routed","port":30000,"served_model_name":"thinkingmachines/Inkling-NVFP4","tp_size":8},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c012": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"SGLANG_ENABLE_UNIFIED_RADIX_TREE":"1"},"measured_arguments":{"attention_backend":"fa4","enable_multimodal":true,"enable_torch_symm_mem":true,"fp4_gemm_runner_backend":"flashinfer_trtllm","host":"0.0.0.0","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.85,"moe_runner_backend":"flashinfer_trtllm_routed","page_size":128,"port":30000,"quantization":"modelopt_fp4","reasoning_parser":"inkling","served_model_name":"thinkingmachines/Inkling-NVFP4","swa_full_tokens_ratio":0.1,"tool_call_parser":"inkling","tp_size":8,"trust_remote_code":true},"model_path_note":"Staged checkpoint path omitted; recorded model/revision are in the runtime catalog.","public_command":null},
+    "c013": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"attention_backend":"fa4","enable_multi_layer_eagle":true,"enable_torch_symm_mem":true,"fp4_gemm_backend":"marlin","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.78,"moe_runner_backend":"marlin","page_size":128,"quantization":"modelopt_fp4","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":9,"speculative_num_steps":8,"speculative_use_rejection_sampling":true,"swa_full_tokens_ratio":0.1},"public_command":null},
+    "c014": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"attention_backend":"fa4","fp4_gemm_backend":"marlin","mamba_radix_cache_strategy":"extra_buffer","moe_runner_backend":"marlin","quantization":"modelopt_fp4"},"public_command":null},
+    "c015": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"attention_backend":"fa4","enable_multi_layer_eagle":true,"enable_torch_symm_mem":true,"fp4_gemm_backend":"flashinfer_trtllm","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.65,"moe_runner_backend":"flashinfer_trtllm_routed","page_size":128,"quantization":"modelopt_fp4","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":9,"speculative_num_steps":8,"speculative_use_rejection_sampling":true,"swa_full_tokens_ratio":0.1},"public_command":null},
+    "c016": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"moe_runner_backend":"flashinfer_trtllm_routed","page_size":128,"quantization":"modelopt_fp4"},"public_command":null},
+    "c035": {"acceptance_mode":"synthetic acceptance override","environment":{},"extra_arguments":["--trust-remote-code","--enable-multimodal","--reasoning-parser","inkling","--tool-call-parser","inkling"],"measured_arguments":{"attention_backend":"fa4","context_length":1048576,"enable_metrics":true,"enable_multi_layer_eagle":true,"enable_torch_symm_mem":true,"fp4_gemm_backend":"flashinfer_trtllm","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","max_running_requests":24,"mem_fraction_static":0.8,"moe_runner_backend":"flashinfer_trtllm_routed","page_size":128,"pp_size":1,"quantization":"modelopt_fp4","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":9,"speculative_num_steps":8,"speculative_use_rejection_sampling":true,"swa_full_tokens_ratio":0.1,"tp_size":8},"synthetic_acceptance_length":3.17},
+    "c036": {"acceptance_mode":"synthetic acceptance override","environment":{},"extra_arguments":["--trust-remote-code","--enable-multimodal","--reasoning-parser","inkling","--tool-call-parser","inkling"],"measured_arguments":{"attention_backend":"fa4","context_length":1048576,"enable_metrics":true,"enable_multi_layer_eagle":true,"enable_torch_symm_mem":true,"fp4_gemm_backend":"marlin","mamba_full_memory_ratio":0.1,"mamba_radix_cache_strategy":"extra_buffer","mem_fraction_static":0.78,"moe_runner_backend":"marlin","page_size":128,"pp_size":1,"quantization":"modelopt_fp4","speculative_algorithm":"EAGLE","speculative_eagle_topk":1,"speculative_num_draft_tokens":9,"speculative_num_steps":8,"speculative_use_rejection_sampling":true,"swa_full_tokens_ratio":0.1,"tp_size":8},"synthetic_acceptance_length":3.18}
+  },
+  "protocols": {
+    "p001": {"aiperf_version":"0.11.0","cache_isolation":"new server allocation per point; fresh cache_salt namespace per point (salt is not physical eviction)","client_options":{},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":"not available in AIPerf 0.11.0","random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":10800,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":null,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":"no injected warmup; two 128-token pre-measurement requests (the smoke and the identical return_meta_info speculation probe, ignore_eos, temperature 0) on the separate <namespace>-smoke cache_salt before the measured replay","workers":8,"client_adapter_identity_sha256":"c119bf2507ab1696ae1035ece63f94c8f335960a063e7984c8de797e6b39767c"},
+    "p002": {"aiperf_version":"0.11.0","cache_isolation":"new server allocation per point; fresh cache_salt namespace per point (salt is not physical eviction)","client_options":{},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":"not available in AIPerf 0.11.0","random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":10800,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":null,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":"no injected warmup; two 128-token pre-measurement requests (the smoke and the identical return_meta_info speculation probe, ignore_eos, temperature 0) on the separate <namespace>-smoke cache_salt before the measured replay","workers":16,"client_adapter_identity_sha256":"c119bf2507ab1696ae1035ece63f94c8f335960a063e7984c8de797e6b39767c"},
+    "p003": {"aiperf_version":null,"cache_isolation":null,"client_options":{},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":null,"random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":3600,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":null,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":null,"workers":null,"client_adapter_identity_sha256":"b3a10de4250c8e6f48cca46e92af6495df5567f7e40906cdd513e0c9837fa34b"},
+    "p009": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"88fccd812665e7dddf37ee0eb103e4633db2e7453e4503e970e56c79958cc413","warmup_command_present":false},"client_options":{"aiperf_args":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"thinkingmachines/Inkling-NVFP4","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--random-seed":42,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","skip_auto_warmup":true,"tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv_structured_4perc","num_requests":942,"parameters":{"context_length":1048576,"osl_cap":12000,"request_timeout_seconds":3600,"subset_percent":1.0},"source_sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176"}}
+  },
+  "groups": {
+    "g007": {"concurrency":8,"label":"Tuned custom runtime","model":"inkling","n":3,"records":["e019","e020","e021"],"sku":"H200","tp":8,"sglang_version":"0.5.18"},
+    "g008": {"concurrency":8,"label":"Upstream stock (Inkling: minimal load fixes)","model":"inkling","n":3,"records":["e022","e023","e024"],"sku":"H200","tp":8,"sglang_version":"0.5.18"},
+    "g009": {"concurrency":8,"label":"Cookbook balanced","model":"inkling","n":3,"records":["e025","e026","e027"],"sku":"H200","tp":8,"sglang_version":"0.5.18"},
+    "g010": {"concurrency":16,"label":"Tuned custom runtime","model":"inkling","n":3,"records":["e028","e029","e030"],"sku":"B200","tp":8,"sglang_version":"0.5.18"},
+    "g011": {"concurrency":16,"label":"Upstream stock (Inkling: minimal load fixes)","model":"inkling","n":3,"records":["e031","e032","e033"],"sku":"B200","tp":8,"sglang_version":"0.5.18"},
+    "g012": {"concurrency":16,"label":"Cookbook balanced","model":"inkling","n":3,"records":["e034","e035","e036"],"sku":"B200","tp":8,"sglang_version":"0.5.18"},
+    "g013": {"concurrency":8,"label":"Tuned custom runtime","model":"inkling","n":1,"records":["e037"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g014": {"concurrency":8,"label":"Generic, speculation off","model":"inkling","n":1,"records":["e038"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g015": {"concurrency":16,"label":"Tuned custom runtime","model":"inkling","n":1,"records":["e039"],"sku":"B200","tp":8,"sglang_version":"0.5.20"},
+    "g016": {"concurrency":16,"label":"Generic, speculation off","model":"inkling","n":1,"records":["e040"],"sku":"B200","tp":8,"sglang_version":"0.5.20"}
+  },
+  "accuracy": {
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Full-precision measurement records">
+
+```csv Measurement records
+id,group,sglang_version,cell,arm,c,replicate,output_tok_s_per_gpu,output_tok_s,mean_itl_ms,mean_ttft_ms,duration_s,csv_request_count,attempted_requests,failed_requests,accepted_failures,output_token_count,synthetic_acceptance_length,csv_status,runtime_status,request_qualification,source,source_row,config,runtime,protocol,server_config_sha256,benchmark_config_sha256,metric_export_sha256
+e019,g007,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,optimized,8,1,62.65064885244838,501.205190819587,17.501746548010182,2992.1166205069662,4433.132458917,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s009,3,c007,r009,p001,19f2f0c43ce4fb2210edf030e939be75d5c0b84aa033345b60d58febeb1840d3,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,e781e31fddd169a9dd627b46d11b5c84734307ab49d40503585783c8b710b9eb
+e020,g007,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,optimized,8,2,62.37863186586528,499.02905492692224,16.25240510405566,2882.193235039657,4452.4513991680005,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s010,2,c007,r010,p001,19f2f0c43ce4fb2210edf030e939be75d5c0b84aa033345b60d58febeb1840d3,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,8afd541e22d2e27d49611c63cb962e9e222e415ccfd87bdf40900446d538fdab
+e021,g007,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,optimized,8,3,61.70965707909653,493.67725663277224,16.081137254429702,2835.1246426613075,4500.71964928,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s010,3,c007,r010,p001,19f2f0c43ce4fb2210edf030e939be75d5c0b84aa033345b60d58febeb1840d3,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,aa7ba38149992689a034080d7ad9e7028292db26641dd2e6b36a7ea1ef86a52f
+e022,g008,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,baseline,8,2,59.0006375933217,472.0051007465736,16.307457292372884,1638.5937748488745,4707.354289664,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s010,4,c008,r011,p001,c1dedcb76078d9b6011d811cef7e225cc9b76921392e5835fd7c29591bc5ff7f,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,e557bf079e4310e19e818b4cf5fd6f2207fa5d4328ffee8482ee246b66b435cc
+e023,g008,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,baseline,8,3,59.268348167620815,474.1467853409665,16.469185490709,1569.9436428049303,4686.092064,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s010,5,c008,r011,p001,c1dedcb76078d9b6011d811cef7e225cc9b76921392e5835fd7c29591bc5ff7f,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,25a13fdd5510139832aa716250183702451358cb121c4354e4664cc999218764
+e024,g008,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,baseline,8,1,58.71926212668097,469.75409701344773,16.585619590538528,1591.0696681371917,4729.940652197,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s011,4,c008,r012,p001,c1dedcb76078d9b6011d811cef7e225cc9b76921392e5835fd7c29591bc5ff7f,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,550109c7ec7f8e3f7ecc221f2e40a61749e61af2a621c0e5375b20d91ea22599
+e025,g009,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,prior,8,2,59.238956811478864,473.9116544918309,15.894650355402558,1718.4518394812433,4688.4170918400005,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s010,6,c009,r011,p001,04d954f4dd48c7e853dc4e1d4cb9d4a16a545e49e506b6248daa3870d82cbc43,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,9bde678cdb3d373a16fc7b95c2ecbda35912c8dbbf0a11f150c0787a18e9b0b0
+e026,g009,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,prior,8,3,59.16080654507477,473.28645236059816,15.904082294339156,1740.050319414791,4694.610376448,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s010,7,c009,r011,p001,04d954f4dd48c7e853dc4e1d4cb9d4a16a545e49e506b6248daa3870d82cbc43,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,fc65958c899aaef973459c30263e3107d2fc4c69b31169dd809f98ae9c781d96
+e027,g009,0.5.18,thinkingmachines/Inkling-NVFP4 H200 TP8,prior,8,1,59.186484839814106,473.49187871851285,15.883728786885698,1737.7089636859594,4692.602132931001,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s012,3,c009,r012,p001,04d954f4dd48c7e853dc4e1d4cb9d4a16a545e49e506b6248daa3870d82cbc43,cfe1227db8204af3699e0f06635e39c049bb1879e7836b5e958c0e3f82795de9,276713d2e9c3f8903c06747f936a45569e24488bbc3729778b8ac308fcca2f32
+e028,g010,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,optimized,16,1,140.75773134480573,1126.0618507584459,15.55076711123869,1811.3166304255092,1973.1678135650002,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s013,4,c010,r009,p002,e0f7a634eb45394b5462122f707f10fe1f2f946eff7170778408c1b5259db511,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,bf6a86bbd6ea54f459ed264afcf454206fe4cf6f03145263e088183dd642821a
+e029,g010,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,optimized,16,2,139.16829748545746,1113.3463798836597,15.3511639111939,1852.1686915702035,1995.6913620480002,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s014,2,c010,r010,p002,e0f7a634eb45394b5462122f707f10fe1f2f946eff7170778408c1b5259db511,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,13608dad4e7dee6174da516481e072ca48defebb468e6ded5770e72f357e470f
+e030,g010,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,optimized,16,3,139.86870630556993,1118.9496504445594,15.614113706165877,1816.2003232175775,1985.6998425600002,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s014,3,c010,r010,p002,e0f7a634eb45394b5462122f707f10fe1f2f946eff7170778408c1b5259db511,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,d787ccdb00002928031ada2db8cc72caa2bdf22a00df233712e8fb917ed10f89
+e031,g011,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,baseline,16,2,116.921552959761,935.372423678088,16.69882476101177,706.1333175948553,2375.3992770560003,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s014,4,c011,r011,p002,f5bdf4b35779371ed815d7a523647ca52943dbc6e16762ec857e9f546300b3ef,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,23d5139ac80abc50e54a0e9af44b408e4d79f4acb9df931af06932c57674db01
+e032,g011,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,baseline,16,3,116.54671431604426,932.3737145283541,16.935508655165208,702.0270131329046,2383.0410263040003,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s014,5,c011,r011,p002,f5bdf4b35779371ed815d7a523647ca52943dbc6e16762ec857e9f546300b3ef,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,56a51ceb0cc11e69e2b4ca03934d9eef34184e6f582d6f8744f856594064b226
+e033,g011,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,baseline,16,1,116.48011197954536,931.8408958363628,16.84331565756259,695.2256339517685,2384.429584415,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s015,4,c011,r012,p002,f5bdf4b35779371ed815d7a523647ca52943dbc6e16762ec857e9f546300b3ef,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,493331b2cfea4a4c4e25b904f4356f78892146a59648e21afcf020f9f18ac8a8
+e034,g012,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,prior,16,2,120.81817796152642,966.5454236922113,15.746111239966206,698.2126802583065,2298.78811008,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s014,6,c012,r011,p002,b62d432a49b3acbf78f825ce9374ac175c0541bfe8dc55b7f5b668a8e6475476,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,01a5ba5b13c74910b3cc901c993e4fb68e41b75a6f670148e735bfefc7b3bbd3
+e035,g012,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,prior,16,3,120.8153958439316,966.5231667514528,15.74944841565524,692.2518570857449,2298.82611968,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s014,7,c012,r011,p002,b62d432a49b3acbf78f825ce9374ac175c0541bfe8dc55b7f5b668a8e6475476,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,de14dd6602a96bf4ff8fc95520d6ecc2e96955c64f11b5b4e9f002343da942a8
+e036,g012,0.5.18,thinkingmachines/Inkling-NVFP4 B200 TP8,prior,16,1,120.51512960249865,964.1210368199892,15.693718914013656,696.2883525948553,2304.595496981,933.0,942,9.0,9.0,2221909.0,,completed,recorded upstream,passed,s016,4,c012,r012,p002,b62d432a49b3acbf78f825ce9374ac175c0541bfe8dc55b7f5b668a8e6475476,d832a4cf592d3f93b0523c3739588d62085068f245066ee04e3e5dfe50ed3370,e90676dab7b85c6961b4dc09ec42e266bca931b13481da44de4d2aaa6eb64c59
+e037,g013,0.5.20,thinkingmachines/Inkling-NVFP4 H200 TP8,optimized,8,1,64.30767416787326,514.4613933429861,15.947416196674384,2479.7100867609856,4318.903281667001,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s017,3,c013,r013,p003,48b9b8605ccfcc3360d88bbe77cf0d6ec081a54068a421423a94ffb87c4cf539,489ced63fd3d6342640bbfa5a2fa78caa6e9d3d9631c3d5c78fb50ba0db6731b,921d46b5517a58d9ff06181e69abf750d70d41e08f150a8521aae4aab5cbf759
+e038,g014,0.5.20,thinkingmachines/Inkling-NVFP4 H200 TP8,baseline,8,1,58.299907057717064,466.3992564617365,15.66811678313336,1916.5041495927117,4763.963426649,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s018,3,c014,r013,p003,90cb66a5867cd217cf50aec21fd0f50098f13a59db41c000ae35af1d9275159c,489ced63fd3d6342640bbfa5a2fa78caa6e9d3d9631c3d5c78fb50ba0db6731b,b719c9d6c23e8c0ab0d4072cfe43f3769c03ea339b8a0e7d62bcf4b477b78f8a
+e039,g015,0.5.20,thinkingmachines/Inkling-NVFP4 B200 TP8,optimized,16,1,150.5499851258475,1204.39988100678,13.954783534762743,1338.7608815669882,1844.8266518780001,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s019,4,c015,r013,p003,c660b33fb8f671421b067e09cfb091298014c8feeb400868ee749609a37d2a7b,5ef21ca143fad3218cc4384a1f4425ba9a094fd2278eaa1eeed113dc2c0f129d,55ba16f49c2b644c3235a29e146669ab256606d6fe660fd3bcc0f9871740c2d5
+e040,g016,0.5.20,thinkingmachines/Inkling-NVFP4 B200 TP8,baseline,16,1,116.90629849606043,935.2503879684834,16.07365878812621,782.7878449346196,2375.7370524340004,933.0,942,9.0,9.0,2221909.0,,completed,recorded custom runtime,passed,s020,4,c016,r013,p003,a90306ba03ca642b14483a65487b7e51d4955139b06ecc2958fc47fdd0fa4662,5ef21ca143fad3218cc4384a1f4425ba9a094fd2278eaa1eeed113dc2c0f129d,ac907025ed3cb956d7a7a2a7ebd0104217f9665d3e93fd72c5decc5ee0535756
+e087,,0.5.21,inkling-b200-tp8,optimized,4,1,78.48130695889681,627.8504556711745,5.993760664112293,698.3450878864119,3523.710364416,942,942,0,0,,3.17,completed,verified,passed,s035,3,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,e3ef8984eb3d7447779a6cca79ca26a2f556169f787493c8014259f83725f665
+e088,,0.5.21,inkling-b200-tp8,optimized,8,1,113.71419528552357,909.7135622841886,8.180041654828912,812.9054353089172,2431.9166287360003,942,942,0,0,,3.17,completed,verified,passed,s035,5,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,1586afe8f97238ce498dbe2511c0387a35805976af4c875087238771f6de569b
+e089,,0.5.21,inkling-b200-tp8,optimized,16,1,150.70209601149898,1205.6167680919918,12.94755961966877,981.3179901273884,1835.037412608,942,942,0,0,,3.17,completed,verified,passed,s035,2,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,f725479a2a19a8735fc12e0fc7f7edcc6858e5cae4211f061f04fab7637dd52c
+e090,,0.5.21,inkling-b200-tp8,optimized,32,1,181.41784256283464,1451.342740502677,16.484432710805514,13381.845373606156,1524.3464391680002,942,942,0,0,,3.17,completed,verified,passed,s036,2,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,5b1e5e970c7c224dd5685c50717c02e01d872c3b04dc99465be30617cd556f30
+e091,,0.5.21,inkling-b200-tp8,optimized,64,1,180.80341953535788,1446.427356282863,16.644665942862133,61034.75128680679,1529.5256793600001,942,942,0,0,,3.17,completed,verified,passed,s035,6,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,508258e042aacdb9e424003ce5f747d24c1692123a374f12f71c455041912f09
+e092,,0.5.21,inkling-b200-tp8,optimized,128,1,180.71001348439046,1445.6801078751237,15.865433327076207,151995.6617715074,1530.316868352,942,942,0,0,,3.17,completed,verified,passed,s035,4,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,3c5d5d1f8d3c36f94e2d57027b783a0a554e867fefca9b7f06534235706fb0ed
+e093,,0.5.21,inkling-b200-tp8,optimized,256,1,181.79365440024984,1454.3492352019987,17.061417016281162,313845.8845318068,1521.1949068800002,942,942,0,0,,3.17,completed,verified,passed,s035,7,c035,r026,p009,0a68e9f7e6e064ba1b489959ea645eae739129b027a6eb09f94ed6fc7164cdd1,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,bc81a30c3c5c5fd0235f45805267eb23be02264141ef64635ccecd0120acfe8d
+e094,,0.5.21,inkling-h200-tp8,optimized,4,1,48.08962637739075,384.717011019126,9.12109166406182,2152.760299866242,5750.63584384,942,942,0,0,,3.18,completed,verified,passed,s037,3,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,ad741d0c9ccc788caf9ee20325fdf2981e374176662a4c271488bb4feefbc347
+e095,,0.5.21,inkling-h200-tp8,optimized,8,1,61.5875843385219,492.7006747081752,14.2222978127188,2683.726520388535,4490.281445376,942,942,0,0,,3.18,completed,verified,passed,s037,4,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,54cac172fe45104cf1c6e3550bb1d6cbe639db5f2384884764892346477f36dd
+e096,,0.5.21,inkling-h200-tp8,optimized,16,1,69.28731795388207,554.2985436310565,26.32889761436783,5876.723243698514,3991.28656768,942,942,0,0,,3.18,completed,verified,passed,s037,2,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,7a16e5bbd5b99d5dfc5812d66e04da194121dbc5fabc5147d051a307506a5def
+e097,,0.5.21,inkling-h200-tp8,optimized,32,1,74.60815500951398,596.8652400761118,32.45348226400947,48444.57294692357,3706.6364229120004,942,942,0,0,,3.18,completed,verified,passed,s037,8,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,d1d54d7b3ccaf1d396b766e5060dfe6c16cffa665e953f08b9ba7dbf14d9c4a7
+e098,,0.5.21,inkling-h200-tp8,optimized,64,1,73.27510015757146,586.2008012605717,34.103718283245406,167054.3375882731,3767.7852508160004,941,942,1,1,,3.18,completed,verified,passed,s037,5,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,79017bb8496c503ec872593e7d9e31abdbdc2e4f9c692db20ac08a0f8c5481c1
+e099,,0.5.21,inkling-h200-tp8,optimized,128,1,73.9396295525943,591.5170364207544,33.814129140773396,389761.01701444155,3740.1474091520004,942,942,0,0,,3.18,completed,verified,passed,s037,6,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,5ef1e3ca13f78ff06b1881b6ba5463c30052e7fcdd779661b8670c13d5482614
+e100,,0.5.21,inkling-h200-tp8,optimized,256,1,75.10415191999122,600.8332153599298,33.60488566410554,777053.0677240669,3682.1553448960003,942,942,0,0,,3.18,completed,verified,passed,s037,7,c036,r027,p009,6041b6860516498126f8ebfc52dfa9aef99211d042e5c4f39876093c080b0d97,900431d6735456a2458d38b633494db0814748a5f046d20c2e0d435fdea268af,3fd7d697c7f5831f8743ef8607c2b4ee780ea2889526bcc077149b0b6f954114
+```
+
+</Accordion>
 
 ## 1. Model Introduction
 

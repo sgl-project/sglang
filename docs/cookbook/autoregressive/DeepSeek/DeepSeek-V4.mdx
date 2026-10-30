@@ -3,10 +3,6 @@ title: DeepSeek-V4
 description: "Deploy DeepSeek-V4 with SGLang — verified launch commands, benchmarks, and tuning for Flash Official (0731), Flash, Flash Vision (Exp), Pro, and Pro Official (0813)."
 ---
 
-For long-context SGLang configurations, see the
-[agentic serving recipes](/cookbook/autoregressive/agentic-serving-configs#deepseek-v4-flash-0731) and
-[benchmark evidence](/cookbook/autoregressive/agentic-serving-evidence).
-
 ## Deployment
 
 <a id="install" />
@@ -140,7 +136,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## Agentic Long-Context Deployment
 
-Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. The explorer below gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
 - **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
@@ -150,6 +146,840 @@ import { AgentX } from "/src/snippets/_agentx.jsx";
 import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4.jsx";
 
 <AgentX data={agentx} />
+
+### Single-node tuning configurations
+
+The following Flash 0731 and Pro 0813 configurations target long-context workloads
+on H200 and B200, with DSpark speculation and hardware-specific memory settings.
+
+Use these configurations on one Linux/NVIDIA CUDA node with the GPU count shown
+in each heading and pipeline parallelism 1. Follow [Install SGLang](/docs/get-started/install)
+for your hardware. The argument names target upstream
+[`f3f23d128cd5`](https://github.com/sgl-project/sglang/tree/f3f23d128cd576352492334534be7e20fdd8fab6).
+Pin that runtime and your checkpoint revision when comparing results; supply `HF_TOKEN`
+if the named checkpoint requires access, or set `--model-path` to its local directory.
+
+<Note>
+The recorded measurements used custom runtime builds. These public-checkpoint commands
+have not been rerun on the pinned upstream revision, and public checkpoint names do not
+establish identical weight bytes. The recipes do not change the Deploy panel's verification
+status. Check startup, complete responses, and tool calls before comparing performance.
+</Note>
+
+These commands retain the recorded SGLang 0.5.21 workers' 1,048,576-token context
+limit. The SGLang 0.5.20 performance measurements used a 262,144-token cap; the
+recorded GPQA summaries do not qualify the larger window. All SGLang 0.5.21 performance points
+use simulated speculative acceptance; those settings are omitted from the commands.
+DeepSeek Pro also uses a different trace, so the two runtime versions do not form
+a controlled speed comparison. Preserve the `NCCL_NET_GDR_LEVEL=LOC` setting only
+after checking it against your interconnect, and reserve host memory for HiCache.
+
+#### Flash 0731
+
+These are the **0731** checkpoints.
+Both configurations use DSpark block size 5 and cap running requests at 64.
+
+##### B200 TP4 NVFP4
+
+Checkpoint: [nvidia/DeepSeek-V4-Flash-0731-NVFP4](https://huggingface.co/nvidia/DeepSeek-V4-Flash-0731-NVFP4).
+The configuration tested with SGLang 0.5.21 changes the prefill/decode interval from 16 to 8.
+
+<Accordion title="Launch DeepSeek-V4-Flash-0731 on B200 TP4">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Flash-0731-NVFP4 \
+  --tp-size 4 \
+  --mem-fraction-static 0.88 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 512 \
+  --disable-flashinfer-autotune \
+  --log-level info \
+  --log-level-http info \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --prefill-decode-interval 8 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+##### H200 TP4 FP8 with MXFP4 experts
+
+Checkpoint: [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731).
+Keep its MXFP4 expert layout; do not substitute an all-FP8 checkpoint.
+The configuration tested with SGLang 0.5.21 adds the 16,384-token prefill chunk, interval 8, and FP8
+compute mode for the FlashInfer MXFP4 MoE runner. This mode requires
+**FlashInfer 0.6.18 or newer** on H200, as documented in the
+[upstream option declaration](https://github.com/sgl-project/sglang/blob/f3f23d128cd576352492334534be7e20fdd8fab6/python/sglang/srt/arg_groups/fields/exec_.py#L895-L901).
+Its selected custom-runtime point
+had substantially higher TTFT than the incumbent, so measure queueing latency
+as well as inter-token latency.
+
+<Accordion title="Launch DeepSeek-V4-Flash-0731 on H200 TP4">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --tp-size 4 \
+  --mem-fraction-static 0.88 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 16384 \
+  --flashinfer-mxfp4-moe-precision fp8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --prefill-decode-interval 8 \
+  --reasoning-parser deepseek-v4 \
+  --schedule-policy lof \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+##### Flash configuration history
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Profile</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.20</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.21</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}><code>--prefill-decode-interval 16</code>; no explicit log-level flags</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Interval 8; info log levels</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>H200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Omit <code>--chunked-prefill-size</code>, <code>--prefill-decode-interval</code>, and <code>--flashinfer-mxfp4-moe-precision</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Chunk 16384, interval 8, MXFP4 MoE precision <code>fp8</code></td>
+    </tr>
+  </tbody>
+</table>
+
+An omitted flag uses the tested build's default, which may differ on another
+build. Both configurations preserve memory fraction 0.88 and the H200 `lof`
+schedule policy.
+
+#### Pro 0813
+
+These **0813** recipes preserve the engine settings tested with SGLang 0.5.20
+and 0.5.21, including the allocator setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` from the
+measured runtime. The H200 recipe uses DSpark block size 3; B200 uses block
+size 5. The commands include the measured worker's 1,048,576-token context cap.
+
+##### B200 TP8 NVFP4
+
+Checkpoint: [nvidia/DeepSeek-V4-Pro-0813-NVFP4](https://huggingface.co/nvidia/DeepSeek-V4-Pro-0813-NVFP4).
+
+<Accordion title="Launch DeepSeek-V4-Pro-0813 on B200 TP8">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Pro-0813-NVFP4 \
+  --tp-size 8 \
+  --mem-fraction-static 0.85 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 8192 \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+##### H200 TP8 FP8 with MXFP4 experts
+
+Checkpoint: [deepseek-ai/DeepSeek-V4-Pro-0813](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813).
+This uses a HiCache host tier with ratio 2, kernel I/O, and write-through.
+The recorded setup needed approximately 240 GB of pinnable host memory per
+node; recheck that budget when the device KV pool or runtime changes.
+
+<Accordion title="Launch DeepSeek-V4-Pro-0813 on H200 TP8">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --tp-size 8 \
+  --mem-fraction-static 0.88 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --dsv4-prefill-backend flashmla_sparse_q8 \
+  --enable-hierarchical-cache \
+  --hicache-io-backend kernel \
+  --hicache-ratio 2 \
+  --hicache-write-policy write_through \
+  --moe-runner-backend marlin \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 3 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+#### Recorded measurements
+
+These results belong to the recorded configurations, checkpoints, and runtimes.
+They are historical measurements, not new executions of the public launch commands above.
+Throughput is **output tokens/s/GPU**; ITL and TTFT are **means**. These workload-specific
+results do not replace the deployment cards' total-token throughput benchmarks.
+
+The tuned arms use custom runtime builds. Public-image comparison arms remain
+separate controls; matching an engine version does not establish runtime or checkpoint equivalence.
+
+SGLang 0.5.20 measurements use a 262,144-token context limit; the recipes and
+recorded 0.5.21 workers use 1,048,576. The earlier results do not validate the larger
+window. Flash H200 c20 is an additional point outside the original c4/8/16/32/64 grid.
+
+<Accordion title="Historical configuration comparisons">
+
+Each row aggregates all retained measurements at one configuration and client concurrency.
+The objective was output throughput under mean ITL ≤ 20 ms. Repeats exceeding that bound
+are retained. `±` is the sample standard deviation of throughput; `n` is the replicate
+count. A single measurement has no estimated standard deviation.
+
+##### Recorded SGLang 0.5.20
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Group</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model / hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Arm</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>n</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g027</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Flash-0731 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned DSpark recipe</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1103.52 ± 5.24</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.51</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>6424.16</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g028</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Flash-0731 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Upstream stock SGLang</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>769.59</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>31.78</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1578.12</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g029</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Flash-0731 / H200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned DSpark recipe</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>342.01</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.03</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1257.03</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g030</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Flash-0731 / H200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Upstream stock SGLang</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>229.96 ± 0.30</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>18.74</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1009.31</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g031</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Pro-0813 / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned DSpark recipe</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>152.95 ± 1.19</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.62</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1141.12</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g032</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Pro-0813 / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Upstream stock SGLang</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>116.89 ± 0.14</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.93</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>900.09</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g033</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Pro-0813 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned DSpark recipe</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>61.57 ± 0.12</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>18.66</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2170.76</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g034</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Pro-0813 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Upstream stock SGLang</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>39.35</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>23.78</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2401.26</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g035</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>DeepSeek-V4-Flash-0731 / H200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned DSpark recipe, off-grid c20</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>20</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>366.72 ± 1.47</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.11</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1515.97</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+<Accordion title="Recorded SGLang 0.5.21 concurrency measurements">
+
+All 28 points use **synthetic speculative acceptance**, with the imposed acceptance
+length (AL) shown for each table. Each point is one measurement. These results do
+not qualify natural speculative acceptance or semantic accuracy. The launch commands
+above omit the simulation overrides.
+
+Client concurrency can exceed `max-running-requests`; queued requests can increase
+TTFT after throughput flattens. Do not assume every point satisfies the latency target
+or represents steady state.
+
+Request-receipt checksums matched the retained evidence for 21 points. The seven
+Flash B200 receipts were referenced but unavailable; their CSV qualification status
+is retained without claiming those receipts were rechecked.
+
+##### DeepSeek-V4-Flash-0731 on B200 TP4
+
+Prefill/decode interval 8; AL 3.30. The c16 outlier is retained. All seven request checks passed, but their effective-runtime evidence is marked not_verified; the submitted configuration is not a log-verified effective configuration. No semantic accuracy gate accompanies these points.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Failed / accepted failures</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>303.94</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2.87</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>625.05</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>450.43</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3.81</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>920.06</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>95.23</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>33.13</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8566.93</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>776.95</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8.08</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2494.29</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>919.16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>12.65</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>6462.26</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>128</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>920.23</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>12.66</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>42796.89</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>256</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>922.60</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>12.21</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>111108.44</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+  </tbody>
+</table>
+
+##### DeepSeek-V4-Flash-0731 on H200 TP4
+
+AL 4.50. The original c128 selection and six later fixed-recipe measurements use the recorded custom runtime launcher. The original selection compared different concurrency and acceptance assumptions and waived repeats; no percentage gain is transferred.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Failed / accepted failures</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>224.16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3.53</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1485.83</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>301.64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>5.07</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2168.15</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>364.27</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8.27</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>3583.25</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>420.61</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.41</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>6956.91</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>476.49</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>19.66</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>20222.44</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>128</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>464.25</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>18.54</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>99383.81</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>256</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>478.31</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>17.48</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>249572.83</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0 / 0</td>
+    </tr>
+  </tbody>
+</table>
+
+##### DeepSeek-V4-Pro-0813 on B200 TP8
+
+Retained recipe; historical AL 4.79, different from the canonical calibration record of 2.50. These points use the legacy 3,541-request trace, with 3,539 exact-output successes and two accepted context-limit HTTP 400 responses. Warmups, cache salts, and client resources vary, so do not treat this as a controlled homogeneous curve. At c256 the replay completed, but orchestration failed during client cleanup.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Failed / accepted failures</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>85.54</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4.46</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2215.38</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>107.01</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>7.54</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2557.25</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>127.77</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.14</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>2928.28</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>139.11</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>25.12</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>5333.04</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>145.12</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>50.60</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>48544.03</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>128</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>143.59</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>50.12</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>179919.13</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>256</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>144.26</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>53.97</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>432259.52</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+  </tbody>
+</table>
+
+##### DeepSeek-V4-Pro-0813 on H200 TP8
+
+Retained recipe; AL 2.30. The legacy 3,541-request trace has 3,539 exact-output successes and two accepted context-limit HTTP 400 responses. Warmups, cache salts, and client resources vary; this is not a controlled homogeneous curve. At c256 the replay completed, but orchestration failed afterward. Stock attempts ran out of memory or timed out.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Failed / accepted failures</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>33.77</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>11.54</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>5634.13</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>41.86</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>18.71</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>11360.66</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>46.75</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>37.90</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>38318.79</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>32</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>47.83</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>68.35</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>124965.38</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>64</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>47.34</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>84.55</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>322335.79</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>128</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>47.48</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>84.47</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>712490.73</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>256</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>47.97</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>78.70</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1462537.95</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2 / 2</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+<Accordion title="Recorded GPQA-Diamond comparisons">
+
+The 0.5.20 campaign summaries record paired GPQA-Diamond evaluations, speculative decoding
+on versus off on the selected custom-runtime configuration: five runs of 198 items per arm.
+The Flash decisions used a predeclared maximum regression of four percentage points.
+Scores below retain the precision of the recorded summary; do not infer a more precise
+difference from rounded values. The catalog includes the decision-receipt checksums.
+
+These are reported historical results, not newly executed tests. Raw item-level GPQA
+outputs are not included in the retained CSVs. The performance schema's
+`accuracy_qualification` field remains `not_asserted`; the paired decision is narrower
+than qualification of all API, tool-call, multimodal, or larger-context behavior.
+These summaries do not qualify the changed SGLang 0.5.21 settings.
+
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Speculation on</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Speculation off</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Runs × items per arm</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>DeepSeek-V4-Flash-0731</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.738</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>0.757</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>5 × 198</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>DeepSeek-V4-Flash-0731</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>H200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.741</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>0.76</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>5 × 198</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>DeepSeek-V4-Pro-0813</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.7434</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>0.7202</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>5 × 198</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>DeepSeek-V4-Pro-0813</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.7495</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>0.7384</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>5 × 198</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+#### Reproduction records
+
+The historical workload replays 942 Mooncake trace records sequentially, reconstructing
+synthetic text from hashes and lengths with `ignore_eos: true`,
+`skip_special_tokens: false`, and server token accounting.
+
+The SGLang 0.5.20 replay filters that population to 912 records whose input plus output
+fit 262,144 tokens. The 0.5.21 Pro runs instead use a distinct 3,541-record legacy
+trace. Do not pool these populations into a runtime-version speed comparison.
+
+The 49 full-precision records below join to this model's configuration, runtime, protocol,
+and source catalog. `source_row` counts the CSV header as row 1. Source and metric-export
+checksums identify original artifacts; configuration and benchmark fingerprints hash the
+original JSON field text. Client-adapter fingerprints distinguish recorded adapter metadata.
+`csv_request_count` retains the exporter's value, which sometimes counts successes;
+`attempted_requests` is the replay population.
+
+Recalculate each historical group using arithmetic means of output throughput, ITL, and
+TTFT, and throughput sample standard deviation with denominator `n - 1`. Retain every
+listed repeat, including those above the latency bound.
+
+Image digests and trace hashes identify artifacts without making private assets publicly
+downloadable. Public checkpoint revision SHAs are retained; omitted custom aliases have
+fingerprints and do not establish byte equivalence to public weights. Null denotes an
+unrecorded field or an adjacent omission marker. A new public-runtime comparison must
+pin image, checkpoint, effective arguments, trace, concurrency, output lengths, and cache
+state, and measure natural acceptance separately from simulations.
+
+<Accordion title="Configuration, runtime, workload, and source identities">
+
+```json Evidence catalog
+{
+  "sources": {
+    "s025": {"sha256":"5c4dd046e3c576928dd713767ed7c868d145b8bbbf7cea0076454d4146dc945d"},
+    "s026": {"sha256":"e3edc9cec7eb49e4793e7c59c939974521e2c26cc9d901005093bf493a9efbd6"},
+    "s027": {"sha256":"84abae946d45c2f1e727b221bfb86a0d7ceeba94a323229299a2c8fd54060dfc"},
+    "s028": {"sha256":"8413b75b2963e2987b8c9451c9918716edcd96aa688d1d73cd66bc9609c0912d"},
+    "s029": {"sha256":"ae3f19cab305d6c9a64ac3b207c64e889fe671d8354ccc564d517b2b1678bbb1"},
+    "s030": {"sha256":"d1c7e86f2a1a29a75c887f76eed6487f05a5431df4dbefa511cf68cd326dd736"},
+    "s031": {"sha256":"bc1484eb882d5fcc2c77e633f94436dfe2c9413bf8746a72ddbb590e29d0a591"},
+    "s032": {"sha256":"ab98f8273754eb89397f1d4e20b36ab06a58f77ff2ef558515f00269076fa73e"},
+    "s033": {"sha256":"d41771a71c8b837737b429325386cb8e75207178cae9205f0e5cb7e1b86f26b8"},
+    "s034": {"sha256":"274897af452496d1738c1890d52be8de6b567826c4672e3510f61e4c474878f3"},
+    "s038": {"sha256":"2f115a12848b23284bb6cd7e96664e54a6615e2b5f7f10786aeb6e6126e46bd3"},
+    "s039": {"sha256":"80e94848ec24f096d2387dcf6069d57ad9364c37d95f576df3f6286397df0035"},
+    "s040": {"sha256":"b77b73469dfbf0a00fd2801575892629b2189956c8793b571d37c888dbe73e84"},
+    "s041": {"sha256":"1f655d763b94fc69f455f0f126b27b7eafc428cccedca737366cd36e703abef2"},
+    "s042": {"sha256":"6e0d76b810d4e53b73cab75e3278a901afd4249f84121824a40b07473424c481"}
+  },
+  "runtimes": {
+    "r018": {"checkpoint":"nvidia/DeepSeek-V4-Flash-0731-NVFP4","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":null,"image_digest":"sha256:9f61bcca2adf4b3d380ccda1da19334952619830ad8af374b681b84bf356321c","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":"f1caa71142bd0be02f728c79f75042ac1e461579","upstream_source_revision":null},
+    "r019": {"checkpoint":"nvidia/DeepSeek-V4-Flash-0731-NVFP4","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":"docker.io/lmsysorg/sglang:v0.5.20-cu130-runtime@sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","image_digest":"sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":"f1caa71142bd0be02f728c79f75042ac1e461579","upstream_source_revision":null},
+    "r020": {"checkpoint":"deepseek-ai/DeepSeek-V4-Flash-0731","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":null,"image_digest":"sha256:9f61bcca2adf4b3d380ccda1da19334952619830ad8af374b681b84bf356321c","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":"7872f01b1d1fe23eabc4c98b48bffcef5a386062","upstream_source_revision":null},
+    "r021": {"checkpoint":"deepseek-ai/DeepSeek-V4-Flash-0731","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":"docker.io/lmsysorg/sglang:v0.5.20-cu130-runtime@sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","image_digest":"sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":"7872f01b1d1fe23eabc4c98b48bffcef5a386062","upstream_source_revision":null},
+    "r022": {"checkpoint":"nvidia/DeepSeek-V4-Pro-0813-NVFP4","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":null,"image_digest":"sha256:9f61bcca2adf4b3d380ccda1da19334952619830ad8af374b681b84bf356321c","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":"949138637e8e8fe190335be2396af62187dc8a83","upstream_source_revision":null},
+    "r023": {"checkpoint":"nvidia/DeepSeek-V4-Pro-0813-NVFP4","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":"docker.io/lmsysorg/sglang:v0.5.20-cu130-runtime@sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","image_digest":"sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":"949138637e8e8fe190335be2396af62187dc8a83","upstream_source_revision":null},
+    "r024": {"checkpoint":"deepseek-ai/DeepSeek-V4-Pro-0813","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":null,"image_digest":"sha256:9f61bcca2adf4b3d380ccda1da19334952619830ad8af374b681b84bf356321c","kind":"custom-runtime","measurement_scope":"custom_runtime","recorded_model_revision":"72e1d3230f6c080a530b0a1d46f8eb4602340597","upstream_source_revision":null},
+    "r025": {"checkpoint":"deepseek-ai/DeepSeek-V4-Pro-0813","client_image_digest":null,"client_image_public":null,"client_tag":"0.13.0rc5","engine_version":"0.5.20","image":"docker.io/lmsysorg/sglang:v0.5.20-cu130-runtime@sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","image_digest":"sha256:00b02004501e402332827ffd5343a225a8960d99adc990b37d6f31085b8f6800","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":"72e1d3230f6c080a530b0a1d46f8eb4602340597","upstream_source_revision":null},
+    "r028": {"client_image_digest":null,"client_image_tag":"0.13.0rc5","client_version":"0.13.0","engine_version":"0.5.21","image":null,"image_digest":"sha256:b93fe5d3f76b92c2a6ed3fa2e44189724b9aa460d74d342bd3ddda8a02992c0a","kind":"custom-runtime","measurement_scope":"custom_runtime","public_revision_equivalence":"HF revision recorded","recorded_model_revision":"f1caa71142bd0be02f728c79f75042ac1e461579","recorded_revision_field_sha256":"b5c5e2fa7de68cb98dd03892d95c05356e89c10e46278314159ee656020b0fa2","revision_address_omitted":false,"served_model_name":"nvidia/DeepSeek-V4-Flash-0731-NVFP4"},
+    "r029": {"client_image_digest":null,"client_image_tag":"0.13.0rc5","client_version":"0.13.0","engine_version":"0.5.21","image":null,"image_digest":"sha256:e9b70144ede5acaa5e3a45a037142c5211c38ed242dafa5cd7b52bd174da451c","kind":"custom-runtime","measurement_scope":"custom_runtime","public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established","recorded_model_revision":null,"recorded_revision_field_sha256":"52b38cf41089a88e29fb27d6dd2055c54457b91812652af004542fcfcbc9ecc2","revision_address_omitted":true,"served_model_name":"deepseek-ai/DeepSeek-V4-Flash-0731","recorded_revision_alias_sha256":"8058a3574c7747018f20547685a2e0ec703efd1544d78d93999c6cfddfc64269","revision_alias_omitted":true},
+    "r030": {"client_image_digest":null,"client_image_tag":"0.13.0rc5","client_version":"0.13.0","engine_version":"0.5.21","image":null,"image_digest":"sha256:f5e5d0c6cdac39c71753f07fc520a4fa00d0d490694efabfaa3d1f0e4149ae29","kind":"custom-runtime","measurement_scope":"custom_runtime","public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established","recorded_model_revision":null,"recorded_revision_field_sha256":"bc7a33145d620329907e7cb0f085bf9af9d5aa3eb9c63118d190ee25e3cb5245","revision_address_omitted":false,"served_model_name":"deepseek-ai/DeepSeek-V4-Pro-0813","recorded_revision_alias_sha256":"bc7a33145d620329907e7cb0f085bf9af9d5aa3eb9c63118d190ee25e3cb5245","revision_alias_omitted":true},
+    "r031": {"client_image_digest":null,"client_image_tag":"0.13.0rc5","client_version":"0.13.0","engine_version":"0.5.21","image":null,"image_digest":"sha256:f5e5d0c6cdac39c71753f07fc520a4fa00d0d490694efabfaa3d1f0e4149ae29","kind":"custom-runtime","measurement_scope":"custom_runtime","public_revision_equivalence":"Custom checkpoint alias omitted; public HF byte equivalence not established","recorded_model_revision":null,"recorded_revision_field_sha256":"15bc0fd593b7b16efd758153c5859b5f8d7566121ccbd8b3fa61a1b2135059dd","revision_address_omitted":false,"served_model_name":"deepseek-ai/DeepSeek-V4-Pro-0813","recorded_revision_alias_sha256":"15bc0fd593b7b16efd758153c5859b5f8d7566121ccbd8b3fa61a1b2135059dd","revision_alias_omitted":true}
+  },
+  "configs": {
+    "c027": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"context_length":262144,"cuda_graph_backend_prefill":"breakable","cuda_graph_max_bs_prefill":512,"disable_flashinfer_autotune":true,"max_running_requests":64,"mem_fraction_static":0.88,"moe_runner_backend":"flashinfer_trtllm_routed","pipeline_parallel_size":1,"prefill_decode_interval":16,"reasoning_parser":"deepseek-v4","speculative_algorithm":"DSPARK","speculative_dspark_block_size":5,"swa_full_tokens_ratio":0.1,"tensor_parallel_size":4,"tool_call_parser":"deepseekv4"},"public_command":null},
+    "c028": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":262144,"revision":"f1caa71142bd0be02f728c79f75042ac1e461579","tensor_parallel_size":4},"public_command":null},
+    "c029": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"context_length":262144,"max_running_requests":64,"mem_fraction_static":0.88,"moe_runner_backend":"flashinfer_mxfp4","pipeline_parallel_size":1,"reasoning_parser":"deepseek-v4","schedule_policy":"lof","speculative_algorithm":"DSPARK","speculative_dspark_block_size":5,"tensor_parallel_size":4,"tool_call_parser":"deepseekv4"},"public_command":null},
+    "c030": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":262144,"revision":"7872f01b1d1fe23eabc4c98b48bffcef5a386062","tensor_parallel_size":4},"public_command":null},
+    "c031": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"measured_arguments":{"chunked_prefill_size":8192,"context_length":262144,"max_running_requests":64,"mem_fraction_static":0.85,"moe_runner_backend":"flashinfer_trtllm_routed","pipeline_parallel_size":1,"reasoning_parser":"deepseek-v4","speculative_algorithm":"DSPARK","speculative_dspark_block_size":5,"swa_full_tokens_ratio":0.1,"tensor_parallel_size":8,"tool_call_parser":"deepseekv4"},"public_command":null},
+    "c032": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":262144,"revision":"949138637e8e8fe190335be2396af62187dc8a83","tensor_parallel_size":8},"public_command":null},
+    "c033": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{"NCCL_NET_GDR_LEVEL":"LOC","PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"},"measured_arguments":{"context_length":262144,"dsv4_prefill_backend":"flashmla_sparse_q8","enable_hierarchical_cache":true,"hicache_io_backend":"kernel","hicache_ratio":2,"hicache_write_policy":"write_through","max_running_requests":64,"mem_fraction_static":0.88,"moe_runner_backend":"marlin","pipeline_parallel_size":1,"reasoning_parser":"deepseek-v4","speculative_algorithm":"DSPARK","speculative_dspark_block_size":3,"tensor_parallel_size":8,"tool_call_parser":"deepseekv4"},"public_command":null},
+    "c034": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{"context_length":262144,"revision":"72e1d3230f6c080a530b0a1d46f8eb4602340597","tensor_parallel_size":8},"public_command":null},
+    "c037": {"acceptance_mode":"synthetic acceptance override","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"extra_arguments":[],"measured_arguments":{"context_length":1048576,"cuda_graph_backend_prefill":"breakable","cuda_graph_max_bs_prefill":512,"disable_flashinfer_autotune":true,"enable_metrics":true,"log_level":"info","log_level_http":"info","max_running_requests":64,"mem_fraction_static":0.88,"moe_runner_backend":"flashinfer_trtllm_routed","pp_size":1,"prefill_decode_interval":8,"reasoning_parser":"deepseek-v4","speculative_algorithm":"DSPARK","speculative_dspark_block_size":5,"swa_full_tokens_ratio":0.1,"tool_call_parser":"deepseekv4","tp_size":4},"synthetic_acceptance_length":3.3},
+    "c038": {"acceptance_mode":"synthetic acceptance override","environment":{"NCCL_NET_GDR_LEVEL":"LOC"},"extra_arguments":[],"measured_arguments":{"chunked_prefill_size":16384,"context_length":1048576,"enable_metrics":true,"flashinfer_mxfp4_moe_precision":"fp8","log_level":"info","log_level_http":"info","max_running_requests":64,"mem_fraction_static":0.88,"moe_runner_backend":"flashinfer_mxfp4","pp_size":1,"prefill_decode_interval":8,"reasoning_parser":"deepseek-v4","schedule_policy":"lof","speculative_algorithm":"DSPARK","speculative_dspark_block_size":5,"tool_call_parser":"deepseekv4","tp_size":4},"synthetic_acceptance_length":4.5},
+    "c039": {"acceptance_mode":"synthetic acceptance override","environment":{"NCCL_NET_GDR_LEVEL":"LOC","PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"},"extra_arguments":[],"measured_arguments":{"chunked_prefill_size":8192,"context_length":1048576,"enable_metrics":true,"log_level":"info","log_level_http":"info","max_running_requests":64,"mem_fraction_static":0.85,"moe_runner_backend":"flashinfer_trtllm_routed","pp_size":1,"reasoning_parser":"deepseek-v4","speculative_algorithm":"DSPARK","speculative_dspark_block_size":5,"swa_full_tokens_ratio":0.1,"tool_call_parser":"deepseekv4","tp_size":8},"synthetic_acceptance_length":4.79},
+    "c040": {"acceptance_mode":"synthetic acceptance override","environment":{"NCCL_NET_GDR_LEVEL":"LOC","PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"},"extra_arguments":[],"measured_arguments":{"context_length":1048576,"dsv4_prefill_backend":"flashmla_sparse_q8","enable_hierarchical_cache":true,"enable_metrics":true,"hicache_io_backend":"kernel","hicache_ratio":2,"hicache_write_policy":"write_through","log_level":"info","log_level_http":"info","max_running_requests":64,"mem_fraction_static":0.88,"moe_runner_backend":"marlin","pp_size":1,"reasoning_parser":"deepseek-v4","speculative_algorithm":"DSPARK","speculative_dspark_block_size":3,"tool_call_parser":"deepseekv4","tp_size":8},"synthetic_acceptance_length":2.3}
+  },
+  "protocols": {
+    "p008": {"aiperf_version":"0.13.0","cache_isolation":null,"client_options":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--per-chunk-usage":true,"--random-seed":42,"--server-metrics-formats":["json","csv"]},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":true,"random_seed":42,"raw_trace_record_count":942,"replay_record_count":912,"request_count":912,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":3600,"sequential_replay":true,"sha256":"6a805b015155a1da8c521473367ebb38923837c79a0e7ee2bafb0ee676965aa3","skip_auto_warmup":true,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":null,"workers":null},
+    "p010": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"88fccd812665e7dddf37ee0eb103e4633db2e7453e4503e970e56c79958cc413","warmup_command_present":false},"client_options":{"aiperf_args":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"nvidia/DeepSeek-V4-Flash-0731-NVFP4","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--random-seed":42,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","skip_auto_warmup":true,"tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"not_located_in_checked_in_tree","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv_structured_4perc","num_requests":942,"parameters":{"context_length":1048576,"osl_cap":12000,"request_timeout_seconds":3600,"subset_percent":1.0},"source_sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176"}},
+    "p011": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"88fccd812665e7dddf37ee0eb103e4633db2e7453e4503e970e56c79958cc413","warmup_command_present":false},"client_options":{"aiperf_args":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Flash-0731","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--random-seed":42,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","skip_auto_warmup":true,"tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv_structured_4perc","num_requests":942,"parameters":{"context_length":1048576,"request_timeout_seconds":3600},"source_sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176"}},
+    "p012": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"88fccd812665e7dddf37ee0eb103e4633db2e7453e4503e970e56c79958cc413","warmup_command_present":false},"client_options":{"aiperf_args":{"--dataset-sampling-strategy":"sequential","--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Flash-0731","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--random-seed":42,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","skip_auto_warmup":true,"tool":"aiperf"},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":null,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv_structured_4perc","num_requests":942,"parameters":{"context_length":1048576,"request_timeout_seconds":3600},"source_sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176"}},
+    "p013": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"97df5799b50981884f2e0118e3a7bbf3c92e4c880e6c17eff4cf632ac3a9d945","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p014": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"aa811e199012c395d428cf74a46d471748ad899701b4796d59023cc34039c398","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p015": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"184c6e1677f5ee15a000e948a265570aa780ca16c47c519de9416b5fede0cadb","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p016": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"ffaae00b8c6c67e48ed02cda007201f1ffe160c008fc2d8e8e8f8f515458d408","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p017": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"5ca2feaf3cd38a442dcfcf0e6a286393bac4c2649b5569c599201172d38ace77","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p018": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"0075a77174d15c13a9f140a6f95dee45dc297e13b38744535f7a7144896c4891","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p019": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"88fccd812665e7dddf37ee0eb103e4633db2e7453e4503e970e56c79958cc413","warmup_command_present":false},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p020": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"e0ec178702137d92253dec8df42e4d4be5d69588e1890742d248a99e60d65f19","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p021": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"781681bb229d698ecf63d62c068224a83ee28e4831fe50c30f5ccd42d7872f80","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p022": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"99600954acf0132cf7c61849b07a77930d3456827b46bafa30613b8267baca59","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p023": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"46cd0c4c0d7c9873d946e777485fa957861605d51d89f9b58aee06a230303e0b","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p024": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"38c9d135ad00231e1866653cd690d1a4f28b9a7bc345986821e0fa5f273fd657","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}},
+    "p025": {"adaptations":{"contains_aiperf_offline_tokenizer_workaround":true,"pre_command_present":true,"pre_command_sha256":"263980167e380b747303a30d16508a50293d0a67074811ac5b4589b08a5f990e","warmup_command_present":true},"client_options":{"aiperf_args":{"--extra-inputs":["skip_special_tokens:false","ignore_eos:true"],"--model":"deepseek-ai/DeepSeek-V4-Pro-0813","--no-gpu-telemetry":true,"--no-server-metrics":false,"--per-chunk-usage":true,"--request-timeout-seconds":3600,"--server-metrics-formats":["json","csv"],"--synthesis-max-isl":1048576,"--synthesis-max-osl":12000},"endpoint":"chat","input":"file","intent":"performance","tokenizer_trust_remote_code":true,"tool":"aiperf","use_server_token_count":true},"request_receipt_check":"sha256_matches","workload":{"fixed_schedule":false,"format":"mooncake_trace","name":"trace_agentic_64k_400_90kv","num_requests":3541,"parameters":{"context_length":1048576,"request_timeout_seconds":3600,"subset_percent":0.15},"source_sha256":"aa0a64efcad575a01949e46e28dded094f20733db8708e0bc91b88ce9981fed6"}}
+  },
+  "groups": {
+    "g027": {"concurrency":64,"label":"Tuned DSpark recipe","model":"deepseek-v4-flash-0731","n":3,"records":["e064","e065","e066"],"sku":"B200","tp":4,"sglang_version":"0.5.20"},
+    "g028": {"concurrency":64,"label":"Upstream stock SGLang","model":"deepseek-v4-flash-0731","n":1,"records":["e067"],"sku":"B200","tp":4,"sglang_version":"0.5.20"},
+    "g029": {"concurrency":16,"label":"Tuned DSpark recipe","model":"deepseek-v4-flash-0731","n":1,"records":["e068"],"sku":"H200","tp":4,"sglang_version":"0.5.20"},
+    "g030": {"concurrency":16,"label":"Upstream stock SGLang","model":"deepseek-v4-flash-0731","n":3,"records":["e069","e070","e071"],"sku":"H200","tp":4,"sglang_version":"0.5.20"},
+    "g031": {"concurrency":16,"label":"Tuned DSpark recipe","model":"deepseek-v4-pro-0813","n":3,"records":["e072","e073","e074"],"sku":"B200","tp":8,"sglang_version":"0.5.20"},
+    "g032": {"concurrency":16,"label":"Upstream stock SGLang","model":"deepseek-v4-pro-0813","n":3,"records":["e075","e076","e077"],"sku":"B200","tp":8,"sglang_version":"0.5.20"},
+    "g033": {"concurrency":8,"label":"Tuned DSpark recipe","model":"deepseek-v4-pro-0813","n":3,"records":["e078","e079","e080"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g034": {"concurrency":8,"label":"Upstream stock SGLang","model":"deepseek-v4-pro-0813","n":1,"records":["e081"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g035": {"concurrency":20,"label":"Tuned DSpark recipe, off-grid c20","model":"deepseek-v4-flash-0731","n":3,"records":["e082","e083","e084"],"sku":"H200","tp":4,"sglang_version":"0.5.20"}
+  },
+  "accuracy": {
+    "a1": {"dataset":"GPQA-Diamond","decision_receipt_sha256":["e9cc3ca9dd63f3d140f8eedb7fcd995951525ed0961b92882908e30b7a1b606d"],"evidence_type":"Recorded campaign summary and referenced decision checksum; raw item-level scores not included","items_per_replicate":198,"model":"DeepSeek-V4-Flash-0731","replicates":5,"sku":"B200","spec_off":0.757,"spec_on":0.738,"summary_line":30,"summary_source":{"sha256":"4dfc5647d63613d9225677dcaf72d34a9ad9b59b73bf823deef9209b8a7bc7a0"},"tp":4},
+    "a2": {"dataset":"GPQA-Diamond","decision_receipt_sha256":["ba4a106821d387a564c4752c4fdbaea212e50afc15e9e369801c1700ad80d8db"],"evidence_type":"Recorded campaign summary and referenced decision checksum; raw item-level scores not included","items_per_replicate":198,"model":"DeepSeek-V4-Flash-0731","replicates":5,"sku":"H200","spec_off":0.76,"spec_on":0.741,"summary_line":73,"summary_source":{"sha256":"4dfc5647d63613d9225677dcaf72d34a9ad9b59b73bf823deef9209b8a7bc7a0"},"tp":4},
+    "a3": {"dataset":"GPQA-Diamond","decision_receipt_sha256":["95d414acea07cbe55c33ba4e001f213357db962cdd8e9428ca457ae60d250676"],"evidence_type":"Recorded campaign summary and referenced decision checksum; raw item-level scores not included","items_per_replicate":198,"model":"DeepSeek-V4-Pro-0813","replicates":5,"sku":"B200","spec_off":0.7202,"spec_off_spread":0.0146,"spec_on":0.7434,"spec_on_spread":0.0131,"summary_line":10,"summary_source":{"sha256":"92ec2e0f5c6c1850da4fb9342688b807463a6fcb9cb6f1a3560c6cb996ce8769"},"tp":8},
+    "a4": {"dataset":"GPQA-Diamond","decision_receipt_sha256":["2856a48b277f65df16c121cc9837fdff7bd1742d248d366b7657e09666676c53"],"evidence_type":"Recorded campaign summary and referenced decision checksum; raw item-level scores not included","items_per_replicate":198,"model":"DeepSeek-V4-Pro-0813","replicates":5,"sku":"H200","spec_off":0.7384,"spec_off_spread":0.0137,"spec_on":0.7495,"spec_on_spread":0.0133,"summary_line":10,"summary_source":{"sha256":"92ec2e0f5c6c1850da4fb9342688b807463a6fcb9cb6f1a3560c6cb996ce8769"},"tp":8}
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Full-precision measurement records">
+
+```csv Measurement records
+id,group,sglang_version,cell,arm,c,replicate,output_tok_s_per_gpu,output_tok_s,mean_itl_ms,mean_ttft_ms,duration_s,csv_request_count,attempted_requests,failed_requests,accepted_failures,output_token_count,synthetic_acceptance_length,csv_status,runtime_status,request_qualification,source,source_row,config,runtime,protocol,server_config_sha256,benchmark_config_sha256,metric_export_sha256
+e064,g027,0.5.20,nvidia/DeepSeek-V4-Flash-0731-NVFP4 B200 TP4,optimized,64,1,1106.9077395273107,4427.630958109243,13.54214746081527,6216.200865429824,475.68556672000005,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s025,7,c027,r018,p008,2d91f6ee5f44ce5ac692df1b490fe81679c59bbbd8d68ee2c462bbdb7d526428,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,d5e58188a8bd5ed71aa3cb4508b6e3735685d16c1011d2c8f20854cd3d7a0db1
+e065,g027,0.5.20,nvidia/DeepSeek-V4-Flash-0731-NVFP4 B200 TP4,optimized,64,2,1106.1645864986447,4424.658345994579,13.70917845753906,6456.806813185306,476.00535014400003,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s025,8,c027,r018,p008,2d91f6ee5f44ce5ac692df1b490fe81679c59bbbd8d68ee2c462bbdb7d526428,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,1966fe0ac87657cdf948a29077cdcbc1102f4f45a1c32007c43bbb6d2a71de80
+e066,g027,0.5.20,nvidia/DeepSeek-V4-Flash-0731-NVFP4 B200 TP4,optimized,64,3,1097.4903118826762,4389.961247530705,13.288865299340173,6599.478655229167,479.76231372800004,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s025,9,c027,r018,p008,2d91f6ee5f44ce5ac692df1b490fe81679c59bbbd8d68ee2c462bbdb7d526428,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,c1c1650a72eafeb95f8a8b6f151452341528cfeef5ad541d5c1e7b6124405cea
+e067,g028,0.5.20,nvidia/DeepSeek-V4-Flash-0731-NVFP4 B200 TP4,baseline,64,1,769.5941900112215,3078.376760044886,31.78090159219495,1578.1229244188596,684.141984256,912.0,912,0.0,0.0,,,completed,recorded upstream,passed,s026,6,c028,r019,p008,099bf9cb7d3dd11bbc7f5ce16ec5ecf4f5a3890f8283fad6786b65bbbbb7ee52,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,a95ec486a2f9c36047cb1aa492dabd68cac9ddd53e3f8cdd3a6eaae86508e1a1
+e068,g029,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,optimized,16,1,342.0125989512444,1368.0503958049776,17.027057164578483,1257.0323182039472,1539.5731878400002,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s027,6,c029,r020,p008,b9fe55bd79dd97d032bae49f76c7cdb25a2850ec982af098b712867b0d3b423d,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,2c0a7c436de3627330ebfa1b2eb8bf9edb69eb06d9f066f4bf7ead41117f4073
+e069,g030,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,baseline,16,2,229.62797160979468,918.5118864391787,18.555505151844454,1009.3824024133771,2293.070959104,912.0,912,0.0,,2106250.0,,completed,recorded upstream,,s028,2,c030,r021,p008,66ec68565ce2df49218b2b9661b9eb69fbac54dfdb97caeb81504f370938f623,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,6890c95eb1eee29fface3cfaccb089f3a8396d317f9ff64d75d459ff6106f0f6
+e070,g030,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,baseline,16,3,230.19895498032292,920.7958199212917,19.182392563663004,994.1906740866228,2287.3820971520004,912.0,912,0.0,,2106250.0,,completed,recorded upstream,,s028,3,c030,r021,p008,66ec68565ce2df49218b2b9661b9eb69fbac54dfdb97caeb81504f370938f623,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,1557e64fe9e59e05051ccb9751a8d1d0805315483cb77893aa8fa813861819ac
+e071,g030,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,baseline,16,1,230.05980809772083,920.2392323908833,18.493191551456807,1024.3484659385965,2288.766622208,912.0,912,0.0,0.0,,,completed,recorded upstream,passed,s029,4,c030,r021,p008,66ec68565ce2df49218b2b9661b9eb69fbac54dfdb97caeb81504f370938f623,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,4dc39fbe19a6d302d056017175a08bb3a1a7350db623bd9bdb8800975ff725f3
+e072,g031,0.5.20,nvidia/DeepSeek-V4-Pro-0813-NVFP4 B200 TP8,optimized,16,1,152.12934355322585,1217.0347484258068,18.55113131192289,1132.6804065964914,1730.62378112,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s030,12,c031,r022,p008,afe15a29ec6d4a0ca63f878f9458dbfefd1f7132431a8cd0159f43be61d020f1,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,d50d9074d0752759c40235ce1985dc8a2c15009f4393b5b478c86e40650bfeda
+e073,g031,0.5.20,nvidia/DeepSeek-V4-Pro-0813-NVFP4 B200 TP8,optimized,16,2,154.3130835254674,1234.5046682037391,17.512995307141004,1101.940952234649,1706.1318228480002,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s030,13,c031,r022,p008,afe15a29ec6d4a0ca63f878f9458dbfefd1f7132431a8cd0159f43be61d020f1,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,efd4a82a57d76e7067053dcb16e30d5eab749018f4c2925aa68184e8ac685c3a
+e074,g031,0.5.20,nvidia/DeepSeek-V4-Pro-0813-NVFP4 B200 TP8,optimized,16,3,152.40505036124893,1219.2404028899914,16.792463449716248,1188.733043622807,1727.493864448,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s030,14,c031,r022,p008,afe15a29ec6d4a0ca63f878f9458dbfefd1f7132431a8cd0159f43be61d020f1,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,a59fda827a795cd4954b93717a66c5fe71faaa2fa3011bc02186dfbafe8c0dc9
+e075,g032,0.5.20,nvidia/DeepSeek-V4-Pro-0813-NVFP4 B200 TP8,baseline,16,2,116.7631418277191,934.1051346217528,18.23445650478257,885.3511803519737,2254.79433856,912.0,912,0.0,,2106250.0,,completed,recorded upstream,,s031,2,c032,r023,p008,f83cfe5acb7a6f229d85fb8d499043d9e5a60d97f66fca46dee747c7b0c2687e,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,50bb6b899ee85c717728777135ee29b11be7309057da0994b2200dcb16db424a
+e076,g032,0.5.20,nvidia/DeepSeek-V4-Pro-0813-NVFP4 B200 TP8,baseline,16,3,116.86183422744486,934.8946738195589,18.004706337592495,905.7437269945175,2252.888544768,912.0,912,0.0,,2106250.0,,completed,recorded upstream,,s031,3,c032,r023,p008,f83cfe5acb7a6f229d85fb8d499043d9e5a60d97f66fca46dee747c7b0c2687e,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,b88b70eb4d67767fb68f425a4cf0e3a8ea7f5473677e80c46198fc5df4a12eaf
+e077,g032,0.5.20,nvidia/DeepSeek-V4-Pro-0813-NVFP4 B200 TP8,baseline,16,1,117.03293095834017,936.2634476667214,17.540994511835642,909.1735656480263,2249.595501056,912.0,912,0.0,0.0,,,completed,recorded upstream,passed,s032,3,c032,r023,p008,f83cfe5acb7a6f229d85fb8d499043d9e5a60d97f66fca46dee747c7b0c2687e,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,5174e9069aa618b004c7fe38d8f12461e48900e6e256a6fcbe33c2104a972fc4
+e078,g033,0.5.20,deepseek-ai/DeepSeek-V4-Pro-0813 H200 TP8,optimized,8,1,61.68875533865498,493.5100427092398,18.925020443579594,2142.200513286184,4267.87654656,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s033,14,c033,r024,p008,e69bdae3ec5d7a8c469adf69cf63199860f7fae6ba6de6e21c1a19b88bdc0083,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,2d93505e3a44c40064bfff915f483b4b8e948cd427f15f71bcc12aff4d35d853
+e079,g033,0.5.20,deepseek-ai/DeepSeek-V4-Pro-0813 H200 TP8,optimized,8,2,61.45789770611013,491.66318164888105,18.40067743847676,2205.801469775219,4283.9109478400005,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s033,15,c033,r024,p008,e69bdae3ec5d7a8c469adf69cf63199860f7fae6ba6de6e21c1a19b88bdc0083,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,f3430a9fa0eea311b775466e8267342d524087ac1c875451cd1118d390f18c15
+e080,g033,0.5.20,deepseek-ai/DeepSeek-V4-Pro-0813 H200 TP8,optimized,8,3,61.5758734596111,492.6069876768888,18.648247523227283,2164.2735180866225,4275.700785152,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s033,16,c033,r024,p008,e69bdae3ec5d7a8c469adf69cf63199860f7fae6ba6de6e21c1a19b88bdc0083,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,e9361835b6368aba8dea1e46d2f589a4810e6118d65afeb1119d1c04d8f85ad8
+e081,g034,0.5.20,deepseek-ai/DeepSeek-V4-Pro-0813 H200 TP8,baseline,8,1,39.35319268733833,314.8255414987066,23.775778431025497,2401.2576668870615,6690.171477504,912.0,912,0.0,0.0,,,completed,recorded upstream,passed,s034,4,c034,r025,p008,aa1ffe991f74547b2770733313cb9e441e1976831ecd782aa032faf69c38c296,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,9ff75e8359e552ce6647f48fc2c52b8ae635919c397368195f27f33dd30f4ca5
+e082,g035,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,optimized,20,1,365.1379376180766,1460.5517504723064,17.628935486309977,1499.82846635307,1442.076019456,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s027,3,c029,r020,p008,b9fe55bd79dd97d032bae49f76c7cdb25a2850ec982af098b712867b0d3b423d,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,e21ac97fb9d82a30c746ea07b500460ab9ac0854fec8df06c9d33eb5119300a3
+e083,g035,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,optimized,20,2,366.9889642689324,1467.9558570757297,17.098424257981964,1526.781749493421,1434.802128384,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s027,4,c029,r020,p008,b9fe55bd79dd97d032bae49f76c7cdb25a2850ec982af098b712867b0d3b423d,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,66879ff1012faf212a800fa292e743bf4ed6f0e77a2fcd175785ae3c86aaeb2b
+e084,g035,0.5.20,deepseek-ai/DeepSeek-V4-Flash-0731 H200 TP4,optimized,20,3,368.03926223731105,1472.1570489492442,16.608083583928565,1521.3095391173244,1430.7019993600002,912.0,912,0.0,,,,completed,recorded custom runtime,not_verified,s027,5,c029,r020,p008,b9fe55bd79dd97d032bae49f76c7cdb25a2850ec982af098b712867b0d3b423d,53c8c87c6d636675fb207431db656cc9a625aeab3a51ae8c34ce3d82c63a1800,4da385d6eb6270f6fca10016f79e239bb33d7c6fe186b7e5b57149b2e608e2c0
+e101,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,4,1,303.9427546880463,1215.7710187521852,2.874635807482555,625.0534158927812,1819.711849984,942,942,0,0,,3.3,completed,not_verified,passed,s038,9,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,edd96aedb3c1dc714d98a14c4e0c58dabbb59564abff79e3021a339be4766ea2
+e102,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,8,1,450.4322890835778,1801.7291563343113,3.8059262184944664,920.0574846995754,1227.898548992,942,942,0,0,,3.3,completed,not_verified,passed,s038,10,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,1493a910c02467cdf00ad51477ef5c640ca4534949c14d3298f2dc716c28d090
+e103,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,16,1,95.22800599943422,380.91202399773687,33.13077123173635,8566.934268161358,5808.080584448,942,942,0,0,,3.3,completed,not_verified,passed,s038,11,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,2692850960be45a71f529cbdadc095fbda6cb97054ed4c7c6878beaff726414d
+e104,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,32,1,776.9537947469782,3107.815178987913,8.081155738213615,2494.2898337760084,711.855907072,942,942,0,0,,3.3,completed,not_verified,passed,s038,12,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,4706af9c954e13c7fdb2535ec5c4a542eb792b6606a4266acdbdfbf71bf43340
+e105,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,64,1,919.1594387105634,3676.637754842254,12.64755984007565,6462.264013478768,601.71718016,942,942,0,0,,3.3,completed,not_verified,passed,s038,13,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,0f0ae509e9bf5a3e8738ea992bc77956c359a7e29a2fa8dcf09e9ab94cb8c054
+e106,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,128,1,920.2312960325179,3680.9251841300716,12.663129815171352,42796.88613005414,601.016003072,942,942,0,0,,3.3,completed,not_verified,passed,s038,14,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,09594c01e12cc676ce82617c8efb2111e91f7440049dddd68e3b4dfc808112cb
+e107,,0.5.21,deepseek-v4-flash-0731-b200-tp4,optimized,256,1,922.6035437449132,3690.4141749796527,12.213527186294696,111108.43906502653,599.458850816,942,942,0,0,,3.3,completed,not_verified,passed,s038,15,c037,r028,p010,389332bdc9928cec6d8dbb1268333299560a21f944655abf81b7065039a23f0e,e79b3038f734182b99c48cbd4e40f4aa7c0fff88fa4bd79f9a9173e928d5e3af,e69e91c99ce1dc9ce9c990e399d241ae49280b1321eaf3ae5af8fdf6f469110b
+e108,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,4,1,224.1582400383373,896.6329601533492,3.533799328791291,1485.8262515403396,2467.409721344,942,942,0,0,,4.5,completed,verified,passed,s039,3,c038,r029,p011,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,e1258050ae43cc31d9bfa2afd0c5d9222ebc1b11a9f480a73833836a02d21a0e,458be9a4ddda3fcbc637227e29914d74d829fa4f179cffb0f2c5e4acba935817
+e109,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,8,1,301.635417566878,1206.541670267512,5.074687492211954,2168.1455962898085,1833.634516736,942,942,0,0,,4.5,completed,verified,passed,s039,7,c038,r029,p011,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,e1258050ae43cc31d9bfa2afd0c5d9222ebc1b11a9f480a73833836a02d21a0e,02e21dc61d6ec1939ae0552437035d55a9f64d681d1df5118a9bee3b48c159d3
+e110,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,16,1,364.2700372920574,1457.0801491682296,8.268607801966178,3583.2469626942675,1518.345778688,942,942,0,0,,4.5,completed,verified,passed,s039,2,c038,r029,p011,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,e1258050ae43cc31d9bfa2afd0c5d9222ebc1b11a9f480a73833836a02d21a0e,0a0adfaf3d70020b5c1a7f7a3b97397e7843b864cae79e48020f8257b3c94e95
+e111,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,32,1,420.61388966778287,1682.4555586711315,13.40592009549823,6956.908048454352,1314.949607424,942,942,0,0,,4.5,completed,verified,passed,s039,5,c038,r029,p011,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,e1258050ae43cc31d9bfa2afd0c5d9222ebc1b11a9f480a73833836a02d21a0e,7bcc4cfd8899f659392d007c471ef6b8c7d098befe49d5ffc1ce5ed63d01e866
+e112,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,64,1,476.48936450538,1905.95745802152,19.660245413386868,20222.43830742675,1160.749472,942,942,0,0,,4.5,completed,verified,passed,s039,4,c038,r029,p011,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,e1258050ae43cc31d9bfa2afd0c5d9222ebc1b11a9f480a73833836a02d21a0e,d1c7f397ad83abdbf1e4a1baf614ac727591332b0ded350a52f99a2489bc7284
+e113,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,128,1,464.249373199773,1856.997492799092,18.536908642847106,99383.80592526644,1191.354948352,942,942,0,0,,4.5,completed,not recorded in CSV,passed,s040,3,c038,r029,p012,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,4a8acaaddcc2e5bdef8725942d9b7f4f249ab92bc372ef8d5ed19f22c079693e,ddb724a7ab1b11d96e898eabac52465a1b73ff2eac2f5a532c618db5d4e17eaf
+e114,,0.5.21,deepseek-v4-flash-0731-h200-tp4,optimized,256,1,478.30880722728597,1913.2352289091439,17.478008380661155,249572.83064575796,1156.3278896640002,942,942,0,0,,4.5,completed,verified,passed,s039,6,c038,r029,p011,23d2a6fbc5018b0357dc8f74054f5eb95fdd3680294df9cafef1473ef1c176f7,e1258050ae43cc31d9bfa2afd0c5d9222ebc1b11a9f480a73833836a02d21a0e,5a2c29f09795822c6047b3c440a514ea0b7b29f529bc22e30fabbf750024f4c6
+e115,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,4,1,85.54484589268905,684.3587671415124,4.460336566988859,2215.382449161062,12340.813366528,3539,3541,2,2,,4.79,completed,verified,passed,s041,2,c039,r030,p013,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,14b9c5cc5afae290bfed1cef71a435e0877081e580b4f558e8463f098922b83b,51f51b3b3ed2b4d2a9354f131b16bcdb672d3f9fb2e17e8a569273117f76b883
+e116,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,8,1,107.01226313616804,856.0981050893444,7.54134736017185,2557.247116729302,9865.159332096,3539,3541,2,2,,4.79,completed,verified,passed,s041,7,c039,r030,p014,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,29b11780c2f4f64bdb7d9b86eff7970ebe9b59377ea2c83d7adf2492a61c73f4,94e530f3a26dcac589b4d1794837b3d1aad8ec92bbd627381e4d1db43f867967
+e117,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,16,1,127.77391956029419,1022.1913564823535,13.139445760244167,2928.277836011585,8262.19256704,3539,3541,2,2,,4.79,completed,verified,passed,s041,3,c039,r030,p015,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,0ed90b61712ba71504ece801d88ed7110dc13ed09fe0a9979e20e6f80e579eb5,c9647a690bf98813598589713cc938634f9cd4c8ae7d5b2e12fe1b07ab2b918a
+e118,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,32,1,139.10829722579481,1112.8663778063585,25.11898218660119,5333.043618778185,7588.998402816001,3539,3541,2,2,,4.79,completed,verified,passed,s041,6,c039,r030,p016,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,3422675469bd94df1130cd1e7a3f7025ccc6768ef39169fe9b2ad4e676dffc0c,b6bedac212b75772d198b6756ef3c86efd0d1c8f6196641c723d4974a11c3254
+e119,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,64,1,145.1207632228545,1160.966105782836,50.59744302560334,48544.027376256,7274.5753576960005,3539,3541,2,2,,4.79,completed,verified,passed,s041,4,c039,r030,p017,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,d675e78fab26fe0536eb4d96fc56980f9de2a339baccd2a56d6eaf35773e4aa1,75ebdf010b519aa5a44a107e8e916093f55ad3cfdcebd5b0978e44d6f05ac827
+e120,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,128,1,143.59046617261194,1148.7237293808955,50.124787069012335,179919.13170171797,7352.1037824000005,3539,3541,2,2,,4.79,completed,verified,passed,s041,5,c039,r030,p018,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,17f29e217b1fc49c58ab710e921c32e19601b90d083ce38f1d47a54db176dbee,d6f76bbb9cbf2869a1b68bcfedc0767a9b21880f4eb614bb6ab13698c89524fb
+e121,,0.5.21,deepseek-v4-pro-0813-b200-tp8,optimized,256,1,144.2626966527203,1154.1015732217625,53.96972568203235,432259.51730673324,7317.8454673920005,3539,3541,2,2,,4.79,completed,verified,passed,s041,8,c039,r030,p019,5acc66b64e9ae2ba3c97586340d6e28f3ae3dcd4c16e1e220bc277be4c67461d,0235c01e8ff94d7877e619c0c0ebff289f7a85b03843f0fd4adc2cf9fb00fa9f,d09c48364b8ae52bd8eb8be3e362279c737bfdc97d2357c26b66826cfbf14fa0
+e122,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,4,1,33.772329812591295,270.17863850073036,11.541207330396352,5634.129762209099,31259.127270656,3539,3541,2,2,,2.3,completed,verified,passed,s042,3,c040,r031,p020,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,067f78c6cd376889518c4a029fec05d316cbfc30ac9731fe6966c2c816c78170,f7c92ccdcc0623f0a4eca4c6cf656ebe40d8d358e0afd6a4cb33dd404ebc1dd8
+e123,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,8,1,41.86237218074254,334.8989774459403,18.70864865029548,11360.657474373835,25218.192645888,3539,3541,2,2,,2.3,completed,verified,passed,s042,8,c040,r031,p021,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,b69d6ebb1cee16d99eacf2b1a3064cf1a67600523ae90bb1d2bf8012f03acdd5,187e3bbdc3ef3cb62ab0fec3fe571c16daa9c8efac9987f412ef6cb42c5d8e87
+e124,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,16,1,46.74591371128976,373.9673096903181,37.90090523632925,38318.7851710794,22583.645796864002,3539,3541,2,2,,2.3,completed,verified,passed,s042,2,c040,r031,p022,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,83b112a78acdfc6b9d829fe599c0a4f6298aed277008401175b7cf9cd4850834,e71f1d40bcb1185a06e4c2d3ef282232fb36dfd0221c2e3f3eeba5c627ab91fe
+e125,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,32,1,47.82996909495119,382.6397527596095,68.3484815969528,124965.38251216529,22071.792365824,3539,3541,2,2,,2.3,completed,verified,passed,s042,5,c040,r031,p023,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,aef942943ddab153b005333390ef823cbb056478539201e4d342c8ea343f6ad8,6190f53df658bdee0724da57b20de2e332ae865020dc37096a03007d20200b3a
+e126,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,64,1,47.336166397243325,378.6893311779466,84.54831100207906,322335.7903295261,22302.04006272,3539,3541,2,2,,2.3,completed,verified,passed,s042,4,c040,r031,p024,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,9e0d75b6f0351273d76072610aac91fe502e00f6b7426c8d71be2c2473ac2972,c5ad29b77bc4042df94ecfbc14cd43760b27360dbe64d88db2c6126cd65e4418
+e127,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,128,1,47.484505324474654,379.87604259579723,84.46838564702112,712490.7301176168,22232.369360896002,3539,3541,2,2,,2.3,completed,verified,passed,s042,7,c040,r031,p025,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,45c34edd788e35f79a6ed41a3bd6663dff69de38170210bf53c0521070f31560,e3cf5a877970e510fac9e0a17da5583e66a03b2ef2dcc8669b87c7ee329f5b47
+e128,,0.5.21,deepseek-v4-pro-0813-h200-tp8,optimized,256,1,47.96573794595343,383.7259035676274,78.7017860222221,1462537.950084071,22009.311727104003,3539,3541,2,2,,2.3,completed,verified,passed,s042,6,c040,r031,p019,e0ac3a96c365cb814e81be5d9020974ba7aaf77129e65b9e0edd01efa8aa16a4,dafa19dcf8e636c2a27368540a653a0873d5bef93622672f2418660523611e17,3edf19443b57b02fc532a77833a84b9377f6743dedb029dd6b0e404142172228
+```
+
+</Accordion>
 
 ## 1. Model Introduction
 

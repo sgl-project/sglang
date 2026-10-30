@@ -4,10 +4,6 @@ description: "Deploy GLM-5.3 with SGLang — Z.ai's DeepSeek-Sparse-Attention (D
 tag: NEW
 ---
 
-For long-context SGLang configurations, see the
-[agentic serving recipes](/cookbook/autoregressive/agentic-serving-configs#glm-5-3) and
-[benchmark evidence](/cookbook/autoregressive/agentic-serving-evidence).
-
 ## Deployment
 
 <a id="install" />
@@ -124,7 +120,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## Agentic Long-Context Deployment
 
-Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. The explorer below gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
 - **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
@@ -197,6 +193,358 @@ python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000
 ```
+
+### Single-node long-context tuning configurations
+
+Use Linux with NVIDIA CUDA on one node with the GPU count shown for each command;
+all recipes use pipeline parallelism 1. Follow [Install SGLang](/docs/get-started/install)
+for the hardware-specific runtime. Argument names were checked against upstream
+[`f3f23d128cd5`](https://github.com/sgl-project/sglang/tree/f3f23d128cd576352492334534be7e20fdd8fab6).
+Download the named checkpoint or replace `--model-path` with its local directory,
+and supply `HF_TOKEN` if access requires it. Pin the checkpoint revision and runtime
+for your own comparisons.
+
+<Note>
+The supporting SGLang 0.5.20 measurements used a public image with the tool parser
+omitted. The commands below include `glm47` and have not been remeasured with that
+parser enabled. Consult the exact image and checkpoint identities in the evidence
+below. These workload-specific recipes do not change the Deploy panel's verification
+status.
+</Note>
+
+These configurations were retained after SGLang 0.5.20 testing. Later H200
+candidate runs had the same short-output qualification problem as GLM-5.2.
+The B200 TP8 search did not produce a qualified replacement; TP4 has no
+separate SGLang 0.5.21 campaign. HiCache candidates from that search are not
+part of these settings.
+
+#### H200 TP8 FP8
+
+Checkpoint: [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3).
+This profile uses three EAGLE steps and six draft tokens, with a 250,000-token
+context cap and no explicit HiCache tier.
+
+<Accordion title="Launch GLM-5.3 on H200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --tp-size 8 \
+  --quantization fp8 \
+  --mem-fraction-static 0.9 \
+  --context-length 250000 \
+  --attention-backend dsa \
+  --cp-strategy interleave \
+  --dsa-prefill-backend flashmla_kv \
+  --enable-prefill-cp \
+  --flashinfer-allreduce-fusion-backend auto \
+  --fp8-gemm-backend flashinfer_deepgemm \
+  --kv-cache-dtype fp8_e4m3 \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":32}' \
+  --moe-a2a-backend none \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 3 \
+  --tool-call-parser glm47 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+
+</Accordion>
+
+#### B200 TP4 NVFP4
+
+Checkpoint: [nvidia/GLM-5.3-NVFP4](https://huggingface.co/nvidia/GLM-5.3-NVFP4).
+
+<Accordion title="Launch GLM-5.3 on B200 TP4">
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/GLM-5.3-NVFP4 \
+  --tp-size 4 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.85 \
+  --context-length 500000 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --flashinfer-allreduce-fusion-backend auto \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-attention-mode decode \
+  --speculative-eagle-topk 1 \
+  --speculative-moe-a2a-backend none \
+  --speculative-moe-runner-backend flashinfer_cutlass \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code
+```
+
+</Accordion>
+
+#### B200 TP8 NVFP4
+
+The separate TP8 profile preserves the same limits and speculative settings.
+It is not a claim of equal throughput or memory behavior between TP4 and TP8.
+
+<Accordion title="Launch GLM-5.3 on B200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/GLM-5.3-NVFP4 \
+  --tp-size 8 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.85 \
+  --context-length 500000 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --flashinfer-allreduce-fusion-backend auto \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-attention-mode decode \
+  --speculative-eagle-topk 1 \
+  --speculative-moe-a2a-backend none \
+  --speculative-moe-runner-backend flashinfer_cutlass \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code
+```
+
+</Accordion>
+
+#### Recorded measurements
+
+These results belong to the recorded configurations, checkpoints, and runtimes.
+They are historical measurements, not new executions of the public launch commands above.
+Throughput is **output tokens/s/GPU**; ITL and TTFT are **means**. These workload-specific
+results do not replace the deployment cards' total-token throughput benchmarks.
+
+The measured GLM-5.3 performance arms use the public image pinned below, but omit
+`--tool-call-parser`; they do not qualify the parser-on recipes. The B200 optimized
+groups include the first confirmation labeled `prior` in the source records.
+The B200 TP8 generic group has only two retained repeats. No qualified optimized
+SGLang 0.5.21 curve was recovered.
+
+<Accordion title="Historical configuration comparisons">
+
+Each row aggregates all retained measurements at one configuration and client concurrency.
+The objective was output throughput under mean ITL ≤ 20 ms. Repeats exceeding that bound
+are retained. `±` is the sample standard deviation of throughput; `n` is the replicate
+count. A single measurement has no estimated standard deviation.
+
+##### Recorded SGLang 0.5.20
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead><tr>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Group</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Model / hardware</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Arm</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>c</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>n</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Output tok/s/GPU</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean ITL ms</th>
+    <th style={{textAlign: "left", padding: "10px 12px"}}>Mean TTFT ms</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g021</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.3 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned, parser off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>63.34 ± 0.25</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.94</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>5908.25</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g022</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.3 / H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Generic, parser off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>42.86 ± 0.09</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>18.52</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>10648.08</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g023</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.3 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned, parser off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>141.08 ± 0.16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>11.99</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>3757.55</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g024</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.3 / B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Generic, parser off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>132.21 ± 0.40</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>13.95</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1945.73</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g025</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.3 / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Tuned, parser off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>118.16 ± 0.92</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>16.25</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1934.21</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>g026</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.3 / B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Generic, parser off</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>16</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>2</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>105.52 ± 0.11</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>19.69</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>1753.81</td>
+    </tr>
+  </tbody>
+</table>
+
+</Accordion>
+
+#### Recorded public-runtime command
+
+This is the measured GLM-5.3 B200 TP4 performance command with its recorded public
+checkpoint revision and image digest. Its tool parser is omitted, and cache-reporting
+and metrics flags are enabled. It therefore differs explicitly from the parser-on
+recipe above. The Docker wrapper below supplies GPU access, shared memory, port
+mapping, and a persistent checkpoint cache; that wrapper is a reproduction adaptation.
+The engine arguments are copied from the measured CSV record. This is historical
+execution evidence, not a fresh run of this Docker wrapper.
+
+<Accordion title="GLM-5.3 B200 TP4: recorded public runtime and parser-off command">
+
+```bash Reproduce the recorded engine configuration
+docker run --rm --gpus all --ipc=host -p 30000:30000 \
+  -e HF_TOKEN -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  docker.io/lmsysorg/sglang@sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f \
+  sglang serve \
+    --model-path nvidia/GLM-5.3-NVFP4 \
+    --revision e3b8f9f2fad29727dfa95e766c5cac18ea1414bf \
+    --served-model-name nvidia/GLM-5.3-NVFP4 \
+    --tp-size 4 \
+    --trust-remote-code \
+    --quantization modelopt_fp4 \
+    --context-length 500000 \
+    --mem-fraction-static 0.85 \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 6 \
+    --speculative-attention-mode decode \
+    --speculative-moe-runner-backend flashinfer_cutlass \
+    --speculative-moe-a2a-backend none \
+    --max-running-requests 128 \
+    --cuda-graph-max-bs-decode 128 \
+    --flashinfer-allreduce-fusion-backend auto \
+    --reasoning-parser glm45 \
+    --enable-cache-report \
+    --enable-metrics \
+    --host 0.0.0.0 \
+    --port 30000
+```
+
+</Accordion>
+
+#### Reproduction records
+
+The historical workload replays 942 Mooncake trace records sequentially, reconstructing
+synthetic text from hashes and lengths with `ignore_eos: true`,
+`skip_special_tokens: false`, and server token accounting.
+
+The 17 full-precision records below join to this model's configuration, runtime, protocol,
+and source catalog. `source_row` counts the CSV header as row 1. Source and metric-export
+checksums identify original artifacts; configuration and benchmark fingerprints hash the
+original JSON field text. Client-adapter fingerprints distinguish recorded adapter metadata.
+`csv_request_count` retains the exporter's value, which sometimes counts successes;
+`attempted_requests` is the replay population.
+
+Recalculate each historical group using arithmetic means of output throughput, ITL, and
+TTFT, and throughput sample standard deviation with denominator `n - 1`. Retain every
+listed repeat, including those above the latency bound.
+
+Image digests and trace hashes identify artifacts without making private assets publicly
+downloadable. Public checkpoint revision SHAs are retained; omitted custom aliases have
+fingerprints and do not establish byte equivalence to public weights. Null denotes an
+unrecorded field or an adjacent omission marker. A new public-runtime comparison must
+pin image, checkpoint, effective arguments, trace, concurrency, output lengths, and cache
+state, and measure natural acceptance separately from simulations.
+
+<Accordion title="Configuration, runtime, workload, and source identities">
+
+```json Evidence catalog
+{
+  "sources": {
+    "s023": {"sha256":"d081594e0618e135b13e60c0c89d63a46fb06ad990815bc5b7b30724b25d1e78"},
+    "s024": {"sha256":"5a828dcdc4bd4e62a51929f3e999f83820dcc11614fb88483c083567c5edfff5"}
+  },
+  "runtimes": {
+    "r016": {"checkpoint":"zai-org/GLM-5.3","client_image_digest":"sha256:fd4ccc2f3cd05e7c0c7a00c21cd537cfab70ec8bf25fec67ce094dde8e31e5e4","client_image_public":null,"client_tag":null,"engine_version":"0.5.20","image":"docker.io/lmsysorg/sglang@sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f","image_digest":"sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":"aca966e4e02791568aa6a4ced368624b3d897f42","upstream_source_revision":"94602c9c2b7cbdb8efd5c52802dac6a1c180089e"},
+    "r017": {"checkpoint":"nvidia/GLM-5.3-NVFP4","client_image_digest":"sha256:fd4ccc2f3cd05e7c0c7a00c21cd537cfab70ec8bf25fec67ce094dde8e31e5e4","client_image_public":null,"client_tag":null,"engine_version":"0.5.20","image":"docker.io/lmsysorg/sglang@sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f","image_digest":"sha256:06e4f2ed21afde4ff513cda65070124e727ba23ccaeff7712b8c40e1097d611f","kind":"public-sglang","measurement_scope":"upstream_framework","recorded_model_revision":"e3b8f9f2fad29727dfa95e766c5cac18ea1414bf","upstream_source_revision":"94602c9c2b7cbdb8efd5c52802dac6a1c180089e"}
+  },
+  "configs": {
+    "c021": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{},"public_command":"sglang serve --model-path zai-org/GLM-5.3 --revision aca966e4e02791568aa6a4ced368624b3d897f42 --served-model-name zai-org/GLM-5.3 --tp-size 8 --ep-size 1 --trust-remote-code --quantization fp8 --kv-cache-dtype fp8_e4m3 --context-length 250000 --mem-fraction-static 0.90 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 --attention-backend dsa --dsa-prefill-backend flashmla_kv --enable-prefill-cp --cp-strategy interleave --moe-a2a-backend none --fp8-gemm-backend flashinfer_deepgemm --flashinfer-allreduce-fusion-backend auto --watchdog-timeout 3600 --model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":32}' --reasoning-parser glm45 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 30000"},
+    "c022": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{},"public_command":"sglang serve --model-path zai-org/GLM-5.3 --revision aca966e4e02791568aa6a4ced368624b3d897f42 --served-model-name zai-org/GLM-5.3 --tp-size 8 --trust-remote-code --quantization fp8 --context-length 250000 --mem-fraction-static 0.90 --reasoning-parser glm45 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 30000"},
+    "c023": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{},"public_command":"sglang serve --model-path nvidia/GLM-5.3-NVFP4 --revision e3b8f9f2fad29727dfa95e766c5cac18ea1414bf --served-model-name nvidia/GLM-5.3-NVFP4 --tp-size 4 --trust-remote-code --quantization modelopt_fp4 --context-length 500000 --mem-fraction-static 0.85 --speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 --speculative-attention-mode decode --speculative-moe-runner-backend flashinfer_cutlass --speculative-moe-a2a-backend none --max-running-requests 128 --cuda-graph-max-bs-decode 128 --flashinfer-allreduce-fusion-backend auto --reasoning-parser glm45 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 30000"},
+    "c024": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{},"public_command":"sglang serve --model-path nvidia/GLM-5.3-NVFP4 --revision e3b8f9f2fad29727dfa95e766c5cac18ea1414bf --served-model-name nvidia/GLM-5.3-NVFP4 --tp-size 4 --trust-remote-code --quantization modelopt_fp4 --context-length 500000 --mem-fraction-static 0.90 --reasoning-parser glm45 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 30000"},
+    "c025": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{},"public_command":"sglang serve --model-path nvidia/GLM-5.3-NVFP4 --revision e3b8f9f2fad29727dfa95e766c5cac18ea1414bf --served-model-name nvidia/GLM-5.3-NVFP4 --tp-size 8 --trust-remote-code --quantization modelopt_fp4 --context-length 500000 --mem-fraction-static 0.85 --speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 --speculative-attention-mode decode --speculative-moe-runner-backend flashinfer_cutlass --speculative-moe-a2a-backend none --max-running-requests 128 --cuda-graph-max-bs-decode 128 --flashinfer-allreduce-fusion-backend auto --reasoning-parser glm45 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 30000"},
+    "c026": {"acceptance_mode":"no synthetic acceptance override; speculation follows configuration","environment":{},"measured_arguments":{},"public_command":"sglang serve --model-path nvidia/GLM-5.3-NVFP4 --revision e3b8f9f2fad29727dfa95e766c5cac18ea1414bf --served-model-name nvidia/GLM-5.3-NVFP4 --tp-size 8 --trust-remote-code --quantization modelopt_fp4 --context-length 500000 --mem-fraction-static 0.90 --reasoning-parser glm45 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 30000"}
+  },
+  "protocols": {
+    "p006": {"aiperf_version":null,"cache_isolation":null,"client_options":{},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":null,"random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":null,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":null,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":null,"workers":8},
+    "p007": {"aiperf_version":null,"cache_isolation":null,"client_options":{},"fixed_schedule":false,"format":"mooncake_trace","ignore_eos":true,"per_chunk_usage":null,"random_seed":42,"raw_trace_record_count":942,"replay_record_count":942,"request_count":942,"request_count_meaning":"Attempted replay population, including permitted context-limit rejections; metrics.request_count retains original CSV value.","request_timeout_seconds":null,"sequential_replay":true,"sha256":"dc9e89c28f1ffd0927dbccb6608b1c9ffdc2f3a411cfbdae1c022ca5a0c07176","skip_auto_warmup":null,"skip_special_tokens":false,"use_server_token_count":true,"warmup_policy":null,"workers":16}
+  },
+  "groups": {
+    "g021": {"concurrency":8,"label":"Public SGLang tuned, tool parser omitted","model":"glm-5-3","n":3,"records":["e049","e050","e051"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g022": {"concurrency":8,"label":"Public SGLang generic, tool parser omitted","model":"glm-5-3","n":3,"records":["e052","e053","e054"],"sku":"H200","tp":8,"sglang_version":"0.5.20"},
+    "g023": {"aggregation_note":"Includes one prior-arm row: same config_id, public image, model revision, workload, c; client_description identifies optimized confirmation r1.","concurrency":8,"label":"Public SGLang tuned, tool parser omitted","model":"glm-5-3","n":3,"records":["e055","e056","e085"],"sku":"B200","tp":4,"sglang_version":"0.5.20"},
+    "g024": {"concurrency":8,"label":"Public SGLang generic, tool parser omitted","model":"glm-5-3","n":3,"records":["e057","e058","e059"],"sku":"B200","tp":4,"sglang_version":"0.5.20"},
+    "g025": {"aggregation_note":"Includes one prior-arm row: same config_id, public image, model revision, workload, c; client_description identifies optimized confirmation r1.","concurrency":16,"label":"Public SGLang tuned, tool parser omitted","model":"glm-5-3","n":3,"records":["e060","e061","e086"],"sku":"B200","tp":8,"sglang_version":"0.5.20"},
+    "g026": {"concurrency":16,"label":"Public SGLang generic, tool parser omitted","model":"glm-5-3","n":2,"records":["e062","e063"],"sku":"B200","tp":8,"sglang_version":"0.5.20"}
+  },
+  "accuracy": {
+  }
+}
+```
+
+</Accordion>
+
+<Accordion title="Full-precision measurement records">
+
+```csv Measurement records
+id,group,sglang_version,cell,arm,c,replicate,output_tok_s_per_gpu,output_tok_s,mean_itl_ms,mean_ttft_ms,duration_s,csv_request_count,attempted_requests,failed_requests,accepted_failures,output_token_count,synthetic_acceptance_length,csv_status,runtime_status,request_qualification,source,source_row,config,runtime,protocol,server_config_sha256,benchmark_config_sha256,metric_export_sha256
+e049,g021,0.5.20,zai-org/GLM-5.3 H200 TP8,optimized,8,1,63.6202368991975,508.96189519358,13.982687046074954,5800.727171465859,4084.57297026,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s023,33,c021,r016,p006,3db03c691d0d39bd68e77a22beb36e4d800cbe26965ed8898cd6eed4b171667d,ea3bf314d99e3cf2124056f8cc2a312d7ee65952f4f452ea2fe5b227bb244ccb,125dc1b05974f7771b4cb1a084f254ec77b2857f16dd5d76c78f37cba6e35ba1
+e050,g021,0.5.20,zai-org/GLM-5.3 H200 TP8,optimized,8,1,63.27173409420244,506.17387275361955,13.944899850424882,5955.121722481277,4107.0709333350005,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s023,34,c021,r016,p006,3db03c691d0d39bd68e77a22beb36e4d800cbe26965ed8898cd6eed4b171667d,ea3bf314d99e3cf2124056f8cc2a312d7ee65952f4f452ea2fe5b227bb244ccb,4d4d67ed18000216fe98f86f9c049bbc70bf730deeb0fc71b13c79d805440042
+e051,g021,0.5.20,zai-org/GLM-5.3 H200 TP8,optimized,8,2,63.128427087555245,505.02741670044196,13.905236485523819,5968.889388079295,4116.394340692001,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s023,35,c021,r016,p006,3db03c691d0d39bd68e77a22beb36e4d800cbe26965ed8898cd6eed4b171667d,ea3bf314d99e3cf2124056f8cc2a312d7ee65952f4f452ea2fe5b227bb244ccb,e3905afaee624ef36ef8a24438258ba14f35cbd73128737ed669932a27efc8ce
+e052,g022,0.5.20,zai-org/GLM-5.3 H200 TP8,baseline,8,1,42.79782825509078,342.3826260407262,18.907129095252635,10656.87136988326,6071.838469259001,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s023,24,c022,r016,p006,a40c0f2a2dcd3a7f1ad99f224e797567b78536a379838b08d80d46e0ca9039ea,ea3bf314d99e3cf2124056f8cc2a312d7ee65952f4f452ea2fe5b227bb244ccb,025260726b00ffce61a300669f74fe44adafd8e093779f34540f0bafe4cf6183
+e053,g022,0.5.20,zai-org/GLM-5.3 H200 TP8,baseline,8,2,42.965269840715784,343.7221587257263,18.202847835225295,10632.856741798458,6048.175676852,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s023,25,c022,r016,p006,a40c0f2a2dcd3a7f1ad99f224e797567b78536a379838b08d80d46e0ca9039ea,ea3bf314d99e3cf2124056f8cc2a312d7ee65952f4f452ea2fe5b227bb244ccb,181751b73bb70f6c3f459f91bb4d10434e29f7918c1cb021a6f354163d226a09
+e054,g022,0.5.20,zai-org/GLM-5.3 H200 TP8,baseline,8,3,42.81802947244004,342.5442357795203,18.45977859488632,10654.517106571586,6068.973822517,908.0,942,34.0,34.0,2078892.0,,completed,recorded upstream,passed,s023,26,c022,r016,p006,a40c0f2a2dcd3a7f1ad99f224e797567b78536a379838b08d80d46e0ca9039ea,ea3bf314d99e3cf2124056f8cc2a312d7ee65952f4f452ea2fe5b227bb244ccb,93cc330971713e1d1909e505ed7278cfe87a6afd7030d2463ee172179ccc7ea5
+e055,g023,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP4,optimized,8,1,141.26513406893187,565.0605362757275,11.862005312544067,4100.822746153598,3901.139539011,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,10,c023,r017,p006,83d29ab1add015c4dd8a73628dbef759f4701fb3a256a7292080cc0a6b0683e1,4247ff550c12f18adc115a67344abf1bb58890e8f1605b347d6b2af3af924665,46cb391bed44a296942a9ec6b20ff54c11b904c71320b1776e4ec5d6b288e457
+e056,g023,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP4,optimized,8,2,140.9888999253197,563.9555997012789,11.562832802459303,3746.0169362986035,3908.7828920710003,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,11,c023,r017,p006,83d29ab1add015c4dd8a73628dbef759f4701fb3a256a7292080cc0a6b0683e1,4247ff550c12f18adc115a67344abf1bb58890e8f1605b347d6b2af3af924665,136de822169d868dffee8f13e0ef3ceb146c278dfdeb30123f0ed89104a352e7
+e057,g024,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP4,baseline,8,1,131.8282309133817,527.3129236535268,14.224281687886089,1971.9287728088077,4180.401998735,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,3,c024,r017,p006,ecb35b7ed613d2d7d740e0f865e45540f3c3cb5e03fe9b92b7b430ecb248dcf0,4247ff550c12f18adc115a67344abf1bb58890e8f1605b347d6b2af3af924665,f223bb74377d527d2156ed0d5651f283b205bf365bc1e20a394d555f5967eed8
+e058,g024,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP4,baseline,8,2,132.17746660200464,528.7098664080186,13.654188995933799,1950.0372851288935,4169.356654863001,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,4,c024,r017,p006,ecb35b7ed613d2d7d740e0f865e45540f3c3cb5e03fe9b92b7b430ecb248dcf0,4247ff550c12f18adc115a67344abf1bb58890e8f1605b347d6b2af3af924665,b7b177a8bbd454579e4dd0bc6ce125adda53f73ac620ae5bbc3d9c09c0734b6f
+e059,g024,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP4,baseline,8,3,132.6249201158175,530.49968046327,13.975905202501194,1915.2232832932332,4155.289967517,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,5,c024,r017,p006,ecb35b7ed613d2d7d740e0f865e45540f3c3cb5e03fe9b92b7b430ecb248dcf0,4247ff550c12f18adc115a67344abf1bb58890e8f1605b347d6b2af3af924665,089e677544820c01d2c87aa16a7798362bb1ea14c6c8b51e51ac2d3857ef357e
+e060,g025,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP8,optimized,16,1,117.63255128957353,941.0604103165882,15.712598726657902,1930.171392049409,2342.4426060580004,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,26,c025,r017,p007,072be4a724d5127dcff3bf413ebe304aa16d76fac18a82d91ea73b9e3ab5ba0d,342d791b9a7d72dda945c74ecbe7b32967b57dfad1263b9f04b498fccc30002a,cba8e12f679cb98b018b15730e0e22547584ba55d6beae568e7d2a8cce1aefeb
+e061,g025,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP8,optimized,16,2,119.22496098381998,953.7996878705599,15.90800437827875,1970.253146991407,2311.156134808,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,27,c025,r017,p007,072be4a724d5127dcff3bf413ebe304aa16d76fac18a82d91ea73b9e3ab5ba0d,342d791b9a7d72dda945c74ecbe7b32967b57dfad1263b9f04b498fccc30002a,386742a31deed990c6dff5217c12a8910376aad22a162fbd8a0df62c7a863861
+e062,g026,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP8,baseline,16,1,105.44337099659182,843.5469679727346,20.14665220777159,1717.726400905478,2613.227340853,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,20,c026,r017,p007,7cfcc5687d0e86401602264d28513c6ae71b1044c714cd929af329d25a33fcb8,342d791b9a7d72dda945c74ecbe7b32967b57dfad1263b9f04b498fccc30002a,a399bc2de9f473bbbe4c497ef70ff69772bdf6a44525134ec3000bd2bc25daa0
+e063,g026,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP8,baseline,16,3,105.60151028122968,844.8120822498374,19.227457773148828,1789.8843946272823,2609.314007595,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,21,c026,r017,p007,7cfcc5687d0e86401602264d28513c6ae71b1044c714cd929af329d25a33fcb8,342d791b9a7d72dda945c74ecbe7b32967b57dfad1263b9f04b498fccc30002a,d99dc5ae94f054122f8de11d8ce0b129b67b948ed767564c4b10412316a2b3db
+e085,g023,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP4,prior,8,1,140.97823550835406,563.9129420334162,12.539585503704783,3425.8007250515575,3909.0785752340003,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,16,c023,r017,p006,83d29ab1add015c4dd8a73628dbef759f4701fb3a256a7292080cc0a6b0683e1,4247ff550c12f18adc115a67344abf1bb58890e8f1605b347d6b2af3af924665,43cfb3e47256acd50fc5446259618a32d24b83eb0dd05d82385f32351a00d260
+e086,g025,0.5.20,nvidia/GLM-5.3-NVFP4 B200 TP8,prior,16,1,117.62233864883866,940.9787091907093,17.11812043283297,1902.198476641246,2342.645990254,931.0,942,11.0,11.0,2204380.0,,completed,recorded upstream,passed,s024,30,c025,r017,p007,072be4a724d5127dcff3bf413ebe304aa16d76fac18a82d91ea73b9e3ab5ba0d,342d791b9a7d72dda945c74ecbe7b32967b57dfad1263b9f04b498fccc30002a,096a962fd5319e07dcef07f0e0fdba87689186bc8d14a83371ce501428668763
+```
+
+</Accordion>
 
 ## 1. Model Introduction
 
