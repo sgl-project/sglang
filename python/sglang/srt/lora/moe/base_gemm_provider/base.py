@@ -46,10 +46,12 @@ def admit_weight_layout(quant_info) -> int:
     """Validate [E, S*I, H] / [E, H, I] weights and return S."""
     if quant_info.intermediate_size <= 0:
         raise ValueError("intermediate_size must be positive")
+    # Sub-byte formats pack K elements per byte.
+    pack = getattr(quant_info, "elements_per_byte", 1)
     expected_w2 = (
         quant_info.num_local_experts,
         quant_info.hidden_size,
-        quant_info.intermediate_size,
+        quant_info.intermediate_size // pack,
     )
     if quant_info.w2_weight.shape != expected_w2:
         raise ValueError(
@@ -58,7 +60,7 @@ def admit_weight_layout(quant_info) -> int:
     if (
         quant_info.w13_weight.ndim != 3
         or quant_info.w13_weight.shape[0] != quant_info.num_local_experts
-        or quant_info.w13_weight.shape[2] != quant_info.hidden_size
+        or quant_info.w13_weight.shape[2] != quant_info.hidden_size // pack
     ):
         raise ValueError(
             "w13_weight must be [num_local_experts, slices*intermediate, hidden]"

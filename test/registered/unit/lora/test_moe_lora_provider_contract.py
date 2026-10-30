@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import sys
 import types
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,6 +14,21 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+ROOT = Path(__file__).resolve().parents[4]
+PROVIDER = ROOT / "python/sglang/srt/lora/moe/base_gemm_provider"
+
+
+def _function(source: str, name: str) -> str:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
+            return ast.get_source_segment(source, node) or ""
+    raise AssertionError(f"function {name!r} not found")
+
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -93,6 +110,43 @@ class TestMxfp4PreparedQuantInfo(CustomTestCase):
             MoeLoraMxfp4MarlinQuantInfo.from_layer(self._layer(hidden_size=200))
 
 
+class TestMxfp4ScaleStorage(CustomTestCase):
+    """Under a lora_* backend the FP8 method stores FP4-expert scales as E8M0 bytes."""
+
+    def _scales(self, backend):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+        from sglang.srt.runtime_context import get_flags
+
+        layer = torch.nn.Module()
+        layer.moe_tp_size = 1
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        with get_flags().moe.override(runner_backend=backend):
+            Fp8MoEMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                    is_fp4_experts=True,
+                )
+            ).create_weights(
+                layer=layer,
+                num_experts=2,
+                hidden_size=256,
+                intermediate_size_per_partition=128,
+                params_dtype=torch.bfloat16,
+            )
+        return layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+
+    def test_lora_backends_store_e8m0_scales(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        for backend, dtype in (
+            (MoeRunnerBackend.LORA_CUTEDSL, torch.float8_e8m0fnu),
+            (MoeRunnerBackend.AUTO, torch.float32),
+        ):
+            for scale in self._scales(backend):
+                self.assertEqual(scale.dtype, dtype, backend)
+
+
 class TestVendorResolution(CustomTestCase):
     def test_family_default_serves_vendors_except_marlin(self):
         """The family default serves a vendor without a provider, except Marlin:
@@ -100,10 +154,13 @@ class TestVendorResolution(CustomTestCase):
         from sglang.srt.lora.moe.base_gemm_provider import resolve_vendor
 
         self.assertEqual(resolve_vendor("mxfp4", "marlin"), "marlin")
+        self.assertEqual(resolve_vendor("mxfp4", "cutedsl"), "cutedsl")
         self.assertEqual(resolve_vendor("bf16", "marlin"), "cutedsl")
-        self.assertEqual(resolve_vendor("bf16", "triton"), "triton")
-        with self.assertRaisesRegex(NotImplementedError, "use lora_marlin$"):
-            resolve_vendor("mxfp4", "cutedsl")
+        self.assertEqual(resolve_vendor("mxfp8", "marlin"), "cutedsl")
+        with self.assertRaisesRegex(
+            NotImplementedError, "lora_triton; use lora_marlin or lora_cutedsl$"
+        ):
+            resolve_vendor("mxfp4", "triton")
 
     def test_lora_runners_never_fold_routed_scaling(self):
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -164,6 +221,68 @@ class TestProviderGeometry(CustomTestCase):
             self.assertEqual(cached, original)
             self.assertIsNot(actual, cached)
         module.try_get_optimal_moe_config.assert_called_once()
+
+
+class TestCompileCache(CustomTestCase):
+    def test_stage_constants_separate_compiled_code(self):
+        """NVFP4 gate/up and down stages of one geometry differ only in their
+        epilogue constants; the cache must not hand one the other's code."""
+        from sglang.srt.lora.moe.base_gemm_provider import cutedsl_common
+
+        class Provider(cutedsl_common.CuteDslTileMixin):
+            _ROW_MODE = "masked"
+            _DTYPE_TAG = "nvfp4"
+
+            def __init__(self):
+                self.quant_info = SimpleNamespace(num_local_experts=2)
+                self._compiled = {64: {}}
+                self._as_dynamic_cute_tensor = lambda tensor, leading_dim: tensor
+                self.compiles = 0
+
+            def _stage_weight(self, stage):
+                return torch.zeros((2, 256, 128), dtype=torch.uint8)
+
+            def _stage_constexprs(self, stage):
+                return (16, True, 128 if stage == "gemm1" else 1 << 30)
+
+            def _prepare_dummy(self, stage, config):
+                self.compiles += 1
+                return SimpleNamespace(launch=lambda: None, compiled_fn=object())
+
+        with mock.patch.dict(cutedsl_common._COMPILE_CACHE, clear=True):
+            provider = Provider()
+            provider._compile_stage(64, "gemm1", config="tile")
+            provider._compile_stage(64, "gemm2", config="tile")
+            self.assertEqual(provider.compiles, 2)
+            calls = provider._compiled[64]
+            self.assertIsNot(calls["gemm1"].compiled_fn, calls["gemm2"].compiled_fn)
+            # The same geometry and constants reuse the compiled code.
+            provider._compile_stage(64, "gemm1", config="tile")
+            self.assertEqual(provider.compiles, 2)
+
+
+class TestBlockScaledBuffers(CustomTestCase):
+    def test_masked_buffers_keep_the_expert_dimension_for_one_expert(self):
+        from sglang.srt.lora.moe.base_gemm_provider.base import prepare_buffer
+
+        source = _function(
+            (PROVIDER / "cutedsl_blockscaled.py").read_text(), "_quant_buffers"
+        )
+        namespace = {"prepare_buffer": prepare_buffer, "torch": torch}
+        exec("from __future__ import annotations\n" + source, namespace)
+        quant_buffers = namespace["_quant_buffers"]
+        provider = SimpleNamespace(
+            _pack=2,
+            _w13=torch.zeros(1, dtype=torch.uint8),
+            SF_VEC_SIZE=32,
+            _scale_atom_bytes=lambda rows, k, vec, slabs=1: slabs * rows * k // vec,
+        )
+        # The masked kernels address [experts, rows, K] slabs for one expert too.
+        data, scales = quant_buffers(provider, None, "masked:rows", (1, 64), 256, "cpu")
+        self.assertEqual(tuple(data.shape), (1, 64, 128))
+        self.assertEqual(scales.numel(), 64 * 256 // 32)
+        data, _ = quant_buffers(provider, None, "flat:rows", (64,), 256, "cpu")
+        self.assertEqual(tuple(data.shape), (64, 128))
 
 
 class TestMaterializedFinalize(CustomTestCase):

@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 VENDORS = {
     "bf16": ("cutedsl", "triton"),
     "fp8": ("cutedsl", "triton"),
-    "nvfp4": ("marlin",),
-    "mxfp4": ("marlin",),
+    "nvfp4": ("marlin", "cutedsl"),
+    "mxfp4": ("marlin", "cutedsl"),
+    "mxfp8": ("cutedsl",),
 }
 
 
@@ -98,6 +99,39 @@ def select_provider_cls(
             )
 
             return MarlinMxfp4ContiguousProvider
+        case "cutedsl", "mxfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
+                CuteDslMxfp4ContiguousProvider,
+                CuteDslMxfp4MaskedProvider,
+            )
+
+            return (
+                CuteDslMxfp4MaskedProvider
+                if expert_major
+                else CuteDslMxfp4ContiguousProvider
+            )
+        case "cutedsl", "nvfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
+                CuteDslNvFp4ContiguousProvider,
+                CuteDslNvFp4MaskedProvider,
+            )
+
+            return (
+                CuteDslNvFp4MaskedProvider
+                if expert_major
+                else CuteDslNvFp4ContiguousProvider
+            )
+        case "cutedsl", "mxfp8":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
+                CuteDslMxfp8ContiguousProvider,
+                CuteDslMxfp8MaskedProvider,
+            )
+
+            return (
+                CuteDslMxfp8MaskedProvider
+                if expert_major
+                else CuteDslMxfp8ContiguousProvider
+            )
         case _:
             raise ValueError(
                 f"no {vendor} MoE LoRA base-GEMM provider for {family} layers"

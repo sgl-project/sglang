@@ -41,6 +41,7 @@ class CuteDslTileMixin:
     WIDE_EXPECTED_M_THRESHOLD: int
     XWIDE_EXPECTED_M_THRESHOLD = 96
     OUTPUT_WIDTH = 128
+    TOKEN_WIDTHS = (NARROW_TOKEN_WIDTH, WIDE_TOKEN_WIDTH, XWIDE_TOKEN_WIDTH)
 
     _ROW_MODE: str
     _DTYPE_TAG: str
@@ -93,6 +94,7 @@ class CuteDslTileMixin:
         )
         if drop_narrow_tile:
             tile_set = tile_set[1:]
+        tile_set = tuple(tile for tile in tile_set if tile[0] in self.TOKEN_WIDTHS)
 
         version = cutedsl_version()
         self._config_table = load_config_table(
@@ -162,6 +164,10 @@ class CuteDslTileMixin:
     def _stage_scale(self, stage: str) -> torch.Tensor | None:
         return None
 
+    def _stage_constexprs(self, stage: str) -> tuple:
+        """Compile-time arguments beyond the operand geometry."""
+        return ()
+
     def _compile_stage(self, token_width: int, stage: str, config) -> None:
         weight = self._stage_weight(stage)
         device = weight.device
@@ -174,6 +180,7 @@ class CuteDslTileMixin:
             self.quant_info.num_local_experts,
             weight.shape[1],
             weight.shape[2],
+            *self._stage_constexprs(stage),
         )
         compiled_fn = _COMPILE_CACHE.get(key)
         if compiled_fn is None:

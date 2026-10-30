@@ -94,8 +94,128 @@ def _admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
             )
 
 
+class MoeLoraMxQuantInfo(msgspec.Struct, kw_only=True):
+    """MX block-scaled weights: E4M3 or packed E2M1 pairs with E8M0 scales per 32.
+
+    W13: [E, S*I, H / elements_per_byte]; W2: [E, H, I / elements_per_byte].
+    Scales keep the checkpoint form [E, rows, K / 32] as E8M0 bytes.
+    """
+
+    w13_weight: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_weight: torch.Tensor
+    w2_scale: torch.Tensor
+    elements_per_byte: int
+    num_local_experts: int
+    intermediate_size: int
+    hidden_size: int
+
+    @classmethod
+    def _from_layer(
+        cls,
+        base_layer: FusedMoE,
+        *,
+        scheme: str,
+        elements_per_byte: int,
+        scale_attr: str = "weight_scale_inv",
+        sf_vec_size: int = 32,
+        **extra,
+    ):
+        if base_layer.params_dtype != torch.bfloat16:
+            raise NotImplementedError(f"{scheme} MoE LoRA requires BF16 activations.")
+        quant_info = cls(
+            w13_weight=base_layer.w13_weight,
+            w13_scale=getattr(base_layer, f"w13_{scale_attr}").view(torch.uint8),
+            w2_weight=base_layer.w2_weight,
+            w2_scale=getattr(base_layer, f"w2_{scale_attr}").view(torch.uint8),
+            elements_per_byte=elements_per_byte,
+            num_local_experts=int(base_layer.num_local_experts),
+            intermediate_size=int(base_layer.intermediate_size_per_partition),
+            hidden_size=int(base_layer.hidden_size),
+            **extra,
+        )
+        # The tcgen05 kernels tile K by 128 and the scale atoms span 4 groups.
+        for name, value in (
+            ("hidden_size", quant_info.hidden_size),
+            ("intermediate_size", quant_info.intermediate_size),
+        ):
+            if value % 128:
+                raise NotImplementedError(
+                    f"{scheme} MoE LoRA requires {name} % 128 == 0, got {value}"
+                )
+        for name, scale, rows in (
+            ("w13_scale", quant_info.w13_scale, quant_info.w13_weight.shape[1]),
+            ("w2_scale", quant_info.w2_scale, quant_info.hidden_size),
+        ):
+            k = (
+                quant_info.hidden_size
+                if name == "w13_scale"
+                else quant_info.intermediate_size
+            )
+            expected = (quant_info.num_local_experts, rows, k // sf_vec_size)
+            if tuple(scale.shape) != expected:
+                raise ValueError(
+                    f"{name} must be E8M0 bytes {list(expected)}, got {tuple(scale.shape)}"
+                )
+        return quant_info
+
+
+class MoeLoraMxfp8QuantInfo(MoeLoraMxQuantInfo):
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraMxfp8QuantInfo:
+        if base_layer.w13_weight.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "MXFP8 MoE LoRA requires resident float8_e4m3fn weights"
+            )
+        return cls._from_layer(base_layer, scheme="MXFP8", elements_per_byte=1)
+
+
+class MoeLoraMxfp4QuantInfo(MoeLoraMxQuantInfo):
+    """Checkpoint-form MXFP4 experts (FP8 configs with ``routed_experts_quant_method``)."""
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraMxfp4QuantInfo:
+        if base_layer.w13_weight.dtype not in (torch.int8, torch.uint8):
+            raise NotImplementedError(
+                "MXFP4 MoE LoRA on CuTeDSL requires packed checkpoint weights; "
+                "a Marlin-repacked layer is unsupported"
+            )
+        return cls._from_layer(base_layer, scheme="MXFP4", elements_per_byte=2)
+
+
+class MoeLoraNvFp4QuantInfo(MoeLoraMxQuantInfo):
+    """Canonical ModelOpt NVFP4 experts: E2M1 pairs, E4M3 scales per 16, and
+    per-expert global scales. Activations share one global scale per stage."""
+
+    w13_global_scale: torch.Tensor  # fp32 [E, 2] (gate, up) or [E]
+    w2_global_scale: torch.Tensor  # fp32 [E]
+    w13_input_scale: float
+    w2_input_scale: float
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4QuantInfo:
+        if base_layer.w13_weight.dtype != torch.uint8:
+            raise NotImplementedError(
+                "NVFP4 MoE LoRA on CuTeDSL requires packed checkpoint weights; "
+                "a Marlin-repacked layer is unsupported"
+            )
+        return cls._from_layer(
+            base_layer,
+            scheme="NVFP4",
+            elements_per_byte=2,
+            scale_attr="weight_scale",
+            sf_vec_size=16,
+            w13_global_scale=base_layer.w13_weight_scale_2.float(),
+            w2_global_scale=base_layer.w2_weight_scale_2.float(),
+            w13_input_scale=float(base_layer.w13_input_scale.max()),
+            w2_input_scale=float(base_layer.w2_input_scale.max()),
+        )
+
+
 # Marlin's packed weights do not use the standard row-domain layout.
-StandardLayoutQuantInfo = MoeLoraBf16QuantInfo | MoeLoraFp8QuantInfo
+StandardLayoutQuantInfo = (
+    MoeLoraBf16QuantInfo | MoeLoraFp8QuantInfo | MoeLoraMxQuantInfo
+)
 
 
 class MoeLoraMarlinQuantInfo(msgspec.Struct, kw_only=True):
