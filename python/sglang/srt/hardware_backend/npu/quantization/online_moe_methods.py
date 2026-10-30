@@ -148,7 +148,7 @@ class NPUW4A8MXFP4OnlineMoEMethod(_NPUOnlineMXFP4MoEMethodBase):
     scheme_name = "W4A8 MXFP"
 
     def _make_kernel(self, weight_prefix: str):
-        return NPUW4A8MXFP4MoEMethod()
+        return NPUW4A8MXFP4MoEMethod(weight_prefix=weight_prefix)
 
 
 class NPUW4A4MXFP4OnlineMoEMethod(_NPUOnlineMXFP4MoEMethodBase):

@@ -48,8 +48,12 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         # npu_grouped_matmul_swiglu_quant_v2 once it accepts swiglu_limit.
         # V4 sets swiglu_limit=10.0; the current fused op implements only
         # standard SwiGLU and would skip the required gate/up clamps.
-        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
-        self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, weight_prefix="w13"
+        )
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, weight_prefix="w2"
+        )
         self.runner = None
 
     def create_weights(
