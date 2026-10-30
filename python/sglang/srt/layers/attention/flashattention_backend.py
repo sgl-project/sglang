@@ -33,8 +33,15 @@ from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadataBuilder,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+    is_cp_sharded_padded,
+)
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded_cache_transfer_indices,
+    is_cp_active,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
@@ -832,6 +839,11 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices[:bs, None],
                 self.full_cg_prefill_strided_indices[:max_seq_pages],
             ]
+            if is_cp_sharded_padded():
+                # Project cache rows to this rank's local rows; null rows stay.
+                page_indices = get_cp_sharded_padded_cache_transfer_indices(
+                    page_indices
+                )
             m.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             if self.use_sliding_window_kv_pool:
                 # SWA block table: translate the page-start full slots to their
@@ -1190,6 +1202,11 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if is_cp_sharded_padded():
+                # Project cache rows to this rank's local rows; null rows stay.
+                metadata.page_table = get_cp_sharded_padded_cache_transfer_indices(
+                    metadata.page_table
+                )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # Fixed-q window (num_draft_tokens, widened by num_front_tokens

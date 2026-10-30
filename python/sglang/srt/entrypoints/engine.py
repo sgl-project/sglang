@@ -1132,6 +1132,17 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     @classmethod
+    def _handle_follower_sigterm(cls, signum, frame) -> None:
+        # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
+        # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
+        # the backstop. Subclasses may override this to ask rank 0 to drain.
+        logger.warning(
+            f"SIGTERM received on node_rank {get_parallel().node_rank}; "
+            "waiting for the rank-0 ShutdownReq broadcast to stop "
+            "the schedulers."
+        )
+
+    @classmethod
     def _launch_subprocesses(
         cls,
         server_args: ServerArgs,
@@ -1264,19 +1275,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
-            # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
-            # the backstop.
             if threading.current_thread() is threading.main_thread():
-
-                def sigterm_handler(signum, frame):
-                    logger.warning(
-                        f"SIGTERM received on node_rank {get_parallel().node_rank}; "
-                        "waiting for the rank-0 ShutdownReq broadcast to stop "
-                        "the schedulers."
-                    )
-
-                signal.signal(signal.SIGTERM, sigterm_handler)
+                signal.signal(signal.SIGTERM, cls._handle_follower_sigterm)
 
             # A node-local Rust listener owns the health endpoints when present.
             rust_server_owns_base_port = (
@@ -1668,7 +1668,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def update_weights_from_distributed(
         self,
         names: list[str],
-        dtypes: list[str],
+        dtypes: list[Union[str, torch.dtype]],
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
@@ -1677,7 +1677,8 @@ class Engine(EngineScoreMixin, EngineBase):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
-            dtypes=dtypes,
+            # msgpack IPC carries dtype names only.
+            dtypes=[str(dtype).removeprefix("torch.") for dtype in dtypes],
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,

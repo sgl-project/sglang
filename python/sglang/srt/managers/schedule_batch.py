@@ -23,6 +23,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
+    WeightVersionSpans,
     truncate_weight_version_events,
 )
 
@@ -67,6 +68,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -164,8 +166,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-
-INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 # Constant used as the base offset for MM (multimodal) pad values.
 # This ensures pad_values don't overlap with valid text token IDs.
@@ -350,8 +350,8 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
-# Msgpack-native containers and Ext-decoded tensor/transport leaves. Tuple
-# containers intentionally decode as lists, matching msgpack's native model.
+# Any processor-owned value. Msgpack IPC pickles the ones it would not decode
+# back unchanged (tuples, dataclasses, transport proxies); see map_object_fields.
 MultimodalDataValue: TypeAlias = object
 
 
@@ -661,6 +661,40 @@ class MultimodalProcessorOutput(
             visible_frame_counts=d.get("visible_frame_counts"),
         )
 
+    def map_object_fields(
+        self, transform: Callable[[list], list]
+    ) -> MultimodalProcessorOutput:
+        """Copy with transform applied to every item's object-typed values.
+
+        transform sees the values of all items in one list, in a fixed order,
+        and returning that list unchanged returns self.
+        """
+        values = [
+            value
+            for item in self.mm_items
+            for value in (
+                item.feature,
+                item.precomputed_embeddings,
+                *item.model_specific_data.values(),
+            )
+        ]
+        new_values = transform(values)
+        if new_values is values:
+            return self
+        new_values = iter(new_values)
+        mm_items = [
+            msgspec.structs.replace(
+                item,
+                feature=next(new_values),
+                precomputed_embeddings=next(new_values),
+                model_specific_data={
+                    key: next(new_values) for key in item.model_specific_data
+                },
+            )
+            for item in self.mm_items
+        ]
+        return msgspec.structs.replace(self, mm_items=mm_items)
+
     @staticmethod
     def build_padded_input_ids(input_ids, mm_items: List[MultimodalDataItem]):
         """pad the input_ids with mm_items if it's not already padded"""
@@ -959,7 +993,8 @@ class ReqKvInfo:
     # Match observations and scheduling state stay on the Req itself.
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
-    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    # The request's own KV is [cache_protected_len, kv_allocated_len). Only the
+    # methods below write the lengths.
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
     # This request already inserted [0, here) into the tree; later inserts count
     # a hit only on the nodes past it, so a request counts each node once.
@@ -1031,6 +1066,9 @@ class ReqKvInfo:
     def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
         self.component_evicted_seqlens[component_type] = length
 
+    def copy_evicted_seqlens(self) -> dict[ComponentType, int]:
+        return self.component_evicted_seqlens.copy()
+
     def clamp_evicted_seqlens(self, length: int) -> None:
         for component, cursor in self.component_evicted_seqlens.items():
             self.component_evicted_seqlens[component] = min(cursor, length)
@@ -1038,6 +1076,85 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
+
+    def set_row_len(self, end: int) -> None:
+        """The row holds exactly [0, end), all of it committed."""
+        self.kv_allocated_len = end
+        self.kv_committed_len = end
+
+    def allocate_decode(self, num_tokens: int) -> None:
+        """A decode step holds num_tokens more slots and commits them at
+        allocation, before the step runs."""
+        self.kv_allocated_len += num_tokens
+        self.kv_committed_len += num_tokens
+
+    def allocate_spec_decode(self, end: int) -> None:
+        """A speculative step holds at least [0, end) and commits nothing; a
+        reservation an earlier step left past end stays."""
+        self.kv_allocated_len = max(self.kv_allocated_len, end)
+
+    def allocate_prealloc(self, fill_len: int) -> None:
+        """PD decode: the preallocated row holds [0, fill_len)."""
+        self.kv_allocated_len = fill_len
+
+    def commit_prealloc(self, fill_len: int) -> None:
+        """PD decode: [0, fill_len) counts as committed, since the prefill
+        node computes it and the transfer writes its KV."""
+        self.kv_committed_len = fill_len
+
+    def commit_decode(self, num_tokens: int) -> None:
+        """num_tokens more decode tokens (a verify's accepted run) are committed."""
+        self.kv_committed_len += num_tokens
+
+    def commit_finished(self, end: int) -> None:
+        """A finished turn kept by a streaming session commits up to end,
+        capped at what the row holds."""
+        self.kv_committed_len = min(end, self.kv_allocated_len)
+
+    def truncate_committed(self, end: int) -> None:
+        """Committed drops to end if it is past it; nothing else changes."""
+        self.kv_committed_len = min(self.kv_committed_len, end)
+
+    def truncate(self, end: int) -> None:
+        """The row keeps at most [0, end): every length past end drops to it."""
+        self.kv_allocated_len = min(self.kv_allocated_len, end)
+        self.kv_committed_len = min(self.kv_committed_len, end)
+        self.clamp_evicted_seqlens(end)
+
+    def protect_prefix(self, length: int) -> None:
+        """The tree owns [0, length) of the row; the request frees only past it."""
+        self.cache_protected_len = length
+
+    def record_insert(self, length: int) -> None:
+        """The request inserted [0, length) into the tree; a shorter insert
+        than an earlier one leaves the record as it is."""
+        self.cache_inserted_len = max(self.cache_inserted_len, length)
+
+    def clear_tree_prefix(self) -> None:
+        """The tree owns none of the row and the request inserted none of it."""
+        self.cache_protected_len = 0
+        self.cache_inserted_len = 0
+
+    def shield_swa_prefill(self, extend_end: int) -> None:
+        """Prefill-aware SWA: the window never evicts [0, extend_end)."""
+        self.swa_evict_floor = extend_end
+
+    def reset_for_retract(self) -> None:
+        """A retracted request, its row already released, starts over: the tree
+        prefix, the committed length and the mamba state are reset."""
+        assert not self.holds_kv, "expect it is already released"
+        self.clear_tree_prefix()
+        self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_ping_pong_empty = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_prev_track_seqlen = None
+        self.mamba_untracked_decode_batch_idx = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+        self.kv_committed_len = 0
 
 
 class Req(ReqDllmMixin):
@@ -1196,26 +1313,13 @@ class Req(ReqDllmMixin):
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
-        # set to_finish instead of directly setting finished_reason.
+        # call request_finish instead of finish_outside_step.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
-
-        # For incremental decoding
-        # ----- | --------- read_ids -------|
-        # ----- |   surr_ids  |
-        # xxxxx | xxxxxxxxxxx | xxxxxxxxxxx |
-        # ----- ^ ----------- ^ ----------- ^
-        # ----- 1 ----------- 2 ----------- 3
-        # 1: surr_offset
-        # 2: read_offset
-        # 3: last token
-        self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
-        self.read_offset = None
-        self.decoded_text = ""
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
@@ -1286,11 +1390,13 @@ class Req(ReqDllmMixin):
         self.retracted_stain = False
 
         self.weight_version_events: List[WeightVersionEvent] = []
+        self.prefill_weight_versions: Optional[WeightVersionSpans] = None
 
         # Incremental streamining
         self.send_token_offset: int = 0
-        self.send_decode_id_offset: int = 0
-        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+        # Whether the DetokenizeHeader went out, so the detokenizer holds its state.
+        self.detokenize_header_sent = False
+        # TODO (Byron): send_output_token_logprobs_offset and send_token_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
 
@@ -1394,6 +1500,10 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
+        # The retraction_count of the last RequestOutputStats sent; None before
+        # the first output.
+        self.request_stats_retraction_count: Optional[int] = None
+
         # For observability
         self.metrics_collector = metrics_collector
         if time_stats is not None:
@@ -1408,10 +1518,6 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
-        # Decode-local: the already-emitted boundary token to replay when a
-        # retracted request is rebootstrapped. Set in pause_generation(retract)
-        # and consumed in the decode transfer commit; never plumbed to prefill.
-        self.pd_rebootstrap_forced_output_id: Optional[int] = None
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -1670,6 +1776,18 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def take_request_stats_due(self) -> bool:
+        """Whether this output row carries the request's stats, recording the
+        send: due on the first output, the first after each retraction, and the
+        finished row."""
+        if (
+            self.request_stats_retraction_count != self.retraction_count
+            or self.finished()
+        ):
+            self.request_stats_retraction_count = self.retraction_count
+            return True
+        return False
+
     def next_output_finishes_by_length(self) -> bool:
         # Whether committing one more output token reaches max_new_tokens
         return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
@@ -1752,7 +1870,7 @@ class Req(ReqDllmMixin):
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is None:
-                self.kv.cache_protected_len = self.prefix_len
+                self.kv.protect_prefix(self.prefix_len)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1796,26 +1914,11 @@ class Req(ReqDllmMixin):
             max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
-    # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
-    def init_incremental_detokenize(self):
-        first_iter = self.surr_offset is None or self.read_offset is None
-
-        output_ids = self.output_ids_through_stop
-
-        if first_iter:
-            self.read_offset = len(self.origin_input_ids_unpadded)
-            self.surr_offset = max(
-                self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
-            )
-            self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
-            )
-            self.cur_decode_ids_len = len(output_ids)
-        else:
-            self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
-            self.cur_decode_ids_len = len(output_ids)
-
-        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
+    def take_detokenize_header_due(self) -> bool:
+        """Whether this output carries the DetokenizeHeader: only the first does."""
+        due = not self.detokenize_header_sent
+        self.detokenize_header_sent = True
+        return due
 
     def _stop_match_tail_len(self, new_accepted_len: int) -> int:
         max_len_tail_str = max(
@@ -1930,13 +2033,11 @@ class Req(ReqDllmMixin):
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
-                    stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
+                    if stop_str in tail_str:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        if stop_str_in_tail:
-                            self.finished_len = self._locate_str_stop_finished_len(
-                                new_accepted_len, stop_str=stop_str
-                            )
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_str=stop_str
+                        )
                         return True
 
             # Check stop regex
@@ -2016,6 +2117,24 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
             self.finished_len = max_new_tokens
 
+    def request_finish(self, reason: BaseFinishReason) -> None:
+        """Finish with reason at the request's next commit."""
+        self.to_finish = reason
+
+    def request_discard(self, reason: FINISH_ABORT) -> None:
+        """Drop the output of the request's in-flight step and finish with reason."""
+        self.discard_output_reason = reason
+
+    def clear_requested_finish(self) -> None:
+        """Drop the finish requested for the next commit."""
+        self.to_finish = None
+
+    def finish_outside_step(self, reason: BaseFinishReason) -> None:
+        """Finish now, not through update_finish_state: the request is queued
+        or transferring (an abort, a PD handoff), or its result is decided
+        elsewhere (a beam group, the dLLM context limit)."""
+        self.finished_reason = reason
+
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
             return
@@ -2067,8 +2186,6 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
-        self.kv.cache_protected_len = 0
-        self.kv.cache_inserted_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock = None
@@ -2083,20 +2200,10 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
-        self.kv.mamba_pool_idx = None
-        self.kv.mamba_ping_pong_track_buffer = None
-        self.kv.mamba_ping_pong_empty = None
-        self.kv.mamba_next_track_idx = None
-        self.kv.mamba_last_track_idx = None
-        self.kv.mamba_last_track_seqlen = None
-        self.kv.mamba_prev_track_seqlen = None
-        self.kv.mamba_untracked_decode_batch_idx = None
         self.mamba_branching_seqlen = None
-        self.kv.mamba_cow_src_index = None
-        self.kv.mamba_needs_clear = False
         self.already_computed = 0
-        assert not self.kv.holds_kv, "expect it is already released"
-        self.kv.kv_committed_len = 0
+        self.kv.reset_for_retract()
+        self.prefill_weight_versions = None
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -2167,10 +2274,9 @@ class Req(ReqDllmMixin):
         JSON-serializable even when ``origin_input_ids``/``output_ids`` hold
         numpy scalars. The sampling-param allow-list forces ``max_new_tokens=1``
         and drops stop/grammar/min_new_tokens so the recompute only re-derives
-        the prefix KV and samples a single handoff token. The already-emitted
-        boundary token is replayed on the *decode* side (the transfer commit
-        overrides the sampled handoff with it), so it is intentionally not sent
-        to the prefill here.
+        the prefix KV and samples a single handoff token. The last output id is
+        not sent: like a handoff token it is the pending decode input, so the
+        decode commit keeps it and ignores the token the prefill samples.
         """
         # TODO: multi-modal requests are not supported here. The payload only
         # carries token ``input_ids`` and drops any image/audio/video inputs, so
@@ -2179,7 +2285,7 @@ class Req(ReqDllmMixin):
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
-            + [int(x) for x in self.output_ids],
+            + [int(x) for x in self.output_ids[:-1]],
             "sampling_params": {
                 "max_new_tokens": 1,
                 "temperature": sp.temperature,
@@ -2247,7 +2353,7 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
+        self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
@@ -3481,11 +3587,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.beam_group is not None:
                 # Free member rows before release_req: they need the leader's kv
                 # info, which still carries the lockstep allocated length.
-                req.to_finish = FINISH_ABORT(
-                    "Beam search group aborted: KV cache pool is full. Beam "
-                    "groups cannot be retracted, so they are aborted instead "
-                    "of being requeued.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                req.request_finish(
+                    FINISH_ABORT(
+                        "Beam search group aborted: KV cache pool is full. Beam "
+                        "groups cannot be retracted, so they are aborted instead "
+                        "of being requeued.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 )
                 reqs_to_abort.append(req)
                 free_member_rows(
@@ -3512,7 +3620,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "backup. Retry later."
                     )
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                req.to_finish = FINISH_ABORT(message, status_code=status_code)
+                req.request_finish(FINISH_ABORT(message, status_code=status_code))
                 reqs_to_abort.append(req)
                 logger.warning(
                     "retract_decode: aborted request %s: %s", req.rid, message
@@ -3525,10 +3633,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Instead of crashing the scheduler, gracefully abort it.
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
-            last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
-                "in the decode batch. Aborting the last request.",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            last_req.request_finish(
+                FINISH_ABORT(
+                    "Out of memory even after retracting all other requests "
+                    "in the decode batch. Aborting the last request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
             )
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
