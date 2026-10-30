@@ -204,9 +204,6 @@ class DecoderReplayTail:
         if not (tail is not None or (dp and forward_batch.is_extend_in_batch)):
             return False, None
         if forward_batch.dp_spec_prefill_coordination_applied:
-            # A coordinated step pairs a peer's extend with this rank's verify, which
-            # has rows but no tail: run_idle would replace them with the bucket's.
-            # Every rank of the step carries the flag, so all stay eager together.
             return False, None
         scattered = self._scattered_dp(
             tail,
