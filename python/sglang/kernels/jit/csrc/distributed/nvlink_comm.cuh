@@ -429,7 +429,7 @@ struct NVLinkComm {
     auto device_ = SymbolicDevice{};
     auto dtype_ = SymbolicDType{};
     if constexpr (!std::is_same_v<T, void>) dtype_.set_options<T>();
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({-1, D})  //
         .with_dtype(dtype_)
         .with_device(device_)

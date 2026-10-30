@@ -186,7 +186,7 @@ struct MegaMoEPreDispatchKernel {
     auto H = SymbolicSize{"hidden"};
     auto K = SymbolicSize{"top_k"};
     auto G4 = SymbolicSize{"num_groups_div_4"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, H})  // input x
         .with_dtype<bf16_t>()

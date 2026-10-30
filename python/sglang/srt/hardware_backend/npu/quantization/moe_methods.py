@@ -1100,22 +1100,21 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     (weights already quantised); ``process_weights_after_loading`` tells the two
     apart by weight dtype.
 
-    gmm1 re-quantises its own output, so it is a single fused kernel rather than
-    a matmul plus a separate activation: the runner calls
-    ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
-    per-prefix matmul chosen here.
+    Plain SwiGLU uses ``apply_fused_gmm1_swiglu`` for w13. A positive
+    ``swiglu_limit`` uses an unfused w13 GEMM and the existing grouped clipped
+    SwiGLU + MXFP8 quantization before w2.
 
-    Where the *activation* quant happens depends on the transport. On the
-    no-A2A path it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
-    which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP has no
-    mxfp8 dispatch dtype, so it hands over bf16 and w13 quantises the hidden
-    states itself before gmm1.
+    Where the activation quant happens depends on the transport. The no-A2A
+    routing can emit E4M3 activations and E8M0 scales directly. DeepEP may
+    provide BF16 or MXFP8 according to the owning adapter's dispatch policy;
+    gmm1 quantizes only when no activation scales were supplied.
     """
 
     def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
         if weight_prefix == "w13":
             self.matmul = GroupedMatmulSwigluQuant()
+            self.unfused_matmul = GroupedMatmul()
             self.hidden_states_quantizer = HiddenStatesDynamicQuant(
                 quant_dtype=torch.float8_e4m3fn
             )
@@ -1196,8 +1195,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         if weight_prefix == "w13":
             from sglang.srt.layers.moe import get_moe_a2a_backend
 
-            # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
-            # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
+            # The online/ModelSlim loading path retains BF16 DeepEP dispatch;
+            # checkpoint-specific adapters may select MXFP8 per mode instead.
             dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
             self._set_moe_dispatch_dtype(layer, dispatcher_dtype)
 
@@ -1213,12 +1212,12 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
         Returns the e4m3 activations and their e8m0 block scale, i.e. exactly
         what the w2 gmm needs, which is why the runner skips its activation step
-        for MXFP8.
+        for plain SwiGLU.
 
         ``pertoken_scale`` is None when the dispatcher handed over unquantised
-        hidden states (the DeepEP path), in which case the activation quant that
-        the no-A2A routing fuses in is done here instead. Both paths therefore
-        reach the kernel below with the same e4m3 + e8m0 input.
+        hidden states (e.g. DeepEP normal), in which case input quantization
+        runs here before gmm1. Routing and transport paths therefore reach the
+        kernel below with the same E4M3 payload and E8M0 scales.
         """
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
@@ -1249,16 +1248,18 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        if weight_prefix != "w2":
-            raise ValueError(
-                f"NPUMXFP8MoEMethod.apply only serves the w2 gmm, got "
-                f"'{weight_prefix}'. gmm1 fuses swiglu into a single op and must "
-                f"go through apply_fused_gmm1_swiglu, which returns a scale too."
+        if weight_prefix == "w13":
+            if pertoken_scale is None:
+                hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                    hidden_states, dst_type=torch.float8_e4m3fn
+                )
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
             )
 
         e8m0_dtype = _require_e8m0_dtype()
@@ -1270,7 +1271,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             "x_dtype": None,
             "weight_dtype": None,
         }
-        return self.matmul.forward(
+        matmul = self.unfused_matmul if weight_prefix == "w13" else self.matmul
+        return matmul.forward(
             quant_info,
             weight_prefix,
             hidden_states,
