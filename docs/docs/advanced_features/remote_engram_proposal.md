@@ -52,7 +52,14 @@ research runtime. It currently only supports 256-wide Engram layers 1 and 14;
 the old prefetch path is rejected. It is not a self-contained installation,
 nor does this draft provide the owner, NIXL GET implementation or setup script.
 The experimental runtime validates checkpoint identity and registered table
-metadata. This branch has not yet passed a full model or 1P1D run.
+metadata. With the experimental runtime, one same-version H20 1P1D smoke ran
+the real model with 16K input and produced 64 output tokens matching a prior
+reference output exactly. The P used TP8/CP8, bounded replay disabled and the
+remote reader; D used DP8, a native per-node host table and DSpark. Mooncake
+handled P/D KV transfer. P recorded one KV transfer, and both P/D requests
+returned successfully. This is a single functional smoke, not a performance,
+concurrency or production qualification. The reader runtime and owner remain
+external dependencies.
 
 ## Research evidence and limits
 
