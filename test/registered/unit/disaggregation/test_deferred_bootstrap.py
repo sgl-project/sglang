@@ -55,10 +55,8 @@ class TestDeferredBootstrap(unittest.TestCase):
                 self.table.open(1, self.owner)
                 self.table.register(1, self.endpoint)
                 self.table.complete(1, self.owner)
-                self.assertEqual(
-                    self.table.close(1, self.owner, success=True),
-                    (self.endpoint, False),
-                )
+                # The transfer worker, not the release, tells decode of Success.
+                self.assertIsNone(self.table.close(1, self.owner, success=True))
                 self.assertNotIn(1, self.table.rooms)
                 new_owner = object()
                 if receiver_first:
@@ -75,6 +73,34 @@ class TestDeferredBootstrap(unittest.TestCase):
                 )
                 self.table.close(1, new_owner, success=True)
 
+    def test_next_request_registers_before_release(self):
+        """Once decode hears Success it may resume the room's request before this
+        side releases it. Its registration must start the next room, not attach
+        to the finished one, whose readiness was already sent."""
+        self.table.open(1, self.owner)
+        self.table.register(1, self.endpoint)
+        self.assertEqual(self.table.complete(1, self.owner), (self.endpoint, False))
+        self.table.conclude(1)
+        self.assertTrue(self.table.awaits_release(1))
+        self.assertIsNone(self.table.register(1, self.endpoint))
+        self.assertIsNone(self.table.open(1, object()))
+        self.assertIsNone(self.table.close(1, self.owner, success=True))
+        self.assertFalse(self.table.awaits_release(1))
+        new_owner = object()
+        state = self.table.open(1, new_owner)
+        self.assertFalse(state.ready or state.failed)
+        self.assertEqual(self.table.complete(1, new_owner), (self.endpoint, False))
+
+    def test_next_request_cancelled_before_release_stays_cancelled(self):
+        self.table.open(1, self.owner)
+        self.table.register(1, self.endpoint)
+        self.table.complete(1, self.owner)
+        self.table.conclude(1)
+        self.assertIsNone(self.table.register(1, self.endpoint))
+        self.table.cancel(1)
+        self.table.close(1, self.owner, success=True)
+        self.assertTrue(self.table.open(1, object()).failed)
+
     def test_success_cannot_reset_cancelled_room(self):
         self.table.open(1, self.owner)
         self.table.fail(1)
@@ -87,6 +113,7 @@ class TestDeferredBootstrap(unittest.TestCase):
             lambda: self.table.register(1, self.endpoint),
             lambda: self.table.complete(1, self.owner),
             lambda: self.table.fail(1),
+            lambda: self.table.cancel(1),
             lambda: self.table.close(1, self.owner),
         ):
             operation()
