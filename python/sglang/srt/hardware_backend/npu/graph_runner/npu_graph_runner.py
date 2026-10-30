@@ -365,7 +365,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     capture_forward_mode=self.capture_forward_mode,
                     is_encoder_decoder=self.is_encoder_decoder,
                 )
-                self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+                self.attn_backend.init_forward_metadata_out_graph(fb_view)
 
         graph_key = self._make_graph_key(self.bs)
 
@@ -379,7 +379,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # recompute from the live batch as before — reading the
                 # backend list there would replay stale capture-time lengths.
                 if self.model_runner.spec_algorithm.is_dflash():
-                    _attn = self._replay_attn_backend()
+                    _attn = self.attn_backend
                     _meta = getattr(_attn, "forward_metadata", None)
                     _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
                 else:
@@ -395,10 +395,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     # Prefer the live CPU mirror to avoid a blocking D2H copy;
                     # fall back to device lengths when the mirror is unavailable.
                     if forward_batch.seq_lens_cpu is not None:
-                        seq_lens_cpu = (
-                            forward_batch.seq_lens_cpu[: self.raw_bs]
-                            + self.captured_req_width
-                        )
+                        seq_lens_cpu = forward_batch.seq_lens_cpu[: self.raw_bs]
+                        # DFlash/DSpark publish CPU mirrors including the verify
+                        # block. Adding it again lets FIA see future candidates.
+                        if not self.model_runner.spec_algorithm.is_dflash_family():
+                            seq_lens_cpu = seq_lens_cpu + self.captured_req_width
                     else:
                         seq_lens_cpu = (
                             forward_batch.seq_lens.cpu() + self.captured_req_width

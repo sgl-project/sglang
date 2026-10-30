@@ -235,7 +235,6 @@ class BaseRunner(ABC):
         # elastic-EP scale-up widens num_dp_ranks on the published config
         self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
-        self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker

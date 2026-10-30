@@ -112,6 +112,36 @@ class HostPoolGroup:
             if pool_names is not None and entry.name not in pool_names:
                 continue
             host = entry.host_pool
+            # Checks that the host pool stores whole page envelopes and has a
+            # peer-write gate installed; such a pool moves its pages when it
+            # compacts, and the gate holds that off while a peer may write.
+            if host.stores_page_envelope and host.peer_writes_gated:
+                # Device and host each expose one region of whole page
+                # envelopes, so a host page holds a device page's exact bytes.
+                infos = entry.device_pool.get_contiguous_buf_infos()
+                host_info = host.peer_write_buf_info()
+                if (
+                    # Rejects an entry with packed draft device pools, because a
+                    # page-envelope host pool holds no draft KV.
+                    entry.packed_draft_device_pools
+                    # Rejects a device pool that registers more or fewer than
+                    # one buffer region.
+                    or len(infos[0]) != 1
+                    # Rejects a device page envelope whose size differs from
+                    # this pool's host page size.
+                    or infos[2] != [host_info[2]]
+                    # Rejects a device region that an earlier pool in this call
+                    # already paired with a different host region.
+                    or host_by_device_ptr.get(infos[0][0], host_info) != host_info
+                ):
+                    raise ValueError(
+                        "Host receive requires one page-envelope region per pool "
+                        "with matching device and host page bytes"
+                    )
+                for combined, values in zip(device_infos, infos, strict=True):
+                    combined.extend(values)
+                host_by_device_ptr[infos[0][0]] = host_info
+                continue
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
             for pool in pools:
                 dense_mha = (
