@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -99,7 +100,14 @@ class TestTrackMambaStateDtype(CustomTestCase):
         self.assertTrue(torch.all(ssm_states == 0))
 
     def test_default_prefill_convolution_hooks_preserve_arguments(self):
-        layer = SimpleNamespace(conv_weights=object(), bias=None, activation="silu")
+        layer = SimpleNamespace(
+            conv_weights=object(),
+            bias=None,
+            activation="silu",
+            q_dim=2,
+            k_dim=2,
+            v_dim=2,
+        )
         batch = SimpleNamespace(
             extend_prefix_lens=torch.tensor([0, 64]), extend_seq_lens_cpu=[2, 2]
         )
@@ -112,6 +120,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
         ):
             with self.subTest(backend=backend_type.__name__):
                 backend = object.__new__(backend_type)
+                backend.kernel_dispatcher = SimpleNamespace(
+                    prefill_backend=LinearAttnKernelBackend.TRITON
+                )
                 starts = torch.tensor([0, 2, 4])
                 backend.forward_metadata = SimpleNamespace(
                     query_start_loc=starts, conv_block_table=None
@@ -122,6 +133,8 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     output = backend._convolve_prefill(
                         layer, batch, qkv, states, indices
                     )
+                if backend_type is KDAAttnBackend:
+                    output = torch.cat(output, dim=-1)
                 torch.testing.assert_close(output, qkv)
                 args, kwargs = conv.call_args
                 torch.testing.assert_close(args[0], qkv.T)

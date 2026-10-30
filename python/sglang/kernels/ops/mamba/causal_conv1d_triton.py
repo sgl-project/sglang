@@ -62,6 +62,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_BLOCK_TABLE: tl.constexpr = False,
+    OUTPUT_SPLIT_SIZE: tl.constexpr = 0,
+    OUTPUT_GROUP_STRIDE: tl.constexpr = 0,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -399,7 +401,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             o_ptr
             + (sequence_start_index + token_offset + idx_token).to(tl.int64)
             * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + (
+                (idx_feats // OUTPUT_SPLIT_SIZE).to(tl.int64) * OUTPUT_GROUP_STRIDE
+                + idx_feats % OUTPUT_SPLIT_SIZE
+                if OUTPUT_SPLIT_SIZE > 0
+                else idx_feats * stride_o_dim
+            )
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
@@ -418,6 +425,7 @@ def causal_conv1d_fn(
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
+    output_split_size: int = 0,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -462,12 +470,26 @@ def causal_conv1d_fn(
         in this case, the kernel will not process entries at
         indices 0 and 3
 
-    out: same shape as `x`
+    out: same shape as `x` by default; when output_split_size > 0,
+        [dim // output_split_size, total_tokens, output_split_size].
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    if output_split_size:
+        if x.ndim != 2 or output_split_size <= 0 or x.shape[0] % output_split_size:
+            raise ValueError(
+                "output_split_size must evenly divide the feature dimension"
+            )
+        # Each feature group is contiguous as [total_tokens, group_features].
+        # The kernel writes this layout directly, avoiding split-view copies.
+        out = torch.empty(
+            (x.shape[0] // output_split_size, x.shape[1], output_split_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+    else:
+        out = torch.empty_like(x)
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
@@ -500,7 +522,9 @@ def causal_conv1d_fn(
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
         # assert stride_istate_dim == 1
-    if out.dim() == 2:
+    if output_split_size:
+        stride_o_seq, stride_o_dim, stride_o_token = 0, 1, output_split_size
+    elif out.dim() == 2:
         stride_o_seq = 0
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
@@ -583,6 +607,8 @@ def causal_conv1d_fn(
         BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
         BLOCK_N=256,
         USE_BLOCK_TABLE=block_table is not None,
+        OUTPUT_SPLIT_SIZE=output_split_size,
+        OUTPUT_GROUP_STRIDE=cu_seqlen * output_split_size,
         num_stages=2,
     )
     return out

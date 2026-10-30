@@ -1023,10 +1023,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dispatcher = self.kernel_dispatcher
+        split_size = (
+            layer.q_dim
+            if layer.q_dim == layer.k_dim == layer.v_dim
+            and dispatcher.prefill_backend.is_flashinfer()
+            and dispatcher.effective_extend_kernel(
+                layer.lower_bound,
+                mixed_qkv.shape[0],
+                self.forward_metadata.query_start_loc.numel() - 1,
+            )
+            is dispatcher.extend_kernel
+            else 0
+        )
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
-        return causal_conv1d_fn(
+        # FlashInfer needs contiguous Q/K/V: write their separate groups here
+        # so its .contiguous() calls do not copy the packed convolution output.
+        output = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1036,7 +1051,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            output_split_size=split_size,
+        )
+        return (
+            output.unbind(0)
+            if split_size
+            else output.transpose(0, 1).split(
+                [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+            )
+        )
 
     def forward_extend(
         self,
@@ -1125,10 +1148,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        qkv = self._convolve_prefill(
+        q, k, v = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
         )
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
