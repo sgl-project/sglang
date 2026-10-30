@@ -251,6 +251,12 @@ add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )
 
+# --- Context parallelism ---
+
+CP_STRATEGY_CHOICES = ["zigzag", "interleave"]
+CP_KV_LAYOUT_CHOICES: list[str] = []
+add_cp_kv_layout_choices = CP_KV_LAYOUT_CHOICES.extend
+
 # --- Transport ---
 
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend

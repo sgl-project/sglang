@@ -41,6 +41,9 @@ class L2Transfer(NamedTuple):
     device_indices: torch.Tensor
     layer_mapper: Optional[Callable[[int], Optional[int]]] = None
     is_draft: bool = False
+    # Controller ids -> the rows the device pool indexes (a unified sub-pool's
+    # id space); None when they index it as they are.
+    device_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
 class TransferCompletion(NamedTuple):
@@ -79,11 +82,10 @@ class L2TransferEngine:
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
         """Resolve controller IDs into this pool's device-buffer indices.
 
-        Call on the index stream after the producer event. The host-transfer
-        move gate prevents relocation until the transfer completes.
+        Call on the index stream after the producer event. The HiCache pin
+        source keeps the rows in place until the transfer is acknowledged.
         """
-        # Mamba state pools do not inherit KVCache's default attributes.
-        translate = getattr(transfer.device_pool, "host_transfer_translate", None)
+        translate = transfer.device_translate
         if translate is None:
             return transfer.device_indices
         original_device = transfer.device_indices.device
@@ -130,6 +132,12 @@ class L2TransferEngine:
         own_stream = stream in (self.host_to_device_stream, self.device_to_host_stream)
         # A caller's stream prepares indices in order with its own copies.
         index_stream = self.index_stream if own_stream else stream
+        # The host layout keeps one finish event per key, and a newer event
+        # covers an older one only on the same stream: a caller's stream keeps
+        # its own entry beside the engine stream's.
+        layout_key = (
+            (id(self), transfer_key) if own_stream else (id(self), transfer_key, stream)
+        )
         try:
             with device_module.stream(index_stream):
                 # Index preparation can read producer-owned device indices. On its
@@ -153,8 +161,7 @@ class L2TransferEngine:
         finally:
             for domain in reversed(domains):
                 domain.release_layout(
-                    ack_finish if finish_recorded else None,
-                    (id(self), transfer_key),
+                    ack_finish if finish_recorded else None, layout_key
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:

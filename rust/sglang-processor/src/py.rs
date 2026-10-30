@@ -473,10 +473,6 @@ pub(crate) fn py_strip(text: &str) -> &str {
     text.trim_matches(py_space)
 }
 
-pub(crate) fn py_rstrip(text: &str) -> &str {
-    text.trim_end_matches(py_space)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -162,10 +162,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 # Prefer the live CPU mirror to avoid a blocking D2H copy;
                 # fall back to device lengths when the mirror is unavailable.
                 if forward_batch.seq_lens_cpu is not None:
-                    seq_lens_cpu = (
-                        forward_batch.seq_lens_cpu[: runner.raw_bs]
-                        + runner.captured_req_width
-                    )
+                    seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs]
+                    # DFlash/DSpark publish CPU mirrors including the verify
+                    # block. Adding it again lets FIA see future candidates.
+                    if not runner.model_runner.spec_algorithm.is_dflash_family():
+                        seq_lens_cpu = seq_lens_cpu + runner.captured_req_width
                 else:
                     seq_lens_cpu = (
                         forward_batch.seq_lens.cpu() + runner.captured_req_width

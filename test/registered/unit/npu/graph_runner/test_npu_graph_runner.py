@@ -8,12 +8,12 @@ import torch
 
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as runner_mod
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_npu_ci(est_time=12, suite="base-a-test-npu")
 
 
-def make_backend(*, dflash=False, width=1, bs=4, raw_bs=2):
+def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
     backend = mod.NPUCudaGraphBackend.__new__(mod.NPUCudaGraphBackend)
     attention = SimpleNamespace(forward_metadata=None)
     runner = runner_mod.DecodeCudaGraphRunner.__new__(runner_mod.DecodeCudaGraphRunner)
@@ -27,7 +27,9 @@ def make_backend(*, dflash=False, width=1, bs=4, raw_bs=2):
                 hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
             ),
             spec_algorithm=SimpleNamespace(
-                is_dflash=lambda: dflash, is_dspark=lambda: False
+                is_dflash=lambda: dflash,
+                is_dspark=lambda: dspark,
+                is_dflash_family=lambda: dflash or dspark,
             ),
         ),
         _replay_attn_backend=lambda: attention,
@@ -49,13 +51,22 @@ def test_cpu_lengths_are_padded_without_reading_device_lengths():
     assert backend.cache_loc_dtype == torch.int32
 
 
-def test_verify_lengths_and_dflash_metadata_are_not_double_added():
+@pytest.mark.parametrize("dflash,dspark", [(False, False), (True, False), (False, True)])
+def test_verify_cpu_lengths_include_block_only_once(dflash, dspark):
+    backend, _, _ = make_backend(dflash=dflash, dspark=dspark, width=3)
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+        seq_lens_cpu=torch.tensor([13, 14] if dflash or dspark else [10, 11]),
+    )
+    assert backend._decode_update_lengths(batch) == [13, 14, 0, 0]
+
+
+def test_dflash_replay_metadata_lengths_are_not_double_added():
     backend, _, attention = make_backend(dflash=True, width=3)
     batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_target_verify=lambda: True),
-        seq_lens_cpu=torch.tensor([10, 11]),
+        seq_lens_cpu=torch.tensor([13, 14]),
     )
-    assert backend._decode_update_lengths(batch) == [13, 14, 0, 0]
     attention.forward_metadata = SimpleNamespace(seq_lens_cpu_list=[13, 14, 0, 0])
     assert backend._decode_update_lengths(batch) == [13, 14, 0, 0]
 
