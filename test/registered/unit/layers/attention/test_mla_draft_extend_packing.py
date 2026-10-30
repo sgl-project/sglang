@@ -23,6 +23,9 @@ class TestMLADraftExtendPacking(unittest.TestCase):
                 ),
             ):
                 backend = TRTLLMMLABackend.__new__(TRTLLMMLABackend)
+                backend.runner_ids = SimpleNamespace(
+                    is_translating=True, copy_page_table=Mock()
+                )
                 backend.num_draft_tokens = 4
                 backend.max_context_len = 16
                 backend.decode_cuda_graph_metadata = {}
@@ -31,9 +34,6 @@ class TestMLADraftExtendPacking(unittest.TestCase):
                 backend._get_dcp_local_max_seq_len = lambda length: length
                 backend._get_dcp_local_seq_lens = lambda lengths: lengths
                 backend._fill_dcp_block_kv_indices = Mock()
-                backend.kv_index_translator = SimpleNamespace(
-                    is_translating=True, copy_page_table=Mock()
-                )
                 lengths = torch.tensor([9, 13], dtype=torch.int32)
                 mode = ForwardMode.DRAFT_EXTEND_V2
                 backend._init_cuda_graph_metadata(2, 12, mode, lengths, "cpu")
@@ -89,8 +89,8 @@ class TestMLADraftExtendPacking(unittest.TestCase):
                 backend = SimpleNamespace(
                     data_type=torch.float32,
                     page_size=1,
-                    token_to_kv_pool=SimpleNamespace(
-                        get_key_buffer=lambda _: torch.zeros(4, 1, 1)
+                    kv_layers=SimpleNamespace(
+                        read=lambda _: SimpleNamespace(key=lambda: torch.zeros(4, 1, 1))
                     ),
                     forward_decode_metadata=metadata,
                     padded_q_buffer=(
