@@ -59,6 +59,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.rust_server = None
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
+    sched.beam_coordinator = Mock()
     return sched
 
 
@@ -90,6 +91,18 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
         self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
+
+    def test_aborted_chunked_beam_leader_retires_its_group(self):
+        req = _FakeReq("beam_leader")
+        sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
+        sched._release_aborted_request = Mock()
+        sched.tree_cache = None
+        sched.ipc_channels = Mock()
+
+        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
+            sched.process_pending_chunked_abort()
+
+        sched.beam_coordinator.retire_group.assert_called_once_with(req)
 
 
 if __name__ == "__main__":
