@@ -156,12 +156,18 @@ class AscendKVManager(MooncakeKVManager):
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
 
     def _get_dcp_remote_decode_layout(self) -> List[bool]:
+        num_draft = self.kv_args.num_draft_entries
+        if self.is_hybrid_mla_backend and StateType.DSA not in self.kv_args.state_types:
+            # Dense hybrid MLA keeps target KV followed by replicated draft KV.
+            # DSA index buffers retain their per-entry pool layout below.
+            num_target = len(self.kv_args.kv_data_ptrs) - num_draft
+            return [False] * num_target + [True] * num_draft
+
         layout = self._dcp_remote_decode_layout
         if layout is None or len(layout) != len(self.kv_args.kv_data_ptrs):
             raise RuntimeError(
                 "Ascend PD DCP layout does not match its source KV entries"
             )
-        num_draft = self.kv_args.num_draft_entries
         if num_draft:
             # Remote decode draft KV uses global slots regardless of the local
             # prefill pool's worker role.

@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import numpy as np
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,6 +23,7 @@ class TestAscendPageDcpSend(CustomTestCase):
                 with self.subTest(target=target_layout, draft=draft_layout):
                     pool_layout = target_layout + draft_layout
                     mgr = object.__new__(AscendKVManager)
+                    mgr.is_hybrid_mla_backend = False
                     mgr.kv_args = SimpleNamespace(
                         kv_data_ptrs=list(range(len(pool_layout))),
                         num_draft_entries=len(draft_layout),
@@ -32,6 +34,22 @@ class TestAscendPageDcpSend(CustomTestCase):
                         target_layout + [True] * len(draft_layout),
                     )
                     self.assertEqual(pool_layout, target_layout + draft_layout)
+
+    def test_hybrid_dsa_preserves_index_buffer_layout(self):
+        mgr = object.__new__(AscendKVManager)
+        mgr.is_hybrid_mla_backend = True
+        mgr.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1_000, 2_000, 3_000, 4_000, 5_000],
+            num_draft_entries=2,
+            state_types=[StateType.MAMBA, StateType.DSA],
+        )
+        mgr._dcp_remote_decode_layout = [False, False, True, False, False]
+        self.assertEqual(
+            mgr._get_dcp_remote_decode_layout(), [False, False, True, True, True]
+        )
+        mgr._dcp_remote_decode_layout = []
+        with self.assertRaisesRegex(RuntimeError, "layout does not match"):
+            mgr._get_dcp_remote_decode_layout()
 
     def test_rejects_incorrect_destination_geometry(self):
         mgr = object.__new__(AscendKVManager)
@@ -86,9 +104,10 @@ class TestAscendPageDcpSend(CustomTestCase):
             kv_item_lens=widths,
             page_size=2,
             num_draft_entries=2 if with_draft else 0,
+            state_types=[StateType.MAMBA],
         )
-        # The prefill pools report local roles; Ascend resolves remote draft slots.
-        mgr._dcp_remote_decode_layout = [False] * len(src_ids)
+        # Hybrid MLA must work without a layout hook on the public pool wrapper.
+        mgr._dcp_remote_decode_layout = []
         mgr.get_mla_kv_ptrs_with_pp = Mock(side_effect=AssertionError("legacy pairing"))
         mgr._transfer_data = Mock(return_value=0)
         kwargs = dict(
@@ -133,6 +152,12 @@ class TestAscendPageDcpSend(CustomTestCase):
                         stage_ids=stage_ids, draft=with_draft, widths=with_widths
                     ):
                         mgr, kwargs, expected = self._hybrid_case(stage_ids, with_draft)
+                        self.assertEqual(
+                            mgr.prepare_dcp_token_item_lens(
+                                kwargs["dst_kv_item_lens"], kwargs["dst_dcp_size"]
+                            ),
+                            kwargs["dcp_token_item_lens"],
+                        )
                         if not with_widths:
                             kwargs.pop("dst_kv_item_lens")
                         self.assertEqual(mgr.send_kvcache_dcp(**kwargs), 0)
