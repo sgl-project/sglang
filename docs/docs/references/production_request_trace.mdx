@@ -70,10 +70,11 @@ This section explains how to configure the request tracing and export the trace 
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
-## Cache checkpoint CPU time
+## Cache checkpoint elapsed time
 
 With request tracing enabled at level 1 or higher, `cache_checkpoint_cpu` spans
-measure calls to the prefix cache's `checkpoint` method through the scheduler's
+measure elapsed wall time around calls to the prefix cache's `checkpoint` method
+through the scheduler's
 `checkpoint_kv_cache` and `release_kv_cache` helpers. Direct backend calls outside
 these helpers are not instrumented by this stage.
 The span belongs to the request trace and carries:
@@ -84,7 +85,8 @@ The span belongs to the request trace and carries:
   copied or retained tokens.
 - `cache.checkpoint.succeeded`: whether the checkpoint call returned normally.
 
-The interval includes CPU insertion work and any blocking waits performed by
+The interval is not CPU resource consumption: it includes insertion work and any
+blocking waits performed by
 the selected cache backend. Timestamps are captured around the backend call
 before creating or exporting the span, so tracing setup and export time are not
 included in this interval. Tracing can still affect end-to-end latency; the
