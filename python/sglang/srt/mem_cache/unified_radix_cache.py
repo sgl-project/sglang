@@ -3757,8 +3757,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
             for req in failed:
                 req.skip_radix_cache_insert = True
-                req.discard_output_reason = FINISH_ABORT(
-                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                req.request_discard(
+                    FINISH_ABORT(
+                        "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                    )
                 )
         return failed
 

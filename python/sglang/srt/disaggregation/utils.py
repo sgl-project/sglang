@@ -1570,7 +1570,7 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finish_outside_step(FINISH_ABORT(error_message, status_code))
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

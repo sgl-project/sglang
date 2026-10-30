@@ -405,7 +405,7 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     if discard_finish_reason is not None:
-                        req.to_finish = discard_finish_reason
+                        req.request_finish(discard_finish_reason)
                         req.update_finish_state(0)
                     elif req.beam_group is not None:
                         # The relay point already replaced the sampled-token
@@ -526,7 +526,7 @@ class SchedulerBatchResultProcessor:
                     req.discard_output_reason is not None
                     and req.inflight_middle_chunks <= 0
                 ):
-                    req.to_finish = req.discard_output_reason
+                    req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                     req.time_stats.set_completion_time()
@@ -780,10 +780,12 @@ class SchedulerBatchResultProcessor:
                 logger.error(
                     f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                 )
-                req.to_finish = FINISH_ABORT(
-                    f"Grammar accept_token failed: {e}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "InternalServerError",
+                req.request_finish(
+                    FINISH_ABORT(
+                        f"Grammar accept_token failed: {e}",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "InternalServerError",
+                    )
                 )
         req.grammar.finished = req.finished()
 
@@ -926,10 +928,12 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT(
-                f"Grammar accept_token failed: {e}",
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "InternalServerError",
+            req.request_finish(
+                FINISH_ABORT(
+                    f"Grammar accept_token failed: {e}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                )
             )
         return retained
 
@@ -1094,7 +1098,7 @@ class SchedulerBatchResultProcessor:
                     status=status
                 )
             if sampling_mask_finish_reason is not None:
-                req.to_finish = sampling_mask_finish_reason
+                req.request_finish(sampling_mask_finish_reason)
                 new_accept_len = 0
             else:
                 req.output_ids.extend(next_token_id)
