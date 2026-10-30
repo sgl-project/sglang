@@ -193,6 +193,30 @@ class TestServerArgsPositionalOrder(CustomTestCase):
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_max_queued_tokens_cli_and_validation(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for value, expected in (("0", 0), ("100k", 100_000), ("1M", 1_000_000)):
+            with self.subTest(value=value):
+                args = ServerArgs.from_cli_args(
+                    parser.parse_args(
+                        [
+                            "--model-path",
+                            "dummy",
+                            "--served-model-name",
+                            "dummy",
+                            "--chunked-prefill-size",
+                            "-1",
+                            "--max-queued-tokens",
+                            value,
+                        ]
+                    )
+                )
+                args.check_server_args()
+                self.assertEqual(args.max_queued_tokens, expected)
+        with self.assertRaisesRegex(AssertionError, "max-queued-tokens"):
+            ServerArgs(model_path="dummy", max_queued_tokens=-1).check_server_args()
+
     def test_optimistic_prefill_allows_l2_write_through_only(self):
         for policy, expected in (
             ("write_back", 2),

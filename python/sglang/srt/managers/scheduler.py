@@ -213,6 +213,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.queue_admission import select_queue_evictions
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -3650,49 +3651,43 @@ class Scheduler(
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
-        if (
-            self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
-        ):
+        evictions = select_queue_evictions(
+            waiting_queue=self.waiting_queue,
+            incoming=recv_req,
+            max_requests=self.max_queued_requests,
+            max_tokens=get_schedule().max_queued_tokens,
+            enable_priority=self.enable_priority_scheduling,
+            low_priority_values_first=self.schedule_low_priority_values_first,
+        )
+        if evictions == []:
             return False
 
-        # Reject the incoming request by default.
-        req_to_abort = recv_req
-        message = "The request queue is full."
-        if self.enable_priority_scheduling:
-            # With priority scheduling, consider aboritng an existing request based on the priority.
-            # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
-            # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
-            # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
-            direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda item: (
-                direction * item[1].priority,
-                item[1].time_stats.wait_queue_entry_time,
-            )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
-            abort_existing_req = (
-                direction * recv_req.priority < direction * candidate_req.priority
-            )
-            if abort_existing_req:
-                self._release_aborted_request(candidate_req)
-                self.waiting_queue.pop(idx)
-                self.beam_coordinator.retire_group(candidate_req)
-                req_to_abort = candidate_req
-                message = "The request is aborted by a higher priority request."
+        rejected = evictions is None
+        if evictions is None:
+            reqs_to_abort = [recv_req]
+            message = "The request queue is full."
+        else:
+            reqs_to_abort = evictions
+            message = "The request is aborted by a higher priority request."
+            for req in evictions:
+                self._release_aborted_request(req)
+                self.waiting_queue.remove(req)
+                self.beam_coordinator.retire_group(req)
 
-        self.send_abort_output(
-            _make_abort_req(
-                req_to_abort,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": message,
-                },
-            ),
-            req_to_abort,
-        )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
-        return req_to_abort.rid == recv_req.rid
+        for req in reqs_to_abort:
+            self.send_abort_output(
+                _make_abort_req(
+                    req,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": message,
+                    },
+                ),
+                req,
+            )
+            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        return rejected
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
         """Emit aborts only; every rank must drop the same requests in the
