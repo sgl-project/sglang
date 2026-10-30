@@ -541,8 +541,10 @@ __device__ __forceinline__ uint32_t cvt_fp4_word(uint32_t p0, uint32_t p1, uint3
     return idx | (__float_as_uint(x) >> 31 << 3);
   };
   auto nib = [&](uint32_t pair) {
-    const float a = __uint_as_float((pair & 0xffffu) << 16) * __builtin_amdgcn_rcpf(dq);
-    const float b = __uint_as_float(pair & 0xffff0000u) * __builtin_amdgcn_rcpf(dq);
+    // Exact divide: rcpf is approximate and can cross an e2m1 bin edge.
+    // Adding 0 clears -0 so the sign bit is not stored as nibble 0x8.
+    const float a = __fdiv_rn(__uint_as_float((pair & 0xffffu) << 16), dq) + 0.0f;
+    const float b = __fdiv_rn(__uint_as_float(pair & 0xffff0000u), dq) + 0.0f;
     return static_cast<uint8_t>(e2m1(a) | (e2m1(b) << 4));
   };
   return static_cast<uint32_t>(nib(p0)) | (static_cast<uint32_t>(nib(p1)) << 8) |

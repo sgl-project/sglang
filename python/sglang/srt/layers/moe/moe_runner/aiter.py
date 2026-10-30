@@ -215,8 +215,16 @@ class AiterRunnerCore(MoeRunnerCore):
         use_hip_prequant = False
         inter_dim, num_experts = route_quant_handoff.staged_moe_shape()
         hip_q = None
-        if hidden_states.shape[-1] == 3584 and route_quant_handoff.hip_prequant_bucket(
-            hidden_states.shape[0], inter_dim, num_experts
+        # Aiter keys the tune table from the weight shape. Pad on the expert
+        # intermediate / hidden makes that key miss the unpadded CSV rows, so
+        # do not feed host fp4 into a fallback that expected bf16.
+        if (
+            hidden_states.shape[-1] == 3584
+            and quant_info.intermediate_pad == 0
+            and quant_info.hidden_pad == 0
+            and route_quant_handoff.hip_prequant_bucket(
+                hidden_states.shape[0], inter_dim, num_experts
+            )
         ):
             hip_q = route_quant_handoff.take_hip_mxfp4(hidden_states)
         if hip_q is not None:

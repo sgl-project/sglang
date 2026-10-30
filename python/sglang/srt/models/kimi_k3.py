@@ -1311,7 +1311,10 @@ class KimiK3MoE(nn.Module):
         router and AITER_SITUV2_A4W4 are both on; the runner consumes that
         MXFP4 only on prequant GEMM buckets.
         """
-        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        from sglang.srt.layers.quantization.mxfp4 import (
+            Mxfp4MoEMethod,
+            _aiter_situ_uses_a8w4,
+        )
 
         method = self.experts.quant_method
         flashinfer = (
@@ -1325,10 +1328,12 @@ class KimiK3MoE(nn.Module):
             return True
         # HIP radix router quantizes the staged row in the same launch.
         # Consumption is limited to a4w4 prequant buckets; f16in stays bf16.
+        # A8W4 wins over A4W4 (same precedence as the weight layout).
         return (
             _is_hip
             and envs.SGLANG_K3_RADIX4_TOPK.get()
-            and os.environ.get("AITER_SITUV2_A4W4", "0") == "1"
+            and get_bool_env_var("AITER_SITUV2_A4W4", "false")
+            and not _aiter_situ_uses_a8w4()
             and isinstance(method, Mxfp4MoEMethod)
             and self.experts.moe_runner_config.activation == "situ"
         )
