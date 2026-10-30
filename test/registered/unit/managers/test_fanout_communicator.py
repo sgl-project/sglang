@@ -2,8 +2,9 @@
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 
-from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.managers.communicator import FanOutCommunicator, FanOutTimeoutError
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -11,6 +12,18 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestQueueingCall(CustomTestCase):
+    def test_call_can_override_fan_out_without_changing_default(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(send=sent.append, fan_out=2)
+            task = asyncio.create_task(comm("request", fan_out=1))
+            await asyncio.sleep(0)
+            comm.handle_recv("response")
+            self.assertEqual(await task, ["response"])
+            self.assertEqual(comm._fan_out, 2)
+
+        asyncio.run(scenario())
+
     def test_concurrent_caller_cannot_bypass_queue(self):
         """A new caller arriving in the wakeup window must not overtake a
         queued caller (this interleaving used to raise AssertionError and
@@ -43,6 +56,96 @@ class TestQueueingCall(CustomTestCase):
             # All callers complete without error, in strict FIFO order.
             await asyncio.gather(*tasks)
             self.assertEqual(sent, ["A", "B", "C"])
+
+        asyncio.run(scenario())
+
+    def test_cancelled_call_drops_late_correlated_response(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=1,
+                mode="queueing",
+                correlation_attr="submission_id",
+            )
+
+            abandoned = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-1"))
+            )
+            await asyncio.sleep(0)
+            abandoned.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await abandoned
+
+            retry = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-2"))
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(submission_id="submission-1"))
+            await asyncio.sleep(0)
+            self.assertFalse(retry.done())
+
+            response = SimpleNamespace(submission_id="submission-2")
+            comm.handle_recv(response)
+            self.assertEqual(await retry, [response])
+
+        asyncio.run(scenario())
+
+    def test_timeout_preserves_partial_results_and_releases_queue(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=2,
+                mode="queueing",
+                correlation_attr="submission_id",
+            )
+            request = SimpleNamespace(submission_id="submission-1")
+
+            task = asyncio.create_task(comm(request, timeout=0.01))
+            await asyncio.sleep(0)
+            response = SimpleNamespace(submission_id="submission-1", rank=0)
+            comm.handle_recv(response)
+
+            with self.assertRaises(FanOutTimeoutError) as raised:
+                await task
+            self.assertEqual(raised.exception.partial_results, [response])
+            self.assertEqual(raised.exception.correlation, "submission-1")
+            self.assertIsNone(comm._result_event)
+
+            retry = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-2"), fan_out=1)
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(submission_id="submission-2"))
+            await retry
+
+        asyncio.run(scenario())
+
+    def test_late_timed_out_response_cannot_complete_retry(self):
+        async def scenario():
+            sent = []
+            comm = FanOutCommunicator(
+                send=sent.append,
+                fan_out=1,
+                mode="queueing",
+                correlation_attr="submission_id",
+            )
+
+            with self.assertRaises(FanOutTimeoutError):
+                await comm(SimpleNamespace(submission_id="submission-1"), timeout=0.01)
+
+            retry = asyncio.create_task(
+                comm(SimpleNamespace(submission_id="submission-2"), timeout=1)
+            )
+            await asyncio.sleep(0)
+            comm.handle_recv(SimpleNamespace(submission_id="submission-1"))
+            await asyncio.sleep(0)
+            self.assertFalse(retry.done())
+
+            response = SimpleNamespace(submission_id="submission-2")
+            comm.handle_recv(response)
+            self.assertEqual(await retry, [response])
 
         asyncio.run(scenario())
 
