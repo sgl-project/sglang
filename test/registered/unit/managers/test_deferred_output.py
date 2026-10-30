@@ -220,6 +220,7 @@ def test_held_responses_do_not_change_idle_state():
 def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler = MagicMock()
     scheduler._deferred_responses = None
+    scheduler.batch_result_processor.deferred_releases = {}
     scheduler.output_streamer = _scheduler().output_streamer
     scheduler.stream_released_deferred_outputs = lambda: (
         Scheduler.stream_released_deferred_outputs(scheduler)
