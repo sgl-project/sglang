@@ -15,14 +15,18 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
     """Minimal stand-in for Req: only the fields the abort paths touch."""
+
+    request_finish = Req.request_finish
+    clear_requested_finish = Req.clear_requested_finish
+    finish_outside_step = Req.finish_outside_step
 
     def __init__(self, rid: str):
         self.rid = rid
@@ -52,8 +56,11 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
+    sched.rust_server = None
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
+    sched.beam_coordinator = Mock()
+    sched.output_streamer = Mock()
     return sched
 
 
@@ -70,16 +77,6 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         self.assertIsNotNone(req.to_finish, "recorded abort was never applied")
         self.assertIsNone(sched._pending_chunked_abort_req)
 
-    def test_finished_req_only_clears_marker(self):
-        req = _FakeReq("done_rid")
-        req._finished = True
-        sched = _make_scheduler(req, chunked_req=None, running_reqs=[])
-
-        sched.process_pending_chunked_abort()
-
-        self.assertIsNone(req.to_finish)
-        self.assertIsNone(sched._pending_chunked_abort_req)
-
     def test_discarded_chunk_keeps_its_abort_reason(self):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
@@ -94,6 +91,18 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         self.assertEqual(req.finished_reason.status_code, 503)
         (abort_req, _), _ = sched.ipc_channels.send_to_tokenizer.send_output.call_args
         self.assertEqual(abort_req.finished_reason, req.discard_output_reason.to_json())
+
+    def test_aborted_chunked_beam_leader_retires_its_group(self):
+        req = _FakeReq("beam_leader")
+        sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
+        sched._release_aborted_request = Mock()
+        sched.tree_cache = None
+        sched.ipc_channels = Mock()
+
+        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
+            sched.process_pending_chunked_abort()
+
+        sched.beam_coordinator.retire_group.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Above the fp16 midpoint 1 + 2^-11 (single-rounds up to 1 + 2^-10) but below
 # the bf16 midpoint 1 + 2^-8 (rounds to 1.0, which then stays 1.0 in fp16):
@@ -178,9 +178,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     conv_states = torch.zeros(16, 6, 2)[::2]
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
-                    backend.req_to_token_pool = SimpleNamespace(
-                        mamba2_layer_cache=lambda _: cache
-                    )
+                    backend.state_layer_cache = lambda _: cache
                     expected_indices = torch.arange(2) if contiguous else indices
 
                     def convolve(_layer, _batch, x, states, slots):

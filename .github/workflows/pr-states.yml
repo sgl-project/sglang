@@ -111,7 +111,7 @@ jobs:
             const sha = pr.head.sha;
             const labels = pr.labels.map(l => l.name);
             const hasCI = labels.includes('run-ci');
-            const hasExtra = labels.includes('run-ci-extra');
+            const hasNvExtra = labels.includes('run-ci-nv-extra');
 
             // Pre-sleep below only matters when a label was just removed;
             // other no-label fires don't race against fresh indexing.
@@ -162,7 +162,7 @@ jobs:
               // pr-test-extra gates on BOTH labels (see call-gate there).
               findRun(
                 'pr-test-extra.yml',
-                (hasCI && hasExtra) ? labelOnOpts : labelOffOpts,
+                (hasCI && hasNvExtra) ? labelOnOpts : labelOffOpts,
               ),
               findRun('pr-test-amd.yml', labelOffOpts),
             ]);
@@ -173,7 +173,7 @@ jobs:
 
             const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
-            const notExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-extra` label to opt in.';
+            const notNvExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-nv-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
@@ -202,8 +202,8 @@ jobs:
               ? runLink(peRun)
               : !hasCI
                 ? peBlockedByCIText
-                : !hasExtra
-                  ? notExtraEnabledText
+                : !hasNvExtra
+                  ? notNvExtraEnabledText
                   : stalePushText;
             const amdText = isReal(amdRun)
               ? runLink(amdRun)
