@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/models/kimi_linear.py
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Optional
 
 import torch
@@ -203,6 +203,9 @@ class KimiDeltaAttention(nn.Module):
         reduce_results: bool = True,
         shard_on_attn_tp: bool = False,
         v_head_dim: Optional[int] = None,
+        linear_attention_cls: Callable[..., RadixLinearAttention] = (
+            RadixLinearAttention
+        ),
         **kwargs,
     ) -> None:
         """Kimi Delta Attention.
@@ -220,6 +223,8 @@ class KimiDeltaAttention(nn.Module):
         shard_on_attn_tp: shard on the attention-TP group instead of the global
             TP group. Required under DP attention, where attn_tp_size < tp_size.
         v_head_dim: asymmetric value head dim; defaults to the key head dim.
+        linear_attention_cls: builds ``self.attn``; DFlash drafts pass a layer
+            that runs on their own per-request recurrent state.
         """
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -431,7 +436,7 @@ class KimiDeltaAttention(nn.Module):
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
-        self.attn = RadixLinearAttention(
+        self.attn = linear_attention_cls(
             layer_id=self.layer_idx,
             num_q_heads=_get_kda_local_num_heads(self.num_k_heads, self.shard_tp_size),
             num_k_heads=_get_kda_local_num_heads(self.num_k_heads, self.shard_tp_size),
