@@ -558,5 +558,6 @@ POSITIONAL_FIELD_ORDER = (
     "engram_config",
     "moe_ascend_ops_config",
     "cp_kv_layout",
+    "max_mm_preprocessing_inflight_items_per_worker",
 )
 # fmt: on
