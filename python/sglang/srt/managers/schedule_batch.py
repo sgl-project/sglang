@@ -1276,9 +1276,9 @@ class Req(ReqDllmMixin):
         self.finished_output = None
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
-        # If we want to abort the request in the middle of the event loop,
-        # call request_finish instead of finish_outside_step.
-        # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
+        # A finish the request's next commit applies: the commit's own checks,
+        # intake rejection, retract and session aborts, a PD prefill abort, or
+        # a pending finish a retract-mode pause hands over.
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids

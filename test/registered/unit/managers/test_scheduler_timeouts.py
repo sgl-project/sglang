@@ -27,6 +27,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -75,6 +78,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
+    s.pending_finishes = PendingFinishes()
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
@@ -191,10 +195,8 @@ class TestRunningTimeout(CustomTestCase):
             aborts = s._poll_timeout_aborts()
 
         self.assertEqual([a.rid for a in aborts], ["stale"])
-        # to_finish is set by abort_request() on every rank, not by the poll.
-        self.assertIsNone(stale.to_finish)
-        self.assertIsNone(fresh.to_finish)
-        self.assertIsNone(done.to_finish, "a finished req must not be aborted")
+        # abort_request() requests the finish on every rank, not the poll.
+        self.assertFalse(s.pending_finishes)
 
     def test_req_in_both_running_and_last_batch_is_emitted_once(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)
@@ -219,10 +221,12 @@ class TestRunningTimeout(CustomTestCase):
         with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
             aborts = s._poll_timeout_aborts()
             self.assertEqual([abort.rid for abort in aborts], ["stale"])
-            # The broadcast abort marks to_finish before the GPU result arrives.
+            # A PD prefill request keeps its own exit: the broadcast abort
+            # marks to_finish before the GPU result arrives.
             s.abort_request(aborts[0])
             self.assertIsInstance(stale.to_finish, FINISH_ABORT)
             self.assertIsNone(fresh.to_finish)
+            self.assertFalse(s.pending_finishes)
             self.assertFalse(stale.finished())
             for _ in range(3):
                 self.assertEqual(s._poll_timeout_aborts(), [])
@@ -250,7 +254,7 @@ class TestRunningTimeout(CustomTestCase):
                 with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
                     aborts = s._poll_timeout_aborts()
                     # Abort and weight-version updates share this request inventory.
-                    self.assertEqual(s.collect_admitted_reqs(), {older, newer})
+                    self.assertEqual(set(s.collect_admitted_reqs()), {older, newer})
 
                 self.assertEqual(
                     [a.rid for a in aborts],

@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from collections import deque
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_mlx_ci
@@ -47,11 +47,15 @@ if _HAS_MLX:
         SchedulerMlxOverlapMixin,
     )
     from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
+    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
+    )
+    from sglang.srt.managers.scheduler_components.pending_finishes import (
+        PendingFinishes,
     )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
@@ -1161,6 +1165,10 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.ingest_requests = lambda: []
+        scheduler.pending_finishes = PendingFinishes()
+        scheduler.drain_pending_finishes = MethodType(
+            Scheduler.drain_pending_finishes, scheduler
+        )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.forward_ct = 0

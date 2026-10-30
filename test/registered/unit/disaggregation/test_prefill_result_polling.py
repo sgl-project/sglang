@@ -31,6 +31,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -124,6 +127,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
+    drain_pending_finishes = Scheduler.drain_pending_finishes
 
     def __init__(
         self,
@@ -164,6 +168,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.attn_tp_cpu_group = None
         self.last_batch = None
         self.result_queue = deque()
+        self.pending_finishes = PendingFinishes()
         self._deferred_responses = None
         self.chunked_req = None
         self.decode_offload_manager = None

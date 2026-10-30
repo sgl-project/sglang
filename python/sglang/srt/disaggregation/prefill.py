@@ -696,6 +696,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Receive requests
             self.ingest_requests()
+            self.drain_pending_finishes()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -818,6 +819,7 @@ class SchedulerDisaggregationPrefillMixin:
             received_inputs = should_ingest_requests and self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
             )
+            self.drain_pending_finishes()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()

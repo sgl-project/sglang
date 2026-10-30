@@ -161,6 +161,9 @@ class SchedulerBatchResultProcessor:
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
+            if req.finished():
+                # Finished outside the commit (an abort): its release is the drain's.
+                continue
             req.time_stats.set_decode_prebuilt_finish_time()
             req.update_finish_state()
             if req.finished():
@@ -524,7 +527,10 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
+                if req.is_retracted or (
+                    req.finished() and req.inflight_middle_chunks <= 0
+                ):
+                    # Retracted, or finished outside the commit (an abort).
                     continue
 
                 if (
@@ -1082,11 +1088,11 @@ class SchedulerBatchResultProcessor:
                 )
                 continue
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
+            if req.finished() or req.is_retracted:
+                # Finished or retracted while this step was in flight: by the
+                # previous commit (overlap) or outside a commit (an abort,
+                # with a step in flight in any loop). All the over-allocated
+                # tokens are freed in `release_kv_cache`.
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -1560,7 +1566,14 @@ class SchedulerBatchResultProcessor:
                 self.decode_offload_manager.finalize_release_on_finish(req)
         else:
             if get_memory().enable_hisparse:
-                self.hisparse_coordinator.request_finished(req)
+                # A request still in host staging (aborted right after its
+                # prefill) holds staging rows instead of a device buffer, and
+                # its KV goes without an insert, as a retraction releases it.
+                if req.hisparse_staging:
+                    self.hisparse_coordinator.abort_staging_request(req)
+                    checkpoint = False
+                else:
+                    self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 

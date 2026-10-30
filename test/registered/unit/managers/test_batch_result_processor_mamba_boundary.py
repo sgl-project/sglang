@@ -14,6 +14,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -110,6 +113,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler.process_input_requests = MagicMock()
                 scheduler._engine_paused = False
                 scheduler.running_batch = batch
+                scheduler.pending_finishes = PendingFinishes()
                 scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
                 scheduler.run_batch = MagicMock(return_value=result)
                 scheduler._apply_war_barrier = MagicMock()
