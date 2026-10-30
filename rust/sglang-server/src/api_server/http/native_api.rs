@@ -526,7 +526,7 @@ fn health_routes() -> Router<Arc<AppState>> {
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.core.is_serving() {
+    if state.core.is_serving() && !state.core.is_draining() {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -566,7 +566,7 @@ async fn health_generate(
             }
             response
         }
-        Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
+        Ok(HealthStatus::NotReady | HealthStatus::Stalled | HealthStatus::Draining) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(CoreError::Unavailable) => native_error(

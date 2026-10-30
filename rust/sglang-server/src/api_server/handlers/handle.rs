@@ -2,7 +2,7 @@
 //! cancellation ownership, and the runtime-call guard behind every operation.
 
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -24,7 +24,11 @@ use crate::utils::fsm::RequestState;
 
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
-use crate::api_server::core::{CoreError, FrontendMetrics};
+use crate::api_server::core::{CoreError, DrainEnd, DrainState, FrontendMetrics};
+
+/// How long the listeners keep open connections after a drain's requests
+/// finished: enough to flush the last responses and close idle connections.
+pub(crate) const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct CoreConfig {
     pub(crate) response_capacity: usize,
@@ -127,6 +131,11 @@ pub(super) struct CoreInner {
     /// The DP rank the local scheduler answers for, and the targets for the rest.
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    /// Shared by every transport (see [`CoreHandle::begin_drain`]).
+    pub(super) drain: Arc<DrainState>,
+    /// Overrides [`GRACEFUL_CLOSE_TIMEOUT`] (see
+    /// [`CoreHandle::set_graceful_close_timeout`]).
+    pub(super) graceful_close_timeout: OnceLock<Duration>,
 }
 
 impl CoreHandle {
@@ -152,6 +161,8 @@ impl CoreHandle {
                 metrics: config.metrics,
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
+                drain: Arc::default(),
+                graceful_close_timeout: OnceLock::new(),
             }),
         }
     }
@@ -182,6 +193,59 @@ impl CoreHandle {
     /// shared by every transport.
     pub(crate) fn mark_ready(&self) {
         self.inner.startup_ready.store(true, Ordering::Release);
+    }
+
+    /// Begin the graceful drain (idempotent): health answers 503 from now
+    /// on, requests are still admitted, and [`CoreHandle::drain_ended`]
+    /// resolves once none is left in flight. `force` skips that wait.
+    pub(crate) fn begin_drain(&self, force: bool) {
+        self.inner.drain.begin(force);
+    }
+
+    /// Set the graceful-close timeout once, at boot; the first value wins.
+    pub(crate) fn set_graceful_close_timeout(&self, timeout: Duration) {
+        let _ = self.inner.graceful_close_timeout.set(timeout);
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.inner.drain.is_draining()
+    }
+
+    /// Resolve once the drain has ended (see [`DrainState::ended`]); the
+    /// listeners then close.
+    pub(crate) async fn drain_ended(&self) -> DrainEnd {
+        self.inner.drain.ended().await
+    }
+
+    /// Resolve once the drain must stop waiting for in-flight requests.
+    pub(crate) async fn drain_forced(&self) {
+        self.inner.drain.forced().await;
+    }
+
+    /// Resolve once the listeners must stop waiting for open connections:
+    /// when the drain is forced, or the graceful-close timeout
+    /// ([`GRACEFUL_CLOSE_TIMEOUT`] by default) after its requests drained. A
+    /// request that raced the close, or a client that never acknowledges the
+    /// HTTP/2 shutdown, must not hold the scheduler's shutdown.
+    pub(crate) async fn drain_close_deadline(&self) {
+        tokio::select! {
+            () = self.drain_forced() => {}
+            () = async {
+                self.drain_ended().await;
+                let timeout = self
+                    .inner
+                    .graceful_close_timeout
+                    .get()
+                    .copied()
+                    .unwrap_or(GRACEFUL_CLOSE_TIMEOUT);
+                tokio::time::sleep(timeout).await;
+            } => {}
+        }
+    }
+
+    /// Why the drain skipped its wait, in Python's words; `None` if it did not.
+    pub(crate) fn drain_force_reason(&self) -> Option<&'static str> {
+        self.inner.drain.force_reason()
     }
 
     pub(super) fn response_activity(&self) -> u64 {

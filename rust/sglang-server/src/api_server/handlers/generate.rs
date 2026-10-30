@@ -16,26 +16,33 @@ use crate::utils::error::Error;
 use super::handle::{
     CoreHandle, ExpectedResponse, LastOutput, RuntimeCall, translate_runtime_error,
 };
-use crate::api_server::core::{CoreError, CoreEvent, RequestMetrics, prefetch};
+use crate::api_server::core::{CoreError, CoreEvent, InFlight, RequestMetrics, prefetch};
 
 impl CoreHandle {
     pub(crate) async fn generate(&self, request: GenerateRequest) -> Result<CoreCall, CoreError> {
+        // Counted from admission, media prefetch included: the drain waits
+        // for it.
+        let in_flight = self.inner.drain.track();
         let generation = self
             .inner
             .generations
             .register(request.rid.clone(), self.inner.abort_tx.clone());
-        self.generate_registered(request, generation).await
+        self.generate_registered(request, generation, in_flight)
+            .await
     }
 
     /// Register a generation under the public ID `rid` before its request
     /// exists, so an explicit cancellation in the meantime is kept for
-    /// [`Self::generate_pending`].
+    /// [`Self::generate_pending`]. The hold counts as in flight: the drain
+    /// waits for the work before `/generate` as for media prefetch.
     pub(crate) fn hold_generation(&self, rid: &str) -> PendingGeneration {
-        PendingGeneration(
-            self.inner
+        PendingGeneration {
+            generation: self
+                .inner
                 .generations
                 .register(Rid::from_client(rid), self.inner.abort_tx.clone()),
-        )
+            in_flight: self.inner.drain.track(),
+        }
     }
 
     /// [`Self::generate`] for a request held by [`Self::hold_generation`]
@@ -46,14 +53,19 @@ impl CoreHandle {
         request: GenerateRequest,
         pending: PendingGeneration,
     ) -> Result<CoreCall, CoreError> {
-        debug_assert!(pending.0.rid == request.rid, "the request claims its hold");
-        self.generate_registered(request, pending.0).await
+        debug_assert!(
+            pending.generation.rid == request.rid,
+            "the request claims its hold"
+        );
+        self.generate_registered(request, pending.generation, pending.in_flight)
+            .await
     }
 
     async fn generate_registered(
         &self,
         mut request: GenerateRequest,
         mut generation: Generation,
+        in_flight: InFlight,
     ) -> Result<CoreCall, CoreError> {
         let created_at = Instant::now();
         self.set_default_priority(&mut request);
@@ -71,7 +83,7 @@ impl CoreHandle {
         let metrics = self.request_metrics(&request, created_at);
         self.submit_generation(request, generation)
             .await
-            .map(|runtime| self.generation_call(runtime, metrics))
+            .map(|runtime| self.generation_call(runtime, metrics, Some(in_flight)))
     }
 
     /// Submit core-owned work without exposing it through the public Abort
@@ -85,6 +97,10 @@ impl CoreHandle {
     ) -> Result<CoreCall, CoreError> {
         let created_at = Instant::now();
         self.set_default_priority(&mut request);
+        // Counted from admission, media prefetch included: the drain waits
+        // for it. The health probe is not a client request; the drain never
+        // waits for it.
+        let in_flight = log_metrics.then(|| self.inner.drain.track());
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         let metrics = log_metrics
@@ -92,7 +108,7 @@ impl CoreHandle {
             .flatten();
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(|runtime| self.generation_call(runtime, metrics))
+            .map(|runtime| self.generation_call(runtime, metrics, in_flight))
     }
 
     /// Prepare the group before submitting any surviving request. Explicit
@@ -110,6 +126,8 @@ impl CoreHandle {
         for request in &mut requests {
             self.set_default_priority(request);
         }
+        // Counted from admission, media prefetch included (see `generate`).
+        let in_flight: Vec<InFlight> = requests.iter().map(|_| self.inner.drain.track()).collect();
         let mut generations: Vec<_> = requests
             .iter()
             .map(|request| {
@@ -133,11 +151,13 @@ impl CoreHandle {
         .await?;
 
         let mut calls = Vec::with_capacity(requests.len());
-        for (request, generation) in requests.into_iter().zip(generations) {
+        for ((request, generation), in_flight) in
+            requests.into_iter().zip(generations).zip(in_flight)
+        {
             let rid = request.rid.clone();
             let metrics = self.request_metrics(&request, created_at);
             let call = match self.submit_generation(request, generation).await {
-                Ok(call) => self.generation_call(call, metrics),
+                Ok(call) => self.generation_call(call, metrics, Some(in_flight)),
                 // Cancellation may happen during preparation or while waiting
                 // for intake. Keep this slot without rolling back siblings.
                 Err(CoreError::Cancelled(_)) => {
@@ -169,8 +189,18 @@ impl CoreHandle {
             .await
     }
 
-    fn generation_call(&self, runtime: RuntimeCall, metrics: Option<RequestMetrics>) -> CoreCall {
-        CoreCall::new(runtime, self.inner.metadata.weight_version.clone(), metrics)
+    fn generation_call(
+        &self,
+        runtime: RuntimeCall,
+        metrics: Option<RequestMetrics>,
+        in_flight: Option<InFlight>,
+    ) -> CoreCall {
+        CoreCall::new(
+            runtime,
+            self.inner.metadata.weight_version.clone(),
+            metrics,
+            in_flight,
+        )
     }
 
     /// Python `_set_default_priority`: an unset priority takes the configured
@@ -220,6 +250,8 @@ pub(crate) struct CoreCall {
     weight_version: Option<Arc<str>>,
     /// Observes every runtime item as the call receives it.
     metrics: Option<RequestMetrics>,
+    /// Holds the drain open while this client request is alive.
+    _in_flight: Option<InFlight>,
 }
 
 impl CoreCall {
@@ -227,12 +259,14 @@ impl CoreCall {
         runtime: RuntimeCall,
         weight_version: Option<Arc<str>>,
         metrics: Option<RequestMetrics>,
+        in_flight: Option<InFlight>,
     ) -> Self {
         Self {
             runtime,
             events_finished: false,
             weight_version,
             metrics,
+            _in_flight: in_flight,
         }
     }
 
@@ -260,6 +294,7 @@ impl CoreCall {
                 last_output: LastOutput::default(),
                 abort_deadline: None,
             },
+            None,
             None,
             None,
         )
@@ -332,6 +367,7 @@ impl CoreCall {
                 last_output: LastOutput::default(),
                 abort_deadline: None,
             },
+            None,
             None,
             None,
         )
@@ -612,7 +648,11 @@ impl Drop for Generation {
 
 /// A generation registered for explicit cancellation before its request
 /// exists ([`CoreHandle::hold_generation`]). Dropping it unregisters it.
-pub(crate) struct PendingGeneration(Generation);
+pub(crate) struct PendingGeneration {
+    generation: Generation,
+    /// Holds the drain open until the request ends or the hold drops.
+    in_flight: InFlight,
+}
 
 impl PendingGeneration {
     /// Make this the generation of `request`, which arrived for it. The
@@ -622,10 +662,16 @@ impl PendingGeneration {
     /// cannot be reached by aborts naming the held one: it registers afresh,
     /// keeping a cancellation that already selected the hold.
     pub(crate) fn claim(self, request: &mut GenerateRequest) -> Self {
-        let mut held = self.0;
+        let Self {
+            generation: mut held,
+            in_flight,
+        } = self;
         if held.rid.client_facing() == request.rid.client_facing() {
             request.rid = held.rid.clone();
-            return Self(held);
+            return Self {
+                generation: held,
+                in_flight,
+            };
         }
         tracing::warn!(
             held = held.rid.client_facing(),
@@ -643,18 +689,21 @@ impl PendingGeneration {
             fresh.observed = Some(cancellation);
             fresh.abort_all = abort_all;
         }
-        Self(fresh)
+        Self {
+            generation: fresh,
+            in_flight,
+        }
     }
 
     /// Resolves once an explicit cancellation selects the generation.
     pub(crate) async fn cancelled(&mut self) -> Aborted {
-        let ending = match self.0.cancelled().await {
+        let ending = match self.generation.cancelled().await {
             Cancellation::Error => AbortEnding::CancelledError,
             Cancellation::Unstarted | Cancellation::Scheduler => AbortEnding::AbortFinishReason,
         };
         Aborted {
             ending,
-            abort_all: self.0.abort_all,
+            abort_all: self.generation.abort_all,
         }
     }
 }
@@ -665,7 +714,7 @@ mod tests {
     use super::AbortEnding::{AbortFinishReason, CancelledError};
     use super::*;
     use crate::api_server::core::FrontendMetrics;
-    use crate::api_server::core::{CoreErrorKind, CoreOutput};
+    use crate::api_server::core::{CoreErrorKind, CoreOutput, DrainEnd};
     use crate::api_server::handlers::test_utils::*;
     use crate::message::config::DisaggregationMode;
     use crate::message::multimodal::MmItem;
@@ -1277,6 +1326,104 @@ mod tests {
             .unwrap();
         assert!(harness.intake_rx.try_recv().is_err());
         assert!(matches!(call.recv().await, Some(CoreEvent::Finished(_))));
+    }
+
+    /// A request still fetching its media when the drain begins holds the
+    /// drain open, and is admitted once its media arrive.
+    #[tokio::test]
+    async fn drain_waits_for_a_request_in_media_prefetch() {
+        use crate::message::types::TokenIds;
+        use crate::multi_modality::worker::MmProcessor;
+
+        struct SlowFetch {
+            started: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl MmProcessor for SlowFetch {
+            fn process(
+                &self,
+                _input_ids: TokenIds,
+                _mm: MmData,
+            ) -> Result<crate::multi_modality::worker::MmProcessOutput, MediaError> {
+                unreachable!("never encoded here")
+            }
+
+            fn fetch_media(
+                &self,
+                _source: &str,
+                _modality: crate::multi_modality::encoded::MmModality,
+                _budget: &crate::MediaByteBudget,
+            ) -> Result<Option<Bytes>, MediaError> {
+                self.started.lock().unwrap().send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(Some(Bytes::from_static(b"media")))
+            }
+        }
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let harness = Harness::unbounded(8);
+        assert!(harness.handle.set_mm_processor(Arc::new(SlowFetch {
+            started: std::sync::Mutex::new(started_tx),
+            release: std::sync::Mutex::new(release_rx),
+        })));
+        let request = GenerateRequest {
+            rid: "fetching".into(),
+            input_ids: Some(vec![1]),
+            mm: Some(Box::new(MmData {
+                image_data: vec![MmItem::Source("custom://slow".into())],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let handle = harness.handle.clone();
+        let call = tokio::spawn(async move { handle.generate(request).await });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        harness.handle.begin_drain(false);
+        let ended =
+            || tokio::time::timeout(Duration::from_millis(100), harness.handle.drain_ended());
+        assert!(
+            ended().await.is_err(),
+            "the drain ignored a request in prefetch"
+        );
+        release_tx.send(()).unwrap();
+        let call = call
+            .await
+            .unwrap()
+            .expect("admitted after its media arrived");
+        let _admitted = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(ended().await.is_err());
+        drop(call);
+        assert_eq!(ended().await.ok(), Some(DrainEnd::Drained));
+    }
+
+    /// A request held before `/generate` ([`CoreHandle::hold_generation`])
+    /// holds the drain open from the hold, through its claim, until its call
+    /// ends; a hold dropped unclaimed (a client gone during the layer's work)
+    /// releases it.
+    #[tokio::test]
+    async fn drain_waits_for_a_held_request() {
+        let harness = Harness::unbounded(8);
+        let held = harness.handle.hold_generation("held");
+        let dropped = harness.handle.hold_generation("dropped");
+        harness.handle.begin_drain(false);
+        let ended =
+            || tokio::time::timeout(Duration::from_millis(100), harness.handle.drain_ended());
+        drop(dropped);
+        assert!(ended().await.is_err(), "the drain ignored a held request");
+        let mut request = public_request("held");
+        let held = held.claim(&mut request);
+        let handle = harness.handle.clone();
+        let call = tokio::spawn(async move { handle.generate_pending(request, held).await });
+        let _admitted = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let call = call.await.unwrap().expect("the held request is admitted");
+        assert!(ended().await.is_err());
+        drop(call);
+        assert_eq!(ended().await.ok(), Some(DrainEnd::Drained));
     }
 
     /// An `/abort_request` that ends a call before Intake claims it records
