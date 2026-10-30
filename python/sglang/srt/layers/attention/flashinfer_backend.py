@@ -754,8 +754,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if (
-            spec_info is not None
-            and spec_info.ragged_verify_layout is not None
+            forward_batch.ragged_verify_layout is not None
             and forward_mode.is_target_verify()
         ):
             raise NotImplementedError(
