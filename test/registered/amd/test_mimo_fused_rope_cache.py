@@ -11,7 +11,7 @@ from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _cos_sin_cache(length=128):
@@ -48,20 +48,21 @@ class TestMiMoFusedRopeCache(CustomTestCase):
         v = torch.randn(m, 1, 128, device="cuda", dtype=torch.bfloat16)
         positions = torch.arange(7, 7 + m, device="cuda", dtype=torch.int64)
         slots = torch.arange(3, 3 + m, device="cuda", dtype=torch.int64)
-        cos_sin = _cos_sin_cache()
+        cache_size = max(32, 3 + m)
+        cos_sin = _cos_sin_cache(7 + m)
         if shuffle_cache:
             key_cache = torch.zeros(
-                32, 1, 6, 1, 32, device="cuda", dtype=torch.bfloat16
+                cache_size, 1, 6, 1, 32, device="cuda", dtype=torch.bfloat16
             )
             value_cache = torch.zeros(
-                32, 1, 4, 1, 32, device="cuda", dtype=torch.bfloat16
+                cache_size, 1, 4, 1, 32, device="cuda", dtype=torch.bfloat16
             )
         else:
             key_cache = torch.zeros(
-                32, 1, 1, 192, device="cuda", dtype=torch.bfloat16
+                cache_size, 1, 1, 192, device="cuda", dtype=torch.bfloat16
             )
             value_cache = torch.zeros(
-                32, 1, 1, 128, device="cuda", dtype=torch.bfloat16
+                cache_size, 1, 1, 128, device="cuda", dtype=torch.bfloat16
             )
         rotary = types.SimpleNamespace(
             head_size=192,
@@ -86,7 +87,7 @@ class TestMiMoFusedRopeCache(CustomTestCase):
         return cache[slots, 0]
 
     def test_matches_reference(self):
-        for m in (1, 4, 16):
+        for m in (1, 4, 16, 32, 120, 128):
             for shuffle_cache in (False, True):
                 with self.subTest(m=m, shuffle_cache=shuffle_cache):
                     q, k, v, positions, rotary, args = self._case(
@@ -116,7 +117,7 @@ class TestMiMoFusedRopeCache(CustomTestCase):
                     )
 
     def test_graph_replay(self):
-        q, k, v, positions, rotary, args = self._case(4, shuffle_cache=True)
+        q, k, v, positions, rotary, args = self._case(120, shuffle_cache=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             accepted = try_mimo_fused_rope_cache(

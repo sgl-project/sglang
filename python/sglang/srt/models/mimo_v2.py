@@ -787,7 +787,10 @@ class MiMoV2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         fused_cache = False
         if (
-            forward_batch.forward_mode.is_decode_or_idle()
+            (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and mimo_fused_front_enabled()
         ):
             fused_cache = try_mimo_fused_rope_cache(

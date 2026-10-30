@@ -173,7 +173,7 @@ def try_mimo_fused_rope_cache(
     global _logged_dispatch
     if not mimo_fused_front_enabled():
         return False
-    if q.shape[0] == 0 or q.shape[0] > 16:
+    if q.shape[0] == 0 or q.shape[0] > 128:
         return False
     if not rotary_emb.is_neox_style:
         return False
