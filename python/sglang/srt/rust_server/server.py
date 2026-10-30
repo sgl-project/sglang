@@ -233,6 +233,14 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        if get_exec().moe.is_ep_joiner:
+            # An elastic-EP joiner stays out: the serving ranks gathered at
+            # their own startup and never enter this collective again, so a
+            # joiner's gather cannot meet them (a scale joiner's returns at
+            # once with unset slots, a recover joiner's waits on them; see
+            # #47505). With no endpoints the joiner's listener fans nothing
+            # out, and the serving ranks' table is untouched.
+            return []
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another
