@@ -29,11 +29,11 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
     SharedReadEnds,
     resolve_window_kv_pool,
 )
 from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -167,7 +167,7 @@ class TRTLLMMHAMetadata:
     fmha_v2_block_tables: Optional[dict] = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -181,7 +181,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if fm == ForwardMode.EXTEND:
             return SharedReadEnds.PRE_REPLAY
-        return super().shared_read_ends(fm)
+        return AttentionBackend.shared_read_ends(self, fm)
 
     def __init__(
         self,
@@ -201,13 +201,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner,
-            skip_prefill,
-            kv_indptr_buf,
-            kv_last_page_len_buf,
-            window_kv_indptr_buf=window_kv_indptr_buf,
-        )
+        # Minimal setup previously inherited from FlashInferAttnBackend.
+        # TRTLLMHAAttnBackend overrides almost everything else; only these
+        # attributes are actually used (see #28808).
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.runner_ids = model_runner.runner_ids
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "prefill", "trtllm_mha"
         )
@@ -342,6 +341,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         else:
             self._swa_full_to_swa_mapping = None
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
 
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
@@ -500,6 +500,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             f"KV cache method {method_name!r} does not support prefill with "
             f"trtllm_mha. Available prefill accesses: {available}."
         )
+
+    def _kv_write_scales(self, layer: RadixAttention):
+        # Moved from FlashInferAttnBackend (#28808): the only non-overridden
+        # parent method still called by this backend.
+        if self.kv_cache_quant_method.needs_global_scale():
+            return None, None
+        return layer.k_scale, layer.v_scale
 
     def _nvfp4_output_view(self, q: torch.Tensor) -> torch.Tensor:
         if self._nvfp4_fp8_output is None:
