@@ -2112,7 +2112,7 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via the custom_ops kernel.
+    """NPU-accelerated hc_pre via the fused pre+sinkhorn op.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
     because npu_hc_pre does not fold input_layernorm — the caller must
@@ -2137,25 +2137,31 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
-    y, post, comb = torch.ops.custom.npu_hc_pre(
-        x,
+    from sglang.srt.hardware_backend.npu.utils import (
+        require_cann_transformer_ops,
+    )
+
+    # The fused op takes 4-D BSND; mHC is token-local, so a (T, 1, n, c)
+    # view of the TND batch is equivalent.
+    fused = require_cann_transformer_ops("mhc_pre_sinkhorn")[0]
+    x4 = x.reshape(-1, 1, hc_mult, shape[-1])
+    h_in, h_post, h_res, *_ = fused(
+        x4,
         hc_fn,
         hc_scale,
         hc_base,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
+        hc_mult,
+        hc_sinkhorn_iters,
+        hc_eps,
+        rms_norm_eps,
+        False,
     )
-    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-    # not fold input_layernorm. Return norm_fused=False so the caller
-    # applies the layernorm itself, matching the deepgemm/torch paths.
-    return y.to(dtype), post, comb, False
+    return (
+        h_in.reshape(-1, shape[-1]).to(dtype),
+        h_post.reshape(-1, hc_mult),
+        h_res.reshape(-1, hc_mult, hc_mult),
+        False,
+    )
 
 
 @triton.jit

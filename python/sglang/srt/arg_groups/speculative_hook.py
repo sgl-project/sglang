@@ -701,8 +701,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(attn_cp_size={cfg.attn_cp_size})."
             )
         if (
-            not _is_npu
-            and cfg.speculative_moe_a2a_backend is not None
+            cfg.speculative_moe_a2a_backend is not None
             and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
         ):
             raise ValueError(
