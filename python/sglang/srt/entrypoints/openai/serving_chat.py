@@ -2196,15 +2196,37 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
+            skip_reencode = (
+                envs.SGLANG_CHAT_MM_SKIP_PROMPT_REENCODE.get()
+                and is_multimodal
+                and bool(image_data or video_data or audio_data)
+                and not tools
+                and not assistant_prefix
+                and not self._prompt_text_round_trip_is_lossy
+                and not add_special_tokens
+            )
             try:
-                prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
-                    openai_compatible_messages,
-                    tools=tools,
-                    template_kwargs=extra_template_kwargs,
-                    encode_kwargs=encode_kwargs,
-                    use_cache=is_multimodal,
-                    add_generation_prompt=add_generation_prompt is not False,
-                )
+                if skip_reencode:
+                    prompt_ids = []
+                    decoded_prompt = (
+                        self.tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=add_generation_prompt is not False,
+                            tools=None,
+                            return_dict=False,
+                            **extra_template_kwargs,
+                        )
+                    )
+                else:
+                    prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                        openai_compatible_messages,
+                        tools=tools,
+                        template_kwargs=extra_template_kwargs,
+                        encode_kwargs=encode_kwargs,
+                        use_cache=is_multimodal,
+                        add_generation_prompt=add_generation_prompt is not False,
+                    )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
