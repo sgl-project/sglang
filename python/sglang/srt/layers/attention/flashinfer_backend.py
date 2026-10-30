@@ -35,6 +35,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     resolve_window_id_space,
     resolve_window_kv_pool,
 )
+from sglang.srt.layers.attention.flashinfer_deterministic import (
+    build_prefill_pad_indices,
+    deterministic_prefill_min_q,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -172,6 +176,8 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    prefill_q_pad_gather_idx: Optional[torch.Tensor] = None
+    prefill_q_pad_out_idx: Optional[torch.Tensor] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -1094,6 +1100,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                prefill_q_pad_gather_idx=self.indices_updater_prefill.prefill_q_pad_gather_idx,
+                prefill_q_pad_out_idx=self.indices_updater_prefill.prefill_q_pad_out_idx,
             )
 
     def init_cuda_graph_state(
@@ -1431,8 +1439,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            pad_gather_idx = self.forward_metadata.prefill_q_pad_gather_idx
+            if pad_gather_idx is not None:
+                q_3d = torch.cat(
+                    [q_3d, q_3d.new_zeros((1, *q_3d.shape[1:]))], dim=0
+                ).index_select(0, pad_gather_idx)
             o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                q_3d,
                 kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
@@ -1442,6 +1456,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            if pad_gather_idx is not None:
+                o = o.index_select(0, self.forward_metadata.prefill_q_pad_out_idx)
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -1925,6 +1941,21 @@ class FlashInferIndicesUpdaterPrefill:
         self._swa_space = attn_backend._swa_space
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
+        self.prefill_cta_min_q = (
+            deterministic_prefill_min_q(
+                self.num_qo_heads, self.num_kv_heads, self.head_dim
+            )
+            if attn_backend.enable_deterministic
+            else 1
+        )
+        self.prefill_q_pad_enabled = (
+            attn_backend.enable_deterministic
+            and attn_backend.dispatch_reason is None
+            and not attn_backend.enable_mis
+        )
+        self.prefill_q_pad_gather_idx: Optional[torch.Tensor] = None
+        self.prefill_q_pad_out_idx: Optional[torch.Tensor] = None
+
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             self.update = self.update_sliding_window
@@ -2003,6 +2034,7 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             custom_kv_indices=custom_kv_indices,
             plan=plan,
         )
@@ -2211,6 +2243,48 @@ class FlashInferIndicesUpdaterPrefill:
                 plan=plan,
             )
 
+    def _can_pad_prefill_q(
+        self,
+        wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
+        use_ragged: bool,
+        use_sliding_window_kv_pool: bool,
+        custom_kv_indices: Optional[torch.Tensor],
+        cross_attention_custom_mask: Optional[torch.Tensor],
+        multi_item_params: Optional[MultiItemScoringParams],
+    ) -> bool:
+        if not self.prefill_q_pad_enabled or self.prefill_cta_min_q <= 1:
+            return False
+        if wrapper_paged.is_cuda_graph_enabled:
+            return False
+        if use_ragged or use_sliding_window_kv_pool:
+            return False
+        if custom_kv_indices is not None or cross_attention_custom_mask is not None:
+            return False
+        if multi_item_params is not None and multi_item_params.is_enabled():
+            return False
+        return not is_in_tc_piecewise_cuda_graph()
+
+    def _prefill_q_lens_cpu(
+        self,
+        q_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        extend_prefix_lens_cpu: Optional[List[int]],
+    ) -> List[int]:
+        bs = q_lens.shape[0]
+        if (
+            extend_prefix_lens_cpu is not None
+            and seq_lens_cpu is not None
+            and len(extend_prefix_lens_cpu) == bs
+            and len(seq_lens_cpu) == bs
+        ):
+            return [
+                int(seq_len) - int(prefix_len)
+                for seq_len, prefix_len in zip(
+                    seq_lens_cpu.tolist(), extend_prefix_lens_cpu
+                )
+            ]
+        return q_lens.detach().to("cpu", torch.int64).tolist()
+
     def call_begin_forward(
         self,
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
@@ -2230,12 +2304,15 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window: Optional[WindowRead] = None,
         *,
         plan: IterationIds,
     ):
         bs = len(seq_lens)
+        self.prefill_q_pad_gather_idx = None
+        self.prefill_q_pad_out_idx = None
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
@@ -2276,7 +2353,33 @@ class FlashInferIndicesUpdaterPrefill:
                     kv_start_idx=kv_start_idx,
                     kind=read_kind,
                 )
-            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+            q_lens = seq_lens - prefix_lens
+            if self._can_pad_prefill_q(
+                wrapper_paged=wrapper_paged,
+                use_ragged=use_ragged,
+                use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                custom_kv_indices=custom_kv_indices,
+                cross_attention_custom_mask=cross_attention_custom_mask,
+                multi_item_params=multi_item_params,
+            ):
+                q_lens_cpu = self._prefill_q_lens_cpu(
+                    q_lens, seq_lens_cpu, extend_prefix_lens_cpu
+                )
+                gather_idx, out_idx = build_prefill_pad_indices(
+                    q_lens_cpu, self.prefill_cta_min_q, seq_lens.device
+                )
+                if gather_idx is not None:
+                    self.prefill_q_pad_gather_idx = gather_idx
+                    self.prefill_q_pad_out_idx = out_idx
+                    q_lens = torch.tensor(
+                        [
+                            max(length, self.prefill_cta_min_q) if length > 0 else 0
+                            for length in q_lens_cpu
+                        ],
+                        dtype=q_lens.dtype,
+                        device=q_lens.device,
+                    )
+            qo_indptr[1 : bs + 1] = torch.cumsum(q_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
             custom_mask = cross_attention_custom_mask
