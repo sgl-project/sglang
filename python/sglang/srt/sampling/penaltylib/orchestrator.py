@@ -40,7 +40,8 @@ class BatchedPenalizerOrchestrator:
             self._batch_ref = weakref.ref(value)
 
     def reqs(self):
-        return self.batch.reqs
+        batch = self.batch
+        return batch.reqs if batch is not None else []
 
     def cumulate_output_tokens(self, output_ids: torch.Tensor):
         """
@@ -114,8 +115,9 @@ class BatchedPenalizerOrchestrator:
             return
 
         if len(keep_indices) == 0:
-            # No requests left in the batch, fully release orchestrator resources
-            self.release()
+            for penalizer in self.penalizers.values():
+                penalizer.teardown()
+            self.is_required = False
             return
 
         is_required = False
@@ -135,7 +137,7 @@ class BatchedPenalizerOrchestrator:
             penalizer.teardown()
         self.penalizers.clear()
         # Break reference to ScheduleBatch
-        self._batch_ref = None
+        self.batch = None
         self.is_required = False
 
     # Context manager support
