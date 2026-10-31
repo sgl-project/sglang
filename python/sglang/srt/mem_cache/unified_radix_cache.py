@@ -766,9 +766,29 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
+    def _with_write_back_headroom(self, params: EvictParams) -> EvictParams:
+        """Grow nonzero token/window shortfalls by the write_back reserve, capped by evictable."""
+        headroom = envs.SGLANG_OPT_HICACHE_WRITE_BACK_EVICTION_HEADROOM_TOKENS.get()
+        if headroom <= 0 or not self.is_write_back:
+            return params
+
+        def grow(shortfall: int, evictable: int) -> int:
+            if shortfall <= 0:
+                return shortfall
+            return shortfall + min(headroom, max(0, evictable - shortfall))
+
+        return EvictParams(
+            num_tokens=grow(params.num_tokens, self.full_evictable_size()),
+            window_num_tokens={
+                name: grow(tokens, self.window_evictable_size(name))
+                for name, tokens in params.window_num_tokens.items()
+            },
+            mamba_num=params.mamba_num,
+        )
+
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
-        return self._evict(params)
+        return self._evict(self._with_write_back_headroom(params))
 
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
@@ -804,17 +824,28 @@ class UnifiedRadixCache(BasePrefixCache):
         short = {ct: n for ct, n in shortfall.items() if n > 0}
         if not short:
             return EvictResult()
-        return self._evict(
+        windows = self._window_sub_pools_by_slot()
+        params = self._with_write_back_headroom(
             EvictParams(
                 num_tokens=short.get(self.slot_id(TREE_TOKEN), 0),
                 window_num_tokens={
-                    name: short[ct]
-                    for ct, name in self._window_sub_pools_by_slot().items()
-                    if ct in short
+                    name: short[ct] for ct, name in windows.items() if ct in short
                 },
                 mamba_num=short.get(self.slot_id(TREE_STATE), 0),
-            ),
-            demand={ct: demand_by_type[ct] for ct in short},
+            )
+        )
+        # The walk stops once the pool can take the demand, so the reserve
+        # grows the demand too.
+        grown = {self.slot_id(TREE_TOKEN): params.num_tokens}
+        for ct, name in windows.items():
+            if name in params.window_num_tokens:
+                grown[ct] = params.window_num_tokens[name]
+        return self._evict(
+            params,
+            demand={
+                ct: demand_by_type[ct] + grown.get(ct, short[ct]) - short[ct]
+                for ct in short
+            },
         )
 
     def _demand_by_type(self, demand: KVDemand) -> dict[ComponentType, int]:
