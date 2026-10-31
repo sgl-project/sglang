@@ -228,12 +228,54 @@ class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
         backend._compile_regex.assert_not_called()
 
 
+class TestOptionalStructuralFormatSchemaValidation(CustomTestCase):
+    def test_rejects_unsupported_schema_inside_optional_format(self):
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+        backend._from_context = MagicMock(return_value="compiled")
+        structural_tag = {
+            "format": {
+                "type": "optional",
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": {"contains": {}},
+                },
+            }
+        }
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("contains", result.error_message)
+        backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+    def test_sanitizes_missing_schema_inside_optional_format(self):
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+        backend._from_context = MagicMock(return_value="compiled")
+        structural_tag = {
+            "format": {
+                "type": "optional",
+                "content": {"type": "json_schema"},
+            }
+        }
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertEqual(result, "compiled")
+        compiled_tag = json.loads(
+            backend.grammar_compiler.compile_structural_tag.call_args.args[0]
+        )
+        self.assertEqual(compiled_tag["format"]["content"]["json_schema"], {})
+
+
 class TestBoundedLinearPatterns(CustomTestCase):
     patterns = (
         "^[0-9a-f]{32}$",  # MD5
         "^[0-9a-f]{40}$",  # SHA-1
         "^[0-9a-f]{64}$",  # SHA-256
         "^[0-9a-f]{128}$",  # SHA-512
+        "^[a-z]{32,64}$",  # Bounded ranges of one character atom grow linearly.
         "[0-9a-f]{64}",  # Unanchored SHA-256: a homogeneous repetition is linear.
         "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         "^(?:[0-9a-f]{8}){8}$",
@@ -276,6 +318,7 @@ class TestBoundedLinearPatterns(CustomTestCase):
         validate_schema_bounds({"type": "string", "pattern": "^[ab]{64}$"})
         for pattern in (
             "^[ab]{10001}$",
+            "^[ab]{0,10001}$",
             "[ab]{10001}",
             "^(?:[ab]{100}){101}$",
         ):
@@ -549,6 +592,14 @@ class TestRegexASTComplexityValidation(unittest.TestCase):
         """Pattern with exactly 500 AST nodes should pass."""
         pattern = "a" * 500
         check_regex_ast_complexity(pattern)
+
+
+class TestBoundedFSMConstruction(CustomTestCase):
+    def test_stops_determinization_at_configured_state_budget(self):
+        with self.assertRaisesRegex(
+            JSONSchemaStateExplosion, "before determinization completed"
+        ):
+            build_fsm_with_budget(r"[ab]*a[ab]{13}", max_states=16)
 
 
 class TestFSMBudgetValidation(unittest.TestCase):

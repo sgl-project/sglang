@@ -1,5 +1,7 @@
 """Detect JSON Schema constraints that grammar backends silently ignore."""
 
+import contextvars
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +44,96 @@ MAX_NESTED_QUANTIFIER_DEPTH = 5
 MAX_COMPILED_DFA_STATES = 10000
 # Maximum time for FSM compilation (seconds)
 MAX_FSM_COMPILE_TIME = 0.5
+
+_FSM_STATE_BUDGET: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "sglang_fsm_state_budget", default=None
+)
+_INTEREGULAR_CRAWL_INSTALL_LOCK = threading.Lock()
+
+
+def _install_interegular_state_budget(interegular_fsm: Any) -> None:
+    """Add a context-local state cap to interegular's determinization walk."""
+    if getattr(interegular_fsm.crawl, "_sglang_budgeted", False):
+        return
+
+    with _INTEREGULAR_CRAWL_INSTALL_LOCK:
+        if getattr(interegular_fsm.crawl, "_sglang_budgeted", False):
+            return
+
+        original_crawl = interegular_fsm.crawl
+
+        def budgeted_crawl(alphabet, initial, final, follow):
+            max_states = _FSM_STATE_BUDGET.get()
+            if max_states is None:
+                return original_crawl(alphabet, initial, final, follow)
+
+            if max_states < 1:
+                raise JSONSchemaStateExplosion(
+                    f"FSM construction exceeded state budget ({max_states})"
+                )
+
+            states = [initial]
+            state_indices = {_fsm_state_key(initial): 0}
+            finals = set()
+            transitions = {}
+            index = 0
+
+            while index < len(states):
+                state = states[index]
+                if final(state):
+                    finals.add(index)
+
+                state_transitions = {}
+                for transition in alphabet.by_transition:
+                    try:
+                        next_state = follow(state, transition)
+                    except interegular_fsm.OblivionError:
+                        continue
+
+                    key = _fsm_state_key(next_state)
+                    next_index = state_indices.get(key)
+                    if next_index is None:
+                        if len(states) >= max_states:
+                            raise JSONSchemaStateExplosion(
+                                "FSM construction exceeded state budget "
+                                f"({max_states}) before determinization completed"
+                            )
+                        next_index = len(states)
+                        state_indices[key] = next_index
+                        states.append(next_state)
+
+                    state_transitions[transition] = next_index
+
+                transitions[index] = state_transitions
+                index += 1
+
+            return interegular_fsm.FSM(
+                alphabet=alphabet,
+                states=range(len(states)),
+                initial=0,
+                finals=finals,
+                map=transitions,
+                __no_validation__=True,
+            )
+
+        budgeted_crawl._sglang_budgeted = True
+        interegular_fsm.crawl = budgeted_crawl
+
+
+def _fsm_state_key(state: Any) -> Any:
+    """Make interegular's composite crawl states usable as dictionary keys."""
+    if isinstance(state, dict):
+        return (
+            dict,
+            frozenset((_fsm_state_key(k), _fsm_state_key(v)) for k, v in state.items()),
+        )
+    if isinstance(state, (set, frozenset)):
+        return (set, frozenset(_fsm_state_key(value) for value in state))
+    if isinstance(state, list):
+        return (list, tuple(_fsm_state_key(value) for value in state))
+    if isinstance(state, tuple):
+        return (tuple, tuple(_fsm_state_key(value) for value in state))
+    return (type(state), state)
 
 
 def check_regex_ast_complexity(
@@ -118,7 +210,7 @@ def build_fsm_with_budget(
     Compile regex to FSM with state budget enforcement.
 
     Tier 1: Fast AST pre-filter (check_regex_ast_complexity)
-    Tier 2: Direct compilation with state count verification
+    Tier 2: Determinization with a state cap and final state-count verification
 
     Args:
         pattern: The regex pattern string to compile
@@ -135,18 +227,24 @@ def build_fsm_with_budget(
     # Tier 1: Fast AST pre-filter
     check_regex_ast_complexity(pattern)
 
-    # Tier 2: Direct compilation with state count verification
-    # Relies on AST complexity bounds to prevent pathological cases.
-    # Timeout enforcement moved to caller if needed (e.g., via process pool).
+    # Interegular's determinization walk is capped so explosive patterns stop
+    # before allocating the full DFA. Keep the final check as a defensive guard.
     try:
         import interegular
+        import interegular.fsm as interegular_fsm
     except ImportError as e:
         raise ImportError(
             "interegular is required for Outlines regex compilation but not installed. "
             "Install it with: pip install interegular"
         ) from e
 
-    fsm = interegular.parse_pattern(pattern).to_fsm()
+    _install_interegular_state_budget(interegular_fsm)
+    budget_token = _FSM_STATE_BUDGET.set(max_states)
+    try:
+        fsm = interegular.parse_pattern(pattern).to_fsm()
+    finally:
+        _FSM_STATE_BUDGET.reset(budget_token)
+
     if len(fsm.states) > max_states:
         raise JSONSchemaStateExplosion(
             f"Compiled DFA states ({len(fsm.states)}) exceeds max limit ({max_states})"
@@ -283,7 +381,7 @@ def _validate_schema_depth_recursive(schema: Any, ctx: TraversalContext) -> None
 
 
 def _estimate_fixed_regex_states(pattern: str) -> int | None:
-    """Count linear states for fixed repetitions of character atoms, if known."""
+    """Estimate linear states for fixed-width patterns and bounded character atoms."""
     try:
         parsed = sre_parse.parse(pattern)
     except Exception:
@@ -293,52 +391,50 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
     if not parsed or parsed.state.flags & sre_parse.SRE_FLAG_MULTILINE:
         return None
 
+    character_atom_ops = (
+        sre_parse.LITERAL,
+        sre_parse.NOT_LITERAL,
+        sre_parse.IN,
+        sre_parse.ANY,
+        sre_parse.CATEGORY,
+    )
+
+    def is_single_character_atom(subpattern):
+        return len(subpattern) == 1 and subpattern[0][0] in character_atom_ops
+
     is_start_anchored = parsed[0] in (
         (sre_parse.AT, sre_parse.AT_BEGINNING),
         (sre_parse.AT, sre_parse.AT_BEGINNING_STRING),
     )
+    # A bounded repetition of one character atom needs only states for the
+    # current run length, whether or not the pattern has start/end anchors.
+    # Do not extend this shortcut to a larger expression: an ambiguous prefix
+    # can need many states to remember candidate match positions.
+    body = list(parsed)
+    if is_start_anchored:
+        body.pop(0)
+    if body and body[-1] in (
+        (sre_parse.AT, sre_parse.AT_END),
+        (sre_parse.AT, sre_parse.AT_END_STRING),
+    ):
+        body.pop()
+    if len(body) == 1 and body[0][0] in (
+        sre_parse.MAX_REPEAT,
+        sre_parse.MIN_REPEAT,
+    ):
+        _, max_rep, child = body[0][1]
+        if max_rep != sre_parse.MAXREPEAT and is_single_character_atom(child):
+            return max_rep + 1
+    elif not is_start_anchored:
+        return None
+
     if not is_start_anchored:
-        # An unanchored suffix can require exponential states to remember
-        # candidate match positions (for example, a[ab]{100}$). A single
-        # fixed repetition of one character atom is different: it only needs
-        # to track the current run length, so its state count is linear.
-        body = list(parsed)
-        if body and body[-1] in (
-            (sre_parse.AT, sre_parse.AT_END),
-            (sre_parse.AT, sre_parse.AT_END_STRING),
-        ):
-            body.pop()
-        if len(body) != 1 or body[0][0] not in (
-            sre_parse.MAX_REPEAT,
-            sre_parse.MIN_REPEAT,
-        ):
-            return None
-        min_rep, max_rep, child = body[0][1]
-        if (
-            min_rep != max_rep
-            or max_rep == sre_parse.MAXREPEAT
-            or len(child) != 1
-            or child[0][0]
-            not in (
-                sre_parse.LITERAL,
-                sre_parse.NOT_LITERAL,
-                sre_parse.IN,
-                sre_parse.ANY,
-                sre_parse.CATEGORY,
-            )
-        ):
-            return None
+        return None
 
     def fixed_width(subpattern):
         width = 0
         for op, arg in subpattern:
-            if op in (
-                sre_parse.LITERAL,
-                sre_parse.NOT_LITERAL,
-                sre_parse.IN,
-                sre_parse.ANY,
-                sre_parse.CATEGORY,
-            ):
+            if op in character_atom_ops:
                 width += 1
             elif op == sre_parse.AT:
                 continue
@@ -414,8 +510,8 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
         has_nested_quantifiers = bool(re.search(nested_quantifier_pattern, pattern))
         linear_states = _estimate_fixed_regex_states(pattern)
         if linear_states is not None:
-            # Fixed repetitions of character atoms grow linearly, including
-            # hashes and UUIDs. Do not apply the explosion-risk multiplier.
+            # Fixed-width patterns and bounded single-character repetitions
+            # grow linearly. Do not apply the explosion-risk multiplier.
             pattern_complexity = linear_states
         elif has_unbounded and has_bounded and has_nested_quantifiers:
             # Nested quantifiers (e.g., (a{100})+ ) can cause exponential blowup
