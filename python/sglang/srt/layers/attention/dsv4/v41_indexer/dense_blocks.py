@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_scores import candidate_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 
 from .scoring import (
@@ -224,15 +225,25 @@ class DenseBlocksBackend:
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
+            candidate_blocks=published.blocks,
+            candidate_block_size=self.block_size,
         ):
             for chunk in chunks:
-                idx = topk_among_blocks(
-                    chunk.scores,
-                    chunk.lens,
-                    published.blocks[chunk.tok],
-                    request.k,
-                    block_size=self.block_size,
-                )
+                if chunk.candidate_only:
+                    idx = candidate_topk(
+                        chunk.scores,
+                        published.blocks[chunk.tok],
+                        request.k,
+                        self.block_size,
+                    )
+                else:
+                    idx = topk_among_blocks(
+                        chunk.scores,
+                        chunk.lens,
+                        published.blocks[chunk.tok],
+                        request.k,
+                        block_size=self.block_size,
+                    )
                 write_prefill(
                     inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
                 )
