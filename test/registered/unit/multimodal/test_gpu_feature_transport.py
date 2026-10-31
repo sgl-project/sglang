@@ -899,6 +899,22 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
 
         process_and_broadcast.assert_not_called()
 
+    def test_already_materialized_inputs_reject_missing_offsets(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalInputs,
+        )
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = object.__new__(Scheduler)
+        mm_inputs = MultimodalInputs(
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE)]
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing token offsets"):
+            scheduler._get_multimodal_inputs(mm_inputs)
+
     def test_broadcast_mm_inputs_sends_entry_rank_processing_error(self):
         from sglang.srt.managers import scheduler as scheduler_module
 

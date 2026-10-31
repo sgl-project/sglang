@@ -2957,6 +2957,7 @@ class Scheduler(
         if isinstance(mm_inputs, MMInputsProcessError):
             raise _MultimodalInputProcessingError(mm_inputs.message)
         if isinstance(mm_inputs, MultimodalInputs):
+            mm_inputs.validate()
             return mm_inputs
 
         if get_mm().enable_broadcast_mm_inputs_process:
@@ -3321,7 +3322,7 @@ class Scheduler(
         if recv_req.mm_inputs is not None:
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
-            except _MultimodalInputProcessingError as error:
+            except (_MultimodalInputProcessingError, ValueError) as error:
                 req.set_finish_with_abort(
                     str(error),
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -3833,7 +3834,7 @@ class Scheduler(
         if recv_req.mm_inputs is not None:
             try:
                 image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
-            except _MultimodalInputProcessingError as error:
+            except (_MultimodalInputProcessingError, ValueError) as error:
                 req.set_finish_with_abort(
                     str(error),
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
