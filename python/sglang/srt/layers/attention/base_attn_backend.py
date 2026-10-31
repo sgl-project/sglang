@@ -359,6 +359,11 @@ class AttentionBackend(ABC):
         """The mask the draft stage fills in place, if this backend has one."""
         return None
 
+    def takes_fp8_dcp_verify_q(self) -> bool:
+        """Whether DCP MLA target verify takes the gathered query as unit-scale
+        fp8 [rows, heads, nope + rope] and needs no verify-window K/V."""
+        return False
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
