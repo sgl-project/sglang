@@ -1,0 +1,5 @@
+# SGLang copies KV in its own GPU context. The daemon selects SHM or inline.
+mp_host: 127.0.0.1
+mp_port: 5556
+extra_config:
+  lmcache.mp.mp_transfer_mode: engine_driven
