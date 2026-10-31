@@ -71,7 +71,7 @@ identical checkpoint to the same local path on every node.
 
 <Info>
 The deployment examples below use a W8A8 checkpoint with `--quantization modelslim`. The PD disaggregation topology
-uses **two Atlas 800I A3 nodes for prefill and two additional A3 nodes for decode**. Make sure that the checkpoint
+uses **two A3 series nodes for prefill and two additional A3 nodes for decode**. Make sure that the checkpoint
 contains the required MTP weights before enabling NEXTN speculative decoding.
 </Info>
 
@@ -91,7 +91,7 @@ The commands below start CANN 9.1.0 base images. Follow
 to install SGLang and the required runtime components inside the container. Use the matching image for your hardware.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="A3 series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
@@ -126,7 +126,7 @@ quay.io/ascend/sglang:cann9.1.0-a3-B080
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="A2 series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
@@ -223,7 +223,7 @@ python3 -m sglang.launch_server \
 
 ### Multi-node deployment
 
-For co-located (mixed) serving across **two Atlas 800I A3 nodes**, both nodes participate in a single GLM-5.3
+For co-located (mixed) serving across **two A3 series nodes**, both nodes participate in a single GLM-5.3
 inference instance. The following script is adapted from the supplied GLM-5.3 W8A8 multi-node configuration, using
 **TP=32**, **DP=16**, DeepEP `auto`, and NEXTN speculative decoding.
 
@@ -233,7 +233,7 @@ initialization address. In this script, the mixed-serving HTTP port is **6688** 
 
 ```shell
 #!/usr/bin/env bash
-# GLM-5.3 W8A8: two-node co-located (mixed) deployment (Atlas 800I A3).
+# GLM-5.3 W8A8: two-node co-located (mixed) deployment (A3 series).
 # Run the same script on both nodes after replacing the variables below.
 
 # ============================================================
@@ -323,7 +323,7 @@ exit 1
 ### Prefill-decode disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate node groups, reducing interference between
-long-prompt processing and autoregressive generation. This configuration uses **four Atlas 800I A3 nodes**:
+long-prompt processing and autoregressive generation. This configuration uses **four A3 series nodes**:
 
 - **Prefill group:** 2 nodes, `TP=8`, `PP=4`, `DP=1`, and prefill context parallelism `CP=8`. It runs DeepEP in `normal`
   mode and disables NPU graph capture.
@@ -337,7 +337,7 @@ bootstrap and should be started before the router.
 
 ```shell
 #!/usr/bin/env bash
-# GLM-5.3 W8A8: 2 prefill nodes + 2 decode nodes (Atlas 800I A3).
+# GLM-5.3 W8A8: 2 prefill nodes + 2 decode nodes (A3 series).
 # Run this same script on all four nodes, after replacing the placeholders below.
 # The IP addresses must match addresses returned by `hostname -I` on each node.
 

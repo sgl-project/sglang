@@ -420,6 +420,18 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUMXFP8OnlineMoEMethod(self)
 
+            if (
+                is_npu_arch35()
+                and self.is_checkpoint_fp8_serialized
+                and not self.is_fp4_experts
+                and self.weight_block_size == [128, 128]
+            ):
+                from sglang.srt.hardware_backend.npu.quantization.block_fp8_moe import (
+                    NPUBlockFp8MoEMethod,
+                )
+
+                return NPUBlockFp8MoEMethod(self)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
@@ -531,12 +543,25 @@ class Fp8LinearMethod(LinearMethodBase):
             else per_config
         )
         self.weight_block_size = self.quant_config.weight_block_size
+        self.use_npu_block_fp8 = (
+            is_npu_arch35()
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and not self.use_mxfp8
+            and not getattr(self.quant_config, "is_fp4_experts", False)
+            and self.weight_block_size == [128, 128]
+            and getattr(self.quant_config, "scale_fmt", None) != "ue8m0"
+            and not envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+        )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
         # Set by a model-owned startup hook after opting into prefill tuning.
         self.mxfp8_prefill_autotune_min_tokens = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        if self.use_npu_block_fp8:
+            from sglang.kernels.ops.gemm import npu_w8a8_block_fp8_linear
+
+            self.w8a8_block_fp8_linear = npu_w8a8_block_fp8_linear
+        elif self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
@@ -552,8 +577,12 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).
-        self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
-            self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+        self.block_fp8_as_mxfp8 = (
+            not self.use_mxfp8
+            and not self.use_npu_block_fp8
+            and can_serve_block_fp8_as_mxfp8(
+                self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+            )
         )
         if self.block_fp8_as_mxfp8:
             self.mxfp8_dense_backend = resolve_block_fp8_mxfp8_backend()
@@ -741,6 +770,9 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_npu_block_fp8:
+            # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
+            return
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -1398,6 +1430,14 @@ class Fp8LinearMethod(LinearMethodBase):
             return out
 
         if self.block_quant:
+            if self.use_npu_block_fp8:
+                return self.w8a8_block_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    bias=bias,
+                )
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
@@ -2752,6 +2792,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
+            from sglang.srt.layers.moe.token_dispatcher.base import (
+                build_dispatcher_quant_config,
+            )
+
             # Execution kernels may declare the dispatch wire format they
             # need (DISPATCHER_QUANT_CONFIG, e.g. the NPU W4A8 MXFP GMMs
             # consume MXFP8 activations); otherwise report the checkpoint
@@ -2763,7 +2807,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 kernel_quant_config
                 if kernel_quant_config is not None
                 else {
-                    "weight_dtype": layer.w13_weight.dtype,
+                    **build_dispatcher_quant_config(
+                        layer,
+                        _require_fp4_dtype()
+                        if self.is_fp4_expert
+                        else layer.w13_weight.dtype,
+                        self._aiter_moe_quant_type(),
+                        gate_up_interleaved=True
+                        if self.use_mxfp8
+                        else getattr(layer, "_aiter_gate_up_interleaved", None),
+                    ),
                     "use_mxfp8": self.use_mxfp8,
                 }
             )
@@ -3405,6 +3458,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         self._cutlass_buffers_ready = True
+
+    def _aiter_moe_quant_type(self):
+        """The quant_type this method hands AITER, which the dispatcher also
+        needs: it separates the two fp8 activation formats."""
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+
+        if self.use_mxfp8:
+            return AiterQuantType.PER_1X32
+        if not self.block_quant:
+            return AiterQuantType.PER_TOKEN
+        return (
+            AiterQuantType.PER_1X32
+            if self.is_fp4_expert
+            else AiterQuantType.PER_128X128
+        )
 
     def maybe_get_hip_aiter_quant_info(
         self,
