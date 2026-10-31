@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
+    merge_source_transfers,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -454,7 +455,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        self.ongoing_load_back: dict[
+            int, _OngoingLoadBack | list[_OngoingLoadBack]
+        ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -1273,7 +1276,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        result = self.insert(insert_params)
+        reuse_existing_mamba = False
+        if self._mamba_host_only_checkpoint():
+            mamba = self.components.get(ComponentType.MAMBA)
+            if mamba is not None:
+                reuse_existing_mamba = mamba.materialize_host_only_checkpoint(
+                    insert_params, radix_key
+                )
+        if reuse_existing_mamba:
+            insert_params.allow_missing_mamba = True
+        try:
+            result = self.insert(insert_params)
+        finally:
+            if reuse_existing_mamba:
+                insert_params.allow_missing_mamba = False
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
@@ -2012,11 +2028,21 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
 
-        self.ongoing_load_back[node_id] = _OngoingLoadBack(
+        receipt = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
+        # A host-only checkpoint stays off the device, so a second request can
+        # load the same anchor before the first ack. Keep every receipt.
+        if self._mamba_host_only_checkpoint():
+            pending = self.ongoing_load_back.get(node_id)
+            if pending is None:
+                self.ongoing_load_back[node_id] = [receipt]
+            else:
+                pending.append(receipt)
+        else:
+            self.ongoing_load_back[node_id] = receipt
 
         return True
 
@@ -2031,24 +2057,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if spec.indices_from_pool == PoolName.KV:
                 indices_source = kv_xfer
             else:
-                source_component = {
-                    PoolName.SWA: ComponentType.SWA,
-                    PoolName.MAMBA: ComponentType.MAMBA,
-                }.get(spec.indices_from_pool)
-                if source_component is None:
-                    raise AssertionError(
-                        f"Unsupported sidecar indices source pool "
-                        f"{spec.indices_from_pool}."
-                    )
-                matching_sources = comp_xfers.get(source_component, ())
-                if not matching_sources:
+                indices_source = merge_source_transfers(
+                    (x for xfers in comp_xfers.values() for x in xfers),
+                    spec.indices_from_pool,
+                )
+                if indices_source is None:
                     continue
-                indices_source = matching_sources[0]
-                if indices_source.name != spec.indices_from_pool:
-                    raise AssertionError(
-                        f"Sidecar indices source pool {spec.indices_from_pool} "
-                        f"resolved to {indices_source.name} during {phase}."
-                    )
 
             indices = (
                 indices_source.device_indices
@@ -3673,7 +3687,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     and self.buffer_pipeline.try_finish_load_back(ack_id)
                 ):
                     continue
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+                if self._mamba_host_only_checkpoint():
+                    entry = self.ongoing_load_back[ack_id]
+                    node, lock_params, host_lock_params = entry.pop(0)
+                    if not entry:
+                        del self.ongoing_load_back[ack_id]
+                else:
+                    node, lock_params, host_lock_params = self.ongoing_load_back.pop(
+                        ack_id
+                    )
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
@@ -3694,6 +3716,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
             finish_count -= 1
 
+    def _mamba_host_only_checkpoint(self) -> bool:
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return False
+        return comp._mamba_host_only_checkpoint()
+
     # ---- HiCache: Scheduler Entry Points ----
 
     @rank_consensus(same_params=["params.host_hit_length"])
@@ -3701,8 +3729,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """Only buffer mode returns None: its admission retries without
-        committing a load."""
+        """None means admission retries without committing a load: buffer
+        mode, or a host-only anchor whose previous load-back is still in flight."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3721,6 +3749,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
+            # ongoing_load_back is keyed by anchor. A host-only mamba
+            # checkpoint stays off the device after its load, so another
+            # request can reach this anchor before the first H->D is acked.
+            if (
+                self._mamba_host_only_checkpoint()
+                and best_match_node_id in self.ongoing_load_back
+            ):
+                return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
@@ -4024,9 +4060,10 @@ class UnifiedRadixCache(BasePrefixCache):
             ongoing_write_through = [
                 (nid, wt.node_id) for nid, wt in self.ongoing_write_through.items()
             ]
-        ongoing_load_back = [
-            (nid, lb.node_id) for nid, lb in self.ongoing_load_back.items()
-        ]
+        ongoing_load_back = []
+        for nid, lb in self.ongoing_load_back.items():
+            receipts = lb if isinstance(lb, list) else (lb,)
+            ongoing_load_back.extend((nid, receipt.node_id) for receipt in receipts)
         self.tree_core.sanity_check(ongoing_write_through, ongoing_load_back)
 
     def pretty_print(self) -> None:

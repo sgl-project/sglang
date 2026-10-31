@@ -795,13 +795,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 prefix_lens=prefix_lens_cpu,
             )
 
+            # Only NEW pages need binding; a tail page carried in from the prefix
+            # is already bound on the swa side. The extend kernel gives the j-th
+            # new page to sequence page first_new_page + j, so the tail's new
+            # pages are the last num_swa_pages of them. Slicing them on the host
+            # keeps admission free of host syncs: a device-side match
+            # (torch.unique) blocks the scheduler behind the in-flight forward.
             def tail_pages(out: torch.Tensor, new_pages: torch.Tensor) -> torch.Tensor:
-                if swa_tail_len == 0 or new_pages.numel() == 0:
-                    return new_pages[:0]
-                tail = torch.unique(out[-swa_tail_len:] // self.page_size)
-                # Only NEW pages need binding; a tail page carried in from the
-                # prefix is already bound on the window.
-                return new_pages[torch.isin(new_pages, tail)]
+                if num_swa_pages > 0:
+                    return new_pages[-num_swa_pages:]
+                return new_pages[:0]
 
             return self._allocate(
                 full_tokens=num_new_pages * self.page_size,
