@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -11,10 +11,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import linear, vocab_parallel_embedding
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -167,6 +169,34 @@ class TestDFlashDPEmbedding(CustomTestCase):
 
 
 class TestDFlashDPMetadata(CustomTestCase):
+    def test_idle_eager_fallback_invalidates_routing_reuse(self):
+        """An idle rank must not reuse graph routing after switching to eager."""
+        worker = object.__new__(DFlashWorkerV2)
+        worker.device = "cpu"
+        worker.block_size = 4
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=Mock(side_effect=StopIteration)
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            is_extend_in_batch=False,
+            sampling_info=None,
+            spec_info=None,
+        )
+        forward = SimpleNamespace(
+            can_run_decode_cuda_graph=True, can_reuse_lora_routing=True
+        )
+        with (
+            get_parallel().override(attn_dp_enabled=True),
+            patch.object(
+                DFlashVerifyInput, "prepare_for_verify", return_value=(forward, True)
+            ),
+            self.assertRaises(StopIteration),
+        ):
+            worker.forward_batch_generation(batch)
+        self.assertFalse(forward.can_run_decode_cuda_graph)
+        self.assertFalse(forward.can_reuse_lora_routing)
+
     def test_deferred_verify_preserves_live_inputs_until_final_planning(self):
         """Early graph loading must not replace an idle or unequal DP batch's live rows."""
         for mode in (ForwardMode.IDLE, ForwardMode.DECODE):

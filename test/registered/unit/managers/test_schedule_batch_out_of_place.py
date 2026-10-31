@@ -49,10 +49,12 @@ class TestScheduleBatchCopy(CustomTestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             req_pool_indices=torch.zeros(0, dtype=torch.int64),
             req_pool_indices_cpu=torch.zeros(0, dtype=torch.int64),
+            can_reuse_lora_routing=True,
         )
         copy = batch.copy()
         self.assertIs(copy.token_to_kv_pool_allocator, allocator)
         self.assertIs(copy.req_to_token_pool, table)
+        self.assertTrue(copy.can_reuse_lora_routing)
 
 
 class TestCachedPrefixTierAttribution(unittest.TestCase):

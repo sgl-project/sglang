@@ -865,6 +865,8 @@ class TboForwardBatchPreparer:
                 forward_metadata_planned_bs=None,
                 forward_metadata_planned_num_tokens=None,
                 forward_metadata_replan_equivalent=False,
+                # The parent's vote does not certify a child's token layout.
+                can_reuse_lora_routing=False,
             )
         )
 

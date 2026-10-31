@@ -501,11 +501,11 @@ class LoRAManager:
         self.lora_backend.reset_routing_cache()
 
     def can_reuse_dp_lora_routing(self, batch: Optional[ScheduleBatch]) -> bool:
-        """Vote that local cached routing inputs are unchanged for this step.
+        """Vote that this rank's cached routing stays valid through preparation.
 
-        Managers that cache distributed routing may override this hook. A
-        unanimous vote is carried to prepare_lora_batch, where the manager must
-        still validate the globally selected batch shape before reusing routing.
+        Cover adapter order, token layout and GPU slots; ``batch`` may be None.
+        Reuse requires unanimous votes and the same final graph/shape decision
+        on every rank in prepare_lora_batch.
         """
         return False
 
