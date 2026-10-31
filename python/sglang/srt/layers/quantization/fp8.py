@@ -2991,6 +2991,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
+    def _deterministic_fp8_experts_on_triton(self) -> bool:
+        """Deterministic mode runs FP8 experts through the Triton runner on ROCm: with
+        AITER's FP8 MoE a token's result depends on its batch, while the Triton runner
+        uses one fixed config in deterministic mode."""
+        from sglang.srt.runtime_context import get_exec
+
+        return (
+            get_exec().deterministic.enable_deterministic_inference
+            and not self.is_fp4_expert
+            and not self.use_mxfp8
+            and not _use_hip_int4
+        )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -3019,6 +3032,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
                 and get_moe_a2a_backend().supports_aiter()
+                and not self._deterministic_fp8_experts_on_triton()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
