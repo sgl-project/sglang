@@ -1,6 +1,7 @@
 """Execute test files in isolated fork children of a preloaded interpreter."""
 
 import argparse
+import importlib
 import json
 import os
 import runpy
@@ -10,13 +11,21 @@ import time
 import traceback
 
 
-def _preload_common_modules() -> None:
+def _preload_common_modules(extra_modules: list[str]) -> None:
     """Load the expensive common stack without creating a CUDA context."""
     import numpy  # noqa: F401
     import pytest  # noqa: F401
     import scipy  # noqa: F401
     import torch
     import triton  # noqa: F401
+
+    # A module that fails to import here is only a lost saving: the child that
+    # needs it imports it again and reports the error in that test's output.
+    for name in extra_modules:
+        try:
+            importlib.import_module(name)
+        except Exception as e:
+            print(f"fork test worker: cannot preload {name}: {e!r}", file=sys.stderr)
 
     if torch.cuda.is_initialized():
         raise RuntimeError("fork test worker initialized CUDA before forking")
@@ -77,8 +86,9 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--result-fd", type=int, required=True)
+    parser.add_argument("--preload", nargs="*", default=[])
     args = parser.parse_args()
-    _preload_common_modules()
+    _preload_common_modules(args.preload)
 
     with os.fdopen(args.result_fd, "w", buffering=1) as result_stream:
         for line in sys.stdin:
