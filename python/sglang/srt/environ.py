@@ -2242,6 +2242,18 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # ROCm gfx950: fuse K3's BF16 attention o_proj GEMM with its attention-TP
+    # sum over mori cco SDMA -- GEMM + all-reduce, or GEMM + reduce-scatter on
+    # SP-MoE layers. Prefill only; needs MORI_ENABLE_SDMA=1 (and, with a mori
+    # EP a2a backend, SGLANG_MORI_EP_V2=1). See
+    # srt/layers/communication/mori_gemm_ar_bf16.py.
+    SGLANG_MORI_OPROJ_AR = EnvBool(False)
+    # Smallest M fused; smaller batches take the ordinary path.
+    SGLANG_MORI_OPROJ_AR_MIN_M = EnvInt(2048)
+    # Copy the fused output out of mori's window (debug aid).
+    SGLANG_MORI_OPROJ_AR_CLONE = EnvBool(False)
+    # Check every fused call against GEMM + collective and log relL2 (slow).
+    SGLANG_MORI_OPROJ_AR_DEBUG = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
