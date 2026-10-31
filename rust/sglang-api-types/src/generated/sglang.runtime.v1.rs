@@ -177,6 +177,10 @@ pub struct GenerateRequest {
     pub video_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "21")]
     pub audio_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Hex hashes of at most 16 digits, one per image_data entry, in image-only requests.
+    /// Each hash becomes the image's cache identity, so it must identify the image bytes.
+    #[prost(string, repeated, tag = "22")]
+    pub mm_hashes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Versioned KV-hint envelope forwarded from a trusted orchestrator.
 #[derive(Clone, PartialEq, ::prost::Message)]
