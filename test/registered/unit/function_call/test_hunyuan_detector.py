@@ -647,6 +647,29 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         self.assertEqual(len(collected), 1)
         self.assertEqual(collected[0]["name"], "get_current_date")
 
+    def test_streaming_incremental_escaped_string_and_multi_args(self):
+        """Incremental string streaming preserves escapes and partial tag holdback."""
+        detector = self._new_detector()
+        raw_query = 'line1 "quoted" \\path\nline2\t<tag> & </arg_val_not_quite> end'
+        full = (
+            "<tool_calls><tool_call>search<tool_sep>"
+            f"<arg_key>query</arg_key><arg_value>{raw_query}</arg_value>"
+            "<arg_key>count</arg_key><arg_value>12</arg_value>"
+            "</tool_call></tool_calls>"
+        )
+        chunks = [full[i : i + 3] for i in range(0, len(full), 3)]
+        all_calls = []
+        for chunk in chunks:
+            all_calls.extend(
+                detector.parse_streaming_increment(chunk, self.tools).calls
+            )
+
+        collected = _collect_streamed_tool_calls(all_calls)
+        self.assertEqual(len(collected), 1)
+        self.assertEqual(collected[0]["name"], "search")
+        parsed = json.loads(collected[0]["parameters"])
+        self.assertEqual(parsed, {"query": raw_query, "count": 12})
+
 
 class TestHunyuanDetectorStructureInfo(CustomTestCase):
     def setUp(self):

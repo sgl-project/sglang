@@ -55,7 +55,7 @@ def _parse_gemma4_array(arr_str: str) -> list:
             break
 
         # String element
-        if arr_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+        if arr_str.startswith(STRING_DELIM, i):
             i += len(STRING_DELIM)
             end_pos = arr_str.find(STRING_DELIM, i)
             if end_pos == -1:
@@ -70,7 +70,7 @@ def _parse_gemma4_array(arr_str: str) -> list:
             obj_start = i + 1
             i += 1
             while i < n and depth > 0:
-                if arr_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+                if arr_str[i] == "<" and arr_str.startswith(STRING_DELIM, i):
                     i += len(STRING_DELIM)
                     next_delim = arr_str.find(STRING_DELIM, i)
                     i = next_delim + len(STRING_DELIM) if next_delim != -1 else n
@@ -143,7 +143,7 @@ def _parse_gemma4_args(args_str: str) -> dict:
             break
 
         # String value: <|"|>...<|"|>
-        if args_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+        if args_str.startswith(STRING_DELIM, i):
             i += len(STRING_DELIM)
             val_start = i
             end_pos = args_str.find(STRING_DELIM, i)
@@ -160,7 +160,7 @@ def _parse_gemma4_args(args_str: str) -> dict:
             obj_start = i + 1
             i += 1
             while i < n and depth > 0:
-                if args_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+                if args_str[i] == "<" and args_str.startswith(STRING_DELIM, i):
                     # Skip over string contents
                     i += len(STRING_DELIM)
                     next_delim = args_str.find(STRING_DELIM, i)
@@ -182,7 +182,7 @@ def _parse_gemma4_args(args_str: str) -> dict:
             arr_start = i + 1
             i += 1
             while i < n and depth > 0:
-                if args_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+                if args_str[i] == "<" and args_str.startswith(STRING_DELIM, i):
                     i += len(STRING_DELIM)
                     next_delim = args_str.find(STRING_DELIM, i)
                     if next_delim == -1:
@@ -208,30 +208,53 @@ def _parse_gemma4_args(args_str: str) -> dict:
     return result
 
 
-def _find_matching_brace(text: str) -> int:
-    """Find index of matching '}' in text, respecting STRING_DELIM and nesting.
+def _find_matching_brace(
+    text: str,
+    start_pos: int = 0,
+    initial_depth: int = 1,
+    in_string_delim: bool = False,
+    string_content_start: int = 0,
+) -> tuple[int, int, int, bool, int]:
+    """Incrementally find index of matching '}' in text, respecting STRING_DELIM.
 
     Assumes text starts just after the opening '{'.
-    Returns index of closing brace, or -1 if not found (incomplete).
+    Returns (match_idx, next_scan_pos, depth, in_string_delim, string_content_start).
     """
-    depth = 1
-    i = 0
+    depth = initial_depth
+    i = start_pos
     n = len(text)
     delim_len = len(STRING_DELIM)
+
+    if in_string_delim:
+        search_from = max(string_content_start, i - (delim_len - 1))
+        next_delim = text.find(STRING_DELIM, search_from)
+        if next_delim == -1:
+            return -1, n, depth, True, string_content_start
+        i = next_delim + delim_len
+        in_string_delim = False
+
     while i < n and depth > 0:
-        if text[i : i + delim_len] == STRING_DELIM:
-            i += delim_len
-            next_delim = text.find(STRING_DELIM, i)
-            if next_delim == -1:
-                return -1
-            i = next_delim + delim_len
-            continue
-        if text[i] == "{":
+        ch = text[i]
+        if ch == "<":
+            if text.startswith(STRING_DELIM, i):
+                i += delim_len
+                string_content_start = i
+                next_delim = text.find(STRING_DELIM, i)
+                if next_delim == -1:
+                    return -1, n, depth, True, string_content_start
+                i = next_delim + delim_len
+                continue
+            if STRING_DELIM.startswith(text[i:]):
+                return -1, i, depth, False, string_content_start
+        elif ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
         i += 1
-    return (i - 1) if depth == 0 else -1
+
+    if depth == 0:
+        return i - 1, i, 0, False, string_content_start
+    return -1, i, depth, False, string_content_start
 
 
 class Gemma4Detector(BaseFormatDetector):
@@ -245,6 +268,16 @@ class Gemma4Detector(BaseFormatDetector):
         self.is_inside_tool_call: bool = False
         self.current_func_name: Optional[str] = None
         self._tool_indices: Optional[dict] = None
+        self._brace_scan_pos: int = 0
+        self._brace_depth: int = 1
+        self._in_string_delim: bool = False
+        self._string_content_start: int = 0
+
+    def _reset_brace_scan_state(self) -> None:
+        self._brace_scan_pos = 0
+        self._brace_depth = 1
+        self._in_string_delim = False
+        self._string_content_start = 0
 
     @staticmethod
     def _extract_tool_calls(text: str) -> list:
@@ -264,7 +297,7 @@ class Gemma4Detector(BaseFormatDetector):
                 if brace != -1:
                     func_name = inner[5:brace]
                     args_content = inner[brace + 1 :]
-                    match_idx = _find_matching_brace(args_content)
+                    match_idx, _, _, _, _ = _find_matching_brace(args_content)
                     args_str = (
                         args_content[:match_idx] if match_idx != -1 else args_content
                     )
@@ -385,6 +418,7 @@ class Gemma4Detector(BaseFormatDetector):
                                     )
                                 )
                                 self.parsed_pos += brace_pos + 1
+                                self._reset_brace_scan_state()
                                 continue
                             else:
                                 # Incomplete call:name{
@@ -401,7 +435,19 @@ class Gemma4Detector(BaseFormatDetector):
                             continue
                     else:
                         # Parsing arguments (looking for balancing })
-                        match_idx = _find_matching_brace(current_slice)
+                        (
+                            match_idx,
+                            self._brace_scan_pos,
+                            self._brace_depth,
+                            self._in_string_delim,
+                            self._string_content_start,
+                        ) = _find_matching_brace(
+                            current_slice,
+                            start_pos=self._brace_scan_pos,
+                            initial_depth=self._brace_depth,
+                            in_string_delim=self._in_string_delim,
+                            string_content_start=self._string_content_start,
+                        )
                         if match_idx != -1:
                             args_str = current_slice[:match_idx]
                             arguments = _parse_gemma4_args(args_str)
@@ -418,6 +464,7 @@ class Gemma4Detector(BaseFormatDetector):
                             )
                             self.parsed_pos += match_idx + 1
                             self.current_func_name = None
+                            self._reset_brace_scan_state()
                             continue
                         else:
                             # Incomplete arguments block
@@ -428,6 +475,7 @@ class Gemma4Detector(BaseFormatDetector):
             # Reset parser state to prevent corruption
             self.is_inside_tool_call = False
             self.current_func_name = None
+            self._reset_brace_scan_state()
             self._buffer = ""
             self.parsed_pos = 0
 
