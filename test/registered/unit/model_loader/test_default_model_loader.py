@@ -14,6 +14,39 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
+    def test_mtp_weights_are_filtered_remapped_and_kept_lazy(self):
+        """Keep only the selected draft layer while yielding checkpoint weights lazily."""
+        weights = [
+            ("model.embed_tokens.weight", torch.tensor([0])),
+            ("model.mtp.layers.0.fc.weight", torch.tensor([1])),
+            ("model.mtp.layers.1.fc.weight", torch.tensor([2])),
+            ("model.mtp.layers.2.fc.weight", torch.tensor([3])),
+        ]
+        consumed = []
+
+        def weight_iterator():
+            for index, weight in enumerate(weights):
+                consumed.append(index)
+                yield weight
+
+        filtered = loader_mod.DefaultModelLoader._filter_mtp_weights(
+            weight_iterator(), "draft.", 1
+        )
+
+        name, tensor = next(filtered)
+        self.assertEqual(name, "draft.model.embed_tokens.weight")
+        self.assertIs(tensor, weights[0][1])
+        self.assertEqual(consumed, [0])
+
+        name, tensor = next(filtered)
+        self.assertEqual(name, "draft.model.mtp.layers.0.fc.weight")
+        self.assertIs(tensor, weights[2][1])
+        self.assertEqual(consumed, [0, 1, 2])
+
+        with self.assertRaises(StopIteration):
+            next(filtered)
+        self.assertEqual(consumed, [0, 1, 2, 3])
+
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
         model = Mock()
