@@ -128,32 +128,79 @@ class KVLayerDecl(msgspec.Struct, frozen=True, kw_only=True):
     parts: Tuple[KVPartDecl, ...]
 
 
+class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
+    """Layers that attend through one window: their ids, their row geometry and
+    the window (``None`` when the model does not state it)."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: Union[MHAGeometry, MLAGeometry]
+    window: Optional[int] = None
+
+
+# The name a model's window sub-pool goes by when it has one window.
+WINDOW_SUB_POOL = "swa"
+
+
+def window_sub_pool_name(
+    window: Optional[int], target_windows: Sequence[Optional[int]]
+) -> str:
+    """The sub-pool name of a window, from window lengths only. The longest
+    window the target's layers declare (an unstated window is longest; with no
+    target window, the window itself) keeps the name a single-window model has
+    always used; any other window is named by its length."""
+    if target_windows:
+        longest = max(
+            target_windows, key=lambda w: WindowLifetime(window=w).retention()
+        )
+    else:
+        longest = window
+    if window == longest:
+        return WINDOW_SUB_POOL
+    return f"{WINDOW_SUB_POOL}_{window}"
+
+
 def kv_layer_decls(
     *,
     full_layer_ids: Sequence[int],
     full_geometry: Union[MHAGeometry, MLAGeometry],
     window_layer_ids: Sequence[int] = (),
-    window_geometry: Optional[MHAGeometry] = None,
+    window_geometry: Optional[Union[MHAGeometry, MLAGeometry]] = None,
     window: Optional[int] = None,
+    windows: Sequence[WindowLayers] = (),
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
     checkpoint_interval: Optional[int] = None,
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
-    may hold an attention part and a state part at once."""
-    assert not set(full_layer_ids) & set(window_layer_ids), (
-        "a layer attends either fully or through a window, not both"
+    may hold an attention part and a state part at once. Window layers come as
+    ``windows``, one group per window length, or as one group through the
+    ``window_*`` arguments."""
+    windows = list(windows)
+    if window_layer_ids:
+        assert window_geometry is not None, "window layers need their geometry"
+        windows.append(
+            WindowLayers(
+                layer_ids=tuple(window_layer_ids),
+                geometry=window_geometry,
+                window=window,
+            )
+        )
+    attending = [set(full_layer_ids), *(set(w.layer_ids) for w in windows)]
+    assert sum(map(len, attending)) == len(set().union(*attending)), (
+        "a layer attends either fully or through one window"
+    )
+    assert len({w.window for w in windows}) == len(windows), (
+        "layers of one window length form one group"
     )
     parts = {}
     full = KVPartDecl(lifetime=FullLifetime(), geometry=full_geometry)
     for layer_id in full_layer_ids:
         parts.setdefault(layer_id, []).append(full)
-    if window_layer_ids:
-        assert window_geometry is not None, "window layers need their geometry"
+    for group in windows:
         part = KVPartDecl(
-            lifetime=WindowLifetime(window=window), geometry=window_geometry
+            lifetime=WindowLifetime(window=group.window), geometry=group.geometry
         )
-        for layer_id in window_layer_ids:
+        for layer_id in group.layer_ids:
             parts.setdefault(layer_id, []).append(part)
     if state_layer_ids:
         assert state_geometry is not None, "state layers need their geometry"
