@@ -1,9 +1,14 @@
+import logging
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils.common import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -37,6 +42,97 @@ elif is_xpu():
     )
 
 
+_AITER_GDN_DECODE_UNAVAILABLE = False
+
+
+def _aiter_gdn_decode_varlen():
+    """AITER's FlyDSL packed-decode recurrence, or None if it cannot be used.
+
+    Opt-in: SGLANG_USE_AITER plus SGLANG_AITER_GDN_DECODE. The kernel splits the
+    K axis across lanes, which raises occupancy sharply at low batch (the decode
+    grid is otherwise a few hundred single-wave workgroups) but costs at high
+    batch, where the extra lanes stop being free. Measured on MI355X at
+    concurrency 4 it is ~1.2x the Triton kernel; by concurrency 32 it is behind.
+    Hence opt-in rather than automatic.
+    """
+    global _AITER_GDN_DECODE_UNAVAILABLE
+    if _AITER_GDN_DECODE_UNAVAILABLE:
+        return None
+    if not (
+        get_bool_env_var("SGLANG_USE_AITER")
+        and get_bool_env_var("SGLANG_AITER_GDN_DECODE")
+    ):
+        _AITER_GDN_DECODE_UNAVAILABLE = True
+        return None
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdn_decode_varlen
+    except ImportError:
+        logger.info(
+            "aiter FlyDSL GDN decode unavailable; keeping the Triton recurrence"
+        )
+        _AITER_GDN_DECODE_UNAVAILABLE = True
+        return None
+    return flydsl_gdn_decode_varlen
+
+
+def _try_aiter_gdn_decode(**kw):
+    """Run the AITER recurrence, or return None so the caller keeps Triton.
+
+    Shape/dtype support is decided by the AITER wrapper, which raises rather
+    than degrading; an unsupported batch simply falls back here.
+    """
+    fn = _aiter_gdn_decode_varlen()
+    if fn is None:
+        return None
+    try:
+        return fn(**kw)
+    except ValueError as exc:
+        logger.debug("aiter FlyDSL GDN decode declined this batch: %s", exc)
+        return None
+
+
+def _try_aiter_gdn_packed_decode(
+    *,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_v_heads: int,
+    head_v_dim: int,
+):
+    """Split the packed decode batch into the AITER recurrence's q/k/v views."""
+    if _aiter_gdn_decode_varlen() is None:
+        return None
+    # mixed_qkv is [B, q_dim + k_dim + v_dim] with q_dim == k_dim;
+    # ssm_states is [num_slots, HV, V, K].
+    B = mixed_qkv.shape[0]
+    head_k_dim = ssm_states.shape[-1]
+    v_dim = num_v_heads * head_v_dim
+    qk_dim = (mixed_qkv.shape[-1] - v_dim) // 2
+    num_k_heads = qk_dim // head_k_dim
+    q, k, v = torch.split(mixed_qkv, [qk_dim, qk_dim, v_dim], dim=-1)
+    return _try_aiter_gdn_decode(
+        q=q.view(1, B, num_k_heads, head_k_dim),
+        k=k.view(1, B, num_k_heads, head_k_dim),
+        v=v.view(1, B, num_v_heads, head_v_dim),
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state=ssm_states,
+        state_indices=cache_indices,
+        cu_seqlens=query_start_loc,
+        scale=scale,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+    )
+
+
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
@@ -54,6 +150,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         scale: float,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
         **kwargs,
@@ -70,6 +167,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             scale: attention scale factor (typically head_k_dim ** -0.5).
             ssm_states: [num_slots, HV, V, K] full state pool.
             cache_indices: [B] per-request state slot indices.
+            query_start_loc: [B + 1] token offsets (one token per request).
             num_v_heads: number of value heads (after TP sharding).
             head_v_dim: dimension per value head.
 
@@ -117,6 +215,24 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 use_qk_l2norm_in_kernel=True,
             )
             return out.transpose(0, 1)
+
+        # The GDN backend sends every Triton decode here rather than to
+        # decode(), so the AITER decode hook has to live on this path.
+        aiter_out = _try_aiter_gdn_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+        )
+        if aiter_out is not None:
+            return aiter_out
 
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
@@ -241,6 +357,28 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # The AITER kernel handles a linear draft chain (topk <= 1). A tree
+        # verify needs the parent-state reload, which it does not implement.
+        if retrieve_parent_token is None:
+            out = _try_aiter_gdn_decode(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state=ssm_states,
+                state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                disable_state_update=True,
+                intermediate_states=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+            )
+            if out is not None:
+                return out
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
