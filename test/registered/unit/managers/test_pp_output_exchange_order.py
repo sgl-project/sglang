@@ -25,17 +25,24 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
-    """Device p2p ops one PP2 rank posts for one output exchange, in stream order."""
+def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
+    """Device p2p ops one PP2 rank posts for one output exchange, in stream order.
+
+    Fences on this rank's own forward show up as ("wait", "own-forward").
+    """
     ops = []
     scheduler = SchedulerPPMixin()
     scheduler._pp_spec_relay = spec_relay
+    scheduler.pp_group = SimpleNamespace(is_first_rank=pp_rank == 0)
+    scheduler.launch_event = "own-forward"
+    scheduler.pp_comm_stream_ctx = nullcontext()
     scheduler.schedule_stream = None
     scheduler.copy_stream = SimpleNamespace(
         wait_stream=lambda stream: None, wait_event=lambda event: None
@@ -43,7 +50,9 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
     scheduler.copy_stream_ctx = nullcontext()
     scheduler.device_module = SimpleNamespace(
         Event=lambda: SimpleNamespace(record=lambda stream: None),
-        current_stream=lambda: None,
+        current_stream=lambda: SimpleNamespace(
+            wait_event=lambda event: ops.append(("wait", event))
+        ),
     )
     scheduler._pp_prep_batch_result = lambda *args: SimpleNamespace(logits_output=None)
 
@@ -63,7 +72,9 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
         contains_last_prefill_chunk=True,
         return_logprob=True,
     )
-    with published_topology(role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2):
+    with published_topology(
+        role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2, **server_args
+    ):
         scheduler._pp_send_recv_and_preprocess_output_tensors(
             0, 1, [None, target], [None, None], deque(), None
         )
@@ -91,6 +102,30 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                     )
                     streams[0].popleft()
                     streams[1].popleft()
+
+    def test_only_first_rank_fences_output_recv_on_its_forward(self):
+        """With the fence on, rank 0 must not post its output recv before its own
+        forward finishes: an early recv holds an SM through the forward and hangs
+        flashinfer MLA."""
+        with envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.override(True):
+            self.assertEqual(
+                _posted_output_ops(0, False, "relay", "output"),
+                [("send", "relay"), ("wait", "own-forward"), ("recv", "output")],
+            )
+            # Later ranks receive relays that already exist, the spec relay
+            # exchanges before its forward, and depth > 0 receives before launch.
+            for pp_rank, spec_relay, server_args in (
+                (1, False, {}),
+                (0, True, {}),
+                (0, False, {"pp_async_batch_depth": 1}),
+            ):
+                with self.subTest(
+                    pp_rank=pp_rank, spec_relay=spec_relay, **server_args
+                ):
+                    ops = _posted_output_ops(
+                        pp_rank, spec_relay, "relay", "output", **server_args
+                    )
+                    self.assertNotIn(("wait", "own-forward"), ops)
 
 
 if __name__ == "__main__":

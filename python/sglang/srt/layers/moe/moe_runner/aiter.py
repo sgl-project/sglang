@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -247,14 +248,29 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
         elif (
-            runner_input.output is not None
-            and "output" not in extra
+            "output" not in extra
             and extra.get("stage2_scatter") is None
             and _aiter_fused_moe_supports_output()
         ):
-            # MORI EPv2 skips staging when this exact arena view is returned. Older
-            # AITER versions, no_combine and stage2_scatter keep their old path.
-            extra["output"] = runner_input.output
+            # Pass MORI EPv2's arena view when set, else a matching published buffer.
+            output = runner_input.output
+            if output is None:
+                output = zero_copy_context.get_moe_output_spec(
+                    torch.Size(
+                        (
+                            runner_input.hidden_states.shape[0],
+                            quant_info.w2_weight.shape[1],
+                        )
+                    ),
+                    (
+                        runner_input.output_dtype
+                        if runner_input.output_dtype is not None
+                        else runner_input.hidden_states.dtype
+                    ),
+                    runner_input.hidden_states.device,
+                )
+            if output is not None:
+                extra["output"] = output
         extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY
 
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.

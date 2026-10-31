@@ -10,12 +10,14 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCachePreallocMixin
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -30,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
@@ -42,6 +46,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -63,6 +68,9 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_token_ids,
     write_backup,
 )
+from sglang.test.kits.unified_radix_cache.kv_events import (
+    UnifiedRadixCacheKVEventsFixtures,
+)
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.kits.unified_radix_cache.storage import (
     AnchorLockOutcomePolicyFixtures,
@@ -74,6 +82,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
@@ -177,6 +186,64 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             )
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, cache.tree_core.get_hash_values(leaf))
+
+    def test_decode_restore_rematch_covers_bigram_prefix(self):
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+            DecodePrefixMatch,
+            HiCacheRestoreResult,
+        )
+        from sglang.srt.mem_cache.common import match_kv_cache
+
+        cache, allocator, pool = build_fixture(self.cfg)
+        UnifiedRadixCacheKVEventsFixtures._init_hicache(self, cache)
+        stored = array("q", range(1, 18))
+        value = allocator.alloc(len(stored) - 1)
+        cache.insert(InsertParams(key=RadixKey(stored), value=value))
+        leaf = cache.match_prefix(MatchPrefixParams(key=RadixKey(stored)))
+        UnifiedRadixCacheKVEventsFixtures._backup_node(
+            self, cache, leaf.last_device_node
+        )
+        cache.evict(EvictParams(num_tokens=len(stored) - 1))
+
+        req = Req(
+            rid="decode-eagle-restore",
+            origin_input_text="",
+            origin_input_ids=stored + array("q", range(100, 104)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        acquire_rows(pool, pool.state, [req])
+        first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
+        self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
+        req.lock = cache.lock(first.last_device_node)
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=cache.prefix_device_indices(req),
+                l2_host_hit_length=first.host_hit_length,
+                l3_storage_hit_length=0,
+                last_device_node=first.last_device_node,
+            ),
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restore_lock=None,
+        )
+
+        queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+            SimpleNamespace(tree_cache=cache), decode_req
+        )
+
+        self.assertTrue(queued)
+        self.assertEqual(
+            decode_req.hicache_restore_status, HiCacheRestoreResult.PENDING
+        )
+        self.assertEqual(len(decode_req.hicache_restored_kv_indices), 16)
+        cache.ready_to_load_host_cache()
+        for ack in list(cache.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
+        cache.loading_check()
+        cache.unlock(decode_req.hicache_restore_lock)
+        cache.unlock(req.lock)
+        cache.sanity_check()
 
     def test_buffer_anchor_rematch_preserves_bigram_boundary(self):
         cache, allocator, _ = self._build_buffer_hicache_fixture(
@@ -982,7 +1049,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
@@ -1245,6 +1314,59 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
 
         cons.sanity_check()
+
+    @requires_hicache
+    @requires(
+        lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
+        "one FULL page_size=4 fixture covers the decode L3 promise",
+    )
+    def test_decode_promises_only_the_prefetched_l3_span(self):
+        threshold = 16
+        storage_dir = self._make_storage_dir()
+        short_hit = self._make_seq(1, 2)  # below prefetch_threshold
+        long_hit = self._make_seq(1001, 6)
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=threshold,
+        )
+        for seq in (short_hit, long_hit):
+            self._insert(prod, prod_alloc, prod_rtp, seq)
+            leaf = prod.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+            self._backup_node(prod, leaf)
+            self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, cons_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=threshold,
+        )
+        decode = SimpleNamespace(
+            scheduler=SimpleNamespace(enable_decode_hicache=True), tree_cache=cons
+        )
+        for stored, promised in ((short_hit, 0), (long_hit, len(long_hit))):
+            req = self._make_req(cons_rtp)
+            req.origin_input_ids = array("q", stored + list(range(5000, 5016)))
+            result = match_kv_cache(req, cons, req.origin_input_ids)
+            match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
+                decode, req, result
+            )
+            self.assertEqual(match.l3_storage_hit_length, len(stored))
+            DecodeHiCachePreallocMixin._start_hicache_prefetch(decode, req, match)
+            self.assertEqual(match.decode_prefix_len, promised)
+            if promised:
+                self._run_prefetch_to_completion(cons, req.cache_request_handle)
+                hit = cons.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", stored)))
+                )
+                self.assertEqual(hit.host_hit_length, promised)
 
     @requires_hicache
     @requires(
@@ -1534,7 +1656,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=cons.tree_core.empty_match_result.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=ReqKvInfo(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         surfaced_swa_hit = req.swa_host_hit_length

@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferI
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ROOM = 106
 DECODE_IP = "10.0.0.2"
@@ -56,7 +56,6 @@ def _chunk() -> TransferKVChunk:
         prefill_kv_indices=np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
         is_last_chunk=False,
-        chunk_id=0,
         prefill_aux_index=None,
         state_indices=None,
     )
@@ -68,7 +67,6 @@ def _last_chunk() -> TransferKVChunk:
         prefill_kv_indices=np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
         is_last_chunk=True,
-        chunk_id=0,
         prefill_aux_index=0,
         state_indices=[[1]],
     )

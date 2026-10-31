@@ -102,7 +102,7 @@ class ReplayRetentionTest(CustomTestCase):
 
     def test_scheduler_and_checkpoint_paths_pass_the_replay_guard(self):
         for relative, expected in (
-            ("base_prefix_cache.py", "self.swa_reprefill_tail_tokens(req)"),
+            ("allocation.py", "tree_cache.swa_reprefill_tail_tokens(req)"),
             (
                 "unified_cache/components/swa.py",
                 "self.cache.swa_reprefill_tail_tokens(req)",
@@ -113,7 +113,8 @@ class ReplayRetentionTest(CustomTestCase):
                 node
                 for node in ast.walk(tree)
                 if isinstance(node, ast.Call)
-                and ast.unparse(node.func) == "free_swa_out_of_window_slots"
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "advance"
             ]
             self.assertEqual(len(calls), 1)
             keyword = next(
@@ -122,6 +123,46 @@ class ReplayRetentionTest(CustomTestCase):
             )
             self.assertIsNotNone(keyword, relative)
             self.assertEqual(ast.unparse(keyword.value), expected)
+
+    def test_storage_implementations_forward_the_replay_guard(self):
+        for relative in ("kv/storage.py", "static_kv_storage.py"):
+            tree = ast.parse((self.source / relative).read_text())
+            method = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "advance"
+            )
+            # Execute the real method with a recording eviction primitive.
+            method.body = [
+                node for node in method.body if not isinstance(node, ast.ImportFrom)
+            ]
+            module = ast.Module(
+                body=[
+                    ast.ImportFrom(
+                        module="__future__",
+                        names=[ast.alias(name="annotations")],
+                        level=0,
+                    ),
+                    method,
+                ],
+                type_ignores=[],
+            )
+            free_window = Mock()
+            scope = {"free_swa_out_of_window_slots": free_window}
+            exec(compile(ast.fix_missing_locations(module), relative, "exec"), scope)
+            storage = SimpleNamespace(
+                _allocator=SimpleNamespace(page_size=256), requests=object()
+            )
+            scope["advance"](
+                storage,
+                object(),
+                32575,
+                window=128,
+                retain_floor=None,
+                shares_prefixes=True,
+                reprefill_tail_tokens=128,
+            )
+            self.assertEqual(free_window.call_args.kwargs["reprefill_tail_tokens"], 128)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=337, stage="base-b", runner_config="1-gpu-large")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "
@@ -61,15 +61,19 @@ class _PagedMatchesUnpaged:
     #: per prompt, decode ones up to the first greedy token the servers differ on.
     exact = True
     median_abs_tolerance = 0.0
+    #: Extra arguments for both servers.
+    server_args = ()
 
     @classmethod
     def setUpClass(cls):
         # Both servers boot and score at the same time.
         with ThreadPoolExecutor(2) as pool:
             reference = pool.submit(
-                _serve_and_score, cls.model, DEFAULT_URL_FOR_TEST, []
+                _serve_and_score, cls.model, DEFAULT_URL_FOR_TEST, [*cls.server_args]
             )
-            paged = pool.submit(_serve_and_score, cls.model, PAGED_URL, PAGED_ARGS)
+            paged = pool.submit(
+                _serve_and_score, cls.model, PAGED_URL, [*cls.server_args, *PAGED_ARGS]
+            )
             cls.reference, cls.paged = reference.result(), paged.result()
 
     def test_captured_decode_matches(self):

@@ -11,11 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""`--enable-unified-memory` speculative-decoding backend allow-lists.
+"""`--enable-unified-memory` speculative-decoding gates.
 
-A speculative backend that does not read through the KV-index translator
-reads the unified pool with virtual ids and produces wrong tokens without
-crashing, so each arm's admitted backend set is pinned exactly.
+The target verifies on whatever backend the layout gates admit: every
+backend reads the unified pool through the KV-index runner_ids. What is
+still gated here is the fused EAGLE draft's backend, DCP's verify on
+flashinfer, and the algorithms and tree shapes the pool cannot serve.
 
     python -m pytest test/registered/unit/server_args/test_unified_memory_spec_gate.py -v
 """
@@ -26,14 +27,14 @@ from unittest.mock import patch
 
 import msgspec
 
-import sglang.srt.arg_groups.kv_cache_hook as kv_cache_hook
+import sglang.srt.configs.hybrid_arch as hybrid_arch
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _PlainHFConfig:
@@ -88,93 +89,68 @@ def _accepts(
         return False
 
 
-# The audited verify set (includes the MLA family).
-_VERIFY_BACKENDS = (
-    "triton",
-    "trtllm_mla",
-    "cutedsl_mla",
-    "flashmla",
-    "flashinfer",
-    "fa3",
-)
-_MHA_RAILS = ("triton", "flashinfer", "fa3", "trtllm_mha")
+# The backends the layout gates admit for a unified target.
+_MLA_VERIFY = ("triton", "trtllm_mla", "cutedsl_mla", "flashmla", "flashinfer", "fa3")
+_MHA_VERIFY = ("triton", "flashinfer", "fa3", "fa4", "trtllm_mha")
 
 
 class TestUnifiedMemorySpecGate(CustomTestCase):
-    VERIFY_BACKENDS = _VERIFY_BACKENDS
-    MHA_RAILS = _MHA_RAILS
-    MLA_ONLY = tuple(b for b in _VERIFY_BACKENDS if b not in _MHA_RAILS)
-    UNAUDITED = ("fa4",)
-
-    def test_dspark_verify_backends(self):
-        for backend in self.VERIFY_BACKENDS + ("fa4",):
-            self.assertTrue(_accepts("DSPARK", backend=backend), backend)
-        self.assertTrue(_accepts("DSPARK", backend="fa4", draft_backend="fa4"))
-        # trtllm_mha is audited for the EAGLE and DFLASH arms only.
-        for backend in ("trtllm_mha",):
-            self.assertFalse(_accepts("DSPARK", backend=backend), backend)
+    def test_target_backend_is_not_gated(self):
+        """No target backend translates ids itself, so none is refused for
+        the algorithm it verifies."""
+        mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
+        for algorithm in ("DSPARK", "DFLASH", "EAGLE", "EAGLE3"):
+            for backend in _MHA_VERIFY:
+                self.assertTrue(
+                    _accepts(algorithm, backend=backend, draft_backend="triton"),
+                    f"{algorithm} {backend}",
+                )
+        for algorithm in ("DSPARK", "DFLASH"):
+            for backend in _MLA_VERIFY:
+                self.assertTrue(
+                    _accepts(algorithm, backend=backend, **mla),
+                    f"{algorithm} {backend}",
+                )
 
     def test_dcp_keeps_flashinfer_off_the_verify_list(self):
         """Under DCP flashinfer's spec verify reads DCP-widened ids; the MLA
         verify family builds its own DCP block table."""
         mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
-        self.assertTrue(_accepts("DSPARK", backend="trtllm_mla", dcp_size=2, **mla))
-        self.assertFalse(_accepts("DSPARK", backend="flashinfer", dcp_size=2, **mla))
-        self.assertTrue(_accepts("DSPARK", backend="flashinfer", **mla))
-
-    def test_dflash_verify_backends(self):
-        """DFLASH verifies on the MHA rails only; the MLA family DSPARK admits
-        must not leak into this arm."""
-        for backend in self.MHA_RAILS:
-            self.assertTrue(_accepts("DFLASH", backend=backend), backend)
-        for backend in self.UNAUDITED + self.MLA_ONLY:
-            self.assertFalse(_accepts("DFLASH", backend=backend), backend)
-
-    def test_eagle_verify_backends_on_an_mha_host(self):
-        for algorithm in ("EAGLE", "EAGLE3"):
-            for topk in (None, 1):
-                for backend in self.MHA_RAILS:
-                    self.assertTrue(
-                        _accepts(algorithm, topk=topk, backend=backend),
-                        f"{algorithm} topk={topk} {backend}",
-                    )
-            for backend in self.UNAUDITED + self.MLA_ONLY:
-                self.assertFalse(
-                    _accepts(algorithm, backend=backend, draft_backend="triton"),
+        for algorithm in ("DSPARK", "DFLASH"):
+            for backend in ("trtllm_mla", "cutedsl_mla"):
+                self.assertTrue(
+                    _accepts(algorithm, backend=backend, dcp_size=2, **mla),
                     f"{algorithm} {backend}",
                 )
-
-    def test_eagle_draft_backend(self):
-        """An unset draft backend inherits the target's; an explicit one must
-        be on the MHA rails."""
-        self.assertTrue(_accepts("EAGLE", draft_backend=None))
-        for draft_backend in self.MHA_RAILS:
-            self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
-        for draft_backend in self.UNAUDITED:
-            self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
-
-    def test_eagle_on_an_mla_host(self):
-        """An MLA mamba hybrid verifies on the audited verify set, while its
-        fused draft is MHA-shaped: an MLA-only draft backend is refused whether
-        named or inherited."""
-        mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
-        with patch.object(kv_cache_hook, "mambaish_config", return_value=object()):
-            for backend in self.VERIFY_BACKENDS:
-                self.assertTrue(
-                    _accepts("EAGLE", backend=backend, draft_backend="triton", **mla),
-                    backend,
-                )
             self.assertFalse(
-                _accepts("EAGLE", backend="fa4", draft_backend="triton", **mla)
+                _accepts(algorithm, backend="flashinfer", dcp_size=2, **mla)
             )
-            for backend in ("trtllm_mla", "flashmla"):
-                for draft_backend in (None, backend):
-                    self.assertFalse(
+            self.assertTrue(_accepts(algorithm, backend="flashinfer", **mla))
+
+    def test_draft_backend_is_not_gated(self):
+        """A fused draft is parts of the target's sub-pools read through views,
+        so no draft backend, named or inherited, is refused for it."""
+        mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
+        for draft_backend in (None, "triton", "flashinfer", "fa3", "fa4", "trtllm_mha"):
+            self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
+        self.assertTrue(_accepts("EAGLE", backend="fa4", draft_backend=None))
+        # The gate reads the lifetimes the model declares, its state from here.
+        with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
+            for backend in _MLA_VERIFY:
+                for draft_backend in (None, "triton"):
+                    self.assertTrue(
                         _accepts(
                             "EAGLE", backend=backend, draft_backend=draft_backend, **mla
                         ),
-                        draft_backend or backend,
+                        f"{backend} {draft_backend}",
                     )
+
+    def test_eagle_needs_a_unified_target(self):
+        """EAGLE's draft fuses into the target's sub-pools, so the target must
+        declare one beside the full one."""
+        mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
+        with patch.object(hybrid_arch, "mambaish_config", return_value=None):
+            self.assertFalse(_accepts("EAGLE", backend="triton", **mla))
 
     def test_unaudited_algorithms_and_tree_drafting_refused(self):
         """NGRAM and tree drafting relocate accepted tokens one at a time
