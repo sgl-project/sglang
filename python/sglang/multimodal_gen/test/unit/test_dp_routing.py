@@ -4,7 +4,10 @@ Generation requests go to exactly one replica, control ops reach every replica,
 and a realtime session always lands on the same replica it started on.
 """
 
+import asyncio
 import itertools
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -17,6 +20,8 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (
     _CONTROL_REQ_TYPES,
+    AsyncSchedulerClient,
+    SchedulerClient,
     _merge_fanout_results,
     _select_replica,
 )
@@ -65,6 +70,44 @@ def test_fanout_merge_surfaces_the_failing_replica():
     bad = OutputBatch(error="replica 1 exploded")
     assert _merge_fanout_results([ok, bad]) is bad
     assert _merge_fanout_results([ok, OutputBatch(output=None)]) is ok
+
+
+@pytest.mark.parametrize("client_type", [SchedulerClient, AsyncSchedulerClient])
+@pytest.mark.parametrize(
+    "error",
+    [
+        None,
+        "CUDA out of memory",
+        "CUDA error: an illegal memory access was encountered",
+    ],
+)
+def test_fanout_preserves_fatal_reply_before_later_timeout(client_type, error):
+    """A later timeout must preserve fatal replies but still fail other calls."""
+    client = client_type()
+    client.server_args = SimpleNamespace(
+        scheduler_endpoints=["tcp://replica-0", "tcp://replica-1"]
+    )
+    client.request_logger = Mock()
+    reply = OutputBatch(error=error)
+    timeout = TimeoutError("Scheduler did not respond in time.")
+    mock_type = AsyncMock if client_type is AsyncSchedulerClient else Mock
+    client._forward_one = mock_type(side_effect=[reply, timeout])
+    # Async forward checks initialization even when the transport is mocked.
+    client.context = Mock()
+
+    def forward():
+        request = SetLoraReq(lora_nickname="x", lora_path="y")
+        if client_type is AsyncSchedulerClient:
+            return asyncio.run(client.forward(request))
+        return client.forward(request)
+
+    if error and "illegal memory access" in error:
+        assert forward() is reply
+    else:
+        with pytest.raises(TimeoutError) as exc_info:
+            forward()
+        assert exc_info.value is timeout
+    assert client._forward_one.call_count == 2
 
 
 def test_scheduler_endpoints_one_per_replica():
