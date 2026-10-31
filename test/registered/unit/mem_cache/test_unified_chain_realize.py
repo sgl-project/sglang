@@ -283,6 +283,61 @@ class TestChainRealize(CustomTestCase):
             self.assertFalse(allocator.verify_byte_accounting())
         self.assertEqual(outcomes, {False, True})
 
+    def _check_reads_are_takes(self, device, seed, count):
+        # Each sub-pool's read is the largest demand of that sub-pool alone
+        # the take's own answer admits (a scan finds no larger one, so the
+        # reads' search may assume nothing about the answer's shape), taking
+        # exactly that much succeeds, and the joint token read is the largest
+        # demand every token sub-pool can take together.
+        rng = random.Random(seed)
+        shared = 0
+        for _ in range(count):
+            setup_allocator_context()
+            chain = rng.choice(("swa", "tri"))
+            allocator = _allocator(device, chain, lazy=rng.random() < 0.8)
+            self._history(rng, allocator)
+            page = allocator.page_size
+            units = {}
+            for band in allocator.bands:
+                name = band.sub_pool_name
+                bound = allocator._id_bound(band)
+                largest = max(
+                    n
+                    for n in range(bound + 2)
+                    if n == 0 or allocator._units_fit({name: n})
+                )
+                unit = 1 if band is allocator.mamba_allocator else page
+                self.assertEqual(allocator.units_available(name), largest * unit)
+                units[name] = largest
+            joint = allocator.available_size()
+            # Bands share bytes: the joint read can be below every one alone.
+            tokens = [
+                units[b.sub_pool_name] * page
+                for b in allocator.bands
+                if b is not allocator.mamba_allocator
+            ]
+            shared += joint < min(tokens)
+            self.assertTrue(allocator.ensure_capacity(joint, joint))
+            self.assertFalse(allocator.ensure_capacity(joint + page, joint + page))
+            # Taking exactly a read succeeds, through the allocator's takes: a
+            # token take binds the owner and every window together.
+            state = allocator.mamba_allocator
+            if state is not None and rng.random() < 0.5:
+                slots = units[state.sub_pool_name]
+                if slots:
+                    self.assertIsNotNone(allocator.alloc_state_slots(slots))
+            elif joint:
+                self.assertIsNotNone(allocator.alloc(joint))
+            self.assertFalse(allocator.verify_byte_accounting())
+        self.assertGreater(shared, 0)
+
+    def test_reads_are_takes_on_cpu(self):
+        self._check_reads_are_takes("cpu", seed=31, count=300)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_reads_are_takes_on_cuda(self):
+        self._check_reads_are_takes("cuda", seed=32, count=40)
+
     def test_transfers_leave_capacity_answers_on_cpu(self):
         self._check_transfers_leave_answers("cpu", seed=21, count=300)
 
