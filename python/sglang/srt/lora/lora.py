@@ -29,6 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.peft_moe import normalize_peft_moe_weights
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -201,6 +202,9 @@ class LoRAAdapter(nn.Module):
 
     def _normalize_weights(self):
         for layer in self.layers:
+            normalize_peft_moe_weights(
+                layer.weights, self.base_hf_config, self.config.hf_config
+            )
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
