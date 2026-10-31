@@ -774,10 +774,12 @@ class HiCacheController:
             tp_rank = parallel.attn_tp_rank
             tp_size = parallel.attn_tp_size
             dp_rank = parallel.attn_dp_rank
+            dp_size = parallel.attn_dp_size
         else:
             tp_rank = parallel.tp_rank
             tp_size = parallel.tp_size
             dp_rank = 0
+            dp_size = 1
 
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
         # data. storage only needs rank 0 to write it back.
@@ -833,6 +835,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
+            dp_size=dp_size,
             extra_config=storage_backend_extra_config,
             unified_suffixes=(unified_plan.suffixes if unified_plan else None),
             unified_chunk_spans=unified_chunk_spans,

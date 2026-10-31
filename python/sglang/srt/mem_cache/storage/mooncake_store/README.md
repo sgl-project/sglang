@@ -266,7 +266,7 @@ The Mooncake parameters used here are essentially the same as those configured f
 
 In particular, for the `global segment size`, if at least one `store service` instance is running, this value can be set to `0`. In this case, the SGLang server will not contribute any memory to the system. Note that KV tensors stored in this contributed memory will be lost when the process exits; however, this will **not** cause any system errors.
 
-**Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance and contributes `1/global_segment_size` memory. Therefore, the total memory consumption equals `global segment size`.
+**Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance and contributes `1/global_segment_size` memory. Therefore, the total memory consumption equals `global segment size`. When DP attention is enabled, each DP rank also launches its own Mooncake instance, and the memory is divided by `tp_size * pp_size * dp_size` per rank, so the total still equals `global segment size`.
 
 **Tenant Isolation (`tenant_id`):**
 
