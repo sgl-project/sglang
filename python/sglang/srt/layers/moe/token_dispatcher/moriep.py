@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPPDispatchHooks
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    get_deepep_mode,
     get_moe_a2a_backend,
     is_tbo_enabled,
 )
@@ -141,6 +142,35 @@ def mori_tbo_child_dispatch_cap() -> Optional[int]:
     if not (get_moe_a2a_backend().is_mori() and envs.SGLANG_MORI_EP_V2.get()):
         return None
     return mori_tbo_child_max_dispatch_tokens_per_rank(_max_dispatch_tokens_per_rank())
+
+
+def _epv2_uses_async_ll(deepep_mode: DeepEPMode, enable_sdma: bool) -> bool:
+    # As in init_mori_op: low_latency or SDMA selects the AsyncLL kernels.
+    return deepep_mode.enable_low_latency() or enable_sdma
+
+
+@functools.cache
+def mori_tbo_side_stream_enabled() -> bool:
+    """Whether TBO issues micro-batch B on its own stream: only under MORI EPv2
+    AsyncLL, whose transfers leave the compute queue, so a micro-batch spinning in
+    its receive does not hold up the sibling's independent work."""
+    if not (get_moe_a2a_backend().is_mori() and envs.SGLANG_MORI_EP_V2.get()):
+        return False
+    deepep_mode = get_deepep_mode()
+    if deepep_mode == DeepEPMode.AUTO:
+        deepep_mode = DeepEPMode.NORMAL
+    if not _epv2_uses_async_ll(
+        deepep_mode, get_bool_env_var("MORI_ENABLE_SDMA", "false")
+    ):
+        return False
+    if get_bool_env_var("MORI_ASYNCLL_FUSED_RECV", "false"):
+        # The fused receive's spinning blocks take the CUs the other stream needs.
+        logger.warning(
+            "MORI_ASYNCLL_FUSED_RECV=1: two-batch overlap keeps both micro-batches "
+            "on one stream"
+        )
+        return False
+    return True
 
 
 def _should_record_expert_distribution() -> bool:
@@ -714,9 +744,9 @@ def init_mori_epv2_op(
         quant_type=_EPV2_COMBINE_QUANT[combine_dtype],
         max_total_recv_tokens=max_total_recv_tokens,
     )
-    # As in init_mori_op: low_latency or SDMA selects the AsyncLL kernels. MORI's
-    # "sdma" transport needs MORI_ENABLE_SDMA for cco's SDMA queues; "lsa" needs none.
-    async_ll = deepep_mode.enable_low_latency() or enable_sdma
+    # MORI's "sdma" transport needs MORI_ENABLE_SDMA for cco's SDMA queues; "lsa"
+    # needs none.
+    async_ll = _epv2_uses_async_ll(deepep_mode, enable_sdma)
     async_ll_transport = "sdma" if enable_sdma else "lsa"
     if async_ll:
         if "async_ll" not in EpDispatchCombineConfig.__dataclass_fields__:

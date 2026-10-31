@@ -16,7 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import moriep
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.runtime_context import get_flags, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -332,6 +332,126 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
         )
         self.assertEqual(self.log, ["dispatch", "combine"])
+
+
+class TestMoriTboSideStream(CustomTestCase):
+    """TBO issues micro-batch B on its own stream only under MORI EPv2 AsyncLL
+    (low_latency, or normal + MORI_ENABLE_SDMA). Native EPv2, EPv1 and other
+    backends share the comm stream between micro-batches and keep one stream;
+    auto is EPv2's normal mode, although DeepEPMode.AUTO enables low latency."""
+
+    def setUp(self):
+        reset_context()
+        self._env = patch.dict(os.environ)
+        self._env.start()
+        for name in ("MORI_ENABLE_SDMA", "MORI_ASYNCLL_FUSED_RECV"):
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        self._env.stop()
+        moriep.mori_tbo_side_stream_enabled.cache_clear()
+        reset_context()
+
+    def _enabled(self, deepep_mode, sdma=False, epv2=True, backend="mori", **env):
+        moriep.mori_tbo_side_stream_enabled.cache_clear()
+        envs.SGLANG_MORI_EP_V2.set(epv2)
+        os.environ["MORI_ENABLE_SDMA"] = "1" if sdma else "0"
+        os.environ.update(env)
+        with get_flags().moe.override(
+            a2a_backend=MoeA2ABackend(backend), deepep_mode=deepep_mode
+        ):
+            return moriep.mori_tbo_side_stream_enabled()
+
+    def test_only_async_ll_runs_micro_batch_b_on_a_side_stream(self):
+        for kwargs, expected in (
+            (dict(deepep_mode=DeepEPMode.LOW_LATENCY), True),
+            (dict(deepep_mode=DeepEPMode.NORMAL, sdma=True), True),
+            (dict(deepep_mode=DeepEPMode.AUTO, sdma=True), True),
+            (dict(deepep_mode=DeepEPMode.NORMAL), False),
+            (dict(deepep_mode=DeepEPMode.AUTO), False),
+            (dict(deepep_mode=DeepEPMode.LOW_LATENCY, epv2=False), False),
+            (dict(deepep_mode=DeepEPMode.LOW_LATENCY, backend="deepep"), False),
+            # The fused receive's spinning blocks starve a concurrent stream.
+            (
+                dict(deepep_mode=DeepEPMode.LOW_LATENCY, MORI_ASYNCLL_FUSED_RECV="1"),
+                False,
+            ),
+        ):
+            with self.subTest(**kwargs):
+                self.assertEqual(self._enabled(**kwargs), expected)
+
+    def test_micro_batch_b_issued_from_its_own_thread(self):
+        """B's stages go through another host thread (its own BLAS handle; two
+        streams' Stream-K GEMMs through one hipBLASLt handle can hang), in the
+        same A/B order, under the caller's grad mode and context variables."""
+        import contextvars
+        import threading
+        from contextlib import nullcontext
+
+        from sglang.srt.batch_overlap import operations
+        from sglang.srt.batch_overlap.operations import (
+            YieldOperation,
+            execute_overlapped_operations,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        var = contextvars.ContextVar("probe", default=None)
+        seen = []
+
+        def stage(index):
+            def op(state, **inputs):
+                name = inputs["forward_batch"].name
+                thread = threading.current_thread() is threading.main_thread()
+                seen.append((name, index, thread, var.get(), torch.is_grad_enabled()))
+                return inputs
+
+            return op
+
+        operations_list = [stage(0), YieldOperation(), stage(1)]
+        inputs = [
+            {
+                "forward_batch": SimpleNamespace(
+                    name=name,
+                    global_dp_buffer_len=None,
+                    tbo_padded_len=None,
+                    global_num_tokens_cpu=None,
+                    tbo_dp_global_num_tokens_bound=None,
+                    dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+                    moe_num_token_non_padded=None,
+                )
+            }
+            for name in ("a", "b")
+        ]
+        stream = SimpleNamespace(
+            device=torch.device("cuda", 0), wait_stream=lambda s: None
+        )
+        with (
+            patch.object(operations, "_micro_batch_b_side_stream", return_value=stream),
+            patch.object(operations, "_create_blas_handle"),
+            patch.object(operations, "_side_issuers", {}),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(torch.cuda, "set_device"),
+            patch.object(torch.cuda, "stream", return_value=nullcontext()),
+            forward_context(ForwardContext(attn_backend=None)),
+            torch.no_grad(),
+        ):
+            var.set("caller")
+            execute_overlapped_operations(
+                inputs, [operations_list] * 2, delta_stages=[0, 1]
+            )
+            operations._side_issuers[0].shutdown()
+        self.assertEqual(
+            seen,
+            [
+                ("a", 0, True, "caller", False),
+                ("a", 1, True, "caller", False),
+                ("b", 0, False, "caller", False),
+                ("b", 1, False, "caller", False),
+            ],
+        )
 
 
 if __name__ == "__main__":

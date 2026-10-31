@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import (
@@ -13,6 +15,8 @@ from typing import (
     Sequence,
     Union,
 )
+
+import torch
 
 from sglang.srt.layers.dp_attention import set_dp_buffer_len
 from sglang.srt.model_executor.forward_context import (
@@ -60,6 +64,14 @@ def execute_overlapped_operations(
     executor_b = _StageExecutor(
         "b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b, micro_batch=True
     )
+    side_stream = _micro_batch_b_side_stream()
+    if side_stream is not None:
+        main_stream = torch.cuda.current_stream()
+        side_stream.wait_stream(main_stream)
+        # B's inputs come from the main stream's pool: keep A from reusing their
+        # blocks while B may still read them.
+        _record_stream(inputs_b, side_stream)
+        executor_b = _SideStreamExecutor(executor_b, side_stream)
 
     for _ in range(delta_stage):
         executor_a.next()
@@ -72,7 +84,98 @@ def execute_overlapped_operations(
         executor_b.next()
 
     assert executor_a.done and executor_b.done
+    if side_stream is not None:
+        main_stream.wait_stream(side_stream)
+        # B's outputs come from the side stream's pool; the main stream uses them.
+        _record_stream(executor_b.output, main_stream)
     return [executor_a.output, executor_b.output]
+
+
+_side_streams: Dict[int, torch.cuda.Stream] = {}
+_side_issuers: Dict[int, ThreadPoolExecutor] = {}
+
+
+def _micro_batch_b_side_stream() -> Optional[torch.cuda.Stream]:
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        mori_tbo_side_stream_enabled,
+    )
+
+    if not mori_tbo_side_stream_enabled() or torch.cuda.is_current_stream_capturing():
+        return None
+    device = torch.cuda.current_device()
+    if device not in _side_streams:
+        _side_streams[device] = torch.cuda.Stream(device=device)
+    return _side_streams[device]
+
+
+def _record_stream(values, stream: torch.cuda.Stream) -> None:
+    """record_stream the tensors in `values` (a dict, list or tuple, one level of
+    nesting), so the caching allocator waits for `stream` before reusing them."""
+    items = values.values() if isinstance(values, dict) else values
+    for value in items:
+        tensors = value if isinstance(value, (list, tuple)) else (value,)
+        for tensor in tensors:
+            if isinstance(tensor, torch.Tensor):
+                tensor.record_stream(stream)
+
+
+def _side_issuer(device: int) -> ThreadPoolExecutor:
+    """The device's host thread that issues micro-batch B's stages.
+
+    torch keeps one BLAS handle per host thread, and hipBLASLt Stream-K GEMMs
+    running concurrently on two streams through one handle can leave a workgroup
+    spinning in its fixup forever; issuing B from its own thread gives B its own
+    handle.
+    """
+    issuer = _side_issuers.get(device)
+    if issuer is None:
+        issuer = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="tbo-side-issuer",
+            initializer=torch.cuda.set_device,
+            initargs=(device,),
+        )
+        issuer.submit(_create_blas_handle).result()
+        _side_issuers[device] = issuer
+    return issuer
+
+
+def _create_blas_handle() -> None:
+    # Create this thread's BLAS handle on an idle device, so its setup cannot race
+    # GEMMs in flight on other streams.
+    torch.cuda.synchronize()
+    x = torch.zeros(256, 256, device="cuda", dtype=torch.bfloat16)
+    torch.nn.functional.linear(x, x)
+    torch.cuda.synchronize()
+
+
+class _SideStreamExecutor:
+    """Runs a _StageExecutor's stages on `stream`, issued from the device's side
+    issuer thread; the caller waits for each stage to be issued, so the host still
+    issues A's and B's stages in the same order."""
+
+    def __init__(self, executor: _StageExecutor, stream: torch.cuda.Stream):
+        self._executor = executor
+        self._stream = stream
+        self._issuer = _side_issuer(stream.device.index)
+
+    def next(self):
+        inference_mode = torch.is_inference_mode_enabled()
+        grad_enabled = torch.is_grad_enabled()
+
+        def issue():
+            with (
+                torch.inference_mode(inference_mode),
+                torch.set_grad_enabled(grad_enabled),
+                torch.cuda.stream(self._stream),
+            ):
+                self._executor.next()
+
+        # B reads the caller's context variables; its writes stay in the copy.
+        self._issuer.submit(contextvars.copy_context().run, issue).result()
+
+    def __getattr__(self, item):
+        return getattr(self._executor, item)
 
 
 def _resolve_tbo_child_contexts():
