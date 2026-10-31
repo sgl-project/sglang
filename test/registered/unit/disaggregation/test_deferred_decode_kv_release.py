@@ -973,6 +973,54 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         }
         self.assertEqual(required_acks, {8: 2})
 
+    def test_pp_failure_keeps_destination_held_until_release_consensus(self):
+        mgr = _make_manager()
+        q = _make_pop_queue(mgr)
+        released = []
+        q._release_request = released.append
+        ready = SimpleNamespace(query=lambda: True)
+        concluded = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
+        concluded.awaiting_publish = True
+        # An abort before send_metadata has no generation that prefill can ack.
+        aborted = _make_failed_req(mgr, room=8, idx=4, abort_notified=True)
+        aborted.pending_metadata = (ready, ("aborted",), {})
+        queued = _make_failed_req(mgr, room=9, idx=5, abort_notified=False)
+        queued.pending_metadata = (ready, ("queued",), {})
+        for entry in (aborted, queued):
+            entry.kv_receiver.send_metadata = MagicMock()
+        aborted_receiver = aborted.kv_receiver
+        pending = aborted.pending_metadata
+        q.queue = [concluded, aborted, queued]
+        q._poll_with_metadata_gate = lambda: [
+            KVPoll.Failed,
+            KVPoll.Failed,
+            KVPoll.WaitingForInput,
+        ]
+
+        with patch.object(decode_mod, "prepare_abort"):
+            q.pop_transferred_with_outcomes({concluded.req.rid: True})
+
+        self.assertEqual(q.queue, [aborted, queued])
+        self.assertEqual(released, [concluded])
+        aborted_receiver.send_metadata.assert_not_called()
+        self.assertIs(aborted.pending_metadata, pending)
+        queued.kv_receiver.send_metadata.assert_called_once_with("queued")
+        self.assertIsNone(queued.pending_metadata)
+
+        # PP now agrees to release the abort. Its unsent destination needs no
+        # drain acknowledgements, even though the receiver already sent ABORT.
+        q._poll_with_metadata_gate = lambda: [KVPoll.Failed, KVPoll.WaitingForInput]
+        with patch.object(decode_mod, "prepare_abort"):
+            q.pop_transferred_with_outcomes({aborted.req.rid: True})
+
+        self.assertEqual(released, [concluded, aborted])
+        self.assertEqual(q.queue, [queued])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [3, 4])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(mgr._deferred_abort_ack_tracker, {})
+        aborted_receiver.send_metadata.assert_not_called()
+        queued.kv_receiver.send_metadata.assert_called_once_with("queued")
+
     def test_backend_optout_keeps_immediate_release_and_sends_no_abort(self):
         mgr = _make_manager()
         mgr.enable_deferred_decode_kv_release = False

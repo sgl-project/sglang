@@ -3278,10 +3278,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
-        # Only requests still queued send a held destination: a failed or aborted
-        # one never tells prefill where to write.
-        for decode_req in self.queue:
+        # PP can keep a failed request queued until release consensus arrives.
+        # Keep its destination held so cleanup needs no drain acknowledgements.
+        for decode_req, poll in zip(self.queue, polls):
+            if poll == KVPoll.Failed:
+                continue
             pending = decode_req.pending_metadata
             if pending is not None and pending[0].query():
                 decode_req.pending_metadata = None
