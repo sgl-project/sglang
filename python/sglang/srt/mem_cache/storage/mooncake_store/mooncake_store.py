@@ -851,10 +851,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return layout
 
         if self.mem_pool_host.kv_buffer is not None:
+            # A storage page spans the anchor's logical slots, dcp_size per row.
             suffixes, _, _ = self._batch_preprocess(
                 [""],
                 torch.arange(
-                    self.mem_pool_host.page_size, dtype=torch.int64, device="cpu"
+                    self.mem_pool_host.logical_page_size,
+                    dtype=torch.int64,
+                    device="cpu",
                 ),
             )
             pools.append(
