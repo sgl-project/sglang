@@ -373,6 +373,11 @@ class TestDFlashMLA(CustomTestCase):
         model = DSparkDraftModel(
             Qwen3Config(**_export_fields(), markov_rank=4, markov_head_type="vanilla")
         )
+        # The layers allocate uninitialized weights, which may hold NaN.
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.copy_(torch.randn_like(param) * 0.2)
         attn = model.layers[0].self_attn
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
