@@ -924,20 +924,143 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    @staticmethod
+    def hybrid_mamba(*, page_size=2, spec=False, strided=False, **req_overrides):
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MambaPool,
+            MHATokenToKVPool,
+        )
 
+        full = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        full.page_size = page_size
+        full.kv_cache_layout = "nhd"
+        full.k_scale_buffer = full.native_k_scale_buffer = None
+        full.k_buffer = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(2)]
+        full.v_buffer = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(2)]
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+        kvcache.full_kv_pool = full
+        kvcache.start_layer = 0
+        # Layers 0 and 2 are attention; layers 1 and 3 are Mamba.
+        kvcache.full_attention_layer_id_mapping = {0: 0, 2: 1}
+
+        conv = torch.zeros((2, 4, 3), dtype=torch.uint8)
+        temporal = torch.zeros((2, 4, 5), dtype=torch.uint8)
+        if strided:
+            conv = torch.zeros((2, 4, 6), dtype=torch.uint8)[..., :3]
+        state_cls = MambaPool.SpeculativeState if spec else MambaPool.State
+        extra = (
+            {"intermediate_ssm": None, "intermediate_conv_window": []} if spec else {}
+        )
+        req_to_token_pool = SimpleNamespace(
+            mamba_ckpt_pool=None,
+            short_conv_pool=SimpleNamespace(enabled=False),
+            ngram_pool=SimpleNamespace(enabled=False),
+            mamba_map={1: 0, 3: 1},
+            mamba_pool=SimpleNamespace(
+                num_mamba_layers=2,
+                enable_linear_replayssm=False,
+                enable_linear_replayssm_spec=False,
+                mamba_cache=state_cls(conv=[conv], temporal=temporal, **extra),
+            ),
+        )
+        for key, value in req_overrides.items():
+            setattr(req_to_token_pool, key, value)
+        return kvcache, SimpleNamespace(req_to_token_pool=req_to_token_pool)
+
+    def resolve_mamba(self, kvcache, params, *, page_size=2):
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
         ):
-            resolve_hybrid_device_pool_group(
+            return resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
-                page_size=2,
-                params=SimpleNamespace(),
+                page_size=page_size,
+                params=params,
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
+
+    def test_full_mamba_hybrid_maps_kv_and_state(self):
+        kvcache, params = self.hybrid_mamba()
+        group = self.resolve_mamba(kvcache, params)
+
+        self.assertEqual(group.num_layers, 4)
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
+        self.assertEqual(
+            group.sources, {PoolName.KV: PoolName.KV, PoolName.MAMBA: PoolName.MAMBA}
+        )
+        self.assertEqual(
+            group.entry_map[PoolName.KV].layer_mapping, {0: (0, 2), 2: (1, 3)}
+        )
+        mamba = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(mamba._row_span, 1)
+        self.assertEqual(mamba.layer_mapping, {1: 0, 3: 1})
+        # Temporal then conv state, one buffer per Mamba layer each.
+        self.assertEqual([len(c) for c in mamba.components], [2, 2])
+
+    def test_full_mamba_hybrid_rejects_unsupported_state(self):
+        for label, kwargs, message in (
+            ("spec", {"spec": True}, "speculative or linear"),
+            ("strided", {"strided": True}, "strided Mamba state"),
+        ):
+            with self.subTest(label):
+                kvcache, params = self.hybrid_mamba(**kwargs)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.resolve_mamba(kvcache, params)
+
+        kvcache, params = self.hybrid_mamba()
+        params.req_to_token_pool.mamba_pool.enable_linear_replayssm = True
+        with self.assertRaisesRegex(ValueError, "speculative or linear"):
+            self.resolve_mamba(kvcache, params)
+
+        kvcache, params = self.hybrid_mamba()
+        with self.assertRaisesRegex(ValueError, "page size must match"):
+            self.resolve_mamba(kvcache, params, page_size=4)
+        kvcache.full_kv_pool.kv_cache_layout = "hnd"
+        with self.assertRaisesRegex(ValueError, "page-row KV layouts"):
+            self.resolve_mamba(kvcache, params)
+        kvcache.full_kv_pool = object()
+        with self.assertRaisesRegex(ValueError, "KV pool"):
+            self.resolve_mamba(kvcache, params)
+
+    def test_swa_mamba_hybrid_gets_the_same_rejections(self):
+        import copy
+
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler as lpa
+
+        def build(kvcache, params):
+            with (
+                patch.object(lpa, "get_memory") as memory,
+                patch(
+                    "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler"
+                    "._swa_layer_mappings",
+                    return_value=({0: 0}, {1: 0}),
+                ),
+            ):
+                memory.return_value = SimpleNamespace(enable_unified_memory=False)
+                return lpa._build_mamba_swa_device_pool_group(kvcache, params, 2)
+
+        kvcache, params = self.hybrid_mamba()
+        kvcache.swa_kv_pool = copy.copy(kvcache.full_kv_pool)
+        self.assertEqual(
+            set(build(kvcache, params).entry_map),
+            {PoolName.KV, PoolName.SWA, PoolName.MAMBA},
+        )
+        kvcache.swa_kv_pool.kv_cache_layout = "hnd"
+        with self.assertRaisesRegex(ValueError, "page-row KV layouts"):
+            build(kvcache, params)
+        kvcache.swa_kv_pool = object()
+        with self.assertRaisesRegex(ValueError, "KV pool"):
+            build(kvcache, params)
+        kvcache, params = self.hybrid_mamba()
+        kvcache.swa_kv_pool = copy.copy(kvcache.full_kv_pool)
+        params.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "MTP draft"):
+            build(kvcache, params)
+        kvcache, params = self.hybrid_mamba(strided=True)
+        kvcache.swa_kv_pool = copy.copy(kvcache.full_kv_pool)
+        with self.assertRaisesRegex(ValueError, "strided Mamba state"):
+            build(kvcache, params)
 
 
 class TestMhaDevicePoolAssembler(CustomTestCase):

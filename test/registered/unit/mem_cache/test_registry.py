@@ -349,6 +349,46 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         self.assertIs(result, cache)
 
+    def test_external_linker_counter_reaches_mamba_req_to_token_pool(self):
+        from sglang.srt.mem_cache.storage.kvcr import kvcr_direct_linker
+
+        for components, expect_mamba in ((("full",), False), (("full", "mamba"), True)):
+            with self.subTest(components=components):
+                ctx = _make_ctx(self)
+                with get_context().override_server_args(
+                    enable_unified_cache_external_linker=True,
+                    unified_cache_external_linker_backend="kvcr",
+                ):
+                    fake_components = MagicMock()
+                    fake_components.ComponentType.FULL = "full"
+                    fake_components.ComponentType.MAMBA = "mamba"
+                    fake_radix = MagicMock()
+                    cache = fake_radix.UnifiedRadixCache.return_value
+                    cache.components = components
+                    counter = cache.linker.layer_done_counter
+                    with (
+                        patch.dict(
+                            "sys.modules",
+                            {
+                                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                            },
+                        ),
+                        patch.object(
+                            kvcr_direct_linker,
+                            "KVCRDirectLinker",
+                            return_value=MagicMock(),
+                        ),
+                    ):
+                        default_radix_cache_factory(ctx)
+                req_pool = ctx.params.req_to_token_pool
+                if expect_mamba:
+                    req_pool.register_layer_transfer_counter.assert_called_once_with(
+                        counter
+                    )
+                else:
+                    req_pool.register_layer_transfer_counter.assert_not_called()
+
     def test_custom_unified_cache_keeps_host_pool_setup(self):
         ctx = _make_ctx(self)
         enter_override(

@@ -228,6 +228,10 @@ def create_unified_radix_cache(
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
+        # Mamba layers wait on the req_to_token pool, which the hybrid KV pool
+        # does not forward the counter to.
+        if ComponentType.MAMBA in cache.components:
+            params.req_to_token_pool.register_layer_transfer_counter(counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
