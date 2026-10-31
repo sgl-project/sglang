@@ -522,6 +522,7 @@ def prepare_mlp_sync_batch_raw(
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
+    pp_size: int,
     offload_tags: set[str],
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
@@ -605,7 +606,10 @@ def prepare_mlp_sync_batch_raw(
         group = torch.distributed.group.WORLD
         device = world.device
     elif len(offload_tags) == 0 and (
-        disable_overlap_schedule
+        # The device gather and its D2H queue behind in-flight GPU work. Only
+        # the non-overlap, non-PP loop schedules with the GPU idle; the PP loop
+        # schedules each microbatch while earlier microbatches still run.
+        (disable_overlap_schedule and pp_size == 1)
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
         group = tp_group.device_group
@@ -752,6 +756,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(),
             draft_require_mlp_tp_gather=draft_require_mlp_tp_gather,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            pp_size=get_parallel().pp_size,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,

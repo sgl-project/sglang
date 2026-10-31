@@ -96,6 +96,7 @@ from sglang.srt.runtime_context import (
     SpawnRanks,
     get_device,
     get_model,
+    get_parallel,
     get_schedule,
     publish,
     spawn_world_rank,
@@ -557,6 +558,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            pp_size=get_parallel().pp_size,
             offload_tags=set(),
         )
 

@@ -74,6 +74,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
                 disable_cuda_graph=False,
                 require_mlp_tp_gather=False,
                 disable_overlap_schedule=True,
+                pp_size=1,
                 offload_tags=set(),
             )
 
@@ -177,6 +178,7 @@ class TestDPBalanceStats(CustomTestCase):
                 disable_cuda_graph=False,
                 require_mlp_tp_gather=True,
                 disable_overlap_schedule=True,
+                pp_size=1,
                 offload_tags=set(),
                 sync_wait_carry=sync_wait_carry,
             )
@@ -391,6 +393,84 @@ class TestDPBalanceStats(CustomTestCase):
                 global_attention_pairs=[0, 0],
                 sync_wait_seconds=0.0,
             )
+
+
+class TestMLPSyncGatherGroup(CustomTestCase):
+    def _gather_group(self, *, disable_overlap_schedule, pp_size, nccl_env=False):
+        device_group, cpu_group = object(), object()
+        gather_groups = []
+
+        def exchange_sync_rows(output, local, group):
+            gather_groups.append(group)
+            output.copy_(local.repeat(output.numel() // local.numel()))
+
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+            envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.override(
+                nccl_env
+            ),
+            patch.object(dp_attn, "_ENABLE_METRICS_DP_ATTENTION", False),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=2,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=device_group,
+                        device="cpu",
+                        cpu_group=cpu_group,
+                        active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+                    ),
+                ),
+            ),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn, "exchange_sync_rows", side_effect=exchange_sync_rows),
+        ):
+            dp_attn.prepare_mlp_sync_batch_raw(
+                None,
+                model_runner=SimpleNamespace(
+                    prefill_cuda_graph_runner=None,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    model_config=object(),
+                ),
+                get_idle_batch=None,
+                disable_cuda_graph=False,
+                require_mlp_tp_gather=True,
+                disable_overlap_schedule=disable_overlap_schedule,
+                pp_size=pp_size,
+                offload_tags=set(),
+            )
+
+        self.assertEqual(len(gather_groups), 1)
+        return "device" if gather_groups[0] is device_group else "cpu"
+
+    def test_pipeline_parallel_gathers_on_cpu_group(self):
+        """PP disables overlap scheduling, but earlier microbatches are still
+        running when the next one is scheduled, so a device gather would wait
+        for them. Without PP the GPU is idle there and the device group stays."""
+        cases = (
+            (True, 1, False, "device"),
+            (True, 2, False, "cpu"),
+            (False, 1, False, "cpu"),
+            (True, 2, True, "device"),
+        )
+        for disable_overlap_schedule, pp_size, nccl_env, expected in cases:
+            with self.subTest(
+                disable_overlap_schedule=disable_overlap_schedule,
+                pp_size=pp_size,
+                nccl_env=nccl_env,
+            ):
+                self.assertEqual(
+                    self._gather_group(
+                        disable_overlap_schedule=disable_overlap_schedule,
+                        pp_size=pp_size,
+                        nccl_env=nccl_env,
+                    ),
+                    expected,
+                )
 
 
 class TestDecodeToExtendConversionVote(CustomTestCase):
