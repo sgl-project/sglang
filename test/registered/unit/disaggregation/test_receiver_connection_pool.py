@@ -303,9 +303,13 @@ class TestReceiverControlMessages(CustomTestCase):
             with self.subTest(backend=backend, customized_info=enabled):
                 receiver, sent = self._make_receiver(backend)
                 receiver.kv_mgr.customized_info_enabled = enabled
-                expected_frames = expected[backend]
-                if enabled and backend != "mori":
-                    expected_frames = expected_frames + [struct.pack("Q", 64)]
+                expected_frames = list(expected[backend])
+                if backend != "mori":
+                    # aux_item_lens follows aux_ptrs; empty when disabled.
+                    expected_frames.insert(
+                        expected_frames.index(aux) + 1,
+                        struct.pack("Q", 64) if enabled else b"",
+                    )
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
                     sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
