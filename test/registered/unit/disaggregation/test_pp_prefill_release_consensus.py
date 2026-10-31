@@ -33,7 +33,13 @@ from sglang.srt.disaggregation.pp_consensus_store import (  # noqa: E402
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator  # noqa: E402
+from sglang.srt.disaggregation.utils import (  # noqa: E402
+    ABORT_REASON_DECODE,
+    ABORT_REASON_REQUEST,
+    ReqToMetadataIdxAllocator,
+    TransferOutcome,
+    poll_transfer_outcomes_attn_cp_tp_group,
+)
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
     IndexedReqList,
@@ -86,6 +92,16 @@ class _Sender:
 
     def poll_pp_release(self):
         return CommonKVManager.check_status_pp_release(self.kv_mgr, self.bootstrap_room)
+
+    def is_failure_requested_abort(self):
+        return utils.is_abort_failure_reason(
+            self.kv_mgr.failure_records.get(self.bootstrap_room)
+        )
+
+    def is_failure_requested_abort_pp_consensus(self):
+        return CommonKVManager.is_failure_requested_abort_pp_consensus(
+            self.kv_mgr, self.bootstrap_room
+        )
 
     def clear(self):
         pass
@@ -239,19 +255,52 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
         self.assertEqual(self.pp1.streamed, [("x", req1.finished_reason)])
         self.assertEqual(req1.disagg_kv_sender.local_polls, 1)
 
-    def test_failure_on_any_stage_fails_the_transfer_on_every_stage(self):
-        self._both("x", 20)
-        self.pp0.store[20] = KVPoll.Success
-        self.pp1.fail(20, "Failed to send kv chunk")
-        self._replicated(20, [KVPoll.Success, KVPoll.Failed])
+    def test_failure_on_one_stage_carries_its_classification_everywhere(self):
+        for room, reason, expected in (
+            (20, ABORT_REASON_DECODE, "abort"),
+            (21, ABORT_REASON_REQUEST, "abort"),
+            (22, "Failed to send kv chunk", "error"),
+        ):
+            with self.subTest(reason=reason):
+                self.pp0.streamed.clear()
+                self.pp1.streamed.clear()
+                self._both("x", room)
+                self.pp0.store[room] = KVPoll.Success
+                self.pp1.fail(room, reason)
+                self._replicated(room, [KVPoll.Success, KVPoll.Failed])
+
+                self._iterate()
+
+                # PP0 succeeded locally and holds no reason, yet concludes
+                # the request the way PP1 saw it.
+                self.assertEqual(self.pp0.streamed, [("x", expected)])
+                self.assertEqual(self.pp1.streamed, [("x", expected)])
+                self.assertEqual(list(self.pp0.disagg_prefill_transfer_queue), [])
+                self.assertEqual(list(self.pp1.disagg_prefill_transfer_queue), [])
+
+    def test_real_error_on_any_stage_outranks_an_abort_on_another(self):
+        self._both("x", 13)
+        self.pp0.fail(13, ABORT_REASON_REQUEST)
+        self.pp1.fail(13, "Failed to send kv chunk")
+        self._replicated(13, [KVPoll.Failed, KVPoll.Failed])
 
         self._iterate()
 
-        # PP0 succeeded locally, yet fails the request with PP1.
+        self.assertEqual(self.pp0.streamed, [("x", "error")])
+        self.assertEqual(self.pp1.streamed, [("x", "error")])
+        self.pp0.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+
+    def test_requested_abort_is_not_counted_as_transfer_failure(self):
+        self._both("x", 14)
+        self.pp0.store[14] = KVPoll.Success
+        self.pp1.fail(14, ABORT_REASON_DECODE)
+        self._replicated(14, [KVPoll.Success, KVPoll.Failed])
+
+        self._iterate()
+
         for stage in (self.pp0, self.pp1):
-            self.assertEqual(stage.streamed, [("x", "error")])
-            self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
-            stage.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+            self.assertEqual(stage.streamed, [("x", "abort")])
+            stage.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
 
     def test_failure_waits_for_every_stage_to_conclude(self):
         # One stage failed the room while the other stage's transfer worker
@@ -264,7 +313,7 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
                 self.pp0.streamed.clear()
                 self.pp1.streamed.clear()
                 self._both("x", room)
-                failed.fail(room, "Failed to send kv chunk")
+                failed.fail(room, ABORT_REASON_REQUEST)
                 expected = [KVPoll.Transferring] * 2
                 expected[failed.pp_rank] = KVPoll.Failed
                 self._replicated(room, expected)
@@ -281,7 +330,7 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
                 self._iterate()
                 for stage in (self.pp0, self.pp1):
                     self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
-                    self.assertEqual(stage.streamed, [("x", "error")])
+                    self.assertEqual(stage.streamed, [("x", "abort")])
 
     def test_success_waits_for_staging_chunks_on_every_stage(self):
         # A stage holds Success while its staging chunks are outstanding; PP0
@@ -330,6 +379,58 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
     def test_idle_iteration_sends_nothing(self):
         self.assertEqual(self._iterate(), ([], []))
         self.assertEqual(self.pp_group.sends, 0)
+
+
+class _LocalSender:
+    def __init__(self, poll, abort=False):
+        self._poll = poll
+        self._abort = abort
+
+    def poll(self):
+        return self._poll
+
+    def is_failure_requested_abort(self):
+        return self._abort
+
+
+class TestTransferOutcomeClassification(CustomTestCase):
+    def test_outcomes_without_pp(self):
+        senders = [
+            _LocalSender(KVPoll.Success),
+            _LocalSender(KVPoll.Transferring),
+            _LocalSender(KVPoll.Failed, abort=True),
+            _LocalSender(KVPoll.Failed, abort=False),
+        ]
+        with patch.object(utils, "_all_reduce_polls", lambda polls, group: polls):
+            polls, outcomes = poll_transfer_outcomes_attn_cp_tp_group(
+                senders, None, None
+            )
+        self.assertEqual(
+            polls,
+            [KVPoll.Success, KVPoll.Transferring, KVPoll.Failed, KVPoll.Failed],
+        )
+        self.assertEqual(
+            outcomes,
+            [
+                TransferOutcome.SUCCESS,
+                None,
+                TransferOutcome.ABORT,
+                TransferOutcome.ERROR,
+            ],
+        )
+
+    def test_tp_peer_error_outranks_local_abort(self):
+        # A TP peer failed with a real error: MIN over the group clears this
+        # rank's abort-only flag.
+        def peer_reduce(flags, group):
+            half = len(flags) // 2
+            return flags[:half] + [0] * half
+
+        with patch.object(utils, "_all_reduce_polls", peer_reduce):
+            _, outcomes = poll_transfer_outcomes_attn_cp_tp_group(
+                [_LocalSender(KVPoll.Failed, abort=True)], None, None
+            )
+        self.assertEqual(outcomes, [TransferOutcome.ERROR])
 
 
 if __name__ == "__main__":
