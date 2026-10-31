@@ -180,6 +180,31 @@ class TestDraftWindowFusesByLifetime(CustomTestCase):
                 )
 
 
+class TestRunnerReadsOneWindow(CustomTestCase):
+    def test_runner_refuses_layers_of_several_windows(self):
+        """Backends bind one window's ids per runner: a runner whose layers
+        attend through two window sub-pools is refused, not given one window's
+        ids for both."""
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+
+        for windows, refused in (((64,), False), ((64, 16), True)):
+            with self.subTest(windows=windows):
+                storage = _storage(windows)
+                allocator = storage.allocator
+                build = lambda: RunnerIds(
+                    req_to_token=torch.zeros((3, 64), dtype=torch.int32),
+                    token_to_kv_pool_allocator=allocator,
+                    token_to_kv_pool=allocator.get_kvcache(),
+                    page_size=4,
+                    device="cpu",
+                )
+                if refused:
+                    with self.assertRaisesRegex(NotImplementedError, "swa_16"):
+                        build()
+                else:
+                    self.assertIsNotNone(build().space("swa"))
+
+
 class TestSeveralWindowsAllocate(CustomTestCase):
     def _check(self, device, seed, count):
         rng = random.Random(seed)
