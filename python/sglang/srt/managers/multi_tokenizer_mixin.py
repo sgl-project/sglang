@@ -729,10 +729,23 @@ class MultiDetokenizerRouter:
     be the key: only some outputs of a request carry its ``http_worker_ipc``.
     """
 
-    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+    def __init__(
+        self,
+        ipc_name_list: List[str],
+        port_args: PortArgs,
+        *,
+        enable_metrics: bool = False,
+    ):
         self.ipc_name_list = ipc_name_list
         self.num_workers = len(ipc_name_list)
         self.socket_mapping = SocketMapping()
+        self.metrics = None
+        if enable_metrics:
+            from sglang.srt.observability.detokenizer_router_metrics import (
+                DetokenizerRouterMetrics,
+            )
+
+            self.metrics = DetokenizerRouterMetrics()
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
@@ -743,6 +756,8 @@ class MultiDetokenizerRouter:
 
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
+        if self.metrics is not None:
+            self.metrics.messages_sent.inc()
 
     def _send_batch(self, recv_obj: BaseBatchReq) -> None:
         targets = [self._pick(rid) for rid in recv_obj.rids]
@@ -764,6 +779,11 @@ class MultiDetokenizerRouter:
     def event_loop(self):
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
+
+            if self.metrics is not None:
+                self.metrics.messages_received.inc()
+                if isinstance(recv_obj, BaseBatchReq):
+                    self.metrics.request_outputs_received.inc(len(recv_obj.rids))
 
             # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
@@ -811,7 +831,9 @@ def run_multi_detokenizer_router_process(
     try:
         if enable_metrics:
             start_cpu_monitor_thread("detokenizer_router")
-        router = MultiDetokenizerRouter(ipc_name_list, port_args)
+        router = MultiDetokenizerRouter(
+            ipc_name_list, port_args, enable_metrics=enable_metrics
+        )
         router.event_loop()
     except Exception:
         traceback = get_exception_traceback()
