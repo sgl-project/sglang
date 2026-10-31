@@ -1,10 +1,16 @@
 """Paged experts match the unpaged model, with decode captured (prompts one at a time) and host-planned (one batch)."""
 
+import io
+import json
+import re
 import statistics
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+import torch
+from huggingface_hub import hf_hub_download
+from transformers import AutoConfig
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -18,7 +24,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=337, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=430, stage="base-b", runner_config="1-gpu-large")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "
@@ -123,14 +129,67 @@ class TestPagedExpertsGptq(_PagedMatchesUnpaged, CustomTestCase):
     median_abs_tolerance = 0.1
 
 
-def _serve_and_score(model, base_url, other_args):
+class TestPagedExpertsAuto(_PagedMatchesUnpaged, CustomTestCase):
+    """``--paged-experts-num-resident auto`` with a static budget that holds about half the
+    experts: the startup sizing, the slot tables it allocates and the decode capture cap it sets,
+    through captured and host-planned decode. The paged server boots after the unpaged one has
+    stopped, so the memory it measures is its own."""
+
+    model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
+    resident_share = 0.5  # of the experts, for the budget
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reference = _serve_and_score(cls.model, DEFAULT_URL_FOR_TEST, [])
+        fraction = _mem_fraction_for_experts(cls.model, cls.resident_share)
+        args = ["--mem-fraction-static", f"{fraction:.3f}", "--enable-paged-experts"]
+        log = io.StringIO()
+        cls.paged = _serve_and_score(cls.model, PAGED_URL, args, log=log)
+        cls.log = log.getvalue()
+
+    def test_auto_keeps_part_of_the_experts_resident(self):
+        """Without this, a budget that holds every expert would pass the comparisons with no
+        paging at all."""
+        found = re.search(r"Paged experts: K=(\d+)(?:-\d+)? of (\d+) experts", self.log)
+        self.assertIsNotNone(found, "auto logged no K")
+        k, num_experts = map(int, found.groups())
+        top_k = AutoConfig.from_pretrained(self.model).num_experts_per_tok
+        self.assertLess(top_k, k)
+        self.assertLess(k, num_experts)
+
+
+def _mem_fraction_for_experts(model, share):
+    """A --mem-fraction-static whose budget holds the model's non-expert weights, 2 GiB for the
+    KV cache and buffers, and ``share`` of its experts (bf16 Qwen MoE)."""
+    config = AutoConfig.from_pretrained(model)
+    experts = (
+        config.num_hidden_layers
+        * config.num_experts
+        * 3
+        * config.hidden_size
+        * config.moe_intermediate_size
+        * 2
+    )
+    with open(hf_hub_download(model, "model.safetensors.index.json")) as f:
+        weights = json.load(f)["metadata"]["total_size"]
+    free, _ = torch.cuda.mem_get_info()
+    return (weights - experts + share * experts + (2 << 30)) / free
+
+
+def _serve_and_score(model, base_url, other_args, log=None):
+    """With ``log``, the server's output is copied into it."""
+    args = SERVER_ARGS
+    if "--mem-fraction-static" in other_args:
+        i = args.index("--mem-fraction-static")
+        args = args[:i] + args[i + 2 :]
     process = popen_launch_server(
         model,
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=SERVER_ARGS + other_args,
+        other_args=args + other_args,
         # Compile DeepGEMM kernels lazily for the few shapes the prompts use.
         env={"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"},
+        return_stdout_stderr=(log, log) if log is not None else None,
     )
     try:
         return {
