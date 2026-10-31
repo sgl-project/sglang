@@ -1,4 +1,8 @@
+import json
+from functools import lru_cache
 from typing import Any
+
+from transformers.utils import cached_file
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
@@ -50,7 +54,10 @@ class DllmConfig:
             model_revision=cfg.revision,
         )
         DLLM_PARAMS = {
-            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+            "LLaDA2MoeModelLM": {
+                "block_size": getattr(model_config.hf_config, "block_size", 32),
+                "mask_id": 156895,
+            },
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
             "DiffusionGemmaForBlockDiffusion": {
@@ -70,6 +77,20 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+
+        if arch == "LLaDA2MoeModelLM":
+            _require_llada2_block_size(block_size)
+            declared_mask_id = _checkpoint_mask_id(
+                tokenizer_path=cfg.tokenizer_path or cfg.model_path,
+                revision=cfg.revision,
+            )
+            if declared_mask_id is not None:
+                if not 0 <= declared_mask_id < model_config.vocab_size:
+                    raise ValueError(
+                        f"Tokenizer mask ID {declared_mask_id} is outside the model "
+                        f"vocabulary [0, {model_config.vocab_size})"
+                    )
+                mask_id = declared_mask_id
 
         from sglang.srt.dllm.algorithm import get_algorithm_cls
 
@@ -153,17 +174,27 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        if arch == "LLaDA2MoeModelLM":
+            _require_llada2_block_size(block_size)
+
         checkpoint_block_size = getattr(model_config.hf_config, "block_size", None)
         if (
-            getattr(model_config.hf_config, "expert_capacity", None) is not None
+            arch == "LLaDA2MoeModelLM"
+            and checkpoint_block_size is not None
             and block_size != checkpoint_block_size
         ):
             raise ValueError(
-                "LLaDA2 block routing requires the dLLM block size to match the "
+                "LLaDA2 requires the dLLM block size to match the "
                 f"checkpoint block_size ({checkpoint_block_size}), got {block_size}. "
                 "Remove the block_size override from --dllm-algorithm-config or "
                 "set it to the checkpoint value."
             )
+
+        if (
+            getattr(model_config.hf_config, "expert_capacity", None) is not None
+            and checkpoint_block_size is None
+        ):
+            raise ValueError("LLaDA2 block routing requires checkpoint block_size")
 
         return DllmConfig(
             algorithm=cfg.dllm_algorithm,
@@ -182,3 +213,83 @@ class DllmConfig:
             delete_token_id=delete_token_id,
             split_token_id=split_token_id,
         )
+
+
+def _require_llada2_block_size(block_size: Any) -> None:
+    if (
+        isinstance(block_size, bool)
+        or not isinstance(block_size, int)
+        or block_size <= 0
+    ):
+        raise ValueError(
+            f"LLaDA2 block_size must be a positive integer, got {block_size!r}"
+        )
+
+
+@lru_cache(maxsize=32)
+def _checkpoint_mask_id(tokenizer_path: str, revision: str | None) -> int | None:
+    """Read declared mask metadata without initializing remote tokenizer code."""
+    from sglang.srt.utils.hf_transformers.tokenizer import _resolve_tokenizer_name
+
+    tokenizer_path = _resolve_tokenizer_name(tokenizer_name=tokenizer_path, kwargs={})
+    has_mask = False
+    tokenizer_config = {}
+    for filename in ("tokenizer_config.json", "special_tokens_map.json"):
+        config_path = cached_file(
+            tokenizer_path,
+            filename,
+            revision=revision,
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if config_path is not None:
+            with open(config_path) as f:
+                metadata = json.load(f)
+            if not isinstance(metadata, dict):
+                raise ValueError(f"{filename} at {tokenizer_path!r} must be a mapping")
+            if filename == "tokenizer_config.json":
+                tokenizer_config = metadata
+            has_mask |= metadata.get("mask_token") is not None
+    if not has_mask:
+        return None
+
+    # Let Transformers resolve legacy special-token maps and added-token metadata.
+    # Loading the concrete fast class never imports a checkpoint's custom Python.
+    from transformers import PreTrainedTokenizerFast
+
+    try:
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            tokenizer_path, revision=revision
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid tokenizer mask_token metadata at {tokenizer_path!r}"
+        ) from exc
+    mask_token = tokenizer.mask_token
+    if mask_token is None:
+        return None
+    if not isinstance(mask_token, str) or not mask_token:
+        raise ValueError(f"Invalid tokenizer mask_token: {mask_token!r}")
+
+    # A serialized fast tokenizer covers both added tokens and the base vocabulary.
+    # token_to_id returns None for a missing token instead of the unknown-token ID.
+    from tokenizers import Tokenizer
+    from transformers.tokenization_utils_base import get_fast_tokenizer_file
+
+    tokenizer_filename = "tokenizer.json"
+    if "fast_tokenizer_files" in tokenizer_config:
+        tokenizer_filename = get_fast_tokenizer_file(
+            tokenizer_config["fast_tokenizer_files"]
+        )
+    tokenizer_file = cached_file(tokenizer_path, tokenizer_filename, revision=revision)
+    token_id = Tokenizer.from_file(tokenizer_file).token_to_id(mask_token)
+    if token_id is None:
+        raise ValueError(
+            f"Tokenizer mask_token {mask_token!r} is absent from its vocabulary "
+            f"at {tokenizer_path!r}"
+        )
+    if tokenizer.mask_token_id != token_id:
+        raise ValueError(
+            f"Conflicting mask IDs at {tokenizer_path!r}: tokenizer metadata "
+            f"resolves {tokenizer.mask_token_id}, {tokenizer_filename} declares {token_id}"
+        )
+    return token_id
