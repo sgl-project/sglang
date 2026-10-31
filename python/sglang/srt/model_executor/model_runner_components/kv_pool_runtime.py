@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_schedule,
+    max_prefill_buffer_tokens,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
@@ -90,27 +91,48 @@ def compute_post_capture_kv_resize(
             decode_max_bs,
             running_requests,
         )
+    prefill_cuda_graph_config = get_exec().graph.cuda_graph_config.prefill
+    captured_prefill_tokens = max(prefill_cuda_graph_config.bs or (0,))
+    prefill_buffer_tokens = max_prefill_buffer_tokens()
+    eager_prefill_gap = (
+        get_disagg().disaggregation_mode != "decode"
+        and prefill_cuda_graph_config.backend != Backend.DISABLED
+        and prefill_buffer_tokens > captured_prefill_tokens
+    )
+    if eager_prefill_gap:
+        logger.warning(
+            "Post-capture KV sizing: prefill CUDA graph covers %d tokens < prefill "
+            "buffer ceiling %d; reserving eager prefill activation headroom (raise "
+            "--cuda-graph-max-bs-prefill to capture whole chunks)",
+            captured_prefill_tokens,
+            prefill_buffer_tokens,
+        )
+    reserve_activation_headroom = eager_prefill_gap
     if eager_decode_gap or mambaish_config(model_runner.model_config) is not None:
         prefill_max_requests = get_schedule().prefill_max_requests
-        request_slots = get_exec().graph.cuda_graph_config.prefill.full_prefill_max_req
+        request_slots = prefill_cuda_graph_config.full_prefill_max_req
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the configured headroom then covers the eager tail.
         capped_full_prefill_role = (
             get_disagg().disaggregation_mode == "prefill"
-            and get_exec().graph.cuda_graph_config.prefill.backend == Backend.FULL
+            and prefill_cuda_graph_config.backend == Backend.FULL
             and get_schedule().max_mamba_cache_size is not None
             and prefill_max_requests is not None
             and request_slots is not None
             and prefill_max_requests <= request_slots
         )
         if not capped_full_prefill_role:
-            headroom_gb = max(
-                headroom_gb,
-                pre_capture_activation_reserve_mb(
-                    get_device_memory_capacity(model_runner.device)
-                )
-                / 1024,
+            reserve_activation_headroom = True
+    if reserve_activation_headroom:
+        headroom_gb = max(
+            headroom_gb,
+            pre_capture_activation_reserve_mb(
+                get_device_memory_capacity(model_runner.device),
+                # PP dynamic chunking lifts the ceiling past chunked_prefill_size.
+                prefill_tokens=prefill_buffer_tokens if eager_prefill_gap else 0,
             )
+            / 1024,
+        )
     if not graph_pool_borrow_enabled():
         # Borrowing serves the sampling temporaries out of idle graph storage;
         # without it they need real headroom the KV pool must not claim.

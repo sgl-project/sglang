@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -39,6 +40,9 @@ class TestCanaryHeadroom(CustomTestCase):
         *,
         graph_borrow=False,
         eager_gap=False,
+        prefill_gap=False,
+        real_reserve=False,
+        server_args=None,
         pool=None,
         draft_pools=None,
     ):
@@ -69,9 +73,14 @@ class TestCanaryHeadroom(CustomTestCase):
         with (
             get_context().override_server_args(
                 disaggregation_mode="null",
+                chunked_prefill_size=4096,
                 cuda_graph_config=CudaGraphConfig(
-                    decode=PhaseConfig(backend=Backend.FULL, max_bs=8)
+                    decode=PhaseConfig(backend=Backend.FULL, max_bs=8),
+                    prefill=PhaseConfig(
+                        backend=Backend.BREAKABLE, bs=[1024 if prefill_gap else 4096]
+                    ),
                 ),
+                **(server_args or {}),
             ),
             patch.object(kv_pool_runtime.torch.cuda, "synchronize"),
             get_parallel().override(
@@ -82,10 +91,14 @@ class TestCanaryHeadroom(CustomTestCase):
             patch.object(
                 kv_pool_runtime, "get_device_memory_capacity", return_value=32
             ),
-            patch.object(
-                kv_pool_runtime,
-                "pre_capture_activation_reserve_mb",
-                return_value=8 * 1024,
+            (
+                nullcontext()
+                if real_reserve
+                else patch.object(
+                    kv_pool_runtime,
+                    "pre_capture_activation_reserve_mb",
+                    return_value=8 * 1024,
+                )
             ),
             patch.object(
                 kv_pool_runtime, "graph_pool_borrow_enabled", return_value=graph_borrow
@@ -120,6 +133,38 @@ class TestCanaryHeadroom(CustomTestCase):
                     ),
                     (20 - headroom - 1 + 2) * _GIB,
                 )
+
+    def test_short_prefill_graph_coverage_reserves_activation_headroom(self):
+        """A prefill graph covering fewer tokens than the prefill buffer keeps the
+        eager activation reserve out of the KV budget, like an uncaptured decode
+        batch size does; full coverage does not."""
+        self.assertEqual(
+            self._resize(None, (None,), graph_borrow=True, prefill_gap=True),
+            (20 - 8 - 1 + 2) * _GIB,
+        )
+        self.assertEqual(
+            self._resize(None, (None,), graph_borrow=True, prefill_gap=False),
+            (20 - 4 - 1 + 2) * _GIB,
+        )
+
+    def test_eager_prefill_reserve_covers_the_pp_dynamic_chunk_ceiling(self):
+        """PP dynamic chunking lifts the prefill buffer ceiling to max_prefill_tokens
+        while the graph tops out at chunked_prefill_size. The eager reserve is sized
+        for the 8192-token ceiling, with the real reserve formula."""
+        # 512 MB base + 1.5 MB per token + tp * pp / 8 GB.
+        reserve_gb = (512 + 8192 * 1.5 + 1 * 2 / 8 * 1024) / 1024
+        self.assertEqual(
+            self._resize(
+                None,
+                (None,),
+                graph_borrow=True,
+                real_reserve=True,
+                server_args=dict(
+                    enable_dynamic_chunking=True, max_prefill_tokens=8192, pp_size=2
+                ),
+            ),
+            (20 - reserve_gb - 1 + 2) * _GIB,
+        )
 
     def test_workspace_is_added_to_other_headroom_at_installed_capacity(self):
         manager = _manager(1_000_000, 3)
