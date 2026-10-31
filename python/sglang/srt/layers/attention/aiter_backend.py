@@ -384,6 +384,10 @@ class AiterAttnBackend(AttentionBackend):
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
 
+    # Set in __init__; declared here for tests that build the backend without it
+    # (test_aiter_fp8_kv_scales_paths.py).
+    deterministic_prefill_max_q: Optional[int] = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
