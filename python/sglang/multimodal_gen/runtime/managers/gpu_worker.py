@@ -834,6 +834,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     forward_failed = True
                     raise
 
+            # still on the scheduler thread, before saving or handing off to a thread
+            raise_if_cancelled(log_reqs)
+
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):

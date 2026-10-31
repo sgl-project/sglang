@@ -241,6 +241,11 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
+def pre_alloc_fill_len(req: Req) -> int:
+    """The last output id is the pending decode input, so its KV is not written."""
+    return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 
@@ -1570,7 +1575,7 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finish_outside_step(FINISH_ABORT(error_message, status_code))
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

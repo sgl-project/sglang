@@ -199,7 +199,7 @@ struct ActivationKernel {
     auto D_in = SymbolicSize{"input_width"};
     auto D_out = SymbolicSize{"output_width"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     if constexpr (kReuseInput) {
       TensorMatcher({N, D_out}).with_strides({D_in, 1}).with_dtype<T>().with_device(device_).verify(out);
@@ -349,7 +349,7 @@ struct ActivationKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  //
         .with_dtype<T>()

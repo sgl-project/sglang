@@ -1,17 +1,57 @@
-"""The detokenizer's incremental decoding: the per-request state and step that
-turn each row's decode ids into text."""
+"""The detokenizer's incremental decoding: the DetokenizeHeader the scheduler
+builds and sends on a request's first output, and the per-request state, kept
+by rid, that turns each row's output ids into text."""
 
 from __future__ import annotations
 
+import logging
+from array import array
 from collections import OrderedDict
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import msgspec
 
 from sglang.srt.environ import envs
 from sglang.utils import find_printable_text
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+
+logger = logging.getLogger(__name__)
+
+
+PROMPT_TAIL_LEN = 5
+
 DETOKENIZER_MAX_STATES = envs.SGLANG_DETOKENIZER_MAX_STATES.get()
+
+
+class DetokenizeHeader(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """A request's detokenization inputs. The scheduler sends it on the request's
+    first output only; the detokenizer keeps it for the request's lifetime and
+    decodes each row, the first included, from that row's output_ids."""
+
+    # The prompt tail decoded ahead of the output as context; the output text
+    # starts after it.
+    prompt_tail_ids: array
+    skip_special_tokens: bool
+    spaces_between_special_tokens: bool
+    no_stop_trim: bool
+    http_worker_ipc: Optional[str]
+
+
+def build_detokenize_header(req: Req) -> DetokenizeHeader:
+    prompt_ids = req.origin_input_ids_unpadded
+    surr_offset = max(len(prompt_ids) - PROMPT_TAIL_LEN, 0)
+    sampling_params = req.sampling_params
+    return DetokenizeHeader(
+        prompt_tail_ids=prompt_ids[surr_offset:],
+        skip_special_tokens=sampling_params.skip_special_tokens,
+        spaces_between_special_tokens=sampling_params.spaces_between_special_tokens,
+        no_stop_trim=sampling_params.no_stop_trim,
+        http_worker_ipc=req.http_worker_ipc,
+    )
 
 
 def _clamp_decode_ids(ids: List[int], vocab_size: Optional[int]) -> List[int]:
@@ -42,24 +82,73 @@ class DetokenizeState(msgspec.Struct):
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
+    header: DetokenizeHeader
+    # Output ids received so far; a non-beam row's completion_tokens is this
+    # plus the row's output ids.
+    num_received_ids: int = 0
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
     decoded_text: str = ""
     decoded_text_len: int = 0
     decoded_text_chunks: List[str] = []
 
-    def decode_inputs(
+    @classmethod
+    def from_header(
+        cls, *, header: DetokenizeHeader, vocab_size: Optional[int]
+    ) -> DetokenizeState:
+        return cls(
+            decode_ids=_clamp_decode_ids(header.prompt_tail_ids, vocab_size),
+            surr_offset=0,
+            read_offset=len(header.prompt_tail_ids),
+            header=header,
+        )
+
+    def append_row(
         self,
         *,
-        finished_reason: Optional[Dict],
-        no_stop_trim: bool,
-        trim_matched_stop: Callable,
+        rid: str,
+        output_ids: List[int],
+        completion_tokens: int,
+        is_beam: bool,
+        vocab_size: Optional[int],
+    ) -> None:
+        if not is_beam:
+            self._check_continuity(
+                rid=rid,
+                num_received=self.num_received_ids,
+                num_new=len(output_ids),
+                completion_tokens=completion_tokens,
+            )
+            # Resync to the scheduler's count; the two differ only after an alarm.
+            self.num_received_ids = completion_tokens
+        else:
+            # A beam row's completion_tokens counts its returned sequences.
+            self.num_received_ids += len(output_ids)
+        self.decode_ids.extend(_clamp_decode_ids(output_ids, vocab_size))
+
+    @staticmethod
+    def _check_continuity(
+        *, rid: str, num_received: int, num_new: int, completion_tokens: int
+    ) -> None:
+        if num_received + num_new != completion_tokens:
+            # Outside CI an alarm only: the row is still decoded and routed.
+            msg = (
+                f"Output ids of {rid=} do not continue the "
+                f"{num_received} received: {num_new} new for "
+                f"{completion_tokens} in all."
+            )
+            if envs.SGLANG_IS_IN_CI.get():
+                raise RuntimeError(msg)
+            logger.warning(msg)
+
+    def decode_inputs(
+        self, *, finished_reason: Optional[Dict], trim_matched_stop: Callable
     ) -> Tuple[List[int], List[int]]:
         """The (read_ids, surr_ids) this row decodes."""
         read_ids = trim_matched_stop(
             self.decode_ids[self.surr_offset :],
             finished_reason,
-            no_stop_trim,
+            self.header.no_stop_trim,
         )
         surr_ids = self.decode_ids[self.surr_offset : self.read_offset]
         return read_ids, surr_ids
@@ -70,7 +159,6 @@ class DetokenizeState(msgspec.Struct):
         read_text: str,
         surr_text: str,
         finished_reason: Optional[Dict],
-        no_stop_trim: bool,
         trim_matched_stop: Callable,
     ) -> str:
         """Advance by one row's decoded texts; return the text to send."""
@@ -100,7 +188,7 @@ class DetokenizeState(msgspec.Struct):
         output_str = trim_matched_stop(
             self.get_decoded_text() + new_text,
             finished_reason,
-            no_stop_trim,
+            self.header.no_stop_trim,
         )
         incremental_output = output_str[self.sent_offset :]
         self.sent_offset = len(output_str)
@@ -132,30 +220,20 @@ class LimitedCapacityDict(OrderedDict):
 
 
 class DetokenizeStateTable:
-    """The detokenizer's DetokenizeState by rid: started by a request's first row,
-    released by its finished row; past capacity, the oldest is evicted."""
+    """The detokenizer's DetokenizeState by rid: started by a request's
+    DetokenizeHeader, released by its finished row or a DetokenizeReleaseReq;
+    past capacity, the oldest is evicted."""
 
     def __init__(self, capacity: int):
         self._states = LimitedCapacityDict(capacity=capacity)
 
-    def start_or_extend(
-        self,
-        *,
-        rid: str,
-        decode_ids: List[int],
-        read_offset: int,
-        vocab_size: Optional[int],
+    def start(
+        self, *, rid: str, header: DetokenizeHeader, vocab_size: Optional[int]
     ) -> DetokenizeState:
-        if rid not in self._states:
-            s = DetokenizeState(
-                decode_ids=_clamp_decode_ids(decode_ids, vocab_size),
-                surr_offset=0,
-                read_offset=read_offset,
-            )
-            self._states[rid] = s
-        else:
-            s = self._states[rid]
-            s.decode_ids.extend(_clamp_decode_ids(decode_ids, vocab_size))
+        # A request's first output; it replaces any stale state of a reused rid.
+        self._states.pop(rid, None)
+        s = DetokenizeState.from_header(header=header, vocab_size=vocab_size)
+        self._states[rid] = s
         return s
 
     def get(self, rid: str) -> Optional[DetokenizeState]:
