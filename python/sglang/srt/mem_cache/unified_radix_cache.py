@@ -179,6 +179,11 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+# Hit-reservation outcomes, MIN-ordered for the rank agreement: a shortfall on
+# any rank wins over a reservation; a settled (declined) outcome rests on
+# rank-identical tree state and must match on every rank.
+_RESERVE_SHORT, _RESERVE_DONE, _RESERVE_SETTLED = range(3)
 device_module = get_device_module()
 
 
@@ -3245,8 +3250,10 @@ class UnifiedRadixCache(BasePrefixCache):
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
+        rank_agreed: bool = True,
     ) -> None:
         cc = self.cache_controller
+        agree_reservations = rank_agreed and self.storage_engine is not None
 
         def _drain_queue(q: Queue[T], n: Optional[int]) -> Iterator[T]:
             """If n is None, consume all items from the queue.
@@ -3270,24 +3277,29 @@ class UnifiedRadixCache(BasePrefixCache):
 
         buffer_mode = self.host_memory_mode == "buffer_only"
 
-        def _try_alloc_storage_hit(operation) -> bool:
-            """Allocate the hit-sized bounce and launch the transfer.
-            Returns False when staging pressure defers the allocation
-            (buffer mode parks and retries; cache mode revokes)."""
+        # Reservation outcomes, MIN-ordered across ranks: a shortfall on any
+        # rank parks (buffer mode) or revokes (cache mode) the operation on
+        # every rank; a settled outcome rests on rank-identical state and must
+        # match everywhere.
+        reserved_rows: dict[CacheRequestHandle, tuple[torch.Tensor, int, int]] = {}
+
+        def _reserve_storage_hit(operation) -> tuple[int, int]:
+            """Reserve the hit-sized bounce without launching the transfer.
+            Returns (outcome, reserved tokens)."""
             request = operation.handle
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
             if info is None:
-                return True  # aborted/cleaned; nothing to retry
+                return _RESERVE_SETTLED, 0  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
                 self.revoke_pending_prefetch(request)
-                return True
+                return _RESERVE_SETTLED, 0
 
             if buffer_mode and cc.prefetch_rate_limited():
                 # Pool is load-saturated: hold the KNOWN hit until staged
                 # prefetches ahead of us are consumed. The op stays in
                 # ongoing_prefetch, so wait_complete keeps gating admission.
-                return False
+                return _RESERVE_SHORT, 0
             if buffer_mode:
                 # IO commit pins the splice base; a parked op held no pin, so a
                 # moved or vanished anchor is detected (and recovered) here.
@@ -3297,11 +3309,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 if anchor == "anchor_lost":
                     self._prefetch_outcome_stats["declined_anchor_lost"] += 1
                     self._handle_storage_prefetch_anchor_loss(request)
-                    return True
+                    return _RESERVE_SETTLED, 0
                 if anchor == "cap_busy":
                     # Other prefetches hold the budget; ours fits once they
                     # drain, so park rather than launch this one unprotected.
-                    return False
+                    return _RESERVE_SHORT, 0
                 if anchor == "unservable":
                     # The device prefix is resident but unreadable; the
                     # request recomputes and heals it instead of splicing.
@@ -3317,7 +3329,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         request, fulfilled_tokens=0, reason="unservable_prefix"
                     )
                     self.revoke_pending_prefetch(request)
-                    return True
+                    return _RESERVE_SETTLED, 0
                 if self.buffer_pipeline.staged_span_covered(
                     request, operation.storage_hit_count
                 ):
@@ -3328,13 +3340,18 @@ class UnifiedRadixCache(BasePrefixCache):
                         request, fulfilled_tokens=0, reason="device_covered"
                     )
                     self.revoke_pending_prefetch(request)
-                    return True
+                    return _RESERVE_SETTLED, 0
                 info, hit_tokens, aux_hit_tokens = self._trim_buffer_prefetch_full_head(
                     request, info, operation, full_match_len, hit_tokens
                 )
-                return self.buffer_pipeline.allocate_and_queue_prefetch(
+                outcome = self.buffer_pipeline.reserve_prefetch(
                     operation, info, hit_tokens, aux_hit_tokens
                 )
+                if outcome == "reserved":
+                    return _RESERVE_DONE, operation.storage_hit_count
+                if outcome == "short":
+                    return _RESERVE_SHORT, 0
+                return _RESERVE_SETTLED, 0
             aux_hit_tokens = hit_tokens
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
@@ -3344,32 +3361,29 @@ class UnifiedRadixCache(BasePrefixCache):
                 evict_host=self.evict_host,
             )
             if host_indices is None:
-                self._finish_storage_prefetch(
-                    request, fulfilled_tokens=0, reason="host_capacity"
-                )
-                self.revoke_pending_prefetch(request)
-                self.storage_prefetch_retries.poll_miss(
-                    request.rid, operation.storage_start + operation.storage_hit_count
-                )
-                self._log_storage_prefetch_deferred(
-                    max(alloc_len, aux_hit_tokens), "host_capacity"
-                )
-                return True
+                reserved_rows[request] = (None, alloc_len, aux_hit_tokens)
+                return _RESERVE_SHORT, 0
             if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
                 # Same outcome as a KV shortfall: nothing stays staged.
-                cc.append_host_mem_release(host_indices=host_indices)
-                self._finish_storage_prefetch(
-                    request, fulfilled_tokens=0, reason="host_capacity"
-                )
-                self.revoke_pending_prefetch(request)
-                self.storage_prefetch_retries.poll_miss(
-                    request.rid, operation.storage_start + operation.storage_hit_count
-                )
-                self._log_storage_prefetch_deferred(
-                    max(alloc_len, aux_hit_tokens), "host_capacity"
-                )
-                return True
+                cc.free_prefetch_host_buffers(operation, host_indices)
+                reserved_rows[request] = (None, alloc_len, aux_hit_tokens)
+                return _RESERVE_SHORT, 0
+            reserved_rows[request] = (host_indices, alloc_len, aux_hit_tokens)
+            return _RESERVE_DONE, alloc_len
 
+        def _dispatch_reserved(operation, agreed_tokens: int) -> None:
+            if buffer_mode:
+                self.buffer_pipeline.dispatch_reserved_prefetch(operation)
+                return
+            request = operation.handle
+            info = self.ongoing_prefetch[request]
+            host_indices, alloc_len, _ = reserved_rows.pop(request)
+            hit_tokens = operation.storage_hit_count
+            if agreed_tokens < alloc_len:
+                # A peer could only fit the agreed prefix; give the rest back.
+                cc.mem_pool_host.free(host_indices[agreed_tokens:])
+                host_indices = host_indices[:agreed_tokens]
+                alloc_len = agreed_tokens
             self._resolve_storage_prefetch_tokens(
                 request, hit_tokens - alloc_len, reason="host_capacity"
             )
@@ -3378,16 +3392,72 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.host_indices = host_indices
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
             cc.dispatch_prefetch_transfer(operation)
-            return True
+
+        def _settle_short(operation, locally_reserved: bool) -> None:
+            """Agreed shortfall: give back whatever this rank reserved, then
+            park (buffer mode) or revoke (cache mode) like every other rank."""
+            request = operation.handle
+            if buffer_mode:
+                if locally_reserved:
+                    self.buffer_pipeline.rollback_reserved_prefetch(operation)
+                return
+            host_indices, alloc_len, aux_hit_tokens = reserved_rows.pop(request)
+            if locally_reserved:
+                cc.free_prefetch_host_buffers(operation, host_indices)
+            self._finish_storage_prefetch(
+                request, fulfilled_tokens=0, reason="host_capacity"
+            )
+            self.revoke_pending_prefetch(request)
+            self.storage_prefetch_retries.poll_miss(
+                request.rid, operation.storage_start + operation.storage_hit_count
+            )
+            self._log_storage_prefetch_deferred(
+                max(alloc_len, aux_hit_tokens), "host_capacity"
+            )
+
+        def _settle_hit_reservations(candidates: list) -> None:
+            """Reserve every candidate here, agree the outcomes across ranks
+            in one MIN, then dispatch the agreed prefix and park the rest in
+            order: a parked hit keeps its turn and the budget it waits for."""
+            if not candidates:
+                return
+            outcomes = [_reserve_storage_hit(operation) for operation, _ in candidates]
+            if agree_reservations:
+                agreed = self._agree_hit_reservations(outcomes)
+            else:
+                agreed = outcomes
+            parked_again = []
+            for (operation, was_parked), (local, _), (state, agreed_tokens) in zip(
+                candidates, outcomes, agreed
+            ):
+                if state == _RESERVE_SETTLED or local == _RESERVE_SETTLED:
+                    if state != local:
+                        raise RuntimeError(
+                            "HiCache hit reservation diverged across ranks for "
+                            f"request {operation.request_id}: local={local} "
+                            f"agreed={state}; the tree state is no longer lockstep"
+                        )
+                    continue
+                if state == _RESERVE_DONE and not parked_again:
+                    _dispatch_reserved(operation, agreed_tokens)
+                    continue
+                # Agreed shortfall, or behind one: nothing launches out of turn.
+                _settle_short(operation, locally_reserved=local == _RESERVE_DONE)
+                if buffer_mode:
+                    parked_again.append((operation, was_parked))
+            for operation, was_parked in parked_again:
+                if not was_parked:
+                    # Counted once at first parking, not per retry tick.
+                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
+                self.buffer_pipeline.pending_hit_allocs.append(operation)
 
         def _drain_and_alloc_storage_hit():
+            candidates: list = []
             # Parked hits first (FIFO fairness with retries; buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
-                while parked:
-                    if not _try_alloc_storage_hit(parked[0]):
-                        break
-                    parked.popleft()
+                candidates.extend((operation, True) for operation in parked)
+                parked.clear()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
@@ -3427,15 +3497,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(request)
                     continue
                 self._account_prefetch_outcome(operation, revoked=False)
-                # A parked hit keeps its turn: a newer hit must not take the
-                # staging or anchor budget the parked head is waiting for.
-                parked_ahead = buffer_mode and bool(
-                    self.buffer_pipeline.pending_hit_allocs
-                )
-                if parked_ahead or not _try_alloc_storage_hit(operation):
-                    # Counted once at first parking, not per retry tick.
-                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
-                    self.buffer_pipeline.pending_hit_allocs.append(operation)
+                candidates.append((operation, False))
+            _settle_hit_reservations(candidates)
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
@@ -3596,6 +3659,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 name: None for name in cc.extra_host_mem_release_queues
             },
             log_metrics=False,
+            rank_agreed=False,
         )
 
     # ---- HiCache: Storage backend lifecycle (delegated) ----
@@ -4053,6 +4117,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 {pool.value: pages for pool, pages in zip(PoolName, agreed[2:])}
             )
             operation.pool_transfers_done = bool(agreed[1])
+
+    def _agree_hit_reservations(
+        self, outcomes: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """One MIN over this drain's reservation outcomes: the most
+        conservative outcome and the shortest reserved prefix win, so no rank
+        launches a read a peer could not stage."""
+        packed = torch.tensor(outcomes, dtype=torch.int64)
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        return [tuple(row) for row in packed.tolist()]
 
     def _tick_storage_engine(self) -> tuple[int, int]:
         """One agreement round: returns the hits and acks it published into the

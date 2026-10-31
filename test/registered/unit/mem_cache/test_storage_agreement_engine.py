@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 from array import array
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from datetime import timedelta
 from queue import Queue
@@ -413,6 +413,132 @@ class TestStorageAgreementTransfers(unittest.TestCase):
             transfer.publish_local_transfer_progress(8)
             transfer.mark_transfer_finished()
         self.assertEqual(local.tick(), (0, 1))
+
+
+class TestAgreedHitReservations(unittest.TestCase):
+    """The hit drain reserves locally, agrees the outcomes in one MIN, and only
+    then dispatches: a peer's shortfall parks the operation here too, and a
+    parked hit keeps its turn."""
+
+    def _cache(self, peer_outcomes):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.host_memory_mode = "buffer_only"
+        cache.prefetch_threshold = PAGE
+        cache.enable_storage_metrics = False
+        cache.storage_metrics_collector = None
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
+        cache._storage_prefetch_wait = {}
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache._storage_prefetch_hit_remaining_by_reqid = {}
+        cache._record_storage_prefetch_hit = Mock()
+        cache.revoke_pending_prefetch = Mock()
+        cache._invalidate_absent_from_hit_query = Mock()
+        cache._account_prefetch_outcome = Mock()
+        cache._trim_buffer_prefetch_full_head = (
+            lambda request, info, operation, full, hit: (info, hit, hit)
+        )
+        cache.storage_engine = object()  # agreement on
+        dispatched, rolled_back = [], []
+        pipeline = SimpleNamespace(
+            pending_hit_allocs=deque(),
+            try_lock_anchor=lambda request, tokens: ("locked", 0),
+            staged_span_covered=lambda request, tokens: False,
+            reserve_prefetch=lambda operation, info, hit, aux: "reserved",
+            dispatch_reserved_prefetch=dispatched.append,
+            rollback_reserved_prefetch=rolled_back.append,
+            release_anchor_lock=lambda request: None,
+        )
+        cache.buffer_pipeline = pipeline
+        cache.cache_controller = SimpleNamespace(
+            prefetch_hit_queue=Queue(),
+            ack_prefetch_queue=Queue(),
+            ack_backup_queue=Queue(),
+            host_mem_release_queue=Queue(),
+            extra_host_mem_release_queues={},
+            prefetch_rate_limited=lambda: False,
+        )
+        cache.ongoing_prefetch = {}
+
+        def reduce_min(tensor, op):
+            peer = torch.tensor(peer_outcomes, dtype=torch.int64)
+            torch.minimum(tensor, peer, out=tensor)
+
+        cache._all_reduce_attn_groups = reduce_min
+        return cache, pipeline, dispatched, rolled_back
+
+    def _hit(self, cache, rid):
+        operation = _operation(rid)
+        operation.storage_hit_count = len(TOKENS)
+        operation.hash_value = list(CHAIN)
+        cache.ongoing_prefetch[operation.handle] = _OngoingPrefetch(
+            0, RadixKey(array("q", TOKENS)), None, operation, None, {}
+        )
+        cache.cache_controller.prefetch_hit_queue.put(operation)
+        return operation
+
+    def _drain(self, cache, hits):
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=hits,
+            n_ack_prefetch=0,
+            n_backup=0,
+            n_release=0,
+            extra_release_counts=None,
+            log_metrics=False,
+        )
+
+    def test_peer_shortfall_parks_a_locally_reserved_hit(self):
+        # The peer is short on a and reserved b; b behind a keeps its turn.
+        cache, pipeline, dispatched, rolled_back = self._cache(
+            [[0, 0], [1, len(TOKENS)]]
+        )
+        a, b = self._hit(cache, "a"), self._hit(cache, "b")
+        self._drain(cache, 2)
+        self.assertEqual(rolled_back, [a, b])
+        self.assertEqual(dispatched, [])
+        self.assertEqual(list(pipeline.pending_hit_allocs), [a, b])
+        self.assertEqual(cache._prefetch_outcome_stats["declined_rate_limited"], 2)
+
+    def test_agreed_reservations_dispatch_in_order(self):
+        cache, pipeline, dispatched, rolled_back = self._cache(
+            [[1, len(TOKENS)], [1, len(TOKENS)]]
+        )
+        a, b = self._hit(cache, "a"), self._hit(cache, "b")
+        self._drain(cache, 2)
+        self.assertEqual(dispatched, [a, b])
+        self.assertEqual(rolled_back, [])
+        self.assertFalse(pipeline.pending_hit_allocs)
+
+    def test_local_shortfall_parks_without_rollback(self):
+        cache, pipeline, dispatched, rolled_back = self._cache([[1, len(TOKENS)]])
+        pipeline.reserve_prefetch = lambda operation, info, hit, aux: "short"
+        a = self._hit(cache, "a")
+        self._drain(cache, 1)
+        self.assertEqual((rolled_back, dispatched), ([], []))
+        self.assertEqual(list(pipeline.pending_hit_allocs), [a])
+
+    def test_settled_outcome_must_match_the_peers(self):
+        # This rank declines (span device-covered) while the peer reserved:
+        # the tree state is no longer lockstep, which is fatal, not a park.
+        cache, pipeline, *_ = self._cache([[1, len(TOKENS)]])
+        pipeline.staged_span_covered = lambda request, tokens: True
+        self._hit(cache, "a")
+        with self.assertRaisesRegex(RuntimeError, "diverged"):
+            self._drain(cache, 1)
+
+    def test_parked_hit_is_retried_first_and_dispatches_once_agreed(self):
+        cache, pipeline, dispatched, rolled_back = self._cache([[1, len(TOKENS)]])
+        a = self._hit(cache, "a")
+        pipeline.reserve_prefetch = lambda operation, info, hit, aux: "short"
+        self._drain(cache, 1)
+        self.assertEqual(list(pipeline.pending_hit_allocs), [a])
+        pipeline.reserve_prefetch = lambda operation, info, hit, aux: "reserved"
+        self._drain(cache, 0)
+        self.assertEqual(dispatched, [a])
+        self.assertFalse(pipeline.pending_hit_allocs)
+        self.assertEqual(cache._prefetch_outcome_stats["declined_rate_limited"], 1)
+
+
+# ---------------------------------------------------------------- two ranks
 
 
 class _HoldingBackend:
