@@ -2435,6 +2435,26 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             f"expected the replacement to be named, got {messages}",
         )
 
+    def test_calling_one_from_inside_the_package_compiles_with_fullgraph(self):
+        """A collective that calls a deprecated getter must compile with fullgraph."""
+        import torch
+
+        from sglang.srt.distributed import communication_op, parallel_state
+
+        compiled = torch.compile(
+            communication_op.tensor_model_parallel_all_reduce,
+            backend="eager",
+            fullgraph=True,
+        )
+        stand_in = SimpleNamespace(all_reduce=lambda x: x * 2)
+        # A getter that has warned skips the frame lookup;
+        # other cases in this class warn for get_tp_group.
+        with (
+            patch.object(parallel_state, "_ALREADY_WARNED", set()),
+            get_parallel().override(tp_group=stand_in),
+        ):
+            self.assertEqual(compiled(torch.ones(2)).tolist(), [2.0, 2.0])
+
     def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
         from sglang.srt.distributed import parallel_state
 
