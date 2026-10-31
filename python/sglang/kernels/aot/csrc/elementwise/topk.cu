@@ -17,7 +17,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <sgl_kernel/dsa/legacy_radix_topk.cuh>
 
 namespace {
 
@@ -34,8 +33,9 @@ constexpr size_t kSmem = 48 * 1024;  // bytes
 #endif
 #else
 // Reduced from 128KB to 32KB to improve occupancy.
-// Each radix pass needs at most ~TopK candidates in the threshold bin,
-// so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
+// Keep two 4K shared-memory candidate buffers for the common fast path.
+// Larger threshold buckets are recovered from the original input by the
+// overflow slow path below.
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
 #endif
 
@@ -76,10 +76,308 @@ __device__ void naive_topk_transform_ragged(
   }
 }
 
+__device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
+  __half h = __float2half_rn(x);
+  uint16_t bits = __half_as_ushort(h);
+  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+  return static_cast<uint8_t>(key >> 8);
+}
+
+__device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
+  uint32_t bits = __float_as_uint(x);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
-  ::sglang::device::legacy_radix_topk::select<kThreadsPerBlock, TopK, static_cast<int>(kSmem / (2 * sizeof(int)))>(
-      input, index, row_start, length, TopK);
+  // An optimized topk kernel copied from tilelang kernel
+  // We assume length > TopK here, or it will crash
+  int topk = TopK;
+  constexpr auto BLOCK_SIZE = 1024;
+  constexpr auto RADIX = 256;
+  constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
+
+  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
+  alignas(128) __shared__ int s_counter;
+  alignas(128) __shared__ int s_threshold_bin_id;
+  alignas(128) __shared__ int s_num_input[2];
+
+  auto& s_histogram = s_histogram_buf[0];
+  // allocate for two rounds
+  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
+
+  const int tx = threadIdx.x;
+  // First uncached candidate in this thread's tx + n * BLOCK_SIZE lane.
+  int resume_idx = length;
+
+  // stage 1: 8bit coarse histogram
+  if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
+
+  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    const auto bin = convert_to_uint8(input[idx + row_start]);
+    ::atomicAdd(&s_histogram[bin], 1);
+  }
+  __syncthreads();
+
+  const auto run_cumsum = [&] {
+#pragma unroll 8
+    for (int i = 0; i < 8; ++i) {
+      static_assert(1 << 8 == RADIX);
+      if (C10_LIKELY(tx < RADIX)) {
+        const auto j = 1 << i;
+        const auto k = i & 1;
+        auto value = s_histogram_buf[k][tx];
+        if (tx < RADIX - j) {
+          value += s_histogram_buf[k][tx + j];
+        }
+        s_histogram_buf[k ^ 1][tx] = value;
+      }
+      __syncthreads();
+    }
+  };
+
+  run_cumsum();
+  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    s_threshold_bin_id = tx;
+    s_num_input[0] = 0;
+    s_counter = 0;
+  }
+  __syncthreads();
+
+  const auto coarse_threshold_bin = s_threshold_bin_id;
+  topk -= s_histogram[coarse_threshold_bin + 1];
+
+  if (topk == 0) {
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
+      if (bin > coarse_threshold_bin) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        index[pos] = idx;
+      }
+    }
+    __syncthreads();
+    return;
+  } else {
+    __syncthreads();
+    if (tx < RADIX + 1) {
+      s_histogram[tx] = 0;
+    }
+    __syncthreads();
+
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto raw_input = input[idx + row_start];
+      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+      if (bin > coarse_threshold_bin) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        index[pos] = idx;
+      } else if (bin == coarse_threshold_bin) {
+        const auto pos = ::atomicAdd(&s_num_input[0], 1);
+        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+          s_input_idx[0][pos] = idx;
+          const auto key = convert_to_uint32(raw_input);
+          const auto sub_bin = (key >> 24) & 0xFF;
+          ::atomicAdd(&s_histogram[sub_bin], 1);
+        } else {
+          if (resume_idx == length) resume_idx = idx;
+          // Overflow candidates remain in the logical set even though they
+          // were not materialized in the shared-memory cache.
+          const auto key = convert_to_uint32(raw_input);
+          const auto sub_bin = (key >> 24) & 0xFF;
+          ::atomicAdd(&s_histogram[sub_bin], 1);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // stage 2: refine with 8bit radix passes
+  if (C10_LIKELY(s_num_input[0] <= int(SMEM_INPUT_SIZE))) {
+    // Preserve the original shared-memory-only path for the common case. No
+    // resume prefix is maintained and no raw-input tail is revisited here.
+#pragma unroll 4
+    for (int round = 0; round < 4; ++round) {
+      __shared__ int s_last_remain;
+      const auto r_idx = round % 2;
+      const auto num_input = s_num_input[r_idx];
+
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+        s_num_input[r_idx ^ 1] = 0;
+        s_last_remain = topk - s_histogram[tx + 1];
+      }
+      __syncthreads();
+
+      const auto threshold_bin = s_threshold_bin_id;
+      topk -= s_histogram[threshold_bin + 1];
+
+      if (topk == 0) {
+        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          const auto offset = 24 - round * 8;
+          const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
+          if (bin > threshold_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            index[pos] = idx;
+          }
+        }
+        __syncthreads();
+        break;
+      }
+
+      __syncthreads();
+      if (tx < RADIX + 1) {
+        s_histogram[tx] = 0;
+      }
+      __syncthreads();
+      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+        const auto idx = s_input_idx[r_idx][i];
+        const auto raw_input = input[idx + row_start];
+        const auto offset = 24 - round * 8;
+        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          if (round == 3) {
+            const auto pos = ::atomicAdd(&s_last_remain, -1);
+            if (pos > 0) {
+              index[TopK - pos] = idx;
+            }
+          } else {
+            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+              s_input_idx[r_idx ^ 1][pos] = idx;
+              const auto key = convert_to_uint32(raw_input);
+              const auto sub_bin = (key >> (offset - 8)) & 0xFF;
+              ::atomicAdd(&s_histogram[sub_bin], 1);
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+    return;
+  }
+
+  // Slow path: the first threshold bucket overflowed the smem cache.
+  uint32_t refine_prefix = 0;
+#pragma unroll 4
+  for (int round = 0; round < 4; ++round) {
+    __shared__ int s_last_remain;
+    const auto r_idx = round % 2;
+
+    // clip here to prevent overflow
+    const auto _raw_num_input = s_num_input[r_idx];
+    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
+
+    run_cumsum();
+    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+      s_threshold_bin_id = tx;
+      s_num_input[r_idx ^ 1] = 0;
+      s_last_remain = topk - s_histogram[tx + 1];
+    }
+    __syncthreads();
+
+    const auto threshold_bin = s_threshold_bin_id;
+    topk -= s_histogram[threshold_bin + 1];
+    const auto offset = 24 - round * 8;
+    const uint32_t prefix_mask = round == 0 ? 0u : 0xFFFFFFFFu << (32 - round * 8);
+
+    if (topk == 0) {
+      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+        const auto idx = s_input_idx[r_idx][i];
+        const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        }
+      }
+      for (int idx = resume_idx; idx < length; idx += BLOCK_SIZE) {
+        const auto raw_input = input[idx + row_start];
+        if (static_cast<int>(convert_to_uint8(raw_input)) != coarse_threshold_bin) continue;
+        const auto key = convert_to_uint32(raw_input);
+        if ((key & prefix_mask) != refine_prefix) continue;
+        const auto bin = (key >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        }
+      }
+      __syncthreads();
+      break;
+    } else {
+      __syncthreads();
+      if (tx < RADIX + 1) {
+        s_histogram[tx] = 0;
+      }
+      __syncthreads();
+      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+        const auto idx = s_input_idx[r_idx][i];
+        const auto raw_input = input[idx + row_start];
+        const auto key = convert_to_uint32(raw_input);
+        const auto bin = (key >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          if (round == 3) {
+            const auto pos = ::atomicAdd(&s_last_remain, -1);
+            if (pos > 0) {
+              index[TopK - pos] = idx;
+            }
+          } else {
+            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            // Materialized candidates run before the tail, so their survivor
+            // count is bounded by num_input and always fits.
+            s_input_idx[r_idx ^ 1][pos] = idx;
+            const auto sub_bin = (key >> (offset - 8)) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+      __syncthreads();
+
+      // Process the raw tail only after every materialized survivor has claimed
+      // its next-cache slot. A failed store advances this thread's resume point,
+      // but scanning continues so the next histogram remains complete.
+      int idx = resume_idx;
+      resume_idx = length;
+      bool tail_overflowed = false;
+      for (; idx < length; idx += BLOCK_SIZE) {
+        const auto raw_input = input[idx + row_start];
+        if (static_cast<int>(convert_to_uint8(raw_input)) != coarse_threshold_bin) continue;
+        const auto key = convert_to_uint32(raw_input);
+        if ((key & prefix_mask) != refine_prefix) continue;
+        const auto bin = (key >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          if (round == 3) {
+            const auto pos = ::atomicAdd(&s_last_remain, -1);
+            if (pos > 0) {
+              index[TopK - pos] = idx;
+            }
+          } else {
+            const auto sub_bin = (key >> (offset - 8)) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+            if (!tail_overflowed) {
+              const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+              if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+                s_input_idx[r_idx ^ 1][pos] = idx;
+              } else {
+                resume_idx = idx;
+                tail_overflowed = true;
+              }
+            }
+          }
+        }
+      }
+      refine_prefix |= static_cast<uint32_t>(threshold_bin) << offset;
+      __syncthreads();
+    }
+  }
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
@@ -121,10 +419,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     static_assert(TopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = pos_0 < 0 ? -1 : src_page_entry[pos_0];
+    dst_page_entry[idx_0] = src_page_entry[pos_0];
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = pos_1 < 0 ? -1 : src_page_entry[pos_1];
+    dst_page_entry[idx_1] = src_page_entry[pos_1];
   }
 }
 
@@ -173,10 +471,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
     static_assert(TopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = pos_0 < 0 ? -1 : src_page_entry[pos_0];
+    dst_page_entry[idx_0] = src_page_entry[pos_0];
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = pos_1 < 0 ? -1 : src_page_entry[pos_1];
+    dst_page_entry[idx_1] = src_page_entry[pos_1];
   }
 }
 
@@ -204,10 +502,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     static_assert(TopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    dst_indices_entry[idx_0] = pos_0 < 0 ? -1 : pos_0 + offset;
+    dst_indices_entry[idx_0] = pos_0 + offset;
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    dst_indices_entry[idx_1] = pos_1 < 0 ? -1 : pos_1 + offset;
+    dst_indices_entry[idx_1] = pos_1 + offset;
   }
 }
 
