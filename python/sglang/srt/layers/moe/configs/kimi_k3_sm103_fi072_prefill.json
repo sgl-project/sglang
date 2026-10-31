@@ -1,6 +1,6 @@
 {
   "_metadata": {
-    "flashinfer_version": "0.7.1",
+    "flashinfer_version": "0.7.2",
     "cuda_version": "13.0",
     "cublas_version": "13.1.1",
     "cudnn_version": "92400",
@@ -12,7 +12,7 @@
     "MoERunner",
     [
       128,
-      0
+      4
     ],
     [
       "cuda_graph_profile_replays",

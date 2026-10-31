@@ -23,9 +23,9 @@ def load_kimi_k3_prefill_tactics(
         or (tp_size, pp_size, ep_size) != (1, 8, 1)
         or chunk_size != 16384
         or dtype != torch.bfloat16
-        or flashinfer.__version__ != "0.7.1"
+        or flashinfer.__version__ != "0.7.2"
         or torch.cuda.get_device_capability(device) != (10, 3)
     ):
         return False
-    path = Path(__file__).with_name("configs") / "kimi_k3_sm103_fi071_prefill.json"
+    path = Path(__file__).with_name("configs") / "kimi_k3_sm103_fi072_prefill.json"
     return tuner.load_configs(str(path))

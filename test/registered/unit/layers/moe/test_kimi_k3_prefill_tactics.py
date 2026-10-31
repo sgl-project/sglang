@@ -33,20 +33,20 @@ class TestKimiK3PrefillTactics(CustomTestCase):
         tuner.load_configs.return_value = True
         with (
             patch.dict(
-                "sys.modules", {"flashinfer": SimpleNamespace(__version__="0.7.1")}
+                "sys.modules", {"flashinfer": SimpleNamespace(__version__="0.7.2")}
             ),
             patch("torch.cuda.get_device_capability", return_value=(10, 3)),
         ):
             self.assertTrue(load_kimi_k3_prefill_tactics(tuner, **self.kwargs))
             path = Path(tuner.load_configs.call_args.args[0])
             records = json.loads(path.read_text())
-            self.assertEqual(records.pop("_metadata")["flashinfer_version"], "0.7.1")
+            self.assertEqual(records.pop("_metadata")["flashinfer_version"], "0.7.2")
             self.assertEqual(len(records), 1)
             key, record = next(iter(records.items()))
             op, runner, shapes, extras = ast.literal_eval(key)
             self.assertEqual(op, "flashinfer::trtllm_fp4_block_scale_moe")
             self.assertEqual(runner, record[0])
-            self.assertEqual(record[1], [128, 0])
+            self.assertEqual(record[1], [128, 4])
             self.assertEqual(shapes[0], (16384, 3584))
             self.assertEqual(extras[1:5], (16, 896, 896, 0))
             for field, value in (
@@ -63,8 +63,12 @@ class TestKimiK3PrefillTactics(CustomTestCase):
                     self.assertFalse(load_kimi_k3_prefill_tactics(tuner, **args))
                     tuner.load_configs.assert_not_called()
 
-    def test_new_flashinfer_and_other_hardware_keep_defaults(self):
-        for version, capability in (("0.7.2", (10, 3)), ("0.7.1", (10, 0))):
+    def test_unvalidated_flashinfer_and_other_hardware_keep_defaults(self):
+        for version, capability in (
+            ("0.7.1", (10, 3)),
+            ("0.7.3", (10, 3)),
+            ("0.7.2", (10, 0)),
+        ):
             with (
                 self.subTest(version=version, capability=capability),
                 patch.dict(
