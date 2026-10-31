@@ -415,10 +415,14 @@ class Band:
         # relocates: the engine reads or writes the addresses it was handed.
         self.pin_sources: Tuple[Callable[[], bool], ...] = ()
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
-        # Most-recent forward's (done_event, out_cache_loc_virtual) for `_flush`'s
-        # write-race check. Single slot: at most ONE forward in flight per call
-        # site; `_flush` materializes the write-set lazily, avoiding a sync here.
-        self._inflight_forward: Optional[Tuple[torch.cuda.Event, torch.Tensor]] = None
+        # (done_event, written virtual ids, or None when unknown) of every
+        # forward that may still be running, oldest first, for `_flush`'s
+        # write-race check. Forwards run in order on one stream, so the newest
+        # event covers them all. `_flush` materializes the write set lazily,
+        # avoiding a sync here.
+        self._inflight_forwards: List[
+            Tuple[torch.cuda.Event, Optional[torch.Tensor]]
+        ] = []
         self._hicache_transfer_done_events: Dict[Hashable, torch.cuda.Event] = {}
         # A host load's explicit pin: HiCache reserves physical pages during
         # load-back, then binds them into the tree before the H2D copy is
@@ -529,7 +533,7 @@ class Band:
         self._pending_reuse.clear()
         self._pending_reuse_pages_cpu.clear()
         self.live_page_count = 0
-        self._inflight_forward = None
+        self._inflight_forwards.clear()
         self._latest_forward_done_event = None
         self._hicache_transfer_done_events.clear()
         self._load_pinned_pages = 0
@@ -1404,51 +1408,60 @@ class Band:
     def set_inflight_forward(
         self,
         forward_done: torch.cuda.Event,
-        out_cache_loc_virtual: Optional[torch.Tensor],
+        written_virtual: Optional[torch.Tensor],
+        *,
+        writes_unknown: bool = False,
     ) -> None:
-        """Stash the just-launched forward's `forward_done` event plus the virtual
-        `out_cache_loc` for `_flush`'s write-race check; no GPU work, only
-        references. Pass `out_cache_loc_virtual=None` when the forward does not
-        write this pool (Mamba state goes through mamba kernels, not
-        `set_kv_buffer`). No-op in eager mode.
+        """Record a just-launched forward's `forward_done` event and the virtual
+        ids it writes in this band, for `_flush`'s write-race check; no GPU work,
+        only references. Forwards still running stay recorded: a pipeline stage
+        launches the next microbatch before the previous one ends. Pass
+        `written_virtual=None` when the forward writes nothing here, and
+        ``writes_unknown`` when its write ids cannot be read before it ends:
+        nothing then moves until it does. No-op in eager mode.
         """
         with record_function("Band.set_inflight_forward"):
             if not self.lazy_compaction:
                 return
-            if out_cache_loc_virtual is None or out_cache_loc_virtual.numel() == 0:
-                # No write race on this pool -- clear the slot so `_flush`
-                # short-circuits and the prior tensor reference can be GC'd.
-                self._inflight_forward = None
-                return
-            self._inflight_forward = (forward_done, out_cache_loc_virtual)
+            self._prune_inflight_forwards()
+            if writes_unknown:
+                self._inflight_forwards.append((forward_done, None))
+            elif written_virtual is not None and written_virtual.numel() > 0:
+                self._inflight_forwards.append((forward_done, written_virtual))
+
+    def _prune_inflight_forwards(self) -> None:
+        """Drop the forwards that completed, so later checks in the same tick
+        don't re-query fired events."""
+        self._inflight_forwards = [
+            inflight for inflight in self._inflight_forwards if not inflight[0].query()
+        ]
 
     def _materialize_inflight_write_set(self) -> Optional[Set[int]]:
-        """The in-flight forward's write-set (physical PAGE ids it is about to
-        write), or `None` if there is none / it already completed. Pays a bs-sized
-        D2H sync, once per call and only when a survivor needs classifying.
+        """The physical PAGE ids the unfinished forwards write, or `None` if
+        none is unfinished. Pays a bs-sized D2H sync per forward, once per call
+        and only when a survivor needs classifying. `_flush` has settled any
+        forward whose writes are unknown.
         """
-        inflight = self._inflight_forward
-        if inflight is None:
+        self._prune_inflight_forwards()
+        written = [w for _, w in self._inflight_forwards if w is not None]
+        if not written:
             return None
-        event, oclv = inflight
-        # Forward completed -> no write race. Clear so later flushes in the same
-        # tick don't re-check the fired event.
-        if event.query():
-            self._inflight_forward = None
-            return None
-        # `oclv` is non-None here (set_inflight_forward clears the slot otherwise).
         with record_function("Band._materialize_inflight_write_set"):
             # `oclv` is a WIDENED virtual id under DCP; collapse it. A widened page
             # covers the same page, so the non-owned ids fold in harmlessly.
             dcp_size = get_parallel().attn_dcp_size if self.shards_under_dcp else 1
-            if dcp_size > 1:
-                oclv = oclv // dcp_size
-            phys_tokens = self.ids.translate(oclv)
-            if self.pool_page_size > 1:
-                phys_pages = (phys_tokens // self.pool_page_size).unique()
-            else:
-                phys_pages = phys_tokens
-            return set(phys_pages.tolist())  # .tolist() syncs schedule_stream
+            pages: Set[int] = set()
+            # One forward at a time, not concatenated: a kernel's first launch
+            # loads its module, which waits for the running forwards.
+            for oclv in written:
+                if dcp_size > 1:
+                    oclv = oclv // dcp_size
+                # Negative ids (an empty tracking slot) translate to the sink.
+                phys_tokens = self.ids.translate(oclv)
+                if self.pool_page_size > 1:
+                    phys_tokens = (phys_tokens // self.pool_page_size).unique()
+                pages.update(phys_tokens.tolist())  # .tolist() syncs schedule_stream
+            return pages
 
     def _maybe_emit_stats(self) -> None:
         """Env-gated periodic stats emit (at most once per interval) at `_flush` end.
@@ -1632,7 +1645,7 @@ class Band:
         ev = self._latest_forward_done_event
         if ev is not None:
             torch.cuda.current_stream().wait_event(ev)
-            self._inflight_forward = None
+            self._inflight_forwards.clear()
 
     def _flush(self, *, urgent: bool) -> int:
         """One batched compaction pass; returns the number of survivor moves.
@@ -1653,6 +1666,13 @@ class Band:
             # pending sources rejoin it now, since that copies nothing.
             self._drain_pending_reuse(urgent=False)
             return 0
+        self._prune_inflight_forwards()
+        if any(written is None for _, written in self._inflight_forwards):
+            # A running forward whose writes are unknown may write any survivor.
+            if not urgent:
+                self._drain_pending_reuse(urgent=False)
+                return 0
+            self._settle_inflight_forward()
         self._wait_hicache_transfers()
         self._stats_n_flush_calls += 1
         with record_function("Band._flush"):
@@ -1727,10 +1747,11 @@ class Band:
                         n_moves += len(srcs)
                         srcs.clear()
                         dsts.clear()
-                        inflight = self._inflight_forward
-                        if inflight is not None:
-                            torch.cuda.current_stream().wait_event(inflight[0])
-                            self._inflight_forward = None
+                        if self._inflight_forwards:
+                            torch.cuda.current_stream().wait_event(
+                                self._inflight_forwards[-1][0]
+                            )
+                            self._inflight_forwards.clear()
                         write_set = set()  # forward drained -> no race
                         latest_event = None
                         # DO NOT reset cursor/j_cursor: rewinding would re-pick

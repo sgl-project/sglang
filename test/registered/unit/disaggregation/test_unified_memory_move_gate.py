@@ -331,7 +331,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         """Every member that can relocate pages must hear each event its moves
         wait on: a member that misses a HiCache copy's event may move a page the
         copy still reads or writes. Recurrent state is written by its own
-        kernels, so its member gets no in-flight token ids."""
+        kernels, so its member gets the state slots, not the token ids."""
         for chain in self._CHAINS:
             alloc = self._chain(chain)
             received = {m.sub_pool_name: {} for m in alloc.members}
@@ -347,7 +347,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                             mock.patch.object(
                                 member,
                                 name,
-                                side_effect=lambda *args, got=got, hook=hook: (
+                                side_effect=lambda *args, got=got, hook=hook, **_: (
                                     got.__setitem__(hook, args[-1])
                                 ),
                             )
@@ -355,7 +355,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 event, ids = object(), torch.tensor([5, 6])
                 alloc.set_hicache_transfer_done_event("load", event)
                 alloc.set_latest_forward_done_event(event)
-                alloc.set_inflight_forward(event, ids)
+                alloc.set_inflight_forward(event, ids, torch.tensor([3]))
             for hook in ("hicache", "forward_done", "inflight"):
                 with self.subTest(chain=chain, hook=hook):
                     self.assertEqual(
@@ -366,7 +366,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
             with self.subTest(chain=chain, hook="inflight ids"):
                 for name, got in received.items():
                     if name == "mamba":
-                        self.assertIsNone(got["inflight"])
+                        self.assertEqual(got["inflight"].tolist(), [3])
                     else:
                         self.assertEqual(got["inflight"].tolist(), [5, 6])
 

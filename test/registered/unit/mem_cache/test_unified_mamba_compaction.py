@@ -11,6 +11,11 @@ from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
+    build_unified_bundle,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small")
@@ -212,6 +217,56 @@ class TestMambaCompaction(CustomTestCase):
                 self._verify(f, set(range(8, 16)))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_every_unfinished_forward_guards_its_state_writes(self):
+        # A pipeline stage keeps several microbatch forwards in flight, each
+        # writing its own requests' state slots in place. A non-urgent flush must
+        # not move a slot any of them writes; an urgent one waits for all of them.
+        f = self._fixture("cuda")
+        f.alloc.free(f.ids[8:16])
+        n = f.spec.entry_bytes()
+        # The oldest forward writes the topmost survivor, the first one moved.
+        writers = (f.count - 1, f.count - 2)
+        expected = f.raw.clone()
+        payloads = {}
+        for k, i in enumerate(writers):
+            page = f.original_pages[i]
+            expected[page * n : (page + 1) * n] = 100 + k
+            payloads[i] = torch.full((n,), 100 + k, dtype=torch.uint8, device="cuda")
+        schedule = torch.cuda.Stream()
+        forward = torch.cuda.Stream()
+        with torch.cuda.stream(schedule):
+            # Loading a kernel module and growing the caching allocator both wait
+            # for every stream; warm both first, as a running scheduler has.
+            f.alloc.prewarm_compaction()
+            # Both pointer alignments the write-set translation is launched with.
+            f.alloc.ids.translate(f.ids[:1])
+            f.alloc.ids.translate(f.ids[1:2])
+            torch.empty(1, device="cuda")
+            torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        f.move.reset_mock()  # the warm-up copies the sink onto itself
+        events = []
+        for i in writers:
+            page = f.original_pages[i]
+            done = torch.cuda.Event()
+            with torch.cuda.stream(forward):
+                torch.cuda._sleep(500_000_000)
+                f.pool.raw[page * n : (page + 1) * n].copy_(payloads[i])
+                done.record()
+            f.alloc.set_latest_forward_done_event(done)
+            f.alloc.set_inflight_forward(done, f.ids[i : i + 1])
+            events.append(done)
+        with torch.cuda.stream(schedule):
+            self.assertFalse(events[0].query())
+            early = f.alloc.flush_opportunistic()
+            self.assertFalse(events[0].query(), "the forwards ended before the flush")
+            late = f.alloc.flush_for_allocation()
+        torch.cuda.synchronize()
+        f.raw = expected
+        self._verify(f, set(range(8, 16)))
+        self.assertEqual((early, late), (0, 8))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_pending_read_sources_drain_with_closed_gate(self):
         f = self._fixture("cuda")
         f.alloc.free(f.ids[8:16])
@@ -294,6 +349,66 @@ class TestMambaCompaction(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(observed, expected))
+
+
+class _Event:
+    """A forward's done event, fired by the test."""
+
+    def __init__(self):
+        self.fired = False
+
+    def query(self):
+        return self.fired
+
+
+class TestForwardWriteSets(CustomTestCase):
+    def _allocator(self):
+        setup_allocator_context()
+        bundle = build_unified_bundle(
+            UnifiedGeometry(chain="mamba", full_layer_ids=(0,), state_layer_ids=(1,))
+        )
+        return bundle.token_to_kv_pool_allocator
+
+    def test_state_band_records_every_slot_the_forward_writes(self):
+        # State kernels write the working slots of the batch's rows in place,
+        # plus its tracking and copy-on-write slots; compaction must see them.
+        allocator = self._allocator()
+        storage = allocator.storage
+        storage.requests.req_index_to_mamba_index_mapping[torch.tensor([1, 2])] = (
+            torch.tensor([5, 6], dtype=torch.int32)
+        )
+        tokens = torch.tensor([10, 11])
+        storage.record_forward(
+            _Event(),
+            written_tokens=tokens,
+            token_writes_unknown=False,
+            req_pool_indices=torch.tensor([1, 2]),
+            state_slots=(torch.tensor([7, -1]), None),
+        )
+        state = allocator.mamba_allocator._inflight_forwards
+        self.assertEqual(state[-1][1].tolist(), [5, 6, 7, -1])
+        owner = allocator.full_attn_allocator._inflight_forwards
+        self.assertIs(owner[-1][1], tokens)
+
+    def test_unknown_token_writes_hold_non_urgent_moves(self):
+        # A pipeline stage's verify forward produces its own write slots, so
+        # nothing may move until it ends, even with a newer forward recorded.
+        allocator = self._allocator()
+        owner = allocator.full_attn_allocator
+        ids = owner.alloc(4)
+        owner.free(ids[1:3])
+        unknown, known = _Event(), _Event()
+        for event, tokens in ((unknown, None), (known, ids[3:])):
+            allocator.storage.record_forward(
+                event,
+                written_tokens=tokens,
+                token_writes_unknown=tokens is None,
+                req_pool_indices=torch.tensor([0]),
+                state_slots=(),
+            )
+        self.assertEqual(owner.flush_opportunistic(), 0)
+        unknown.fired = known.fired = True
+        self.assertGreater(owner.flush_opportunistic(), 0)
 
 
 if __name__ == "__main__":
