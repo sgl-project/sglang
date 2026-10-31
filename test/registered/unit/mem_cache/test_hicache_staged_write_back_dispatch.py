@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -36,7 +37,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
 DSA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.dsa"
@@ -218,6 +219,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
+        controller.is_kv_sharded = False
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
@@ -228,8 +230,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.mem_pool_device_allocator = mock.Mock()
-        controller._l2_transfers.side_effect = lambda *args: (
-            HybridCacheController._l2_transfers(controller, *args)
+        controller._l2_transfers.side_effect = lambda *args, **kwargs: (
+            HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
         controller._l2_load_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_load_transfers(controller, *args)
@@ -268,6 +270,95 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller._num_tokens_by_pool.assert_called_once_with(merged_op)
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
+
+    def _hybrid_load_controller(self):
+        entries = {}
+        for name in (PoolName.KV, PoolName.SWA, PoolName.DRAFT):
+            host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+            host_pool.load_to_device_per_layer = mock.Mock()
+            entries[name] = PoolEntry(
+                name=name,
+                host_pool=host_pool,
+                device_pool=object(),
+                layer_mapper=lambda layer_id: layer_id,
+            )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=entries[PoolName.KV], entry_map=entries
+        )
+        controller.mem_pool_device_allocator = object()
+        controller.load_queue = []
+        return controller
+
+    def test_swa_restore_skips_only_empty_draft(self):
+        for full_tokens in (0, 64):
+            with self.subTest(full_tokens=full_tokens):
+                controller = self._hybrid_load_controller()
+                full_host = _indices(0, full_tokens)
+                full_device = _indices(256, 256 + full_tokens)
+                swa_host, swa_device = _indices(0, 64), _indices(128, 192)
+                controller.load(
+                    full_host,
+                    device_indices=full_device,
+                    extra_pools=[
+                        PoolTransfer(
+                            PoolName.SWA,
+                            host_indices=swa_host,
+                            device_indices=swa_device,
+                        ),
+                        PoolTransfer(PoolName.DRAFT, indices_from_pool=PoolName.KV),
+                    ],
+                )
+                op = controller.load_queue[0]
+                transfers = controller._l2_load_transfers(
+                    op.host_indices, op.device_indices, op.pool_transfers
+                )
+                expected = {PoolName.SWA: (swa_host, swa_device)}
+                if full_tokens:
+                    expected.update(
+                        {
+                            PoolName.KV: (full_host, full_device),
+                            PoolName.DRAFT: (full_host, full_device),
+                        }
+                    )
+                self.assertEqual(len(transfers), len(expected))
+                completed = mock.Mock()
+                with mock.patch.object(
+                    transfer_module, "device_module", _FakeDeviceModule
+                ):
+                    L2TransferEngine("kernel").submit_host_to_device(
+                        transfers, transfer_layer_id_max=2, on_layer_done=completed
+                    )
+                self.assertEqual(completed.call_args_list, [mock.call(0), mock.call(1)])
+                for name, entry in controller.mem_pool_host.entry_map.items():
+                    copies = entry.host_pool.load_to_device_per_layer.call_args_list
+                    if name not in expected:
+                        self.assertEqual(copies, [])
+                        continue
+                    self.assertEqual([copy.args[3] for copy in copies], [0, 1])
+                    for copy in copies:
+                        self.assertIs(copy.args[1], expected[name][0])
+                        self.assertIs(copy.args[2], expected[name][1])
+
+    def test_mismatched_auxiliary_transfer_is_not_silently_dropped(self):
+        controller = self._hybrid_load_controller()
+        empty = _indices(0, 0)
+        for host_tokens, device_tokens in ((0, 1), (1, 0)):
+            with self.subTest(host_tokens=host_tokens, device_tokens=device_tokens):
+                transfer = PoolTransfer(
+                    PoolName.DRAFT,
+                    host_indices=_indices(0, host_tokens),
+                    device_indices=_indices(0, device_tokens),
+                )
+                self.assertEqual(
+                    len(controller._l2_transfers(empty, empty, [transfer])), 1
+                )
+
+    def test_unresolved_auxiliary_transfer_still_fails(self):
+        controller = self._hybrid_load_controller()
+        empty = _indices(0, 0)
+        with self.assertRaisesRegex(ValueError, "Unresolved L2 transfer"):
+            controller._l2_transfers(empty, empty, [PoolTransfer(PoolName.DRAFT)])
 
     def _short_swa_tail_pipeline(self, swa_page_size: int) -> BufferModePipeline:
         """Pipeline holding one staged span [2, 8) whose 4-slot trailing SWA
@@ -328,7 +419,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                         rid="r",
                         cache_request_handle=handle,
                         prefix_len=0,
-                        kv=SimpleNamespace(cache_protected_len=0),
+                        kv=ReqKvInfo(cache_protected_len=0),
                     )
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertEqual(req.host_hit_length, 2)

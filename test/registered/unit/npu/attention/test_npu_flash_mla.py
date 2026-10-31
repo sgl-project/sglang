@@ -644,6 +644,7 @@ def test_pool_configurator_only_merges_dspark_target_cache(
             config._build_hybrid_linear_kv_pool(
                 max_total_num_tokens=256,
                 req_to_token_pool=SimpleNamespace(mamba_pool=Mock()),
+                state_pool=Mock(),
                 mha_pool_class=Mock(),
                 mla_pool_class=Mock(),
                 dsa_pool_class=Mock(),

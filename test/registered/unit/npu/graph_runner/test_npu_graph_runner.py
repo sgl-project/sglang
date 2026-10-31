@@ -8,9 +8,9 @@ import torch
 
 from sglang.srt.hardware_backend.npu.graph_runner import npu_graph_runner as mod
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_npu_ci(est_time=12, suite="base-a-test-npu")
 
 
 @pytest.mark.parametrize("needs_cpu_seq_lens", [True, False])
@@ -46,7 +46,7 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch(
         init_forward_metadata_out_graph=mock.Mock(),
         needs_cpu_seq_lens=needs_cpu_seq_lens,
     )
-    runner._replay_attn_backend = lambda: attention
+    runner.attn_backend = attention
     runner.backend = SimpleNamespace(
         replay_with_input_update=mock.Mock(
             return_value=LogitsProcessorOutput(

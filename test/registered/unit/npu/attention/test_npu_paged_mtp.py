@@ -258,7 +258,7 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
             )
         ),
         decode_cuda_graph_runner=None,
-        kv_index_translator=object(),
+        runner_ids=object(),
     )
     proposer = SimpleNamespace(
         gamma=7,
@@ -285,7 +285,7 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
     window = SimpleNamespace(
         positions_2d=torch.arange(7).reshape(1, 7),
         verify_cache_loc_2d=torch.arange(7).reshape(1, 7),
-        kv_loc_plan=SimpleNamespace(bind=Mock()),
+        iteration_ids=SimpleNamespace(bind=Mock()),
     )
     kwargs = dict(
         batch=fb,
@@ -295,7 +295,7 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
         device="cpu",
         embed_module=lambda x: torch.zeros(1, 7, 16),
     )
-    if needs_cpu and mirror is None and allocation is None:
+    if needs_cpu and mirror is None:
         with pytest.raises(RuntimeError, match="batch.seq_lens_cpu"):
             method(proposer, **kwargs)
         runner.forward.assert_not_called()
@@ -347,7 +347,7 @@ def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mir
         verify_window=SimpleNamespace(
             positions_2d=torch.arange(8),
             verify_cache_loc=torch.arange(8),
-            kv_loc_plan=object(),
+            iteration_ids=object(),
         ),
         sampling_info=None,
     )
@@ -375,9 +375,13 @@ def test_device_length_graph_uses_plain_replay_after_loading_inputs(backend):
     )
     fb = batch((127,))
     fb.needs_forward_metadata_init = lambda: True
-    output = SimpleNamespace(next_token_logits=None, hidden_states=torch.ones(7, 16))
+    output = SimpleNamespace(
+        next_token_logits=None,
+        hidden_states=torch.ones(7, 16),
+        last_hidden_states=None,
+    )
     runner = SimpleNamespace(
-        _replay_attn_backend=lambda: backend,
+        attn_backend=backend,
         load_batch=Mock(),
         _make_graph_key=lambda bs: bs,
         bs=1,

@@ -25,7 +25,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -399,6 +399,7 @@ class _RowCache:
     def __init__(self, allocator, row):
         self.req_to_token_pool = SimpleNamespace(req_to_token=row.unsqueeze(0))
         self.token_to_kv_pool_allocator = allocator
+        self.logical_page_size = allocator.page_size
         self.page_size = allocator.page_size
 
 

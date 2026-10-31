@@ -1145,7 +1145,7 @@ class InklingForConditionalGeneration(nn.Module):
         # The MTP chain needs the undivided hidden (the mup division is
         # lm_head-only); passed unconditionally because the target
         # verify/prefill forwards never set return_hidden_states_before_norm.
-        return self.llm.logits_processor(
+        output = self.llm.logits_processor(
             input_ids,
             hidden_states_for_logits,
             self.llm.lm_head,
@@ -1157,6 +1157,10 @@ class InklingForConditionalGeneration(nn.Module):
                 None if aux_hidden_states is not None else hidden_states
             ),
         )
+        if output.last_hidden_states is not None:
+            # Auxiliary capture returns post-norm states before LM-head scaling.
+            output.last_hidden_states = hidden_states
+        return output
 
     def _load_regular_param(
         self,

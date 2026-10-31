@@ -1,4 +1,5 @@
 import concurrent.futures
+import dataclasses
 import threading
 import unittest
 from collections import defaultdict
@@ -49,6 +50,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -59,6 +63,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
     QSATokenToKVPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -68,7 +73,15 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+
+
+def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(
+        None, allocator, draft_token_to_kv_pool=draft, num_hidden_layers=total_kv_layers
+    )
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -91,6 +104,7 @@ class TestMixedSWAKVBlockScales(CustomTestCase):
         ):
             with self.subTest(full=full_quantized, swa=swa_quantized):
                 target = object.__new__(SWAKVPool)
+                target.layers_mapping = {}
                 for name, quantized, scale_infos in (
                     ("full_kv_pool", full_quantized, full_scale_infos),
                     ("swa_kv_pool", swa_quantized, swa_scale_infos),
@@ -105,7 +119,7 @@ class TestMixedSWAKVBlockScales(CustomTestCase):
                     setattr(target, name, pool)
 
                 kv_args = KVArgs()
-                setup_state_kv_args(kv_args, target)
+                setup_state_kv_args(kv_args, _static_storage(target))
 
                 expected_types = [StateType.SWA]
                 expected_infos = [swa_infos]
@@ -845,7 +859,7 @@ class TestQwen4StateWire(unittest.TestCase):
         pool = self._qsa_pool(24)
 
         kv_args = SimpleNamespace()
-        setup_state_kv_args(kv_args, pool)
+        setup_state_kv_args(kv_args, _static_storage(pool))
 
         self.assertEqual(
             kv_args.state_types,
@@ -866,7 +880,7 @@ class TestQwen4StateWire(unittest.TestCase):
         kv_args = SimpleNamespace()
         setup_state_kv_args(
             kv_args,
-            target_pool,
+            _static_storage(target_pool, draft_pool, 48),
             draft_token_to_kv_pool=draft_pool,
             total_kv_layers=48,
         )
@@ -904,7 +918,7 @@ class TestQwen4StateWire(unittest.TestCase):
         pool.qsa_compressed_k_buffer_pool = []
 
         kv_args = SimpleNamespace()
-        setup_state_kv_args(kv_args, pool)
+        setup_state_kv_args(kv_args, _static_storage(pool))
 
         # Keep the component slots aligned across PP stages, but expose no QSA
         # buffers or layer ids from a stage that cannot produce their contents.
@@ -1455,6 +1469,71 @@ class TestStagingWatermark(unittest.TestCase):
         )
 
 
+class TestStagingScatterLifecycle(CustomTestCase):
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_unregister_waits_for_submit_to_publish_its_event(self, make_event):
+        """Room teardown must not release a slot before its scatter is enqueued."""
+        room = 7
+        alloc_id = 5
+        receiver = SimpleNamespace(chunk_staging_infos=[(alloc_id, 4096, 0, 8192, 3)])
+        decode_req = SimpleNamespace(_chunk_events=[])
+        context = SimpleNamespace(
+            room_receivers={room: receiver}, room_bootstrap={room: object()}
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.kv_manager = SimpleNamespace(_staging_ctx=context)
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler._room_to_decode_req = {room: decode_req}
+        handler._room_to_receiver = {room: receiver}
+        handler._writer_counts = {room: {}}
+        handler._staging_lifecycle = threading.Condition()
+        token = object()
+        handler._room_tokens = {room: token}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler._free_and_send_watermark = Mock()
+
+        scatter_started = threading.Event()
+        finish_scatter = threading.Event()
+        unregister_waiting = threading.Event()
+        original_wait = handler._staging_lifecycle.wait
+
+        def observed_wait():
+            unregister_waiting.set()
+            return original_wait()
+
+        def scatter_region(*_args):
+            scatter_started.set()
+            finish_scatter.wait()
+            return True
+
+        handler._staging_lifecycle.wait = observed_wait
+        handler._scatter_region = scatter_region
+        event = make_event.return_value
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            submit = pool.submit(handler.submit_chunk_scatter, room, 0, 11, 3)
+            try:
+                self.assertTrue(scatter_started.wait(timeout=1))
+                unregister = pool.submit(handler.unregister_decode_req, room)
+                self.assertTrue(unregister_waiting.wait(timeout=1))
+                self.assertFalse(unregister.done())
+                handler._free_and_send_watermark.assert_not_called()
+            finally:
+                finish_scatter.set()
+
+            self.assertTrue(submit.result(timeout=1))
+            unregister.result(timeout=1)
+
+        event.record.assert_called_once_with(handler.staging_allocator._scatter_stream)
+        handler._free_and_send_watermark.assert_called_once_with(alloc_id, decode_req)
+        self.assertNotIn(room, context.room_receivers)
+        self.assertNotIn(room, context.room_bootstrap)
+
+
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
     def test_draft_buffers_use_logical_device_indices(self):
         """A local target layer count must not turn remote target KV into draft KV."""
@@ -1770,12 +1849,16 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                         sampling_logprobs_mode=mode,
                     )
                 )
+                fields = dict.fromkeys(
+                    f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                )
+                fields["model_config"] = SimpleNamespace(
+                    self_opened_think_start_ids=None
+                )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
-                    batch_result_processor=SimpleNamespace(
-                        _maybe_update_reasoning_tokens=lambda req, token_id: None
-                    ),
+                    batch_result_processor=SchedulerBatchResultProcessor(**fields),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
@@ -1784,6 +1867,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
                     output_ids=[],
+                    require_reasoning=False,
                     return_logprob=False,
                     return_sampling_mask=True,
                     sampling_logprobs_mode=mode,
@@ -1807,9 +1891,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     ([[7, 8, 9]], expected),
                 )
 
-    def test_rebootstrap_replay_keeps_one_sampling_mask_row_per_token(self):
-        """A PD rebootstrap that replays an already-emitted token keeps that token's
-        sampling-mask row instead of adding the prefill worker's fresh one."""
+    def test_rebootstrap_commit_keeps_emitted_output(self):
+        """A PD rebootstrap with output keeps its output ids and their sampling-mask
+        rows; the prefill worker's fresh token and row are dropped."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -1833,7 +1917,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             )
             queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
             queue.metadata_buffers = buffers
-            # Retracting popped token 6 from output_ids; its row is still queued.
             sampling_mask_rows = SamplingMaskRows()
             sampling_mask_rows.append(
                 np.array([5, 1], np.int32), np.array([-0.5, -2.25], np.float32)
@@ -1845,8 +1928,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 rid="r0",
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,
-                output_ids=[5],
-                pd_rebootstrap_forced_output_id=6,
+                output_ids=[5, 6],
                 return_logprob=False,
                 return_sampling_mask=True,
                 sampling_logprobs_mode="support",
@@ -1964,6 +2046,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
         override = get_context().override_server_args(
             speculative_eagle_topk=1,
@@ -2002,6 +2085,52 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
 
                 self.assertEqual(draft_input.dsa_topk_indices.tolist(), expected)
+
+    def test_pd_decode_fused_topk_drops_seed_past_request_length(self):
+        # Whether the batch keeps its seed is decided on the host before the
+        # device remap runs; it must agree with the rows the remap invalidates.
+        req_to_token = torch.tensor(
+            [[0, 0, 0, 0], [700, 801, 902, 990]], dtype=torch.int32
+        )
+        batch = SimpleNamespace(
+            reqs=[
+                self._make_req(torch.tensor([1, 0, -1], dtype=torch.int32)),
+                self._make_req(torch.tensor([0, 3, -1], dtype=torch.int32)),
+            ],
+            device="cpu",
+            enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
+            req_pool_indices=torch.tensor([1, 1], dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            seq_lens=torch.tensor([4, 3], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
+        )
+        override = get_context().override_server_args(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="decode",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True),
+        ):
+            draft_input = build_eagle_disagg_draft_input(
+                batch, torch.tensor([11, 12], dtype=torch.int64), None
+            )
+
+        self.assertIsNone(draft_input.dsa_topk_indices)
+        self.assertFalse(draft_input.cuda_graph_compatible)
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
@@ -2214,9 +2343,8 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         expected_infos = draft.get_state_buf_infos()
         kv_args = KVArgs()
 
-        setup_state_kv_args(
-            kv_args, _make_dsv4_target(unified=False, mapping=mapping), draft
-        )
+        target = _make_dsv4_target(unified=False, mapping=mapping)
+        setup_state_kv_args(kv_args, _static_storage(target, draft), draft)
 
         # The draft's SWA valid-from follows its SWA as one item per request slot.
         self.assertEqual(
@@ -2235,7 +2363,7 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                     expected_infos = draft.get_state_buf_infos()
                 kv_args = KVArgs()
 
-                setup_state_kv_args(kv_args, target, draft)
+                setup_state_kv_args(kv_args, _static_storage(target, draft), draft)
 
                 self.assertEqual(kv_args.state_types, expected_types)
                 self.assertEqual(kv_args.state_data_ptrs[:-1], target_ptrs)
@@ -2255,7 +2383,7 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         self.assertEqual(expected_infos[2], [16, 128])
 
         kv_args = KVArgs()
-        setup_state_kv_args(kv_args, target, draft)
+        setup_state_kv_args(kv_args, _static_storage(target, draft), draft)
         self.assertEqual(kv_args.state_types[-1], StateType.SWA_RING)
         self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
         self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
