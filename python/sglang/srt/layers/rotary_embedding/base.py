@@ -67,16 +67,27 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.kernels.ops.attention.utils import (
+    from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
         fused_qk_rope_reshape_and_cache,
     )
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    try:
+        from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    except ImportError:
+        fused_qk_rope_with_cos_sin_cache_inplace = None
+        logger.warning(
+            "sgl_kernel.fused_qk_rope_with_cos_sin_cache_inplace is unavailable; "
+            "XPU rotary embedding will use the generic rotary_embedding kernel. "
+            "Upgrade sgl_kernel to enable the fused XPU kernel."
+        )
 
 
 class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
+
+    # (source cos_sin_cache, cast copy) memo for cos_sin_cache_as().
+    _cos_sin_cache_cast: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def __init__(
         self,
@@ -86,6 +97,7 @@ class RotaryEmbedding(BaseFusedOp):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
+        position_start: int = 0,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -94,6 +106,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.position_start = position_start
         self._force_native = (
             publish_role() is not None
             and get_exec().deterministic.rl_on_policy_target is not None
@@ -101,7 +114,9 @@ class RotaryEmbedding(BaseFusedOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
-        if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
+        # HIP: the fused QSA indexer JIT kernel (qsa_indexer.cuh) requires
+        # fp32 cos_sin_cache. Keep fp32 on HIP, matching CUDA behavior.
+        if not (_is_cuda or _is_hip or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -127,6 +142,14 @@ class RotaryEmbedding(BaseFusedOp):
         else:
             self.use_fallback_kernel = False
 
+        self._supports_bf16_rope_store = (
+            _is_cuda
+            and type(self) is RotaryEmbedding
+            and self.use_fallback_kernel
+            and self.is_neox_style
+            and not self._force_native
+        )
+
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -141,14 +164,71 @@ class RotaryEmbedding(BaseFusedOp):
             )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
 
+    def try_bf16_rope_store(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        kv_target: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        value_scale: float,
+    ) -> torch.Tensor | None:
+        """Return contiguous rotated Q and write K/V; leave packed QKV unchanged."""
+        if (
+            not self._supports_bf16_rope_store
+            or kv_target is None
+            or qkv.dtype != torch.bfloat16
+            or qkv.shape[0] == 0
+        ):
+            return None
+        from sglang.kernels.ops.attention.rope import bf16_rope_scale_store
+
+        key_cache, value_cache, locations = kv_target
+        query_size = qkv.shape[-1] - (
+            key_cache.shape[1] * key_cache.shape[2]
+            + value_cache.shape[1] * value_cache.shape[2]
+        )
+        query = qkv.new_empty((qkv.shape[0], query_size))
+        self._match_cos_sin_cache_dtype(qkv)
+        bf16_rope_scale_store(
+            qkv,
+            query,
+            key_cache,
+            value_cache,
+            self.cos_sin_cache,
+            positions,
+            locations,
+            value_scale,
+        )
+        return query
+
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
-        if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
-        ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if _is_hip:
+            # On HIP, keep fp32 for the fused QSA indexer JIT kernel
+            # (qsa_indexer.cuh requires const float* cos_sin_cache).
+            if self.cos_sin_cache.device != query.device:
+                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+        else:
+            if (
+                self.cos_sin_cache.device != query.device
+                or self.cos_sin_cache.dtype != query.dtype
+            ):
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
+
+    def cos_sin_cache_as(self, dtype: torch.dtype) -> torch.Tensor:
+        """cos_sin_cache in ``dtype``, for kernels that read it in the activation
+        dtype. The cast copy is reused until cos_sin_cache is replaced (growth or
+        device move), so steady-state calls launch no cast kernel."""
+        cache = self.cos_sin_cache
+        if cache.dtype == dtype:
+            return cache
+        memo = self._cos_sin_cache_cast
+        if memo is None or memo[0] is not cache or memo[1].dtype != dtype:
+            memo = (cache, cache.to(dtype))
+            self._cos_sin_cache_cast = memo
+        return memo[1]
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -173,7 +253,11 @@ class RotaryEmbedding(BaseFusedOp):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.position_start,
+            self.position_start + self.max_position_embeddings,
+            dtype=torch.float,
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -197,8 +281,9 @@ class RotaryEmbedding(BaseFusedOp):
         inv_freq = self._compute_inv_freq(self.base).to(device=device)
 
         # Incremental computation for new positions only
-        start = cur_len
-        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        start = self.position_start + cur_len
+        end = self.position_start + new_len
+        t_new = torch.arange(start, end, dtype=inv_freq.dtype, device=device)
         if t_new.numel() == 0:
             return
 
@@ -242,9 +327,9 @@ class RotaryEmbedding(BaseFusedOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for native implementation"
+        )
 
         if offsets is not None:
             positions = positions + offsets
@@ -284,9 +369,9 @@ class RotaryEmbedding(BaseFusedOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for npu implementation"
+        )
         if (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float
@@ -343,12 +428,15 @@ class RotaryEmbedding(BaseFusedOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for cpu implementation"
+        )
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
+            # rotary_embedding_cpu requires query and the cache to share a dtype;
+            # forward_cuda/forward_xpu already align them, forward_cpu did not.
+            self._match_cos_sin_cache_dtype(query)
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,
@@ -386,7 +474,6 @@ class RotaryEmbedding(BaseFusedOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
                 k_cache = fused_set_kv_buffer_arg["key_cache"]
@@ -419,18 +506,26 @@ class RotaryEmbedding(BaseFusedOp):
                     **extra_args,
                 )
             else:
-                assert (
-                    fused_set_kv_buffer_arg is None
-                ), "save kv cache is not supported for fallback_rotary_embedding."
-                self.cos_sin_cache = self.cos_sin_cache.to(
-                    query.device, dtype=query.dtype
+                assert fused_set_kv_buffer_arg is None, (
+                    "save kv cache is not supported for fallback_rotary_embedding."
                 )
+                if _is_hip:
+                    # HIP keeps the buffer fp32 for the fused QSA indexer, but
+                    # this kernel reads it in the query dtype.
+                    if self.cos_sin_cache.device != query.device:
+                        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    cos_sin_cache = self.cos_sin_cache_as(query.dtype)
+                else:
+                    self.cos_sin_cache = self.cos_sin_cache.to(
+                        query.device, dtype=query.dtype
+                    )
+                    cos_sin_cache = self.cos_sin_cache
                 self.fallback_rotary_embedding(
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key
@@ -449,15 +544,17 @@ class RotaryEmbedding(BaseFusedOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        )
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        self._match_cos_sin_cache_dtype(query)
-
         # Fused_qk_rope only supports aligned head_size
-        if self.head_size in [128, 256, 512]:
+        if fused_qk_rope_with_cos_sin_cache_inplace is not None and self.head_size in [
+            128,
+            256,
+            512,
+        ]:
             num_tokens = positions.size(0)
             q_rope = query.view(num_tokens, -1, self.head_size)
             k_rope = key.view(num_tokens, -1, self.head_size)
@@ -473,9 +570,20 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             return query, key
+        elif self.head_size != self.rotary_dim:
+            return self.forward_native(positions, query, key)
         else:
-            # Use fallback kernel of 'rotary_embedding'
-            return torch.ops.sgl_kernel.rotary_embedding(
+            self._match_cos_sin_cache_dtype(query)
+            # Use fallback kernel of 'rotary_embedding'.
+            # The kernel requires 3D tensors (batch, num_heads, head_size);
+            # add a num_heads=1 dim for 2D tensors (e.g. DSA indexer k_rope).
+            q_2d = query.dim() == 2
+            k_2d = key.dim() == 2
+            if q_2d:
+                query = query.view(query.shape[0], -1, self.head_size)
+            if k_2d:
+                key = key.view(key.shape[0], -1, self.head_size)
+            q_out, k_out = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 query,
                 key,
@@ -483,6 +591,11 @@ class RotaryEmbedding(BaseFusedOp):
                 self.cos_sin_cache,
                 self.is_neox_style,
             )
+            if q_2d:
+                q_out = q_out.view(q_out.shape[0], -1)
+            if k_2d:
+                k_out = k_out.view(k_out.shape[0], -1)
+            return q_out, k_out
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

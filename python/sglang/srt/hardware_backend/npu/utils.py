@@ -2,7 +2,7 @@ import functools
 import logging
 import sys
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -22,6 +22,38 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    if not is_npu():
+        return False
+
+    import acl
+
+    return acl.rt.get_device_info(0, 601) == (3510, 0)
+
+
+def use_npu_arch35_mxfp8_wo_a(
+    quant_config, wo_a_keeps_quant_config: Optional[bool] = None
+) -> bool:
+    """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
+
+    Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
+    ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
+    NPU arch35 MXFP8 scale layout.
+    """
+    if (
+        wo_a_keeps_quant_config is False
+        or not _is_npu
+        or not is_npu_arch35()
+        or quant_config is None
+        or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+    ):
+        return False
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    return tuple(weight_block_size or ()) == (128, 128)
 
 
 class NPUACLFormat(IntEnum):
@@ -144,8 +176,16 @@ def set_default_server_args(args: "ServerArgs"):
         disable_custom_all_reduce=True,
     )
 
-    # handles hierarchical cache configs
-    if cfg.enable_hierarchical_cache:
+    # Backup-only decode retraction also builds a HiCache host pool. The
+    # inferred backend is resolved later, once the device KV pool exists.
+    if (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+        or (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
+        )
+    ):
         declare_resolution(
             args,
             "set_default_server_args",

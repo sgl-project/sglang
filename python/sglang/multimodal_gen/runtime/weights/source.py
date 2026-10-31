@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 from huggingface_hub.utils import validate_repo_id
 
 WeightSourceKind = Literal["local", "huggingface"]
@@ -18,6 +20,13 @@ WeightSourceKind = Literal["local", "huggingface"]
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt")
 _SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
 _WEIGHT_REFERENCE_SUFFIXES = _WEIGHT_SUFFIXES + (_SAFETENSORS_INDEX_SUFFIX,)
+_PRECISION_VARIANT_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)\.(?:fp16|bf16|fp32)(?:-\d+-of-\d+)?"
+    r"(?P<suffix>\.safetensors(?:\.index\.json)?)$"
+)
+_CANONICAL_SAFETENSORS_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)(?:-\d+-of-\d+)?" r"(?P<suffix>\.safetensors(?:\.index\.json)?)$"
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,33 @@ class ResolvedWeightSet:
 
 class NoSafetensorsWeightsError(FileNotFoundError):
     """The source has no safetensors payload to resolve as a weight set."""
+
+
+def filter_duplicate_precision_variant_safetensors(
+    safetensors_files: Sequence[str],
+) -> list[str]:
+    """Prefer canonical files over precision-suffixed copies in each family.
+
+    A precision-only family remains valid. Sharded and unsharded copies are
+    compared by family so one export cannot be loaded twice merely because its
+    shard layout differs between variants.
+    """
+    canonical_families: set[tuple[str, str]] = set()
+    for path in safetensors_files:
+        if _PRECISION_VARIANT_SUFFIX_RE.match(path) is not None:
+            continue
+        if match := _CANONICAL_SAFETENSORS_SUFFIX_RE.match(path):
+            canonical_families.add((match.group("stem"), match.group("suffix")))
+
+    selected: list[str] = []
+    for path in safetensors_files:
+        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
+        family = (
+            (match.group("stem"), match.group("suffix")) if match is not None else None
+        )
+        if family is None or family not in canonical_families:
+            selected.append(path)
+    return selected
 
 
 def is_explicit_weight_file_reference(source: str) -> bool:
@@ -251,6 +287,41 @@ def resolve_weight_inventory(source: WeightSource) -> WeightInventory:
     )
 
 
+def _cached_hub_inventory(source: WeightSource) -> WeightInventory | None:
+    """List the locally cached snapshot of a Hub source without any network call.
+
+    Returns None when the revision is not cached. The listing holds only the
+    files downloaded so far, so callers must use it only to find a file they
+    name exactly, never to choose among candidates.
+    """
+    assert source.repo_id is not None
+    try:
+        snapshot = Path(
+            snapshot_download(
+                source.repo_id, revision=source.revision, local_files_only=True
+            )
+        )
+    except LocalEntryNotFoundError:
+        return None
+    # An empty refs file resolves to the snapshots/ parent instead of a revision.
+    if snapshot.parent.name != "snapshots":
+        return None
+    files = tuple(
+        path.relative_to(snapshot).as_posix()
+        for path in sorted(snapshot.rglob("*"))
+        if path.is_file()
+    )
+    try:
+        files = _filter_inventory_files(files, source)
+    except FileNotFoundError:
+        return None
+    return WeightInventory(
+        source=source,
+        resolved_revision=snapshot.name,
+        files=files,
+    )
+
+
 def _select_named_file(candidates: tuple[str, ...], weight_name: str) -> str:
     exact = tuple(path for path in candidates if path == weight_name)
     if exact:
@@ -263,8 +334,7 @@ def _select_named_file(candidates: tuple[str, ...], weight_name: str) -> str:
     if not basename_matches:
         raise FileNotFoundError(f"Requested weight {weight_name!r} was not found")
     raise ValueError(
-        f"Weight name {weight_name!r} matches multiple files: "
-        f"{list(basename_matches)}"
+        f"Weight name {weight_name!r} matches multiple files: {list(basename_matches)}"
     )
 
 
@@ -297,6 +367,24 @@ def resolve_weight(
 ) -> ResolvedWeight:
     """Resolve one weight file without downloading its tensor payload."""
     parsed_source = parse_weight_source(source, revision=revision)
+    if parsed_source.kind == "huggingface" and (
+        parsed_source.filename is not None or weight_name is not None
+    ):
+        # A named file already in the local cache needs no Hub API call.
+        cached = _cached_hub_inventory(parsed_source)
+        if cached is not None:
+            # A partial snapshot may lack the file, or hold only basename
+            # matches that hide an exact path elsewhere in the repo, so only an
+            # exact path skips the Hub.
+            try:
+                selected_file = select_weight_file(cached, weight_name)
+            except (FileNotFoundError, ValueError):
+                selected_file = None
+            if selected_file is not None and selected_file in (
+                parsed_source.filename,
+                weight_name,
+            ):
+                return ResolvedWeight(inventory=cached, selected_file=selected_file)
     inventory = resolve_weight_inventory(parsed_source)
     selected_file = select_weight_file(inventory, weight_name)
     return ResolvedWeight(
@@ -443,6 +531,8 @@ def resolve_safetensors_weight_set(
             _read_safetensors_index(inventory, selected),
             index_file=selected,
         )
+    weights = tuple(filter_duplicate_precision_variant_safetensors(weights))
+    indexes = tuple(filter_duplicate_precision_variant_safetensors(indexes))
     if len(indexes) == 1:
         return ResolvedWeightSet(
             inventory,

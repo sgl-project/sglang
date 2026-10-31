@@ -24,6 +24,7 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 
@@ -46,8 +47,8 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -94,7 +95,6 @@ class Qwen2VLVideoInputs(TypedDict):
 
 
 class Qwen2VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -126,7 +126,6 @@ class Qwen2VisionMLP(nn.Module):
 
 
 class Qwen2VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -183,7 +182,6 @@ class Qwen2VisionBlock(nn.Module):
 
 
 class Qwen2VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -209,7 +207,6 @@ class Qwen2VisionPatchEmbed(nn.Module):
 
 
 class Qwen2VisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         d_model: int,
@@ -256,7 +253,6 @@ class Qwen2VisionPatchMerger(nn.Module):
 
 
 class Qwen2VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
@@ -291,7 +287,6 @@ class Qwen2VisionRotaryEmbedding(nn.Module):
 
 
 class Qwen2VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: Qwen2VLVisionConfig,
@@ -498,9 +493,8 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same

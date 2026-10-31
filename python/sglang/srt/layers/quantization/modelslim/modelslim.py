@@ -63,6 +63,7 @@ def npu_wrapper_rmsnorm_forward(func):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
@@ -164,9 +165,9 @@ class ModelSlimConfig(QuantizationConfig):
             if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
                 continue
             if rest.startswith("markov_head."):
-                alias = f"markov_head.{rest[len('markov_head.'):]}"
+                alias = f"markov_head.{rest[len('markov_head.') :]}"
             elif rest.startswith("confidence_head."):
-                alias = f"confidence_head.{rest[len('confidence_head.'):]}"
+                alias = f"confidence_head.{rest[len('confidence_head.') :]}"
             else:
                 mapped_rest = rest
                 if mapped_rest.startswith("attn."):
@@ -217,6 +218,18 @@ class ModelSlimConfig(QuantizationConfig):
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
         for candidate in list(candidates):
+            if candidate.startswith("model.language_model."):
+                candidates.append(
+                    "model." + candidate.removeprefix("model.language_model.")
+                )
+            elif candidate.startswith("model."):
+                candidates.append(
+                    "model.language_model." + candidate.removeprefix("model.")
+                )
+            if candidate.startswith("model.visual."):
+                candidates.append(candidate.removeprefix("model."))
+            elif candidate.startswith("visual."):
+                candidates.append("model." + candidate)
             if candidate.startswith("language_model."):
                 candidates.append(candidate.removeprefix("language_model."))
             else:
@@ -275,7 +288,11 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
+            direct_prefix = self._resolve_quant_prefix(prefix)
+            if (
+                direct_prefix + ".weight" not in self.quant_description
+                and proj_name in packed_modules_mapping_subset
+            ):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
@@ -311,6 +328,7 @@ class ModelSlimConfig(QuantizationConfig):
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
             ("W8A8", ModelSlimW8A8Int8),
+            ("W8A8S", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
             ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
             ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
@@ -326,8 +344,7 @@ class ModelSlimConfig(QuantizationConfig):
                 return scheme_class(quant_config=self.quant_description, prefix=prefix)
 
         logger.warning(
-            f"Unsupported Linear modelslim scheme: "
-            f"{quant_schemes} in layer: {prefix}"
+            f"Unsupported Linear modelslim scheme: {quant_schemes} in layer: {prefix}"
         )
         return None
 
@@ -440,6 +457,9 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        direct_prefix = self._resolve_quant_prefix(prefix)
+        if direct_prefix + ".weight" in self.quant_description:
+            return self.quant_description[direct_prefix + ".weight"] == "FLOAT"
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)
@@ -473,7 +493,6 @@ class ModelSlimConfig(QuantizationConfig):
 
 
 class ModelSlimLinearMethod(_NPULinearMethodBase):
-
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 

@@ -8,7 +8,10 @@ import torch.nn as nn
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    _to_unit_range,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
     LTX2RefinementStage,
 )
@@ -23,15 +26,30 @@ class TestDecodingStageParallelism(unittest.TestCase):
     def test_component_use_honors_decode_precision_override(self):
         stage = DecodingStage(FakeVAE())
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(
                 vae_precision="fp32",
                 vae_decode_precision="bf16",
-            )
+            ),
         )
 
         [component_use] = stage.component_uses(server_args)
 
         self.assertEqual(component_use.target_dtype, torch.bfloat16)
+
+    def test_component_use_honors_exact_component_precision(self):
+        stage = DecodingStage(FakeVAE())
+        server_args = SimpleNamespace(
+            component_precisions={"vae": "fp16"},
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="bf16",
+            ),
+        )
+
+        [component_use] = stage.component_uses(server_args)
+
+        self.assertEqual(component_use.target_dtype, torch.float16)
 
     def test_cfg_parallel_uses_replicated_decode_when_decode_group_has_multiple_ranks(
         self,
@@ -182,6 +200,30 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 stage.parallelism_type,
                 StageParallelismType.MAIN_RANK_ONLY,
             )
+
+
+class TestToUnitRange(unittest.TestCase):
+    def test_in_place_matches_out_of_place(self):
+        image = torch.tensor([-1.5, -1.0, 0.0, 1.0, 1.5])
+        expected = (image / 2 + 0.5).clamp(0, 1)
+
+        result = _to_unit_range(image.clone(), in_place=True)
+
+        torch.testing.assert_close(result, expected)
+
+    def test_in_place_mutates_the_input_tensor(self):
+        image = torch.tensor([-1.0, 0.0, 1.0])
+        result = _to_unit_range(image, in_place=True)
+
+        self.assertIs(result, image)
+        torch.testing.assert_close(image, torch.tensor([0.0, 0.5, 1.0]))
+
+    def test_default_does_not_mutate_the_input_tensor(self):
+        image = torch.tensor([-1.0, 0.0, 1.0])
+        result = _to_unit_range(image)
+
+        self.assertIsNot(result, image)
+        torch.testing.assert_close(image, torch.tensor([-1.0, 0.0, 1.0]))
 
 
 if __name__ == "__main__":

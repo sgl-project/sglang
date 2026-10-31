@@ -2,12 +2,14 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
+    register_xpu_ci,
 )
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 # The dst layout-contract tests run on CPU (no kernel launch).
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 
@@ -15,22 +17,47 @@ import torch
 
 try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        _conv_multi_eligible,
         _require_entry_contiguous_dst,
+        fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
+        scatter_mamba_states_after_mtp_verify,
     )
 
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     _require_entry_contiguous_dst = None
+    fused_conv_window_scatter_multi = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
+    scatter_mamba_states_after_mtp_verify = None
     _FUSED_IMPORT_ERROR = e
 
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
     mamba_entry_bytes,
 )
+from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.utils import get_device
+from sglang.srt.utils.common import get_device_module
+from sglang.test.test_utils import CustomTestCase
+
+# Backends the multi-type scatter is verified against; extend as others gain Triton.
+TRITON_DEVICES = ("cuda", "xpu")
+
+
+def _triton_device():
+    # get_device() raises when the host has no accelerator; the layout-contract
+    # cases below still run on the CPU suite.
+    try:
+        device = get_device()
+    except RuntimeError:
+        return None
+    return device if device in TRITON_DEVICES else None
+
+
+DEVICE = _triton_device()
 
 
 def _ref_scatter(dst, src, dst_indices, src_indices, step_indices):
@@ -229,7 +256,7 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
 
 
 def _make_envelope_views(device="cpu"):
-    """Envelope-strided conv/temporal views, exactly as UnifiedMambaPool /
+    """Envelope-strided conv/temporal views, exactly as the unified state view /
     the page-major MambaPool serve them ((num_layers, max_slots, *inner) with
     slot stride = the multi-layer entry envelope). Mirrors
     test_flashkda_strided_state_access.py's setup."""
@@ -246,7 +273,7 @@ def _make_envelope_views(device="cpu"):
         temporal_dtype=temporal_dtype,
     )
     raw = torch.zeros(slots * entry, dtype=torch.uint8, device=device)
-    conv_views, temporal = build_page_major_mamba_views(
+    conv_views, temporal = build_mamba_entry_views(
         raw,
         layer_num=layers,
         conv_state_shapes=conv_shapes,
@@ -363,6 +390,180 @@ class TestMambaStateScatterEnvelopeDst(unittest.TestCase):
 
         torch.testing.assert_close(temporal, expect_temporal)
         torch.testing.assert_close(conv_views[0], expect_conv)
+
+
+@unittest.skipUnless(
+    DEVICE is not None,
+    f"multi-type conv scatter needs one of {TRITON_DEVICES}",
+)
+class TestFusedConvWindowScatterMulti(CustomTestCase):
+    """Multi-type conv scatter must place every conv type correctly; it reaches
+    them through a host-built device-pointer table (issue #35047)."""
+
+    def _run(self, num_types, n2):
+        # n2 sizes the optional second (interval-crossing track) index set.
+        torch.manual_seed(11)
+        dev = DEVICE
+        layers, slots, batch, steps, dim, km1 = 2, 16, 5, 3, 8, 3
+        pairs = []
+        for t in range(num_types):
+            elems = dim * (t + 1)
+            pairs.append(
+                (
+                    torch.randn(
+                        (layers, slots, elems, km1), dtype=torch.bfloat16, device=dev
+                    ),
+                    torch.randn(
+                        (layers, batch, steps, elems, km1),
+                        dtype=torch.bfloat16,
+                        device=dev,
+                    ),
+                )
+            )
+
+        g = torch.Generator(device=dev).manual_seed(5)
+        # One permutation split across the two sets: their dst slots must be
+        # disjoint, else the two writes to a shared slot race.
+        perm = torch.randperm(slots, device=dev, generator=g).to(torch.int64)
+        dst1, dst2 = perm[:batch], perm[batch : batch + n2]
+
+        def _steps(n):
+            step = torch.randint(
+                0, steps, (n,), device=dev, dtype=torch.int64, generator=g
+            )
+            step[0] = -1  # one rejected row per set must be skipped
+            return step
+
+        step1 = _steps(batch)
+        if n2:
+            step2 = _steps(n2)
+        else:
+            dst2, step2 = None, None
+
+        expect = [dst.clone() for dst, _ in pairs]
+        for exp, (_, src) in zip(expect, pairs):
+            for dsts, stps in ((dst1, step1), (dst2, step2)):
+                if stps is None:
+                    continue
+                valid = stps >= 0
+                # src row = the row's position within its own index set
+                rows = torch.arange(stps.numel(), device=dev)[valid]
+                exp[:, dsts[valid]] = src[:, rows, stps[valid]]
+
+        fused_conv_window_scatter_multi(pairs, dst1, step1, dst2, step2)
+        get_device_module().synchronize()
+        for i, (exp, (got, _)) in enumerate(zip(expect, pairs)):
+            torch.testing.assert_close(got, exp, msg=f"conv type {i} mismatch")
+
+    def test_strided_envelope_commit_and_track(self):
+        """Outer strides must not disable fusion or overwrite adjacent state."""
+        layers, slots, batch, steps = 3, 16, 5, 4
+        shapes = [(3, 8), (3, 16), (3, 32)]
+        entry = layers * sum(a * b for a, b in shapes) * 2 + 64
+        raw = torch.full((slots * entry,), 0x55, dtype=torch.uint8, device=DEVICE)
+        conv, _ = build_mamba_entry_views(
+            raw,
+            layer_num=layers,
+            conv_state_shapes=shapes,
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(0, 0, 0),
+            temporal_dtype=torch.float32,
+            max_slots=slots,
+            entry_bytes=entry,
+        )
+        ref_raw = raw.clone()
+        ref, _ = build_mamba_entry_views(
+            ref_raw,
+            layer_num=layers,
+            conv_state_shapes=shapes,
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(0, 0, 0),
+            temporal_dtype=torch.float32,
+            max_slots=slots,
+            entry_bytes=entry,
+        )
+        sources = [
+            torch.randn(
+                layers, batch, steps, *shape, device=DEVICE, dtype=torch.bfloat16
+            )
+            for shape in shapes
+        ]
+        dst1 = torch.tensor([1, 3, 5, 7, 9], device=DEVICE, dtype=torch.int32)
+        dst2 = torch.tensor([2, 4, 6], device=DEVICE, dtype=torch.int32)
+        step1 = torch.tensor([0, -1, 2, 3, 1], device=DEVICE, dtype=torch.int32)
+        step2 = torch.tensor([1, 2, -1], device=DEVICE, dtype=torch.int32)
+        pairs = list(zip(conv, sources))
+        self.assertTrue(_conv_multi_eligible(pairs))
+        # Transposing the feature block is not supported by its flat store.
+        self.assertFalse(
+            _conv_multi_eligible(
+                [(conv[0].transpose(2, 3), sources[0].transpose(3, 4))]
+            )
+        )
+        for dsts, stps in [(dst1, step1), (dst2, step2)]:
+            valid = stps >= 0
+            rows = torch.arange(stps.numel(), device=DEVICE)[valid]
+            for target, src in zip(ref, sources):
+                target[:, dsts[valid].long()] = src[:, rows, stps[valid].long()]
+        fused_conv_window_scatter_multi(pairs, dst1, step1, dst2, step2)
+        torch.testing.assert_close(raw, ref_raw, rtol=0, atol=0)
+
+    def test_cached_descriptor_tracks_destination_strides(self):
+        """Rebinding the same storage with new outer strides must refresh metadata."""
+        layers, slots, dim, win = 2, 16, 8, 3
+        entry = dim * win
+        raw = torch.zeros(
+            layers * slots * 2 * entry, device=DEVICE, dtype=torch.bfloat16
+        )
+        source = torch.randn(
+            layers, 2, 3, dim, win, device=DEVICE, dtype=torch.bfloat16
+        )
+        indices = torch.tensor([3, 7], device=DEVICE, dtype=torch.int32)
+        steps = torch.tensor([0, 2], device=DEVICE, dtype=torch.int32)
+        for factor in [1, 2]:
+            raw.zero_()
+            strides = (slots * 2 * entry, factor * entry, win, 1)
+            dst = raw.as_strided((layers, slots, dim, win), strides)
+            ref_raw = raw.clone()
+            ref = ref_raw.as_strided(dst.shape, strides)
+            ref[:, indices.long()] = source[
+                :, torch.arange(2, device=DEVICE), steps.long()
+            ]
+            fused_conv_window_scatter_multi([(dst, source)], indices, steps)
+            torch.testing.assert_close(raw, ref_raw, rtol=0, atol=0)
+
+    def test_single_type(self):
+        self._run(num_types=1, n2=0)
+
+    def test_multi_type(self):
+        self._run(num_types=3, n2=0)
+
+    def test_multi_type_with_track_set(self):
+        self._run(num_types=2, n2=4)
+
+
+@unittest.skipUnless(
+    DEVICE is not None,
+    f"verify scatter needs one of {TRITON_DEVICES}",
+)
+class TestScatterAfterVerifyZeroWidthConv(CustomTestCase):
+    def test_zero_width_conv_pool(self):
+        """A model without conv state (Lightning attention) must commit an MTP verify."""
+        caches = MambaPool.SpeculativeState(
+            conv=[torch.empty(2, 8, 0, 0, dtype=torch.bfloat16, device=DEVICE)],
+            temporal=torch.empty(2, 8, 0, device=DEVICE),
+            intermediate_ssm=torch.empty(2, 2, 3, 0, device=DEVICE),
+            intermediate_conv_window=[
+                torch.empty(2, 2, 3, 0, 0, dtype=torch.bfloat16, device=DEVICE)
+            ],
+        )
+        scatter_mamba_states_after_mtp_verify(
+            mamba_caches=caches,
+            state_indices_tensor=torch.tensor([1, 5], device=DEVICE),
+            last_correct_step_indices=torch.tensor([0, 2], device=DEVICE),
+            mamba_track_indices=None,
+            mamba_steps_to_track=None,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

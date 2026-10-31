@@ -14,10 +14,11 @@ from sglang.srt.beam_search.fork import (
     neutral_member_sampling_params,
     remap_kv_mapping,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestRemapKvMapping(CustomTestCase):
@@ -109,6 +110,9 @@ class _FakeReqToTokenPool:
 
 
 class _FakeAllocator:
+    # A pool built without unified memory has no KV storage of its own.
+    storage = None
+
     def __init__(self):
         self.freed = []
 
@@ -116,10 +120,24 @@ class _FakeAllocator:
         self.freed.extend(slots.tolist())
 
 
+class _FakeStorage:
+    """The KV storage calls `free_member_rows` makes, over the two recorders."""
+
+    def __init__(self, pool, allocator):
+        self.requests = pool
+        self._allocator = allocator
+
+    def free_tokens(self, ids):
+        self._allocator.free(ids)
+
+    def release_rows(self, rows):
+        self.requests.free_rows(rows)
+
+
 class TestFreeMemberRows(CustomTestCase):
     def _make_group(self, req_to_token, allocated_len):
         leader = SimpleNamespace(
-            kv=SimpleNamespace(
+            kv=ReqKvInfo(
                 kv_allocated_len=allocated_len, kv_committed_len=allocated_len
             ),
         )
@@ -138,7 +156,7 @@ class TestFreeMemberRows(CustomTestCase):
         group = self._make_group(req_to_token, allocated_len=8)
 
         leader = group.leader
-        free_member_rows(group, pool, allocator)
+        free_member_rows(group, _FakeStorage(pool, allocator))
 
         # The group owns the whole decode region [5, 8) across all its rows
         # (leader included) and frees it once.
@@ -154,7 +172,7 @@ class TestFreeMemberRows(CustomTestCase):
         self.assertIsNone(group.all_rows)
 
         # Idempotent: a second free is a no-op.
-        free_member_rows(group, pool, allocator)
+        free_member_rows(group, _FakeStorage(pool, allocator))
         self.assertEqual(sorted(pool.freed), [1, 2])
 
     def test_empty_suffix_frees_rows_only(self):
@@ -164,7 +182,7 @@ class TestFreeMemberRows(CustomTestCase):
         allocator = _FakeAllocator()
         group = self._make_group(req_to_token, allocated_len=5)
 
-        free_member_rows(group, pool, allocator)
+        free_member_rows(group, _FakeStorage(pool, allocator))
 
         self.assertEqual(allocator.freed, [])
         self.assertEqual(sorted(pool.freed), [1, 2])
@@ -208,7 +226,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         allocator = _FakeAllocator()
         group = SimpleNamespace(
             leader=SimpleNamespace(
-                kv=SimpleNamespace(kv_allocated_len=8, kv_committed_len=8),
+                kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
             ),
             prompt_len=5,
             member_rows=torch.tensor([1, 2], dtype=torch.int64),
@@ -222,7 +240,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
 
         # retract_decode's sequence: member rows released without the
         # coordinator, then the scheduler retires the group.
-        free_member_rows(group, pool, allocator)
+        free_member_rows(group, _FakeStorage(pool, allocator))
         by_rows = sorted(allocator.freed)
         self.assertEqual(by_rows, [5, 6, 7, 29, 30, 31])
         # The orphans are disjoint from what the rows still name, which is

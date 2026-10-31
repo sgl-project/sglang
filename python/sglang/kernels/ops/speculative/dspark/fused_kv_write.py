@@ -17,10 +17,12 @@ def _fused_kv_norm_rope_write_kernel(
     locs_row_width,
     KV: tl.constexpr,
     D: tl.constexpr,
+    ROT: tl.constexpr,
     NH: tl.constexpr,
     L: tl.constexpr,
     EPS: tl.constexpr,
     HAS_COMMIT_LENS: tl.constexpr,
+    IS_NEOX: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     l = tl.program_id(1).to(tl.int64)
@@ -35,13 +37,26 @@ def _fused_kv_norm_rope_write_kernel(
         return
     pos = tl.load(pos_ptr + t).to(tl.int64)
 
-    HALF: tl.constexpr = D // 2
+    # RoPE rotates the first ROT dims; the cos/sin cache rows are [cos | sin] of
+    # ROT // 2 each, and dims ROT..D pass through after the norm.
+    HALF: tl.constexpr = ROT // 2
     half_ar = tl.arange(0, HALF)
     d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
-    knw1 = tl.load(knw_ptr + l * D + half_ar).to(tl.float32)
-    knw2 = tl.load(knw_ptr + l * D + HALF + half_ar).to(tl.float32)
+    # Rotation pairing: neox pairs dims (i, i + ROT/2), interleaved (GPT-J style)
+    # pairs (2i, 2i + 1). The cos/sin cache layout is the same for both.
+    if IS_NEOX:
+        off1 = half_ar
+        off2 = HALF + half_ar
+    else:
+        off1 = 2 * half_ar
+        off2 = 2 * half_ar + 1
+    cos = tl.load(cos_sin_ptr + pos * ROT + half_ar).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * ROT + HALF + half_ar).to(tl.float32)
+    knw1 = tl.load(knw_ptr + l * D + off1).to(tl.float32)
+    knw2 = tl.load(knw_ptr + l * D + off2).to(tl.float32)
+    if ROT < D:
+        pass_ar = ROT + tl.arange(0, D - ROT)
+        knw_pass = tl.load(knw_ptr + l * D + pass_ar).to(tl.float32)
 
     k_buf = tl.load(meta_ptr + l * 4 + 0).to(tl.pointer_type(tl.bfloat16))
     v_buf = tl.load(meta_ptr + l * 4 + 1).to(tl.pointer_type(tl.bfloat16))
@@ -53,14 +68,17 @@ def _fused_kv_norm_rope_write_kernel(
         k = tl.load(row + h * D + d_ar).to(tl.float32)
         ms = tl.sum(k * k, 0) / D
         inv = 1.0 / tl.sqrt(ms + EPS)
-        k1 = tl.load(row + h * D + half_ar).to(tl.float32) * inv * knw1
-        k2 = tl.load(row + h * D + HALF + half_ar).to(tl.float32) * inv * knw2
+        k1 = tl.load(row + h * D + off1).to(tl.float32) * inv * knw1
+        k2 = tl.load(row + h * D + off2).to(tl.float32) * inv * knw2
         k1 = k1.to(tl.bfloat16).to(tl.float32)
         k2 = k2.to(tl.bfloat16).to(tl.float32)
         o1 = k1 * cos - k2 * sin
         o2 = k2 * cos + k1 * sin
-        tl.store(k_buf + loc * ks0 + h * D + half_ar, o1.to(tl.bfloat16))
-        tl.store(k_buf + loc * ks0 + h * D + HALF + half_ar, o2.to(tl.bfloat16))
+        tl.store(k_buf + loc * ks0 + h * D + off1, o1.to(tl.bfloat16))
+        tl.store(k_buf + loc * ks0 + h * D + off2, o2.to(tl.bfloat16))
+        if ROT < D:
+            kp = tl.load(row + h * D + pass_ar).to(tl.float32) * inv * knw_pass
+            tl.store(k_buf + loc * ks0 + h * D + pass_ar, kp.to(tl.bfloat16))
 
         v = tl.load(row + KV + h * D + d_ar)
         tl.store(v_buf + loc * vs0 + h * D + d_ar, v)
@@ -79,6 +97,8 @@ def fused_kv_norm_rope_write(
     eps: float,
     commit_lens: Optional[torch.Tensor] = None,
     locs_row_width: Optional[int] = None,
+    is_neox_style: bool = True,
+    rotary_dim: Optional[int] = None,
 ) -> None:
     """Write per-layer normed+roped K and raw V rows into the KV pools.
 
@@ -86,6 +106,11 @@ def fused_kv_norm_rope_write(
     flattened [bs, locs_row_width] verify window and only the first
     commit_lens[b] columns of each row are written — the in-kernel
     replacement for masking the tail columns to -1 on the host.
+
+    is_neox_style selects the RoPE rotation pairing (neox or interleaved).
+    rotary_dim (default head_dim) rotates only the leading dims; the rest are
+    normed and stored unrotated. k_norm_weights are the multipliers the norm
+    applies, so a Gemma (1 + w) norm passes 1 + w.
     """
     T = kv.shape[0]
     if T == 0:
@@ -119,8 +144,10 @@ def fused_kv_norm_rope_write(
         locs_row_width,
         KV=kv_size,
         D=head_dim,
+        ROT=head_dim if rotary_dim is None else rotary_dim,
         NH=kv_size // head_dim,
         L=num_layers,
         EPS=eps,
         HAS_COMMIT_LENS=has_commit_lens,
+        IS_NEOX=is_neox_style,
     )

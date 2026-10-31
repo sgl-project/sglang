@@ -1,34 +1,322 @@
 import asyncio
 import pickle
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import torch
 
+import sglang.srt.disaggregation.encoder.server as encoder_server
+from sglang.srt.disaggregation.encoder import http_server
+from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
 from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
-from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
-from sglang.srt.disaggregation.encoder.server import (
-    EncoderDelivery,
-    InternalError,
-    MMEncoder,
-    MooncakeDelivery,
-    ReqState,
-    SendDestination,
-    ZmqDelivery,
-    meta_registry,
-    rid_to_cond,
-    rid_to_receive_count,
-    rid_to_receive_endpoint,
+from sglang.srt.disaggregation.encoder.runtime import (
+    _DP_RELEASE_AFTER_ENCODE,
+    DPDispatcher,
+    _retire_abandoned_encode,
 )
+from sglang.srt.disaggregation.encoder.server import (
+    EncoderMetaRegistry,
+    MMEncoder,
+    MMError,
+    meta_registry,
+)
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
+from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestEncoderDPErrorHandling(CustomTestCase):
+    @staticmethod
+    async def _run_registration_error(error):
+        encoder = SimpleNamespace(
+            register_embedding_destinations=AsyncMock(side_effect=error)
+        )
+        send = AsyncMock()
+        request = {
+            "req_id": "req",
+            "receive_count": 1,
+            "receive_url": "tcp://127.0.0.1:1",
+        }
+        with patch.object(encoder_runtime, "async_sock_send", send):
+            await encoder_runtime._dp_worker_handle_request(
+                encoder,
+                None,
+                object(),
+                asyncio.Lock(),
+                0,
+                request,
+                "register_destinations",
+            )
+        return unwrap_from_pickle(send.await_args.args[1])
+
+    def test_worker_reports_third_party_exception_with_callable_code(self):
+        class RpcLikeError(Exception):
+            def code(self):
+                return "INTERNAL"
+
+        envelope = asyncio.run(
+            self._run_registration_error(RpcLikeError("registration failed"))
+        )
+        self.assertEqual(envelope["_error"], "registration failed")
+        self.assertEqual(envelope["_error_code"], 500)
+
+    def test_worker_preserves_mm_error_status(self):
+        envelope = asyncio.run(
+            self._run_registration_error(MMError("bad destination", code=400))
+        )
+        self.assertEqual(envelope["_error_code"], 400)
+
+    def test_dispatcher_drops_malformed_result_without_stopping_listener(self):
+        async def run():
+            dispatcher = encoder_runtime.DPDispatcher(
+                dp_size=1,
+                dispatch_sockets=[object()],
+                release_sockets=[object()],
+                result_socket=object(),
+                worker_processes=[],
+            )
+            future = asyncio.get_running_loop().create_future()
+            dispatcher.pending_futures[0]["req"] = future
+            dispatcher.req_id_to_rank["req"] = 0
+            valid = {"req_id": "req", "_dp_type": "encode", "content": None}
+            recv = AsyncMock(
+                side_effect=[
+                    ["not", "an", "envelope"],
+                    valid,
+                    asyncio.CancelledError(),
+                ]
+            )
+
+            with patch.object(encoder_runtime, "async_sock_recv", recv):
+                listener = asyncio.create_task(dispatcher._result_listener())
+                await asyncio.wait_for(future, timeout=1)
+                listener.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await listener
+
+            self.assertEqual(future.result(), valid)
+
+        asyncio.run(run())
+
+
+class TestEncoderMetaRegistry(CustomTestCase):
+    def test_stale_releases_do_not_block_each_other(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            blocked_started = asyncio.Event()
+            unblock = asyncio.Event()
+            fast_released = asyncio.Event()
+
+            async def release(req_id):
+                if req_id == "blocked":
+                    blocked_started.set()
+                    await unblock.wait()
+                else:
+                    fast_released.set()
+
+            registry.on_release = release
+            registry._pending_at.update(blocked=0, fast=0)
+
+            blocked_task = registry._schedule_stale_release("blocked")
+            await asyncio.wait_for(blocked_started.wait(), timeout=1)
+            fast_task = registry._schedule_stale_release("fast")
+            await asyncio.wait_for(fast_released.wait(), timeout=1)
+            await fast_task
+
+            self.assertIn("blocked", registry._pending_at)
+            self.assertNotIn("fast", registry._pending_at)
+
+            unblock.set()
+            await blocked_task
+            self.assertNotIn("blocked", registry._pending_at)
+
+        asyncio.run(run())
+
+    def test_failed_stale_release_is_retried(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            attempts = 0
+
+            async def release(_req_id):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient cleanup failure")
+
+            registry.on_release = release
+            registry._pending_at["req"] = 0
+
+            await registry._release_stale("req")
+            self.assertIn("req", registry._pending_at)
+            retry_at = registry._pending_at["req"]
+            self.assertGreater(retry_at, 0)
+
+            await registry._release_stale("req")
+            self.assertNotIn("req", registry._pending_at)
+            self.assertEqual(attempts, 2)
+
+        asyncio.run(run())
+
+    def test_send_retries_do_not_release_before_all_destinations_finish(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            released = AsyncMock()
+            registry.on_release = released
+
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            await registry.note_send_done("req", 2, "10.0.0.1:5000")
+            released.assert_not_awaited()
+
+            await registry.note_send_done("req", 2, "10.0.0.2:5000")
+            released.assert_awaited_once_with("req")
+
+        asyncio.run(run())
+
+    def test_http_send_counts_the_normalized_destination(self):
+        async def run():
+            send = AsyncMock(return_value=True)
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(http_server, "dp_dispatcher", None),
+                patch.object(http_server, "encoder", SimpleNamespace(send=send)),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                response = await http_server.handle_send_request(request)
+
+            self.assertEqual(response.status_code, 200)
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
+
+    def test_dp_send_counts_the_normalized_destination(self):
+        async def run():
+            encoder = SimpleNamespace(send=AsyncMock(return_value=True))
+            note_send_done = AsyncMock()
+            request = {
+                "req_id": "req",
+                "prefill_host": "127.0.0.1",
+                "embedding_port": 5000,
+                "session_id": "session",
+                "buffer_address": 1234,
+                "receive_count": 2,
+            }
+            with (
+                patch.object(encoder_runtime, "async_sock_send", AsyncMock()),
+                patch.object(
+                    encoder_server.meta_registry,
+                    "note_send_done",
+                    note_send_done,
+                ),
+            ):
+                await encoder_runtime._dp_worker_handle_request(
+                    encoder,
+                    None,
+                    object(),
+                    asyncio.Lock(),
+                    0,
+                    request,
+                    "send",
+                )
+
+            note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
+
+        asyncio.run(run())
+
+
+class TestEncoderPreprocessorOffEventLoop(CustomTestCase):
+    @staticmethod
+    def _make_preprocessor():
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_type = "minimax_m3_vl"
+        preprocessor.image_processor = None
+        preprocessor.use_image_processor_gpu = False
+        preprocessor.vision_config = {"image": {}, "video": {}}
+        preprocessor.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preserve_media_metadata=True, preprocess_off_event_loop=True
+        )
+        preprocessor.io_executor = ThreadPoolExecutor(max_workers=2)
+        preprocessor.preproc_executor = ThreadPoolExecutor(max_workers=1)
+        return preprocessor
+
+    @staticmethod
+    def _run_with_loop_handshake(make_awaitable):
+        """The hook blocks until a coroutine on the event loop answers it, so a hook
+        that holds the loop thread starves that coroutine and times out."""
+        started, answered = threading.Event(), threading.Event()
+
+        def wait_for_loop():
+            started.set()
+            if not answered.wait(timeout=5):
+                raise TimeoutError("the preprocess hook blocked the event loop")
+
+        async def answer():
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            answered.set()
+
+        async def run():
+            responder = asyncio.create_task(answer())
+            result = await make_awaitable(wait_for_loop)
+            await asyncio.wait_for(responder, timeout=5)
+            return result
+
+        return asyncio.run(run())
+
+    def test_video_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._load_single_item = lambda data, modality: "decoded"
+
+        def process(wait_for_loop):
+            def hook(videos, modality, config):
+                wait_for_loop()
+                return {"videos": videos}
+
+            return preprocessor._process_video_items([{"url": "a.mp4"}], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertEqual(output, {"videos": ["decoded"]})
+
+    def test_image_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._flatten_and_load_images = AsyncMock(
+            return_value=[torch.zeros(3, 4, 4)]
+        )
+        grid = torch.tensor([[1, 2, 2]])
+
+        def process(wait_for_loop):
+            def hook(images, modality, config):
+                wait_for_loop()
+                return {"image_grid_thw": grid}
+
+            return preprocessor._process_image_items(["img"], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertIs(output["image_grid_thw"], grid)
 
 
 class TestEncoderPreprocessorKimiGrid(CustomTestCase):
@@ -129,410 +417,173 @@ class TestEncoderPreprocessorKimiGrid(CustomTestCase):
         torch.testing.assert_close(restored.grid_dim, torch.tensor([[40, 60]]))
 
 
-class TestEncoderDelivery(CustomTestCase):
-    def test_contract_has_two_direct_implementations(self):
-        self.assertEqual(EncoderDelivery.__abstractmethods__, {"send", "release"})
-        self.assertEqual(
-            set(EncoderDelivery.__subclasses__()),
-            {
-                MooncakeDelivery,
-                ZmqDelivery,
-            },
+class TestEncoderDPAbandonedRequest(CustomTestCase):
+    @staticmethod
+    def _make_dispatcher():
+        return DPDispatcher(
+            dp_size=1,
+            dispatch_sockets=[object()],
+            release_sockets=[object()],
+            result_socket=object(),
+            worker_processes=[],
         )
 
-    def test_zmq_delivery_cleanup_is_configurable(self):
+    def test_dispatch_timeout_notifies_worker_to_release(self):
         async def run():
-            req_id = "test-zmq-delivery-cleanup"
-            rid_to_receive_endpoint[req_id] = {"127.0.0.1:1"}
-            rid_to_receive_count[req_id] = 1
-            rid_to_cond[req_id] = asyncio.Condition()
-            state = ReqState(req_id)
-            encoder = SimpleNamespace()
+            dispatcher = self._make_dispatcher()
+            sent = []
+            release_sent = asyncio.Event()
 
-            await ZmqDelivery(encoder, cleanup_receive_state=False).release(state)
-            self.assertIn(req_id, rid_to_receive_endpoint)
-            self.assertIn(req_id, rid_to_receive_count)
-            self.assertIn(req_id, rid_to_cond)
+            async def send(socket, payload):
+                message = unwrap_from_pickle(payload)
+                sent.append((socket, message))
+                if message.get("_dp_type") == _DP_RELEASE_AFTER_ENCODE:
+                    release_sent.set()
 
-            await ZmqDelivery(encoder, cleanup_receive_state=True).release(state)
-            self.assertNotIn(req_id, rid_to_receive_endpoint)
-            self.assertNotIn(req_id, rid_to_receive_count)
-            self.assertNotIn(req_id, rid_to_cond)
-
-        asyncio.run(run())
-
-    def test_preprocess_metadata_precedes_embedding(self):
-        async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.rank = 0
-            encoder.req_states = {}
-            encoder._embedding_dims = {Modality.IMAGE: 8}
-            encoder._embedding_dtype = torch.float16
-            encoder._element_size = 2
-            first_state = encoder._acquire_encode_ref("req-0")
-            second_state = encoder._acquire_encode_ref("req-1")
-            ctx = SimpleNamespace(
-                req_id="req-0",
-                modality=Modality.IMAGE,
-                items_per_req=[1, 2],
-                preprocess_result=SimpleNamespace(
-                    token_counts=[2, 3, 4],
-                    grid_thw=[[1, 2, 3], [1, 4, 5], [1, 6, 7]],
+            request = {"req_id": "timed-out", "modality": "image"}
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                    side_effect=send,
                 ),
-            )
-            requests = [
-                {"req_id": "req-0", "num_parts": 2, "part_idx": 0},
-                {"req_id": "req-1", "num_parts": 2, "part_idx": 1},
-            ]
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.server_module.ENCODER_REQ_TIMEOUT",
+                    0.01,
+                ),
+            ):
+                result = await dispatcher.dispatch(request)
+                await asyncio.wait_for(release_sent.wait(), timeout=1)
 
-            publish = AsyncMock()
-            with patch.object(meta_registry, "publish", publish):
-                await encoder._publish_preprocess_metadata(ctx, requests)
-
-            self.assertIs(encoder.req_states["req-0"], first_state)
-            self.assertIs(encoder.req_states["req-1"], second_state)
-            self.assertEqual(first_state.embedding_data.shape, [2, 8])
-            self.assertEqual(second_state.embedding_data.shape, [7, 8])
-            self.assertEqual(first_state.embedding_data.grid_dim, [[1, 2, 3]])
+            self.assertEqual(result["_error_type"], "TimeoutError")
+            self.assertIs(sent[0][0], dispatcher.dispatch_sockets[0])
+            self.assertEqual(sent[0][1], request)
+            self.assertIs(sent[1][0], dispatcher.release_sockets[0])
             self.assertEqual(
-                second_state.embedding_data.grid_dim,
-                [[1, 4, 5], [1, 6, 7]],
+                sent[1][1],
+                {
+                    "_dp_type": _DP_RELEASE_AFTER_ENCODE,
+                    "req_id": "timed-out",
+                },
             )
-            self.assertEqual(first_state.embedding_data.dtype, torch.float16)
-            self.assertEqual(second_state.embedding_data.dtype, torch.float16)
-            self.assertFalse(first_state.embedding_ready.is_set())
-            self.assertFalse(second_state.embedding_ready.is_set())
-            self.assertEqual(
-                publish.await_args_list,
-                [
-                    unittest.mock.call("req-0", 32, 2, 8),
-                    unittest.mock.call("req-1", 112, 7, 8),
-                ],
-            )
-            await encoder._release_encode_ref(first_state)
-            await encoder._release_encode_ref(second_state)
+            self.assertEqual(dispatcher.pending_counts, [0])
+            self.assertNotIn("timed-out", dispatcher.req_id_to_rank)
 
         asyncio.run(run())
 
-    def test_mooncake_embedding_is_ready_only_after_cuda_sync(self):
-        class FakeCudaEmbedding:
-            shape = (2, 4)
-            dtype = torch.float16
-            nbytes = 16
-            is_cuda = True
-            device = "cuda:0"
+    def test_dispatch_cancellation_notifies_worker_to_release(self):
+        async def run():
+            dispatcher = self._make_dispatcher()
+            encode_sent = asyncio.Event()
+            release_sent = asyncio.Event()
 
-            def __getitem__(self, key):
-                return self
+            async def send(_socket, payload):
+                message = unwrap_from_pickle(payload)
+                if message.get("_dp_type") == _DP_RELEASE_AFTER_ENCODE:
+                    release_sent.set()
+                else:
+                    encode_sent.set()
 
-        encoder = MMEncoder.__new__(MMEncoder)
-        encoder.rank = 0
-        events = []
-        encoder._stage_embedding = lambda mm_data: events.append("ready")
-        ctx = SimpleNamespace(
-            req_id="req",
-            modality=Modality.IMAGE,
-            items_per_req=[1],
-            preprocess_result=SimpleNamespace(
-                token_counts=[2],
-                grid_thw=[[1, 2, 3]],
-            ),
-            aux_data={},
-            use_global_cache=True,
-        )
-        stream = SimpleNamespace(synchronize=lambda: events.append("sync"))
-
-        with patch.object(torch.cuda, "current_stream", return_value=stream):
-            encoder._stage_embeddings(
-                ctx,
-                [{"req_id": "req", "num_parts": 1, "part_idx": 0}],
-                FakeCudaEmbedding(),
-                keep_on_gpu=True,
-            )
-
-        self.assertEqual(events, ["sync", "ready"])
-
-    def test_stage_embedding_does_not_resurrect_missing_state(self):
-        encoder = MMEncoder.__new__(MMEncoder)
-        encoder.req_states = {}
-
-        with self.assertRaisesRegex(
-            InternalError, "No request state exists while encoding request: req"
-        ):
-            encoder._stage_embedding(
-                EmbeddingData(
-                    "req",
-                    1,
-                    0,
-                    None,
-                    Modality.IMAGE,
-                    embedding=torch.ones((1, 1)),
+            with patch(
+                "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                side_effect=send,
+            ):
+                task = asyncio.create_task(
+                    dispatcher.dispatch({"req_id": "cancelled", "modality": "image"})
                 )
+                await encode_sent.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await asyncio.wait_for(release_sent.wait(), timeout=1)
+
+            self.assertEqual(dispatcher.pending_counts, [0])
+            self.assertNotIn("cancelled", dispatcher.req_id_to_rank)
+
+        asyncio.run(run())
+
+    def test_worker_marks_running_encode_abandoned(self):
+        async def run():
+            async def encode():
+                await asyncio.Event().wait()
+
+            encode_task = asyncio.create_task(encode())
+            encoder = SimpleNamespace(
+                abandon_request=AsyncMock(),
+                release_request=AsyncMock(),
             )
+            await _retire_abandoned_encode(encoder, encode_task, "abandoned")
 
-        self.assertNotIn("req", encoder.req_states)
+            encoder.abandon_request.assert_awaited_once_with("abandoned")
+            encoder.release_request.assert_not_awaited()
+            encode_task.cancel()
+            await asyncio.gather(encode_task, return_exceptions=True)
 
-    def test_stage_embedding_requires_active_encode(self):
-        encoder = MMEncoder.__new__(MMEncoder)
-        state = ReqState("req")
-        encoder.req_states = {"req": state}
+        asyncio.run(run())
 
-        with self.assertRaisesRegex(
-            InternalError, "Request state has no active encode work: req"
-        ):
-            encoder._stage_embedding(
-                EmbeddingData(
-                    "req",
-                    1,
-                    0,
-                    None,
-                    Modality.IMAGE,
-                    embedding=torch.ones((1, 1)),
-                )
-            )
-
-        self.assertIs(encoder.req_states["req"], state)
-        self.assertIsNone(state.embedding_data)
-        self.assertFalse(state.embedding_ready.is_set())
-
-    def test_release_during_encode_is_deferred_without_resurrecting_state(self):
+    def test_worker_preserves_release_before_encode_task_exists(self):
         async def run():
             encoder = MMEncoder.__new__(MMEncoder)
             encoder.rank = 0
             encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
             encoder.delivery = SimpleNamespace(release=AsyncMock())
 
-            state = encoder._acquire_encode_ref("req")
-            state.embedding_data = EmbeddingData(
-                "req",
-                1,
-                0,
-                None,
-                Modality.IMAGE,
-                embedding_shape=[1, 1],
-                dtype=torch.float32,
-            )
+            await _retire_abandoned_encode(encoder, None, "abandoned")
+            self.assertIn("abandoned", encoder.abandoned_req_ids)
 
-            discard = AsyncMock()
-            with patch.object(meta_registry, "discard", discard):
-                await encoder.release_request("req")
-                self.assertTrue(state.release_requested)
-                self.assertIn("req", encoder.req_states)
-                encoder.delivery.release.assert_not_awaited()
-
-                embedding = torch.ones((1, 1))
-                encoder._stage_embedding(
-                    EmbeddingData(
-                        "req",
-                        1,
-                        0,
-                        None,
-                        Modality.IMAGE,
-                        embedding=embedding,
-                    )
-                )
+            state = encoder._acquire_encode_ref("abandoned")
+            self.assertTrue(state.release_requested)
+            with patch.object(meta_registry, "discard", AsyncMock()):
                 await encoder._release_encode_ref(state)
 
             encoder.delivery.release.assert_awaited_once_with(state)
-            discard.assert_awaited_once_with("req")
-            self.assertIsNone(state.embedding_data)
-            self.assertNotIn("req", encoder.req_states)
+            self.assertNotIn("abandoned", encoder.req_states)
 
         asyncio.run(run())
 
-    def test_error_metadata_survives_buffer_release_for_waiter(self):
+    def test_worker_release_survives_encode_failure(self):
         async def run():
-            req_id = "test-error-metadata-waiter"
-            await meta_registry.discard(req_id)
+            async def encode():
+                raise RuntimeError("bad image")
 
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.req_states = {}
-            encoder.delivery = SimpleNamespace(release=AsyncMock())
-            state = ReqState(
-                req_id,
-                EmbeddingData(
-                    req_id,
-                    1,
-                    0,
-                    None,
-                    Modality.IMAGE,
-                    error_msg="encode failed",
-                ),
-            )
-            state.embedding_ready.set()
-            encoder.req_states[req_id] = state
-
-            waiter = asyncio.create_task(meta_registry.wait(req_id))
+            encode_task = asyncio.create_task(encode())
             await asyncio.sleep(0)
-            try:
-                await meta_registry.publish(req_id, 0, 0, 0, error="encode failed")
-                await encoder.release_request(req_id, preserve_metadata=True)
-                meta = await asyncio.wait_for(waiter, timeout=1)
-                self.assertEqual(meta, {"error": "encode failed"})
-                self.assertNotIn(req_id, encoder.req_states)
-            finally:
-                if not waiter.done():
-                    waiter.cancel()
-                await meta_registry.discard(req_id)
+            encoder = SimpleNamespace(
+                abandon_request=AsyncMock(),
+                release_request=AsyncMock(),
+            )
+            await _retire_abandoned_encode(
+                encoder,
+                encode_task,
+                "failed",
+            )
+
+            encoder.release_request.assert_awaited_once_with("failed")
+            encoder.abandon_request.assert_not_awaited()
+            await asyncio.gather(encode_task, return_exceptions=True)
 
         asyncio.run(run())
 
-    def test_zmq_pipeline_sends_only_after_encode_completes(self):
-        async def run():
-            events = []
-            finish_encode = asyncio.Event()
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.transfer_backend = "zmq_to_tokenizer"
 
-            async def encode(**kwargs):
-                events.append("metadata_published")
-                await finish_encode.wait()
-                events.append("encode_completed")
-                return 16, 2, 4, None, None
+class TestMooncakeRegistration(CustomTestCase):
+    def setUp(self):
+        self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
+        self.engine.engine = unittest.mock.Mock()
 
-            async def send(**kwargs):
-                events.append("send")
-                return True
+    def test_register_raises_on_nonzero_status(self):
+        self.engine.engine.register_memory.return_value = -1
 
-            async def release_request(req_id, **kwargs):
-                events.append("release")
+        with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-1"):
+            self.engine.register(1234, 4096)
 
-            encoder.encode = AsyncMock(side_effect=encode)
-            encoder.send = AsyncMock(side_effect=send)
-            encoder.release_request = AsyncMock(side_effect=release_request)
+    def test_deregister_preserves_backend_failure(self):
+        backend_error = OSError("backend failed")
+        self.engine.engine.unregister_memory.side_effect = backend_error
 
-            publish = AsyncMock()
-            request = {
-                "req_id": "req",
-                "mm_items": ["item"],
-                "modality": "image",
-                "num_parts": 1,
-                "part_idx": 0,
-                "prefill_host": "127.0.0.1",
-                "embedding_port": 1234,
-            }
-            with patch.object(meta_registry, "publish", publish):
-                task = asyncio.create_task(
-                    execute_encode_pipeline(encoder, None, request)
-                )
-                await asyncio.sleep(0)
-                self.assertEqual(events, ["metadata_published"])
-                encoder.send.assert_not_awaited()
+        with self.assertRaisesRegex(RuntimeError, "deregistration failed") as ctx:
+            self.engine.deregister(1234)
 
-                finish_encode.set()
-                self.assertIsNone(await task)
-
-            self.assertEqual(
-                events,
-                ["metadata_published", "encode_completed", "send", "release"],
-            )
-            publish.assert_awaited_once_with("req", 16, 2, 4)
-
-        asyncio.run(run())
-
-    def test_send_waits_for_embedding_published_by_encode(self):
-        async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.rank = 0
-            encoder.req_states = {}
-            state = encoder._acquire_encode_ref("req")
-            state.embedding_data = EmbeddingData(
-                "req",
-                1,
-                0,
-                None,
-                Modality.IMAGE,
-                embedding_shape=[1, 1],
-                dtype=torch.float32,
-            )
-
-            delivered = []
-
-            async def send(current_state, destination):
-                delivered.append(await encoder._wait_for_embedding(current_state))
-
-            encoder.delivery = SimpleNamespace(
-                send=AsyncMock(side_effect=send),
-                release=AsyncMock(),
-            )
-            send_task = asyncio.create_task(
-                encoder.send_to_destination(state, SendDestination("127.0.0.1:1"))
-            )
-            await asyncio.sleep(0)
-            self.assertFalse(send_task.done())
-
-            embedding = torch.ones((1, 1))
-            encoder._stage_embedding(
-                EmbeddingData(
-                    "req",
-                    1,
-                    0,
-                    None,
-                    Modality.IMAGE,
-                    embedding=embedding,
-                )
-            )
-            await send_task
-            await encoder._release_encode_ref(state)
-
-            with patch.object(meta_registry, "discard", AsyncMock()):
-                await encoder.release_request("req")
-
-            self.assertEqual(len(delivered), 1)
-            self.assertIs(delivered[0].embedding, embedding)
-
-        asyncio.run(run())
-
-    def test_release_waits_for_send_then_clears_embedding(self):
-        async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
-            encoder.req_states = {}
-
-            send_started = asyncio.Event()
-            finish_send = asyncio.Event()
-
-            async def send(state, destination):
-                send_started.set()
-                await finish_send.wait()
-
-            embedding_seen_by_release = []
-
-            async def release(state):
-                embedding_seen_by_release.append(state.embedding_data.embedding)
-
-            encoder.delivery = SimpleNamespace(
-                send=AsyncMock(side_effect=send),
-                release=AsyncMock(side_effect=release),
-            )
-            embedding = torch.ones((1, 1))
-            state = ReqState(
-                "req",
-                EmbeddingData("req", 1, 0, None, Modality.IMAGE, embedding=embedding),
-            )
-            state.embedding_ready.set()
-            encoder.req_states[state.req_id] = state
-
-            send_task = asyncio.create_task(
-                encoder.send_to_destination(state, SendDestination("127.0.0.1:1"))
-            )
-            await send_started.wait()
-            release_task = asyncio.create_task(encoder.release_request("req"))
-            await asyncio.sleep(0)
-
-            encoder.delivery.release.assert_not_awaited()
-            self.assertIs(state.embedding_data.embedding, embedding)
-
-            finish_send.set()
-            await send_task
-            await release_task
-
-            encoder.delivery.release.assert_awaited_once_with(state)
-            self.assertEqual(len(embedding_seen_by_release), 1)
-            self.assertIs(embedding_seen_by_release[0], embedding)
-            self.assertIsNone(state.embedding_data)
-            self.assertNotIn("req", encoder.req_states)
-
-        asyncio.run(run())
+        self.assertIs(ctx.exception.__cause__, backend_error)
 
 
 if __name__ == "__main__":
