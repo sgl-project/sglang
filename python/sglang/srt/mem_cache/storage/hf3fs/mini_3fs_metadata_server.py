@@ -58,8 +58,12 @@ class RankMetadata:
             for i, key, prefix_key in new_keys_to_process:
                 if len(self.free_pages) > 0:
                     page_index = self.free_pages.pop()
-                else:
+                elif self.key_to_index:
                     page_index = self.key_to_index.popitem(last=False)[1]
+                else:
+                    # All pages are reserved by unconfirmed writes. Return the
+                    # allocations so far and let the caller skip this key.
+                    page_index = -1
 
                 results[i] = (False, page_index)
 
