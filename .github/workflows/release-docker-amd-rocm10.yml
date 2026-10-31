@@ -105,7 +105,7 @@ jobs:
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
-            -f docker/rocm10.Dockerfile \
+            -f docker/rocm.Dockerfile \
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
             --build-arg "GPU_ARCH=${GPU_ARCH}" \
@@ -182,7 +182,7 @@ jobs:
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
-            -f docker/rocm10.Dockerfile \
+            -f docker/rocm.Dockerfile \
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1010 \
@@ -262,7 +262,7 @@ jobs:
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
-            -f docker/rocm10.Dockerfile \
+            -f docker/rocm.Dockerfile \
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1000 \

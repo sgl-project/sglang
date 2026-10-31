@@ -69,8 +69,6 @@ jobs:
           version=${{ steps.version.outputs.version }}
           echo "Version: ${version}"
 
-          dockerfile="docker/rocm.Dockerfile"
-          cache_args=(--no-cache)
           gpu_arch_suffix=""
           if [ "${{ matrix.rocm_version }}" = "rocm720" ] || [ "${{ matrix.rocm_version }}" = "rocm724" ]; then
             gpu_arch_suffix="-${{ matrix.rocm_version }}"
@@ -87,8 +85,6 @@ jobs:
             # while the published tag keeps the rocm10 flavor name that CI and
             # the nightly images already use.
             gpu_arch_suffix="-rocm1000"
-            dockerfile="docker/rocm10.Dockerfile"
-            cache_args=()
             if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
               rocm_tag="rocm10-mi30x"
             elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
@@ -108,5 +104,5 @@ jobs:
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
-          docker build . -f "${dockerfile}" --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }}${gpu_arch_suffix} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t lmsysorg/sglang:${tag} "${cache_args[@]}"
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }}${gpu_arch_suffix} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t lmsysorg/sglang:${tag}
           docker push lmsysorg/sglang:${tag}

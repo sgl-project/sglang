@@ -271,23 +271,18 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
-DOCKERFILE="docker/rocm.Dockerfile"
-case "${IMAGE_STAGE_SUFFIX}" in
-  -rocm1000|-rocm1010) DOCKERFILE="docker/rocm10.Dockerfile" ;;
-esac
-
 # -----------------------
 # MORI
-# The CI image bakes MORI at the selected Dockerfile-pinned commit; when a PR
+# The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
 # When the image's checkout is already at the pin the reinstall is redundant.
-MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' "${DOCKERFILE}" | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
+MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
 IMAGE_MORI_COMMIT=$(docker exec ci_sglang git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
 if [[ -n "${MORI_COMMIT}" && "${IMAGE_MORI_COMMIT}" == "${MORI_COMMIT}" ]]; then
   echo "[MORI] Image already has MORI ${MORI_COMMIT}; skipping reinstall"
 elif docker exec ci_sglang test -d /sgl-workspace/mori; then
-  MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' "${DOCKERFILE}" | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
+  MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
 
   if [[ -z "${MORI_COMMIT}" ]]; then
     echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"
@@ -323,7 +318,7 @@ elif docker exec ci_sglang test -d /sgl-workspace/mori; then
     # default compiler, CMake, and linker search paths used by MORI.
     # gfx1250 additionally needs the SDK's own cmake trees on the prefix path:
     # that is what lets hsakmt-config.cmake resolve find_dependency(NUMA)
-    # without patching MORI's CMakeLists. Same split as the selected Dockerfile.
+    # without patching MORI's CMakeLists. Same split as docker/rocm.Dockerfile.
     ROCM_SYSDEPS="\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"
     if [ '${IMAGE_GFX}' = 'gfx1250' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
       export PATH="\${ROCM_HOME}/bin:\${PATH}"
@@ -360,11 +355,13 @@ fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK START ==="
 
+DOCKERFILE="docker/rocm.Dockerfile"
+
 # GPU_ARCH
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
-# Image owns Triton (pinned in the selected Dockerfile). Rebuild AITER against it.
+# Image owns Triton (pinned in docker/rocm.Dockerfile). Rebuild AITER against it.
 
 #############################################
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
@@ -376,7 +373,7 @@ case "${IMAGE_GFX}" in
     *)       _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}" ;;
 esac
 echo "[CI-AITER-CHECK] Using ${_from_line} from Dockerfile..."
-REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" "${DOCKERFILE}" \
+REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
                     | grep 'AITER_COMMIT_DEFAULT=' \
                     | head -n1 \
                     | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
