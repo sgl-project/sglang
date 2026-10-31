@@ -1717,6 +1717,49 @@ class TestMuseSparkReasoningParser(CustomTestCase):
         )
 
 
+class _SplitSpecialTokenizer:
+    """Never parses special tokens out of text, as with split_special_tokens=True."""
+
+    def __init__(self, *, added_vocab: dict[str, int], special_ids: dict[str, int]):
+        self._added_vocab = added_vocab
+        self._ids = {**added_vocab, **special_ids, "<unk>": 0}
+        self.all_special_ids = [0, *special_ids.values()]
+
+    def encode(self, text, add_special_tokens):
+        return [100 + ord(char) for char in text]
+
+    def convert_tokens_to_ids(self, token):
+        return self._ids.get(token, 0)
+
+    def convert_ids_to_tokens(self, token_id):
+        return {v: k for k, v in self._ids.items()}[token_id]
+
+    def get_added_vocab(self):
+        return self._added_vocab
+
+
+class TestThinkEndTokenIds(CustomTestCase):
+    def test_added_end_marker_maps_to_its_id(self):
+        """The reasoning gate matches generated ids, so an end marker that is an added
+        token must map to the one id the model emits, even when its text splits."""
+        tokenizer = _SplitSpecialTokenizer(added_vocab={"</think>": 7}, special_ids={})
+        self.assertEqual(Qwen3Detector().get_think_end_token_ids(tokenizer), [7])
+
+    def test_special_end_marker_without_added_vocab_maps_to_its_id(self):
+        tokenizer = _SplitSpecialTokenizer(added_vocab={}, special_ids={"</think>": 7})
+        self.assertEqual(Qwen3Detector().get_think_end_token_ids(tokenizer), [7])
+
+    def test_unknown_marker_is_encoded(self):
+        tokenizer = _SplitSpecialTokenizer(added_vocab={"</think>": 7}, special_ids={})
+        detector = BaseReasoningFormatDetector(
+            think_start_token="<think>", think_end_token="\n</think>"
+        )
+        self.assertEqual(
+            detector.get_think_end_token_ids(tokenizer),
+            [100 + ord(char) for char in "\n</think>"],
+        )
+
+
 class TestReasoningParserNames(CustomTestCase):
     def test_matches_registry(self):
         # `server_args` builds the --reasoning-parser choices from this list to
