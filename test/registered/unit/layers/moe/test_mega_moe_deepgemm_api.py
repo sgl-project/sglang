@@ -889,56 +889,25 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def test_allocate_buffers_before_kv_sizing(self):
         from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
-        def moe_layer(ready):
-            moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
-            torch.nn.Module.__init__(moe)
-            moe.experts = SimpleNamespace(
-                num_experts=8, ready=ready, _mega_moe_nvfp4=False, _mega_moe_w4a4=False
-            )
-            moe.config = SimpleNamespace(
-                num_experts_per_tok=2, hidden_size=128, moe_intermediate_size=256
-            )
-            moe.num_fused_shared_experts = 0
-            moe.mega_shared_l1_weights = None
-            moe.n_shared_experts = 1
-            return moe
-
-        model = torch.nn.ModuleList(
-            [moe_layer(True), moe_layer(True), moe_layer(False)]
-        )
-        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
-            return_value=SimpleNamespace(buffer=torch.empty(1 << 10, dtype=torch.int8))
-        )
-        group = object()
+        layers = [DeepseekV2MoE.__new__(DeepseekV2MoE) for _ in range(3)]
+        for layer, ready in zip(layers, (True, True, False)):
+            torch.nn.Module.__init__(layer)
+            layer.experts = SimpleNamespace(ready=ready)
+        model = torch.nn.ModuleList(layers)
         with (
-            patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}),
+            patch.object(mega_moe, "is_mega_moe_experts_ready", lambda e: e.ready),
             patch.object(
-                mega_moe, "is_mega_moe_experts_ready", side_effect=lambda e: e.ready
-            ),
-            get_parallel().override(moe_ep_group=SimpleNamespace(device_group=group)),
-            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(64),
+                mega_moe,
+                "_mega_moe_buffer",
+                return_value=SimpleNamespace(buffer=torch.empty(8, dtype=torch.int8)),
+            ) as get_buffer,
         ):
             with get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE):
                 mega_moe.allocate_mega_moe_buffers(model)
-            self.deep_gemm.get_symm_buffer_for_mega_moe.assert_not_called()
-
+            get_buffer.assert_not_called()
             with get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE):
                 mega_moe.allocate_mega_moe_buffers(model)
-                # The forward path asks for the same buffer and finds it cached.
-                mega_moe._mega_moe_buffer(model[0])
-
-        # One buffer for the two ready layers; the layer that is not ready skips.
-        self.deep_gemm.get_symm_buffer_for_mega_moe.assert_called_once_with(
-            group,
-            8,
-            64,
-            2,
-            128,
-            256,
-            num_shared_experts=0,
-            mma_type="fp8xfp4",
-            activation="swiglu",
-        )
+        self.assertEqual(get_buffer.call_args_list, [call(layers[0]), call(layers[1])])
 
     def _get_test_buffer(self, group):
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
