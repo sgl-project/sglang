@@ -32,6 +32,7 @@ class DevicePoolEntry:
         rows_are_pages: bool,
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        shard: int | None = None,
     ):
         self.name = name
         self.indices_from_pool = indices_from_pool
@@ -41,6 +42,9 @@ class DevicePoolEntry:
         self.page_size = page_size
         self.packed = packed
         self._index_mapper = index_mapper
+        # Ranks that declare the same shard hold identical objects, e.g. ranks
+        # with the same DCP rank; None means every rank holds its own.
+        self.shard = shard
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
 
@@ -551,6 +555,8 @@ def _build_mamba_device_pool_group(
             ),
             page_size=page_size,
             rows_are_pages=False,
+            # The MLA KV is identical on every attention TP rank.
+            shard=0,
         ),
         _mamba_device_pool_entry(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
