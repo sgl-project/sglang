@@ -6,6 +6,8 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from fastapi.responses import ORJSONResponse
+
 from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -780,6 +782,92 @@ class TestSplitDocumentAssembly(CustomTestCase):
             return found
 
         self.assertEqual(asyncio.run(mismatches()), [])
+
+    def test_early_exit_aborts_the_parked_successor(self):
+        """Every early exit must release a successor sent before the current reply"""
+
+        async def check(mode):
+            started, release = asyncio.Event(), asyncio.Event()
+            successor_tasks, aborted = [], []
+            windows = _ScriptedWindows(["p0"])
+            splitter = _splitter(windows)
+            manager = splitter._tokenizer_manager
+            manager.abort_request = aborted.append
+
+            async def handle_window(sub, raw_request):
+                if "uocr_doc_after" in sub.custom_params:
+                    manager.rid_to_state[sub.rid] = object()
+                    successor_tasks.append((sub.rid, asyncio.current_task()))
+                    started.set()
+                    await asyncio.Event().wait()
+                await release.wait()
+                if mode == "exception":
+                    raise RuntimeError("window failed")
+                if mode == "rejected":
+                    return ORJSONResponse({"message": "rejected"}, status_code=400)
+                response = await windows.handle_window(sub, raw_request)
+                if mode in ("abort", "content_filter"):
+                    response.choices[0].finish_reason = mode
+                if mode == "invalid_usage":
+                    response.usage.completion_tokens = sub.max_tokens + 1
+                return response
+
+            splitter._handle_window = handle_window
+            request = _document_request(2, stream=False)
+            request.max_tokens = 3 if mode == "budget" else 6
+            with serving_chat_doc_split.envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.override(
+                True
+            ):
+                task = asyncio.create_task(
+                    splitter._handle_split_document(
+                        request, None, [(0, 1, 0), (1, 2, 1)], doc_reuse_id="doc"
+                    )
+                )
+                try:
+                    await asyncio.wait_for(started.wait(), timeout=5)
+                    if mode == "cancel":
+                        task.cancel()
+                    else:
+                        release.set()
+                    result = (await asyncio.gather(task, return_exceptions=True))[0]
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(len(successor_tasks), 1)
+            rid, successor = successor_tasks[0]
+            await asyncio.gather(successor, return_exceptions=True)
+            self.assertTrue(successor.cancelled())
+            self.assertEqual(aborted, [rid])
+            if mode == "cancel":
+                self.assertIsInstance(result, asyncio.CancelledError)
+            elif mode == "exception":
+                self.assertIsInstance(result, RuntimeError)
+            elif mode == "rejected":
+                self.assertEqual(result.status_code, 400)
+            elif mode == "invalid_usage":
+                self.assertIn("invalid usage accounting", result)
+            else:
+                self.assertEqual(result.usage.completion_tokens, 3)
+                self.assertEqual(result.choices[0].message.content, "<PAGE>p0")
+                self.assertEqual(
+                    result.choices[0].finish_reason,
+                    "length" if mode == "budget" else mode,
+                )
+                self.assertEqual(
+                    result.metadata["doc_split_budget_exhausted"], mode == "budget"
+                )
+
+        for mode in (
+            "budget",
+            "abort",
+            "content_filter",
+            "invalid_usage",
+            "rejected",
+            "exception",
+            "cancel",
+        ):
+            with self.subTest(mode=mode):
+                asyncio.run(check(mode))
 
 
 class TestPromptKeepsInlinePagePlaceholders(CustomTestCase):
