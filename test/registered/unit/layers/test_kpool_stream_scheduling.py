@@ -521,6 +521,61 @@ def _chunking_patches(*, rows_per_chunk, kv_pool, rocm=False):
         yield
 
 
+class TestKPoolTPChunking(CustomTestCase):
+    def test_shard_preserves_row_metadata_and_output_padding(self):
+        n_real, world_size, width = 17, 4, 4
+        pool_lens = torch.arange(1, n_real + 1, dtype=torch.int32)
+        expected = _expected_rows(
+            pool_lens=pool_lens, index=torch.arange(n_real), width=width, pad_rows=5
+        )
+        for rank in range(world_size):
+            calls = []
+            backend = _chunk_backend(topk=_encoding_topk(width=width, calls=calls))
+            group = SimpleNamespace(
+                world_size=world_size, rank_in_group=rank, device_group=object()
+            )
+            per_rank = (n_real + world_size - 1) // world_size
+
+            def gather(output, local, *, group):
+                start = rank * per_rank
+                stop = min(start + per_rank, n_real)
+                torch.testing.assert_close(local[: stop - start], expected[start:stop])
+                if stop - start < per_rank:
+                    self.assertTrue(torch.all(local[stop - start :] == -1))
+                output[:n_real] = expected[:n_real]
+
+            with (
+                _chunking_patches(rows_per_chunk=3, kv_pool=object()),
+                patch.object(
+                    torch.distributed, "all_gather_into_tensor", side_effect=gather
+                ),
+            ):
+                actual = backend._kpool_topk_by_row_chunks(
+                    q_fp8=_fp8_zeros(n_real, 4),
+                    weights=torch.arange(1, n_real + 1, dtype=torch.float32).reshape(
+                        n_real, 1
+                    ),
+                    kv_fp8=(_fp8_zeros(16, 4), torch.ones(16, 1)),
+                    logits_starts=torch.zeros(n_real, dtype=torch.int32),
+                    logits_ends=torch.full((n_real,), 16, dtype=torch.int32),
+                    pool_lens=pool_lens,
+                    seq_lens=pool_lens,
+                    page_table=None,
+                    page_table_row_index=None,
+                    topk_offsets=torch.arange(n_real, dtype=torch.int32),
+                    topk_row_starts=torch.zeros(n_real, dtype=torch.int32),
+                    row_chunks=_row_chunks(
+                        num_rows=n_real,
+                        num_cols=16,
+                        device=torch.device("cpu"),
+                        rows_per_chunk=3,
+                    ),
+                    out_rows=n_real + 5,
+                    tp_group=group,
+                )
+            torch.testing.assert_close(actual, expected)
+
+
 class TestKPoolPlanChunking(CustomTestCase):
     NUM_REQ_SLOTS = 64
     TOPK = 4
