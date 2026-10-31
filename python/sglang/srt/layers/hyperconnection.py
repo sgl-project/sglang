@@ -152,6 +152,7 @@ class GatedResidual(HyperConnectionBase):
         use_mix: bool = True,
         use_combine: bool = True,
         role: Optional[str] = None,
+        seam: bool = True,
     ):
         super().__init__(config, use_mix, use_combine, role)
 
@@ -263,8 +264,9 @@ class GatedResidual(HyperConnectionBase):
 
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
-        self._seam_shape_ok = (
-            use_mix
+        self._seam_eligible = (
+            seam
+            and use_mix
             and self.hc_count == _hc_seam.HC
             and self.hidden_size == _hc_seam.HS
             and self.config.hc_lowrank == _hc_seam.LOWRANK
@@ -275,7 +277,7 @@ class GatedResidual(HyperConnectionBase):
         rows = hyper_input.shape[0]
         return (
             _HC_SEAM
-            and self._seam_shape_ok
+            and self._seam_eligible
             and _HC_SEAM_MIN_ROWS <= rows <= _HC_SEAM_MAX_ROWS
             and not torch.compiler.is_compiling()
             and _hc_seam.hc_seam_supported(rows, hyper_input)

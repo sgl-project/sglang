@@ -304,7 +304,8 @@ class Envs:
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
     # ROCm: run each Qwen4 hyper-connection boundary of a batch of MIN..MAX rows
     # as one fused Triton seam (combine + norm + low-rank mix). Validated up to
-    # 193 rows; the kernel accepts up to 256.
+    # 193 rows; the kernel accepts up to 256. MTP draft layers keep the
+    # existing path.
     SGLANG_ENABLE_QWEN4_HC_SEAM = EnvBool(False)
     SGLANG_QWEN4_HC_SEAM_MIN_ROWS = EnvInt(1)
     SGLANG_QWEN4_HC_SEAM_MAX_ROWS = EnvInt(193)
