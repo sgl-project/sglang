@@ -175,6 +175,9 @@ class Req:
 
     # Timesteps
     timesteps: torch.Tensor | None = None
+    # ComfyUI native batching: one timestep per latent row. ``timesteps`` stays
+    # the one-step schedule the denoising loop walks.
+    comfyui_row_timesteps: torch.Tensor | None = None
     paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
