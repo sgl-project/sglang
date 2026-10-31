@@ -33,6 +33,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_S2V_14B_Config
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
@@ -41,6 +42,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     normalize_quality,
 )
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.sample.wan import Wan2_2_S2V_14B_SamplingParam
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -943,6 +945,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             ModelTaskType.I2I: True,
             ModelTaskType.I2V: True,
             ModelTaskType.I2M: True,
+            ModelTaskType.S2V: True,
             ModelTaskType.VLA_ACTION: False,
         }
         request_based_expected = {
@@ -1037,6 +1040,88 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(len(reqs), 1)
         self.assertEqual(reqs[0].data_type, ModelTaskType.I2M.data_type())
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
+    def test_s2v_pipeline_builds_image_and_audio_conditioned_warmup(self):
+        """Audio-input S2V must still get a synthetic warmup, not skip it."""
+        server_args = MagicMock()
+        server_args.warmup_mode = "server"
+        server_args.warmup_steps = 1
+        server_args.warmup_resolutions = None
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.enable_breakable_cuda_graph = False
+        server_args.pipeline_config = SimpleNamespace(task_type=ModelTaskType.S2V)
+        builder = "sglang.multimodal_gen.runtime.warmup_request_builder"
+
+        with (
+            patch(
+                f"{builder}.get_model_sampling_defaults",
+                return_value=SamplingParams(width=1024, height=704, num_frames=81),
+            ),
+            patch(
+                f"{builder}._resolve_default_warmup_resolution",
+                return_value=(1024, 704),
+            ),
+            patch(f"{builder}._resolve_warmup_num_frames", return_value=81),
+            patch(f"{builder}._resolve_auto_residency_warmup_shape", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.server_warmup.is_realtime_serving",
+                return_value=False,
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                warmup_audio_path="/tmp/warmup_audio.wav",
+                server_based_warmup=True,
+            )
+            self.assertTrue(should_run_synthetic_server_warmup(server_args))
+            with self.assertRaisesRegex(RuntimeError, "Warmup audio path"):
+                build_warmup_reqs(
+                    server_args,
+                    warmup_resolutions=None,
+                    warmup_input_path="/tmp/warmup.png",
+                    server_based_warmup=True,
+                )
+
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+        self.assertEqual(reqs[0].audio_path, "/tmp/warmup_audio.wav")
+
+    def test_server_warmup_resolves_sequence_shard_like_a_real_request(self):
+        """Synthetic warmups skip SamplingParams._adjust. Left unresolved, the flag sent S2V's
+        SP=2 warmup down time-sharding, which halved the video latent against its pose
+        condition and failed every warmup; a real request shards tokens instead."""
+        builder = "sglang.multimodal_gen.runtime.warmup_request_builder"
+        for pipeline_config, sampling_defaults, expected in (
+            (Wan2_2_S2V_14B_Config(), Wan2_2_S2V_14B_SamplingParam(), True),
+            (LTX25PipelineConfig(), LTX25SamplingParams(), False),
+        ):
+            with self.subTest(pipeline=type(pipeline_config).__name__):
+                server_args = MagicMock()
+                server_args.warmup_mode = "server"
+                server_args.warmup_steps = 2
+                server_args.warmup_resolutions = None
+                server_args.enable_cfg_parallel = False
+                server_args.enable_torch_compile = False
+                server_args.enable_breakable_cuda_graph = False
+                server_args.num_gpus = 2
+                server_args.pipeline_config = pipeline_config
+                with patch(
+                    f"{builder}.get_model_sampling_defaults",
+                    return_value=sampling_defaults,
+                ):
+                    reqs = build_warmup_reqs(
+                        server_args,
+                        warmup_resolutions=None,
+                        warmup_input_path="/tmp/warmup.png",
+                        warmup_audio_path="/tmp/warmup_audio.wav",
+                        server_based_warmup=True,
+                    )
+                self.assertTrue(reqs)
+                for req in reqs:
+                    self.assertIs(req.sampling_params.enable_sequence_shard, expected)
 
     def test_server_based_warmup_keeps_ti2i_image_input(self):
         server_args = MagicMock()
