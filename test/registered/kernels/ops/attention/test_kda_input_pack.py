@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -97,6 +98,73 @@ class TestKDAInputPack(CustomTestCase):
         actual = kernel.extend(*inputs, ssm_states=states, **kwargs)
         self.assertTrue(torch.equal(expected, actual))
         self.assertTrue(torch.equal(expected_states, states))
+
+    def test_flashinfer_graph_adapter_replay(self):
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            self.skipTest("FlashInfer KDA requires Blackwell")
+        from sglang.srt.layers.attention.linear.kda_flashinfer_prefill_graph import (
+            FlashInferKDAPrefillGraph,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+            FlashInferKDAPrefillKernel,
+        )
+
+        kernel = FlashInferKDAPrefillKernel()
+        if kernel.prefill_graph_wrapper_cls is None:
+            self.skipTest("FlashInfer does not provide the prefill graph wrapper")
+        inputs = make_inputs(257, 6)
+        for t in inputs:
+            t.normal_(0, 0.1)
+        states = torch.zeros(2, 6, 128, 128, dtype=torch.bfloat16, device="cuda")
+        layer = SimpleNamespace(
+            layer_id=0,
+            A_log=torch.zeros(6, device="cuda"),
+            dt_bias=torch.zeros(768, device="cuda"),
+            lower_bound=-5.0,
+        )
+        adapter = FlashInferKDAPrefillGraph(
+            wrapper_cls=kernel.prefill_graph_wrapper_cls,
+            num_tokens=257,
+            max_seqs=1,
+            track=False,
+            device="cuda",
+        )
+        adapter.cu_seqlens.copy_(torch.tensor([0, 257], device="cuda"))
+        adapter.cache_indices.fill_(1)
+
+        def run():
+            return adapter.run(
+                layer=layer,
+                **dict(zip(("q", "k", "v", "g", "beta"), inputs)),
+                ssm_states=states,
+                h_track=None,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = run()
+        for _ in range(2):
+            for t in inputs:
+                t.normal_(0, 0.1)
+            states.zero_()
+            expected_states = states.clone()
+            expected = kernel.extend(
+                *(t.contiguous() for t in inputs),
+                ssm_states=expected_states,
+                cache_indices=adapter.cache_indices,
+                query_start_loc=adapter.cu_seqlens,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+            )
+            graph.replay()
+            self.assertTrue(torch.equal(expected, actual))
+            self.assertTrue(torch.equal(expected_states, states))
 
 
 if __name__ == "__main__":
