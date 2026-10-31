@@ -29,15 +29,11 @@ class _ForkTestWorker:
     def __init__(self, preload_modules: List[str]):
         result_read_fd, result_write_fd = os.pipe()
         worker_path = os.path.join(os.path.dirname(__file__), "fork_test_worker.py")
+        cmd = ["python3", worker_path, "--result-fd", str(result_write_fd)]
+        if preload_modules:
+            cmd += ["--preload", *preload_modules]
         self.process = subprocess.Popen(
-            [
-                "python3",
-                worker_path,
-                "--result-fd",
-                str(result_write_fd),
-                "--preload",
-                *preload_modules,
-            ],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=None,
             stderr=None,

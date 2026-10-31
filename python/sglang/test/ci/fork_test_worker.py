@@ -19,13 +19,8 @@ def _preload_common_modules(extra_modules: list[str]) -> None:
     import torch
     import triton  # noqa: F401
 
-    # A module that fails to import here is only a lost saving: the child that
-    # needs it imports it again and reports the error in that test's output.
     for name in extra_modules:
-        try:
-            importlib.import_module(name)
-        except Exception as e:
-            print(f"fork test worker: cannot preload {name}: {e!r}", file=sys.stderr)
+        importlib.import_module(name)
 
     if torch.cuda.is_initialized():
         raise RuntimeError("fork test worker initialized CUDA before forking")
