@@ -134,7 +134,10 @@ class LIMDecodeAdapter:
             self._metadata_next_scratch = torch.full(
                 (self.batch_capacity,), -1, dtype=torch.int32, device=device
             )
-        self.mtp_full_visible = envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+        self.mtp_separate_tail = envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+        self.mtp_full_visible = (
+            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get() or self.mtp_separate_tail
+        )
         if self.mtp_full_visible:
             # The diagnostic integration supports the target-verify Q4 shape.
             rows = self.batch_capacity * 4
@@ -355,7 +358,12 @@ class LIMDecodeAdapter:
         validate_mtp_chain(forward_batch, positions, live, self.rows)
         valid = live.all(dim=1)
         lengths = torch.where(valid, positions[:, -1] + 1, 0).to(torch.int32)
-        sparse = valid & (lengths >= self.capacity)
+        prefixes = (
+            (lengths - 4).clamp_min(0) // 128 * 128
+            if self.mtp_separate_tail
+            else lengths
+        )
+        sparse = valid & (prefixes >= self.capacity)
         slots = torch.where(valid, forward_batch.req_pool_indices, self.rows).to(
             torch.int32
         )
@@ -393,16 +401,18 @@ class LIMDecodeAdapter:
                 cache_sizes=self._pre_cache_sizes[:batch],
                 capacity=self.capacity,
                 request_rows=self.rows,
-                full_visible=True,
+                full_visible=not self.mtp_separate_tail,
+                query_width=4,
             )
             slots = self._pre_safe_slots[:batch]
             lengths = self._pre_lengths[:batch]
+            prefixes = self._pre_prefixes[:batch]
             sparse = self._pre_sparse[:batch]
             valid = self._pre_valid[:batch]
             states = self._pre_states[:batch]
         else:
             previous = self.last_prefix[layer_index][slots.long()]
-            warm = sparse & (previous >= 0) & (lengths >= previous)
+            warm = sparse & (previous >= 0) & (prefixes >= previous)
             states = torch.where(sparse, torch.where(warm, -1, -2), -3).to(torch.int32)
             table.zero_()
             table[:, :columns].copy_(block_table[:, :columns])
@@ -418,7 +428,7 @@ class LIMDecodeAdapter:
             block_table=table,
             query_ends=self.mtp_query_ends[:batch],
             seq_lens=lengths,
-            prefix_lens=lengths,
+            prefix_lens=prefixes,
             cache_sizes=(
                 self._pre_cache_sizes[:batch]
                 if self.fused_pre_metadata
@@ -434,10 +444,10 @@ class LIMDecodeAdapter:
             miss_slots=self.miss_slots[:batch],
             miss_counts=self.miss_counts[:batch],
             operator=self.operator,
-            full_visible=True,
+            full_visible=not self.mtp_separate_tail,
         )
         sources.masked_fill_(~valid[:, None].expand(batch, 4).reshape(rows, 1, 1), -1)
-        next_prefix = torch.where(sparse, lengths, -1)
+        next_prefix = torch.where(sparse, prefixes, -1)
         self.last_prefix[layer_index].index_copy_(0, slots.long(), next_prefix)
         return LIMSelection(
             sources[:, 0],
@@ -446,7 +456,7 @@ class LIMDecodeAdapter:
             self.miss_sources[:batch],
             self.miss_slots[:batch],
             self.miss_counts[:batch],
-            lengths,
+            prefixes,
             sparse,
             valid,
             slots,
@@ -478,6 +488,7 @@ class LIMDecodeAdapter:
                 dram_block_table=manager.planner_dram_block_table[:batch],
                 capacity=self.capacity,
                 host_context_len=manager.max_context_len,
+                tail_tokens=manager.tail_tokens,
                 request_rows=self.rows,
                 host_block_table=(
                     self.block_table[:batch]

@@ -369,11 +369,12 @@ class AscendAttnBackend(AttentionBackend):
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
         )
-        # Draft-decode steps and draft-extend use different attention backends
-        # over the same KV pool. They must also share its host KV and residency.
-        self.sparse_kv_manager = getattr(
-            self.token_to_kv_pool, "sparse_kv_manager", None
+        self.sparse_kv_manager = (
+            getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
+            if self.enable_sparsity_driven_kv_offload
+            else None
         )
         if self.enable_sparsity_driven_kv_offload and self.sparse_kv_manager is None:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (

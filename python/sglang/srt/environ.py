@@ -1067,6 +1067,8 @@ class Envs:
     SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(False)
     # Experimental MTP path; requires a matching full-visible LIM kernel.
     SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE = EnvBool(False)
+    # Explicit prefix-TopK plus causal HBM-tail experiment (different selection).
+    SGLANG_NPU_MTP_SEPARATE_KV_TAIL = EnvBool(False)
     # Optional operator-enabled library; loaded once before graph capture.
     SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph

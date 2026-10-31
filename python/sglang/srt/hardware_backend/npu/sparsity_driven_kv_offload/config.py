@@ -50,7 +50,12 @@ def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
     use_mla_backend: bool,
+    is_draft_worker: bool = False,
 ) -> bool:
+    # Offload is a target-model policy. Draft attention keeps its native KV
+    # pool even though the process inherits the target's environment flags.
+    if is_draft_worker:
+        return False
     indexer_impl = get_sparse_kv_indexer_impl()
     if (
         envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
@@ -156,10 +161,12 @@ def get_sparsity_driven_kv_offload_cell_size(
     use_mla_backend: bool,
     num_layers: int,
     element_size: int,
+    is_draft_worker: bool = False,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
         use_mla_backend=use_mla_backend,
+        is_draft_worker=is_draft_worker,
     ):
         return None
 
@@ -201,7 +208,11 @@ def get_sparse_kv_budget(
         indexer_impl=get_sparse_kv_indexer_impl(),
         copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
         copy_sfa_query_heads=copy_sfa_query_heads,
-        mtp_full_visible=envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get(),
+        mtp_full_visible=(
+            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+            or envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+        ),
+        device_tail_tokens=256 if envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get() else 0,
         fused_copy_sfa_metadata=envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get(),
         fused_pre_metadata=envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get(),
         graph_batch_capacity=sparse_batch_capacity(

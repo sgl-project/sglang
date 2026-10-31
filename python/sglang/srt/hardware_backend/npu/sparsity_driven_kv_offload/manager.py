@@ -123,7 +123,9 @@ class SparseKVCacheManager:
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
-        if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get():
+        self.separate_mtp_tail = envs.SGLANG_NPU_MTP_SEPARATE_KV_TAIL.get()
+        self.tail_tokens = 256 if self.separate_mtp_tail else 0
+        if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get() or self.separate_mtp_tail:
             from sglang.srt.runtime_context import get_spec
 
             spec = get_spec()
@@ -179,6 +181,7 @@ class SparseKVCacheManager:
             graph_batch_capacity=self.batch_capacity,
         )
         self.device_cache_size = self.budget.cache_tokens
+        self.device_kv_stride = self.device_cache_size + self.tail_tokens
         self.budget = replace(
             self.budget,
             host_kv_bytes=(
@@ -251,7 +254,7 @@ class SparseKVCacheManager:
                     torch.empty(
                         (
                             self.size,
-                            self.device_cache_size,
+                            self.device_kv_stride,
                             self.head_num,
                             self.head_dim,
                         ),
@@ -262,6 +265,23 @@ class SparseKVCacheManager:
                 ]
         except Exception as e:
             self._raise_buffer_allocation_error("device_kv_buffer", e)
+        if self.separate_mtp_tail:
+            self.tail_starts = [
+                torch.full((self.size + 1,), -1, dtype=torch.int32, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self.tail_ends = [torch.full_like(x, -1) for x in self.tail_starts]
+            hs = torch.empty(
+                self.batch_capacity * 128, dtype=torch.int64, device=self.device
+            )
+            hd = torch.empty_like(hs)
+            hv = torch.empty(hs.numel(), dtype=torch.bool, device=self.device)
+            cs = torch.arange(
+                self.batch_capacity * 4, dtype=torch.int64, device=self.device
+            )
+            cd = torch.empty_like(cs)
+            cv = torch.empty(cs.numel(), dtype=torch.bool, device=self.device)
+            self.tail_workspace = hs, hd, hv, cs, cd, cv
 
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -356,7 +376,7 @@ class SparseKVCacheManager:
                         self.planner_actual_seq_lengths_query
                     )
                     self.hbm_page_offsets = torch.arange(
-                        self.cache_capacity // 128,
+                        self.device_kv_stride // 128,
                         dtype=torch.int32,
                         device=self.device,
                     )
@@ -366,7 +386,7 @@ class SparseKVCacheManager:
                         device=self.device,
                     )
                     self.planner_hbm_block_table = torch.empty(
-                        (self.batch_capacity, self.cache_capacity // 128),
+                        (self.batch_capacity, self.device_kv_stride // 128),
                         dtype=torch.int32,
                         device=self.device,
                     )
@@ -375,7 +395,10 @@ class SparseKVCacheManager:
                         dtype=torch.int32,
                         device=self.device,
                     )
-                    if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get():
+                    if (
+                        envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+                        or self.separate_mtp_tail
+                    ):
                         self.mtp_attn_out = torch.empty(
                             (
                                 self.batch_capacity * 4,
@@ -548,6 +571,9 @@ class SparseKVCacheManager:
             req_ids, dtype=torch.long, device=self.device
         ).contiguous()
         for layer_idx in range(self.layer_num):
+            if self.separate_mtp_tail:
+                self.tail_starts[layer_idx].index_fill_(0, req_ids_tensor, -1)
+                self.tail_ends[layer_idx].index_fill_(0, req_ids_tensor, -1)
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
             if self.copy_sfa_enabled:
                 self.device_slot_owner[layer_idx].index_fill_(0, req_ids_tensor, -1)
@@ -662,6 +688,8 @@ class SparseKVCacheManager:
                 host_context_len=self.max_context_len,
                 request_rows=self.size,
                 query_width=4,
+                tail_tokens=self.tail_tokens,
+                tail_seq_lens=plan.seq_lens if self.separate_mtp_tail else None,
                 host_block_table=(
                     adapter.block_table[:batch]
                     if getattr(self, "host_kv_is_paged", False)
@@ -673,14 +701,19 @@ class SparseKVCacheManager:
             plan.miss_counts.masked_fill_(~valid, 0)
             # These lengths suppress padding; full-visible attention appends no tail.
             self.planner_actual_seq_lengths_kv[:batch].copy_(
-                valid.to(torch.int32) * (self.cache_capacity + 3)
+                valid.to(torch.int32)
+                * (
+                    self.cache_capacity + plan.seq_lens - plan.prefix_lens
+                    if self.separate_mtp_tail
+                    else self.cache_capacity + 3
+                )
             )
             self.planner_num_cache_tokens[:batch].copy_(
                 valid.to(torch.int32) * self.cache_capacity
             )
             for pages, offsets, output in (
                 (
-                    self.cache_capacity // 128,
+                    self.device_kv_stride // 128,
                     self.hbm_page_offsets,
                     self.planner_hbm_block_table,
                 ),
@@ -692,6 +725,19 @@ class SparseKVCacheManager:
             ):
                 fill_request_block_table(
                     plan.request_slots, valid, offsets, pages, output[:batch]
+                )
+            if self.separate_mtp_tail:
+                cp = self.cache_capacity // 128
+                p = self.device_kv_stride // 128
+                self.planner_hbm_block_table[:batch, cp:].copy_(
+                    plan.request_slots[:, None] * p
+                    + cp
+                    + (
+                        plan.prefix_lens[:, None] // 128
+                        + self.hbm_page_offsets[None, cp:]
+                        - cp
+                    )
+                    % 2
                 )
             if getattr(self, "host_kv_is_paged", False):
                 self.fill_host_block_table(
@@ -705,7 +751,10 @@ class SparseKVCacheManager:
         output = self.mtp_attn_out[:rows]
         layer_idx = layer.layer_id - self.start_layer
         combined = self.device_kv_buffer[layer_idx].view(
-            self.size * (self.cache_capacity // 128), 128, self.head_num, self.head_dim
+            self.size * (self.device_kv_stride // 128),
+            128,
+            self.head_num,
+            self.head_dim,
         )
         fused_scatter_copy_sparse_flash_attention(
             query_nope.contiguous(),
@@ -726,8 +775,8 @@ class SparseKVCacheManager:
             output,
             scale_value,
             operator=self._copy_sfa_operator,
-            full_visible=True,
-            resident_refresh_tail=True,
+            full_visible=not self.separate_mtp_tail,
+            resident_refresh_tail=not self.separate_mtp_tail,
         )
         result = output[:, :query_heads].reshape(rows, -1)
         return result.masked_fill(~route_valid[:, None], 0)
@@ -796,7 +845,10 @@ class SparseKVCacheManager:
 
         layer_idx = layer.layer_id - self.start_layer
         combined_hbm_cache = self.device_kv_buffer[layer_idx].view(
-            self.size * (self.cache_capacity // 128), 128, self.head_num, self.head_dim
+            self.size * (self.device_kv_stride // 128),
+            128,
+            self.head_num,
+            self.head_dim,
         )
         fused_scatter_copy_sparse_flash_attention(
             query_nope,
@@ -1161,6 +1213,29 @@ class SparseKVCacheManager:
                 block_dim=48,
                 dst_ptr=self.dev_ptr_list[layer_idx],
             )
+
+            if (
+                getattr(self, "separate_mtp_tail", False)
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_mtp_tail import (
+                    stage_mtp_tail,
+                )
+
+                stage_mtp_tail(
+                    current=src_tensor.view(-1, self.head_dim),
+                    cache=self.device_kv_buffer[layer_idx],
+                    host=self.host_kv_buffer[layer_idx],
+                    host_address=self.dev_ptr_list[layer_idx],
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                    requests=forward_batch.req_pool_indices,
+                    positions=forward_batch.positions,
+                    starts=self.tail_starts[layer_idx],
+                    ends=self.tail_ends[layer_idx],
+                    workspace=self.tail_workspace,
+                    capacity=self.cache_capacity,
+                    context_len=self.logical_max_context_len,
+                )
 
     def get_forward_kv(
         self,

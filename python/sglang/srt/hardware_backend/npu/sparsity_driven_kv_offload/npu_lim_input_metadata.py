@@ -26,6 +26,7 @@ def _prepare_kernel(
     ROWS: tl.constexpr,
     CAPACITY: tl.constexpr,
     FULL_VISIBLE: tl.constexpr,
+    QUERY_WIDTH: tl.constexpr,
     SRC_COLS: tl.constexpr,
     DST_COLS: tl.constexpr,
     SRC_S0: tl.constexpr,
@@ -57,7 +58,7 @@ def _prepare_kernel(
         safe_slot = tl.where(valid, raw_slot, ROWS).to(tl.int32)
         length = tl.where(valid, raw_length, 0).to(tl.int32)
         prefix = tl.where(
-            FULL_VISIBLE, length, ((tl.maximum(length - 1, 0) // 128) * 128)
+            FULL_VISIBLE, length, ((tl.maximum(length - QUERY_WIDTH, 0) // 128) * 128)
         ).to(tl.int32)
         sparse = valid & (prefix >= CAPACITY)
         previous = tl.load(last_ptr + safe_slot).to(tl.int32)
@@ -93,6 +94,7 @@ def fused_prepare_lim_metadata(
     capacity: int,
     request_rows: int,
     full_visible: bool,
+    query_width: int = 1,
 ) -> None:
     """Fill request inputs and source pages; Q4 supplies its full union length."""
     if seq_lens.dtype not in (torch.int32, torch.int64):
@@ -108,6 +110,8 @@ def fused_prepare_lim_metadata(
     if not isinstance(request_rows, int) or request_rows <= 0:
         raise ValueError("request_rows must be positive")
     batch = seq_lens.numel()
+    if not 1 <= query_width <= 16:
+        raise ValueError("query_width must be in [1,16]")
     if batch <= 0 or request_slots.numel() != batch:
         raise ValueError("seq_lens and request_slots must have equal nonzero length")
     if seq_lens.device.type != "npu" or request_slots.device != seq_lens.device:
@@ -186,6 +190,7 @@ def fused_prepare_lim_metadata(
         request_rows,
         capacity,
         full_visible,
+        query_width,
         block_table.shape[1],
         cols,
         block_table.stride(0),

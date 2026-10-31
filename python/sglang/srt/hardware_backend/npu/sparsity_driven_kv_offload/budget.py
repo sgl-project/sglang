@@ -49,6 +49,7 @@ def resolve_sparse_kv_budget(
     fused_copy_sfa_metadata: bool = False,
     fused_pre_metadata: bool = False,
     graph_batch_capacity: int = 0,
+    device_tail_tokens: int = 0,
 ) -> SparseKVBudget:
     """Size persistent manager allocations, including padding and one workspace.
 
@@ -69,12 +70,19 @@ def resolve_sparse_kv_budget(
         ("cache_tokens", cache_tokens),
         ("hbm_budget_bytes", hbm_budget_bytes),
         ("graph_batch_capacity", graph_batch_capacity),
+        ("device_tail_tokens", device_tail_tokens),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer, got {value!r}.")
 
     if indexer_impl not in ("legacy", "li_reference", "lim"):
         raise ValueError(f"Unknown sparse indexer implementation: {indexer_impl}.")
+    if device_tail_tokens and (
+        device_tail_tokens != 256 or not copy_sfa or indexer_impl != "lim"
+    ):
+        raise ValueError(
+            "A separate HBM tail requires native LIM/CopySFA and256 slots."
+        )
     if copy_sfa:
         if top_k != 2048 or (
             cache_tokens != 0
@@ -152,6 +160,10 @@ def resolve_sparse_kv_budget(
                     - slot_ids_bytes
                     - adapter_bytes
                     - mtp_output_bytes
+                    - request_rows
+                    * num_layers
+                    * device_tail_tokens
+                    * kv_bytes_per_token
                 )
                 // per_slot,
             ),
@@ -186,13 +198,19 @@ def resolve_sparse_kv_budget(
         )
     result = SparseKVBudget(
         cache_tokens=cache_tokens,
-        device_kv_bytes=request_rows * num_layers * cache_tokens * kv_bytes_per_token,
+        device_kv_bytes=request_rows
+        * num_layers
+        * (cache_tokens + device_tail_tokens)
+        * kv_bytes_per_token,
         slot_map_bytes=slot_map_bytes,
         policy_bytes=policy_bytes,
         selected_kv_bytes=selected_kv_bytes,
         host_kv_bytes=request_rows * num_layers * context_len * kv_bytes_per_token,
         adapter_bytes=adapter_bytes,
-        copy_sfa_bytes=copy_sfa_bytes,
+        copy_sfa_bytes=copy_sfa_bytes
+        + num_layers * (request_rows + 1) * 8 * bool(device_tail_tokens)
+        + batch_rows * 132 * 17 * bool(device_tail_tokens)
+        + batch_rows * (device_tail_tokens // 128) * 4,
     )
     if hbm_budget_bytes and result.managed_hbm_bytes > hbm_budget_bytes:
         raise ValueError(

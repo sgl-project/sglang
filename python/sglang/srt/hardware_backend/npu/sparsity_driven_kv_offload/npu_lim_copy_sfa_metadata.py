@@ -22,6 +22,7 @@ def _lim_copy_sfa_metadata_kernel(
     hbm_block_table_ptr,
     dram_block_table_ptr,
     host_block_table_ptr,
+    tail_seq_lens_ptr,
     B: tl.constexpr,
     K: tl.constexpr,
     Q: tl.constexpr,
@@ -36,6 +37,7 @@ def _lim_copy_sfa_metadata_kernel(
     HOST_COLS: tl.constexpr,
     HOST_S0: tl.constexpr,
     HOST_S1: tl.constexpr,
+    TAIL_MODE: tl.constexpr,
 ):
     tile_id = tl.program_id(0).to(tl.int32)
     row_id = tl.program_id(1).to(tl.int32)
@@ -61,6 +63,13 @@ def _lim_copy_sfa_metadata_kernel(
     if tile_id * BLOCK < HBM_PAGES:
         hbm_base = row_id.to(tl.int64) * HBM_PAGES
         hbm_values = base_request * HBM_PAGES + col
+        if TAIL_MODE:
+            prefix = tl.maximum(tl.load(next_prefix_ptr + row_id), 0)
+            hbm_values = base_request * HBM_PAGES + tl.where(
+                col < C // 128,
+                col,
+                C // 128 + (prefix // 128 + col - C // 128) % 2,
+            )
         tl.store(
             hbm_block_table_ptr + hbm_base + col.to(tl.int64),
             hbm_values,
@@ -89,9 +98,16 @@ def _lim_copy_sfa_metadata_kernel(
             tl.store(topk_misses_ptr + row_id * Q + route, 0, mask=~active)
         tl.store(miss_counts_ptr + row_id, 0, mask=~active)
         cache_length = tl.where(active, C, 0).to(tl.int32)
+        logical_length = C + Q - 1
+        if TAIL_MODE:
+            logical_length = (
+                C
+                + tl.load(tail_seq_lens_ptr + row_id)
+                - tl.load(next_prefix_ptr + row_id)
+            )
         tl.store(
             actual_seq_lengths_kv_ptr + row_id,
-            tl.where(active, C + Q - 1, 0).to(tl.int32),
+            tl.where(active, logical_length, 0).to(tl.int32),
         )
         tl.store(num_cache_tokens_ptr + row_id, cache_length)
         tl.store(
@@ -148,6 +164,8 @@ def fused_lim_copy_sfa_metadata(
     request_rows: int,
     query_width: int = 1,
     host_block_table: torch.Tensor | None = None,
+    tail_seq_lens: torch.Tensor | None = None,
+    tail_tokens: int = 0,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
@@ -211,7 +229,19 @@ def fused_lim_copy_sfa_metadata(
         raise ValueError("all per-row metadata tensors must have shape [B].")
     if last_prefix.ndim != 1 or last_prefix.shape[0] != request_rows + 1:
         raise ValueError("last_prefix must have shape [request_rows + 1].")
-    if hbm_block_table.shape != (batch, capacity // 128):
+    if tail_tokens not in (0, 256):
+        raise ValueError("tail_tokens must be0 or256")
+    if tail_seq_lens is not None and (
+        tail_tokens != 256
+        or tail_seq_lens.shape != (batch,)
+        or tail_seq_lens.dtype != torch.int32
+        or tail_seq_lens.device != source_ids.device
+        or not tail_seq_lens.is_contiguous()
+    ):
+        raise ValueError(
+            "Separate-tail sequence lengths must be contiguous same-device int32[B]."
+        )
+    if hbm_block_table.shape != (batch, (capacity + tail_tokens) // 128):
         raise ValueError("hbm_block_table must have shape [B, capacity // 128].")
     if dram_block_table.shape != (batch, host_context_len // 128):
         raise ValueError(
@@ -262,7 +292,7 @@ def fused_lim_copy_sfa_metadata(
     _validate_tensor("valid_rows", valid_rows, dtype=torch.bool, device=device)
     _validate_tensor("sparse_rows", sparse_rows, dtype=torch.bool, device=device)
 
-    hbm_pages = capacity // 128
+    hbm_pages = (capacity + tail_tokens) // 128
     dram_pages = host_context_len // 128
     tiles = triton.cdiv(max(2048, hbm_pages, dram_pages), 2048)
     _lim_copy_sfa_metadata_kernel[(tiles, batch)](
@@ -279,6 +309,7 @@ def fused_lim_copy_sfa_metadata(
         hbm_block_table,
         dram_block_table,
         host_block_table if host_block_table is not None else dram_block_table,
+        tail_seq_lens if tail_seq_lens is not None else actual_seq_lengths_kv,
         batch,
         2048,
         query_width,
@@ -293,6 +324,7 @@ def fused_lim_copy_sfa_metadata(
         host_block_table.shape[1] if host_block_table is not None else 0,
         host_block_table.stride(0) if host_block_table is not None else 0,
         host_block_table.stride(1) if host_block_table is not None else 0,
+        tail_seq_lens is not None,
     )
 
 

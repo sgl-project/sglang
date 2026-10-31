@@ -287,6 +287,7 @@ class TestSparseKVManager(unittest.TestCase):
         m = self.Manager.__new__(self.Manager)
         m.lim_adapter = None
         m.copy_sfa_enabled = False
+        m.separate_mtp_tail = False
         m.size, m.max_context_len, m.sparse_context_len = 4, 64, 2
         m.device_cache_size, m.use_lru = capacity, capacity > 2
         m.device, m.start_layer, m.layer_num = "cpu", 0, 1

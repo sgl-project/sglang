@@ -262,7 +262,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_sparsity_driven_kv_offload_enabled(
-                model_config=kvc.model_config, use_mla_backend=kvc.use_mla_backend
+                model_config=kvc.model_config,
+                use_mla_backend=kvc.use_mla_backend,
+                is_draft_worker=kvc.is_draft_worker,
             ):
                 # The variable-sized native pool contains only indexer KV. The
                 # separate sparse manager is allocated later by AscendAttnBackend
@@ -292,16 +294,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 budget = get_sparse_kv_budget(num_layers=num_layers, **budget_options)
                 reservation = budget.managed_hbm_bytes
-                num_sparse_pools = 1
-                if not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle():
-                    draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
-                    if draft_layers is None or draft_layers <= 0:
-                        raise ValueError("Sparse KV MTP requires the draft layer count")
-                    draft_budget = get_sparse_kv_budget(
-                        num_layers=int(draft_layers), **budget_options
-                    )
-                    reservation += draft_budget.managed_hbm_bytes
-                    num_sparse_pools += 1
                 if (
                     envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() == 0
                     and envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() > 0
@@ -309,9 +301,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # Final admission capacity may be smaller than the configured
                     # maximum; auto-sizing can then use more of the byte budget.
                     reservation = (
-                        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get()
-                        * 1024**2
-                        * num_sparse_pools
+                        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
                     )
                 self._fixed_overhead_bytes += reservation
                 if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
@@ -371,13 +361,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size *= dcp_size
                     draft_indexer_size *= dcp_size
                     if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
-                        # Both pools are index-only. Their host-KV managers were
-                        # reserved above; native LIM also needs one FP32 scale
-                        # workspace per physical draft index token.
-                        self._cell_size += draft_indexer_size
-                        if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
-                            self._cell_size += 4
-                            self._fixed_overhead_bytes += 4 * get_schedule().page_size
+                        from sglang.srt.mem_cache.kv_cache_configurator import (
+                            calculate_mla_kv_cache_dim,
+                        )
+
+                        # The target's index-only price contains no attention
+                        # KV to scale. Charge the draft's full native KV layout.
+                        draft_kv_size = (
+                            calculate_mla_kv_cache_dim(
+                                model_config=kvc.model_config,
+                                kv_cache_dtype=kvc.kv_cache_dtype,
+                            )
+                            * torch._utils._element_size(kvc.kv_cache_dtype)
+                            * draft_num_layers
+                            * draft_loc_space_scale
+                            * dcp_size
+                        )
+                        self._cell_size += draft_kv_size + draft_indexer_size
                     else:
                         self._cell_size += draft_kv_size + draft_indexer_size
                 else:
@@ -441,6 +441,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     use_mla_backend=kvc.use_mla_backend,
                     num_layers=num_layers,
                     element_size=kv_size,
+                    is_draft_worker=kvc.is_draft_worker,
                 )
                 if offload_cell_size is not None:
                     # Keep the offload validator above, but price the physical

@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -16,6 +17,8 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -667,7 +670,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
-            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get() and not is_draft_worker
         )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
@@ -754,6 +757,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     device=self.device,
                 )
+            logger.info(
+                "NPU MLA attention KV allocation: role=%s offload=%s "
+                "CKV_bytes=%d KPE_bytes=%d",
+                "draft" if is_draft_worker else "target",
+                self.enable_sparsity_driven_kv_offload,
+                self.k_buffer.nbytes if self.k_buffer is not None else 0,
+                self.v_buffer.nbytes if self.v_buffer is not None else 0,
+            )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
