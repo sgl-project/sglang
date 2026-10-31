@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -92,6 +93,7 @@ class NGRAMWorker(BaseSpecWorker):
         super().__init__()
 
         self.server_args = server_args
+        self.force_greedy_verify = envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -482,6 +484,7 @@ class NGRAMWorker(BaseSpecWorker):
                 logits_output,
                 grammar_mask,
                 watermark_state=self.model_runner.watermark_state,
+                force_greedy=self.force_greedy_verify,
             )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
