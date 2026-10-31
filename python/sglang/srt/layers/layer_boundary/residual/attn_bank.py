@@ -14,7 +14,7 @@
 """A residual read that aggregates a bank of snapshots of itself."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -100,6 +100,9 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # per batch size: read the FFN input on this rank's rows and leave the written
+    # residual there, for an FFN that consumes it on the shard (K3 gfx950 prefill)
+    ffn_row_shards: Optional[Callable[[int], bool]] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -143,6 +146,42 @@ class AttnBankState:
             score_norm=self.ffn_score_norm,
             write=False,
         )
+
+    def reduce_scatter_rows_and_read_ffn_input(
+        self, hidden_states, residual, forward_batch, norm
+    ):
+        """Returns (normed FFN input on every row, written residual on this rank's
+        padded 1/TP of the rows, zero past the last token)."""
+        num_tokens, hidden_size = hidden_states.shape
+        if not self.ffn_row_shards(num_tokens):
+            return None
+        group = get_parallel().attn_tp_group
+        world, rank = group.world_size, group.rank_in_group
+        padded = -(-num_tokens // world) * world
+        rows = padded // world
+        if padded != num_tokens:
+            hidden_states = torch.nn.functional.pad(
+                hidden_states, (0, 0, 0, padded - num_tokens)
+            )
+        reduced = hidden_states.new_empty(rows, hidden_size)
+        group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
+        start = rank * rows
+        valid = min(rows, num_tokens - start)
+        normed, written = self.bank.require().forward(
+            reduced[:valid],
+            None if residual is None else residual[start : start + valid],
+            self.ffn_score_proj,
+            self.ffn_score_norm,
+            norm,
+            rows=slice(start, start + valid),
+        )
+        if valid < rows:
+            pad = (0, 0, 0, rows - valid)
+            normed = torch.nn.functional.pad(normed, pad)
+            written = torch.nn.functional.pad(written, pad)
+        gathered = normed.new_empty(padded, hidden_size)
+        group.all_gather_into_tensor(gathered, normed.contiguous())
+        return gathered[:num_tokens], written
 
     def reduce_scatter_and_read_ffn_input(
         self, hidden_states, residual, forward_batch, norm
@@ -274,15 +313,25 @@ class _FfnReadout(_BankReadout):
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
+        fusions = state.ffn_input_fusions
+        if state.ffn_row_shards is not None:
+            fusions = (
+                ReadoutFusion(
+                    SumGroup.ATTN_TP,
+                    state.reduce_scatter_rows_and_read_ffn_input,
+                    reads=True,
+                ),
+                *fusions,
+            )
         if not state.fuses_slice_collectives:
-            return state.ffn_input_fusions
+            return fusions
         reads = ReadoutFusion(
             SumGroup.ATTN_TP,
             state.reduce_scatter_and_read_ffn_input,
             scatters=True,
             reads=True,
         )
-        return (reads, *state.ffn_input_fusions)
+        return (reads, *fusions)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the
