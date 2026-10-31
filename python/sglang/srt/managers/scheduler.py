@@ -4954,10 +4954,11 @@ class Scheduler(
         stream,
         written_tokens: Optional[torch.Tensor],
         token_writes_unknown: bool = False,
-    ) -> None:
+    ):
         """Tell the unified pool about a forward just launched on ``stream``, so
-        that no page move races it. The write set is gathered on the schedule
-        stream, where compaction reads it, without waiting for the forward.
+        that no page move races it, and return the event that records it. The
+        write set is gathered on the schedule stream, where compaction reads it,
+        without waiting for the forward.
         A speculative batch's tracking slots are produced on its planning
         stream with no order against the schedule stream, so its state writes
         are recorded as unknown."""
@@ -4977,6 +4978,7 @@ class Scheduler(
                 ),
                 state_writes_unknown=state_writes_unknown,
             )
+        return forward_done
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
@@ -5071,10 +5073,17 @@ class Scheduler(
                             )
                         if self.enable_unified_memory:
                             # Before copy_to_cpu, so the event covers only the forward.
-                            self._record_unified_forward(
-                                batch=batch,
-                                stream=self.forward_stream,
-                                written_tokens=batch.out_cache_loc,
+                            # A speculative forward also writes draft and verify
+                            # slots past `out_cache_loc`, allocated inside it.
+                            batch_result.unified_forward_done = (
+                                self._record_unified_forward(
+                                    batch=batch,
+                                    stream=self.forward_stream,
+                                    written_tokens=batch.out_cache_loc,
+                                    token_writes_unknown=(
+                                        not batch.spec_algorithm.is_none()
+                                    ),
+                                )
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
@@ -5233,7 +5242,7 @@ class Scheduler(
                 # A pipeline stage schedules its next microbatch while this
                 # forward runs; the current stream is the one the forward ran on.
                 # A stage's verify slots come from inside its forward.
-                self._record_unified_forward(
+                batch_result.unified_forward_done = self._record_unified_forward(
                     batch=batch,
                     stream=self.device_module.current_stream(),
                     written_tokens=batch.out_cache_loc,
@@ -5446,6 +5455,13 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.deferred_responses.stream_released()
+        if (
+            isinstance(result, GenerationBatchResult)
+            and result.unified_forward_done is not None
+        ):
+            self.token_to_kv_pool_allocator.storage.retire_forward(
+                result.unified_forward_done
+            )
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
