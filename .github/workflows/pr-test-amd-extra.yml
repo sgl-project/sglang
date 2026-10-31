@@ -2,7 +2,7 @@ name: PR Test Extra (AMD)
 # Label-gated AMD extra CI workflow — the AMD mirror of pr-test-extra.yml.
 #
 # Adds AMD runtime to a PR only when the author opts in: the PR must carry
-# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-extra` (explicit opt-in).
+# `run-ci` plus `run-ci-amd-extra` (AMD Extra opt-in).
 # The label check happens at runtime in pr-gate.yml via a live
 # `gh pr view`-style fetch, so reruns after adding the labels (e.g. via a
 # slash command) pick up the new label set — a workflow-level `if` would read
@@ -10,22 +10,26 @@ name: PR Test Extra (AMD)
 # runs unconditionally on workflow_dispatch / workflow_call so it can be
 # triggered manually or chained from the AMD scheduler.
 #
-# Stage: extra-a. Each job mirrors the container bring-up of pr-test-amd.yml
-# and dispatches `run_suite.py --hw amd --suite extra-a-test-{config}-amd`:
-#   - 1-gpu-small: mock-model / kv_canary unit + single-GPU canary e2e tests
-#   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton,
-#                  sessions streaming-session, spec standalone triton,
-#                  kv_canary self-bench)
-#   - 2-gpu-large: multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests
+# Stages: extra-a and extra-b. Each job mirrors the container bring-up of
+# pr-test-amd.yml and dispatches `run_suite.py --hw amd --suite
+# {stage}-test-{config}-amd`:
+#   - extra-a 1-gpu-small: mock-model / kv_canary unit + single-GPU canary e2e
+#                          tests, plus LoRA eviction/drainer, priority
+#                          scheduling, torch-native attention
+#   - extra-a 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton,
+#                          sessions, spec standalone triton, basic_perf
+#                          throughput/latency, torch.compile, VLM models)
+#   - extra-a 2-gpu-large: multi-GPU (TP/PP/PD) mock-model + kv_canary e2e
+#                          tests, PP/MoE throughput, distributed weight update
+#   - extra-b 4-gpu:       PP extra configs, gpt-oss-20b LoRA logprob diff
+# Everything here is in CUDA's extra tier too.
 # kv_canary e2e is registered to the same extra-a stage as its CUDA siblings
 # (it now exercises the ROCm canary kernels end-to-end).
 
 on:
+  # No `labeled` trigger, as in pr-test-extra.yml: a label event would cancel
+  # the run in progress. Adding the labels after a push takes a rerun.
   pull_request:
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push. See call-gate.if for the matching guard
-    # that prevents unrelated label additions from dispatching a full run.
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       runner_arch:
@@ -116,35 +120,26 @@ permissions:
 jobs:
   # =============================================== PR Gate ====================================================
   # Runtime live-fetch label gate (mirrors pr-test-extra.yml's call-gate):
-  # requires both `run-ci` and `run-ci-extra`. A failure here cascades to
+  # requires `run-ci` and `run-ci-amd-extra`. A failure cascades to
   # every test job via `needs`, so a PR without the labels ends in one red
   # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
-  #
-  # The job-level `if` only filters the `labeled` event type so that adding an
-  # unrelated label doesn't dispatch a full run; the actual label-presence
-  # gate is enforced at runtime inside pr-gate.yml.
   call-gate:
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-extra'
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
-      require-run-ci-extra: true
+      require-label: run-ci-amd-extra
     secrets: inherit
 
   # =============================================== extra-a (1-gpu-small) ===============================================
-  # Single unpartitioned job: the 21 onboarded unit tests total ~233s, so the
-  # expensive per-job setup (container bring-up + sgl-kernel ROCm build + dep
-  # install, several minutes) dominates. Partitioning would multiply that
-  # setup across scarce AMD GPUs to shave only a couple minutes of test time,
-  # so one GPU running the whole suite sequentially is the better trade.
+  # ~1h of tests in total; two shards keep each under the step timeout.
   extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -168,16 +163,20 @@ jobs:
       - name: Run test
         timeout-minutes: 45
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (1-gpu-large) ===============================================
-  # Single-GPU lora / spec / quant model e2e tests. Runs on the same 1-gpu
-  # pool as small (AMD GPUs carry enough VRAM that "large" here is a CUDA
-  # memory-tier label, not a separate AMD runner pool).
+  # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
+  # 1-gpu pool as small (AMD GPUs carry enough VRAM that "large" here is a
+  # CUDA memory-tier label, not a separate AMD runner pool). ~1.5h in total.
   extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -199,15 +198,20 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
-  # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
-  # extra-a 2-gpu-large stage; runs on the 2-GPU AMD pool.
+  # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE
+  # throughput. Mirrors CUDA's extra-a 2-gpu-large stage; runs on the 2-GPU
+  # AMD pool.
   extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
+    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -229,7 +233,43 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+
+  # =============================================== extra-b (4-gpu) ===============================================
+  # 4-GPU tests that CUDA runs in extra-b. Same container env as the
+  # stage-c-test-4-gpu-amd job in pr-test-amd.yml.
+  extra-b-test-4-gpu-amd:
+    name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi300') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm10' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e NCCL_CUMEM_ENABLE=0 \
+            -e NCCL_NVLS_ENABLE=0 \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e SGLANG_USE_ROCM700A=1 \
+            -w "/sglang-checkout/test" \
+            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job
@@ -242,15 +282,9 @@ jobs:
         extra-a-test-1-gpu-small-amd,
         extra-a-test-1-gpu-large-amd,
         extra-a-test-2-gpu-large-amd,
+        extra-b-test-4-gpu-amd,
       ]
-    # Same `labeled` guard as call-gate: an unrelated label would otherwise finish
-    # green with nothing executed, over the real run's result.
-    if: |
-      always() &&
-      (github.event_name != 'pull_request' ||
-       github.event.action != 'labeled' ||
-       github.event.label.name == 'run-ci' ||
-       github.event.label.name == 'run-ci-extra')
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

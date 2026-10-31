@@ -26,11 +26,14 @@ class TestFile:
 class _ForkTestWorker:
     """Preloaded interpreter that forks an isolated child for each test file."""
 
-    def __init__(self):
+    def __init__(self, preload_modules: List[str]):
         result_read_fd, result_write_fd = os.pipe()
         worker_path = os.path.join(os.path.dirname(__file__), "fork_test_worker.py")
+        cmd = ["python3", worker_path, "--result-fd", str(result_write_fd)]
+        if preload_modules:
+            cmd += ["--preload", *preload_modules]
         self.process = subprocess.Popen(
-            ["python3", worker_path, "--result-fd", str(result_write_fd)],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=None,
             stderr=None,
@@ -79,7 +82,11 @@ class _ForkTestWorker:
             self.process.kill()
             self.process.wait()
         if self.process.stdin is not None:
-            self.process.stdin.close()
+            # A worker that died before reading leaves the request unflushed.
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
         self.result_stream.close()
 
 
@@ -219,6 +226,8 @@ def run_unittest_files(
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
     fork_worker_batch_size: int = 1,
+    fork_worker_preload: Optional[List[str]] = None,
+    timeout_overrides: Optional[Dict[str, float]] = None,
 ):
     """
     Run a list of test files.
@@ -236,6 +245,9 @@ def run_unittest_files(
         fork_worker_batch_size: Number of files served by one preloaded fork
                                 worker. Each file still runs in a fresh child
                                 process. One keeps the existing exec behavior.
+        fork_worker_preload: Extra modules the fork worker imports before
+                             forking, so each child inherits them.
+        timeout_overrides: First-attempt timeouts keyed by path suffix; retries use the above.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -259,11 +271,16 @@ def run_unittest_files(
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
 
-        file_timeout = (
+        base_timeout = (
             timeout_per_file
             if timeout_per_file is not None
             else derive_timeout_per_file(estimated_time)
         )
+        # An override caps only the first attempt; retries get the full budget.
+        first_timeout = base_timeout
+        for suffix, override in (timeout_overrides or {}).items():
+            if filename == suffix or filename.endswith("/" + suffix):
+                first_timeout = min(base_timeout, override)
 
         process = None
         output_lines = []
@@ -284,7 +301,7 @@ def run_unittest_files(
                 ):
                     if fork_worker is not None:
                         fork_worker.close()
-                    fork_worker = _ForkTestWorker()
+                    fork_worker = _ForkTestWorker(fork_worker_preload or [])
                 process = fork_worker.process
                 ret_code, _ = fork_worker.run(full_path)
                 if ret_code != 0 or fork_worker.files_run >= fork_worker_batch_size:
@@ -336,6 +353,7 @@ def run_unittest_files(
         was_retried = False
 
         while attempt <= (max_attempts if enable_retry else 1):
+            file_timeout = first_timeout if attempt == 1 else base_timeout
             if attempt > 1:
                 logger.info(
                     f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n"

@@ -1118,6 +1118,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "unlimited-ocr": "unlimited-ocr",
+    "unlimited_ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1196,11 +1197,11 @@ def match_minicpm(model_path: str):
     # must NOT fall back to the legacy `minicpmv` conv template (which encodes
     # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
     model_type = get_model_type(model_path)
-    if model_type == "minicpmv4_6":
+    if model_type in ("minicpmv4_6", "minicpmv4_7"):
         return None
     # For HF-hub paths (where config.json isn't on local disk yet), fall back
     # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
-    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+    if re.search(r"minicpm-(v|o)-4[._][67]", model_path, re.IGNORECASE):
         return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
@@ -1230,7 +1231,7 @@ def match_unlimited_ocr(model_path: str):
     if "unlimited" in model_path.lower():
         return "unlimited-ocr"
     model_type = get_model_type(model_path)
-    if model_type == "unlimited-ocr":
+    if model_type in ("unlimited-ocr", "unlimited_ocr"):
         return "unlimited-ocr"
     return None
 

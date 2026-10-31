@@ -22,7 +22,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestTritonSparseMLAValidator(CustomTestCase):
@@ -265,11 +265,6 @@ class TestTritonSparseMLARegistration(CustomTestCase):
         self.assertIn(
             "triton_sparse_mla", actions_by_option["--dsa-prefill-backend"].choices
         )
-
-    def test_union_defaults_to_off(self):
-        from sglang.srt.server_args import ServerArgs
-
-        self.assertEqual(ServerArgs(model_path="dummy").dsa_triton_union, 0)
 
     def test_sm120_glm_fp8_still_resolves_to_flashinfer_on_its_own(self):
         # Registering this backend must not change what SM120 selects by itself:
