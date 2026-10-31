@@ -187,11 +187,11 @@ impl ChatFormatter {
                 matches!(
                     formatter,
                     ProcessorFormatter::Glm53(_)
-                        | ProcessorFormatter::MiniMaxM3(_)
+                        | ProcessorFormatter::MiniMaxM3 { .. }
                         | ProcessorFormatter::Qwen38 { .. }
                 )
             });
-        let minimax_m31 = matches!(processor, Some(ProcessorFormatter::MiniMaxM3(_)))
+        let minimax_m31 = matches!(processor, Some(ProcessorFormatter::MiniMaxM3 { .. }))
             && !cfg["chat_template"].to_string().contains("thinking_mode");
         let template: ChatTemplate =
             serde_json::from_value(cfg).context("parse tokenizer_config.json")?;

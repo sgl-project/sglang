@@ -10,7 +10,8 @@ use super::legacy::{
 };
 use super::thinking::ThinkingTemplates;
 use super::{
-    ChatFormatter, TemplateError, is_glm53, is_minimax_m3, is_qwen38, takes_content_parts,
+    ChatFormatter, TemplateError, is_glm53, is_minimax_m3, is_qwen38, prints_arguments_as_xml,
+    takes_content_parts,
 };
 
 pub fn load_chat_formatter(
@@ -159,7 +160,12 @@ impl ChatFormatter {
         Ok(if glm53 {
             Self::Glm53(formatter)
         } else if minimax_m3 {
-            Self::MiniMaxM3(formatter)
+            Self::MiniMaxM3 {
+                formatter,
+                xml_arguments: config["chat_template"]
+                    .as_str()
+                    .is_some_and(prints_arguments_as_xml),
+            }
         } else if let Some(template) = qwen38 {
             Self::Qwen38 {
                 formatter,
@@ -348,7 +354,7 @@ mod tests {
             Some("minimax_m3_vl"),
         )
         .unwrap();
-        assert!(matches!(formatter, ChatFormatter::MiniMaxM3(_)));
+        assert!(matches!(formatter, ChatFormatter::MiniMaxM3 { .. }));
 
         // The same tagless template without the model_type is not M3.
         let formatter =
@@ -367,7 +373,7 @@ mod tests {
         let formatter =
             ChatFormatter::from_tokenizer_config(&serde_json::from_str(m3_template).unwrap())
                 .unwrap();
-        assert!(matches!(formatter, ChatFormatter::MiniMaxM3(_)));
+        assert!(matches!(formatter, ChatFormatter::MiniMaxM3 { .. }));
     }
 
     /// A `--chat-template` override keeps the checkpoint's `model_type`: a
@@ -392,7 +398,7 @@ mod tests {
         };
         assert!(matches!(
             load(Some("minimax_m3_vl")),
-            ChatFormatter::MiniMaxM3(_)
+            ChatFormatter::MiniMaxM3 { .. }
         ));
         assert!(matches!(load(None), ChatFormatter::HuggingFace { .. }));
 

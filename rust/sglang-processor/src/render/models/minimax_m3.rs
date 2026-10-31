@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use super::glm53::valid_documents;
 use super::pydantic_dump::{continues_final_message, engine_message, split_continuation};
 use super::qwen38::{prints_unlike_python, template_tools};
-use crate::py::python_float;
+use crate::py::{py_truthy, python_float};
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -27,6 +27,10 @@ const RESERVED_KWARGS: &[&str] = &[
     "tools",
 ];
 
+/// `apply_chat_template` flags that default to `False`: falsy, a kwarg is that
+/// default, and the template never sees it.
+const DEFAULT_FALSE_KWARGS: &[&str] = &["continue_final_message", "return_assistant_tokens_mask"];
+
 /// `serving_chat._M3_THINKING_TYPES`.
 const THINKING_TYPES: &[&str] = &["adaptive", "enabled", "disabled"];
 
@@ -40,10 +44,17 @@ pub(crate) fn is_minimax_m3(template: &str) -> bool {
     template.contains("<mm:think>") || template.contains("]<]minimax[>[")
 }
 
+/// The checkpoint template prints tool-call argument scalars through its `to_xml`
+/// macro; a custom template may print them otherwise, `tojson` among them.
+pub(crate) fn prints_arguments_as_xml(template: &str) -> bool {
+    template.contains("macro to_xml(val, ns)") && template.contains("to_xml(v, ns_token)")
+}
+
 /// Render an SGLang chat request body. Returns the prompt and the
 /// `continue_final_message` prefix, which SGLang tokenizes separately.
 pub(crate) fn render(
     formatter: &PromptFormatter,
+    xml_arguments: bool,
     mut request: Value,
     defaults: &HashMap<String, Value>,
 ) -> Result<(String, String), RenderError> {
@@ -57,8 +68,12 @@ pub(crate) fn render(
     for message in &mut messages {
         parse_tool_arguments(message)?;
     }
-    for arguments in messages.iter_mut().flat_map(tool_arguments) {
-        python_floats(arguments)?;
+    // Other templates get numbers, and the check below declines the floats
+    // minijinja prints unlike Python.
+    if xml_arguments {
+        for arguments in messages.iter_mut().flat_map(tool_arguments) {
+            python_floats(arguments)?;
+        }
     }
     // The template renders tool results by position, not by `tool_call_id`.
     let mut messages = canonical_tool_order(messages)
@@ -206,6 +221,11 @@ fn template_args(
                 .cloned();
         }
         normalize(&mut kwargs, &mut effort, thinking);
+    }
+    for key in DEFAULT_FALSE_KWARGS {
+        if kwargs.get(*key).is_some_and(|value| !py_truthy(value)) {
+            kwargs.remove(*key);
+        }
     }
     if let Some(key) = RESERVED_KWARGS
         .iter()
@@ -448,9 +468,11 @@ impl OAIChatLikeRequest for TemplateRequest {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::HashMap;
 
-    use crate::render::ChatFormatter;
+    use serde_json::{Value, json};
+
+    use crate::render::{ChatFormatter, TemplateError};
 
     /// MiniMax-M3 is known by its think tags or its tool-call namespace token.
     #[test]
@@ -460,15 +482,127 @@ mod tests {
         };
         assert!(matches!(
             formatter("{# <mm:think> #}"),
-            ChatFormatter::MiniMaxM3(_)
+            ChatFormatter::MiniMaxM3 { .. }
         ));
         assert!(matches!(
             formatter("{# ]<]minimax[>[ #}"),
-            ChatFormatter::MiniMaxM3(_)
+            ChatFormatter::MiniMaxM3 { .. }
         ));
         assert!(matches!(
             formatter("{# <think> #}"),
             ChatFormatter::HuggingFace { .. }
         ));
+    }
+
+    /// A `minimax_m3_vl` checkpoint served with `template`.
+    fn checkpoint(template: &str) -> ChatFormatter {
+        ChatFormatter::from_tokenizer_config_with_type(
+            &json!({"chat_template": template}),
+            Some("minimax_m3_vl"),
+        )
+        .unwrap()
+    }
+
+    fn render(formatter: &ChatFormatter, request: Value) -> Result<String, TemplateError> {
+        formatter
+            .render_request(request, &HashMap::new())
+            .map(|(prompt, _)| prompt.into_text())
+    }
+
+    /// History arguments `{"x": <x>}`, answered by a tool result.
+    fn tool_history(x: &str) -> Value {
+        json!({"messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "a",
+                "type": "function",
+                "function": {"name": "f", "arguments": format!("{{\"x\":{x}}}")},
+            }]},
+            {"role": "tool", "tool_call_id": "a", "content": "done"},
+        ]})
+    }
+
+    /// Only the checkpoint templates print argument scalars through `to_xml`.
+    #[test]
+    fn checkpoint_templates_print_arguments_as_xml() {
+        for name in ["minimax-m3", "minimax-m3.1-flash"] {
+            let path = format!(
+                "{}/tests/fixtures/parity/{name}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let fixture: Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let formatter = checkpoint(fixture["chat_template"].as_str().unwrap());
+            assert!(
+                matches!(
+                    formatter,
+                    ChatFormatter::MiniMaxM3 {
+                        xml_arguments: true,
+                        ..
+                    }
+                ),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            checkpoint("{{ messages | tojson }}"),
+            ChatFormatter::MiniMaxM3 {
+                xml_arguments: false,
+                ..
+            }
+        ));
+    }
+
+    /// A custom template that prints arguments with `tojson` keeps their floats
+    /// numbers, as Python does, rather than M3's `repr` strings.
+    #[test]
+    fn custom_template_keeps_float_arguments() {
+        let formatter = checkpoint("{{ messages[1].tool_calls[0].function.arguments | tojson }}");
+        assert_eq!(
+            render(&formatter, tool_history("1.5")).unwrap(),
+            r#"{"x": 1.5}"#
+        );
+        // A float minijinja prints unlike Python is left to the template path.
+        assert!(matches!(
+            render(&formatter, tool_history("1e20")),
+            Err(TemplateError::NeedsRenderFallback { .. })
+        ));
+    }
+
+    /// A falsy `continue_final_message` or `return_assistant_tokens_mask` kwarg is
+    /// `apply_chat_template`'s default and never reaches the template; a truthy
+    /// one still fails the request.
+    #[test]
+    fn falsy_default_false_kwargs_render() {
+        let formatter = checkpoint(
+            "{{ messages[0].content }}|{{ continue_final_message is defined }}\
+             |{{ return_assistant_tokens_mask is defined }}",
+        );
+        let request = |kwargs: Value| {
+            json!({
+                "messages": [{"role": "user", "content": "Hi"}],
+                "chat_template_kwargs": kwargs,
+            })
+        };
+        for falsy in [json!(false), json!(null), json!(0), json!("")] {
+            let kwargs = json!({
+                "continue_final_message": falsy,
+                "return_assistant_tokens_mask": falsy,
+            });
+            assert_eq!(
+                render(&formatter, request(kwargs)).unwrap(),
+                "Hi|False|False",
+                "{falsy}"
+            );
+        }
+        for key in ["continue_final_message", "return_assistant_tokens_mask"] {
+            assert!(
+                matches!(
+                    render(&formatter, request(json!({key: true}))),
+                    Err(TemplateError::Renderer { .. })
+                ),
+                "{key}"
+            );
+        }
     }
 }

@@ -95,7 +95,7 @@ mod tests {
         let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let template = fixture["chat_template"].as_str().unwrap();
         let formatter = checkpoint_formatter(&fixture["config"], template);
-        assert!(matches!(formatter, ChatFormatter::MiniMaxM3(_)));
+        assert!(matches!(formatter, ChatFormatter::MiniMaxM3 { .. }));
 
         // An assistant tool call answered by a *second*, unpaired tool message:
         // `_validate_minimax_m3_request` rejects it (tool calls and results must
