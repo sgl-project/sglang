@@ -158,7 +158,7 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
         def __init__(self, sources):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
-            self._load_pinned_pages = 0
+            self._fixed = {}
             self.entry_bytes_per_page = 512
             self.pin_sources = sources
 
