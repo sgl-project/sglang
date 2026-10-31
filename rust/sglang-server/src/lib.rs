@@ -22,8 +22,8 @@ pub use api_server::http::generate_hook::{
     GenerateTerminal,
 };
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
-    ModelConfig, RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmSpec, ModelConfig,
+    RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::{GenerateRequest, MmData};
@@ -387,8 +387,6 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ModelConfig>()?;
     m.add_class::<MetricsConfig>()?;
     m.add_class::<ServerArgs>()?;
-    m.add_class::<MmFamily>()?;
-    m.add_class::<MmResample>()?;
     m.add_class::<MmSpec>()?;
     m.add_class::<IngressRequest>()?;
     m.add_class::<ShmBuffer>()?;

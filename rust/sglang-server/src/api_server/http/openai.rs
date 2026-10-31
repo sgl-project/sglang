@@ -19,7 +19,7 @@ mod tokenize;
 mod tools;
 
 pub(super) use lowered::OpenAiChat;
-pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
+pub(super) use template::{ChatEncodes, ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};

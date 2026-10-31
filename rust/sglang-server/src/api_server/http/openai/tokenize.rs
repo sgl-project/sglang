@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::chat::{ChatBody, ChatRequest};
-use super::template::{RenderedChat, render_chat};
+use super::template::{RenderedChat, render_chat_off_executor};
 use super::{AppState, contains_media, lowered};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -122,7 +122,7 @@ async fn tokenize(
             if let Some(ids) = lowered::prompt_ids(&state, bytes.into()).await {
                 return Json(one(ids)).into_response();
             }
-            let rendered = match render_chat_prompt(&state, chat) {
+            let rendered = match render_chat_prompt(&state, chat).await {
                 Ok(rendered) => rendered,
                 Err((error_type, message)) => {
                     return error_body(StatusCode::BAD_REQUEST, error_type, message);
@@ -170,7 +170,7 @@ fn chat_body(messages: Value, mut fields: Map<String, Value>) -> Value {
 
 /// Render a chat request through the typed handler's path. A failure is a 400,
 /// returned as its error type and message.
-fn render_chat_prompt(
+async fn render_chat_prompt(
     state: &AppState,
     body: Value,
 ) -> Result<RenderedChat, (&'static str, String)> {
@@ -192,12 +192,15 @@ fn render_chat_prompt(
     let Some(formatter) = &state.chat_formatter else {
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
-    render_chat(
+    render_chat_off_executor(
+        &state.chat_encodes,
         formatter,
         body,
         &request,
         &state.server_args.default_chat_template_kwargs,
     )
+    .await
+    .map(|(rendered, _)| rendered)
     .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
@@ -254,6 +257,18 @@ mod tests {
     /// standing in for an auto-added BOS) and detokenize with a description
     /// of what it was asked, so the tests see exactly what reached it.
     fn answering_state() -> Arc<AppState> {
+        answering_state_with(
+            sglang_processor::load_chat_formatter(
+                None,           /* config_file */
+                None,           /* model_path */
+                None,           /* model_type */
+                Some("chatml"), /* chat_template_arg */
+            )
+            .unwrap(),
+        )
+    }
+
+    fn answering_state_with(chat_formatter: sglang_processor::ChatFormatter) -> Arc<AppState> {
         let (intake_tx, intake_rx) = flume::unbounded::<TmEvent>();
         tokio::spawn(async move {
             while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
@@ -267,12 +282,18 @@ mod tests {
                         let words = text.split_whitespace().map(|w| w.len() as i64);
                         ResponseItem::TokenIds(bos.into_iter().chain(words).collect())
                     }
-                    RequestKind::Tokenize(TokenizeInput::Chat(chat)) => {
-                        let text = chat.as_ref().clone().into_text();
-                        ResponseItem::TokenIds(
-                            text.split_whitespace().map(|w| w.len() as i64).collect(),
-                        )
-                    }
+                    // As the tokenizer pool: a formatter's own ids win over its text.
+                    RequestKind::Tokenize(TokenizeInput::Chat(chat)) => match &chat.ids {
+                        Some(ids) => {
+                            ResponseItem::TokenIds(ids.iter().map(|&id| id as i64).collect())
+                        }
+                        None => {
+                            let text = chat.as_ref().clone().into_text();
+                            ResponseItem::TokenIds(
+                                text.split_whitespace().map(|w| w.len() as i64).collect(),
+                            )
+                        }
+                    },
                     RequestKind::Detokenize {
                         token_ids,
                         skip_special_tokens,
@@ -306,18 +327,34 @@ mod tests {
                 server_args.as_ref(),
             ),
             server_args,
-            chat_formatter: Some(
-                sglang_processor::load_chat_formatter(
-                    None,           /* config_file */
-                    None,           /* model_path */
-                    None,           /* model_type */
-                    Some("chatml"), /* chat_template_arg */
-                )
-                .unwrap(),
-            ),
+            chat_formatter: Some(chat_formatter),
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         })
+    }
+
+    /// `messages` tokenize to the ids chat submits: special-token spellings in
+    /// user content stay plain text, as Python's `prompt_ids`.
+    #[tokio::test]
+    async fn tokenize_returns_the_ids_a_deepseek_chat_submits() {
+        let messages =
+            json!([{"role": "user", "content": "Explain <think> and <｜deepseek_image｜>"}]);
+        let body = json!({"model": "default", "messages": messages});
+        let request = serde_json::from_value(body.clone()).unwrap();
+        let formatter = super::super::test_utils::deepseek_formatter();
+        let (chat, _) =
+            super::super::template::render_chat(&formatter, body, &request, &Default::default())
+                .unwrap();
+        let chat_ids = chat.ids.unwrap();
+        assert!(!chat_ids.contains(&105), "user text is not an image token");
+
+        let app = routes().with_state(answering_state_with(formatter));
+        let response = post_json(app, "/v1/tokenize", json!({"messages": messages})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["tokens"], json!(chat_ids));
+        assert_eq!(body["count"], chat_ids.len());
     }
 
     async fn call(path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {

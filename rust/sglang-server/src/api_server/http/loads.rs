@@ -489,6 +489,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
         let query = Query::try_from_uri(&format!("/v1/loads?{query}").parse().unwrap()).unwrap();
         let response = loads(State(state), query).await;

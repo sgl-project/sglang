@@ -69,37 +69,39 @@ fn check_case(case: &Value) -> Result<(), String> {
 
 /// The fields `generate_mm_parity.py` records, computed from the Rust output.
 fn summary(output: &MmOutput) -> Value {
-    let (mrope, delta) = match &output.positions {
-        PositionOutput::MRope { positions, delta } => (positions.clone(), *delta),
-        _ => panic!("Qwen-VL uses M-RoPE"),
-    };
-    let grids: Vec<Value> = (output.items.iter())
-        .map(|item| {
-            let (_, grid) = (item.aux.iter())
-                .find(|(name, _)| name == "image_grid_thw")
-                .expect("missing image_grid_thw");
-            let TensorData::I64(grid) = &grid.data else {
-                panic!("image_grid_thw is i64");
-            };
-            json!(grid)
-        })
-        .collect();
     let features = output.items.iter().map(|item| match &item.feature.data {
         TensorData::F32(values) => values,
-        _ => panic!("Qwen-VL features are f32"),
+        _ => panic!("features are f32"),
     });
-    json!({
+    let mut summary = json!({
         "input_ids_sha256": sha256(output.input_ids.iter().flat_map(|id| id.to_le_bytes())),
         "num_input_ids": output.input_ids.len(),
         "offsets": output.offsets,
-        "image_grid_thw": grids,
         "feature_shapes": output.items.iter().map(|item| &item.feature.shape).collect::<Vec<_>>(),
         "feature_sha256": features
             .map(|values| sha256(values.iter().flat_map(|v| v.to_le_bytes())))
             .collect::<Vec<_>>(),
-        "mrope_sha256": sha256(mrope.iter().flat_map(|p| p.to_le_bytes())),
-        "mrope_delta": delta,
-    })
+    });
+    // Model kwargs such as `image_grid_thw`, one value per item.
+    for (name, _) in output.items.first().map_or(&[][..], |item| &item.aux[..]) {
+        let values: Vec<Value> = (output.items.iter())
+            .map(|item| {
+                let (_, tensor) = (item.aux.iter())
+                    .find(|(aux, _)| aux == name)
+                    .expect("every item has the same aux");
+                let TensorData::I64(values) = &tensor.data else {
+                    panic!("{name} is i64");
+                };
+                json!(values)
+            })
+            .collect();
+        summary[name] = json!(values);
+    }
+    if let PositionOutput::MRope { positions, delta } = &output.positions {
+        summary["mrope_sha256"] = json!(sha256(positions.iter().flat_map(|p| p.to_le_bytes())));
+        summary["mrope_delta"] = json!(delta);
+    }
+    summary
 }
 
 fn compare(actual: &Value, expected: &Value) -> Result<(), String> {

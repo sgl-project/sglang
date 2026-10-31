@@ -27,19 +27,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestWrapEncoded(CustomTestCase):
     def setUp(self):
-        # feature_dim == 3 * temporal_patch_size * patch_size**2 == 6.
         self.spec = RustMmSpec(
             family="qwen_vl",
             feature_shm=False,
+            pipeline={},
             image_token_id=10,
-            patch_size=1,
-            merge_size=1,
-            temporal_patch_size=2,
-            min_pixels=1,
-            max_pixels=1 << 30,
-            image_mean=(0.0, 0.0, 0.0),
-            image_std=(1.0, 1.0, 1.0),
-            resample="aten_u8",
             vision_start_token_id=11,
             vision_end_token_id=12,
             video_token_id=13,
@@ -241,7 +233,7 @@ class TestWrapEncodedShm(TestWrapEncoded):
         wrapper neither releases nor discards; that is the drain loop's call."""
         features = np.arange(30, dtype=np.float32)
         meta = msgspec.msgpack.decode(self.meta().tobytes())
-        del meta["items"][1]["model_specific_data"]["image_grid_thw"]
+        del meta["items"][1]["offsets"]
         buffers = {
             "mm.mrope": np.arange(30, dtype=np.int64).reshape(3, 10),
             "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
@@ -317,7 +309,7 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
 
     def test_wrap_failure_rejects_request_and_discards_segments(self):
         meta = msgspec.msgpack.decode(self.meta().tobytes())
-        del meta["items"][1]["model_specific_data"]["image_grid_thw"]
+        del meta["items"][1]["offsets"]
         header = self._header("r1")
         server, errors = self._server(
             header,
