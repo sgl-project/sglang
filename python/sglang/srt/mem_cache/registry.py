@@ -193,7 +193,14 @@ def create_unified_radix_cache(
     )
     tree_slots = list(storage.tree_slots(window_reach=params.draft_swa_window))
 
-    if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+    # C128 pages are owned through the allocator's dedicated C128 sub-allocator,
+    # so the component is only meaningful for models that actually carry
+    # ratio-128 layers (DeepSeek-V4). DeepSeek-V4.1 reuses the NPU req pool --
+    # and therefore its (never populated) sidecar table -- but has no C128 pool
+    # and runs on the generic SWA allocator, which has no `c128_attn_allocator`;
+    # registering the component there makes its hooks fail on that attribute.
+    has_c128_layers = 128 in (getattr(ctx.model_config, "compress_ratios", None) or ())
+    if has_c128_layers and hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
         )

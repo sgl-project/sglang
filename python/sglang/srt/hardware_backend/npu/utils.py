@@ -219,7 +219,39 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
+    try:
+        # Registers the ds41 (DeepSeek-V4.1) Python operators under
+        # cann_ops_transformer.ops.ds41. Absent for DSV4-only deployments.
+        import cann_ops_transformer  # noqa: F401
+    except ImportError as e:
+        logger.warning(
+            "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
+            "will not be registered: %s",
+            e,
+        )
+
     import torch_npu
+
+    # Pre-build torch._dynamo's object rule map BEFORE transfer_to_npu rebinds
+    # torch.cuda.* onto the torch.npu.* objects. The map (lru-cached, built once)
+    # resolves rules by dotted name: torch.cuda.manual_seed_all is a
+    # SkipFunctionVariable (RNG side effects must graph-break) while the
+    # Ascend-registered torch.npu.manual_seed_all is in-graph. Once the rebinding
+    # makes both names resolve to the same function object, the first torch.compile
+    # — in sglang a module-level decorator (sglang/srt/models/cohere2_moe.py)
+    # inside the model registry's bulk import — raises
+    # "Duplicate torch object ... manual_seed_all", and the registry then silently
+    # drops every dynamo-touching model module. Building the map while the cuda/npu
+    # names still refer to distinct objects protects every model at once; the
+    # lru_cache guarantees the post-rebind state can never trigger a rebuild. If
+    # the pre-build ever fails, warn loudly instead of half-mitigating: a broken
+    # rule map must stay visible (the registry logs import failures with tracebacks).
+    try:
+        import torch._dynamo.trace_rules as _trace_rules
+
+        _trace_rules.get_torch_obj_rule_map()
+    except Exception as e:
+        logger.warning("Failed to pre-build torch._dynamo trace rules on NPU: %s", e)
 
     # These imports lead to unpredictable behavior in diffusion models
     # and a significant reduction in performance.
