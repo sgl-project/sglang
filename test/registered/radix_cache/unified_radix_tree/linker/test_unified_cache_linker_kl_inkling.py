@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=300,
+    est_time=500,
     stage="extra-b",
     # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
     runner_config="4-gpu-h100",
@@ -38,6 +38,37 @@ KL_DIV_THRESHOLD = 1e-9
 PAGE_SIZE = 128
 TRACK_INTERVAL = 128
 
+_SERVER_ARGS = [
+    "--trust-remote-code",
+    "--revision",
+    _MODEL_REVISION,
+    "--attention-backend",
+    "fa4",
+    "--page-size",
+    str(PAGE_SIZE),
+    "--mamba-radix-cache-strategy",
+    "extra_buffer",
+    "--mamba-track-interval",
+    str(TRACK_INTERVAL),
+    "--enable-deterministic-inference",
+    "--mem-fraction-static",
+    "0.6",
+    "--max-running-requests",
+    "1",
+    "--enable-cache-report",
+]
+_MTP_ARGS = [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--enable-multi-layer-eagle",
+    "--speculative-num-steps",
+    "2",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "3",
+]
+
 
 class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
     @classmethod
@@ -47,26 +78,7 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
         cls.mooncake = MooncakeTestServices()
         cls.addClassCleanup(cls.mooncake.stop)
         cls.mooncake.start()
-        other_args = [
-            "--trust-remote-code",
-            "--revision",
-            _MODEL_REVISION,
-            "--attention-backend",
-            "fa4",
-            "--page-size",
-            str(PAGE_SIZE),
-            "--mamba-radix-cache-strategy",
-            "extra_buffer",
-            "--mamba-track-interval",
-            str(TRACK_INTERVAL),
-            "--enable-deterministic-inference",
-            "--mem-fraction-static",
-            "0.6",
-            "--max-running-requests",
-            "1",
-            "--enable-cache-report",
-            "--enable-unified-cache-external-linker",
-        ]
+        other_args = _SERVER_ARGS + ["--enable-unified-cache-external-linker"]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -112,6 +124,62 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
             logprobs,
             label="linker_load_back_after_flush",
             sampling_temperature=0,
+        )
+
+
+class TestInklingUnifiedCacheLinkerMTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mooncake = MooncakeTestServices()
+        cls.addClassCleanup(cls.mooncake.stop)
+        cls.mooncake.start()
+        cls.input_ids = get_input_ids(
+            tokenizer_path=_MODEL_PATH, num_samples=4, trust_remote_code=True
+        )
+
+    def _second_turns(self, *, from_l3):
+        base_url = f"http://127.0.0.1:{find_available_port(30000)}"
+        other_args = _SERVER_ARGS + _MTP_ARGS
+        if from_l3:
+            other_args += ["--enable-unified-cache-external-linker"]
+        process = popen_launch_server(
+            _MODEL_PATH,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env("python", **self.mooncake.server_env()),
+        )
+        try:
+            (filler,) = _random_suffixes(1, 1536, seed=7)
+            turns = []
+            for ids, suffix in zip(
+                self.input_ids, _random_suffixes(len(self.input_ids), 256, seed=100)
+            ):
+                first_turn = list(ids[:1024])
+                history = (
+                    first_turn + _generate(base_url, [first_turn], 256)[0]["output_ids"]
+                )
+                if from_l3:
+                    _flush_cache(base_url)
+                    _generate(base_url, [filler], 64)
+                    _flush_cache(base_url)
+                (result,) = _generate(base_url, [history + suffix], 256)
+                meta = result["meta_info"]
+                details = meta.get("cached_tokens_details") or {}
+                self.assertGreater(meta["cached_tokens"], 0)
+                self.assertEqual(
+                    int(details.get("host" if from_l3 else "device", 0)),
+                    meta["cached_tokens"],
+                )
+                turns.append((meta["spec_verify_ct"], result["output_ids"]))
+                _flush_cache(base_url)
+        finally:
+            terminate_and_kill_process_tree(process, wait_timeout=60)
+        return turns
+
+    def test_l3_hit_restores_draft_state(self):
+        self.assertEqual(
+            self._second_turns(from_l3=True), self._second_turns(from_l3=False)
         )
 
 

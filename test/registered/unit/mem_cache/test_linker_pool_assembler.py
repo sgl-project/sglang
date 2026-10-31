@@ -815,6 +815,98 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
 
+    def test_mamba_swa_packs_mtp_draft_kv_and_state(self):
+        from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
+
+        def mha(rows, layers, width):
+            return SimpleNamespace(
+                page_size=2,
+                layer_num=layers,
+                k_scale_buffer=None,
+                native_k_scale_buffer=None,
+                k_buffer=[torch.zeros((rows, width), dtype=torch.uint8)] * layers,
+                v_buffer=[torch.zeros((rows, width), dtype=torch.uint8)] * layers,
+            )
+
+        def mamba(layers):
+            return SimpleNamespace(
+                num_mamba_layers=layers,
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros((layers, 4, 3), dtype=torch.uint8),
+                    conv=[torch.zeros((layers, 4, 2), dtype=torch.uint8)],
+                ),
+            )
+
+        kvcache = SimpleNamespace(
+            start_layer=0,
+            layers_mapping={0: (0, True), 1: (0, False), 2: (1, True)},
+            full_kv_pool=mha(8, 1, 5),
+            swa_kv_pool=mha(4, 2, 3),
+        )
+        drafts = (
+            SimpleNamespace(
+                full_kv_pool=mha(8, 0, 5),
+                swa_kv_pool=mha(8, 1, 7),
+                swa_uses_full_indices=True,
+            ),
+            SimpleNamespace(
+                full_kv_pool=mha(8, 1, 5),
+                swa_kv_pool=mha(4, 0, 3),
+                swa_uses_full_indices=True,
+            ),
+            SimpleNamespace(
+                full_kv_pool=mha(8, 0, 5),
+                swa_kv_pool=mha(4, 1, 3),
+                swa_uses_full_indices=False,
+            ),
+        )
+        draft_mamba = (mamba(1), mamba(1))
+        params = SimpleNamespace(
+            mtp_draft_device_pools=drafts,
+            mtp_draft_mamba_pools=draft_mamba,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(
+                    pool=mamba(2),
+                    layer_map={0: 0, 2: 1},
+                    ckpt_pool=None,
+                    short_conv_pool=SimpleNamespace(enabled=False),
+                    ngram_pool=SimpleNamespace(enabled=False),
+                )
+            ),
+        )
+        with patch.object(
+            linker_pool_assembler,
+            "get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            group = linker_pool_assembler._build_mamba_swa_device_pool_group(
+                kvcache, params, page_size=2
+            )
+
+        def page_ptrs(name, indices):
+            return set(group.entry_map[name].get_page_buffer_meta(indices)[0])
+
+        def row_ptr(buffer, row):
+            return buffer[row].data_ptr()
+
+        self.assertEqual(group.num_layers, 3)
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.layer_mapping, {1: (0, 1, 2, 3, 4, 5)})
+        kv_ptrs = page_ptrs(PoolName.KV, torch.tensor([2, 3]))
+        for pool in (drafts[0].swa_kv_pool, drafts[1].full_kv_pool):
+            self.assertIn(row_ptr(pool.k_buffer[0], 2), kv_ptrs)
+            self.assertIn(row_ptr(pool.v_buffer[0], 2), kv_ptrs)
+        swa = group.entry_map[PoolName.SWA]
+        self.assertEqual(swa.layer_mapping, {0: (0, 2), 2: (1, 3, 4, 5)})
+        swa_ptrs = page_ptrs(PoolName.SWA, torch.tensor([2, 3]))
+        self.assertIn(row_ptr(drafts[2].swa_kv_pool.k_buffer[0], 2), swa_ptrs)
+        mamba_entry = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(mamba_entry.layer_mapping, {0: 0, 2: (1, 2, 3)})
+        mamba_ptrs = page_ptrs(PoolName.MAMBA, torch.tensor([3]))
+        for pool in draft_mamba:
+            self.assertIn(row_ptr(pool.mamba_cache.temporal[0], 3), mamba_ptrs)
+            self.assertIn(row_ptr(pool.mamba_cache.conv[0][0], 3), mamba_ptrs)
+
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
