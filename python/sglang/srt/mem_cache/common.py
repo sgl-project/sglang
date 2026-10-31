@@ -372,8 +372,7 @@ def backup_kv_cache(
     if backend == "none":
         return False
     if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
-        if req.multimodal_inputs is not None:
-            # The recompute payload carries token ids only; images would be lost.
+        if not req.resumable_by_rebootstrap:
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from array import array
 from dataclasses import InitVar, dataclass, field
 from enum import Enum, auto
 from typing import (
@@ -9,6 +10,7 @@ from typing import (
     Any,
     Callable,
     ClassVar,
+    Dict,
     List,
     Optional,
 )
@@ -36,9 +38,17 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_observability,
+    get_parallel,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_decoding_metrics import (
+    populate_spec_info,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
@@ -189,6 +199,33 @@ class SchedulerOutputStreamer:
         if req.detokenize_header_sent:
             self.send_to_detokenizer.send_output(DetokenizeReleaseReq(rid=req.rid))
 
+    def get_request_stats(self, req: Req, completion_tokens: int) -> Dict[str, Any]:
+        """A finished request's ``meta_info`` keys that Python's
+        TokenizerManager derives from scheduler state, built with the helpers
+        it uses, for the Rust frontend to report as they are: the retraction
+        count, the scheduler's timings when metrics are on, and the
+        speculative-decoding stats. TokenizerManager also reports the first
+        two on intermediate frames; the frontend reports them only on the
+        terminal one."""
+        stats: Dict[str, Any] = {"num_retractions": req.retraction_count}
+        if get_observability().enable_metrics:
+            output_time_stats = req.time_stats.to_output_time_stats()
+            if output_time_stats is not None:
+                stats.update(output_time_stats.to_meta_info())
+        if not self.spec_algorithm.is_none():
+            populate_spec_info(
+                stats,
+                num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                completion_tokens=completion_tokens,
+                verify_ct=req.spec_verify_ct,
+                num_correct_drafts=req.spec_num_correct_drafts,
+                num_cap_tokens=req.spec_num_cap_tokens,
+                num_block_accept_tokens=req.spec_num_block_accept_tokens,
+                correct_drafts_histogram=req.spec_correct_drafts_histogram,
+                cap_lens_histogram=req.spec_cap_lens_histogram,
+            )
+        return stats
+
     def stream_output(
         self,
         reqs: List[Req],
@@ -257,6 +294,9 @@ class SchedulerOutputStreamer:
             cached_tokens_split=(
                 [] if self._rust_frames_split_cached_tokens() else None
             ),
+            get_request_stats=(
+                self.get_request_stats if self.rust_server is not None else None
+            ),
         )
         for req in reqs:
             if req is skip_req:
@@ -302,6 +342,7 @@ class SchedulerOutputStreamer:
                         if acc.cached_tokens_split and self.enable_hicache_storage()
                         else None
                     ),
+                    acc.rust_request_stats,
                 )
             else:
                 self.send_to_detokenizer.send_output(payload)
@@ -340,6 +381,8 @@ class SchedulerOutputStreamer:
 
         embeddings = []
         request_stats = []
+        tensor_embeddings = []
+        has_tensor_embeddings = False
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -347,7 +390,13 @@ class SchedulerOutputStreamer:
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
+                if isinstance(req.embedding, torch.Tensor):
+                    embeddings.append([])
+                    tensor_embeddings.append(req.embedding)
+                    has_tensor_embeddings = True
+                else:
+                    embeddings.append(req.embedding)
+                    tensor_embeddings.append(None)
                 request_stats.append(self.build_request_stats(req))
 
                 phs = req.pooled_hidden_state
@@ -387,6 +436,9 @@ class SchedulerOutputStreamer:
                 request_stats=request_stats,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
+                tensor_embeddings=(
+                    tensor_embeddings if has_tensor_embeddings else None
+                ),
                 pooled_hidden_states=stacked_phs,
             )
         )
@@ -412,7 +464,9 @@ class _GenerationStreamAccumulator:
     http_worker_ipcs: list = field(default_factory=list)
     has_http_worker_ipc: bool = False
     finished_reasons: list = field(default_factory=list)
-    output_ids: list = field(default_factory=list)
+    # See BatchTokenIDOutput.output_ids_flat.
+    output_ids_flat: array = field(default_factory=lambda: array("q"))
+    output_ids_offsets: list = field(default_factory=lambda: [0])
     # OutputSink.DETOKENIZER only.
     detokenize_headers: list = field(default_factory=list)
     has_detokenize_header: bool = False
@@ -433,6 +487,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
+    prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -466,6 +521,12 @@ class _GenerationStreamAccumulator:
     # request's cached tokens per tier, as (device, host, storage). None
     # otherwise.
     cached_tokens_split: Optional[list] = None
+    # Rust server mode: builds a finished request's `request_stats` from it and
+    # its completion tokens (`SchedulerOutputStreamer.get_request_stats`).
+    # None otherwise.
+    get_request_stats: Optional[Callable[[Req, int], Dict[str, Any]]] = None
+    # By row, the finished requests' `request_stats`.
+    rust_request_stats: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.output_sink is OutputSink.RUST:
@@ -551,7 +612,8 @@ class _GenerationStreamAccumulator:
         )
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-        self.output_ids.append(output_ids_[send_token_offset:])
+        self.output_ids_flat.extend(output_ids_[send_token_offset:])
+        self.output_ids_offsets.append(len(self.output_ids_flat))
         req.send_token_offset = len(output_ids_)
         # A verified token block can extend past the stop position. Report
         # reasoning usage only within the same prefix as completion usage.
@@ -620,8 +682,19 @@ class _GenerationStreamAccumulator:
                 latency = _scheduler_decode_latency(req.time_stats)
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
+            self.prefill_weight_versions.append(req.prefill_weight_versions)
+            if self.get_request_stats is not None:
+                self.rust_request_stats[len(self.rids) - 1] = self.get_request_stats(
+                    req,
+                    (
+                        beam_completion_tokens(beam_output)
+                        if beam_output is not None
+                        else len(output_ids_)
+                    ),
+                )
         else:
             self.weight_versions.append(None)
+            self.prefill_weight_versions.append(None)
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -752,7 +825,8 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
-        current_output_len = len(self.output_ids[-1])
+        offsets = self.output_ids_offsets
+        current_output_len = offsets[-1] - offsets[-2]
         if req.customized_info is not None:
             for key, req_values in req.customized_info.items():
                 is_request_level = self.is_request_level_customized_info_key(key)
@@ -764,8 +838,8 @@ class _GenerationStreamAccumulator:
                         continue
                 if key not in self.customized_info:
                     self.customized_info[key] = [
-                        [] if is_request_level else [None] * len(prev_output_ids)
-                        for prev_output_ids in self.output_ids[:-1]
+                        [] if is_request_level else [None] * (end - start)
+                        for start, end in zip(offsets[:-2], offsets[1:-1])
                     ]
                 if req_values is None:
                     values = [] if is_request_level else [None] * current_output_len
@@ -776,7 +850,7 @@ class _GenerationStreamAccumulator:
                 self.customized_info[key].append(values)
 
         for key, per_request_values in self.customized_info.items():
-            if len(per_request_values) < len(self.output_ids):
+            if len(per_request_values) < len(self.rids):
                 per_request_values.append(
                     []
                     if self.is_request_level_customized_info_key(key)
@@ -805,7 +879,8 @@ class _GenerationStreamAccumulator:
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             finished_reasons=self.finished_reasons,
-            output_ids=self.output_ids,
+            output_ids_flat=self.output_ids_flat,
+            output_ids_offsets=self.output_ids_offsets,
             detokenize_headers=(
                 self.detokenize_headers if self.has_detokenize_header else None
             ),
@@ -872,6 +947,11 @@ class _GenerationStreamAccumulator:
             ),
             weight_versions=(
                 self.weight_versions if any(self.weight_versions) else None
+            ),
+            prefill_weight_versions=(
+                self.prefill_weight_versions
+                if any(self.prefill_weight_versions)
+                else None
             ),
             dp_ranks=dp_ranks,
         )

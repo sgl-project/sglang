@@ -806,6 +806,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             {name: buffer[:num_tokens] for name, buffer in buffers.items()}
         )
 
+    def _zero_padded_tail(self) -> bool:
+        # The padded attention tail is uninitialized graph-pool memory. Skipping
+        # its zeroing is safe only when everything after attention is row-local:
+        # MoE routing/collectives and per-tensor dynamic activation quantization
+        # (amax over all rows) read padded rows, and other devices are unaudited.
+        model_config = getattr(self.model_runner, "model_config", None)
+        return (
+            not is_cuda()
+            or any(self.moe_layers or ())
+            or self.quant_config is not None
+            or getattr(model_config, "quantization", None) is not None
+        )
+
     @contextmanager
     def _prefill_forward_context(
         self,
@@ -817,7 +830,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with (
             set_forward_batch(forward_batch),
             prefill_graph_scope(
-                full_graph=self._is_full_backend, raw_num_tokens=raw_num_tokens
+                full_graph=self._is_full_backend,
+                raw_num_tokens=raw_num_tokens,
+                zero_padded_tail=self._zero_padded_tail(),
             ),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend),
@@ -953,7 +968,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         with (
             set_forward_batch(fb),
-            prefill_graph_scope(full_graph=self._is_full_backend),
+            prefill_graph_scope(
+                full_graph=self._is_full_backend,
+                zero_padded_tail=self._zero_padded_tail(),
+            ),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend),
                 forward_batch=fb,
