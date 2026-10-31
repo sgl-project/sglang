@@ -55,14 +55,18 @@ del _fn
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
-register_kernel(
-    KernelSpec(
-        op="layernorm.rmsnorm_hf",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.layernorm.rmsnorm_hf:rmsnorm_hf",
-        capabilities=CUDA_ONLY,
+# The rmsnorm family: one JIT template for plain / fused residual-add / fp8 per-tensor quant.
+for _fn in ("rmsnorm", "fused_add_rmsnorm", "rmsnorm_quant", "fused_add_rmsnorm_quant"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.norm:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
     )
-)
+del _fn
+
 register_kernel(
     KernelSpec(
         op="layernorm.grouped_gemma_rmsnorm",
