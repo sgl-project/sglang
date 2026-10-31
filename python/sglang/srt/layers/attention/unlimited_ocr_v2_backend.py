@@ -55,8 +55,8 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
 from sglang.srt.runtime_context import max_speculative_num_draft_tokens
-from sglang.srt.session import uocr_doc_reuse
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

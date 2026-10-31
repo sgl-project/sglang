@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.session import uocr_doc_prefetch as p
-from sglang.srt.session.uocr_doc_reuse import UocrReqState
+from sglang.srt.models.unlimited_ocr_v2_support import document_prefetch as p
+from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

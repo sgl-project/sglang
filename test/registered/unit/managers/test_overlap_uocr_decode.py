@@ -9,14 +9,12 @@ from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
 )
 from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
-from sglang.srt.model_executor.model_runner_components.uocr_greedy_graph import (
-    UocrGreedyGraph,
-)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from sglang.srt.model_executor.runner.uocr_decode_graph_io import UOCRDecodeGraphIO
+from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
+from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

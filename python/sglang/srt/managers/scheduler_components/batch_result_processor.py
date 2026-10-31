@@ -74,7 +74,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
-    from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
@@ -84,6 +83,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)

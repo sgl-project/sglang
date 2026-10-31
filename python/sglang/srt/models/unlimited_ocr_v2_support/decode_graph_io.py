@@ -12,9 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.model_runner_components.uocr_greedy_graph import (
-        UocrGreedyGraph,
-    )
+    from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
 
 
 class UOCRDecodeGraphIO:

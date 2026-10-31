@@ -186,9 +186,6 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     SpecAuxHiddenStateConfig,
     resolve_spec_aux_hidden_state_config,
 )
-from sglang.srt.model_executor.model_runner_components.uocr_greedy_graph import (
-    UocrGreedyGraph,
-)
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
     WeightExporter,
 )
@@ -200,6 +197,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,

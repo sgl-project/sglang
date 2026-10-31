@@ -6,14 +6,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.scheduler_components.async_shm_materializer import (
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     AsyncShmMaterializer,
     ShmPointerMMData,
     create_async_shm_materializer,
     estimate_shm_bytes,
-)
-from sglang.srt.managers.scheduler_components.request_receiver import (
-    SchedulerRequestReceiver,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

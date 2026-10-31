@@ -16,7 +16,7 @@ from sglang.srt.utils.common import ceil_align, is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang.srt.session.uocr_doc_reuse import DocReuse
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 
 logger = logging.getLogger(__name__)

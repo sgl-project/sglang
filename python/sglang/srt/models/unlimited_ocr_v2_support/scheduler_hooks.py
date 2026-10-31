@@ -9,8 +9,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable, List, Optional
 
-from sglang.srt.session.uocr_doc_prefetch import DocPrefetch, EarlyEmbeddings
-from sglang.srt.session.uocr_doc_reuse import (
+from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import (
+    DocPrefetch,
+    EarlyEmbeddings,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     META_FORCED_TOKENS,
     DocReuse,
     forced_len,
@@ -25,7 +28,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_policy import PrefillAdder
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    from sglang.srt.model_executor.runner.uocr_decode_graph_io import (
+    from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
         UOCRDecodeGraphIO,
     )
 

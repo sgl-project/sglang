@@ -5,7 +5,9 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.models.unlimited_ocr_crop_transfer import UnlimitedOcrCropTransfer
+from sglang.srt.models.unlimited_ocr_v2_support.crop_transfer import (
+    UnlimitedOcrCropTransfer,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

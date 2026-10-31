@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.models.unlimited_ocr_crop_transfer import (
+    from sglang.srt.models.unlimited_ocr_v2_support.crop_transfer import (
         UnlimitedOcrCropTransfer,
     )
 
@@ -236,10 +236,6 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
-from sglang.srt.managers.scheduler_components.async_shm_materializer import (
-    AsyncShmMaterializer,
-    create_async_shm_materializer,
-)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -284,9 +280,6 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.managers.scheduler_components.overlap_release import (
-    DeferredOverlapRelease,
-)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -300,7 +293,6 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
-from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -326,11 +318,19 @@ from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner.uocr_decode_graph_io import (
-    resolve_uocr_decode_graph_io,
-)
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
+    AsyncShmMaterializer,
+    create_async_shm_materializer,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
+    resolve_uocr_decode_graph_io,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.overlap_release import (
+    DeferredOverlapRelease,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,

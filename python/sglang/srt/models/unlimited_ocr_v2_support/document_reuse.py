@@ -26,7 +26,7 @@ from typing import (
 import msgspec
 import torch
 
-from sglang.srt.sampling.doc_window_params import (
+from sglang.srt.models.unlimited_ocr_v2_support.window_params import (
     KEY_DOC_ID,
     KEY_KEEP,
     KEY_LOOKAHEAD,
@@ -1091,7 +1091,9 @@ class DocReuse:
             FINISH_MATCHED_STR,
             FINISH_MATCHED_TOKEN,
         )
-        from sglang.srt.session.document_session import DocumentSessionSlot
+        from sglang.srt.models.unlimited_ocr_v2_support.retained_window import (
+            DocumentSessionSlot,
+        )
 
         cp = _doc_params(req)
         if cp is None:

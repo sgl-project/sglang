@@ -140,7 +140,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.session.uocr_doc_reuse import DocReuse
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 

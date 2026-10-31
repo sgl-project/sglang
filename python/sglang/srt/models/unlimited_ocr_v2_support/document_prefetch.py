@@ -22,8 +22,11 @@ from sglang.srt.managers.mm_schedule import (
     PrefetchedEmbeddingFunc,
     _move_items_to_device,
 )
-from sglang.srt.sampling.doc_window_params import KEY_KEEP
-from sglang.srt.session.uocr_doc_reuse import forced_len, req_state
+from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
+    forced_len,
+    req_state,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.window_params import KEY_KEEP
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import MultimodalDataItem, Req

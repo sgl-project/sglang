@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
@@ -30,7 +31,6 @@ from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
 )
-from sglang.srt.session.uocr_doc_reuse import UocrReqState
 from sglang.test.test_utils import CustomTestCase
 
 

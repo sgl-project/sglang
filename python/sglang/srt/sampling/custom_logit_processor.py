@@ -9,7 +9,7 @@ import msgspec
 import orjson
 import torch
 
-from sglang.srt.sampling.doc_window_params import KEY_LOOKAHEAD
+from sglang.srt.models.unlimited_ocr_v2_support.window_params import KEY_LOOKAHEAD
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req

@@ -51,7 +51,7 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.scheduler_components.async_shm_materializer import (
+    from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
         AsyncShmMaterializer,
     )
     from sglang.srt.rust_server.server import RustServer

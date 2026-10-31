@@ -20,9 +20,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.async_shm_materializer import (
-    AsyncShmMaterializer,
-)
+from sglang.srt.models.unlimited_ocr_v2_support.async_shm import AsyncShmMaterializer
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
 )

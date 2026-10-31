@@ -33,7 +33,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
     MAX_PAGE_PROMPT_TOKENS,
     UocrDocumentConfig,
 )
-from sglang.srt.entrypoints.openai import doc_split
+from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

@@ -13,13 +13,13 @@ from sglang.srt.models.deepseek_ocr import (
     get_rel_pos,
 )
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
-from sglang.srt.models.unlimited_ocr_crop_transfer import (
-    RetiredTransfer,
-    UnlimitedOcrCropTransfer,
-)
 from sglang.srt.models.unlimited_ocr_v2 import (
     UnlimitedOCRV2Attention,
     UnlimitedOCRV2ForCausalLM,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.crop_transfer import (
+    RetiredTransfer,
+    UnlimitedOcrCropTransfer,
 )
 from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
 from sglang.srt.server_args import ServerArgs

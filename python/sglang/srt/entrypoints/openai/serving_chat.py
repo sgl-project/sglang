@@ -85,7 +85,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.entrypoints.openai.serving_chat_doc_split import ChatDocSplitter
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -111,6 +110,7 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,

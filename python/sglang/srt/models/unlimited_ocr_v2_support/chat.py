@@ -25,8 +25,6 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
     DEFAULT_LOOKAHEAD_PAGES,
     UocrDocumentConfig,
 )
-from sglang.srt.entrypoints.openai import doc_split
-from sglang.srt.entrypoints.openai.doc_kv_state import DocumentKVState
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
@@ -37,8 +35,13 @@ from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import should_include_usage
 from sglang.srt.environ import envs
+from sglang.srt.models.unlimited_ocr_v2_support import (
+    document_prefetch as uocr_doc_prefetch,
+)
+from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
+from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
+from sglang.srt.models.unlimited_ocr_v2_support.document_plan import DocumentKVState
 from sglang.srt.runtime_context import get_mm, get_serving
-from sglang.srt.session import uocr_doc_prefetch, uocr_doc_reuse
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat

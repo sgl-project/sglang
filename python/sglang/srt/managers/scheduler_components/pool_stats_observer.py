@@ -18,11 +18,11 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ReqKvInfo
-    from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv.storage import KVStorage, SubPoolUsage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]

@@ -163,9 +163,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
     from sglang.srt.sampling.custom_logit_processor import PageGuardState
     from sglang.srt.session.session_controller import Session
-    from sglang.srt.session.uocr_doc_reuse import UocrReqState
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Constant used as the base offset for MM (multimodal) pad values.

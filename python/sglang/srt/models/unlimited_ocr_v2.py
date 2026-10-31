@@ -34,10 +34,12 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekMLP, DeepseekMoE
 from sglang.srt.models.deepseek_ocr import clear_sam_rel_pos_cache
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
-from sglang.srt.models.unlimited_ocr_crop_transfer import UnlimitedOcrCropTransfer
+from sglang.srt.models.unlimited_ocr_v2_support.crop_transfer import (
+    UnlimitedOcrCropTransfer,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import EarlyEmbeddings
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.session.uocr_doc_prefetch import EarlyEmbeddings
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)

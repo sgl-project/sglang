@@ -22,7 +22,7 @@ from sglang.srt.managers.incremental_detokenize import (
     build_detokenize_header,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.session import uocr_doc_reuse as r
+from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as r
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

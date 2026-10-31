@@ -7,8 +7,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
-from sglang.srt.entrypoints.openai import doc_split, serving_chat_doc_split
-from sglang.srt.entrypoints.openai.doc_kv_state import DocumentKVState
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -17,9 +15,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     DocSplitOptions,
     UsageInfo,
 )
+from sglang.srt.models.unlimited_ocr_v2_support import chat as serving_chat_doc_split
+from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
+from sglang.srt.models.unlimited_ocr_v2_support.document_plan import DocumentKVState
+from sglang.srt.models.unlimited_ocr_v2_support.retained_window import (
+    DocumentSessionSlot,
+)
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.runtime_context import get_context
-from sglang.srt.session.document_session import DocumentSessionSlot
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -491,7 +494,9 @@ class TestWindowLookahead(CustomTestCase):
         return [{"role": "user", "content": content}]
 
     def _sub(self, plan, bi, n, lookahead=1):
-        from sglang.srt.session import uocr_doc_reuse
+        from sglang.srt.models.unlimited_ocr_v2_support import (
+            document_reuse as uocr_doc_reuse,
+        )
 
         request = ChatCompletionRequest(
             model="m",

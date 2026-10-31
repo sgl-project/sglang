@@ -53,7 +53,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
