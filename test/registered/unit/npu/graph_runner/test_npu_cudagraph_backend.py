@@ -21,11 +21,7 @@ def _make_backend():
         set_device=mock.Mock(),
         Event=mock.Mock(),
     )
-    runner = SimpleNamespace(
-        device_module=device_module,
-        enable_torch_compile=False,
-        model_runner=SimpleNamespace(is_draft_worker=False),
-    )
+    runner = SimpleNamespace(device_module=device_module, enable_torch_compile=False)
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
