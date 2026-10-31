@@ -3,7 +3,7 @@
 import hashlib
 import math
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -718,7 +718,6 @@ class UnlimitedVLConfig(PretrainedConfig):
     tile_tag: str = "2D"
     global_view_pos: str = "head"
     candidate_resolutions: tuple[tuple[int, int]] = ((384, 384),)
-    customized_processor_type: type[Any] = UnlimitedOCRHFProcessor
 
     def __init__(
         self,
@@ -746,9 +745,23 @@ class UnlimitedVLConfig(PretrainedConfig):
         self.hidden_size = self.text_config.hidden_size
 
 
-AutoProcessor.register(UnlimitedVLConfig, UnlimitedOCRHFProcessor)
+@register_customized_processor(processor_class=UnlimitedOCRHFProcessor)
+class UnlimitedOCRConfig(UnlimitedVLConfig):
+    """UnlimitedVLConfig under the model_type spelling of the re-saved checkpoint."""
 
-try:
-    AutoConfig.register("unlimited-ocr", UnlimitedVLConfig)
-except ValueError:
-    pass
+    # baidu/Unlimited-OCR revision 8249d20b renamed model_type to this spelling;
+    # earlier revisions still use "unlimited-ocr".
+    model_type = "unlimited_ocr"
+
+    # Must be defined here: transformers 5.x replaces an inherited __init__ with a
+    # dataclass one, which would skip building text_config and the sub-configs.
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+
+for _config_cls in (UnlimitedVLConfig, UnlimitedOCRConfig):
+    AutoProcessor.register(_config_cls, UnlimitedOCRHFProcessor)
+    try:
+        AutoConfig.register(_config_cls.model_type, _config_cls)
+    except ValueError:
+        pass

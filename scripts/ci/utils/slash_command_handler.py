@@ -1729,6 +1729,9 @@ def handle_run_cpu_ci(gh_repo, pr, comment, user_perms, token):
     Always dispatched on main with the head SHA as an input, for forks and
     in-repo PRs alike, so the workflow definition is main's. It runs PR code on
     hosted runners with no secrets, so it takes the /rerun-test gate.
+
+    Like /rerun-test, the reply comment is posted before dispatching so the run
+    can write its result back to it (update_rerun_test_status.py).
     """
     if not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "run-cpu-ci"
@@ -1750,12 +1753,21 @@ def handle_run_cpu_ci(gh_repo, pr, comment, user_perms, token):
         pr.create_issue_comment(f"⛔ `{CPU_CI_WORKFLOW_FILE}` not found: {e}")
         return False
 
+    target = f"`{CPU_CI_SUITE}` on `{head_sha[:12]}`"
+    marker = "<!--rrt:0-->"
+    reply_comment = pr.create_issue_comment(f"🚀 Dispatching {target}...")
+
     dispatch_time = time.time()
     resp = requests.post(
         f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{workflow.id}/dispatches",
         json={
             "ref": ref,
-            "inputs": {"git_ref": head_sha, "pr_number": str(pr.number)},
+            "inputs": {
+                "git_ref": head_sha,
+                "pr_number": str(pr.number),
+                "reply_comment_id": str(reply_comment.id),
+                "reply_marker": marker,
+            },
         },
         headers={
             "Authorization": f"Bearer {token}",
@@ -1765,7 +1777,7 @@ def handle_run_cpu_ci(gh_repo, pr, comment, user_perms, token):
     if resp.status_code not in (200, 204):
         print(f"Dispatch failed: {resp.status_code} {resp.text}")
         comment.create_reaction("confused")
-        pr.create_issue_comment(
+        reply_comment.edit(
             f"⛔ Failed to dispatch `{CPU_CI_WORKFLOW_FILE}`: {resp.status_code}"
         )
         return False
@@ -1779,12 +1791,15 @@ def handle_run_cpu_ci(gh_repo, pr, comment, user_perms, token):
         dispatch_time,
         pr_head_sha=head_sha,
     )
-    target = f"`{CPU_CI_SUITE}` on `{head_sha[:12]}`"
+    # The marker ends the line: the writeback swaps the ⏳ before it for ✅/❌.
     if run_url:
-        pr.create_issue_comment(f"🚀 Running {target}: [View workflow run]({run_url})")
+        reply_comment.edit(
+            f"🚀 Running {target}: ⏳ [View workflow run]({run_url}) {marker}"
+        )
     else:
-        pr.create_issue_comment(
-            f"🚀 Running {target}. Could not retrieve the run URL; check the "
+        reply_comment.edit(
+            f"🚀 Running {target}: ⏳ {marker}\n\n"
+            f"⚠️ Could not retrieve the run URL; check the "
             f"[Actions tab](https://github.com/{gh_repo.full_name}/actions/workflows/{CPU_CI_WORKFLOW_FILE})."
         )
     comment.create_reaction("+1")

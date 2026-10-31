@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import pickle
 import struct
 from array import array
 from typing import Sequence, Union
@@ -8,15 +10,31 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
-
 # Stable wire IDs. Changing these requires updating the golden-wire test.
 _MSGPACK_EXT_ARRAY = 1
 _MSGPACK_EXT_TORCH_TENSOR = 2
 _MSGPACK_EXT_NP_ARRAY = 3
 _MSGPACK_EXT_SHM_POINTER_MM_DATA = 4
-_MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY = 5
+# A pickled value in an object-typed field, where a PickleWrapper struct would
+# decode as a dict. ext_hook leaves it an Ext, so a forwarding hop re-sends it
+# unchanged; unpickle_values restores it on the receiver.
+_MSGPACK_EXT_PICKLED_VALUE = 6
 _MSGPACK_BUFFER_METADATA_SIZE = struct.Struct(">I")
+# Values that decode from msgpack IPC with the same type and contents.
+_MSGPACK_FAITHFUL_TYPES = frozenset(
+    (
+        type(None),
+        bool,
+        int,
+        float,
+        str,
+        bytes,
+        torch.Tensor,
+        np.ndarray,
+        array,
+        msgspec.msgpack.Ext,
+    )
+)
 
 
 def _pack_ext(code: int, obj: object) -> msgspec.msgpack.Ext:
@@ -131,23 +149,59 @@ def _decode_shm_pointer_mm_data(state: dict[str, object]) -> object:
     return obj
 
 
-def _encode_cuda_ipc_tensor_proxy(obj: CudaIpcTensorTransportProxy) -> object:
-    return {
-        "proxy_state": _to_msgpack_state(obj.proxy_state),
-        "sync_data_meta": _to_msgpack_state(obj.sync_data_meta),
-    }
+def _is_msgpack_faithful(value: object) -> bool:
+    value_type = type(value)
+    if value_type in _MSGPACK_FAITHFUL_TYPES:
+        return True
+    if value_type is list:
+        # The first check covers a flat list of leaves without a Python call each.
+        return _MSGPACK_FAITHFUL_TYPES.issuperset(map(type, value)) or all(
+            map(_is_msgpack_faithful, value)
+        )
+    if value_type is dict:
+        return all(
+            type(key) is str and _is_msgpack_faithful(item)
+            for key, item in value.items()
+        )
+    return _is_shm_pointer_mm_data(value)
 
 
-def _decode_cuda_ipc_tensor_proxy(
-    state: dict[str, object],
-) -> CudaIpcTensorTransportProxy:
-    obj = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
-    obj.proxy_state = _from_msgpack_state(state["proxy_state"])
-    obj.reconstruct_tensor = None
-    obj.sync_data_meta = _from_msgpack_state(state["sync_data_meta"])
-    obj.sync_buffer = None
-    obj._consumer_acknowledged = False
-    return obj
+def _is_pickled_value(value: object) -> bool:
+    return (
+        type(value) is msgspec.msgpack.Ext and value.code == _MSGPACK_EXT_PICKLED_VALUE
+    )
+
+
+def pickle_unfaithful_values(values: list) -> list:
+    """Pickle each value that msgpack would not decode back unchanged.
+
+    msgspec encodes tuples as lists and dataclasses as dicts without calling
+    enc_hook, so object-typed fields pass their values through here. One
+    pickler handles them all, so an object shared by several values (a packed
+    CUDA VMM owner) is still shared after unpickle_values.
+    """
+    if all(map(_is_msgpack_faithful, values)):
+        return values
+    buffer = io.BytesIO()
+    pickler = pickle.Pickler(buffer, protocol=pickle.HIGHEST_PROTOCOL)
+    wrapped = []
+    for value in values:
+        if not _is_msgpack_faithful(value):
+            pickler.dump(value)
+            value = msgspec.msgpack.Ext(_MSGPACK_EXT_PICKLED_VALUE, buffer.getvalue())
+            buffer.seek(0)
+            buffer.truncate()
+        wrapped.append(value)
+    return wrapped
+
+
+def unpickle_values(values: list) -> list:
+    """Inverse of pickle_unfaithful_values, given the values in the same order."""
+    pickled = [value.data for value in values if _is_pickled_value(value)]
+    if not pickled:
+        return values
+    unpickler = pickle.Unpickler(io.BytesIO(b"".join(pickled)))
+    return [unpickler.load() if _is_pickled_value(value) else value for value in values]
 
 
 def enc_hook(obj: object) -> object:
@@ -178,11 +232,6 @@ def enc_hook(obj: object) -> object:
         return int(obj)
     if isinstance(obj, np.bool_):
         return bool(obj)
-    if isinstance(obj, CudaIpcTensorTransportProxy):
-        return _pack_ext(
-            _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
-            _encode_cuda_ipc_tensor_proxy(obj),
-        )
     if _is_shm_pointer_mm_data(obj):
         return _pack_ext(
             _MSGPACK_EXT_SHM_POINTER_MM_DATA,
@@ -224,7 +273,6 @@ def ext_hook(code: int, data: memoryview) -> object:
         _MSGPACK_EXT_TORCH_TENSOR,
         _MSGPACK_EXT_NP_ARRAY,
         _MSGPACK_EXT_SHM_POINTER_MM_DATA,
-        _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
     ):
         return msgspec.msgpack.Ext(code, bytes(data))
 
@@ -243,6 +291,4 @@ def ext_hook(code: int, data: memoryview) -> object:
         return np.frombuffer(raw_data, dtype=np.dtype(dtype)).copy().reshape(shape)
     if code == _MSGPACK_EXT_SHM_POINTER_MM_DATA:
         return _decode_shm_pointer_mm_data(_unpack_ext(data))
-    if code == _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY:
-        return _decode_cuda_ipc_tensor_proxy(_unpack_ext(data))
     raise AssertionError(f"Unhandled known MessagePack extension code: {code}")

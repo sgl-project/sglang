@@ -117,12 +117,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
-    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
-    # whose heuristic reads the post-capture KV sizing switch.
-    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
-
-    apply_muse_spark_env_defaults(server_args)
-
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
@@ -147,6 +141,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_pd_disaggregation, server_args)
+
+    # Resolve checkpoint/hardware defaults after explicit quantization opt-outs,
+    # but before GPU memory sizing and the generic backend defaults consume them.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
 
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
@@ -202,6 +202,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_nccl_pre_warm,
         handle_npu_backends,
         handle_platform_defaults,
+        handle_sail_backends,
         handle_symm_mem_device_support,
         handle_xpu_backends,
     )
@@ -211,6 +212,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_npu_backends, server_args)
     run_hook(handle_mps_backends, server_args)
     run_hook(handle_xpu_backends, server_args)
+    run_hook(handle_sail_backends, server_args)
     # Must precede handle_gpu_memory_settings: its symm-mem prealloc default
     # keys off enable_symm_mem.
     run_hook(handle_symm_mem_device_support, server_args)
@@ -358,16 +360,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     # needs the resolved CUDA-graph, attention-backend and speculative settings
-    from sglang.srt.kernel_plugins.amd.binding import (
-        handle_amd_monokernel,
-    )
+    from sglang.srt.kernel_plugins.amd.binding import handle_monokernel
     from sglang.srt.kernel_plugins.nvidia.binding import (
         handle_nvidia_megakernel,
     )
 
     # first, so a server with both kernel flags gets every reason in one error
     run_hook(handle_nvidia_megakernel, server_args)
-    run_hook(handle_amd_monokernel, server_args)
+    run_hook(handle_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 

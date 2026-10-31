@@ -405,7 +405,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/run-extra-ci amd`, `/run-amd-extra-ci`, `/run-ci amd-extra` | Adds `run-ci` and `run-ci-amd-extra`, then reruns only AMD Extra, including green runs. Base CI behavior is unchanged; existing labels are kept. |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
-| `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
+| `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved; writes ✅/❌ back to its reply comment. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 
@@ -415,8 +415,8 @@ The registry contains `nv-extra`, selecting `pr-test-extra.yml` with
 `run-ci-nv-extra`, and `amd-extra`, selecting `pr-test-amd-extra.yml` with
 `run-ci-amd-extra`. NVIDIA/shared Extra includes its existing Xeon CPU coverage.
 The `nv` and `amd` entries select Base workflows; `mlu` selects `pr-test-mlu.yml`
-with `run-ci-mlu`. PPU is not registered; its workflow uses `run-ci` and
-`run-ci-ppu` labels plus PPU path filters.
+with `run-ci-mlu`, and `ppu` selects `pr-test-ppu.yml` with `run-ci-ppu`.
+PPU retains its existing path filters.
 
 `/run-extra-ci <hardware>` and `/run-full-ci <hardware>` require exactly one
 `nv` or `amd` argument. Full combines the matching Base and Extra tiers. Missing,

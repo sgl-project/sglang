@@ -1876,7 +1876,6 @@ class KVCacheConfigurator:
             head_num=target_pool.head_num,
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
-            enable_alt_stream=not get_disagg().enable_pdmux,
         )
 
     def _build_dsv4_kv_pool(
@@ -2639,7 +2638,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not get_disagg().enable_pdmux,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             **pool_kwargs,
         )

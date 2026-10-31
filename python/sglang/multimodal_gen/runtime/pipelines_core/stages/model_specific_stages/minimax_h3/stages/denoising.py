@@ -678,9 +678,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             or current_platform.is_mps()
             or current_platform.is_npu()
             or current_platform.is_xpu()
+            or current_platform.is_out_of_tree()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, "
+                "Ascend NPU, or an out-of-tree platform"
             )
 
         device = current_platform.get_local_torch_device()
@@ -831,6 +833,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ):
 
                 def on_step(_step, _video_rows, _audio_rows):
+                    self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
                         self.step_profile()
