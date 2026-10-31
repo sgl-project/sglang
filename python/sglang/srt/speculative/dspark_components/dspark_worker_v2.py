@@ -1128,7 +1128,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
 
-        run_compact = self._verify_planner.should_run_compact(layout=layout) 
+        run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids
         if verify_ids_2d is None:
