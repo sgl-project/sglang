@@ -13,6 +13,7 @@
 # ==============================================================================
 """AITER utility helpers."""
 
+import functools
 import logging
 import os
 
@@ -55,3 +56,22 @@ def maybe_pre_warm_aiter_chip_info() -> None:
             logger.info("Pre-warmed aiter GPU_ARCHS=%s", gfx)
     except Exception as e:
         logger.warning("Failed to pre-warm aiter chip info: %s", e)
+
+
+@functools.lru_cache(maxsize=None)
+def aiter_unified_attention_supports_non_causal() -> bool:
+    """Whether the installed AITER ``unified_attention`` accepts ``causal=False``."""
+    try:
+        from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+            kernel_unified_attention_2d,
+            kernel_unified_attention_3d,
+        )
+
+        # AITER added non-causal attention together with this kernel constexpr.
+        return all(
+            "CAUSAL" in kernel.arg_names
+            for kernel in (kernel_unified_attention_2d, kernel_unified_attention_3d)
+        )
+    except Exception as e:
+        logger.debug("AITER unified_attention non-causal probe failed: %s", e)
+        return False
