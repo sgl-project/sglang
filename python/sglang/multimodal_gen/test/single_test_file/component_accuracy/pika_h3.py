@@ -19,11 +19,6 @@ from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
 from sglang.multimodal_gen.runtime.utils.model_overlay import resolve_model_overlay
 
 
-class _AdapterLoader(PikaH3FlexPipeline):
-    def create_pipeline_stages(self, server_args):
-        raise AssertionError("Component accuracy only loads the adapter")
-
-
 @torch.no_grad()
 def check_pika_adapter_accuracy(variant: str) -> None:
     path = hf_hub_download(
@@ -33,7 +28,7 @@ def check_pika_adapter_accuracy(variant: str) -> None:
     )
     source = load_file(path)
     assert len(source) == 624
-    loader = _AdapterLoader.__new__(_AdapterLoader)
+    loader = PikaH3FlexPipeline.__new__(PikaH3FlexPipeline)
     loader.server_args = SimpleNamespace(
         lora_path=path,
         lora_weight_name=None,

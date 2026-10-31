@@ -243,30 +243,11 @@ def _resolve_spatial(
     auto_geometry_source: str | None,
     policy: MiniMaxH3RequestPolicy | None = None,
 ) -> dict[str, Any]:
-    if policy is not None:
-        tier = target["short_edge"]
-        ar_w, ar_h = _parse_aspect_ratio(target["aspect_ratio"])
-        shape.update(
-            minimax_h3_resolve_spatial_shape(
-                width=ar_w,
-                height=ar_h,
-                base_short_edge=tier,
-                max_pixels=policy.max_pixels[tier],
-                warn_unverified=False,
-            )
-        )
-        shape.update(
-            geometry_source="request",
-            shape_policy_version=policy.name,
-            size_mode="bucket",
-            keyframe_fit="source_crop",
-            reference_short_edge=policy.reference_short_edges[tier],
-        )
-        return shape
-
     aspect_ratio = str(target["aspect_ratio"])
-    base_short_edge = _validate_base_short_edge(target.get("short_edge"))
-    if aspect_ratio == "auto":
+    base_short_edge = _validate_base_short_edge(
+        target.get("short_edge"), warn_unverified=policy is None
+    )
+    if policy is None and aspect_ratio == "auto":
         if auto_aspect_ratio is None:
             # Deferred: canvas comes from material/model geometry at prepare time.
             shape["geometry"] = "deferred"
@@ -283,8 +264,22 @@ def _resolve_spatial(
             width=ar_w,
             height=ar_h,
             base_short_edge=base_short_edge,
+            max_pixels=(
+                policy.max_pixels[base_short_edge]
+                if policy is not None
+                else MINIMAX_H3_MAX_PIXELS
+            ),
+            warn_unverified=policy is None,
         )
     )
+    if policy is not None:
+        shape.update(
+            geometry_source="request",
+            shape_policy_version=policy.name,
+            size_mode="bucket",
+            keyframe_fit="source_crop",
+            reference_short_edge=policy.reference_short_edges[base_short_edge],
+        )
     return shape
 
 
@@ -346,9 +341,8 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                 f"{signatures!r}"
             )
     policy = minimax_h3_request_policy(canonical.get("request_policy"))
-    target = canonical["target"]
     shape = _resolve_shape(
-        target,
+        canonical["target"],
         geometry_source=profile.geometry_source,
         auto_aspect_ratio=profile.auto_aspect_ratio,
         auto_geometry_source=profile.auto_geometry_source,

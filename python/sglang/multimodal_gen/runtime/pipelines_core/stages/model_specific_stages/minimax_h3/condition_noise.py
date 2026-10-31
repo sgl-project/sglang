@@ -93,7 +93,11 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
 
     out: list[torch.Tensor] = []
     row_offset = 0
-    timestep = torch.tensor(noise_aug, dtype=torch.float32, device=clean_rows.device)
+    weight = (
+        noise_aug
+        if generator is not None
+        else torch.tensor(noise_aug, dtype=torch.float32, device=clean_rows.device)
+    )
     for latent_t, latent_h, latent_w in parsed_shapes:
         if generator is not None:
             noise = torch.randn(
@@ -128,7 +132,6 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
         )
         row_count = int(noise_rows.shape[0])
         clean_part = clean_rows[row_offset : row_offset + row_count].to(torch.float32)
-        weight = noise_aug if generator is not None else timestep
         out.append(weight * clean_part + (1.0 - weight) * noise_rows)
         row_offset += row_count
     return (out[0] if len(out) == 1 else torch.cat(out, dim=0)).contiguous()
