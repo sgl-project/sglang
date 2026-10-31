@@ -136,6 +136,10 @@ class TestTriJointReclaim(CustomTestCase):
                     demand = 4 if count == 8 else 9
                     if count == 24:
                         demand = min(a.full_available_size(), a.swa_available_size())
+                    # Eviction is needed exactly when the records' first prefix
+                    # in eviction order must go: without it the demand does not
+                    # fit (5 states leave room already).
+                    self.assertEqual(a.ensure_capacity(demand, demand), count == 5)
                     with patch.object(
                         a, "ensure_capacity", wraps=a.ensure_capacity
                     ) as prep:
@@ -143,9 +147,10 @@ class TestTriJointReclaim(CustomTestCase):
                         got = a.alloc(demand)
                     self.assertIsNotNone(got)
                     self.assertLessEqual(prep.call_count, 4)
-                    expected = (
-                        [] if count == 24 else ([1, 2] if count == 8 else [0, 1, 2])
-                    )
+                    # The take counts room a relayout opens, so one record
+                    # (the one-token prefix evicted first) is enough even for
+                    # 24 states, where per-shape quotas evicted all three.
+                    expected = [0, 1, 2] if count == 5 else [1, 2]
                     for i, (key, prior) in enumerate(records):
                         match = c.path_device_indices(
                             c.match_prefix(MatchPrefixParams(key=key)).last_device_node
@@ -156,8 +161,9 @@ class TestTriJointReclaim(CustomTestCase):
                         else:
                             self.assertEqual(len(match), 0)
                     self.check_payload(b, a, outside, states[3:], states)
-                    if count == 8:
-                        self.assertEqual(c.full_evictable_size(), 95)
+                    self.assertEqual(
+                        c.full_evictable_size(), {8: 95, 24: 79, 5: 96}[count]
+                    )
                     self.assertFalse(a.verify_byte_accounting())
 
     def test_impossible_and_locked_demands_preserve_cache(self):
@@ -582,7 +588,7 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                     else:
                         evict_from_tree_cache(cache, 6)
-                    self.assertTrue(allocator.available_size() >= 6)
+                    self.assertTrue(allocator.ensure_capacity(6, 6))
                     self.assertEqual(cache.full_evictable_size(), 4)
                     matched = cache.match_prefix(MatchPrefixParams(key=key))
                     torch.testing.assert_close(
@@ -748,20 +754,6 @@ class TestTriJointReclaim(CustomTestCase):
                     return result
 
                 sa = a.swa_attn_allocator
-                move = sa.make_room
-                targets = []
-
-                def checked_move(*, side, min_bytes):
-                    self.assertEqual(side, "high")
-                    self.assertEqual(min_bytes, 256)
-                    self.assertEqual(
-                        min_bytes,
-                        float_high_target(
-                            chain_snapshot(a), float_chain(a), 4, flush_ends=False
-                        ),
-                    )
-                    targets.append(min_bytes)
-                    return move(side=side, min_bytes=min_bytes)
 
                 with (
                     patch(
@@ -769,7 +761,7 @@ class TestTriJointReclaim(CustomTestCase):
                         side_effect=checked_query,
                     ),
                     patch.object(c, "evict_for_alloc", side_effect=checked_evict),
-                    patch.object(sa, "make_room", side_effect=checked_move),
+                    patch.object(sa, "relocate_into", wraps=sa.relocate_into) as move,
                     patch(
                         "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError(
@@ -784,7 +776,8 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(a.alloc(4))
                 self.assertEqual(results, [(1, 1, 1)])
                 self.assertEqual(set(checkpoints), {95})
-                self.assertEqual(targets, [256])
+                # One victim leaves room the take reaches by moving the float once.
+                self.assertEqual(move.call_count, 1)
                 self.assertLessEqual(prepare.call_count, 3)
                 self.assertEqual(c.full_evictable_size(), 95)
                 for key, prior in records[1:]:
@@ -797,7 +790,7 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
 
-    def test_float_plan_rechecks_pins_taken_during_preparation(self):
+    def test_take_replans_after_a_pin_taken_since_admission(self):
         for owner in ("full", "mamba", "swa"):
             with self.subTest(owner=owner):
                 b, a, c = self.build(
@@ -818,38 +811,28 @@ class TestTriJointReclaim(CustomTestCase):
                     "swa": a.swa_attn_allocator,
                 }
                 member = members[owner]
-                full_flush = a.full_attn_allocator.flush_for_allocation
-
-                def close_during_prepare():
-                    member.add_pin_source(lambda: True)
-                    return full_flush()
-
-                sa = a.swa_attn_allocator
-                with (
-                    patch.object(
-                        a.full_attn_allocator,
-                        "flush_for_allocation",
-                        side_effect=close_during_prepare,
-                    ),
-                    patch.object(sa, "make_room", wraps=sa.make_room) as movement,
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                        side_effect=AssertionError("stale plan used fallback"),
-                    ),
+                # Admitted before the pin: a take that reused that answer would
+                # move the pinned band. It must plan again from what is pinned.
+                self.assertTrue(a.ensure_capacity(4, 4))
+                member.add_pin_source(lambda: True)
+                bound = member.ids.virtual_to_physical.clone()
+                with patch(
+                    "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
+                    side_effect=AssertionError("a pinned plan used fallback"),
                 ):
-                    result = a.ensure_capacity(4, 4)
-                self.assertEqual(result, owner == "full")
-                if owner == "full":
-                    self.assertEqual(
-                        movement.call_args.kwargs, {"side": "high", "min_bytes": 224}
-                    )
-                else:
-                    self.assertEqual(movement.call_count, 0)
-                    self.assertIsNone(
-                        float_high_target(
-                            chain_snapshot(a), float_chain(a), 4, flush_ends=False
-                        )
-                    )
+                    fits = a.ensure_capacity(4, 4)
+                    got = a.alloc(4)
+                # With the owner pinned the float still moves out of its way;
+                # a pinned state end or float leaves no layout that serves it.
+                self.assertEqual(fits, owner == "full")
+                self.assertEqual(got is not None, fits)
+                was_bound = bound > 0
+                torch.testing.assert_close(
+                    member.ids.virtual_to_physical[: bound.numel()][was_bound],
+                    bound[was_bound],
+                )
+                if got is not None:
+                    a.free(got)
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 member.pin_sources = ()
                 self.assertTrue(a.ensure_capacity(4, 4))
@@ -880,9 +863,7 @@ class TestTriJointReclaim(CustomTestCase):
                 retreat = target // sa.entry_bytes_per_page - gap
                 self.assertGreaterEqual(retreat, sa._live_pages())
                 with (
-                    patch.object(
-                        sa, "_relocate_to_positions", wraps=sa._relocate_to_positions
-                    ) as whole,
+                    patch.object(sa, "relocate_into", wraps=sa.relocate_into) as whole,
                     patch(
                         "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
                         side_effect=AssertionError(
