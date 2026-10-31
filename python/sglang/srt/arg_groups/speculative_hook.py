@@ -1274,8 +1274,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--speculative-use-rejection-sampling is incompatible with "
                 "--speculative-accept-threshold-single / "
-                "--speculative-accept-threshold-acc; rejection sampling ignores "
-                "the accept thresholds."
+                "--speculative-accept-threshold-acc."
             )
         if (
             resolved_view(server_args).enable_multi_layer_eagle
