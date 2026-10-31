@@ -64,8 +64,8 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"M3.1 NVFP4 {algorithm} requires MiniMaxM3SparseForConditionalGeneration, "
                     f"got {hf_config.architectures[0]}"
                 )
-            if not get_platform().is_blackwell:
-                raise ValueError(f"M3.1 NVFP4 {algorithm} requires Blackwell")
+            if algorithm == "DFLASH" and not get_platform().is_blackwell:
+                raise ValueError("M3.1 NVFP4 DFLASH requires Blackwell")
             if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
                 raise ValueError(
                     f"M3.1 NVFP4 {algorithm} requires SGLANG_RAGGED_VERIFY_MODE=static"
@@ -78,12 +78,21 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
             if cfg.speculative_draft_kv_cache_dtype in (None, "auto"):
                 overrides["speculative_draft_kv_cache_dtype"] = "bf16"
+            # The draft checkpoint declares the target's MXFP8 projections; off
+            # Blackwell they load as block-FP8 like the target's.
+            if (
+                not get_platform().is_blackwell
+                and cfg.speculative_draft_model_quantization is None
+            ):
+                overrides["speculative_draft_model_quantization"] = "minimax_m3_nvfp4"
             # DFLASH resolves its backend against the draft's attention layout.
             if (
                 algorithm == "DSPARK"
                 and cfg.speculative_draft_attention_backend is None
             ):
-                overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+                overrides["speculative_draft_attention_backend"] = (
+                    "trtllm_mha" if get_platform().is_blackwell else "fa3"
+                )
             # Draft tokens come from a cross-rank candidate gather and the greedy
             # accept from gathered target logits, so the ranks agree without
             # rank 0's broadcasts; keep only the RNG-dependent sites.

@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RebuildFullToSWAMapping,
@@ -1040,7 +1041,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             self.assertTrue(cache.tree_core.is_node_in_device_lru(n, ComponentType.SWA))
             self.assertFalse(cache.tree_core.is_node_in_host_lru(n, ComponentType.SWA))
             full_idx = node_device_value(cache, n, ComponentType.FULL)
-            translated = allocator.translate_loc_from_full_to_swa(full_idx)
+            translated = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(full_idx)
             self.assertEqual(translated.tolist(), swa_idx.tolist())
             restored += int(swa_idx.numel())
         self.assertEqual(

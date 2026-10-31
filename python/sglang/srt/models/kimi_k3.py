@@ -1272,17 +1272,35 @@ class KimiK3MoE(nn.Module):
         takes both a strided row and an fp32 row. The SM90/SM120 cutlass mxfp4
         kernels return from apply() before that quant, and precision="bf16"
         skips it as well, so those keep the bf16 contract even though the
-        runner backend is the same."""
-        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+        runner backend is the same.
+
+        On aiter, the SiTUv2 A8W4 mxfp8 quant indexes rows by input.stride(-2);
+        every other aiter route still gets the dense bf16 buffer."""
+        from sglang.srt.layers.quantization.mxfp4 import (
+            Mxfp4MoEMethod,
+            _aiter_situ_uses_a8w4,
+        )
 
         method = self.experts.quant_method
+        runner = self.experts.runner
         return not (
             isinstance(method, Mxfp4MoEMethod)
-            and method.use_flashinfer
-            and not method.use_marlin
-            and method._fi_kernel == "trtllm_sm100"
-            and method.flashinfer_mxfp4_moe_precision == "default"
-            and method.hidden_size == self.moe_hidden_size
+            and (
+                (
+                    method.use_flashinfer
+                    and not method.use_marlin
+                    and method._fi_kernel == "trtllm_sm100"
+                    and method.flashinfer_mxfp4_moe_precision == "default"
+                    and method.hidden_size == self.moe_hidden_size
+                )
+                or (
+                    runner is not None
+                    and runner.runner_backend.is_aiter()
+                    and self.experts.moe_runner_config.activation == "situ"
+                    and _aiter_situ_uses_a8w4()
+                    and not self._front_fp32
+                )
+            )
         )
 
     @cached_property

@@ -415,16 +415,17 @@ async def _cleanup_realtime_session(
         if task is None:
             continue
         await _await_realtime_task(task)
-    try:
-        await async_scheduler_client.forward(
-            ReleaseRealtimeSessionReq(session_id=session.id)
-        )
-    except Exception as e:
-        logger.warning(
-            "failed to release realtime session on scheduler, session_id=%s, error=%s",
-            session.id,
-            e,
-        )
+    if generate_task is not None:
+        try:
+            await async_scheduler_client.forward(
+                ReleaseRealtimeSessionReq(session_id=session.id)
+            )
+        except Exception as e:
+            logger.warning(
+                "failed to release realtime session on scheduler, session_id=%s, error=%s",
+                session.id,
+                e,
+            )
     if session.input_temp_dir is not None:
         shutil.rmtree(session.input_temp_dir, ignore_errors=True)
     session.dispose()
@@ -453,26 +454,27 @@ async def generate(websocket: WebSocket):
     """endpoint for creating a new realtime session"""
     await websocket.accept()
     await _wait_for_server_warmup(websocket)
-    if _ACTIVE_SESSION_IDS and not await _wait_for_active_session_slot():
-        logger.warning(
-            "reject realtime session because another session is active: %s",
-            sorted(_ACTIVE_SESSION_IDS),
-        )
-        try:
-            await write_error_msg(
-                "another realtime session is already active", websocket
-            )
-        finally:
-            await websocket.close(code=1008)
-        return
-
     session = GenerateSession()
-    _ACTIVE_SESSION_IDS.add(session.id)
     generate_task = None
     listen_task = None
     try:
         # receive new generate request
         await _listen_generate_request(websocket, session)
+
+        # only initialized sessions reserve the GPU slot; idle connections do not
+        if _ACTIVE_SESSION_IDS and not await _wait_for_active_session_slot():
+            logger.warning(
+                "reject realtime session because another session is active: %s",
+                sorted(_ACTIVE_SESSION_IDS),
+            )
+            try:
+                await write_error_msg(
+                    "another realtime session is already active", websocket
+                )
+            finally:
+                await websocket.close(code=1008)
+            return
+        _ACTIVE_SESSION_IDS.add(session.id)
 
         # continuously generate video chunk
         generate_task = asyncio.create_task(_generate_loop(websocket, session))
