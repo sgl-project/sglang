@@ -11,7 +11,7 @@ import random
 import unittest
 
 import torch
-from test_unified_chain_realize import _allocator
+from test_unified_chain_realize import _allocator, _live_pages
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -57,6 +57,11 @@ class TestAdmissionIsATake(CustomTestCase):
             # Pins require lazy compaction.
             if lazy and rng.random() < 0.15:
                 band.pin_sources = (lambda: True,)
+            elif rng.random() < 0.3 and band is not state:
+                p2v = band.ids.physical_to_virtual.cpu().tolist()
+                live = [p for p in _live_pages(band) if p2v[p] in protected]
+                if live:
+                    band.fix_pages("held", rng.sample(live, min(len(live), 2)))
         return cached, cached_slots
 
     def _credit(self, allocator, cached, cached_slots):
