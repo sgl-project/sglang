@@ -146,7 +146,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             # recompute from the live batch as before — reading the
             # backend list there would replay stale capture-time lengths.
             if runner.model_runner.spec_algorithm.is_dflash():
-                _attn = runner._replay_attn_backend()
+                _attn = runner.attn_backend
                 _meta = getattr(_attn, "forward_metadata", None)
                 _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
             else:
@@ -317,7 +317,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 capture_forward_mode=runner.capture_forward_mode,
                 is_encoder_decoder=runner.is_encoder_decoder,
             )
-            runner._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+            runner.attn_backend.init_forward_metadata_out_graph(fb_view)
         # Preserve the legacy NPU pre-planned replay key.
         runner._replay_graph_key = runner._make_graph_key(runner.bs)
         return True

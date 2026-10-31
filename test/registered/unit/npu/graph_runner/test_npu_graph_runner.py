@@ -32,7 +32,7 @@ def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
                 is_dflash_family=lambda: dflash or dspark,
             ),
         ),
-        _replay_attn_backend=lambda: attention,
+        attn_backend=attention,
         _make_graph_key=lambda bs: runner_mod.ShapeKey(size=bs),
     )
     backend._decode_runner = runner
