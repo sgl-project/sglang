@@ -1526,3 +1526,4 @@ class SchedulerMetricsReporter:
         # publishing so the gauges do not hold the last batch's values.
         self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)
+        self.scheduler.kv_events_publisher.emit_kv_metrics()
