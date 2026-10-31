@@ -12,7 +12,7 @@ graph launch.
 Correctness contract:
 
 - The caller only routes here when the replay is padding-free
-  (raw_bs == padded bs) and TBO / pdmux / LoRA are off, so every
+  (raw_bs == padded bs) and TBO / LoRA are off, so every
   Python-visible branch inside the backends is constant per key.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
@@ -63,7 +63,7 @@ class MetadataGlueGraph:
 
     def note_not_routed(self) -> None:
         """A replay the caller prepared eagerly without calling ``run`` (padding,
-        TBO, pdmux, LoRA, disabled)."""
+        TBO, LoRA, disabled)."""
         if self._states or self.disabled:
             self.eager += 1
 
