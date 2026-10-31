@@ -434,6 +434,13 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
+    # v1 per-token NVFP4 dispatch only: GEMM1 fuses SwiGLU, so W13 rows are
+    # interleaved in 64-row up/gate blocks with the up projection first.
+    # w1_alpha_up dequantizes the up rows and swiglu_params holds
+    # (alpha, beta, limit) of gate * sigmoid(alpha * gate) * (up + beta).
+    w1_alpha_up: Optional[torch.Tensor] = None
+    swiglu_params: Optional[tuple[float, float, float]] = None
+
 
 @register_fused_func("none", "flashinfer_cutedsl")
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
@@ -642,7 +649,52 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         "apply_router_weight_on_input is not supported for Flashinfer"
     )
 
-    hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    masked_m = dispatch_output.masked_m
+    overlap = quant_info.down_gemm_overlap_args
+    overlap_kwargs = (
+        dict(
+            down_sm_count=overlap.num_sms,
+            down_signals=overlap.signal,
+            down_start_event=overlap.start_event,
+        )
+        if overlap is not None
+        else {}
+    )
+
+    if dispatch_output.per_token_scale is not None:
+        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+            flashinfer_cutedsl_moe_masked_fused_swiglu,
+        )
+
+        assert (
+            quant_info.w1_alpha_up is not None and quant_info.swiglu_params is not None
+        ), "Per-token NVFP4 dispatch requires the fused SwiGLU W13 layout."
+        swiglu_alpha, swiglu_beta, swiglu_limit = quant_info.swiglu_params
+        output = flashinfer_cutedsl_moe_masked_fused_swiglu(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            per_token_scale=dispatch_output.per_token_scale,
+            w1=quant_info.w13_weight,
+            w1_blockscale=quant_info.w13_weight_sf,
+            w1_alpha=quant_info.w1_alpha,
+            w1_alpha_up=quant_info.w1_alpha_up,
+            w2=quant_info.w2_weight,
+            a2_global_scale=quant_info.a2_scale,
+            w2_blockscale=quant_info.w2_weight_sf,
+            w2_alpha=quant_info.w2_alpha,
+            masked_m=masked_m,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            **overlap_kwargs,
+        )
+        return DeepEPLLCombineInput(
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
 
     # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
     # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
@@ -659,7 +711,6 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
             "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
         )
 
-    overlap = quant_info.down_gemm_overlap_args
     output = flashinfer_cutedsl_moe_masked(
         hidden_states=(hidden_states, hidden_states_scale),
         input_global_scale=(
@@ -674,15 +725,7 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         masked_m=masked_m,
         activation=runner_config.activation,
-        **(
-            dict(
-                down_sm_count=overlap.num_sms,
-                down_signals=overlap.signal,
-                down_start_event=overlap.start_event,
-            )
-            if overlap is not None
-            else {}
-        ),
+        **overlap_kwargs,
     )
 
     return DeepEPLLCombineInput(
