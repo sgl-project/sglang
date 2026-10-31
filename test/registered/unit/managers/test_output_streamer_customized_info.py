@@ -730,6 +730,30 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                 self.assertEqual(received, expected)
 
 
+class TestOutputStreamerRoutedExpertsForcing(unittest.TestCase):
+    def test_only_a_finished_keyed_request_carries_its_counters(self):
+        """Only a finished keyed request carries its forcing counters."""
+        counters = {"held_tokens": 3, "forced_tokens": 3, "unforced_tokens": 0}
+        reqs = [
+            _FakeReq("streaming", [10]),
+            _FakeReq("finished", [20], finished=True),
+            _FakeReq("unkeyed", [30], finished=True),
+        ]
+        for req, keyed in zip(reqs, (True, True, False)):
+            req.routed_experts_forcing_state = (
+                SimpleNamespace(meta_info=lambda: counters) if keyed else None
+            )
+
+        accumulator = dataclasses.replace(
+            _accumulator(), return_routed_experts_forcing=True
+        )
+        for req in reqs:
+            accumulator.accept(req=req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(payload.routed_experts_forcing, [None, counters, None])
+
+
 class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
     def test_payload_carries_prefill_spans_for_finished_requests(self):
         """Prefill spans computed before the KV release ride out with the finished request."""

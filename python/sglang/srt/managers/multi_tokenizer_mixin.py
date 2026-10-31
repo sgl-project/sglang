@@ -258,6 +258,9 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             indexer_topk_num_layers=getattr(output, "indexer_topk_num_layers", None),
+            routed_experts_forcing=_extract_field_by_index(
+                output, "routed_experts_forcing", i
+            ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
             prefill_weight_versions=_extract_field_by_index(
@@ -385,6 +388,9 @@ def _handle_output_by_index(output, i):
             ),
             indexer_topk_raw=_extract_field_by_index(
                 output, "indexer_topk_raw", i, check_length=False
+            ),
+            routed_experts_forcing=_extract_field_by_index(
+                output, "routed_experts_forcing", i
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False

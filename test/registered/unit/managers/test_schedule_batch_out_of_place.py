@@ -17,6 +17,9 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
+from sglang.srt.state_capturer.routed_experts_store import (  # noqa: E402
+    ForcingBatch,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -194,6 +197,10 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
             extend_lens=[3, 3],
             extend_num_tokens=6,
             extend_logprob_start_lens=[0, 0],
+            forced_routes=ForcingBatch(
+                mask=torch.ones(6, dtype=torch.bool),
+                routes=torch.ones((6, 1, 1), dtype=torch.uint8),
+            ),
         )
         running_batch = make_schedule_batch(
             1,
@@ -225,6 +232,8 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertEqual(extend_batch.extend_lens, [3, 3, 1])
         self.assertEqual(extend_batch.extend_num_tokens, 7)
         self.assertEqual(extend_batch.extend_logprob_start_lens, [0, 0, 0])
+        # Routed-experts forcing: the decode tail's row is never forced.
+        self.assertEqual(extend_batch.forced_routes.mask.tolist(), [True] * 6 + [False])
         self.assertFalse(extend_batch.is_prefill_only)
         self.assertIsNot(extend_batch.prefix_lens, extend_prefix_before)
         self.assertIsNot(extend_batch.extend_lens, extend_lens_before)

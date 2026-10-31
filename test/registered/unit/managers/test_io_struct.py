@@ -1061,6 +1061,15 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 session_params={"id": "legacy"},
             ).normalize_batch_and_arguments()
 
+    def test_routed_experts_session_key_rejects_batches(self):
+        for inputs in ({"text": ["Hello", "World"]}, {"sampling_params": {"n": 2}}):
+            with self.subTest(**inputs):
+                with self.assertRaisesRegex(ValueError, "not supported with batch"):
+                    GenerateReqInput(
+                        **{"text": "Hello", **inputs},
+                        routed_experts_session_key="s",
+                    ).normalize_batch_and_arguments()
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
