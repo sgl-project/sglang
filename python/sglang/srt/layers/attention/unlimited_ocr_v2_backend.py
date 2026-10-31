@@ -144,7 +144,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
 
         hf_config = model_runner.model_config.hf_config
         sparse_cfg = get_unlimited_ocr_v2_sparse_config(hf_config)
-        self.sparse_cfg = sparse_cfg
         self.block_size = int(sparse_cfg["sparse_block_size"])
         self.local_blocks = max(1, int(sparse_cfg.get("sparse_local_block", 1)))
         self.idx_head_dim = int(sparse_cfg.get("sparse_index_dim", 128))
@@ -197,7 +196,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self._cos_sin_cache: dict = {}
 
         self.forward_metadata: Optional[UnlimitedOCRV2Metadata] = None
-        self._max_pages = (self.kv_pool.size + self.block_size) // self.block_size
 
         # Captured grid and reduction widths must not grow with sequence length.
         self.max_block_static = max(

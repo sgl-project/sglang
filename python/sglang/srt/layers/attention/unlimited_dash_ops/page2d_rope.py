@@ -170,14 +170,14 @@ class PageCoordState:
         self.cnt = torch.zeros((n, self.max_pages), dtype=torch.int32, device=device)
 
     @torch.no_grad()
-    def _rows(self, layout) -> torch.Tensor:
+    def _rows(self, block_table, start_pos) -> torch.Tensor:
         """Match the first physical block to a state row or allocate by LRU.
 
         Device-side writes and counters keep CUDA graph replay safe.
         """
         step = self._step_counter()
-        keys = layout.block_table[:, 0].to(torch.int64)
-        fresh = layout.start_pos.to(torch.int64) <= 0
+        keys = block_table[:, 0].to(torch.int64)
+        fresh = start_pos.to(torch.int64) <= 0
         live = self.key[None, :] >= 0
         eq = (keys[:, None] == self.key[None, :]) & live
         matched = eq.any(dim=1)
@@ -237,7 +237,7 @@ class PageCoordState:
         req = layout.req_of_token.to(torch.int64)
         starts = layout.q_start[:-1].to(torch.int64)
         q_len = layout.q_start[1:].to(torch.int64) - starts
-        row = self._rows(layout)
+        row = self._rows(layout.block_table, layout.start_pos)
         st_marker_in = self.st_marker[row]
         st_pp_in = self.st_pp[row]
         cnt_in = self.cnt[row]

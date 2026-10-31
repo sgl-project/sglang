@@ -22,18 +22,6 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 )
 
 
-class _LayoutShim:
-    """The two fields ``PageCoordState._rows`` reads, without a full BatchLayout."""
-
-    __slots__ = ("block_table", "start_pos")
-
-    def __init__(self, block_table, seq_lens, block_size):
-        self.block_table = block_table
-        # `_rows` keys on "does this request start at position 0" to detect a
-        # fresh request; on decode seq_lens is always >= 1 past that.
-        self.start_pos = seq_lens.to(torch.int64) - 1
-
-
 @torch.no_grad()
 def decode_meta_fused(
     *,
@@ -56,7 +44,7 @@ def decode_meta_fused(
     device = input_ids.device
     page_state._ensure(num_slots, device)
     coord_state._ensure(device)
-    row = coord_state._rows(_LayoutShim(block_table, seq_lens, block_size))
+    row = coord_state._rows(block_table, seq_lens.to(torch.int64) - 1)
     result = dash_decode_meta(
         input_ids=input_ids,
         block_table=block_table,
