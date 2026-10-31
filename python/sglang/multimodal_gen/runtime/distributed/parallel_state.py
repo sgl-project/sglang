@@ -153,6 +153,8 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._PP is None and _PP is not None:
+        srt_parallel_state._PP = _PP
     if srt_parallel_state._TP is _TP and srt_parallel_state._MOE_TP is None:
         srt_parallel_state._MOE_TP = _TP
     if (
@@ -174,6 +176,7 @@ def _sync_srt_tp_group() -> None:
             attn_cp_rank=0,
             pp_rank=0,
             moe_ep_rank=0,
+            **({"pp_group": _PP, "pp_size": _PP.world_size} if _PP is not None else {}),
             **derive_parallel_widths(
                 tp_size=_TP.world_size,
                 attn_cp_size=1,
@@ -199,6 +202,8 @@ def _clear_srt_tp_group() -> None:
             get_parallel().override_permanently(world_group=srt_parallel_state._WORLD)
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
+    if srt_parallel_state._PP is _PP:
+        srt_parallel_state._PP = None
     if srt_parallel_state._MOE_TP is _TP:
         srt_parallel_state._MOE_TP = None
     if _SRT_MOE_EP is not None:

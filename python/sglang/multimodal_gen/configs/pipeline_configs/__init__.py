@@ -30,6 +30,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.helios import (
     HeliosMidConfig,
     HeliosT2VConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
+    HiDreamPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
@@ -95,6 +98,7 @@ __all__ = [
     "HeliosT2VConfig",
     "HunyuanConfig",
     "FastHunyuanConfig",
+    "HiDreamPipelineConfig",
     "Hunyuan3D2PipelineConfig",
     "HunyuanImage3PipelineConfig",
     "Ideogram4PipelineConfig",
