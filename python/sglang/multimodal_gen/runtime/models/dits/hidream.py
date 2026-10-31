@@ -423,8 +423,15 @@ class HiDreamForCausalLM(BaseDiT):
         token_types: torch.Tensor,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Two-pass SDPA attention: causal on AR tokens, full on all tokens."""
+        """Two-pass SDPA attention: causal on AR tokens, full on all tokens.
+
+        ``pad_mask`` ([B, seq], True at padding slots) excludes padded keys
+        from both passes; it is None on the unpadded fast path, which keeps
+        the mask-free ``is_causal`` kernels bit-identical to single-row
+        inference.
+        """
         text_model = self.language_model
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
@@ -470,22 +477,47 @@ class HiDreamForCausalLM(BaseDiT):
                 q_ar = q[:, :, idx_ar].contiguous()
                 k_ar = k[:, :, idx_ar].contiguous()
                 v_ar = v[:, :, idx_ar].contiguous()
-                out_ar = F.scaled_dot_product_attention(
-                    q_ar,
-                    k_ar,
-                    v_ar,
-                    is_causal=True,
-                    scale=softmax_scale,
-                )
+                if pad_mask is None:
+                    out_ar = F.scaled_dot_product_attention(
+                        q_ar,
+                        k_ar,
+                        v_ar,
+                        is_causal=True,
+                        scale=softmax_scale,
+                    )
+                else:
+                    # causal over original slots, padded keys removed
+                    slot_q = idx_ar.view(1, -1)
+                    slot_k = idx_ar.view(1, -1)
+                    keep = (slot_q >= slot_k).unsqueeze(0) & ~pad_mask[
+                        :, idx_ar
+                    ].unsqueeze(1)
+                    out_ar = F.scaled_dot_product_attention(
+                        q_ar,
+                        k_ar,
+                        v_ar,
+                        attn_mask=keep.unsqueeze(1),
+                        scale=softmax_scale,
+                    )
             else:
                 out_ar = None
 
-            out_full = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                scale=softmax_scale,
-            )
+            if pad_mask is None:
+                out_full = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=softmax_scale,
+                )
+            else:
+                key_keep = (~pad_mask)[:, None, None, :]
+                out_full = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=key_keep,
+                    scale=softmax_scale,
+                )
 
             if out_ar is not None:
                 out_full = out_full.clone()
@@ -525,6 +557,7 @@ class HiDreamForCausalLM(BaseDiT):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         use_flash_attn: bool = False,
+        pad_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for one denoising step; returns {'x_pred': patches}."""
@@ -614,6 +647,7 @@ class HiDreamForCausalLM(BaseDiT):
                 token_types,
                 visual_pos_masks=visual_pos_masks,
                 deepstack_visual_embeds=deepstack_image_embeds,
+                pad_mask=pad_mask,
             )
         else:
             dtype = inputs_embeds.dtype
@@ -629,6 +663,10 @@ class HiDreamForCausalLM(BaseDiT):
                 causal = torch.triu(causal, diagonal=1)
                 gen_positions = token_types[b].bool()
                 causal[gen_positions, :] = 0
+                if pad_mask is not None:
+                    # padded keys are excluded for every query, including
+                    # the fully-attending generation rows
+                    causal[:, pad_mask[b]] = min_val
                 attn_masks.append(causal)
             attention_mask_4d = torch.stack(attn_masks, dim=0).unsqueeze(1)
 
@@ -658,6 +696,7 @@ class HiDreamForCausalLM(BaseDiT):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         use_flash_attn: bool = False,
+        pad_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Main forward entry point. Dispatches to _forward_generation for diffusion."""
@@ -671,6 +710,7 @@ class HiDreamForCausalLM(BaseDiT):
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 use_flash_attn=use_flash_attn,
+                pad_mask=pad_mask,
                 **kwargs,
             )
         raise ValueError("HiDreamForCausalLM requires vinputs for generation mode")
