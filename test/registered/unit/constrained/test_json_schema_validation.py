@@ -309,6 +309,15 @@ class TestBoundedLinearPatterns(CustomTestCase):
         with patch("sglang.srt.constrained.outlines_backend.RegexGuide"):
             self._assert_dispatch_accepts(backend, OutlinesGrammar)
 
+    def test_outlines_regex_dispatch_accepts_long_literal(self):
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend.whitespace_pattern = None
+        backend.outlines_tokenizer = MagicMock()
+        with patch("sglang.srt.constrained.outlines_backend.RegexGuide"):
+            result = backend.dispatch_regex("a" * 501)
+
+        self.assertIsInstance(result, OutlinesGrammar)
+
     def test_llguidance_dispatch_accepts_fixed_patterns(self):
         backend = object.__new__(GuidanceBackend)
         backend.llguidance_tokenizer = LLTokenizer("byte")
