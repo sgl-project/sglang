@@ -54,7 +54,8 @@ python -m sglang.launch_server \
   --enable-unified-cache-external-linker \
   --unified-cache-external-linker-backend kvcr \
   --hicache-storage-backend-extra-config '{
-    "dram_size_gb": 8,
+    "kvcr_service_socket_path": "/run/kvcr/memory.sock",
+    "compatibility_digest": "qwen3-32b-fp8-tp1-page64",
     "control_host": "0.0.0.0",
     "advertise_host": "192.0.2.10",
     "control_port": 19500,
@@ -65,14 +66,16 @@ python -m sglang.launch_server \
 ```
 
 Replace `192.0.2.10` with an address reachable by the other workers. These options
-are strict; unknown names fail startup.
+are strict; unknown names fail startup. Omit `kvcr_service_socket_path` and
+`compatibility_digest` (and set `dram_size_gb`) to run plain KVCR with in-process
+DRAM.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `kvcr_service_socket_path` | `/run/kvcr/memory.sock` | Guard service socket; `null` explicitly selects in-process DRAM. |
+| `kvcr_service_socket_path` | `null` | Guard service socket. Setting it selects Guard mode and requires `compatibility_digest`; `null` or omitted is plain KVCR with in-process DRAM. |
 | `guard_index` | `0` | Base Guard index; the global rank is added. |
-| `compatibility_digest` | Model/layout/shard namespace | Must match the Guard service's deployment compatibility digest. |
-| `dram_size_gb` | `1` | Fallback in-process DRAM GiB per rank, rounded down to complete pages across all pools. |
+| `compatibility_digest` | `null` | Must match the Guard service's deployment compatibility digest. Required with, and only valid with, `kvcr_service_socket_path`. |
+| `dram_size_gb` | `1` | In-process DRAM GiB per rank without a Guard, rounded down to complete pages across all pools. |
 | `control_host` | `0.0.0.0` | Address on which KVCR binds peer control. |
 | `advertise_host` | Resolved local hostname | Address peers use to reach this worker. |
 | `control_port` | `19500` | Base control port; the global rank is added. |
@@ -83,12 +86,14 @@ are strict; unknown names fail startup.
 | `trailing_capacity_divisor` | `1` | Positive integer reducing SWA-derived pools' page capacity in in-process DRAM; each retains at least one page. Guard capacities are configured separately. |
 | `replicated_source_rank_routing` | `false` | Opt in to fetching replicated KV from the corresponding source rank; requires the source topology described below. |
 
-## Guard memory and fallback
+## Guard memory
 
-Workers first claim Guard-backed memory through KVCR's public API. A missing
-socket or refused connection falls back to anonymous DRAM inside the serving
-process. An incompatible/busy Guard, permission error, or interrupted claim
-fails startup: these do not prove that falling back is safe. KVCR owns Guard
+When `kvcr_service_socket_path` is set, workers claim Guard-backed memory through
+KVCR's public API and there is no fallback: a missing or refusing Guard fails
+startup (and engine reset) with `KVCRConfigError`, as does any refused or
+interrupted socket claim (busy, incompatible, permission error, lost reply; the
+original error is chained). Guard mode also requires
+single-node TP1/CP1/PP1 and advertises a router-hint source. KVCR owns Guard
 claiming, recovery, and release; SGLang does not allocate a second DRAM pool
 when a claim succeeds.
 
@@ -103,10 +108,9 @@ deployment digest on the service and all workers; change it when the model,
 dtype, layout, page size, or parallel topology changes. Storage keys still retain
 their individual shard namespaces.
 
-In fallback mode, pools receive the same page capacity by default. Increase
+Without a Guard, pools receive the same page capacity by default. Increase
 `trailing_capacity_divisor` to give sparsely stored SWA/state pools fewer pages
-and reserve more of the budget for full-prefix pools. Set
-`"kvcr_service_socket_path": null` to select this mode explicitly.
+and reserve more of the budget for full-prefix pools.
 
 ## Operational constraints
 

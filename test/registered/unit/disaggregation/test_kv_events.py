@@ -145,6 +145,7 @@ class TestLocalKvEventSource(CustomTestCase):
         owner = "owner-unique-to-this-engine"
         hint = {
             "cache_owner_id": owner,
+            "capabilities": ["router_hint", "kvcr_inventory"],
             "source_control_endpoint": "tcp://127.0.0.1:19500",
         }
         backend = SimpleNamespace(get_kv_hint_sources=lambda: [hint])
@@ -183,6 +184,41 @@ class TestLocalKvEventSource(CustomTestCase):
             self.assertEqual(info["kv_hint_sources"], [hint])
             self.assertEqual(info["kv_event_sources"], [source])
             self._assert_event_received(publisher, source)
+
+    def _publisher_with_hint(self, hint, config):
+        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+            SchedulerKvEventsPublisher,
+        )
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        backend = SimpleNamespace(get_kv_hint_sources=lambda: [hint])
+        tree = SimpleNamespace(linker=SimpleNamespace(cache_linker=backend))
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            get_parallel().override(
+                pp_rank=0, attn_tp_rank=0, attn_cp_rank=0, attn_dp_rank=0, dp_rank=None
+            ),
+        ):
+            return SchedulerKvEventsPublisher(
+                kv_events_config=json.dumps(config),
+                tree_cache=tree,
+                send_metrics_from_scheduler=None,
+                max_running_requests=1,
+                max_total_num_tokens=1,
+                get_stats=lambda: None,
+            )
+
+    def test_guard_source_keeps_configured_event_topic(self):
+        hint = {
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://127.0.0.1:19500",
+            "inventory_lifetime": "guard",
+        }
+        component = self._publisher_with_hint(
+            hint, {"publisher": "zmq", "endpoint": "tcp://*:0", "topic": ""}
+        )
+        self.addCleanup(component.kv_event_publisher.shutdown)
+        self.assertEqual(component.local_kv_event_sources(64)[0]["topic"], "")
 
     def test_non_subscribable_publishers_are_not_advertised(self):
         for endpoint in (

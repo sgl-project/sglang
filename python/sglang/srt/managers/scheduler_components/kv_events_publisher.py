@@ -64,7 +64,11 @@ class SchedulerKvEventsPublisher:
 
         if self.enable_kv_cache_events:
             parallel = get_parallel()
-            sources = self.kv_hint_sources()
+            sources = [
+                source
+                for source in self.kv_hint_sources()
+                if "kvcr_inventory" in source.get("capabilities", ())
+            ]
             if sources:
                 config = KVEventsConfig.from_cli(kv_events_config)
                 if config.format != "dynamo" or config.publisher != "zmq":
