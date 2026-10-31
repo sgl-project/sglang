@@ -221,9 +221,7 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
             self.assertEqual(output_split_size, 0)
             return x.clone()
 
-        with patch.object(
-            kda_prefill_graph, "causal_conv1d_fn", side_effect=convolve
-        ):
+        with patch.object(kda_prefill_graph, "causal_conv1d_fn", side_effect=convolve):
             output = kda_prefill_graph.kda_extend_in_graph(
                 layer=layer,
                 meta=meta,
@@ -248,9 +246,9 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
             [2, 2, 3],
         )
         torch.testing.assert_close(
-            torch.cat(
-                [graph.inputs["q"], graph.inputs["k"], graph.inputs["v"]], dim=-1
-            ).squeeze(0).squeeze(1),
+            torch.cat([graph.inputs["q"], graph.inputs["k"], graph.inputs["v"]], dim=-1)
+            .squeeze(0)
+            .squeeze(1),
             mixed_qkv,
         )
 
