@@ -29,6 +29,7 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     imgvid_cond_num_frames: int,
     seed: int,
     noise_aug: float,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Apply the imgvid-condition RF noise recipe to packed clean rows.
 
@@ -36,7 +37,9 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
     visual-condition order. A new CPU generator with the same row seed is
     created for every condition. Under the dependent-noise policy, each draw
     uses the target temporal length plus the template's imgvid-condition frame
-    count, then slices the prefix matching the current condition.
+    count, then slices the prefix matching the current condition. A supplied
+    generator instead draws each condition in external [B,F,C,H,W] order from
+    one continuous request-local stream, as used by Pika's release.
     """
 
     noise_aug = float(noise_aug)
@@ -90,30 +93,46 @@ def minimax_h3_imgvid_cond_noise_aug_rows(
 
     out: list[torch.Tensor] = []
     row_offset = 0
-    timestep = torch.tensor(noise_aug, dtype=torch.float32, device=clean_rows.device)
+    weight = (
+        noise_aug
+        if generator is not None
+        else torch.tensor(noise_aug, dtype=torch.float32, device=clean_rows.device)
+    )
     for latent_t, latent_h, latent_w in parsed_shapes:
-        full_t = target_latent_t + imgvid_cond_num_frames
-        if full_t < latent_t:
-            raise ValueError(
-                f"condition latent_t {latent_t} exceeds the noise draw length {full_t}"
-            )
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        noise = torch.randn(
-            1,
-            24,
-            full_t,
-            latent_h,
-            latent_w,
-            generator=generator,
-            dtype=torch.float32,
-            device="cpu",
-        )[:, :, :latent_t]
+        if generator is not None:
+            noise = torch.randn(
+                1,
+                latent_t,
+                24,
+                latent_h,
+                latent_w,
+                generator=generator,
+                dtype=torch.float32,
+                device=generator.device,
+            ).permute(0, 2, 1, 3, 4)
+        else:
+            full_t = target_latent_t + imgvid_cond_num_frames
+            if full_t < latent_t:
+                raise ValueError(
+                    f"condition latent_t {latent_t} exceeds the noise draw length {full_t}"
+                )
+            condition_generator = torch.Generator(device="cpu").manual_seed(int(seed))
+            noise = torch.randn(
+                1,
+                24,
+                full_t,
+                latent_h,
+                latent_w,
+                generator=condition_generator,
+                dtype=torch.float32,
+                device="cpu",
+            )[:, :, :latent_t]
         noise_rows = minimax_h3_patchify_video_latent(noise, patch_size=[1, 2, 2]).to(
             device=clean_rows.device, dtype=torch.float32
         )
         row_count = int(noise_rows.shape[0])
         clean_part = clean_rows[row_offset : row_offset + row_count].to(torch.float32)
-        out.append(timestep * clean_part + (1.0 - timestep) * noise_rows)
+        out.append(weight * clean_part + (1.0 - weight) * noise_rows)
         row_offset += row_count
     return (out[0] if len(out) == 1 else torch.cat(out, dim=0)).contiguous()
 

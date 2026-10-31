@@ -27,6 +27,17 @@ logger = init_logger(__name__)
 _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
+def _validate_text_length(plan, tokens: torch.Tensor, *, tagged: bool = False) -> None:
+    if plan.policy is None:
+        return
+    text_tokens = int((tokens == 1).sum()) if tagged else tokens.numel()
+    if text_tokens > plan.policy.max_text_tokens:
+        raise ValueError(
+            f"Pika H3 Flex presentation has {text_tokens} text tokens; "
+            f"maximum is {plan.policy.max_text_tokens}"
+        )
+
+
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
     deduplicated_output_fields = ("prompt_embeds", "prompt_seq_lens")
     deduplicated_extra_output_keys = (MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,)
@@ -304,6 +315,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 )
             else:
                 positive_ids = minimax_h3_text_only_ids(self.tokenizer, prompt)
+                _validate_text_length(plan, positive_ids)
                 embeddings = {
                     "positive": {
                         "hidden_states": encode_ids(positive_ids),
@@ -360,6 +372,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             prompt=prompt,
             image_token_counts=image_token_counts,
         )
+        _validate_text_length(plan, pos_tags, tagged=True)
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,
@@ -568,6 +581,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 image_token_count=n_image_tokens,
             )
             pos_video_mask = None
+        _validate_text_length(plan, pos_tags, tagged=True)
         pos_hidden = encode_ids(
             pos_ids,
             pixel_values=pixel_values,

@@ -2349,3 +2349,38 @@ MI300X.
 import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
 
 <ComfyUISupport model="minimax-h3" />
+
+## Appendix: Pika H3 Flex on B200
+
+For [Pika H3 Flex](#pika-h3-flex-six-step-adapters) on NVIDIA B200, the measured
+eager configuration is:
+
+```bash Command
+CUDA_VISIBLE_DEVICES=0 sglang serve \
+  --model-path Pika-Labs/Pika-H3-Flex --model-variant fl2va \
+  --attention-backend fa --performance-mode speed \
+  --enable-torch-compile false --enable-breakable-cuda-graph false \
+  --warmup-mode off --port 30010
+```
+
+For Ref2VA, select `--model-variant ref2va`. For four B200s, select
+`CUDA_VISIBLE_DEVICES=0,1,2,3` and add `--num-gpus 4 --tp-size 1 --ulysses-degree 4`.
+Use `target: {"short_edge": 480, "aspect_ratio": "16:9", "duration_seconds": 5}`,
+six steps, seed 42 and lossless quality: the output is 832×480 with 124 frames.
+
+| B200s | TP / Ulysses | Warm denoise | Warm saved E2E, median (range) | Runtime / load peak, GiB/GPU |
+| --- | --- | ---: | ---: | ---: |
+| 1 | 1 / 1 | 3.703 s | 5.390 s (5.363–5.413) | 122.9 / 124.8 |
+| 4 | 1 / 4 | 1.120 s | 1.698 s (1.688–1.722) | 85.4 / 90.1 |
+| 4 | 2 / 2 | 1.187 s | 1.774 s (1.763–1.782) | 55.0 / 59.3 |
+
+Each row combines twelve warm requests across three fresh eager processes,
+excluding the first request. The fixed sailboat prompt reuses exact cached
+conditioning; adapters use dynamic BF16 application. Saved E2E includes decoding,
+MP4 encoding and file output. Memory is the maximum allocator-reserved peak
+across ranks. With weights cached on local NVMe, initialization took 59–81 seconds.
+
+These historical measurements used SGLang `011224b0ba225ba738213c4a0f20ac3c98aa17e0`,
+B200 (183359 MiB), driver 580.126.09, Python 3.12.16, PyTorch 2.14.1+cu130,
+Transformers 5.19.0 and Diffusers 0.37.0. Eager had the lowest warm median among
+the evaluated eager, CUDA graph and compiled configurations.

@@ -31,6 +31,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
+    MiniMaxH3RequestPolicy,
+    minimax_h3_request_policy,
     minimax_h3_task_profile,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
@@ -74,6 +76,7 @@ class MiniMaxH3ResolvedPlan(msgspec.Struct, frozen=True):
     audio_flow_shift: float | None
     shape: dict
     condition_mask: dict
+    policy: MiniMaxH3RequestPolicy | None = None
 
 
 def _parse_aspect_ratio(value: str) -> tuple[int, int]:
@@ -97,7 +100,7 @@ def _nearest_multiple(value: float, multiple: int) -> int:
     return max(multiple, int(round(float(value) / multiple)) * multiple)
 
 
-def _validate_base_short_edge(value: Any) -> int:
+def _validate_base_short_edge(value: Any, *, warn_unverified: bool = True) -> int:
     try:
         short_edge = int(value)
     except (TypeError, ValueError) as exc:
@@ -106,7 +109,7 @@ def _validate_base_short_edge(value: Any) -> int:
         ) from exc
     if short_edge != value or short_edge <= 0:
         raise ValueError(f"target.short_edge must be a positive integer, got {value!r}")
-    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE:
+    if warn_unverified and short_edge != MINIMAX_H3_BASE_SHORT_EDGE:
         warn_unverified_short_edge(short_edge)
     return short_edge
 
@@ -116,6 +119,8 @@ def minimax_h3_resolve_spatial_shape(
     width: int | float,
     height: int | float,
     base_short_edge: int = MINIMAX_H3_BASE_SHORT_EDGE,
+    max_pixels: int = MINIMAX_H3_MAX_PIXELS,
+    warn_unverified: bool = True,
 ) -> dict[str, Any]:
     """Resolve one display ratio with the ``adapt_shape_v1`` math.
 
@@ -125,7 +130,10 @@ def minimax_h3_resolve_spatial_shape(
     The returned dimensions are always 32px aligned; nearest-grid rounding may
     leave the final area slightly above the pre-round soft pixel budget.
     """
-    base_short_edge = _validate_base_short_edge(base_short_edge)
+    base_short_edge = _validate_base_short_edge(
+        base_short_edge,
+        warn_unverified=warn_unverified,
+    )
     try:
         source_width = float(width)
         source_height = float(height)
@@ -157,9 +165,9 @@ def minimax_h3_resolve_spatial_shape(
         nominal_width = float(base_short_edge)
         nominal_height = float(base_short_edge) / ratio
     nominal_area = nominal_width * nominal_height
-    if nominal_area > MINIMAX_H3_MAX_PIXELS:
+    if nominal_area > max_pixels:
         size_mode = "area"
-        scale = math.sqrt(float(MINIMAX_H3_MAX_PIXELS) / nominal_area)
+        scale = math.sqrt(float(max_pixels) / nominal_area)
         nominal_width *= scale
         nominal_height *= scale
     else:
@@ -174,7 +182,7 @@ def minimax_h3_resolve_spatial_shape(
         "base_short_edge": base_short_edge,
         "effective_short_edge": min(resolved_width, resolved_height),
         "size_mode": size_mode,
-        "max_pixels": MINIMAX_H3_MAX_PIXELS,
+        "max_pixels": max_pixels,
         "multiple": MINIMAX_H3_CANVAS_MULTIPLE,
         "rounding": "nearest",
         "width": resolved_width,
@@ -188,6 +196,7 @@ def _resolve_shape(
     geometry_source: str,
     auto_aspect_ratio: str | None = None,
     auto_geometry_source: str | None = None,
+    policy: MiniMaxH3RequestPolicy | None = None,
 ) -> dict[str, Any]:
     fps = MINIMAX_H3_SUPPORTED_FPS
     if "duration_seconds" not in target:
@@ -204,6 +213,7 @@ def _resolve_shape(
             target,
             auto_aspect_ratio=auto_aspect_ratio,
             auto_geometry_source=auto_geometry_source,
+            policy=policy,
         )
     frame_count = minimax_h3_align_frame_count(
         int(round(float(target["duration_seconds"]) * fps))
@@ -221,6 +231,7 @@ def _resolve_shape(
         target,
         auto_aspect_ratio=auto_aspect_ratio,
         auto_geometry_source=auto_geometry_source,
+        policy=policy,
     )
 
 
@@ -230,10 +241,13 @@ def _resolve_spatial(
     *,
     auto_aspect_ratio: str | None,
     auto_geometry_source: str | None,
+    policy: MiniMaxH3RequestPolicy | None = None,
 ) -> dict[str, Any]:
     aspect_ratio = str(target["aspect_ratio"])
-    base_short_edge = _validate_base_short_edge(target.get("short_edge"))
-    if aspect_ratio == "auto":
+    base_short_edge = _validate_base_short_edge(
+        target.get("short_edge"), warn_unverified=policy is None
+    )
+    if policy is None and aspect_ratio == "auto":
         if auto_aspect_ratio is None:
             # Deferred: canvas comes from material/model geometry at prepare time.
             shape["geometry"] = "deferred"
@@ -250,8 +264,22 @@ def _resolve_spatial(
             width=ar_w,
             height=ar_h,
             base_short_edge=base_short_edge,
+            max_pixels=(
+                policy.max_pixels[base_short_edge]
+                if policy is not None
+                else MINIMAX_H3_MAX_PIXELS
+            ),
+            warn_unverified=policy is None,
         )
     )
+    if policy is not None:
+        shape.update(
+            geometry_source="request",
+            shape_policy_version=policy.name,
+            size_mode="bucket",
+            keyframe_fit="source_crop",
+            reference_short_edge=policy.reference_short_edges[base_short_edge],
+        )
     return shape
 
 
@@ -268,6 +296,7 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         "seed",
         "flow_shift",
         "audio_flow_shift",
+        "request_policy",
     }
     unknown = set(canonical) - allowed_keys
     if unknown:
@@ -311,11 +340,13 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                 "conditions with frame_index [0], [-1], or [0, -1], got "
                 f"{signatures!r}"
             )
+    policy = minimax_h3_request_policy(canonical.get("request_policy"))
     shape = _resolve_shape(
         canonical["target"],
         geometry_source=profile.geometry_source,
         auto_aspect_ratio=profile.auto_aspect_ratio,
         auto_geometry_source=profile.auto_geometry_source,
+        policy=policy,
     )
 
     materials: list[MiniMaxH3MaterialPlanItem] = []
@@ -417,6 +448,7 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         ),
         shape=shape,
         condition_mask=condition_mask,
+        policy=policy,
     )
 
 

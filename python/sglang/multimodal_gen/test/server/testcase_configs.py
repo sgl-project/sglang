@@ -752,6 +752,30 @@ MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+PIKA_H3_FLEX_T2VA_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A small red sailboat glides across a calm lake at sunrise. "
+        "Gentle waves lap against the hull and birds chirp in the distance."
+    ),
+    output_size="832x480",
+    seconds=5,
+    output_format="mp4",
+    expect_audio_output=True,
+    extras={
+        "task": "t2va",
+        "conditions": [],
+        "target": {
+            "short_edge": 480,
+            "aspect_ratio": "16:9",
+            "duration_seconds": 5.0,
+        },
+        "num_inference_steps": 6,
+        "seed": 42,
+        "quality": "lossless",
+    },
+)
+
+
 MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
     MODELOPT_T2I_CI_sampling_params,
     extras={"num_inference_steps": 50, "seed": 0},

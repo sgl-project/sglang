@@ -5,6 +5,8 @@ import os
 import shutil
 from dataclasses import replace
 
+import torch
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -276,6 +278,28 @@ class PikaH3FlexPipeline(MiniMaxH3Pipeline):
     """
 
     pipeline_name = "PikaH3FlexPipeline"
+
+    def _load_config(self):
+        # The released adapters require FP32 matmuls at FP32 module boundaries.
+        torch.set_float32_matmul_precision("highest")
+        return super()._load_config()
+
+    def load_lora_adapter(
+        self,
+        lora_path: str,
+        lora_nickname: str,
+        rank: int,
+        weight_name: str | None = None,
+        lora_alpha: int | None = None,
+    ) -> None:
+        super().load_lora_adapter(
+            lora_path, lora_nickname, rank, weight_name, lora_alpha
+        )
+        # Release files store FP32 masters; inference uses BF16 adapter factors.
+        self.lora_adapters[lora_nickname] = {
+            name: weight.to(torch.bfloat16)
+            for name, weight in self.lora_adapters[lora_nickname].items()
+        }
 
 
 EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, PikaH3FlexPipeline]
