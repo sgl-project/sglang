@@ -82,8 +82,9 @@ class L2TransferEngine:
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
         """Resolve controller IDs into this pool's device-buffer indices.
 
-        Call on the index stream after the producer event. The HiCache pin
-        source keeps the rows in place until the transfer is acknowledged.
+        Call on the index stream after the producer event: a page move made
+        before the submission is ordered before this translation, and one made
+        after it waits for the copy's finish event.
         """
         translate = transfer.device_translate
         if translate is None:

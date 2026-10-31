@@ -1853,6 +1853,7 @@ class BufferModePipeline:
                         cache._apply_cache_action(action)
                 offset += end - start
             component.restore_buffer_mapping(torch.cat(full_parts), window_dev)
+        cache.name_loaded_window_rows_by_owner(state.load_transfers)
 
         insert_result = self._insert_loaded_prefix(
             state, req, plan, prefix_indices=prefix_indices
