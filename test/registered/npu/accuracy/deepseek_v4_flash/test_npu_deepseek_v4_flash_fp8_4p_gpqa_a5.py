@@ -1,11 +1,11 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
-    BENCHMARK_TOOL_DEFAULT,
+    EVALSCOPE,
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
+    BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
@@ -128,7 +128,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_GENERATION_CONFIG_MAX = {
 class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
     """Test NPU accuracy for DeepSeek-V4-Flash FP8 4p DSPARK GPQA."""
 
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    benchmark_tool = EVALSCOPE
     model = DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_FP8_4P_ENVS
@@ -150,7 +150,6 @@ class TestNPUDeepSeekV4FlashDSPARK(TestNpuPerformanceTestCaseBase):
     """Test DSPARK for Deepseek-V4 in the 950 environment, acceptance rate greater than 0.5"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_FP8_4P_ENVS
