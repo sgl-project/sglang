@@ -11,6 +11,7 @@ from sglang.srt.runtime_context import get_platform
 from ..common.tile_ptr import tile_ptrs_1d, tile_ptrs_2d
 from ..common.utils import (
     check_sparse_kv_fp8,
+    grid_batch_size,
     robust_allocator,
     sparse_out_dtype,
     unit_scale,
@@ -431,7 +432,9 @@ def flash_decode_with_gqa_share_sparse(
     TARGET_GRID = 256
     target = max(
         1,
-        min(max_topk, TARGET_GRID // max(1, batch_size * num_kv_heads)),
+        min(
+            max_topk, TARGET_GRID // max(1, grid_batch_size(batch_size) * num_kv_heads)
+        ),
     )
     NUM_TOPK_CHUNKS = 1 << (target.bit_length() - 1)
     # output tensor: split-K partials, merged into chunk 0 by the merge kernel

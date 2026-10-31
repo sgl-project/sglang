@@ -15,6 +15,7 @@ from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
     check_sparse_kv_fp8,
+    grid_batch_size,
     robust_allocator,
     sparse_out_dtype,
     unit_scale,
@@ -43,7 +44,7 @@ _ON_HIP = torch.version.hip is not None
 def _decode_score_block_n(args):
     # gfx950 pick: 512 for tiny batches (few CTAs), else 128. A 512-token bf16
     # K tile needs 128 KB of LDS, more than gfx942's 64 KB, so other archs keep 128.
-    small_batch = args["batch_size"] <= 4 and is_gfx95_supported()
+    small_batch = grid_batch_size(args["batch_size"]) <= 4 and is_gfx95_supported()
     return max(512 if small_batch else 128, args["block_size"])
 
 
@@ -1034,7 +1035,10 @@ def flash_decode_with_topk_idx(
     MAX_NUM_KV_CHUNKS = 256
     target = max(
         1,
-        min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
+        min(
+            MAX_NUM_KV_CHUNKS,
+            TARGET_GRID // max(1, grid_batch_size(batch_size) * num_kv_heads),
+        ),
     )
     NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
     score_kv_len = min(max_seqlen, max_kv_len)
