@@ -4608,6 +4608,29 @@ class Scheduler(
             and req.next_output_finishes_by_length()
         ]
 
+    def _settle_pd_decode_inflight(self) -> bool:
+        """Process the queued decode result before a PD decode retraction.
+
+        A retracted request's backup is restored on resume, so it must hold
+        the state that matches the request's output_ids. Under overlap the
+        previous step is still in flight: it may advance recurrent state in
+        place and commit a speculative verify's accepted block into KV and
+        draft state, while result processing skips retracted requests, so
+        output_ids stay a step behind. Returns whether anything was settled.
+        """
+        if (
+            self.disaggregation_mode != DisaggregationMode.DECODE
+            or not self.enable_overlap
+            or not self.result_queue
+        ):
+            return False
+        while self.result_queue:
+            pending_batch, pending_result = self.result_queue.popleft()
+            self.process_batch_result(pending_batch, pending_result)
+        # The overlap loop must not process the settled result again.
+        self.last_batch = None
+        return True
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
@@ -4625,10 +4648,17 @@ class Scheduler(
             batch.batch_is_full = False
             return None
 
+        test_retract = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if (kv_full_retract_flag or test_retract) and self._settle_pd_decode_inflight():
+            # Settling finished requests and released their KV.
+            batch.filter_batch()
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            kv_full_retract_flag = not batch.check_decode_mem()
+
         # Check if decode out of memory
-        if kv_full_retract_flag or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
-        ):
+        if kv_full_retract_flag or test_retract:
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()
