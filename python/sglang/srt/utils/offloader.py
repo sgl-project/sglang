@@ -424,7 +424,13 @@ class _CpuParamOffloader(_BaseParamOffloader):
         _move_param_to_cpu(self._param, pin_memory=True)
 
     def create_device_tensor(self):
-        return self._param.to("cuda", non_blocking=True)
+        output = self._param.to("cuda", non_blocking=True)
+        # `.to()` returns a fresh tensor without the parameter's Python attributes,
+        # but MoE kernels (e.g. aiter fused_moe) select the preshuffled weight layout
+        # via `is_shuffled` on the weight, so carry it over to the device copy.
+        if getattr(self._param, "is_shuffled", False):
+            output.is_shuffled = True
+        return output
 
 
 class _ShmCpuParamOffloader(_BaseParamOffloader):
