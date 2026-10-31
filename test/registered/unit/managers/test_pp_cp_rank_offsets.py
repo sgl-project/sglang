@@ -1,8 +1,11 @@
+import os
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -14,6 +17,8 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import AbortReq, sock_send  # noqa: E402
+from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
@@ -45,8 +50,8 @@ def _fake_group() -> SimpleNamespace:
     return SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
 
 
-def _make_receiver() -> SchedulerRequestReceiver:
-    return SchedulerRequestReceiver(
+def _make_receiver(**kwargs) -> SchedulerRequestReceiver:
+    arguments = dict(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
@@ -60,6 +65,95 @@ def _make_receiver() -> SchedulerRequestReceiver:
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
     )
+    arguments.update(kwargs)
+    return SchedulerRequestReceiver(**arguments)
+
+
+class TestRequestReceiverCompatibility(CustomTestCase):
+    def test_existing_callers_default_to_socket_transport(self):
+        self.assertFalse(_make_receiver().rust_server_mode)
+
+    def test_callers_can_pass_explicit_transport_mode(self):
+        for mode in (False, True):
+            with self.subTest(rust_server_mode=mode):
+                receiver = _make_receiver(rust_server_mode=mode)
+                self.assertIs(receiver.rust_server_mode, mode)
+
+    def test_scheduler_captures_transport_mode(self):
+        scheduler = SimpleNamespace(
+            recv_from_tokenizer=object(),
+            ipc_channels=SimpleNamespace(recv_from_rpc=None),
+            recv_skipper=None,
+            input_blocker=None,
+            mm_receiver=None,
+            server_args=SimpleNamespace(),
+            model_config=SimpleNamespace(is_multimodal=False),
+            max_recv_per_poll=2,
+            output_streamer=Mock(),
+            last_batch=object(),
+            scripted_scheduler_hook=None,
+            scheduler_stage_metrics=None,
+        )
+        for mode in (False, True):
+            with self.subTest(rust_server_mode=mode):
+                with patch.dict(os.environ, {"SGLANG_RUST_SERVER": str(mode)}):
+                    Scheduler.init_request_receiver(scheduler)
+                receiver = scheduler.request_receiver
+                self.assertIs(type(receiver), SchedulerRequestReceiver)
+                self.assertIs(receiver.rust_server_mode, mode)
+                self.assertIs(receiver.get_last_batch(), scheduler.last_batch)
+
+    def test_socket_receiver_ignores_later_environment_changes(self):
+        with ExitStack() as cleanup:
+            context = zmq.Context()
+            cleanup.callback(context.term)
+            sender, tokenizer, rpc = [context.socket(zmq.PAIR) for _ in range(3)]
+            for socket in (sender, tokenizer, rpc):
+                cleanup.callback(socket.close, linger=0)
+            tokenizer.bind("inproc://receiver-transport-mode")
+            sender.connect("inproc://receiver-transport-mode")
+            for rid in ("first", "second", "third"):
+                sock_send(sender, AbortReq(rid=rid))
+            self.assertTrue(tokenizer.poll(1000, zmq.POLLIN))
+            receiver = _make_receiver(
+                recv_from_tokenizer=tokenizer,
+                recv_from_rpc=rpc,
+                max_recv_per_poll=2,
+                rust_server_mode=False,
+            )
+            parallel = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+            with (
+                patch.dict(os.environ, {"SGLANG_RUST_SERVER": "1"}),
+                patch(
+                    "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                    return_value=parallel,
+                ),
+            ):
+                self.assertEqual(
+                    [req.rid for req in receiver._pull_raw_reqs()], ["first", "second"]
+                )
+                self.assertEqual(
+                    [req.rid for req in receiver._pull_raw_reqs()], ["third"]
+                )
+                self.assertEqual(receiver._pull_raw_reqs(), [])
+
+    def test_ring_receiver_ignores_later_environment_changes(self):
+        ring = Mock()
+        ring.drain.side_effect = [[AbortReq(rid="first")], []]
+        receiver = _make_receiver(
+            recv_from_tokenizer=ring, max_recv_per_poll=2, rust_server_mode=True
+        )
+        parallel = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+        with (
+            patch.dict(os.environ, {"SGLANG_RUST_SERVER": "0"}),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            self.assertEqual([req.rid for req in receiver._pull_raw_reqs()], ["first"])
+            self.assertEqual(receiver._pull_raw_reqs(), [])
+        self.assertEqual(ring.drain.call_args_list, [call(2), call(2)])
 
 
 class TestRequestReceiverBroadcast(unittest.TestCase):
