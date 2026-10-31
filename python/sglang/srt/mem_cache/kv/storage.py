@@ -750,6 +750,35 @@ class KVStorage:
         over the queues that live across iterations; tree locks are not pins."""
         self._allocator.add_pin_source(sub_pools, busy)
 
+    def record_forward(
+        self,
+        forward_done: torch.cuda.Event,
+        *,
+        written_tokens: Optional[torch.Tensor],
+        token_writes_unknown: bool,
+        req_pool_indices: torch.Tensor,
+        state_slots: Sequence[Optional[torch.Tensor]],
+    ) -> None:
+        """Record a just-launched forward so that no page move races it: its
+        done event and the virtual ids it writes. State kernels write the
+        batch's working slots in place, and the tracking and copy-on-write
+        slots in ``state_slots``. ``token_writes_unknown``: the token write ids
+        are produced by the forward itself and cannot be read before it ends.
+        Gathers on the current stream, which must be the one compaction runs
+        on."""
+        state = None
+        if self._allocator.mamba_allocator is not None:
+            written = [self.requests.get_mamba_indices(req_pool_indices)]
+            written += [slots for slots in state_slots if slots is not None]
+            state = torch.cat([slots.reshape(-1).to(torch.int64) for slots in written])
+        self._allocator.set_latest_forward_done_event(forward_done)
+        self._allocator.set_inflight_forward(
+            forward_done,
+            written_tokens,
+            state,
+            token_writes_unknown=token_writes_unknown,
+        )
+
     def host_load_alloc(
         self, sub_pool: str
     ) -> Optional[Tuple[Callable[[int], Any], Callable[[Any], Any]]]:
