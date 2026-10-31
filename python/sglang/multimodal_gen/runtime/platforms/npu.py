@@ -168,6 +168,15 @@ class NPUPlatformBase(Platform):
                     "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
                 ) from e
 
+        elif selected_backend == AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (  # noqa: F401
+                HybridWindowAttentionH3Backend,
+            )
+
+            logger.info("Using Ascend Hybrid Window Attention H3 backend.")
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3.HybridWindowAttentionH3Backend"
+
         logger.info("Using Torch SDPA backend.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
