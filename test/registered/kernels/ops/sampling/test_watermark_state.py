@@ -316,5 +316,106 @@ def test_speculative_tree_fast_path_matches_tensor_reference():
     assert fused_selected.view(2, draft_token_num)[:, 2].logical_not().all()
 
 
+@pytest.mark.parametrize("block_verification", [False, True])
+def test_dspark_chain_commits_non_speculative_contexts(block_verification):
+    from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptSampling
+
+    vocab_size = 64
+    req_pool_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((1, 1), device="cuda"),
+        top_ks=torch.tensor([vocab_size], dtype=torch.int32, device="cuda"),
+        top_ps=torch.ones(1, device="cuda"),
+        min_ps=torch.zeros(1, device="cuda"),
+        max_top_k=vocab_size,
+        watermark_keys=None,
+        watermark_context_windows=None,
+        watermark_enabled=None,
+        has_watermark_candidates=True,
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+    )
+    states = [
+        WatermarkState(
+            max_num_reqs=1,
+            context_window=2,
+            max_contexts_per_req=8,
+            key="0123456789abcdef",
+            device="cuda",
+            default_enabled=True,
+        )
+        for _ in range(2)
+    ]
+    reference, state = states
+    for watermark_state in states:
+        watermark_state.init_from_prompt(req_pool_indices, [[10, 11]])
+    logits = torch.randn(
+        (4, vocab_size), generator=torch.Generator("cuda").manual_seed(3), device="cuda"
+    )
+
+    forced = []
+    for row in range(2):
+        row_logits = logits[row : row + 1].clone()
+        reference.force(row_logits, req_pool_indices, sampling_info)
+        forced.append(int(torch.isfinite(row_logits[0]).nonzero().item()))
+        reference.append(
+            req_pool_indices,
+            torch.tensor([forced[-1]], dtype=torch.int32, device="cuda"),
+        )
+
+    chain_tokens = torch.tensor(
+        [[11, forced[0], (forced[1] + 1) % vocab_size, 7]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    target_logits = logits.clone()
+    context_hashes, selected = state.force_speculative_chain(
+        logits=target_logits,
+        req_pool_indices=req_pool_indices,
+        chain_tokens=chain_tokens,
+        positions=torch.arange(4, device="cuda").view(1, 4),
+        sampling_info=sampling_info,
+    )
+    draft_probs = torch.softmax(
+        torch.randn(
+            (1, 3, vocab_size),
+            generator=torch.Generator("cuda").manual_seed(5),
+            device="cuda",
+        ),
+        dim=-1,
+    )
+    correct_len, bonus, _ = AcceptSampling.execute(
+        candidates=chain_tokens,
+        target_logits=target_logits,
+        draft_probs=draft_probs,
+        sampling_info=sampling_info,
+        draft_input=SimpleNamespace(max_top_k=None, uniform_top_k_value=None),
+        gamma=3,
+        verify_num_draft_tokens=4,
+        block_verification=block_verification,
+    )
+    assert correct_len.tolist() == [1]
+    assert bonus.tolist() == [forced[1]]
+
+    state.commit_speculative_chain(
+        req_pool_indices=req_pool_indices,
+        context_hashes=context_hashes,
+        selected=selected,
+        accept_tokens=torch.tensor(
+            [[forced[0], forced[1], 0, 0]], dtype=torch.int64, device="cuda"
+        ),
+        accept_lens=torch.tensor([2], dtype=torch.int32, device="cuda"),
+    )
+    assert torch.equal(
+        state.contexts_tail(req_pool_indices)[0],
+        reference.contexts_tail(req_pool_indices)[0],
+    )
+    assert state.num_watermarked_contexts.tolist() == [2]
+    assert torch.equal(
+        state.watermarked_context_hashes[0, :2],
+        reference.watermarked_context_hashes[0, :2],
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
