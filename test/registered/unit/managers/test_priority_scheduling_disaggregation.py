@@ -527,7 +527,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.transfer_queue = SimpleNamespace(
+            queue=[], enable_staging=False, enable_deferred_kv_release=False
+        )
         queue.kv_manager = SimpleNamespace(
             kv_args=SimpleNamespace(state_types=[]),
         )

@@ -36,6 +36,10 @@ class CompletionFlag:
     def query(self) -> bool:
         return self._flags._load(self._slot) >= self._generation
 
+    @property
+    def device_mapped(self) -> bool:
+        return self._flags._device_ptr is not None
+
     def wait_on_stream(self, stream: torch.cuda.Stream) -> None:
         """Order ``stream``'s later work after the publish, without blocking the
         host."""
@@ -52,7 +56,20 @@ class CompletionFlags:
     # cuStreamWaitValue32 flag: wait until *addr >= value (as unsigned).
     _CU_STREAM_WAIT_VALUE_GEQ = 0x0
 
-    def __init__(self, num_slots: int = 4096):
+    def __init__(self, num_slots: int = 4096, *, device_mapped: bool = True):
+        self._num_slots = num_slots
+        if not device_mapped:
+            # No device to order: the flags only record completion (CPU pools).
+            self._buffer = (ctypes.c_uint32 * num_slots)()
+            self._values = self._buffer
+            self._device_ptr = None
+        else:
+            self._map_to_device(num_slots)
+        self._generations = [0] * num_slots
+        self._free: List[int] = list(range(num_slots))
+        self._lock = threading.Lock()
+
+    def _map_to_device(self, num_slots: int) -> None:
         from cuda.bindings import driver as cuda
 
         from sglang.srt.utils.cuda_vmm_utils import check_drv
@@ -76,10 +93,6 @@ class CompletionFlags:
             )
         )
         self._values = (ctypes.c_uint32 * num_slots).from_address(self._host_ptr)
-        self._num_slots = num_slots
-        self._generations = [0] * num_slots
-        self._free: List[int] = list(range(num_slots))
-        self._lock = threading.Lock()
 
     def acquire(self) -> CompletionFlag:
         """A new unpublished flag. Its slot returns with `release`."""
@@ -97,12 +110,18 @@ class CompletionFlags:
             self._free.append(flag._slot)
 
     def _store(self, slot: int, generation: int) -> None:
-        self._values[slot] = generation
+        # Monotonic: a late publish of an earlier flag of the slot (a timer, a
+        # status thread) must not undo a later flag's publish.
+        with self._lock:
+            if self._values[slot] < generation:
+                self._values[slot] = generation
 
     def _load(self, slot: int) -> int:
         return self._values[slot]
 
     def _wait(self, stream: torch.cuda.Stream, slot: int, generation: int) -> None:
+        if self._device_ptr is None:
+            return
         self._check(
             self._cuda.cuStreamWaitValue32(
                 stream.cuda_stream,
@@ -145,10 +164,13 @@ def signal_fired(key) -> bool:
 def wait_signals(key, stream: Optional[torch.cuda.Stream] = None) -> None:
     """Order ``stream``'s later work after every GPU-waitable signal of
     ``key`` that has not completed."""
-    stream = torch.cuda.current_stream() if stream is None else stream
     for s in signals_of(key):
         if isinstance(s, TransferRelease) or s.query():
             continue
+        if isinstance(s, CompletionFlag) and not s.device_mapped:
+            continue  # a CPU pool has no stream to order
+        if stream is None:
+            stream = torch.cuda.current_stream()
         if isinstance(s, CompletionFlag):
             s.wait_on_stream(stream)
         else:

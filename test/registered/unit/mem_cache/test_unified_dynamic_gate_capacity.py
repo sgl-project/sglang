@@ -94,28 +94,29 @@ class TestDynamicGateCapacity(CustomTestCase):
                     pin_every_band(a, lambda: not state["open"])
                     self.assert_dynamic_views(a, state)
 
-    def test_real_prefill_queue_gate(self):
-        from sglang.srt.disaggregation.utils import (
-            DisaggregationMode,
-            disagg_transfers_in_flight,
-        )
-
+    def test_a_network_transfer_leaves_credit_open(self):
+        """A send reading a window page orders that page's moves; it neither
+        keeps the window in place nor closes the owner's credit for the
+        window's holes, during the transfer or after it."""
         a = build_swa_pool()
         slots = a.alloc(96)
         a.free_swa(slots[:40])
-        scheduler = SimpleNamespace(
-            disaggregation_mode=DisaggregationMode.PREFILL,
-            disagg_prefill_inflight_queue=[],
-            disagg_prefill_pending_chunk_rids=set(),
-        )
-        pin_every_band(a, disagg_transfers_in_flight(scheduler))
-        x = a.full_attn_allocator
+        storage = a.storage
+        x, w = a.full_attn_allocator, a.swa_attn_allocator
         opened = x.schedulable_available_size()
-        scheduler.disagg_prefill_pending_chunk_rids.add("request")
-        closed = x.schedulable_available_size()
-        self.assertLess(closed, opened)
-        self.assertEqual(closed, x._available_tokens())
-        scheduler.disagg_prefill_pending_chunk_rids.clear()
+        req = SimpleNamespace(rid="request", bootstrap_room=1)
+        units = w.ids.virtual_to_physical[slots[-1:] // w.page_size]
+        flag = storage.record_network_transfer(
+            req,
+            a.roles.window,
+            units.tolist(),
+            unit_tokens=storage.unit_tokens(a.roles.window),
+            writes=False,
+        )
+        self.assertFalse(w.moves_blocked())
+        self.assertEqual(x.schedulable_available_size(), opened)
+        storage.end_network_transfer(req)
+        self.assertTrue(flag.query())
         self.assertEqual(x.schedulable_available_size(), opened)
         self.assertEqual(a.verify_byte_accounting(), [])
 

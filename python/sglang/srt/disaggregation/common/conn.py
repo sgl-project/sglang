@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from typing import (
+    Any,
     Dict,
     List,
     Literal,
@@ -294,6 +295,9 @@ class CommonKVManager(BaseKVManager):
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
+    # Completion flags published when a room's transfer concludes, by the thread
+    # that applies the status: (flag, delay after a failure). Created on first use.
+    _conclusion_flags: Optional[Dict[int, Tuple[Any, Optional[float]]]] = None
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
@@ -672,12 +676,44 @@ class CommonKVManager(BaseKVManager):
                 self._notify_bootstrap(
                     bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
                 )
+            self._publish_conclusion(bootstrap_room)
             return
         if current == KVPoll.Failed:
             # Failed is terminal. It also sorts lowest, so the max() below would
             # happily promote it back to Transferring or Success.
             return
         self.request_status[bootstrap_room] = max(current, status)
+        self._publish_conclusion(bootstrap_room)
+
+    def publish_on_conclusion(
+        self, bootstrap_room: int, flag, *, failed_delay: Optional[float]
+    ) -> None:
+        """Publish ``flag`` when the room's transfer concludes, from the thread
+        that applies its status, never waiting for the scheduler loop (which may
+        wait on a forward that waits the flag): at Success, and at Failed after
+        ``failed_delay`` seconds (None: at once), the longest the engine of a
+        failed transfer may still touch the rows."""
+        if self._conclusion_flags is None:
+            self._conclusion_flags = {}
+        self._conclusion_flags[bootstrap_room] = (flag, failed_delay)
+        self._publish_conclusion(bootstrap_room)
+
+    def _publish_conclusion(self, bootstrap_room: int) -> None:
+        if not self._conclusion_flags:
+            return
+        status = self.request_status.get(bootstrap_room)
+        if status not in (KVPoll.Success, KVPoll.Failed):
+            return
+        entry = self._conclusion_flags.pop(bootstrap_room, None)
+        if entry is None:
+            return
+        flag, failed_delay = entry
+        if status == KVPoll.Success or failed_delay is None:
+            flag.publish()
+            return
+        timer = threading.Timer(failed_delay, flag.publish)
+        timer.daemon = True
+        timer.start()
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:

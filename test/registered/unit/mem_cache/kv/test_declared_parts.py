@@ -842,7 +842,7 @@ class TestDeclaredParts(CustomTestCase):
             memory.nbytes,
             sum(t.bytes for t in sized.fixed if t.name != "request_table"),
         )
-        req = SimpleNamespace(kv=_RequestKV())
+        req = SimpleNamespace(rid="r0", kv=_RequestKV())
         row = storage.acquire([req])[0]
         addresses = {n: t.data_ptr() for n, t in memory.tensors.items()}
         for part in memory.parts:
