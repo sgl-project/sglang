@@ -958,6 +958,7 @@ class SWAComponent(TreeComponent):
             pre_len,
             window=self.sliding_window_size,
             retain_floor=self.cache.swa_retain_floor(req),
+            reprefill_tail_tokens=self.cache.swa_reprefill_tail_tokens(req),
             shares_prefixes=True,
         )
 
