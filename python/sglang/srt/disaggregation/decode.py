@@ -1672,7 +1672,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Prefill is responsible for storing this prefix; no persistence ACK is required.
             prefill_info = getattr(decode_req.kv_receiver, "prefill_info", None)
             decode_req.req.linker_offload_skip_prefix_len = (
-                self._pre_alloc_fill_len(decode_req.req)
+                pre_alloc_fill_len(decode_req.req)
                 if prefill_info is not None and prefill_info.stores_to_linker
                 else 0
             )
