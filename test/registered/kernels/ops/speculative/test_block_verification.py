@@ -9,10 +9,6 @@ import torch
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
-from sglang.srt.speculative.dspark_components.dspark_verify import (
-    accept_draft_tokens,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -137,6 +133,51 @@ def test_matches_reference(steps, vocab, block):
     assert (upper > lower).all()
     assert (final_coins >= lower - 1e-6).all()
     assert (final_coins <= upper + 1e-6).all()
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_final_draw_stays_in_sparse_residual_support(block):
+    target = torch.zeros(1, 2, 65568, device=DEVICE)
+    # FP32 prefix sums round differently across blocks at the 0.5 boundary.
+    target[:, :, [7, 4103, 8199, 16391]] = target.new_tensor(
+        [2**-25, 2**-25, 0.5, 0.5 - 2**-24]
+    )
+    draft = torch.zeros_like(target[:, :1])
+    draft[:, :, 3] = 1.0
+    lengths, output = _verify(
+        target,
+        draft,
+        torch.full((1, 2), 3, device=DEVICE),
+        target.new_full((1, 2), 0.9),
+        target.new_tensor([0.5]),
+        block=block,
+    )
+    assert lengths.item() == 0
+    token = output[0, 0].item()
+    assert 0 <= token < target.size(-1)
+    assert target[0, 0, token] > draft[0, 0, token]
+
+
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("vocab,token", [(129, 126), (65569, 32766)])
+def test_final_draw_when_cutoff_rounds_to_residual_total(block, vocab, token):
+    target = torch.zeros(1, 2, vocab, device=DEVICE)
+    # The common prefix sums to 1 - 2**-126; the two rows differ only in the tail.
+    target[:, :, :126] = target.new_tensor([2.0**-k for k in range(1, 127)])
+    target[:, :, token] = 2.0**-126
+    draft = target[:, :1].clone()
+    draft[:, :, token + 1] = draft[:, :, token]
+    draft[:, :, token] = 0
+    lengths, output = _verify(
+        target,
+        draft,
+        torch.full((1, 2), token + 1, device=DEVICE),
+        target.new_full((1, 2), 0.9),
+        target.new_tensor([1 - 2**-24]),
+        block=block,
+    )
+    assert lengths.item() == 0
+    assert output[0, 0].item() == token
 
 
 def test_accepts_longer_prefix_after_rejection():
@@ -337,6 +378,11 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     """The DFLASH-family accept path must reach the block sampler. Here r_1 = 1/2
     and r_2 = 1, so block verification always accepts both drafts; token-wise
     verification rejects the first draft half the time."""
+    from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+    from sglang.srt.speculative.dspark_components.dspark_verify import (
+        accept_draft_tokens,
+    )
+
     batch, vocab, masked = 64, 8, -1e4
     # Draft proposals: q(0) = 1, then q(1) = q(2) = 1/2.
     draft_logits = torch.full((batch, 2, vocab), masked, device=DEVICE)
