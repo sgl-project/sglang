@@ -1,19 +1,29 @@
 from typing import Optional
 
 import numpy as np
-from aiconfigurator.sdk import models
-from aiconfigurator.sdk.backends.factory import get_backend
-from aiconfigurator.sdk.common import (
-    CommQuantMode,
-    DatabaseMode,
-    FMHAQuantMode,
-    GEMMQuantMode,
-    KVCacheQuantMode,
-    MoEQuantMode,
-)
-from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
-from aiconfigurator.sdk.inference_session import InferenceSession
-from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
+
+try:
+    from aisimulate.sdk import models
+    from aisimulate.sdk.backends.factory import get_backend
+    from aisimulate.sdk.common import (
+        CommQuantMode,
+        DatabaseMode,
+        FMHAQuantMode,
+        GEMMQuantMode,
+        KVCacheQuantMode,
+        MoEQuantMode,
+    )
+    from aisimulate.sdk.config import ModelConfig, RuntimeConfig
+    from aisimulate.sdk.inference_session import InferenceSession
+    from aisimulate.sdk.perf_database import get_database, get_systems_paths
+except ModuleNotFoundError as exc:
+    if exc.name not in {"aisimulate", "aisimulate.sdk"}:
+        raise
+    raise ModuleNotFoundError(
+        "Install the AISimulate SDK with: "
+        "pip install -e 'tools/sglang-simulator[aisimulate]'"
+    ) from exc
+
 from sglang_simulator.simulation.types import (
     SchedulerConfig,
 )
@@ -27,7 +37,7 @@ from sglang_simulator.time_predictor.base import (
 )
 from sglang_simulator.utils import get_logger
 
-# Map the common data types to AIConfigurator data types.
+# Map the common data types to AISimulate data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
     DataType.FP16: GEMMQuantMode.bfloat16,
     DataType.BF16: GEMMQuantMode.bfloat16,
@@ -87,10 +97,40 @@ def _resolve_comm_quant_mode(sched_config: SchedulerConfig) -> CommQuantMode:
         return MAP_DTYPE_TO_CommQuantMode[sched_config.data_type]
     except KeyError:
         raise ValueError(
-            "AIConfigurator has no communication quantization mapping for "
+            "AISimulate has no communication quantization mapping for "
             f"model data type {sched_config.data_type.value}. Set "
             "comm_quant_mode_override explicitly to half, int8, or fp8."
         ) from None
+
+
+def get_quant_modes(config: SchedulerConfig) -> dict:
+    """One deployment mapping for memory estimation and static prediction."""
+    dtype, kv = config.data_type, config.kv_cache_data_type
+    specs = (
+        ("gemm", dtype, MAP_DTYPE_TO_GEMMQuantMode, GEMMQuantMode, None),
+        (
+            "moe",
+            dtype,
+            MAP_DTYPE_TO_MoEQuantMode,
+            MoEQuantMode,
+            config.moe_quant_mode_override,
+        ),
+        ("kvcache", kv, MAP_DTYPE_TO_KVCacheQuantMode, KVCacheQuantMode, None),
+        (
+            "fmha",
+            kv,
+            MAP_DTYPE_TO_FMHAQuantMode,
+            FMHAQuantMode,
+            config.fmha_quant_mode_override,
+        ),
+    )
+    result = {}
+    for name, value, mapping, enum, override in specs:
+        result[name + "_quant_mode"] = (
+            getattr(enum, override) if override else mapping.get(value, enum.bfloat16)
+        )
+    result["comm_quant_mode"] = _resolve_comm_quant_mode(config)
+    return result
 
 
 def get_perf_model(
@@ -106,31 +146,11 @@ def get_perf_model(
         attention_dp_size=sched_config.attn_dp_size,
         cp_size=sched_config.cp_size,
         cp_style=sched_config.cp_style,
-        gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
-            sched_config.data_type, GEMMQuantMode.bfloat16
-        ),
-        moe_quant_mode=(
-            getattr(MoEQuantMode, sched_config.moe_quant_mode_override)
-            if sched_config.moe_quant_mode_override
-            else MAP_DTYPE_TO_MoEQuantMode.get(
-                sched_config.data_type, MoEQuantMode.bfloat16
-            )
-        ),
-        kvcache_quant_mode=MAP_DTYPE_TO_KVCacheQuantMode.get(
-            sched_config.kv_cache_data_type, KVCacheQuantMode.bfloat16
-        ),
-        fmha_quant_mode=(
-            getattr(FMHAQuantMode, sched_config.fmha_quant_mode_override)
-            if sched_config.fmha_quant_mode_override
-            else MAP_DTYPE_TO_FMHAQuantMode.get(
-                sched_config.kv_cache_data_type, FMHAQuantMode.bfloat16
-            )
-        ),
-        comm_quant_mode=_resolve_comm_quant_mode(sched_config),
+        **get_quant_modes(sched_config),
         workload_distribution=workload_distribution,
     )
 
-    logger.info(f"Model config for AIConfigurator: {model_config}")
+    logger.info(f"Model config for AISimulate: {model_config}")
 
     return models.get_model(
         model_path=model.model_path,
@@ -139,7 +159,7 @@ def get_perf_model(
     )
 
 
-class AIConfiguratorTimePredictor(InferTimePredictor):
+class AISimulateTimePredictor(InferTimePredictor):
     def __init__(
         self,
         model: ModelInfo,
@@ -174,7 +194,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             raise ValueError("Failed to initialize the database.")
 
         database.set_default_database_mode(database_mode)
-        logger.info(f"AIC Database mode: {database_mode}")
+        logger.info(f"AISimulate database mode: {database_mode}")
 
         self._session = InferenceSession(
             model=get_perf_model(config, model, workload_distribution),
