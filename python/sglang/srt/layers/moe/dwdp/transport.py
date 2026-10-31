@@ -131,6 +131,7 @@ class DWDPTransport:
             handle_list, cpu_group, layout.dwdp_rank
         )
         peer_fds: Dict[Tuple[int, int], int] = {}
+        imported = False
         try:
             key_counts = [None] * layout.dwdp_size
             dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
@@ -207,10 +208,21 @@ class DWDPTransport:
                         dtype=spec.dtype,
                     )
                     self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
+            imported = True
         finally:
-            if self._backend.owns_exported_fds():
-                _close_fds(local_posix_fds)
-            _close_fds(peer_fds.values())
+            # close both sets even if the first close fails, and never let a close
+            # error replace the error that is already propagating
+            close_errors: List[OSError] = []
+            owned_local_fds = (
+                local_posix_fds if self._backend.owns_exported_fds() else ()
+            )
+            for fds in (owned_local_fds, peer_fds.values()):
+                try:
+                    _close_fds(fds)
+                except OSError as error:
+                    close_errors.append(error)
+            if imported and close_errors:
+                raise close_errors[0]
 
     @property
     def handle_set(self) -> MnnvlHandleSet:

@@ -5239,6 +5239,10 @@ def exchange_posix_fds(
     server.settimeout(FD_SEND_TIMEOUT_S)
     received_fds: Dict[Tuple[int, int], int] = {}
     errors: List[BaseException] = []
+    # a timed-out exchange abandons the recv thread while it can still receive,
+    # so it closes late fds itself rather than storing them for nobody
+    received_lock = threading.Lock()
+    abandoned = threading.Event()
 
     def recv_loop() -> None:
         try:
@@ -5252,10 +5256,14 @@ def exchange_posix_fds(
                             break
                         src_rank, base_idx, fd = packet
                         key = (src_rank, base_idx)
-                        if key in received_fds:
-                            os.close(fd)
-                            raise RuntimeError(f"duplicate fd for {key}")
-                        received_fds[key] = fd
+                        with received_lock:
+                            if abandoned.is_set():
+                                os.close(fd)
+                                return
+                            if key in received_fds:
+                                os.close(fd)
+                                raise RuntimeError(f"duplicate fd for {key}")
+                            received_fds[key] = fd
         except BaseException as error:
             errors.append(error)
 
@@ -5299,9 +5307,17 @@ def exchange_posix_fds(
             )
         return received_fds
     except BaseException:
-        # on any failure the caller never sees these fds, so they are closed here
-        for fd in received_fds.values():
-            os.close(fd)
+        # on any failure the caller never sees these fds, so they are closed here;
+        # a close error must not replace the failure being raised
+        with received_lock:
+            abandoned.set()
+            leftover = list(received_fds.values())
+            received_fds.clear()
+        for fd in leftover:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise
     finally:
         server.close()
