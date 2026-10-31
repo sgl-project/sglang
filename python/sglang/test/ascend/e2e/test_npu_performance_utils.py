@@ -367,32 +367,53 @@ def write_pkg_info_to_file(result_file):
         logger.error(f"Error getting packages: {e}")
 
 
-def _build_bench_command(
+def run_bench_serving(
     host,
     port,
-    model_path,
-    backend,
-    dataset_name,
-    dataset_path,
-    request_rate,
-    max_concurrency,
-    num_prompts,
-    input_len,
-    output_len,
-    random_range_ratio,
-    image_resolution,
-    image_count,
-    warmup_requests,
-    seed,
-    output_file,
-    repeat_rate,
-    temperature,
-    top_p,
-    gsp_num_groups,
-    gsp_prompts_per_group,
-    cache_report,
+    model_path=None,
+    backend="sglang",
+    dataset_name=None,
+    dataset_path=None,
+    request_rate=None,
+    max_concurrency=None,
+    num_prompts=None,
+    input_len=None,
+    output_len=None,
+    random_range_ratio=1,
+    image_resolution=None,
+    image_count=None,
+    warmup_requests=None,
+    seed=None,
+    output_file=None,
+    repeat_rate=None,
+    temperature=None,
+    top_p=None,
+    gsp_num_groups=None,
+    gsp_prompts_per_group=None,
+    cache_report=False,
+    env=None,
 ):
-    """Assemble the bench_serving command line (GSP and random branches)."""
+    """Run sglang.bench_serving against a live server and parse its metrics.
+
+    With cache_report=True the returned metrics dict additionally carries
+    the server's hierarchical KV hit rates:
+      - cache_hit_rate_pct: overall KV hit rate across all tiers
+      - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
+      - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+    Thresholds for these tiers are declared on the test case as the
+    min_hit_rate_pcts class attribute and enforced by assert_metrics,
+    which requires cache_report=True to have any values to check.
+    """
+    metrics_path = os.getenv("METRICS_DATA_FILE")
+    result_file = (
+        "./bench_log.txt"
+        if not metrics_path
+        else f"{metrics_path}/bench_serving_metrics.txt"
+    )
+    logger.info(f"The metrics result file: {result_file}")
+
+    write_pkg_info_to_file(result_file)
+
     if dataset_name == "generated-shared-prefix":
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
@@ -448,57 +469,54 @@ def _build_bench_command(
             cmd_args.extend(["--warmup-requests", str(warmup_requests)])
         if cache_report:
             cmd_args.append("--cache-report")
-        return cmd_args
-    cmd_args = [
-        PYTHON_FOR_TEST_TOOL,
-        "-m",
-        "sglang.bench_serving",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--model",
-        model_path,
-        "--backend",
-        backend,
-    ]
+    else:
+        cmd_args = [
+            PYTHON_FOR_TEST_TOOL,
+            "-m",
+            "sglang.bench_serving",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--model",
+            model_path,
+            "--backend",
+            backend,
+        ]
 
-    if dataset_name:
-        cmd_args.extend(["--dataset-name", str(dataset_name)])
-    if dataset_path:
-        cmd_args.extend(["--dataset-path", str(dataset_path)])
-    if request_rate:
-        cmd_args.extend(["--request-rate", str(request_rate)])
-    if max_concurrency:
-        cmd_args.extend(["--max-concurrency", str(max_concurrency)])
-    if num_prompts:
-        cmd_args.extend(["--num-prompts", str(num_prompts)])
-    if input_len:
-        cmd_args.extend(["--random-input-len", str(input_len)])
-    if output_len:
-        cmd_args.extend(["--random-output-len", str(output_len)])
-    if random_range_ratio:
-        cmd_args.extend(["--random-range-ratio", str(random_range_ratio)])
-    if image_resolution:
-        cmd_args.extend(["--image-resolution", str(image_resolution)])
-    if image_count:
-        cmd_args.extend(["--image-count", str(image_count)])
-    if warmup_requests:
-        cmd_args.extend(["--warmup-requests", str(warmup_requests)])
-    if seed:
-        cmd_args.extend(["--seed", str(seed)])
-    if output_file:
-        cmd_args.extend(["--output-file", str(output_file)])
-    if temperature is not None:
-        cmd_args.extend(["--temperature", str(temperature)])
-    if top_p is not None:
-        cmd_args.extend(["--top-p", str(top_p)])
-    return cmd_args
+        if dataset_name:
+            cmd_args.extend(["--dataset-name", str(dataset_name)])
+        if dataset_path:
+            cmd_args.extend(["--dataset-path", str(dataset_path)])
+        if request_rate:
+            cmd_args.extend(["--request-rate", str(request_rate)])
+        if max_concurrency:
+            cmd_args.extend(["--max-concurrency", str(max_concurrency)])
+        if num_prompts:
+            cmd_args.extend(["--num-prompts", str(num_prompts)])
+        if input_len:
+            cmd_args.extend(["--random-input-len", str(input_len)])
+        if output_len:
+            cmd_args.extend(["--random-output-len", str(output_len)])
+        if random_range_ratio:
+            cmd_args.extend(["--random-range-ratio", str(random_range_ratio)])
+        if image_resolution:
+            cmd_args.extend(["--image-resolution", str(image_resolution)])
+        if image_count:
+            cmd_args.extend(["--image-count", str(image_count)])
+        if warmup_requests:
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
+        if seed:
+            cmd_args.extend(["--seed", str(seed)])
+        if output_file:
+            cmd_args.extend(["--output-file", str(output_file)])
+        if temperature is not None:
+            cmd_args.extend(["--temperature", str(temperature)])
+        if top_p is not None:
+            cmd_args.extend(["--top-p", str(top_p)])
+    logger.info(f"Command: {' '.join(cmd_args)}")
 
-
-def _run_bench_and_parse(cmd_args, env, result_file):
-    """Run the benchmark subprocess, stream its output into the log file,
-    and parse recognized metric lines into the returned dict."""
+    # Run benchmark command and capture output
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
     # Launch the benchmark in its own session/process group so a dead server
@@ -620,139 +638,6 @@ def _run_bench_and_parse(cmd_args, env, result_file):
         reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
-    return metrics
-
-
-def _assert_hit_rates(metrics, min_hit_rate_pcts, cache_report):
-    """Assert any subset of overall / L1 (device) / L2 (host) hit rates.
-
-    min_hit_rate_pcts maps a tier name to a percentage threshold, e.g.
-    {"host": 10}; tiers left out are not asserted. Every threshold reads
-    the --cache-report output, so cache_report must be True when the dict
-    is non-empty. Mirrors the accept_rate handling in assert_metrics: dump
-    the observed value and its baseline, then fail loudly when the metric
-    is missing or below the threshold.
-    """
-    metric_keys = {
-        "cache": "cache_hit_rate_pct",
-        "device": "device_hit_rate_pct",
-        "host": "host_hit_rate_pct",
-    }
-    thresholds = min_hit_rate_pcts or {}
-    unknown_tiers = sorted(set(thresholds) - set(metric_keys))
-    if unknown_tiers:
-        raise Exception(
-            f"Unknown hit-rate tiers {unknown_tiers}; "
-            f"supported tiers: {sorted(metric_keys)}"
-        )
-    if thresholds and not cache_report:
-        raise Exception(
-            "min_hit_rate_pcts is set but cache_report is False; hit-rate "
-            "parsing requires --cache-report (and the server must run with "
-            "--enable-cache-report). Pass cache_report=True or drop the "
-            "thresholds."
-        )
-    for tier, threshold in thresholds.items():
-        value = metrics.get(metric_keys[tier])
-        if value is None:
-            raise Exception(
-                f"{tier} hit rate not found in bench_serving output while "
-                f"min_hit_rate_pcts['{tier}'] is set (did the server run "
-                "with --enable-cache-report and the bench with "
-                "--cache-report?)"
-            )
-        # Both the parsed value and the threshold are percentages, so a
-        # plain float() on each is enough - no unit conversion.
-        dump_metric(f"{tier}_hit_rate", float(value), labels={"type": "perf"})
-        dump_metric(
-            f"{tier}_hit_rate_baseline", float(threshold), labels={"type": "perf"}
-        )
-        # Strictly greater: a zero threshold stays meaningful (any actual
-        # hit must be > 0), instead of trivially passing on ">=".
-        assert float(value) > float(threshold), (
-            f"{tier} hit rate {value}% is not above {threshold}%"
-        )
-
-
-def run_bench_serving(
-    host,
-    port,
-    model_path=None,
-    backend="sglang",
-    dataset_name=None,
-    dataset_path=None,
-    request_rate=None,
-    max_concurrency=None,
-    num_prompts=None,
-    input_len=None,
-    output_len=None,
-    random_range_ratio=1,
-    image_resolution=None,
-    image_count=None,
-    warmup_requests=None,
-    seed=None,
-    output_file=None,
-    repeat_rate=None,
-    temperature=None,
-    top_p=None,
-    gsp_num_groups=None,
-    gsp_prompts_per_group=None,
-    cache_report=False,
-    min_hit_rate_pcts=None,
-    env=None,
-):
-    """Run sglang.bench_serving against a live server and parse its metrics.
-
-    With cache_report=True the returned metrics dict additionally carries
-    the server's hierarchical KV hit rates:
-      - cache_hit_rate_pct: overall KV hit rate across all tiers
-      - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
-      - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
-    Pass min_hit_rate_pcts to assert them: a dict mapping a tier name to a
-    percentage threshold ({"host": 10} = "L2 hit rate must exceed 10%").
-    Any subset of cache/device/host may be combined, every set tier is
-    asserted strictly greater than its threshold, and thresholds require
-    cache_report=True (an error is raised otherwise).
-    """
-    metrics_path = os.getenv("METRICS_DATA_FILE")
-    result_file = (
-        "./bench_log.txt"
-        if not metrics_path
-        else f"{metrics_path}/bench_serving_metrics.txt"
-    )
-    logger.info(f"The metrics result file: {result_file}")
-
-    write_pkg_info_to_file(result_file)
-
-    cmd_args = _build_bench_command(
-        host,
-        port,
-        model_path,
-        backend,
-        dataset_name,
-        dataset_path,
-        request_rate,
-        max_concurrency,
-        num_prompts,
-        input_len,
-        output_len,
-        random_range_ratio,
-        image_resolution,
-        image_count,
-        warmup_requests,
-        seed,
-        output_file,
-        repeat_rate,
-        temperature,
-        top_p,
-        gsp_num_groups,
-        gsp_prompts_per_group,
-        cache_report,
-    )
-    logger.info(f"Command: {' '.join(cmd_args)}")
-
-    metrics = _run_bench_and_parse(cmd_args, env, result_file)
-    _assert_hit_rates(metrics, min_hit_rate_pcts, cache_report)
     return metrics
 
 
@@ -1157,6 +1042,50 @@ def assert_metrics(self, metrics):
             float(metrics["accept_length"]) / spec_num_draft_tokens,
             self.accept_rate,
         )
+    # Once a hit-rate baseline dict is set, a missing "Cache Hit Details"
+    # section (e.g. the case did not set cache_report=True or the server
+    # was launched without --enable-cache-report) must fail the test
+    # instead of being silently skipped. Keys map HiCache tiers to their
+    # parsed metrics; values are percentage thresholds (10 = 10%).
+    min_hit_rate_pcts = getattr(self, "min_hit_rate_pcts", None)
+    if min_hit_rate_pcts:
+        hit_rate_keys = {
+            "cache": "cache_hit_rate_pct",
+            "device": "device_hit_rate_pct",
+            "host": "host_hit_rate_pct",
+        }
+        unknown_tiers = sorted(set(min_hit_rate_pcts) - set(hit_rate_keys))
+        if unknown_tiers:
+            raise Exception(
+                f"Unknown hit-rate tiers {unknown_tiers} in "
+                f"min_hit_rate_pcts; supported tiers: {sorted(hit_rate_keys)}"
+            )
+        for tier, threshold in min_hit_rate_pcts.items():
+            self.assertIsNotNone(
+                metrics.get(hit_rate_keys[tier]),
+                f"{tier} hit rate not found in bench_serving output while "
+                f"min_hit_rate_pcts['{tier}'] is set (did the case set "
+                "cache_report=True and the server run with "
+                "--enable-cache-report?)",
+            )
+            dump_metric(
+                f"{tier}_hit_rate",
+                float(metrics[hit_rate_keys[tier]]),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+            dump_metric(
+                f"{tier}_hit_rate_baseline",
+                float(threshold),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+            # Strictly greater: a zero threshold stays meaningful (any
+            # actual hit must be > 0), instead of trivially passing on >=.
+            self.assertGreater(
+                float(metrics[hit_rate_keys[tier]]),
+                float(threshold),
+                f"{tier} hit rate {metrics[hit_rate_keys[tier]]}% is not "
+                f"above {threshold}%",
+            )
 
 
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
