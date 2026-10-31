@@ -783,6 +783,38 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
+    def test_gather_frontend_cpu_share_counts_only_listeners_on_this_mask(self):
+        """Every rank joins the collective, a non-listener contributes no key,
+        and this rank's position is taken at its own index of the gathered
+        list."""
+        gathered = []
+        other_mask = ("node", tuple(range(64, 128)))
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [obj, None, other_mask, obj]
+
+        world_group = SimpleNamespace(
+            all_gather_object=all_gather_object, rank_in_group=3
+        )
+        with (
+            patch.object(
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(world_group=world_group),
+            ),
+            patch.object(
+                server_module,
+                "_frontend_cpu_key",
+                return_value=("node", tuple(range(64))),
+            ),
+        ):
+            share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+            RustServer.gather_frontend_cpu_share(hosts_listener=False)
+
+        self.assertEqual(share, (1, 2))
+        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+
     def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
         """A multi-node launch whose listener is loopback warns, naming the
         host and rendezvous address, unless the nodes rendezvous on loopback
