@@ -103,6 +103,7 @@ def test_mimo_megamoe_caller_uses_shared_adapter(monkeypatch):
     moe = mimo_v2.MiMoV2MoE.__new__(mimo_v2.MiMoV2MoE)
     nn.Module.__init__(moe)
     moe._use_target_mega_moe = True
+    moe.experts = SimpleNamespace(_mega_moe_weights_built=True)
     expected = torch.ones(2, 3)
     monkeypatch.setattr(
         "sglang.srt.layers.moe.mega_moe.should_use_mega_moe",
