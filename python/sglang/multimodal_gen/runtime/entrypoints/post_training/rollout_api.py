@@ -26,7 +26,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _quantize_video_uint8,
     msgpack_encode_spliced,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    prepare_request,
+    select_output_audio,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
@@ -251,6 +254,9 @@ def _build_response(
                 out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
+        serialized_generated_audio = _maybe_serialize(
+            select_output_audio(result.audio, sample_idx)
+        )
         if not rollout:
             responses.append(
                 RolloutResponse(
@@ -258,6 +264,8 @@ def _build_response(
                     prompt=prompt,
                     seed=seed,
                     generated_output=serialized_generated_output,
+                    generated_audio=serialized_generated_audio,
+                    audio_sample_rate=result.audio_sample_rate,
                     inference_time_s=inference_time_s,
                     peak_memory_mb=peak_memory_mb,
                 )
@@ -282,6 +290,8 @@ def _build_response(
                 prompt=prompt,
                 seed=seed,
                 generated_output=serialized_generated_output,
+                generated_audio=serialized_generated_audio,
+                audio_sample_rate=result.audio_sample_rate,
                 rollout_log_probs=serialized_log_probs,
                 rollout_debug_tensors=serialized_debug_tensors,
                 denoising_env=serialized_denoising_env,
