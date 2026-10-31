@@ -4,12 +4,13 @@ copy still reads is not overwritten before that copy ends; a copy that touches
 no moved page holds nothing."""
 
 import threading
+import time
 import unittest
 
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.signals import CompletionFlags
+from sglang.srt.mem_cache.kv.alloc.signals import CompletionFlags, TransferRelease
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -232,6 +233,101 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         )
         self.assertTrue(
             bool((raw[kept_page * epp : (kept_page + 1) * epp] == 100).all())
+        )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestMovesAgainstNetworkTransfers(TestMovesAgainstRunningCopies):
+    """A network engine addresses rows by the physical ids it was handed, so a
+    record keeps those rows, whatever moves later; its completion is a flag a
+    host thread publishes."""
+
+    def _owner_end(self):
+        pool, alloc, live, schedule, copier = self._chain()
+        full = alloc.full_attn_allocator
+        # Interior holes; the survivor nearest the frontier moves first.
+        alloc.free(live[2:6])
+        alive = live[full.ids.virtual_to_physical[live] >= 0]
+        phys = full.ids.virtual_to_physical[alive]
+        near = int(phys.argmin() if full.grow_direction == "down" else phys.argmax())
+        moved, page = alive[near : near + 1], int(phys[near])
+        torch.cuda.synchronize()
+        return pool, full, moved, page, schedule, copier
+
+    def _record(self, full, page, flag, *, writes):
+        full.record_transfer(
+            flag,
+            [page],
+            writes=writes,
+            release=TransferRelease(),
+            unit_tokens=full.pool_page_size,
+        )
+
+    def test_a_row_a_send_reads_moves_and_is_reused_only_after_the_flag(self):
+        """A send reads its row by physical id until the engine is done. The
+        row moves at once; the row it vacates is overwritten only after the
+        flag, so the engine reads the original bytes."""
+        pool, full, moved, page, schedule, copier = self._owner_end()
+        epp = full.entry_bytes_per_page
+        original = pool.raw[page * epp : (page + 1) * epp].clone()
+        flags = CompletionFlags(num_slots=4)
+        flag = flags.acquire()
+        seen = torch.empty(epp, dtype=torch.uint8, device="cuda")
+        read = torch.cuda.Event()
+        with torch.cuda.stream(copier):
+            torch.cuda._sleep(500_000_000)
+            seen.copy_(pool.raw[page * epp : (page + 1) * epp])
+            read.record()
+        publisher = threading.Thread(
+            target=lambda: (read.synchronize(), flag.publish())
+        )
+        self._record(full, page, flag, writes=False)
+
+        with torch.cuda.stream(schedule):
+            self.assertGreater(full.flush_for_allocation(), 0)
+            self.assertFalse(flag.query(), "the move waited for a reading send")
+            new_page = int(full.ids.virtual_to_physical[moved][0])
+            self.assertNotEqual(new_page, page, "the read row did not move")
+            full._wait_fences(page, page + 1)
+            pool.raw[page * epp : (page + 1) * epp].fill_(7)
+        publisher.start()
+        publisher.join()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(seen, original), "the send read a reused row")
+        self.assertTrue(
+            torch.equal(pool.raw[new_page * epp : (new_page + 1) * epp], original)
+        )
+
+    def test_a_row_a_receive_writes_moves_only_after_the_flag(self):
+        """A receive writes its row by physical id; a move an allocation needs
+        copies it only after the flag, without blocking the host."""
+        pool, full, moved, page, schedule, copier = self._owner_end()
+        epp = full.entry_bytes_per_page
+        flags = CompletionFlags(num_slots=4)
+        flag = flags.acquire()
+        written = torch.cuda.Event()
+        with torch.cuda.stream(copier):
+            torch.cuda._sleep(500_000_000)
+            pool.raw[page * epp : (page + 1) * epp].fill_(42)
+            written.record()
+        self._record(full, page, flag, writes=True)
+
+        with torch.cuda.stream(schedule):
+            self.assertEqual(full.flush_opportunistic(), 0, "an idle flush moved it")
+            self.assertGreater(full.flush_for_allocation(), 0)
+            copied = torch.cuda.Event()
+            copied.record()
+        self.assertFalse(written.query(), "the flush blocked the host")
+        written.synchronize()
+        time.sleep(0.05)
+        self.assertFalse(copied.query(), "the copy ran before the flag")
+        flag.publish()
+        copied.synchronize()
+        new_page = int(full.ids.virtual_to_physical[moved][0])
+        self.assertNotEqual(new_page, page)
+        self.assertTrue(
+            bool((pool.raw[new_page * epp : (new_page + 1) * epp] == 42).all()),
+            "the moved row lost the receive's write",
         )
 
 

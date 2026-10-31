@@ -15,6 +15,11 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.alloc.signals import (
+    CompletionFlag,
+    CompletionFlagPool,
+    TransferRelease,
+)
 from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
@@ -106,6 +111,10 @@ class KVStorage:
         self.requests = requests
         self.scratch = scratch
         self._request_memory = request_memory
+        # Network transfers in flight, per request: the completion flag a
+        # stream waits on and the logical release every rank sets alike.
+        self._network_transfers: Dict[str, Tuple[CompletionFlag, TransferRelease]] = {}
+        self._network_flags: Optional[CompletionFlagPool] = None
         state = allocator.state
         self._views: Dict[str, Any] = {}
         sub_pools = []
@@ -326,7 +335,9 @@ class KVStorage:
         )
 
     def release_row(self, req: Req) -> None:
-        """Give back the request's row; its ids went back before."""
+        """Give back the request's row; its ids went back before, and its
+        network transfers end here at the latest."""
+        self.end_network_transfer(req)
         self.requests.free(req)
 
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
@@ -769,6 +780,50 @@ class KVStorage:
             self._member(name).record_transfer(
                 signal, transfer.device_indices, writes=writes
             )
+
+    def record_network_transfer(
+        self, req: Req, sub_pool: str, units, *, unit_tokens: int, writes: bool
+    ) -> CompletionFlag:
+        """Record that a network engine, outside every stream, reads (or with
+        ``writes`` writes) the ``sub_pool`` rows of physical ``units`` (each
+        ``unit_tokens`` tokens; one for a state slot) for ``req``. The rows may
+        still move: a copy of a row it writes waits its completion flag on the
+        GPU, and a row it reads that a move vacates is reused only after the
+        flag and the request's logical release (`end_network_transfer`).
+        ``units`` may be a device tensor the schedule stream produced. Returns
+        the request's completion flag, which the transfer's status path
+        publishes when the engine is done with the rows."""
+        transfer = self._network_transfers.get(req.rid)
+        if transfer is None:
+            transfer = (self._flags().acquire(), TransferRelease())
+            self._network_transfers[req.rid] = transfer
+        flag, release = transfer
+        self._member(sub_pool).record_transfer(
+            flag, units, writes=writes, release=release, unit_tokens=unit_tokens
+        )
+        return flag
+
+    def end_network_transfer(self, req: Req) -> None:
+        """The request's network transfers ended, or its row is released (main's
+        release point for a failed transfer): every rank reaches this alike."""
+        transfer = self._network_transfers.pop(req.rid, None)
+        if transfer is None:
+            return
+        flag, release = transfer
+        release.released = True
+        self._flags().release(flag)  # publishes it too
+
+    def unit_tokens(self, sub_pool: str) -> int:
+        """Tokens one transfer unit of ``sub_pool`` spans: its page, or one for
+        a state slot."""
+        return self._plan.sub_pool(sub_pool).unit
+
+    def _flags(self) -> CompletionFlagPool:
+        if self._network_flags is None:
+            self._network_flags = CompletionFlagPool(
+                device_mapped=torch.device(self._allocator.device).type == "cuda"
+            )
+        return self._network_flags
 
     def _member(self, sub_pool: str):
         """The chain member that holds ``sub_pool``'s rows."""

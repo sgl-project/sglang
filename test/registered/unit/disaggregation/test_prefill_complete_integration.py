@@ -748,7 +748,10 @@ class TestAllocationIntegration(CustomTestCase):
                     queue.kv_manager = Mock()
                     queue.req_to_metadata_buffer_idx_allocator = Mock()
                     queue._transfer_page_indices = Mock(return_value=[0])
-                    queue.transfer_queue = SimpleNamespace(enable_staging=False)
+                    queue.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+                    queue.transfer_queue = SimpleNamespace(
+                        enable_staging=False, enable_deferred_kv_release=False
+                    )
                     queue._num_published_destinations = 0
                     queue.scheduler = SimpleNamespace(enable_overlap=False)
                     events = Mock()
