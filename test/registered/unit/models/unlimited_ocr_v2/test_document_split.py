@@ -782,6 +782,50 @@ class TestSplitDocumentAssembly(CustomTestCase):
 
         self.assertEqual(asyncio.run(mismatches()), [])
 
+    def test_context_rejection_returns_partial_text_and_usage(self):
+        """A rejected window must not break accounting for windows that succeeded"""
+
+        async def check(rejected):
+            windows = _ScriptedWindows(["p0", "p1", "p2"])
+            splitter = _splitter(windows)
+
+            async def handle_window(sub, raw_request):
+                response = await windows.handle_window(sub, raw_request)
+                if response.choices[0].message.content == f"p{rejected}":
+                    return ORJSONResponse(
+                        {"message": "exceeds the maximum allowed length"},
+                        status_code=400,
+                    )
+                return response
+
+            splitter._handle_window = handle_window
+            request = _document_request(3, stream=False)
+            request.max_tokens = 9
+            response = await splitter._handle_split_document(
+                request, None, [(0, 1, 0), (1, 2, 1), (2, 3, 2)], doc_reuse_id=None
+            )
+            self.assertEqual(
+                response.choices[0].message.content,
+                "".join(f"<PAGE>p{i}" for i in range(3) if i != rejected),
+            )
+            self.assertEqual(response.choices[0].finish_reason, "length")
+            self.assertEqual(response.usage.prompt_tokens, 20)
+            self.assertEqual(response.usage.completion_tokens, 6)
+            self.assertEqual(response.usage.total_tokens, 26)
+            meta = response.metadata
+            self.assertFalse(meta["doc_split_complete"])
+            self.assertEqual(meta["doc_split_incomplete_batches"], [rejected])
+            self.assertEqual(meta["doc_split_remaining_completion_tokens"], 3)
+            self.assertEqual(meta["doc_split_batch_page_counts"][rejected], 0)
+            for key in ("marker_counts", "retractions", "extra_pages"):
+                self.assertEqual(meta[f"doc_split_batch_{key}"][rejected], 0)
+            self.assertEqual(meta["doc_split_batch_heads"][rejected], "")
+            self.assertEqual(meta["doc_split_batch_tails"][rejected], "")
+
+        for rejected in range(3):
+            with self.subTest(rejected=rejected):
+                asyncio.run(check(rejected))
+
     def test_early_exit_aborts_the_parked_successor(self):
         """Every early exit must release a successor sent before the current reply"""
 
