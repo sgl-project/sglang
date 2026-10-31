@@ -1987,12 +1987,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        if not is_nextn and self.model is not None:
-            for layer in self.model.layers:
-                if not isinstance(layer, PPMissingLayer) and isinstance(
-                    layer.self_attn, Glm5NextLinearAttention
-                ):
-                    layer.self_attn._prepare_fused_decode()
+        # Weight-loading unit tests run this unbound on a stand-in with no decoder stack.
+        if not is_nextn and isinstance(self, Glm5NextForConditionalGeneration):
+            self._prepare_fused_decode_layers()
 
         if getattr(self, "encoder_only", False):
             run_post = False
@@ -2012,6 +2009,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+        # Loaders that skip load_weights (dummy, sharded state, remote instance)
+        # call only this.
+        if not is_nextn:
+            self._prepare_fused_decode_layers()
+
+    def _prepare_fused_decode_layers(self) -> None:
+        if self.model is None:
+            return
+        for layer in self.model.layers:
+            if not isinstance(layer, PPMissingLayer) and isinstance(
+                layer.self_attn, Glm5NextLinearAttention
+            ):
+                layer.self_attn._prepare_fused_decode()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:
