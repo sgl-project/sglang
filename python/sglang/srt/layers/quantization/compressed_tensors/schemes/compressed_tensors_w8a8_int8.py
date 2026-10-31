@@ -11,6 +11,7 @@ from torch.nn import Parameter
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
+    NPUW8A8Int8StaticLinearMethod,
 )
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
@@ -80,7 +81,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # INPUT SCALE
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
-                data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
             )
             layer.register_parameter("input_scale", input_scale)
 
@@ -89,7 +91,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 # as the weights
                 # AZP loaded as int8 but used as int32
                 input_zero_point = PerTensorScaleParameter(
-                    data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.int8),
+                    weight_loader=weight_loader,
                 )
                 layer.register_parameter("input_zero_point", input_zero_point)
 
@@ -183,19 +186,57 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
         super().__init__(strategy, is_static_input_scheme, input_symmetric)
-        # TODO: Currently, NPU kernel for static quant requires quant_bias field,
-        # which can't be replicated in compressed-tensors.
         if self.is_static_input_scheme:
-            raise NotImplementedError(
-                "Static compressed-tensors scheme is not yet supported on NPU."
-            )
-        self.kernel = NPUW8A8Int8DynamicLinearMethod()
+            if not self.input_symmetric:
+                raise NotImplementedError(
+                    "NPU static compressed-tensors requires symmetric activations"
+                )
+            self.kernel = NPUW8A8Int8StaticLinearMethod()
+        else:
+            self.kernel = NPUW8A8Int8DynamicLinearMethod()
+
+    def create_weights(
+        self,
+        layer,
+        output_partition_sizes,
+        input_size_per_partition,
+        params_dtype,
+        weight_loader,
+        **kwargs,
+    ):
+        if self.is_static_input_scheme:
+            if params_dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("NPU static INT8 supports float16 and bfloat16 output")
+        super().create_weights(
+            layer,
+            output_partition_sizes,
+            input_size_per_partition,
+            params_dtype,
+            weight_loader,
+            **kwargs,
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
         return NotImplementedError
 
     def process_weights_after_loading(self, layer):
+        if self.is_static_input_scheme:
+            # Fused shards share one activation quantization, matching the
+            # compressed-tensors CUDA scheme's symmetric scale reduction.
+            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+            if self.strategy == QuantizationStrategy.TENSOR:
+                # Preserve the exported integer weights: expand each shard's
+                # scale to its output channels instead of requantizing them.
+                scales = torch.cat(
+                    [
+                        scale.expand(width)
+                        for scale, width in zip(
+                            layer.weight_scale, layer.logical_widths
+                        )
+                    ]
+                )
+                layer.weight_scale = Parameter(scales, requires_grad=False)
         return self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(self, layer, x, bias):

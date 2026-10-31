@@ -160,6 +160,52 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         )
 
 
+class NPUW8A8Int8StaticLinearMethod(NPUW8A8Int8DynamicLinearMethod):
+    """Calibrated symmetric INT8 activations and per-channel INT8 weights."""
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        input_size = layer.weight.shape[1]
+        super().process_weights_after_loading(layer)
+        layer.register_buffer(
+            "aclnn_input_scale",
+            layer.input_scale.expand(input_size).contiguous(),
+        )
+        layer.register_buffer(
+            "aclnn_input_offset",
+            torch.zeros_like(layer.aclnn_input_scale, dtype=torch.int32),
+        )
+
+    def apply(self, layer, x, bias=None):
+        output_shape = (*x.shape[:-1], layer.weight.shape[1])
+        x_2d = x.reshape(-1, x.shape[-1])
+        if x_2d.shape[0] == 0:
+            # Idle DP-attention batches can have no tokens. Avoid dispatching
+            # quantization and matmul for an empty output.
+            return x.new_empty(output_shape)
+        quant_out = torch.ops.npu.npu_quantize(
+            x_2d,
+            layer.aclnn_input_scale,
+            layer.aclnn_input_offset,
+            torch.qint8,
+            -1,
+            True,
+        )
+        # This is one fixed calibration scale repeated across rows, not
+        # per-token dynamic quantization. The API's pertoken_scale form also
+        # supports floating-point bias and FP16 graph capture without packing
+        # a dequantization scale on each forward call.
+        static_scale = layer.input_scale.expand(x_2d.shape[0]).contiguous()
+        output = torch.ops.npu.npu_quant_matmul(
+            quant_out,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=static_scale,
+            bias=bias.float() if bias is not None else None,
+            output_dtype=x.dtype,
+        )
+        return output.reshape(output_shape)
+
+
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     """NPU MXFP8 linear method for LLM (SRT) models.
 
