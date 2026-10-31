@@ -232,13 +232,16 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
-        use_quant_indexer = pool.index_k_scale_buffer is not None
+        use_quant_indexer = (
+            pool.dsa_kv_cache_store_fp8 and pool.num_indexer_layers > 0
+        )
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
-            pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
-        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
+            pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k, k_scale)
+        else:
+            pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
@@ -279,7 +282,11 @@ class DSANPUIndexerMixin:
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
+        past_key_states = (
+            pool.get_index_k_with_scale_buffer(layer_id)
+            if use_quant_indexer
+            else pool.get_index_k_buffer(layer_id)
+        )
 
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
@@ -288,6 +295,31 @@ class DSANPUIndexerMixin:
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
+        if use_quant_indexer:
+            # Both local and CP prefill use the quantized packed reader. CP has
+            # already gathered K and supplied its local-Q metadata above.
+            query, query_scale = _quantize_npu_indexer_activation(
+                q.view(-1, self.n_heads, self.head_dim),
+                pool.indexer_hadamard_128,
+                pool.dtype,
+            )
+            if is_prefill:
+                block_table = block_table[: actual_seq_lengths_q.size()[0]]
+            # Load the native library and register the packed QLI operator.
+            import sgl_kernel_npu  # noqa: F401
+
+            topk_indices = torch.ops.npu.sgl_quant_lightning_indexer_packed(
+                query.contiguous(),
+                past_key_states,
+                weights.contiguous(),
+                query_scale.contiguous(),
+                actual_seq_lengths_q.to(device=k.device, dtype=torch.int32).contiguous(),
+                actual_seq_lengths_kv.to(device=k.device, dtype=torch.int32).contiguous(),
+                block_table.to(dtype=torch.int32).contiguous(),
+                self.index_topk,
+                3,
+            )
+            return topk_indices.squeeze(1)
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -309,31 +341,6 @@ class DSANPUIndexerMixin:
                 else block_table
             )
 
-            if use_quant_indexer:
-                query, query_scale = _quantize_npu_indexer_activation(
-                    q.view(-1, self.n_heads, self.head_dim),
-                    pool.indexer_hadamard_128,
-                    pool.dtype,
-                )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                )
-                return topk_indices.squeeze(1)
 
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
