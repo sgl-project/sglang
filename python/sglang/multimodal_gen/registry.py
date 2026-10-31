@@ -192,6 +192,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
     "fastvideo/fastvideo-fasth3-omni-8-step-v1": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
+    "sand-ai/magi-2-preview": "Magi2Pipeline",
+    "magi-2-preview": "Magi2Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",

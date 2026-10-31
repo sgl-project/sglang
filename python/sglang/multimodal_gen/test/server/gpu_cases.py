@@ -940,6 +940,47 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
     ),
 ]
 
+
+MAGI2_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "magi2_preview_t2va_ep4_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="sand-ai/MAGI-2-preview",
+            modality="video",
+            num_gpus=4,
+            ulysses_degree=4,
+            extras=[
+                # ep_size has no CLI flag; the file also skips loading the refiner.
+                "--pipeline-config-path",
+                str(_CACHE_DIT_CONFIG_DIR / "magi2_ep4_preview_only.json"),
+                "--warmup-resolutions 896x512",
+                "--enable-torch-compile",
+                "false",
+            ],
+            env_vars={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A street musician plays an acoustic guitar under a stone archway "
+                "at dusk, strumming a slow folk melody while pigeons settle nearby."
+            ),
+            output_size="896x512",
+            seconds=10,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={"num_inference_steps": 2, "seed": 42},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+FOUR_GPU_H100_CASES = MINIMAX_H3_FOUR_GPU_H100_CASES + MAGI2_FOUR_GPU_H100_CASES
+
 TWO_GPU_CASES = [
     DiffusionTestCase(
         "minimax_h3_t2va_2gpu_h100",
