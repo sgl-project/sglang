@@ -1,8 +1,8 @@
 """Compare CP rank-major input against logical-order compressor input.
 
 Run with one CUDA GPU; the AllGather result is materialized locally:
-    python test/manual/dsv4/test_cp8_rank_major_compress.py
-Set CP_SIZE=2/4/8 to select the gathered layout (default 8).
+    python test/registered/kernels/ops/attention/dsv4/test_cp_rank_major_compress.py
+Set CP_SIZE=2/4/8 to select one layout (default: test all three).
 This is a kernel correctness test, not a distributed/model quality evaluation.
 """
 
@@ -17,6 +17,9 @@ from sglang.kernels.ops.attention.dsv4.compress import (
     RankMajorScores,
     compress_forward,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
 
 def packed_plan(rows, width):
@@ -30,8 +33,12 @@ def packed_plan(rows, width):
 )
 class TestCPRankMajorCompress(unittest.TestCase):
     def test_output_and_state(self):
+        for cp_size in map(int, os.environ.get("CP_SIZE", "2,4,8").split(",")):
+            with self.subTest(cp_size=cp_size):
+                self._check_output_and_state(cp_size)
+
+    def _check_output_and_state(self, cp_size):
         torch.manual_seed(1031)
-        cp_size = int(os.environ.get("CP_SIZE", "8"))
         for actual, padded in ((4096, 4096), (25001, 25008), (50000, 50000)):
             for ratio, dim, online in (
                 (4, 128, False),

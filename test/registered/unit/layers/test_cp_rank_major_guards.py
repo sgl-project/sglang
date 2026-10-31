@@ -7,8 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
 SOURCE = (
-    Path(__file__).resolve().parents[3]
+    Path(__file__).resolve().parents[4]
     / "python/sglang/srt/layers/attention/dsv4/compressor.py"
 )
 

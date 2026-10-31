@@ -218,24 +218,13 @@ class Compressor(BaseFusedOp):
         if dsa_use_prefill_cp(forward_batch):
             if self.supports_rank_major_scores(x, kv_score, forward_batch):
                 from sglang.kernels.ops.attention.dsv4.compress import RankMajorScores
-                from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-                    use_symmetric_memory,
-                )
-                from sglang.srt.layers.dp_attention import (
-                    attn_cp_all_gather_into_tensor,
-                    is_allocation_symmetric,
-                )
+                from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 
                 # Match InterleaveCPStrategy: discard GEMM-only local padding
                 # before the equal-length collective (e.g.6256 ->6250 at50K).
                 cp_size = get_parallel().attn_cp_size
                 rows = forward_batch.attn_cp_metadata.total_seq_lens // cp_size
-                local_scores = kv_score[:rows]
-                with use_symmetric_memory(
-                    get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
-                ):
-                    gathered = kv_score.new_empty((rows * cp_size, kv_score.shape[1]))
-                attn_cp_all_gather_into_tensor(gathered, local_scores)
+                gathered = attn_cp_interleave_gather(kv_score[:rows])
                 return RankMajorScores(gathered, cp_size)
             kv_score = cp_materialize_global_token_order(
                 kv_score,
