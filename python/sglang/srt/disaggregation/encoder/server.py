@@ -551,6 +551,7 @@ class MMEncoder:
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
+            get_mm().allowed_local_media_paths,
         )
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
