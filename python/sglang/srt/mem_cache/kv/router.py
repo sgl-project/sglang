@@ -40,7 +40,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
     # pass it today: a composite's local index, or a plain pool's model layer id.
     view_layer_id: int
     # Whether the layer's sub-pool is the router's owner, whose write ids are the
-    # request's token ids; another token sub-pool writes at the batch's `swa_loc`.
+    # request's token ids; another token sub-pool writes at the batch's `swa_loc`,
+    # or at its own entry of `window_locs` when the batch carries several.
     owner: bool = True
     # A plain pool's own layer: the view is the pool, which takes the write loc
     # as the backend hands it and resolves it itself.
@@ -138,8 +139,12 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
         )
 
         loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
+        window_locs = loc_info.window_locs if isinstance(loc_info, KVWriteLoc) else None
         if self.owner:
             ids = owner_loc if owner_loc is not None else loc
+        elif window_locs is not None and self.route.sub_pool in window_locs:
+            # One of several window sub-pools: its own write ids.
+            ids = window_locs[self.route.sub_pool]
         else:
             assert window_loc is not None, (
                 f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
