@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     CustomizedInfoError,
     KVClassType,
     MetadataBuffers,
+    NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     build_kv_layer_ids,
@@ -65,6 +66,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
+    record_network_transfer,
     setup_state_kv_args,
     wire_sub_pool,
 )
@@ -157,6 +159,34 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
     )
 
 
+class _DeviceRows:
+    """State rows a payload produced on the device for a sender that takes
+    host-tensor indices: the send gets a host copy queued behind them, which
+    fills only when the stream reaches it, and the page-move ledger the
+    device ids."""
+
+    __slots__ = ("ids",)
+
+    def __init__(self, ids: torch.Tensor):
+        self.ids = ids
+
+
+def _rows_on_host(payload):
+    if isinstance(payload, list):
+        return [_rows_on_host(part) for part in payload]
+    if isinstance(payload, _DeviceRows):
+        return async_d2h(payload.ids).numpy()
+    return payload
+
+
+def _rows_on_device(payload):
+    if isinstance(payload, list):
+        return [_rows_on_device(part) for part in payload]
+    if isinstance(payload, _DeviceRows):
+        return payload.ids
+    return payload
+
+
 def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
     """Bootstrap prompt limit; sharded admission never fits a longer prompt."""
     if shard_size == 1:
@@ -181,6 +211,30 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+def _send_peer(sender):
+    """What a page move judges a send about to be queued by: its sender and
+    how many sends of its room were queued before it."""
+    if not isinstance(sender.kv_mgr, CommonKVManager):
+        return None  # an engine without a transfer worker touches nothing later
+    queued, _ = sender.kv_mgr.send_counts(sender.bootstrap_room)
+    return sender, queued
+
+
+def _send_done(peer) -> bool:
+    """Whether this rank's transfer worker is done with a send: the worker
+    finished it, it was never queued (the room had already concluded or this
+    rank sends nothing), or the room failed or was cleared (a failed room's
+    rows are released at once, as for a static pool)."""
+    if peer is None:
+        return True
+    sender, queued_before = peer
+    manager, room = sender.kv_mgr, sender.bootstrap_room
+    if manager.request_status.get(room, KVPoll.Failed) == KVPoll.Failed:
+        return True
+    queued, finished = manager.send_counts(room)
+    return queued <= queued_before or finished > queued_before
 
 
 class PrefillBootstrapQueue:
@@ -252,6 +306,16 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        # A page move that cannot avoid a row a send reads waits, on the host,
+        # until every rank's transfer worker is done with that send.
+        kv_storage_of(
+            self.scheduler.req_to_token_pool, self.scheduler.token_to_kv_pool_allocator
+        ).set_network_waiter(
+            NetworkTransferWaiter(
+                _send_done,
+                (self.scheduler.attn_tp_cpu_group, self.scheduler.attn_cp_cpu_group),
+            )
+        )
         self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
@@ -1670,13 +1734,15 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(kv_indices, page_size)
             return async_d2h(kv_indices[::page_size] // page_size)
 
-        def state_page_indices(kv_indices: torch.Tensor) -> np.ndarray:
-            # State rides the last segment's send, whose indices_event is
-            # recorded behind this copy on the same stream.
-            page_indices = page_indices_of(kv_indices)
-            return page_indices.numpy() if host_indices else page_indices
+        def state_page_indices(kv_indices: torch.Tensor):
+            if not host_indices:
+                return kv_to_page_indices(kv_indices, page_size)
+            # Copied to the host for the send below, behind the device ids.
+            return _DeviceRows(kv_indices[::page_size] // page_size)
 
         state_indices: Optional[List] = None
+        ledger_state_indices: Optional[List] = None
+        state_types = ()
         if last_chunk:
             try:
                 self.disagg_metadata_buffers.set_buf(req)
@@ -1725,10 +1791,8 @@ class SchedulerDisaggregationPrefillMixin:
                     token_boundary=seq_len,
                     window=window,
                 )
-                # The window rides the last segment's send, whose indices_event
-                # is recorded behind this copy on the same stream.
                 units = resume.unit_ids
-                return async_d2h(units).numpy() if host_indices else units.cpu().numpy()
+                return _DeviceRows(units) if host_indices else units.cpu().numpy()
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1837,6 +1901,12 @@ class SchedulerDisaggregationPrefillMixin:
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+            # State rides the last segment's send, whose indices_event is
+            # recorded behind these copies on the same stream. The host
+            # arrays fill only then, so the page-move ledger takes the device
+            # ids instead.
+            ledger_state_indices = [_rows_on_device(p) for p in state_indices]
+            state_indices = [_rows_on_host(p) for p in state_indices]
 
         transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:
@@ -1882,6 +1952,23 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            # The engine reads these rows by physical id until it is done.
+            record_network_transfer(
+                self.token_to_kv_pool_allocator,
+                req,
+                peer=_send_peer(sender),
+                writes=False,
+                # With host indices the copy is still in flight: hand the
+                # ledger the device pages the schedule stream produced.
+                page_indices=(
+                    kv_indices[::page_size] // page_size
+                    if indices_event is not None
+                    else page_indices
+                ),
+                page_size=page_size,
+                state_types=state_types if segment_is_last else (),
+                state_indices=ledger_state_indices if segment_is_last else None,
+            )
             if indices_event is not None:
                 sender.send(
                     page_indices,

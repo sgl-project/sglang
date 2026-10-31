@@ -2876,6 +2876,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                self.note_send_finished(kv_chunk.room)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3167,6 +3168,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 indices_event=indices_event,
             )
         )
+        self.note_send_enqueued(bootstrap_room)
 
     def get_session_id(self):
         return self.engine.get_session_id()

@@ -298,6 +298,11 @@ class CommonKVManager(BaseKVManager):
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
+    # Sends of a room queued for the transfer worker, and done by it, so a page
+    # move can tell when the engine is done with one send's rows. Created on
+    # first use.
+    _enqueued_sends: Optional[Dict[int, int]] = None
+    _finished_sends: Optional[Dict[int, int]] = None
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
@@ -703,6 +708,7 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                self._forget_sends(bootstrap_room)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -717,6 +723,32 @@ class CommonKVManager(BaseKVManager):
             # happily promote it back to Transferring or Success.
             return
         self.request_status[bootstrap_room] = max(current, status)
+
+    def note_send_enqueued(self, bootstrap_room: int) -> None:
+        """A send of the room was queued for the transfer worker (scheduler
+        thread)."""
+        if self._enqueued_sends is None:
+            self._enqueued_sends = defaultdict(int)
+        self._enqueued_sends[bootstrap_room] += 1
+
+    def note_send_finished(self, bootstrap_room: int) -> None:
+        """The transfer worker is done with a queued send of the room: the
+        engine no longer touches its rows (worker thread)."""
+        if self._finished_sends is None:
+            self._finished_sends = defaultdict(int)
+        self._finished_sends[bootstrap_room] += 1
+
+    def send_counts(self, bootstrap_room: int) -> Tuple[int, int]:
+        """The room's sends queued and finished so far, in queue order."""
+        return (
+            (self._enqueued_sends or {}).get(bootstrap_room, 0),
+            (self._finished_sends or {}).get(bootstrap_room, 0),
+        )
+
+    def _forget_sends(self, bootstrap_room: int) -> None:
+        for counts in (self._enqueued_sends, self._finished_sends):
+            if counts is not None:
+                counts.pop(bootstrap_room, None)
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:
@@ -2465,6 +2497,7 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr._forget_sends(self.bootstrap_room)
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:

@@ -374,7 +374,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
             is_mla_backend=False,
             enable_staging=False,
             transfer_queue=SimpleNamespace(
-                queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+                queue=decode_queue(ListKind.PD_RECEIVING),
+                enable_staging=False,
+                enable_deferred_kv_release=False,
             ),
             queue=decode_queue(ListKind.PD_PREALLOC),
             pending_reqs=[],

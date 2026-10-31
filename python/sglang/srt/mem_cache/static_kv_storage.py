@@ -378,6 +378,12 @@ class StaticKVStorage:
             component_type=component_type,
         )
 
+    def set_network_waiter(self, waiter) -> None:
+        """See `KVStorage.set_network_waiter`: nothing ever waits."""
+
+    def end_network_transfer(self, req: Req) -> None:
+        """Rows of a static pool are not ordered against network transfers."""
+
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
         self.requests.free(req)

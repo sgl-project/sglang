@@ -4,13 +4,12 @@ overwritten before that copy ends; a copy that touches no moved page holds
 nothing. Host-cache copies are waited on the GPU; a network transfer, which runs
 outside every stream, is waited for on the host, never on the GPU."""
 
-import threading
 import unittest
 
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.signals import CompletionFlags
+from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -147,38 +146,36 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         ).cuda()
         self.assertTrue(torch.equal(seen, expected), "the backup read a reused page")
 
-    def test_float_move_waits_a_flag_published_by_the_host(self):
-        """A transfer outside every CUDA stream signals with a completion flag
-        the host publishes. A delayed writer rewrites every live window page;
-        a host thread publishes the flag only after it ends. `make_room` must
-        return at once, and the moved pages must carry the writer's bytes."""
+    def test_float_move_waits_on_the_host_for_a_receive_that_writes_a_moved_page(
+        self,
+    ):
+        """A transfer outside every CUDA stream is waited for on the host. A
+        delayed writer rewrites every live window page; the waiter returns only
+        once it ended. The move copies after the waiter, so the moved pages
+        carry the writer's bytes."""
         pool, alloc, live, schedule, copier = self._chain()
         flt = alloc.swa_attn_allocator
         epp = flt.entry_bytes_per_page
         pages = flt.ids.virtual_to_physical[live].tolist()
         ask = self._ask(flt)
-        flags = CompletionFlags(num_slots=4)
-        # A reused slot: the earlier flag's waits stay satisfied.
-        flags.release(flags.acquire())
-        flag = flags.acquire()
         written = torch.cuda.Event()
         with torch.cuda.stream(copier):
             torch.cuda._sleep(500_000_000)
             for k, page in enumerate(pages):
                 pool.raw[page * epp : (page + 1) * epp].fill_(100 + k)
             written.record()
-        publisher = threading.Thread(
-            target=lambda: (written.synchronize(), flag.publish())
+        waited = _EngineWaiter(written)
+        alloc.set_network_waiter(waited)
+        transfer = NetworkTransfer("receive")
+        flt.record_transfer(
+            transfer, live, writes=True, release=transfer, unit_tokens=None
         )
-        flt.record_transfer(flag, live, writes=True)
 
         with torch.cuda.stream(schedule):
             opened = flt.make_room(side="low", min_bytes=ask)
-            self.assertFalse(flag.query(), "make_room blocked the host on the flag")
-        publisher.start()
-        publisher.join()
+        self.assertEqual(waited.calls, [["receive"]])
+        self.assertTrue(transfer.released)
         torch.cuda.synchronize()
-        self.assertTrue(flag.query())
         self.assertGreaterEqual(opened, ask)
         moved = flt.ids.virtual_to_physical[live].tolist()
         self.assertNotEqual(moved, pages, "the geometry asked for no relocation")
@@ -186,7 +183,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         for k, page in enumerate(moved):
             self.assertTrue(
                 bool((raw[page * epp : (page + 1) * epp] == 100 + k).all()),
-                f"window page {k} was copied before the flag",
+                f"window page {k} was copied before the receive ended",
             )
 
     def test_end_flush_does_not_wait_a_copy_of_pages_it_keeps(self):
@@ -234,6 +231,120 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         self.assertTrue(
             bool((raw[kept_page * epp : (kept_page + 1) * epp] == 100).all())
         )
+
+
+class _EngineWaiter:
+    """A network waiter standing in for a transfer engine: it returns once
+    ``done`` (the engine's last touch of the rows) fired, recording each wait."""
+
+    def __init__(self, done):
+        self.done = done
+        self.calls = []
+
+    def __call__(self, transfers):
+        self.calls.append([t.peer for t in transfers])
+        self.done.synchronize()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestMovesAgainstNetworkTransfers(TestMovesAgainstRunningCopies):
+    """A network engine addresses rows by the physical ids it was handed, so a
+    record keeps those rows, whatever moves later; only the host learns that it
+    ended, so a move that cannot avoid it waits on the host."""
+
+    def _owner_end(self):
+        pool, alloc, live, schedule, copier = self._chain()
+        full = alloc.full_attn_allocator
+        # Interior holes; the survivor nearest the frontier moves first.
+        alloc.free(live[2:6])
+        alive = live[full.ids.virtual_to_physical[live] >= 0]
+        phys = full.ids.virtual_to_physical[alive]
+        near = int(phys.argmin() if full.grow_direction == "down" else phys.argmax())
+        moved, page = alive[near : near + 1], int(phys[near])
+        torch.cuda.synchronize()
+        return pool, alloc, full, moved, page, schedule, copier
+
+    def _record(self, full, page, peer, *, writes):
+        transfer = NetworkTransfer(peer)
+        full.record_transfer(
+            transfer,
+            [page],
+            writes=writes,
+            release=transfer,
+            unit_tokens=full.pool_page_size,
+        )
+        return transfer
+
+    def test_a_row_a_send_reads_moves_at_once_and_is_reused_after_the_send(self):
+        """A send reads its row by physical id until the engine is done. The
+        row moves at once, waiting for nothing; reusing the bytes it vacated
+        waits on the host for the send, so the engine reads the original
+        bytes."""
+        pool, alloc, full, moved, page, schedule, copier = self._owner_end()
+        epp = full.entry_bytes_per_page
+        original = pool.raw[page * epp : (page + 1) * epp].clone()
+        seen = torch.empty(epp, dtype=torch.uint8, device="cuda")
+        read = torch.cuda.Event()
+        with torch.cuda.stream(copier):
+            torch.cuda._sleep(500_000_000)
+            seen.copy_(pool.raw[page * epp : (page + 1) * epp])
+            read.record()
+        waited = _EngineWaiter(read)
+        alloc.set_network_waiter(waited)
+        transfer = self._record(full, page, "send", writes=False)
+
+        with torch.cuda.stream(schedule):
+            self.assertGreater(full.flush_for_allocation(), 0)
+            self.assertEqual(waited.calls, [], "the move waited for a reading send")
+            self.assertFalse(read.query())
+            new_page = int(full.ids.virtual_to_physical[moved][0])
+            self.assertNotEqual(new_page, page, "the read row did not move")
+            full._wait_fences(page, page + 1)
+            self.assertEqual(waited.calls, [["send"]])
+            self.assertTrue(transfer.released)
+            pool.raw[page * epp : (page + 1) * epp].fill_(7)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(seen, original), "the send read a reused row")
+        self.assertTrue(
+            torch.equal(pool.raw[new_page * epp : (new_page + 1) * epp], original)
+        )
+
+    def test_a_row_a_receive_writes_moves_only_after_the_receive(self):
+        """A receive writes its row by physical id. An idle flush leaves it; a
+        move an allocation needs waits on the host for the receive, then
+        copies the row it wrote."""
+        pool, alloc, full, moved, page, schedule, copier = self._owner_end()
+        epp = full.entry_bytes_per_page
+        written = torch.cuda.Event()
+        with torch.cuda.stream(copier):
+            torch.cuda._sleep(500_000_000)
+            pool.raw[page * epp : (page + 1) * epp].fill_(42)
+            written.record()
+        waited = _EngineWaiter(written)
+        alloc.set_network_waiter(waited)
+        self._record(full, page, "receive", writes=True)
+
+        with torch.cuda.stream(schedule):
+            self.assertEqual(full.flush_opportunistic(), 0, "an idle flush moved it")
+            self.assertEqual(waited.calls, [])
+            self.assertGreater(full.flush_for_allocation(), 0)
+        self.assertEqual(waited.calls, [["receive"]])
+        torch.cuda.synchronize()
+        new_page = int(full.ids.virtual_to_physical[moved][0])
+        self.assertNotEqual(new_page, page)
+        self.assertTrue(
+            bool((pool.raw[new_page * epp : (new_page + 1) * epp] == 42).all()),
+            "the moved row lost the receive's write",
+        )
+
+    def test_a_move_without_a_waiter_refuses_rather_than_waiting_on_the_gpu(self):
+        """No GPU wait stands in for a network transfer: with no waiter a move
+        that must wait for one raises instead of proceeding."""
+        pool, alloc, full, moved, page, schedule, copier = self._owner_end()
+        self._record(full, page, "receive", writes=True)
+        with torch.cuda.stream(schedule):
+            with self.assertRaisesRegex(RuntimeError, "no network waiter"):
+                full.flush_for_allocation()
 
 
 if __name__ == "__main__":

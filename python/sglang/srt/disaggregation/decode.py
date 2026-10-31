@@ -67,12 +67,14 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
     KVClassType,
     MetadataBuffers,
+    NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
     all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -86,6 +88,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     pre_alloc_fill_len,
     prepare_abort,
+    record_network_transfer,
     setup_state_kv_args,
     wire_sub_pool,
 )
@@ -2066,6 +2069,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         assert decode_req.metadata_buffer_index is not None
         page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
+        if metadata_kwargs.get("destination") != KVTransferDestination.HOST:
+            # The peer writes these pages by physical id from now on; a failed
+            # transfer is done with them at its deferred release.
+            record_network_transfer(
+                self.token_to_kv_pool_allocator,
+                decode_req.req,
+                peer=decode_req,
+                writes=True,
+                page_indices=page_indices,
+                page_size=page_size,
+                state_types=self.kv_manager.kv_args.state_types,
+                state_indices=state_indices,
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2913,6 +2929,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
+        # When a page move waiting for a receive first saw it fail, by rid.
+        self._receive_failed_at: Dict[str, float] = {}
+        # A page move that cannot avoid a row a receive writes waits, on the
+        # host, until every rank's receive is done writing it.
+        kv_storage_of(
+            tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+        ).set_network_waiter(
+            NetworkTransferWaiter(self._receive_done, (self.gloo_group,))
+        )
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
@@ -3344,6 +3369,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         device_admission_refused = True
                         continue
                 self._commit_transfer_to_req(decode_req)
+                # The peer wrote its last byte.
+                end_network_transfer(
+                    self.tree_cache.token_to_kv_pool_allocator, decode_req.req
+                )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 outcomes[decode_req.req.rid] = isinstance(
@@ -3430,14 +3459,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Host-capable receivers own their drain tracking. Device destinations
         # snapshot the number of prefill acknowledgements required by the manager.
         # A rank that only holds for a peer has no local acknowledgements to await.
-        required_acks = (
-            0
-            if self._is_host_destination(decode_req)
-            or decode_req.awaiting_publish
-            or decode_req.pending_metadata is not None
-            or not decode_req.kv_receiver.abort_notified
-            else len(decode_req.kv_receiver.bootstrap_infos)
-        )
         self._deferred_releases.join(
             [
                 (
@@ -3445,13 +3466,60 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     start_time,
                     deadline,
                     decode_req.metadata_buffer_index,
-                    required_acks,
+                    self._required_abort_acks(decode_req),
                 )
             ]
         )
 
+    def _required_abort_acks(self, decode_req: DecodeRequest) -> int:
+        """Prefill acknowledgements an aborted receive waits for before its
+        rows may be reused. Host-capable receivers own their drain tracking;
+        device destinations need one per prefill rank that could still write,
+        and a rank that only holds for a peer has none to await."""
+        if (
+            self._is_host_destination(decode_req)
+            or decode_req.awaiting_publish
+            or decode_req.pending_metadata is not None
+            or not decode_req.kv_receiver.abort_notified
+        ):
+            return 0
+        return len(decode_req.kv_receiver.bootstrap_infos)
+
+    def _receive_done(self, decode_req: DecodeRequest) -> bool:
+        """Whether this rank's receive no longer writes ``decode_req``'s rows,
+        judged as this queue judges a transfer: it succeeded (with its staging
+        scatter done), or it failed and drained, as `resolve_deferred_releases`
+        waits for (up to the release timeout from when this first saw it fail;
+        at once without deferred release)."""
+        receiver = decode_req.kv_receiver
+        if receiver is None:
+            return True
+        staged = self.enable_staging and receiver.require_staging
+        if staged and not self.staging_handler.is_done(decode_req):
+            self.staging_handler.advance_scatter(decode_req)
+        poll = receiver.poll()
+        if staged and self.staging_handler.is_failed(decode_req):
+            poll = KVPoll.Failed
+        rid = decode_req.req.rid
+        if poll == KVPoll.Success:
+            return not staged or self.staging_handler.is_done(decode_req)
+        if poll != KVPoll.Failed:
+            return False
+        if not self.enable_deferred_kv_release:
+            return True
+        if self._is_host_destination(decode_req):
+            return receiver.is_abort_release_safe()
+        # Kept until the release (`_do_release`): once the timeout has passed
+        # the answer stays true, so ranks that saw the failure at different
+        # times still agree in the waiter's reduction.
+        failed_at = self._receive_failed_at.setdefault(rid, time.monotonic())
+        return receiver.kv_mgr.is_abort_release_safe(
+            decode_req.req.bootstrap_room, self._required_abort_acks(decode_req)
+        ) or (time.monotonic() - failed_at >= self.deferred_kv_release_timeout)
+
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
         room = decode_req.req.bootstrap_room
+        self._receive_failed_at.pop(decode_req.req.rid, None)
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
@@ -3545,6 +3613,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
+        self._receive_failed_at.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

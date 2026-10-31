@@ -25,6 +25,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer, NetworkWaiter
 from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
@@ -118,6 +119,9 @@ class KVStorage:
         self._parked_rows: Set[int] = set()
         self.scratch = scratch
         self._request_memory = request_memory
+        # Network transfers in flight, per request: the completion flag a
+        # stream waits on and the logical release every rank sets alike.
+        self._network_transfers: Dict[str, List[NetworkTransfer]] = {}
         state = allocator.state
         if state is not None and requests is not None:
             # The memory clip prices a fresh request's state as acquire does.
@@ -344,7 +348,9 @@ class KVStorage:
         )
 
     def release_row(self, req: Req) -> None:
-        """Give back the request's row; its ids went back before."""
+        """Give back the request's row; its ids went back before, and its
+        network transfers end here at the latest."""
+        self.end_network_transfer(req)
         self._parked_rows.discard(req.kv.req_pool_idx)
         self.requests.free(req)
 
@@ -849,6 +855,58 @@ class KVStorage:
         if sub_pool == roles.owner and band.page_size == band.pool_page_size:
             return ids
         return ids // band.page_size * band.pool_page_size
+
+    def record_network_transfer(
+        self,
+        req: Req,
+        *,
+        pages,
+        page_size: int,
+        states: Sequence[Tuple[str, object]] = (),
+        writes: bool,
+        peer=None,
+    ) -> None:
+        """Record one send (or with ``writes`` one receive) a network engine
+        runs for ``req`` outside every stream: it reads (writes) the owner's
+        physical ``pages`` of ``page_size`` tokens and each ``(sub_pool,
+        slots)`` of ``states`` until it ends. The rows may still move. A relief
+        keeps them in place when it can; when it cannot, a copy of a row the
+        engine writes, or a reuse of the bytes a moved row it reads leaves,
+        waits on the host for the transfer (`set_network_waiter`, which judges
+        it by ``peer``). Every one of the request's transfers ends with
+        `end_network_transfer`. ``pages`` and ``slots`` may be device tensors
+        the schedule stream produced."""
+        transfer = NetworkTransfer(peer)
+        self._network_transfers.setdefault(req.rid, []).append(transfer)
+        rows = [(self.owner, pages, page_size)]
+        rows += [
+            (sub_pool, slots, self.unit_tokens(sub_pool)) for sub_pool, slots in states
+        ]
+        for sub_pool, units, unit_tokens in rows:
+            self._member(sub_pool).record_transfer(
+                transfer,
+                units,
+                writes=writes,
+                release=transfer,
+                unit_tokens=unit_tokens,
+            )
+
+    def set_network_waiter(self, waiter: Optional[NetworkWaiter]) -> None:
+        """What a move waits with, on the host, for a network transfer it
+        cannot avoid: installed by whatever runs the transfers, judging each
+        by the ``peer`` it was recorded with, alike on every rank."""
+        self._allocator.set_network_waiter(waiter)
+
+    def end_network_transfer(self, req: Req) -> None:
+        """The request's network transfers ended, or its row is released (the
+        release point of a failed transfer): every rank reaches this alike."""
+        for transfer in self._network_transfers.pop(req.rid, ()):
+            transfer.released = True
+
+    def unit_tokens(self, sub_pool: str) -> int:
+        """Tokens one transfer unit of ``sub_pool`` spans: its page, or one for
+        a state slot."""
+        return self._plan.sub_pool(sub_pool).unit
 
     def _member(self, sub_pool: str):
         """The chain member that holds ``sub_pool``'s rows."""

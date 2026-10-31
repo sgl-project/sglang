@@ -9,6 +9,8 @@ pages share a byte, and each band takes exactly its demand.
 
 import random
 import unittest
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +18,7 @@ import torch
 
 from sglang.srt.mem_cache.kv.alloc import band as band_module
 from sglang.srt.mem_cache.kv.alloc.pricing import feasible, first_plan
+from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -235,6 +238,56 @@ class TestChainRealize(CustomTestCase):
             outcomes.add(fits)
             self.assertFalse(allocator.verify_byte_accounting())
         self.assertEqual(outcomes, {False, True})
+
+    def _check_transfers_leave_answers(self, device, seed, count):
+        # Network transfers in flight read or write physical pages; they order
+        # moves and never change pricing, so `ensure_capacity` stays exactly
+        # whether the take succeeds while they run.
+        rng = random.Random(seed)
+        outcomes = set()
+        for _ in range(count):
+            setup_allocator_context()
+            chain = rng.choice(("swa", "tri"))
+            allocator = _allocator(device, chain, lazy=rng.random() < 0.8)
+            # The engines are done by the time a move must wait for them.
+            allocator.set_network_waiter(lambda transfers: None)
+            self._history(rng, allocator)
+            before = allocator.pricing_snapshot()
+            running = []
+            for band in allocator.bands:
+                live = _live_pages(band)
+                if live and rng.random() < 0.7:
+                    transfer = NetworkTransfer()
+                    running.append(transfer)
+                    band.record_transfer(
+                        transfer,
+                        rng.sample(live, min(len(live), 3)),
+                        writes=rng.random() < 0.5,
+                        release=transfer,
+                        unit_tokens=band.pool_page_size,
+                    )
+            self.assertEqual(allocator.pricing_snapshot(), before)
+            tokens = rng.choice((1, 2, 4, 8, 16, 24, 32))
+            fits = allocator.ensure_capacity(tokens, tokens)
+            # The engines finish on their own threads, as a status path would.
+            done = threading.Thread(
+                target=lambda: (time.sleep(0.01), [f.publish() for f in running])
+            )
+            done.start()
+            taken = allocator.alloc(tokens)
+            self.assertEqual(fits, taken is not None)
+            outcomes.add(fits)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            self.assertFalse(allocator.verify_byte_accounting())
+        self.assertEqual(outcomes, {False, True})
+
+    def test_transfers_leave_capacity_answers_on_cpu(self):
+        self._check_transfers_leave_answers("cpu", seed=21, count=300)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_transfers_leave_capacity_answers_on_cuda(self):
+        self._check_transfers_leave_answers("cuda", seed=22, count=60)
 
     def test_capacity_answers_are_takes_on_cpu(self):
         self._check_answers_are_takes("cpu", seed=11, count=600)
