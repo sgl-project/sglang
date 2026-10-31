@@ -44,7 +44,7 @@ class DSAMetadataManagementMixin:
             self.dsa_index_kpool, self.physical_page_size, self.dsa_index_topk
         )
         self.experimental_kpool_metadata_fusion = (
-            requested and supported and is_cuda() and not is_hip()
+            requested and supported and (is_cuda() or _is_hip)
         )
         self._fused_decode_metadata = fused_dsa_decode_metadata
         self._fused_verify_metadata = fused_dsa_target_verify_metadata
