@@ -1112,22 +1112,16 @@ class SWAComponent(TreeComponent):
             if not unbacked_swa_nodes:
                 return None
             unbacked_swa_nodes.reverse()
+            # The unified pool names window rows by the owner's token ids; the
+            # transfer translates them when it is submitted, after any move.
+            value_type = (
+                BASE_COMPONENT_TYPE if self._unified_allocator() is not None else ct
+            )
             return [
                 PoolTransfer(
                     name=self.pool_name,
-                    device_indices=(
-                        self._translate_full_to_swa(
-                            torch.cat(
-                                [
-                                    n.component_data[BASE_COMPONENT_TYPE].value
-                                    for n in unbacked_swa_nodes
-                                ]
-                            )
-                        )
-                        if self._unified_allocator() is not None
-                        else torch.cat(
-                            [n.component_data[ct].value for n in unbacked_swa_nodes]
-                        )
+                    device_indices=torch.cat(
+                        [n.component_data[value_type].value for n in unbacked_swa_nodes]
                     ).to(torch.int64),
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )

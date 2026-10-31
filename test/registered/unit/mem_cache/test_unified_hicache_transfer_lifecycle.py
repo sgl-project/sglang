@@ -60,7 +60,7 @@ from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_pool,
-    pin_every_band,
+    chain_snapshot,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -439,9 +439,6 @@ class _UnifiedHiCacheCase(_ConfigCase):
         atexit.unregister(cache.shutdown)
         self.addCleanup(cache.release_host_resources)
         controller = cache.cache_controller
-        # The scheduler's pin source: rows stay put until host copies are
-        # acknowledged.
-        pin_every_band(self.allocator, controller.has_inflight_device_transfers)
         self.cache = cache
         self.controller = controller
         # Compaction and frees wait through this stand-in stream.
@@ -669,6 +666,69 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertTrue(torch.equal(swa[-self.window :], expected[1][-self.window :]))
         self.allocator.free(torch.cat([own, pending]))
         self.cache.dec_lock_ref(running_node, pin)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+        self.cache.sanity_check()
+
+    # Window copies name their rows by the owner's token ids and translate them
+    # when submitted, so page moves need no pin while copies are queued or
+    # unacknowledged.
+
+    def test_pricing_ignores_queued_and_unacknowledged_copies(self):
+        self._cache(write_policy="write_through", tokens=64)
+        self._insert(list(range(1, 17)), 100)
+        self.assertTrue(self.controller.write_queue)
+        queued = chain_snapshot(self.allocator)
+        self.cache.flush_pending_backups()
+        self.assertTrue(self.controller.ack_write_queue)
+        unacknowledged = chain_snapshot(self.allocator)
+        self.cache.writing_check()
+        self.assertEqual(queued, chain_snapshot(self.allocator))
+        self.assertEqual(unacknowledged, chain_snapshot(self.allocator))
+
+    def test_queued_backup_follows_a_window_move_and_loads_back(self):
+        self._cache(write_policy="write_through", tokens=64)
+        swa = self.allocator.swa_attn_allocator
+        # Window rows below the node, freed once its backup is queued: the
+        # node's window pages then move down into them.
+        gap = self.allocator.alloc(2 * PAGE)
+        tokens = list(range(1, 17))
+        ids, expected = self._insert(tokens, 100)
+        self.assertTrue(self.controller.write_queue)
+        before = self.rows.swa_rows(ids)
+        self.allocator.free(gap)
+        moves = []
+        _record_moves(self.allocator, moves)
+        with _recorded_stream():
+            self.assertGreater(swa._flush(urgent=True), 0)
+        self.assertIn(("move", "swa"), moves)
+        after = self.rows.swa_rows(ids)
+        vacated = before[~torch.isin(before, after)]
+        self.assertGreater(vacated.numel(), 0)
+        # Reuse of the vacated rows: a copy still aimed at them reads this.
+        self.rows.swa[vacated] = -7
+        self._assert_rows(ids, expected, swa_tail=self.window)
+
+        # Submitted after the move: the copy reads where the rows went.
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        req = self._request(tokens + list(range(17, 21)))
+        verdict = self._adder().add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertIs(verdict, AddReqResult.CONTINUE)
+        (op,) = self.controller.load_queue
+        (window,) = [t for t in op.pool_transfers if t.name == PoolName.SWA]
+        owner = self.cache.prefix_device_indices(req)[-len(window.device_indices) :]
+        # The load-back's bound rows go by the owner's ids until submission.
+        self.assertTrue(torch.equal(window.device_indices, owner.to(torch.int64)))
+        self.cache.ready_to_load_host_cache()
+        self.cache.loading_check()
+        full, swa_rows = self.rows.read(self.cache.prefix_device_indices(req))
+        self.assertTrue(torch.equal(full, expected[0]))
+        self.assertTrue(
+            torch.equal(swa_rows[-self.window :], expected[1][-self.window :])
+        )
         self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 

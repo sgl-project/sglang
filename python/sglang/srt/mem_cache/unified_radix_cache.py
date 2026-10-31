@@ -1597,6 +1597,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 (swa_indices > 0).all(),
                 f"unmapped {component.pool_name} window positions for request {req.rid}",
             )
+            if self.token_to_kv_pool_allocator.hands_out_virtual_ids:
+                # The unified pool's window rows go by the owner's ids; the
+                # copy translates them when it is submitted.
+                swa_indices = window_indices
             component_transfers[component.component_type] = [
                 PoolTransfer(
                     name=component.pool_name,
@@ -2042,6 +2046,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_indices, kv_xfer, comp_xfers
             )
         )
+        self.name_loaded_window_rows_by_owner(aux_xfers)
 
         self.ongoing_load_back[node_id] = _OngoingLoadBack(
             node_id,
@@ -2050,6 +2055,31 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         return True
+
+    def name_loaded_window_rows_by_owner(self, transfers) -> None:
+        """A queued host load reserved window rows and the tree has bound them
+        to owner ids: from now on its transfer names them by those ids, which
+        the copy translates at submission, after any page move."""
+        if not self.token_to_kv_pool_allocator.hands_out_virtual_ids:
+            return
+        windows = {
+            component.pool_name: component
+            for component in self._components_tuple
+            if component.slot.family == TREE_WINDOW
+        }
+        for transfer in transfers or ():
+            component = windows.get(transfer.name)
+            if (
+                component is None
+                or transfer.indices_from_pool is not None
+                or transfer.device_indices is None
+                or transfer.device_indices.numel() == 0
+            ):
+                continue
+            storage, sub_pool = component.storage_and_sub_pool()
+            transfer.device_indices = storage.owner_ids_of_window_rows(
+                sub_pool, transfer.device_indices
+            )
 
     def _build_sidecar_transfers(
         self,

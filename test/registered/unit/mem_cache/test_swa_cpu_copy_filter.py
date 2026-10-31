@@ -65,7 +65,8 @@ class TestSWACpuCopyFilter(unittest.TestCase):
 
 
 class TestUnifiedSWATransfers(CustomTestCase):
-    def test_offload_uses_physical_swa_pages(self):
+    def test_offload_names_live_window_pages_by_owner_ids(self):
+        # The copy translates them when it is submitted, after any page move.
         from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
             DecodeKVCacheOffloadManager,
         )
@@ -87,10 +88,14 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 if tombstone_tokens == len(indices):
                     self.assertEqual(transfers, [])
                     continue
+                self.assertTrue(
+                    torch.equal(transfers[0].device_indices, indices[tombstone_tokens:])
+                )
                 expected_pages = allocator.swa_v2p_page_table[
                     indices[tombstone_tokens::4] // 4
                 ]
-                pages = transfers[0].device_indices[::4] // 4
+                rows = allocator.storage.window_ids("swa", transfers[0].device_indices)
+                pages = rows[::4] // 4
                 buffer = manager.kv_cache.layer_router.view(
                     "swa"
                 ).get_page_envelope_buffer()

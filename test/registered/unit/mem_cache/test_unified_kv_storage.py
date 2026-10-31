@@ -329,8 +329,8 @@ class TestHostStack(CustomTestCase):
     def test_host_transfers_translate_through_the_storage(self):
         """A host copy maps the controller's ids to rows through the storage's
         id spaces, carried on its entry: the owner's and the state's ids are
-        virtual, a window's host loads bind physical pages. The views hold no
-        allocator callable."""
+        virtual, and a window's are the owner's token ids, so every copy
+        translates when it is submitted. The views hold no allocator callable."""
         for name in ("swa", "mamba", "tri"):
             with self.subTest(chain=name):
                 result, _, cache = self._build(name, backend=None)
@@ -338,11 +338,11 @@ class TestHostStack(CustomTestCase):
                 storage = allocator.storage
                 expected = {
                     storage.owner: allocator.full_attn_allocator.ids.translate,
-                    "swa": None,
                     "mamba": None
                     if allocator.state is None
                     else allocator.state.slots.translate,
                 }
+                owner_ids = allocator.alloc(2 * allocator.page_size)
                 by_view = {
                     id(storage.view(s.name)): s.name for s in storage.sub_pools()
                 }
@@ -350,6 +350,14 @@ class TestHostStack(CustomTestCase):
                 for entry in result.host_pool_group.entry_map.values():
                     sub_pool = by_view[id(entry.device_pool)]
                     seen.add(sub_pool)
+                    if sub_pool == "swa":
+                        self.assertTrue(
+                            torch.equal(
+                                entry.device_translate(owner_ids),
+                                storage.window_ids("swa", owner_ids),
+                            )
+                        )
+                        continue
                     self.assertEqual(entry.device_translate, expected[sub_pool])
                     self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
                 self.assertEqual(seen, set(storage.sub_pool_names()))
