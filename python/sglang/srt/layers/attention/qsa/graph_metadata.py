@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.qsa.metadata import QSA_RING_GROUPS
+
 
 @triton.jit
 def _qsa_graph_layout_kernel(
@@ -83,6 +85,7 @@ def _qsa_graph_row_metadata_kernel(
     req_to_token_row_stride,
     max_pages,
     RATIO: tl.constexpr,
+    RING: tl.constexpr,  # pending-ring slots a request (metadata.QSA_RING_GROUPS groups)
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     PAGE_BLOCK: tl.constexpr,
     seq_lens_ptr,
@@ -128,11 +131,11 @@ def _qsa_graph_row_metadata_kernel(
         tl.store(write_locs_ptr + row, write_loc)
 
         tl.store(logical_positions_ptr + row, current)
-        tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
+        tl.store(state_slots_ptr + row, req * RING + (current % RING).to(tl.int64))
         ring_base = row.to(tl.int64) * RATIO
         for k in tl.static_range(RATIO):
             member = tl.maximum(current - (RATIO - 1 - k), 0)
-            slot = req * RATIO + (member % RATIO).to(tl.int64)
+            slot = req * RING + (member % RING).to(tl.int64)
             tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
     # Page-table entries are the request's FULL-KV page ids, read from the
@@ -207,6 +210,7 @@ def launch_graph_metadata(
         req_to_token.stride(0),
         max_pages,
         RATIO=indexer.compress_ratio,
+        RING=QSA_RING_GROUPS * indexer.compress_ratio,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         PAGE_BLOCK=128,
         seq_lens_ptr=seq_lens,
@@ -232,6 +236,7 @@ def _qsa_draft_graph_metadata_kernel(
     num_padding,
     MAX_PAGES: tl.constexpr,
     RATIO: tl.constexpr,
+    RING: tl.constexpr,
     FULL_PAGE: tl.constexpr,
 ):
     for step in tl.static_range(len(buffers)):
@@ -250,6 +255,7 @@ def _qsa_draft_graph_metadata_kernel(
                 row_stride,
                 MAX_PAGES,
                 RATIO,
+                RING,
                 FULL_PAGE,
                 128,
                 seq_lens,
@@ -302,6 +308,7 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         max(0, min(int(num_padding or 0), bs)),
         max_pages,
         ratio,
+        QSA_RING_GROUPS * ratio,
         full_page,
         num_warps=1,
     )
