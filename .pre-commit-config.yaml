@@ -100,6 +100,13 @@ repos:
         language: system
         files: ^\.github/CI_PERMISSIONS\.json$
         pass_filenames: false
+      - id: test-rerun-suite-validation
+        name: test rerun-test suite validation
+        entry: python -m pytest -q scripts/ci/test_rerun_suite_validation.py
+        language: python
+        additional_dependencies: [pytest, PyGithub, PyYAML]
+        files: ^(scripts/ci/(utils/slash_command_handler|test_rerun_suite_validation|runner_configs|partition_rerun_tests)\.py|scripts/ci/runner_configs\.yml|test/run_suite\.py)$
+        pass_filenames: false
       - id: check-workflow-job-names
         name: check for duplicate workflow job names
         entry: python3 scripts/lint/check_workflow_job_names.py
