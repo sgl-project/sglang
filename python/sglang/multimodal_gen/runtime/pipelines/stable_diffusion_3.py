@@ -26,7 +26,7 @@ class SD3ConditioningStage(PipelineStage):
         batch.prompt_embeds, batch.pooled_embeds = self._merge(
             batch.prompt_embeds, batch.pooled_embeds
         )
-        if batch.do_classifier_free_guidance:
+        if batch.needs_negative_cond:
             batch.negative_prompt_embeds, batch.neg_pooled_embeds = self._merge(
                 batch.negative_prompt_embeds, batch.neg_pooled_embeds
             )

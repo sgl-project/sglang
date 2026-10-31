@@ -452,6 +452,28 @@ def test_negative_conditioning_keeps_private_device_snapshot(native):
 
 
 @torch.no_grad()
+def test_rollout_neg_cond_request_encodes_negative_without_cfg():
+    """A request asking for the negative cond gets it without CFG, never another request's empty one."""
+    executor, stage, encoder, args = make_group_executor(TextEncodingStage, "cpu", 0)
+    requests = [
+        Req(
+            sampling_params=SamplingParams(
+                prompt="hello",
+                negative_prompt="bad quality",
+                guidance_scale=1.0,
+                rollout=True,
+                rollout_return_neg_cond_kwargs=neg_cond,
+            )
+        )
+        for neg_cond in (False, True)
+    ]
+    plain, asking = executor.execute_group([stage], requests, args)
+    assert not asking.do_classifier_free_guidance
+    assert plain.negative_prompt_embeds == []
+    assert len(asking.negative_prompt_embeds) == 1
+
+
+@torch.no_grad()
 def test_batched_request_reuses_conditioning_without_changing_output_seeds():
     executor, stage, encoder, args = make_group_executor(TextEncodingStage, "cpu", 0)
     for _ in range(2):

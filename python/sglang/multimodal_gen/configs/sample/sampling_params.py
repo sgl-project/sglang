@@ -402,6 +402,8 @@ class SamplingParams:
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    # encode the negative prompt even without CFG, for the trainer's CFG
+    rollout_return_neg_cond_kwargs: bool = False
     rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
