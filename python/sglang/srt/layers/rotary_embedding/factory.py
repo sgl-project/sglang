@@ -90,6 +90,21 @@ def _aiter_rope_unsupported_arch() -> bool:
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
+def dead_rope_buffer(rope: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Return a buffer of ``rope`` that a model teardown killed, else None.
+
+    Teardown frees CUDA storages or re-points the module tree at the meta
+    device. Under a meta-device construction pass meta buffers are intended,
+    so nothing counts as dead there.
+    """
+    if torch.get_default_device().type == "meta":
+        return None
+    for buf in rope.buffers():
+        if buf.device.type == "meta" or buf.untyped_storage().nbytes() == 0:
+            return buf
+    return None
+
+
 def _get_live_rope_cache_entry(key: Tuple) -> Optional[RotaryEmbedding]:
     """Return the cached module for ``key``, dropping it if its buffers are dead.
 
@@ -107,18 +122,16 @@ def _get_live_rope_cache_entry(key: Tuple) -> Optional[RotaryEmbedding]:
     cached = _ROPE_DICT.get(key)
     if cached is None:
         return None
-    if torch.get_default_device().type == "meta":
-        return cached
-    for buf in cached.buffers():
-        if buf.device.type == "meta" or buf.untyped_storage().nbytes() == 0:
-            logger.warning(
-                "Discarding dead RoPE cache entry (key=%s): buffer on %s. "
-                "A shared RotaryEmbedding was freed by its owner.",
-                key,
-                buf.device,
-            )
-            del _ROPE_DICT[key]
-            return None
+    dead = dead_rope_buffer(cached)
+    if dead is not None:
+        logger.warning(
+            "Discarding dead RoPE cache entry (key=%s): buffer on %s. "
+            "A shared RotaryEmbedding was freed by its owner.",
+            key,
+            dead.device,
+        )
+        del _ROPE_DICT[key]
+        return None
     return cached
 
 
