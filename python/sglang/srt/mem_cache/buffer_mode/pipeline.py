@@ -1258,25 +1258,65 @@ class BufferModePipeline:
         False parks the operation for another allocation attempt; True means
         the operation was queued or declined.
         """
+        outcome = self.reserve_prefetch(operation, info, hit_tokens, aux_hit_tokens)
+        if outcome == "reserved":
+            self.dispatch_reserved_prefetch(operation)
+        return outcome != "short"
+
+    def reserve_prefetch(
+        self,
+        operation: PrefetchOperation,
+        info: _OngoingPrefetch,
+        hit_tokens: int,
+        aux_hit_tokens: int,
+    ) -> str:
+        """Allocate the hit-sized bounce without starting the read.
+
+        "reserved": the rows are held and the read can be dispatched (or the
+        reservation rolled back); "short": staging pressure defers the
+        allocation, nothing is held; "settled": the operation was declined.
+        The scheduler agrees the outcome across ranks before dispatching, so
+        a rank that could not allocate parks the operation on every rank.
+        """
         cache = self._cache
         cc = cache.cache_controller
         if self._reject_oversized_prefetch(operation, hit_tokens):
-            return True
+            return "settled"
         host_indices, alloc_len = self._allocate_prefetch_host_indices(
             operation, hit_tokens
         )
         if host_indices is None:
-            return self._defer_prefetch_for_host_capacity(
+            self._defer_prefetch_for_host_capacity(
                 operation.handle, max(alloc_len, aux_hit_tokens)
             )
+            return "short"
         if not cache._alloc_prefetch_aux_staging(info, aux_hit_tokens):
             # Same outcome as a KV shortfall: nothing stays staged.
-            cc.append_host_mem_release(host_indices=host_indices)
-            return self._defer_prefetch_for_host_capacity(
+            cc.free_prefetch_host_buffers(operation, host_indices)
+            self._defer_prefetch_for_host_capacity(
                 operation.handle, max(alloc_len, aux_hit_tokens)
             )
-        self._queue_prefetch(operation, info, hit_tokens, host_indices, alloc_len)
-        return True
+            return "short"
+        self._reserve_prefetch(operation, info, hit_tokens, host_indices, alloc_len)
+        return "reserved"
+
+    def dispatch_reserved_prefetch(self, operation: PrefetchOperation) -> None:
+        self._cache.cache_controller.dispatch_prefetch_transfer(operation)
+
+    def rollback_reserved_prefetch(self, operation: PrefetchOperation) -> None:
+        """Undo ``reserve_prefetch``: a peer rank could not allocate, so this
+        rank gives the rows and the anchor pin back and parks too."""
+        cache = self._cache
+        cc = cache.cache_controller
+        request = operation.handle
+        cc.prefetch_tokens_occupied -= operation.buffer_host_occupied_units
+        operation.buffer_host_occupied_units = None
+        cc.free_prefetch_host_buffers(operation, operation.host_indices)
+        operation.host_indices = None
+        cache.ongoing_prefetch[request] = cache.ongoing_prefetch[request]._replace(
+            host_indices=None
+        )
+        self.release_anchor_lock(request)
 
     def _reject_oversized_prefetch(
         self, operation: PrefetchOperation, tokens: int
@@ -1324,6 +1364,26 @@ class BufferModePipeline:
         *,
         span_tokens: Optional[int] = None,
     ) -> None:
+        self._reserve_prefetch(
+            operation,
+            info,
+            hit_tokens,
+            host_indices,
+            alloc_len,
+            span_tokens=span_tokens,
+        )
+        self.dispatch_reserved_prefetch(operation)
+
+    def _reserve_prefetch(
+        self,
+        operation: PrefetchOperation,
+        info: _OngoingPrefetch,
+        hit_tokens: int,
+        host_indices: torch.Tensor,
+        alloc_len: int,
+        *,
+        span_tokens: Optional[int] = None,
+    ) -> None:
         # alloc_len counts FULL host slots; span_tokens counts accepted key tokens.
         cache = self._cache
         cc = cache.cache_controller
@@ -1341,7 +1401,6 @@ class BufferModePipeline:
             host_indices, operation.pool_transfers
         )
         cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
-        cc.dispatch_prefetch_transfer(operation)
 
     def try_lock_anchor(
         self, request: CacheRequestHandle, remaining_full_tokens: int

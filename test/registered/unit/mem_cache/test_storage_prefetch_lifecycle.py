@@ -163,6 +163,7 @@ def _hit_drain_fixture():
         extra_host_mem_release_queues={},
     )
     cache.ongoing_prefetch = {}
+    cache.storage_engine = None
     return cache
 
 
