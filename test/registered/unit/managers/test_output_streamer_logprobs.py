@@ -56,6 +56,7 @@ class _FakeReq:
             prefill_finished_time=0.0, enable_metrics=False
         )
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0

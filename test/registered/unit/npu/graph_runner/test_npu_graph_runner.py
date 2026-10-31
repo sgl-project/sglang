@@ -41,7 +41,7 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
 
     runner._replay_graph_key = ("graph", 2)
     attention = SimpleNamespace(init_forward_metadata_out_graph=mock.Mock())
-    runner._replay_attn_backend = lambda: attention
+    runner.attn_backend = attention
     runner.backend = SimpleNamespace(
         replay_with_input_update=mock.Mock(
             return_value=LogitsProcessorOutput(
