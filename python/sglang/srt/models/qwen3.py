@@ -133,6 +133,9 @@ class Qwen3Attention(nn.Module):
             parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
+        # Quantized layers may store weight in another dtype or not as `weight`
+        # at all, and the LoRA wrapper does not expose params_dtype.
+        self.qkv_input_dtype = self.qkv_proj.params_dtype
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -277,12 +280,12 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         if (
             should_force_bfloat16_dense_tensor_math()
-            or hidden_states.dtype != self.qkv_proj.weight.dtype
+            or hidden_states.dtype != self.qkv_input_dtype
         ):
             # True-on-policy RMSNorm can produce fp32 activations while dense
             # projections remain bf16, including during cuda-graph capture when
             # the global on-policy flag is temporarily cleared.
-            hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
+            hidden_states = hidden_states.to(self.qkv_input_dtype)
 
         save_kv_cache = True
         use_aiter_fused = (
