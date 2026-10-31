@@ -256,9 +256,7 @@ class Dots3MoEGate(nn.Module):
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
-            logits = tiny_gemm_bf16(
-                hidden_states, self.weight, max_m=self.tiny_router_gemm_max_tokens
-            )
+            logits = tiny_gemm_bf16(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
