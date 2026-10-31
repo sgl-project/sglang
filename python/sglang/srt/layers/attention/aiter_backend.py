@@ -1406,15 +1406,17 @@ class AiterAttnBackend(AttentionBackend):
         head_dim = layer.qk_head_dim
 
         def gather_and_repeat(cache: torch.Tensor) -> torch.Tensor:
-            # Read the already quantized cache; uint8 because index_select is
-            # not implemented for fp8.
+            # Copy the already quantized cache as raw 8-byte words: index_select
+            # is not implemented for fp8, and on int64 elements the gather and
+            # the head-repeat copy run ~3x faster than on uint8 ones.
+            words = head_dim * cache.element_size() // 8
             return (
                 cache.view(-1, num_kv_heads * head_dim)
-                .view(torch.uint8)
+                .view(torch.int64)
                 .index_select(0, tok_idx)
-                .view(-1, num_kv_heads, 1, head_dim)
-                .expand(-1, num_kv_heads, repeat, head_dim)
-                .reshape(-1, num_kv_heads * repeat, head_dim)
+                .view(-1, num_kv_heads, 1, words)
+                .expand(-1, num_kv_heads, repeat, words)
+                .reshape(-1, num_kv_heads * repeat, words)
                 .view(cache.dtype)
             )
 

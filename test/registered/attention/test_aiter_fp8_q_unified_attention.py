@@ -581,6 +581,80 @@ class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
             with self.subTest(num_q_heads=num_q_heads, num_kv_heads=num_kv_heads):
                 self._run_prefill(num_q_heads, num_kv_heads)
 
+    def test_kernel_gets_the_context_rows_with_repeated_kv_heads(self):
+        """Byte for byte, the kernel's K/V are the context rows with each KV
+        head repeated in place."""
+        num_q_heads, num_kv_heads, head_dim, device = 24, 4, 256, "cuda"
+        repeat = _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads)
+        num_slots, extend_lens, seq_lens = 101, [5, 6], [20, 17]
+        torch.manual_seed(0)
+        k_bytes = torch.randint(
+            0, 256, (num_slots, num_kv_heads, head_dim), dtype=torch.uint8
+        ).to(device)
+        v_bytes = torch.randint_like(k_bytes, 0, 256)
+        k_cache, v_cache = k_bytes.view(fp8_dtype), v_bytes.view(fp8_dtype)
+        tok_idx = torch.randperm(num_slots, device=device)[: sum(seq_lens)]
+        cu_k = torch.tensor([0, seq_lens[0], sum(seq_lens)], device=device)
+
+        backend = object.__new__(AiterAttnBackend)
+        backend.input_dtype = torch.bfloat16
+        backend.k_scale = torch.ones(1, device=device)
+        backend.qo_indptr = torch.tensor(
+            [0, extend_lens[0], sum(extend_lens)], dtype=torch.int32, device=device
+        )
+        backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
+        backend.forward_metadata = SimpleNamespace(
+            max_q_len=max(extend_lens), max_kv_len=max(seq_lens)
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=backend.k_scale,
+            scaling=head_dim**-0.5,
+        )
+        q = torch.randn(
+            sum(extend_lens), num_q_heads * head_dim, dtype=torch.bfloat16
+        ).to(device)
+        seen = []
+
+        def fake_attention(q, k, v, *args, **kwargs):
+            seen.append((k, v))
+            return torch.zeros(q.shape, dtype=torch.bfloat16, device=q.device)
+
+        with (
+            mock.patch.object(
+                backend,
+                "_asm_context_prefill_indices",
+                return_value=(tok_idx.to(torch.int32), cu_k.to(torch.int32)),
+            ),
+            mock.patch.object(
+                aiter_backend,
+                "flash_attn_varlen_fp8_pertensor_func",
+                side_effect=fake_attention,
+            ),
+        ):
+            backend._forward_extend_fp8_asm_gqa_repeat(
+                q,
+                layer,
+                SimpleNamespace(batch_size=len(seq_lens)),
+                repeat,
+                len(seq_lens) + 1,
+                backend.k_scale,
+                backend.k_scale,
+            )
+        self.assertEqual(len(seen), 1)
+        k, v = seen[0]
+        for got, cache in ((k, k_bytes), (v, v_bytes)):
+            self.assertEqual(got.dtype, fp8_dtype)
+            self.assertEqual(
+                tuple(got.shape), (sum(seq_lens), num_kv_heads * repeat, head_dim)
+            )
+            expected = cache[tok_idx].repeat_interleave(repeat, dim=1)
+            self.assertTrue(torch.equal(got.view(torch.uint8), expected))
+
 
 if __name__ == "__main__":
     unittest.main()
