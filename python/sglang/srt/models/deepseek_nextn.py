@@ -32,7 +32,7 @@ from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -45,7 +45,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_model, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_spec
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
@@ -195,31 +196,9 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
-                previous_hidden_states = forward_batch.spec_info.hidden_states
-                if self.rot_weight is not None:
-                    previous_hidden_states = torch.matmul(
-                        previous_hidden_states, self.rot_weight
-                    )
-                if _is_cuda:
-                    eh_input = fused_eh_norm(
-                        hidden_states,
-                        previous_hidden_states,
-                        self.enorm.weight,
-                        self.hnorm.weight,
-                        self.enorm.variance_epsilon,
-                    )
-                else:
-                    eh_input = torch.cat(
-                        (
-                            self.enorm(hidden_states),
-                            self.hnorm(previous_hidden_states),
-                        ),
-                        dim=-1,
-                    )
-                if isinstance(self.eh_proj, ReplicatedLinear):
-                    hidden_states, _ = self.eh_proj(eh_input)
-                else:
-                    hidden_states = self.eh_proj(eh_input)
+                hidden_states = self._project_with_target_hidden(
+                    hidden_states, forward_batch=forward_batch
+                )
 
             residual_batch.start(forward_batch)
             index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
@@ -242,6 +221,62 @@ class DeepseekModelNextN(nn.Module):
         finally:
             exit_stack.close()
 
+        return hidden_states
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Write the draft KV cache of these tokens without computing outputs."""
+        # Every row is a prompt position, so the target's multimodal embeddings,
+        # when present, are valid for all of them.
+        input_embeds = forward_batch.mm_input_embeds
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids)
+        hidden_states = self._project_with_target_hidden(
+            input_embeds, forward_batch=forward_batch
+        )
+        residual_batch.start(forward_batch)
+        try:
+            self.decoder.forward_kv_only(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        finally:
+            residual_batch.clear(forward_batch)
+
+    def _project_with_target_hidden(
+        self, input_embeds: torch.Tensor, *, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        previous_hidden_states = forward_batch.spec_info.hidden_states
+        if self.rot_weight is not None:
+            previous_hidden_states = torch.matmul(
+                previous_hidden_states, self.rot_weight
+            )
+        if _is_cuda:
+            eh_input = fused_eh_norm(
+                input_embeds,
+                previous_hidden_states,
+                self.enorm.weight,
+                self.hnorm.weight,
+                self.enorm.variance_epsilon,
+            )
+        else:
+            eh_input = torch.cat(
+                (
+                    self.enorm(input_embeds),
+                    self.hnorm(previous_hidden_states),
+                ),
+                dim=-1,
+            )
+        if isinstance(self.eh_proj, ReplicatedLinear):
+            hidden_states, _ = self.eh_proj(eh_input)
+        else:
+            hidden_states = self.eh_proj(eh_input)
         return hidden_states
 
 
@@ -308,10 +343,44 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        spec_info = forward_batch.spec_info
+        if isinstance(spec_info, EagleDraftExtendInput) and spec_info.kv_only:
+            return self.forward_kv_only(
+                input_ids, positions=positions, forward_batch=forward_batch
+            )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    def supports_forward_kv_only(self, *, kv_cache_dtype: torch.dtype) -> bool:
+        attn = self.model.decoder.self_attn
+        # forward_kv_only writes the rotated latent KV through the pool, as DSA prefill does
+        # unless TRT-LLM fuses RoPE into the FP8 write (see _fuse_rope_for_trtllm_mla).
+        trtllm_fuses_rope = (
+            attn.rotary_emb is not None
+            and kv_cache_dtype == torch.float8_e4m3fn
+            and "trtllm"
+            in (
+                get_exec().kernel.dsa_decode_backend,
+                get_exec().kernel.dsa_prefill_backend,
+            )
+        )
+        return attn.use_dsa and not trtllm_fuses_rope
+
+    @torch.no_grad()
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        """Write the draft KV cache of these tokens; no logits or hidden states."""
+        self.model.forward_kv_only(
+            input_ids, positions=positions, forward_batch=forward_batch
+        )
+        return LogitsProcessorOutput(next_token_logits=None)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
