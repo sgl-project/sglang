@@ -138,8 +138,9 @@ def fp8_indexer_candidates(
     ``[rows, heads]``. Row ``r`` scores keys ``j`` in ``[ks[r], ke[r])`` as
     ``kv_scale[j] * sum_h weights[r, h] * relu(q_fp8[r, h] . kv_fp8[j])``
     (DeepGEMM ``fp8_mqa_logits`` arithmetic) and keeps every ``(score, j -
-    ks[r])`` with ``score >= T[r]``, ``T[r]`` the j'-th largest of a strided
-    sample of the row's scores (``j' = ceil((1 + 5 sqrt(2 / j)) j)``,
+    ks[r])`` with ``score >= T[r]``, ``T[r]`` the j'-th largest of a sample
+    of single keys on an odd stride (65, 129 or 257 by span) of the row's
+    scores (``j' = ceil((1 + 4 sqrt(2 / j)) j)``,
     ``j = topk * samples / keys``), so the candidates contain the row's exact
     top-``topk``. Rows with at most ``dense_bound`` keys (default ``topk``)
     keep every key (``T = -inf``). ``counts`` keeps counting past ``cap``; such

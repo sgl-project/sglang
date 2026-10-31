@@ -74,12 +74,14 @@ SGL_DEVICE bf16x2_t cvt_relu_bf16x2_f32(float2 v) {
 }  // namespace device::ptx
 
 struct Fp4IndexerParams {
-  CUtensorMap tmap_q;                   // q_fp4 as [rows * heads, 64] u8, 64 B swizzle, 128 rows per box
-  CUtensorMap tmap_q_sf;                // q_sf as [rows, heads] i32, BLOCK_Q rows per box
-  CUtensorMap tmap_weights;             // weights as [rows, heads] bf16, BLOCK_Q rows per box
-  CUtensorMap tmap_kv;                  // kv_fp4 as [keys, 64] u8, 64 B swizzle, 256 rows per box
-  CUtensorMap tmap_sf_kv;               // kv_sf as [1, keys] i32, 256 keys per box
-  CUtensorMap tmap_kv_sample;           // kv_fp4 as tmap_kv with 8 rows per box (one sample block)
+  CUtensorMap tmap_q;        // q_fp4 as [rows * heads, 64] u8, 64 B swizzle, 128 rows per box
+  CUtensorMap tmap_q_sf;     // q_sf as [rows, heads] i32, BLOCK_Q rows per box
+  CUtensorMap tmap_weights;  // weights as [rows, heads] bf16, BLOCK_Q rows per box
+  CUtensorMap tmap_kv;       // kv_fp4 as [keys, 64] u8, 64 B swizzle, 256 rows per box
+  CUtensorMap tmap_sf_kv;    // kv_sf as [1, keys] i32, 256 keys per box
+  // threshold samples: kv_fp4 as [keys / S, S, 64] (key = row * S + phase), 256 rows of one phase per box, for each
+  // odd sample stride S (see sample_stride)
+  CUtensorMap tmap_kv_strided[6];
   const int8_t* __restrict__ q_fp4;     // [rows, heads, 64] packed e2m1
   const int32_t* __restrict__ q_sf;     // [rows, heads] four ue8m0 bytes per (row, head)
   const int8_t* __restrict__ kv_fp4;    // [keys, 64] packed e2m1
@@ -95,6 +97,7 @@ struct Fp4IndexerParams {
   int32_t* __restrict__ row_samples;    // [rows] samples S_r the threshold was taken from
   uint32_t num_rows;
   uint32_t num_kv;
+  uint32_t sample_limit[6];  // keys < limit[m] = (num_kv / S_m) * S_m are reachable through tmap_kv_strided[m]
   uint32_t topk;
   // the dynamic block counter: zero before the first launch, every launch leaves it zero (one per stream: launches
   // sharing it must not overlap)
@@ -137,6 +140,8 @@ struct Fp4IndexerImpl {
   // 3 accumulator stages: one per math warpgroup and one of lookahead
   static constexpr uint32_t kNumTmemStages = 3;
   static constexpr uint32_t kCap = 12288;
+  // Spans up to this many keys sample every 33rd key, longer ones the stride that fills kSampleTilesMax tiles.
+  static constexpr uint32_t kShortSampleSpan = 49152;
   // Blocks whose rows are all at most this long skip the sample and the drain and store every score: measured
   // faster end to end up to ~6K keys, slower from ~8K on (the top-k then reads every key instead of ~2.5 topk).
   static constexpr uint32_t kDenseLen = 6144;
@@ -161,11 +166,6 @@ struct Fp4IndexerImpl {
   static constexpr uint32_t kSfKvCol = kSfQCol + kNumQStages * 4;
   static constexpr uint32_t kNumTmemCols = 512;
   static_assert(kSfKvCol + kNumKVStages * kSfKvStageCols <= kNumTmemCols);
-  static constexpr uint32_t kSampleBlockKeys = 8;  // one sample = 8 consecutive keys (one 512 B swizzle atom)
-  static constexpr uint32_t kSampleBlocksPerTile = kTileKeys / kSampleBlockKeys;
-  // 1 / 64 of the row's keys are sampled, capped by kSampleTilesMax.
-  static constexpr uint32_t kSampleRatio = 64;
-  static constexpr uint32_t kSampleBlockStride = kSampleRatio * kSampleBlockKeys;
   static constexpr uint32_t kNumWeightRegs = kNumHeads / 2;  // bf16x2 pairs
   // columns per TMEM load: a tile part's UMMA_N columns (BLOCK_Q rows x kNumHeads heads) in UMMA_N / kLoadCols loads
   static constexpr uint32_t kLoadCols = 16;
@@ -176,12 +176,13 @@ struct Fp4IndexerImpl {
   static constexpr uint32_t kSchedConsumers = kNumMathWarps + kNumDrainWarps + kNumSelectWarps + 2;
   enum Barrier { BAR_MATH = 1 };
 
-  struct alignas(16) BlockPlan {  // 16 B aligned: the sched ring copies it with vector accesses
-    uint32_t kv_base;             // first key the tiles cover (multiple of 4)
-    uint32_t span;                // keys covered
-    uint32_t num_tiles;           // 256-key main tiles
-    uint32_t num_samples;         // sample tiles
-    uint32_t sample_stride, sample_phase;
+  struct alignas(16) BlockPlan {            // 16 B aligned: the sched ring copies it with vector accesses
+    uint32_t kv_base;                       // first key the tiles cover (multiple of 4)
+    uint32_t span;                          // keys covered
+    uint32_t num_tiles;                     // 256-key main tiles
+    uint32_t num_samples;                   // sample tiles
+    uint32_t sample_stride, sample_base;    // single-key samples: key of sample i = sample_base + i * sample_stride
+    uint32_t sample_map, sample_limit;      // tensor map index of the stride, keys below the limit are reachable
     uint32_t start[BLOCK_Q], len[BLOCK_Q];  // len = 0 past the last row
     bool dense;  // every row is at most kDenseLen keys: the math warps store all its scores, no sample or drain
   };
@@ -259,18 +260,26 @@ struct Fp4IndexerImpl {
     plan.num_tiles = div_ceil(plan.span, kTileKeys);
     plan.num_samples = 0;
     plan.sample_stride = 0;
-    plan.sample_phase = 0;
+    plan.sample_base = 0;
+    plan.sample_map = 0;
+    plan.sample_limit = 0;
     plan.dense = max_len <= kDenseLen;
     if (!plan.dense) {
-      // 1 / kSampleRatio of the span as 8-key blocks, whole tiles of 32 blocks, at most kSampleTilesMax tiles.
-      uint32_t num_blocks = min(plan.span / kSampleBlockStride, kSampleTilesMax * kSampleBlocksPerTile);
-      num_blocks = max(div_ceil(num_blocks, kSampleBlocksPerTile), 1u) * kSampleBlocksPerTile;
-      plan.num_samples = num_blocks / kSampleBlocksPerTile;
-      // a sampled block spans more than kDenseLen keys, which keeps the stride at 16 or more; multiples of 4 keep
-      // the scale copies 16 B aligned
-      plan.sample_stride = (plan.span / num_blocks) & ~3u;
-      // a per-block phase keeps the sample grid off any fixed alignment of the keys
-      plan.sample_phase = ((block_idx * 2654435761u) >> 8) % plan.sample_stride & ~3u;
+      // Single keys on an odd stride (top keys sit in runs: an 8-key block lands in one or misses it, which makes
+      // the threshold noisy): every 33rd key up to kShortSampleSpan keys, else the smallest stride that keeps the
+      // sample within kSampleTilesMax tiles; a per-block phase keeps the grid off any fixed alignment of the keys.
+      uint32_t m = 0;
+      if (plan.span > kShortSampleSpan) {
+        m = 1;
+        while (m < 5 && div_ceil(plan.span, sample_stride(m)) > kSampleTilesMax * kTileKeys)
+          ++m;
+      }
+      plan.sample_stride = sample_stride(m);
+      plan.sample_map = m;
+      plan.sample_limit = p.sample_limit[m];
+      plan.sample_base = plan.kv_base + ((block_idx * 2654435761u) >> 8) % plan.sample_stride;
+      const uint32_t n = plan.sample_base < hi ? div_ceil(hi - plan.sample_base, plan.sample_stride) : 1u;
+      plan.num_samples = min(div_ceil(n, kTileKeys), kSampleTilesMax);
     }
     return plan;
   }
@@ -331,9 +340,13 @@ struct Fp4IndexerImpl {
     }
   };
 
-  // First key of sample block `g` of the plan's grid.
-  SGL_DEVICE static uint32_t sample_block_key(const BlockPlan& plan, uint32_t g) {
-    return plan.kv_base + min(plan.sample_phase + g * plan.sample_stride, (plan.span - kSampleBlockKeys) & ~3u);
+  // Odd sample strides by index (see make_block_plan).
+  static constexpr uint32_t sample_stride(uint32_t m) {
+    return m == 0 ? 33u : m == 1 ? 65u : m == 2 ? 101u : m == 3 ? 129u : m == 4 ? 193u : 257u;
+  }
+  // Key of sample `i` of the block.
+  SGL_DEVICE static uint32_t sample_key(const BlockPlan& plan, uint32_t i) {
+    return plan.sample_base + i * plan.sample_stride;
   }
 
   // `rank`-th largest element of a 256-bin histogram (one warp): the bin and the rank within it.
@@ -461,7 +474,6 @@ struct Fp4IndexerImpl {
       ptx::prefetch_tensormap(&params.tmap_weights);
       ptx::prefetch_tensormap(&params.tmap_kv);
       ptx::prefetch_tensormap(&params.tmap_sf_kv);
-      ptx::prefetch_tensormap(&params.tmap_kv_sample);
     }
     __syncthreads();
     tcgen05::fence_after_thread_sync();
@@ -504,32 +516,30 @@ struct Fp4IndexerImpl {
         const BlockPlan plan = smem.sched_plans[k % kSchedDepth];
         // Sample tiles: block b of each tile is one TMA box of 8 keys (512 B, one 64 B swizzle atom) issued by one
         // lane; its scales come by cp.async from lane b (a TMA destination needs 128 B alignment).
-        static_assert(kSampleBlocksPerTile == kWarpThreads, "one sample block per lane");
         for (uint32_t t = 0; t < plan.num_samples; ++t) {
           ptx::mbar_wait_parity_suspend(&smem.empty_kv[kv_ring.stage], kv_ring.phase ^ 1);
           const auto stage = kv_ring.stage;
           const auto bar = &smem.full_kv_data[stage];
-          const auto key0 = sample_block_key(plan, t * kSampleBlocksPerTile + lane_id);
-          ptx::cp_async_16B(ptx::to_shared(&smem.sf_kv[stage][lane_id * kSampleBlockKeys]), params.kv_sf + key0);
-          ptx::cp_async_16B(
-              ptx::to_shared(&smem.sf_kv[stage][lane_id * kSampleBlockKeys + 4]), params.kv_sf + key0 + 4);
+          // lane l: the scales of samples 8 l .. 8 l + 7 (keys past the map read key 0: not a valid sample)
+#pragma unroll
+          for (uint32_t j = 0; j < 8; ++j) {
+            const uint32_t key = sample_key(plan, t * kTileKeys + lane_id * 8 + j);
+            ptx::cp_async_ca_4B(
+                ptx::to_shared(&smem.sf_kv[stage][lane_id * 8 + j]),
+                params.kv_sf + (key < plan.sample_limit ? key : 0u));
+          }
           ptx::cp_async_mbarrier_arrive(bar);  // counted before the elected lane's arrive below
           __syncwarp();
           if (warp::elect_one_lane()) {
-            ptx::mbar_arrive_expect_tx(bar, kSampleBlocksPerTile * kSampleBlockKeys * kKeyBytes);
-            const auto kv_smem = ptx::to_shared(smem.kv[stage]);
-            // sample_block_key stepped by the stride: only the last block can reach the clamp
-            const uint32_t key_max = plan.kv_base + ((plan.span - kSampleBlockKeys) & ~3u);
-            uint32_t key = plan.kv_base + plan.sample_phase + t * kSampleBlocksPerTile * plan.sample_stride;
-#pragma unroll
-            for (uint32_t b = 0; b < kSampleBlocksPerTile; ++b, key += plan.sample_stride) {
-              ptx::cp_async_bulk_tensor_2d(
-                  kv_smem + b * kSampleBlockKeys * kKeyBytes,
-                  &params.tmap_kv_sample,
-                  0,
-                  static_cast<int32_t>(min(key, key_max)),
-                  bar);
-            }
+            ptx::mbar_arrive_expect_tx(bar, kTileBytes);
+            const uint32_t key0 = sample_key(plan, t * kTileKeys);
+            ptx::cp_async_bulk_tensor_3d(
+                ptx::to_shared(smem.kv[stage]),
+                &params.tmap_kv_strided[plan.sample_map],
+                0,
+                static_cast<int32_t>(key0 % plan.sample_stride),
+                static_cast<int32_t>(key0 / plan.sample_stride),
+                bar);
           }
           __syncwarp();
           kv_ring.advance();
@@ -785,11 +795,10 @@ struct Fp4IndexerImpl {
         } else {
           if (t < plan.num_samples) {
             // the sample's high code byte into the threshold histogram (the drain's first level)
-            const uint32_t key = sample_block_key(plan, t * kSampleBlocksPerTile + tile_pos / kSampleBlockKeys) +
-                                 tile_pos % kSampleBlockKeys;
+            const uint32_t key = sample_key(plan, t * kTileKeys + tile_pos);
 #pragma unroll
             for (uint32_t i = 0; i < BLOCK_Q; ++i) {
-              if (key - plan.start[i] < plan.len[i]) {
+              if (key - plan.start[i] < plan.len[i] && key < plan.sample_limit) {
                 atomicAdd(&smem.hist[ns & 1u][0][i][bf16_code(bits[i] >> 16) >> 8], 1u);
               }
             }
@@ -938,7 +947,7 @@ struct Fp4IndexerImpl {
         pivot_rank[i] = 0;
         if (len[i] > params.topk && samples[i] > 0) {
           const float j = static_cast<float>(params.topk) * static_cast<float>(samples[i]) / static_cast<float>(len[i]);
-          const float alpha = 5.0f * sqrtf(2.0f / j);
+          const float alpha = 4.5f * sqrtf(2.0f / j);
           const uint32_t rank = static_cast<uint32_t>(ceilf((1.0f + alpha) * j));
           uint32_t bin = 0, rank_in_bin = 0;
           if (find_rank_bin(&hist[0][row_base + i][0], rank, lane_id, bin, rank_in_bin)) {
@@ -955,7 +964,6 @@ struct Fp4IndexerImpl {
       if (any_pivot) {
         for (uint32_t t = 0; t < plan.num_samples; ++t) {
           const auto r = sample_slot(t);
-          const uint32_t key0 = sample_block_key(plan, t * kSampleBlocksPerTile + lane_id);
 #pragma unroll
           for (uint32_t i = 0; i < kRows; ++i) {
             AlignedVector<uint32_t, 4> v;
@@ -963,7 +971,8 @@ struct Fp4IndexerImpl {
 #pragma unroll
             for (uint32_t j = 0; j < 8; ++j) {
               const uint32_t code = bf16_code((v[j / 2] >> (16 * (j % 2))) & 0xffffu);
-              if (key0 + j - start[i] < len[i] && (code >> 8) == pivot[i]) {
+              const uint32_t key = sample_key(plan, t * kTileKeys + 8 * lane_id + j);
+              if (key - start[i] < len[i] && key < plan.sample_limit && (code >> 8) == pivot[i]) {
                 atomicAdd(&hist[1][row_base + i][code & 0xffu], 1u);
               }
             }
@@ -1443,13 +1452,17 @@ struct Fp4IndexerKernel {
         {.swizzle = CU_TENSOR_MAP_SWIZZLE_64B});
     params.tmap_sf_kv = tma::make_map(
         kv_sf.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_INT32, {num_kv, 1}, {num_kv * 4ull}, {Impl::kTileKeys, 1});
-    params.tmap_kv_sample = tma::make_map(
-        kv_fp4.data_ptr(),
-        CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        {Impl::kKeyBytes, num_kv},
-        {Impl::kKeyBytes},
-        {Impl::kKeyBytes, Impl::kSampleBlockKeys},
-        {.swizzle = CU_TENSOR_MAP_SWIZZLE_64B});
+    for (uint32_t m = 0; m < 6; ++m) {
+      const uint64_t stride = Impl::sample_stride(m);
+      params.tmap_kv_strided[m] = tma::make_map(
+          kv_fp4.data_ptr(),
+          CU_TENSOR_MAP_DATA_TYPE_UINT8,
+          {Impl::kKeyBytes, stride, std::max<uint64_t>(num_kv / stride, 1)},
+          {Impl::kKeyBytes, stride * Impl::kKeyBytes},
+          {Impl::kKeyBytes, 1, Impl::kTileKeys},
+          {.swizzle = CU_TENSOR_MAP_SWIZZLE_64B});
+      params.sample_limit[m] = static_cast<uint32_t>(num_kv / stride * stride);
+    }
     params.q_fp4 = static_cast<const int8_t*>(q_fp4.data_ptr());
     params.q_sf = static_cast<const int32_t*>(q_sf.data_ptr());
     params.kv_fp4 = static_cast<const int8_t*>(kv_fp4.data_ptr());

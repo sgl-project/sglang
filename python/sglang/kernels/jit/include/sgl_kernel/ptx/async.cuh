@@ -42,6 +42,20 @@ cp_async_bulk_tensor_2d(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, i
       : "memory");
 }
 
+/// One 3D tile at coordinates (x, y, z), innermost first, of `tmap` into `dst_smem`, completing on `bar`.
+SGL_DEVICE void
+cp_async_bulk_tensor_3d(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, int32_t z, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];" ::
+          "r"(dst_smem),
+      "l"(tmap),
+      "r"(x),
+      "r"(y),
+      "r"(z),
+      "r"(to_shared(bar))
+      : "memory");
+}
+
 /// 1D bulk copy global -> shared, completing on `bar` (16-byte aligned, `bytes % 16 == 0`).
 SGL_DEVICE void cp_async_bulk_g2s(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
   asm volatile(

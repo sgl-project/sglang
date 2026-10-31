@@ -74,8 +74,13 @@ class FullTopKIndexer:
         if data is None:
             return
         out = inputs.out_raw_indices[: data.num_rows]
-        # NOTE: only faster when score length is long enough
-        if self.use_prefill_lite_topk and max(data.lens_per_request) >= 24576:
+        # LiteTopK needs rows x keys to fill the GPU: with few rows a CTA per 4 rows scans the whole key range and the
+        # dense path wins.
+        max_len = max(data.lens_per_request)
+        use_lite = data.num_rows >= 512 and data.num_rows * max_len >= 1 << 26
+        # Rows of at most 6144 keys make every block dense (no sampling), where LiteTopK wins at any size.
+        use_lite = use_lite or max_len <= 6144
+        if self.use_prefill_lite_topk and use_lite:
             self._prefill_lite_topk(inputs, data, out)
         else:
             kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(

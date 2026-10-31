@@ -21,8 +21,13 @@ HEAD_DIM = 128
 HEADS = (32, 64)
 TOPK = 2048
 CAP = 12288
-# Kernel constants mirrored for the threshold check (fp8_indexer.cuh).
-SAMPLE_BLOCK, BLOCKS_PER_TILE, MIN_STRIDE = 8, 32, 512
+# Kernel constants mirrored for the threshold check (fp8_indexer.cuh): single-key samples on an odd stride chosen
+# from the block's span, at most MAX_SAMPLE_TILES tiles of 256.
+TILE_KEYS, MAX_SAMPLE_TILES, ALPHA = 256, 32, 4.0
+
+
+def sample_stride(span: int) -> int:
+    return 65 if span <= 524288 else 129 if span <= 1048576 else 257
 
 
 def make_ragged(
@@ -107,14 +112,13 @@ def expected_thresholds(
     if lo is None:
         return [math.inf] * rpc
     lo = lo // 4 * 4
-    span = hi - lo
-    stride = max(MIN_STRIDE, -(-(-(-span // 1024)) // 4) * 4)
-    nblk = -(-span // stride)
-    tiles = -(-nblk // BLOCKS_PER_TILE) if need else 0
-    idx = torch.arange(
-        tiles * BLOCKS_PER_TILE * SAMPLE_BLOCK, device=logits_rows.device
-    )
-    keys = lo + (idx // SAMPLE_BLOCK) * stride + idx % SAMPLE_BLOCK
+    stride = sample_stride(hi - lo)
+    base = lo + ((blk * 2654435761) % 2**32 >> 8) % stride
+    num = -(-(hi - base) // stride) if base < hi else 0
+    tiles = min(-(-num // TILE_KEYS), MAX_SAMPLE_TILES) if need else 0
+    idx = torch.arange(tiles * TILE_KEYS, device=logits_rows.device)
+    keys = base + idx * stride
+    keys = keys[keys < num_keys // stride * stride]
     for i in range(rpc):
         s, m = lens[i]
         if m == 0:
@@ -129,7 +133,7 @@ def expected_thresholds(
             out.append(-math.inf)
             continue
         j = topk * S / m
-        jp = math.ceil((1 + 5 * math.sqrt(2 / j)) * j)
+        jp = math.ceil((1 + ALPHA * math.sqrt(2 / j)) * j)
         if jp > S or jp == 0:
             out.append(-math.inf)
             continue
@@ -275,6 +279,9 @@ CELLS = {
         (1024, 1024, "last"),
         (16384, 512, "mid"),
     ],
+    # single requests at the 129- and 257-key sample strides
+    "long_1m_r256": [(1024 * 1024 - 4096, 256, "last")],
+    "long_1280k_r128": [(1280 * 1024, 128, "last")],
     "mixed4_r1024": [
         (1024 * 1024, 256, "last"),
         (256 * 1024, 256, "last"),
@@ -372,18 +379,12 @@ def test_fp8_indexer_topk(cell, heads):
 
 
 def test_sample_grid_cap():
-    """At most 32 sample tiles (8192 samples per row) for any span: the per-CTA
-    sample-code scratch (kMaxSampleTiles) holds 32 tiles."""
-    for span in (
-        list(range(1, 70000, 977))
-        + list(range(2**19 - 2048, 2**20 + 1024, 509))
-        + [2**20 + 1023]
-    ):
-        stride = max(MIN_STRIDE, -(-(-(-span // 1024)) // 4) * 4)
-        nblk = -(-span // stride)
-        tiles = -(-nblk // BLOCKS_PER_TILE)
-        assert 1 <= tiles <= 32, (span, stride, tiles)
-        assert tiles * BLOCKS_PER_TILE * SAMPLE_BLOCK <= 8192
+    """Up to 2M keys of span the strided sample fits the 32 sample tiles (8192 samples per row) that the per-CTA
+    sample-code scratch (kMaxSampleTiles) holds, so no sample is dropped."""
+    for span in list(range(1, 70000, 977)) + list(range(2**19 - 2048, 2**21, 509)):
+        stride = sample_stride(span)
+        assert stride % 2 == 1
+        assert -(-span // stride) <= MAX_SAMPLE_TILES * TILE_KEYS, (span, stride)
 
 
 if __name__ == "__main__":

@@ -88,6 +88,9 @@ def reference_logits(inp):
         (64, 1024, 4, [(262144, 96), (65536, 96), (16384, 64)]),
         (32, 512, 2, [(65536, 256)]),
         (32, 512, 1, [(131072, 128), (40960, 128)]),
+        # long rows: 512K and 1M keys take the 129- and 257-key sample strides
+        (32, 512, 2, [(1048576, 128)]),
+        (32, 512, 1, [(1048576, 64)]),
         # rows that see at most topk keys produce every key
         (64, 1024, 4, [(4096, 128)]),
         # 32-head dense blocks (every row <= 6144 keys) with distinct row lengths and a request boundary inside a
@@ -161,6 +164,7 @@ def test_fp4_indexer_candidates(heads, topk, ratio, requests):
     [
         (64, 1024, 4, [(262144, 96), (65536, 96), (4096, 64)]),
         (32, 512, 1, [(131072, 128), (40960, 128)]),
+        (32, 512, 2, [(1048576, 128)]),
     ],
 )
 def test_fp4_indexer_topk(heads, topk, ratio, requests):
