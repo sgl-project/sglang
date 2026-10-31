@@ -668,7 +668,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         )
 
     @torch.no_grad()
-    def _denoise(self, inputs: PaintDenoisingInputs) -> torch.Tensor:
+    def _denoise(self, inputs: PaintDenoisingInputs, batch: Req) -> torch.Tensor:
         scheduler = self.scheduler
         latents = inputs.latents
         step_kwargs = _scheduler_step_kwargs(scheduler, inputs.generator)
@@ -702,6 +702,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
                 with set_forward_context(
                     current_timestep=step_index,
                     attn_metadata=None,
+                    forward_batch=batch,
                 ):
                     noise_prediction = transformer(
                         latent_input,
@@ -742,7 +743,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             batch.extra["multiview_textures"] = []
             return batch
         inputs = self._prepare_denoising_inputs(batch)
-        batch.extra["multiview_textures"] = self._decode(self._denoise(inputs))
+        batch.extra["multiview_textures"] = self._decode(self._denoise(inputs, batch))
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
