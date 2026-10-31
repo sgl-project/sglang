@@ -3,6 +3,8 @@
 TBO=1 runs the FP4-asymmetric two-child TBO path instead; there TEST_CUDA_GRAPH=1
 captures and replays REPLAY_ITERS times (default 3), with each child writing its
 expert output directly into its own combine staging view.
+MODE=low_latency (default normal) or MORI_ENABLE_SDMA=1 runs either path on the
+AsyncLL send/recv kernels, which fall back to bf16 dispatch and combine.
 The identity expert checks buffer correctness, not AITER performance.
 """
 
@@ -67,6 +69,10 @@ class _Group:
         return values[0]
 
 
+def _deepep_mode():
+    return DeepEPMode(os.environ.get("MODE", "normal"))
+
+
 def _expected_unique_destinations(topk_ids: torch.Tensor, experts_per_rank: int):
     return torch.tensor(
         [
@@ -125,6 +131,9 @@ def main():
     dp_attention.set_dp_buffer_len(sum(sender_rows), tokens, False, metadata_rows)
 
     adapter.is_tbo_enabled = lambda: False
+    adapter._max_dispatch_tokens_per_rank = (
+        envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get
+    )
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
@@ -147,7 +156,7 @@ def main():
         num_local_experts=experts_per_rank,
         hidden_size=hidden_size,
         params_dtype=torch.bfloat16,
-        deepep_mode=DeepEPMode.NORMAL,
+        deepep_mode=_deepep_mode(),
     )
     dispatcher.set_quant_config(
         {"weight_dtype": (torch.float4_e2m1fn_x2 if fp4_enabled else torch.bfloat16)}
@@ -179,13 +188,22 @@ def main():
 
     dispatched = dispatcher.dispatch(hidden, topk_output)
     impl = dispatcher._get_impl()
-    assert impl.dispatch_dtype.name == dispatch, (impl.dispatch_dtype, dispatch)
+    async_ll = _deepep_mode().is_low_latency() or impl.enable_sdma
+    # Older MORI builds have no AsyncLL and no async_ll field.
+    assert impl._uses_async_ll == async_ll
+    assert getattr(impl.mori_op.cfg, "async_ll", False) == async_ll
+    expected_dispatch = "bf16" if async_ll and dispatch == "fp4" else dispatch
+    assert impl.dispatch_dtype.name == expected_dispatch, impl.dispatch_dtype
     # MORI builds without the saturation fix fall back to blockwise fp8.
     expected_combine = combine
     saturates = adapter._mori_epv2_fp8_direct_cast_saturates()
     if combine == "fp8_direct_cast" and not saturates:
         expected_combine = "fp8"
+    if async_ll:
+        expected_combine = "bf16"
     assert impl.combine_dtype.name == expected_combine, (impl.combine_dtype, combine)
+    dispatch, combine = expected_dispatch, expected_combine
+    fp4_enabled = dispatch == "fp4"
     expected_cap = 0
     if impl._manual_recv_cap > 0:
         expected_cap = min(impl._manual_recv_cap, impl.mori_op.cfg.effective_max_recv)
@@ -242,7 +260,8 @@ def main():
             f"attn_tp={attn_tp_size} sender_rows={sender_rows} stale_rows={stale_rows} "
             f"recv_cap={dispatched.recv_cap}",
             f"dispatch={dispatch} combine={combine} "
-            f"combine_mode={impl.mori_op.cfg.combine_mode}",
+            f"combine_mode={impl.mori_op.cfg.combine_mode} "
+            f"mode={_deepep_mode().value} async_ll={async_ll}",
             f"mean_abs_error={error.mean().item():.6f}",
             f"max_abs_error={error.max().item() if error.numel() else 0:.6f}",
             flush=True,
@@ -337,6 +356,7 @@ def _run_tbo(rank, world_size):
         num_local_experts=experts_per_rank,
         hidden_size=hidden_size,
         params_dtype=torch.bfloat16,
+        deepep_mode=_deepep_mode(),
         async_finish=True,
     )
     with (
@@ -348,8 +368,16 @@ def _run_tbo(rank, world_size):
     for child in dispatcher._inners:
         child.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
     children = [child._get_impl() for child in dispatcher._inners]
+    async_ll = children[0]._uses_async_ll
     assert children[0]._comm_stream is children[1]._comm_stream
-    assert children[0]._launch_config == adapter._MoriEPv2LaunchConfig(32, 4, 48, 4)
+    if async_ll:
+        # The send halves return at once; MORI sizes the AsyncLL grids itself.
+        assert children[0]._comm_stream is None
+        assert children[0]._launch_config == adapter._get_epv2_launch_config(False)
+    else:
+        assert children[0]._launch_config == adapter._MoriEPv2LaunchConfig(32, 4, 48, 4)
+    dispatch = children[0].dispatch_dtype.name
+    assert dispatch == ("bf16" if async_ll else "fp4"), dispatch
     assert children[0].mori_op is not children[1].mori_op
     probe_trim = os.environ.get("PROBE_TBO_TRIM", "0") == "1"
     if probe_trim:
@@ -426,7 +454,7 @@ def _run_tbo(rank, world_size):
             "TBO children share an output buffer"
         )
         for child_id, output in enumerate(outputs):
-            expert_out = _expert_output(output, "fp4", fp4_lookup)
+            expert_out = _expert_output(output, dispatch, fp4_lookup)
             if output.expert_output is not None:
                 direct_out = output.expert_output[: expert_out.shape[0]]
                 direct_out.copy_(expert_out)
@@ -494,6 +522,8 @@ def _run_tbo(rank, world_size):
             "probe_trim": probe_trim,
             "direct_output": [output.expert_output is not None for output in outputs],
             "cuda_graph": use_graph,
+            "mode": _deepep_mode().value,
+            "async_ll": async_ll,
             "replay_iters": replay_iters,
             "recv_caps": [output.recv_cap for output in outputs],
             "child_sender_rows": child_token_counts,

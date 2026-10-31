@@ -161,6 +161,8 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # Rows of this rank's first TBO micro-batch (0 without TBO).
+    local_tbo_split_num_tokens: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -170,6 +172,7 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     global_attention_pairs: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
+    global_tbo_split_num_tokens: list[int] = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
@@ -187,6 +190,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                self.local_tbo_split_num_tokens,
             ],
             device=device,
             dtype=dtype,
@@ -206,6 +210,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # local_tbo_split_num_tokens
             ],
             device=device,
             dtype=dtype,
@@ -341,6 +346,7 @@ def _update_gather_batch(
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
+        batch.tbo_global_split_num_tokens = mlp_sync_info.global_tbo_split_num_tokens
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
@@ -641,6 +647,7 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        local_tbo_split_num_tokens=tbo_preparer.local_tbo_split_num_tokens,
     )
 
     if num_dp_ranks == 1:
@@ -659,6 +666,10 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
+        if mlp_sync_info.tbo_split_seq_index is not None:
+            mlp_sync_info.global_tbo_split_num_tokens = mlp_sync_info.tp0_info_cpu[
+                :, 11
+            ].tolist()
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)

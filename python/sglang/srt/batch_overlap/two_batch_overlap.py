@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     PplxDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.moriep import mori_tbo_child_dispatch_cap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -338,14 +339,33 @@ def compute_split_indices_for_cuda_graph_replay(
 # -------------------------------- Preparation ---------------------------------------
 
 
+def _verify_input_blocks_split(batch) -> bool:
+    """A verify step (idle DP ranks carry the same input) whose spec input
+    split_spec_info cannot split, e.g. DSpark's DFlashVerifyInput. Every rank
+    runs it without TBO so the MoE collectives still pair up."""
+    spec_info = batch.spec_info
+    return (
+        (batch.forward_mode.is_target_verify() or batch.forward_mode.is_idle())
+        and spec_info is not None
+        and spec_info.is_verify_input()
+        and not hasattr(spec_info, "retrieve_index")
+    )
+
+
 class TboCudaGraphRunnerPlugin:
-    def __init__(self):
+    def __init__(self, is_draft_worker: bool = False):
         self._tbo_children_num_token_non_padded = torch.zeros(
             (2,), dtype=torch.int32, device=get_device().device
         )
+        # A draft worker never runs TBO, so its graphs are captured unsplit.
+        self._is_draft_worker = is_draft_worker
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        if (
+            not is_tbo_enabled()
+            or self._is_draft_worker
+            or _verify_input_blocks_split(batch)
+        ):
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -403,6 +423,7 @@ class TboDPAttentionPreparer:
 
         deepep_mode = get_deepep_mode()
         enable_a2a_moe = not get_moe_a2a_backend().is_none()
+        ll_supports_extend = get_moe_a2a_backend().low_latency_supports_extend()
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
@@ -411,6 +432,9 @@ class TboDPAttentionPreparer:
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
+        # Rows of this rank's first micro-batch, gathered so each micro-batch's
+        # dispatch can be bounded by its own per-rank rows.
+        self.local_tbo_split_num_tokens = 0
         if not enable_two_batch_overlap:
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
@@ -442,8 +466,25 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_a2a_moe
+                and not ll_supports_extend
                 and (resolved_deepep_mode.is_low_latency())
             )
+            if local_can_run_tbo and not local_batch.forward_mode.is_prebuilt():
+                self.local_tbo_split_num_tokens = compute_split_token_index(
+                    split_seq_index=self.local_tbo_split_seq_index,
+                    forward_mode=local_batch.forward_mode,
+                    extend_seq_lens=local_batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
+                )
+                child_cap = mori_tbo_child_dispatch_cap()
+                if (
+                    child_cap is not None
+                    and num_tokens - self.local_tbo_split_num_tokens > child_cap
+                ):
+                    # Micro-batch B dispatches through an op sized for child_cap
+                    # rows per rank; the gathered min keeps every rank unsplit.
+                    local_can_run_tbo = False
+                    self.local_tbo_split_num_tokens = 0
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -507,6 +548,9 @@ class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
         if batch.tbo_split_seq_index is None or is_draft_worker:
+            return
+        if _verify_input_blocks_split(batch):
+            batch.tbo_split_seq_index = None
             return
 
         tbo_children_num_token_non_padded = (
@@ -574,6 +618,7 @@ class TboForwardBatchPreparer:
                 if is_enable_two_chunk
                 else batch.tbo_split_seq_index
             ),
+            first_child=True,
             out_num_token_non_padded=out_num_token_non_padded_a,
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_a,
         )
@@ -583,6 +628,7 @@ class TboForwardBatchPreparer:
             end_token_index=batch.input_ids.shape[0],
             start_seq_index=batch.tbo_split_seq_index,
             end_seq_index=batch.batch_size,
+            first_child=False,
             out_num_token_non_padded=out_num_token_non_padded_b,
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_b,
         )
@@ -662,6 +708,26 @@ class TboForwardBatchPreparer:
             child_b.extend_num_tokens,
         )
 
+    @staticmethod
+    def _child_dp_global_num_tokens(
+        parent_rows: Optional[List[int]],
+        split_rows: Optional[List[int]],
+        first_child: bool,
+    ) -> Optional[List[int]]:
+        """Per-rank rows of one micro-batch: the first takes each rank's split
+        rows, the second the rest of that rank's parent rows. Falls back to the
+        parent's rows, still an upper bound, when the split was not gathered."""
+        if (
+            parent_rows is None
+            or split_rows is None
+            or len(parent_rows) != len(split_rows)
+        ):
+            return parent_rows
+        first = [min(max(s, 0), p) for s, p in zip(split_rows, parent_rows)]
+        if first_child:
+            return first
+        return [p - f for p, f in zip(parent_rows, first)]
+
     @classmethod
     def filter_batch(
         cls,
@@ -671,6 +737,7 @@ class TboForwardBatchPreparer:
         end_token_index: int,
         start_seq_index: int,
         end_seq_index: int,
+        first_child: bool,
         out_num_token_non_padded: torch.Tensor,
         out_num_token_non_padded_cpu: Optional[int] = None,
     ):
@@ -832,6 +899,19 @@ class TboForwardBatchPreparer:
                 encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
+                tbo_dp_global_num_tokens_bound=cls._child_dp_global_num_tokens(
+                    # The counts the parent published for its DP gather.
+                    (
+                        batch.global_num_tokens_padded_cpu
+                        if batch.global_num_tokens_padded_cpu is not None
+                        else batch.global_num_tokens_cpu
+                    ),
+                    batch.tbo_global_split_num_tokens,
+                    # Not start_token_index == 0: an idle or empty-split rank
+                    # starts both children at token 0.
+                    first_child=first_child,
+                ),
+                tbo_global_split_num_tokens=None,
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
@@ -1136,13 +1216,22 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
 
 
 def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
-    value_a = output_a[name]
-    value_b = output_b[name]
+    return _model_forward_tbo_merge_values(
+        output_a[name],
+        output_b[name],
+        output_a["forward_batch"],
+        output_b["forward_batch"],
+        original_len,
+    )
+
+
+def _model_forward_tbo_merge_values(value_a, value_b, batch_a, batch_b, original_len):
+    """Write each child's rows back to its range of the parent batch."""
     assert (value_a is None) == (value_b is None)
     if value_a is None:
         return None
-    s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-    s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+    s0, t0 = batch_a.tbo_parent_token_range
+    s1, t1 = batch_b.tbo_parent_token_range
     res = torch.zeros(
         (original_len, *value_a.shape[1:]),
         dtype=value_a.dtype,

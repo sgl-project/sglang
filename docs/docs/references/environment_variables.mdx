@@ -502,7 +502,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of dispatch tokens per rank for MORI-EP buffer allocation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of dispatch tokens per rank for MORI-EP buffer allocation. When unset, a server that prefills uses its per-rank <code>--chunked-prefill-size</code> (after the DP attention split) if that is larger than <code>4096</code>; a disaggregated decode server uses <code>4096</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
     </tr>
 <tr>
@@ -522,12 +522,12 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_EP_V2</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used only for DeepSeek-V4 models on AITER with <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> that fits one UALink vPOD), a bfloat16 model dtype and <code>MORI_ENABLE_SDMA</code> off, and MORI EPv1 otherwise. Set to <code>true</code> to use EPv2 even when these checks fail (a warning names the failed check), or <code>false</code> to always use EPv1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used for DeepSeek-V4 on AITER with a bfloat16 model dtype and <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> within one UALink vPOD), and EPv1 otherwise; AsyncLL modes also need a MORI build with EPv2 AsyncLL. <code>true</code> forces EPv2 (warning on any failed check), <code>false</code> forces EPv1. With <code>--deepep-mode low_latency</code> or <code>MORI_ENABLE_SDMA=1</code>, EPv2 runs MORI's AsyncLL kernels (copy engine with SDMA, peer stores otherwise). They have no fp4 dispatch or quantized combine: fp4 dispatch falls back to MXFP8 for FP4 weights (bf16 on gfx1250 or older AITER) and combine to bf16. Under two-batch overlap, AsyncLL runs the second micro-batch on its own stream (issued from its own host thread) unless <code>MORI_ASYNCLL_FUSED_RECV=1</code>, and <code>low_latency</code> also moves each receive into the next stage, behind the sibling micro-batch.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_RECV_BOUND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts, missing metadata and two-batch overlap keep the full view.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts and missing metadata keep the full view; a two-batch overlap micro-batch is bounded by its whole batch's counts.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>

@@ -121,6 +121,7 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
                 end_token_index=4,
                 start_seq_index=0,
                 end_seq_index=4,
+                first_child=True,
                 out_num_token_non_padded=torch.tensor(0),
                 out_num_token_non_padded_cpu=0,
             )

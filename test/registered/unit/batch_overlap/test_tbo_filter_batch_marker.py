@@ -53,6 +53,7 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
             end_token_index=hi,
             start_seq_index=lo,
             end_seq_index=hi,
+            first_child=lo == 0,
             out_num_token_non_padded=torch.tensor(hi - lo),
         )
 

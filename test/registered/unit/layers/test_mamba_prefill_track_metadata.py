@@ -384,6 +384,7 @@ class TestDpDecodeRelabel(unittest.TestCase):
                 end_token_index=1,
                 start_seq_index=0,
                 end_seq_index=1,
+                first_child=True,
                 out_num_token_non_padded=torch.zeros(1, dtype=torch.int32),
             )
 

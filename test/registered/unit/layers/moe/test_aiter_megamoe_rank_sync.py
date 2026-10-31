@@ -22,6 +22,7 @@ def test_mlp_sync_retains_full_vector_without_tp_gather():
         num_tokens_for_logprob=32,
         is_extend_in_batch=True,
         tbo_split_seq_index=None,
+        global_tbo_split_num_tokens=None,
         global_forward_mode=None,
         can_run_decode_cuda_graph=False,
         can_run_draft_cuda_graph=False,

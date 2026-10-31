@@ -588,7 +588,7 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "mori":
-        is_epv2 = _resolve_mori_ep_v2(server_args)
+        _resolve_mori_ep_v2(server_args)
         if cfg.deepep_mode == "auto":
             declare_resolution(
                 server_args,
@@ -596,16 +596,6 @@ def handle_a2a_moe(server_args: Any):
                 deepep_mode="normal",
             )
             logger.warning("auto set deepep_mode=`normal` for MORI EP")
-        elif is_epv2 and cfg.deepep_mode == "low_latency":
-            declare_resolution(
-                server_args,
-                "_handle_a2a_moe",
-                deepep_mode="normal",
-            )
-            logger.warning(
-                "MORI EPv2 has no separate low-latency kernel; "
-                "using deepep_mode=`normal` for deepep_mode=`low_latency`"
-            )
 
         # Check chunked prefill for mori
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -613,8 +603,8 @@ def handle_a2a_moe(server_args: Any):
         if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
                 required_mori_dispatch_tokens_per_rank(server_args)
-            ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
-                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
+            ) <= mori_max_dispatch_tokens_per_rank(server_args), (
+                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK "
                 "must be >= the per-rank MoRI dispatch tokens "
                 "(chunked_prefill_size by default)"
             )
@@ -868,6 +858,14 @@ def _resolve_mori_ep_v2(server_args: Any) -> bool:
     return False
 
 
+def _mori_has_epv2_async_ll() -> bool:
+    try:
+        from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
+    except ImportError:
+        return False
+    return "async_ll" in EpDispatchCombineConfig.__dataclass_fields__
+
+
 def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
     # The dispatcher falls back from unsupported dispatch/combine dtypes once it
     # knows the weight dtype.
@@ -882,8 +880,14 @@ def _mori_epv2_unsupported_reason(server_args: Any) -> str | None:
         return f"ep_size={cfg.tp_size} across hosts (EPv2 is validated within one host)"
     if not envs.SGLANG_USE_AITER.get():
         return "SGLANG_USE_AITER=0 (EPv2 experts run on the aiter MoE runner)"
-    if get_bool_env_var("MORI_ENABLE_SDMA", "false"):
-        return "MORI_ENABLE_SDMA=1 (SDMA is EPv1-only)"
+    if (
+        cfg.deepep_mode == "low_latency"
+        or get_bool_env_var("MORI_ENABLE_SDMA", "false")
+    ) and not _mori_has_epv2_async_ll():
+        return (
+            "deepep_mode=low_latency or MORI_ENABLE_SDMA=1 on a MORI build "
+            "without EPv2 AsyncLL"
+        )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return "a model loaded through an instance connector (cannot validate it)"
     model_config = model_config_of(server_args)
@@ -899,6 +903,25 @@ def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
     """Max tokens a single rank dispatches through MoRI in one forward."""
     cfg = resolving_view(server_args)
     return cfg.chunked_prefill_size
+
+
+def mori_max_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Rows per rank each MoRI dispatch/combine op holds.
+
+    An explicit SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK wins. Unset, a server
+    that prefills sizes it to its per-rank chunked prefill, never below the default,
+    which also covers the decode batches of a non-disaggregated server; a
+    disaggregated decode server keeps the default.
+    """
+    configured = envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    cfg = resolving_view(server_args)
+    if (
+        configured.is_set()
+        or cfg.disaggregation_mode == "decode"
+        or cfg.chunked_prefill_size <= 0
+    ):
+        return configured.get()
+    return max(required_mori_dispatch_tokens_per_rank(server_args), configured.get())
 
 
 def required_pplx_dispatch_tokens_per_rank(server_args: Any) -> int:
