@@ -9,7 +9,7 @@ import sys
 import textwrap
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import psutil
 
@@ -63,6 +63,15 @@ class TestKillProcessTree(unittest.TestCase):
         with process.stdout:
             child_pid = int(process.stdout.readline())
         return process.pid, child_pid
+
+    def test_parent_exits_during_child_enumeration(self):
+        parent_pid = 12345
+        parent = Mock()
+        parent.children.side_effect = psutil.NoSuchProcess(parent_pid)
+        with patch.object(PROCESS.psutil, "Process", return_value=parent):
+            kill_process_tree(parent_pid)
+        parent.children.assert_called_once_with(recursive=True)
+        parent.kill.assert_not_called()
 
     def test_waits_for_killed_children(self):
         parent_pid, child_pid = self.spawn_tree()
