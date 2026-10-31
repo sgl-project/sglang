@@ -5,13 +5,14 @@ at the first checkpoint, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
-the donated alloc asserts; ratio 3 (pool = 3N) has headroom. Once decode's
+the optional donation is skipped; ratio 3 (pool = 3N) has headroom. Once decode's
 skip_mamba leaves the matched prefix evictable, even ratio 2 recovers via
 eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
 
 import unittest
 from types import MethodType, SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 import torch
 
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
+    InsertParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
@@ -286,11 +288,40 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
+        self.assertIsNone(component._try_alloc_mamba_slot())
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
         self.assertEqual(
-            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+            cache.alloc_evict_params,
+            [EvictParams(num_tokens=0, mamba_num=1)] * 2,
         )
+
+    def test_unfinished_checkpoint_skips_donation_when_all_states_locked(self):
+        component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
+        cache.enable_mamba_extra_buffer = True
+        req = SimpleNamespace(kv=SimpleNamespace(mamba_last_track_seqlen=8), lock=None)
+        params = InsertParams()
+
+        with (
+            patch.object(
+                MambaComponent, "quantizes_checkpoints", new_callable=PropertyMock
+            ) as quantizes,
+            patch(
+                "sglang.srt.mem_cache.unified_cache.components.mamba.get_exec",
+                return_value=SimpleNamespace(
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+                ),
+            ),
+        ):
+            quantizes.return_value = False
+            self.assertEqual(
+                component.prepare_for_caching_req(req, params, 8, is_finished=False),
+                0,
+            )
+
+        self.assertIsNone(params.mamba_value)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 8)
+        self.assertEqual(len(cache.prefix_nodes), N)
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
