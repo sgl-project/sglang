@@ -19,20 +19,20 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
-| Kimi-K2.6 | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Mixed | 64k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 128k+1k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 64k+1.5k | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
+| Kimi-K2.6 | A3 Series Products | 16 | PD Disaggregation | 64k+1.5k (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
+| Kimi-K2.6 | A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -42,7 +42,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -166,7 +166,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -359,7 +359,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -559,7 +559,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -750,7 +750,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -948,7 +948,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1059,7 +1059,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1168,7 +1168,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -1280,7 +1280,7 @@ python -m sglang.bench_serving \
 
 **Model**: Kimi-K2.6
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
