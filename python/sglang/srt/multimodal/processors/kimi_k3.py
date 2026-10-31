@@ -9,6 +9,7 @@ at load time.
 """
 
 import functools
+import logging
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -67,6 +68,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.utils import is_cuda
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -333,20 +336,31 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             for width, height in image_sizes
         ]
 
+        pixel_values = None
         if images and torch.cuda.is_available():
             image_scale, image_bias = self._get_gpu_norm_tensors()
-            pixel_values, grid_thws = _gpu_preprocess_images(
-                images,
-                resize_configs,
-                image_scale,
-                image_bias,
-                self._patch_size,
-                to_chw=_k3_to_cuda_chw,
-                post_resize=lambda x: _fill_transparent_bg(
-                    x, self._transparent_bg_config
-                ),
-            )
-        else:
+            try:
+                pixel_values, grid_thws = _gpu_preprocess_images(
+                    images,
+                    resize_configs,
+                    image_scale,
+                    image_bias,
+                    self._patch_size,
+                    to_chw=_k3_to_cuda_chw,
+                    post_resize=lambda x: _fill_transparent_bg(
+                        x, self._transparent_bg_config
+                    ),
+                )
+            except torch.OutOfMemoryError:
+                # The tokenizer shares GPU 0 with the scheduler's static pools;
+                # serve the request on the CPU path instead of failing it.
+                logger.warning(
+                    "Kimi-K3 GPU image preprocessing ran out of memory for "
+                    "%d images; falling back to CPU preprocessing.",
+                    len(images),
+                )
+                torch.cuda.empty_cache()
+        if pixel_values is None:
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
             # image features and grids are independent of its text.

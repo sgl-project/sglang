@@ -184,6 +184,13 @@ class TestLoadImage(CustomTestCase):
                         gpu_image_decode=False,
                     )
 
+    def test_decompression_bomb_raises_value_error(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64)).save(buf, format="PNG")
+        with mock.patch.object(Image, "MAX_IMAGE_PIXELS", 1000):
+            with self.assertRaisesRegex(ValueError, "Could not decode image"):
+                _load_image(image_bytes=buf.getvalue(), gpu_image_decode=False)
+
 
 class _FakePynvml:
     """Records the NVML index it was asked for, so a test can tell which
