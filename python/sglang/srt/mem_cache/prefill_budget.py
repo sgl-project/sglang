@@ -173,8 +173,8 @@ class PrefillBudget:
             chunk_limit,
             available_tokens,
         )
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        # Park the continuation rather than take running decodes' headroom.
+        return available if available > 0 else None
 
     def fit_chunk(
         self,
