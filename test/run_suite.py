@@ -475,6 +475,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fork_worker_preload=args.fork_worker_preload,
         timeout_overrides=dict(args.timeout_override),
     )
 
@@ -605,6 +606,15 @@ def main():
         help=(
             "Preload common modules, then run this many files in isolated fork "
             "children (default: 1, preserving one exec per file)."
+        ),
+    )
+    parser.add_argument(
+        "--fork-worker-preload",
+        nargs="*",
+        default=[],
+        help=(
+            "Extra modules the fork worker imports before forking, on top of "
+            "the common numpy/torch/triton stack."
         ),
     )
     args = parser.parse_args()
