@@ -328,6 +328,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
     def test_diff_generator_runs_explicit_warmup_through_scheduler_client(self):
         generator = object.__new__(DiffGenerator)
+        generator.local_scheduler_process = None
         server_args = MagicMock()
         server_args.warmup_mode = "request"
         server_args.warmup_resolutions = ["832x480"]
