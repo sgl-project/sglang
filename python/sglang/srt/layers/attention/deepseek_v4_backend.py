@@ -1073,6 +1073,10 @@ class DSV4Metadata:
     q_pad_buffer: Optional[torch.Tensor] = None
     # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
     q_pad_captured: bool = False
+    # The same scheme for FlashMLA MegaAttention's packed query (pack_query),
+    # whose real heads land on q_pad_buffer's padding.
+    q_mega_pad_buffer: Optional[torch.Tensor] = None
+    q_mega_pad_captured: bool = False
 
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
@@ -1378,6 +1382,8 @@ class DeepseekV4AttnBackend(
         self.builds_verify_metadata_early = False
         # Ids of the captured verify metadata built that way; the bucket keeps them alive.
         self._early_verify_metadata_ids: set = set()
+        # The last metadata a captured graph keeps; see _share_q_mega_pad_buffer.
+        self._last_kept_metadata: Optional[DSV4Metadata] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -2116,6 +2122,10 @@ class DeepseekV4AttnBackend(
                 )
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
+        if tail_metadata.q_mega_pad_buffer is None:
+            # The late layers run over a subset of this forward's rows,
+            # so they reuse its MegaAttention packed-query buffer.
+            tail_metadata.q_mega_pad_buffer = self.forward_metadata.q_mega_pad_buffer
         tail_core = tail_metadata.core_attn_metadata
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
@@ -2637,6 +2647,7 @@ class DeepseekV4AttnBackend(
             metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
             bucket_metadata[graph_key] = metadata
             self._early_verify_metadata_ids.add(id(metadata))
+            self._share_q_mega_pad_buffer(metadata)
             self.forward_metadata = metadata
             return
         # copy_ assigns swa_out_cache_loc; the verify graphs read the captured tensor.
@@ -3187,6 +3198,7 @@ class DeepseekV4AttnBackend(
         )
         if self.low_ratios == (1, 2):
             self._share_bcg_low_ratio_index_buffers(self.forward_metadata.core_metadata)
+        self._share_q_mega_pad_buffer(self.forward_metadata)
         self.forward_metadata.prefill_graph_tail = with_tail
         self.tail_forward_metadata = (
             self._prefill_graph_tail_metadata(forward_batch, max_seq_len)
@@ -3239,6 +3251,20 @@ class DeepseekV4AttnBackend(
                 if not retained or retained[0].shape[0] < value.shape[0]:
                     retained.insert(0, value)
                 setattr(core, name, retained[0][: value.shape[0]])
+
+    def _share_q_mega_pad_buffer(self, metadata: DSV4Metadata) -> None:
+        # Kept graphs replay one at a time and never write the padding,
+        # so they share one buffer.
+        if self._last_kept_metadata is not None:
+            metadata.q_mega_pad_buffer = self._last_kept_metadata.q_mega_pad_buffer
+        self._last_kept_metadata = metadata
+
+    def release_q_mega_pad_buffer(self) -> None:
+        # Eager metadata outlives its forward;
+        # drop its buffer unless a graph captured it.
+        for metadata in (self.forward_metadata, self.tail_forward_metadata):
+            if isinstance(metadata, DSV4Metadata) and not metadata.q_mega_pad_captured:
+                metadata.q_mega_pad_buffer = None
 
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config

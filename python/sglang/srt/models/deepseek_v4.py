@@ -776,6 +776,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
+        DSV4Metadata,
         LateLayerTail,
     )
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
@@ -1603,6 +1604,26 @@ class MQALayer(MqaAttentionBase):
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
         )
 
+    def _zero_packed_q(
+        self, q: torch.Tensor, kernel_num_heads: int, meta: DSV4Metadata
+    ) -> torch.Tensor:
+        # _zero_padded_q's scheme, on the metadata's own packed-query buffer.
+        buf = meta.q_mega_pad_buffer
+        if (
+            buf is None
+            or buf.shape[0] < q.shape[0]
+            or buf.shape[1:] != (kernel_num_heads, self.head_dim)
+            or buf.dtype != q.dtype
+        ):
+            assert not meta.q_mega_pad_captured, (
+                "the packed query buffer grew after a CUDA graph captured it"
+            )
+            buf = q.new_zeros(q.shape[0], kernel_num_heads, self.head_dim)
+            meta.q_mega_pad_buffer = buf
+        if torch.cuda.is_current_stream_capturing():
+            meta.q_mega_pad_captured = True
+        return buf[: q.shape[0]]
+
     def _forward_mega(
         self,
         q: torch.Tensor,
@@ -1611,12 +1632,19 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
     ) -> torch.Tensor:
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
 
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
-            q = pack_query(q, kernel_num_heads)
+            # Tail graphs keep the eager tail metadata, so they pack into fresh zeros.
+            out = None
+            if not in_replay_tail_graph():
+                meta = attn_backend.forward_metadata
+                assert isinstance(meta, DSV4Metadata)
+                out = self._zero_packed_q(q, kernel_num_heads, meta)
+            q = pack_query(q, kernel_num_heads, out=out)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             rows = q.shape[0]
             if self._mega_mxfp8_output(rows):
@@ -3744,8 +3772,9 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
-    # Class-level default for instances built without running __init__.
+    # Class-level defaults for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -3905,6 +3934,10 @@ class DeepseekV4Model(nn.Module):
             and not getattr(config, "language_model_only", False)
         )
         self.decoder_replay_tail = DecoderReplayTail.maybe_create(self)
+        # The condition under which the CUDA dsv4 backend is DeepseekV4MegaAttnBackend.
+        self.use_mega_attention = (
+            _is_cuda and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4412,6 +4445,16 @@ class DeepseekV4Model(nn.Module):
                 )
         finally:
             residual_batch.clear(forward_batch)
+            # Drop this forward's packed-query buffer unless a CUDA graph captured it;
+            # a graph's warmup leaves it for the capture after.
+            if self.use_mega_attention and not get_is_capture_mode():
+                from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+                    DeepseekV4MegaAttnBackend,
+                )
+
+                backend = get_attn_backend()
+                assert isinstance(backend, DeepseekV4MegaAttnBackend), type(backend)
+                backend.release_q_mega_pad_buffer()
 
     @torch.no_grad()
     def _forward_impl(
