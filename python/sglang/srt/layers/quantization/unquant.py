@@ -79,11 +79,51 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
 
+if _is_gfx95:
+    from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        prepare_tiled_weight,
+        rowmajor_gemm,
+        rowmajor_gemm_applies,
+        tiled_gemm,
+        tiled_gemm_applies,
+    )
+    from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
+        quantize_weight as quantize_fp8w_weight,
+    )
+
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
 _A16W16_TRITON_NARROW_K = 512
 _A16W16_TRITON_NARROW_K_MAX_M = 512
+
+# Unquantized GEMM shapes a model opts into on gfx950 before its weights load
+# (the ROCm Muse Spark model registers its attention O projection and its DFlash
+# draft's MLP; see register_gfx950_unquantized_gemm_shapes):
+# * weight shapes (N, K) whose 17..64-row GEMMs run from a tile-contiguous copy
+#   made in process_weights_after_loading (SGLANG_MUSE_DENSE_TILED);
+# * weight shapes (N, K) whose tuned 17..128-row GEMMs read the stored weight
+#   through the same split-K kernel (row-major, no copy; same switch);
+# * weight shapes (N, K) that also keep a per-channel FP8 copy for the FP8 small-M
+#   GEMM a model calls itself with pre-quantized activations (SGLANG_MUSE_DENSE_FP8);
+# * exact (M, N, K) GEMMs routed to the aiter Triton a16w16 kernel (wide K, where
+#   the tuned table's pick for the padded M is slower).
+_gfx950_tiled_weight_shapes: set = set()
+_gfx950_rowmajor_weight_shapes: set = set()
+_gfx950_fp8w_weight_shapes: set = set()
+_gfx950_triton_a16w16_shapes: set = set()
+
+
+def register_gfx950_unquantized_gemm_shapes(
+    *, tiled_weights=(), rowmajor_weights=(), fp8_weights=(), triton_a16w16=()
+) -> None:
+    """Opt (N, K) weight shapes into the tiled or row-major small-M GEMM and exact
+    (M, N, K) shapes into the aiter Triton a16w16 GEMM for every unquantized linear
+    layer loaded afterwards in this process. No effect off gfx950."""
+    _gfx950_tiled_weight_shapes.update(tuple(s) for s in tiled_weights)
+    _gfx950_rowmajor_weight_shapes.update(tuple(s) for s in rowmajor_weights)
+    _gfx950_fp8w_weight_shapes.update(tuple(s) for s in fp8_weights)
+    _gfx950_triton_a16w16_shapes.update(tuple(s) for s in triton_a16w16)
 
 
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -103,8 +143,10 @@ def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.shape[1] == k
-        and 0 < k <= _A16W16_TRITON_MAX_K
-        and 0 < x.shape[0] <= max_m
+        and (
+            (0 < k <= _A16W16_TRITON_MAX_K and 0 < x.shape[0] <= max_m)
+            or (x.shape[0], weight.shape[0], k) in _gfx950_triton_a16w16_shapes
+        )
         and weight.shape[0] > 0
         and x.is_contiguous()
         and weight.is_contiguous()
@@ -577,6 +619,30 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if (
+            _is_gfx95
+            and _gfx950_tiled_weight_shapes
+            and envs.SGLANG_MUSE_DENSE_TILED.get()
+            and type(layer.weight.data) is torch.Tensor
+            and tuple(layer.weight.shape) in _gfx950_tiled_weight_shapes
+        ):
+            # Remade on every weight load, from the loaded values.
+            layer.small_m_tiled_weight = prepare_tiled_weight(layer.weight.data)
+        layer.small_m_rowmajor = (
+            _is_gfx95
+            and envs.SGLANG_MUSE_DENSE_TILED.get()
+            and type(layer.weight.data) is torch.Tensor
+            and tuple(layer.weight.shape) in _gfx950_rowmajor_weight_shapes
+        )
+        # FP8 copy (+ per-channel scales) beside the BF16 weight; remade on every weight load.
+        layer.small_m_fp8_weight = (
+            quantize_fp8w_weight(layer.weight.data)
+            if _is_gfx95
+            and envs.SGLANG_MUSE_DENSE_FP8.get()
+            and type(layer.weight.data) is torch.Tensor
+            and tuple(layer.weight.shape) in _gfx950_fp8w_weight_shapes
+            else None
+        )
 
     def apply(
         self,
@@ -584,6 +650,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            getattr(layer, "small_m_rowmajor", False)
+            and bias is None
+            and rowmajor_gemm_applies(x, layer.weight)
+        ):
+            return rowmajor_gemm(x, layer.weight)
+        tiled = getattr(layer, "small_m_tiled_weight", None)
+        if tiled is not None and bias is None and tiled_gemm_applies(x, tiled):
+            return tiled_gemm(x, tiled, *layer.weight.shape)
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

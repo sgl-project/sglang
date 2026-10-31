@@ -1861,42 +1861,46 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
-        if (
+        try_verify = (
             verify_fwd is not None
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
-            and verify_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous(),
-                v.contiguous(),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.kv_layers.read(layer.layer_id).key(),
-                self.kv_layers.read(layer.layer_id).value(),
-                self.forward_metadata.qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.forward_metadata.custom_mask,
-                causal,
-                self.forward_metadata.mask_indptr,
-                self.forward_metadata.max_extend_len,
-                k_descale,
-                v_descale,
-                layer.scaling,
-                logit_cap=logits_soft_cap,
-                sliding_window_size=sliding_window_size,
-                sinks=sinks,
-                window_kv_offsets=window_kv_offsets,
-                xai_temperature_len=layer.xai_temperature_len,
-                max_bs=self.req_to_token_pool.size,
-            )
+        )
+        # One contiguous copy of the K/V views for both the verify try and the extend fallback (a declined verify
+        # used to copy them twice per layer).
+        if try_verify or self.dllm_attention is None:
+            k_contig, v_contig = k.contiguous(), v.contiguous()
+        if try_verify and verify_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k_contig,
+            v_contig,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            self.forward_metadata.custom_mask,
+            causal,
+            self.forward_metadata.mask_indptr,
+            self.forward_metadata.max_extend_len,
+            k_descale,
+            v_descale,
+            layer.scaling,
+            logit_cap=logits_soft_cap,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            window_kv_offsets=window_kv_offsets,
+            xai_temperature_len=layer.xai_temperature_len,
+            max_bs=self.req_to_token_pool.size,
         ):
             return o
 
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous() if self.dllm_attention is None else k,
-            v.contiguous() if self.dllm_attention is None else v,
+            k_contig if self.dllm_attention is None else k,
+            v_contig if self.dllm_attention is None else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.kv_layers.read(layer.layer_id).key(),
             self.kv_layers.read(layer.layer_id).value(),

@@ -296,7 +296,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -589,3 +589,40 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "bf16_splitk_gemm",
+        "bf16_splitk_gemm_partials",
+        "BF16 small-M split-K GEMM partials in FP32",
+    ),
+    (
+        "bf16_tiled_small_m_gemm",
+        "tiled_gemm",
+        "BF16 17..64-row GEMM from a tile-contiguous weight copy",
+    ),
+    ("router_gemm_fp32", "router_gemv_fp32", "bf16 x fp32 router logits GEMV, M <= 64"),
+    (
+        "router_gemm_fp32",
+        "router_gemm_tuned",
+        "bf16 x fp32 router logits, tuned split-K at verify widths",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual",
+        "MoE unpooler GEMM + boundary norms + gated residual",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc

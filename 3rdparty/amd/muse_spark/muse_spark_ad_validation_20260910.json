@@ -1,0 +1,82 @@
+{
+  "date": "2026-09-10",
+  "container": "jacky-v0.5.19-rocm720-mi35x-muse-spark-day0-test",
+  "model": "/data/Muse-Spark-1.2-820B-A42B-MXFP4-amd",
+  "protocol": {
+    "input_len": 8192,
+    "output_len": 1024,
+    "random_range_ratio": 0.8,
+    "ignore_eos": true,
+    "warmups_per_concurrency_slot": 4,
+    "measured_requests_per_concurrency_slot": 4
+  },
+  "profiles": {
+    "A": {
+      "revision": "dadeda4",
+      "description": "Quark MXFP4, Triton MoE, Triton attention",
+      "smoke": "passed"
+    },
+    "D": {
+      "revision": "ef32fd0",
+      "description": "kernel fusion, FlyDSL MoE, Plan B aiter 3D attention",
+      "smoke": "passed"
+    }
+  },
+  "points": {
+    "4": {
+      "A": {
+        "completed": 16,
+        "output_throughput": 198.73945151343835,
+        "median_tpot_ms": 18.58116078917958,
+        "median_ttft_ms": 559.9337003659457,
+        "median_e2el_ms": 18027.585143921897
+      },
+      "D": {
+        "completed": 16,
+        "output_throughput": 304.1103396430233,
+        "median_tpot_ms": 12.142144566094622,
+        "median_ttft_ms": 399.2268959991634,
+        "median_e2el_ms": 11700.960945570841
+      },
+      "D_vs_A_output_throughput_pct": 53.019613029605225,
+      "D_vs_A_median_tpot_pct": -34.653465927890835
+    },
+    "8": {
+      "A": {
+        "completed": 32,
+        "output_throughput": 339.44749240199314,
+        "median_tpot_ms": 21.65081897246711,
+        "median_ttft_ms": 532.4896115344018,
+        "median_e2el_ms": 20987.296590348706
+      },
+      "D": {
+        "completed": 32,
+        "output_throughput": 475.6754210679239,
+        "median_tpot_ms": 15.617397211090884,
+        "median_ttft_ms": 389.9611812084913,
+        "median_e2el_ms": 15151.626453036442
+      },
+      "D_vs_A_output_throughput_pct": 40.13225365194386,
+      "D_vs_A_median_tpot_pct": -27.866944751830413
+    },
+    "16": {
+      "A": {
+        "completed": 64,
+        "output_throughput": 512.5594161285752,
+        "median_tpot_ms": 28.90447076351612,
+        "median_ttft_ms": 549.7945018578321,
+        "median_e2el_ms": 27576.47306076251
+      },
+      "D": {
+        "completed": 64,
+        "output_throughput": 713.8007300030899,
+        "median_tpot_ms": 20.779139020481843,
+        "median_ttft_ms": 398.69353943504393,
+        "median_e2el_ms": 19858.82470314391
+      },
+      "D_vs_A_output_throughput_pct": 39.26204602668611,
+      "D_vs_A_median_tpot_pct": -28.110986046111098
+    }
+  },
+  "status": "passed"
+}
