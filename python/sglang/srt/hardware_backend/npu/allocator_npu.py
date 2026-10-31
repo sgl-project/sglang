@@ -41,20 +41,18 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         if num_new_pages is None:
-            num_new_pages_tensor = (
-                (seq_lens + self.roundup) // self.page_size
-                - (prefix_lens + self.roundup) // self.page_size
-            ).sum()
-            num_new_pages_item = num_new_pages_tensor.item()
-        else:
-            num_new_pages_item = num_new_pages
-        if num_new_pages_item > len(self.free_pages):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+        if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
 
-        if num_new_pages_item > len(self.free_pages):
+        if num_new_pages > len(self.free_pages):
             return None
 
-        if num_new_pages_item < 200:
+        if num_new_pages < 200:
             from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
 
             out_indices = torch.empty(
@@ -94,7 +92,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages_item:]
+        self.free_pages = self.free_pages[num_new_pages:]
         return out_indices.int()
 
     def alloc_decode(
