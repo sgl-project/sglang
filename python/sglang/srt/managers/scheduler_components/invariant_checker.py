@@ -70,8 +70,7 @@ class SchedulerInvariantChecker:
     # Under PP, the micro-batches' running batches and step batches.
     get_pp_running_mbs: Callable = field(default=lambda: ())
     get_pp_mbs: Callable = field(default=lambda: ())
-    # Whether a launched prefill step's requests are running; when not, the
-    # extend step batches hold no running request.
+    # When False, extend step batches hold no running request.
     prefill_launch_starts_running: Callable = field(default=lambda: True)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0

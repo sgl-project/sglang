@@ -1337,7 +1337,6 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # The requests in the running state, kept at their state transitions
         self.running_reqs = RunningReqs()
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -4597,10 +4596,9 @@ class Scheduler(
         ]
 
     def _prefill_launch_starts_running(self) -> bool:
-        """Whether launching a request's last prefill chunk starts it running.
-        PD prefill hands it to the KV transfer, a PD decode request starts at the
-        prebuilt merge, a HiSparse one when its staging is merged, and a dLLM one
-        never runs."""
+        """Whether launching a request's last prefill chunk starts it running: not
+        under PD (KV transfer, or the prebuilt merge), HiSparse (after staging) or
+        dLLM (never)."""
         return (
             self.disaggregation_mode == DisaggregationMode.NULL
             and self.dllm_config is None
@@ -4608,8 +4606,7 @@ class Scheduler(
         )
 
     def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
-        """A launched extend step starts running each request whose last prefill
-        chunk it runs; its mixed decode rows are running already."""
+        """Launching a request's last prefill chunk starts it running."""
         if self._prefill_launch_starts_running() and batch.forward_mode.is_extend():
             self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
 
@@ -6091,7 +6088,7 @@ class Scheduler(
                 offload_kv=False,
             )
         self.running_batch.reqs = []
-        # Under PP only this micro-batch's requests are retracted; the others stay.
+        # Under PP the other micro-batches keep running.
         self.running_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
