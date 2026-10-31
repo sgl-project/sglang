@@ -52,7 +52,7 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 logger = init_logger(__name__)
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
-# DP they must reach every replica rather than one.
+# DP they reach every replica unless a fatal device error aborts the fan-out.
 _CONTROL_REQ_TYPES = (
     SetLoraReq,
     MergeLoraWeightsReq,
@@ -139,13 +139,21 @@ def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int
     return next(counter) % dp_size
 
 
+def _is_fatal_reply(result: Any) -> bool:
+    return (
+        isinstance(result, OutputBatch)
+        and result.error is not None
+        and is_unrecoverable_device_error(result.error)
+    )
+
+
 def _merge_fanout_results(results: list[Any]) -> Any:
     """Prefer fatal device errors, then the first error, over successful replies."""
     first_error = None
     for result in results:
+        if _is_fatal_reply(result):
+            return result
         if isinstance(result, OutputBatch) and result.error:
-            if is_unrecoverable_device_error(result.error):
-                return result
             if first_error is None:
                 first_error = result
     return first_error if first_error is not None else results[0]
@@ -258,20 +266,11 @@ class SchedulerClient:
         )
         if isinstance(batch, _CONTROL_REQ_TYPES):
             results = []
-            try:
-                for ep in endpoints:
-                    results.append(
-                        self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
-                    )
-            except Exception:
-                # A later transport failure must not hide a fatal reply.
-                if not any(
-                    isinstance(result, OutputBatch)
-                    and result.error
-                    and is_unrecoverable_device_error(result.error)
-                    for result in results
-                ):
-                    raise
+            for ep in endpoints:
+                reply = self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
+                results.append(reply)
+                if _is_fatal_reply(reply):
+                    break
             output_batch = _merge_fanout_results(results)
         else:
             if replica is None:
@@ -365,20 +364,12 @@ class AsyncSchedulerClient:
 
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
-            # replica state (weights, LoRA, memory) must change everywhere
             results = []
-            try:
-                for ep in endpoints:
-                    results.append(await self._forward_one(ep, batch, timeout_ms))
-            except Exception:
-                # A later transport failure must not hide a fatal reply.
-                if not any(
-                    isinstance(result, OutputBatch)
-                    and result.error
-                    and is_unrecoverable_device_error(result.error)
-                    for result in results
-                ):
-                    raise
+            for ep in endpoints:
+                reply = await self._forward_one(ep, batch, timeout_ms)
+                results.append(reply)
+                if _is_fatal_reply(reply):
+                    break
             output_batch = _merge_fanout_results(results)
         else:
             if replica is None:

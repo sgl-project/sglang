@@ -205,7 +205,8 @@ def test_fatal_lora_fanout_error_rejects_later_calls(
     generator, client = generator
     scheduler = SchedulerClient()
     scheduler.server_args = SimpleNamespace(
-        scheduler_endpoints=["tcp://replica-0", "tcp://replica-1"]
+        scheduler_endpoints=["tcp://replica-0", "tcp://replica-1"],
+        scheduler_rpc_timeout=None,
     )
     scheduler.request_logger = Mock()
     replies = [
@@ -227,9 +228,45 @@ def test_fatal_lora_fanout_error_rejects_later_calls(
     with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
         generator.generate({"prompt": "later"})
 
-    assert scheduler._forward_one.call_count == 2
+    assert scheduler._forward_one.call_count == (1 if fatal_first else 2)
     assert client.forward.call_count == 1
     client.close.assert_called_once_with()
+
+
+def test_remote_lora_fatal_reply_without_deadline_invalidates_generator(generator):
+    generator, client = generator
+    scheduler = SchedulerClient()
+    scheduler.server_args = SimpleNamespace(
+        dp_size=2,
+        scheduler_endpoints=["tcp://replica-0", "tcp://replica-1"],
+        scheduler_rpc_timeout=None,
+    )
+    scheduler.request_logger = Mock()
+
+    def reply(endpoint, request, timeout_ms):
+        assert timeout_ms is None
+        if endpoint == "tcp://replica-1":
+            pytest.fail("A fatal reply must not be held behind another replica's RPC")
+        return dg.OutputBatch(error=_DEVICE_ERROR)
+
+    scheduler._forward_one = Mock(side_effect=reply)
+    client.forward.side_effect = scheduler.forward
+    assert generator.local_scheduler_process is None
+
+    with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
+        generator.set_lora("adapter")
+    for operation in (
+        lambda: generator.set_lora("later"),
+        lambda: generator.generate({"prompt": "later"}),
+    ):
+        with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
+            operation()
+
+    assert generator._runtime_error == _DEVICE_ERROR
+    scheduler._forward_one.assert_called_once()
+    client.forward.assert_called_once()
+    client.close.assert_called_once_with()
+    assert not generator.owns_scheduler_client
 
 
 @pytest.mark.parametrize("mapping_raises", [False, True])
