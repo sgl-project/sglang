@@ -32,6 +32,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
     # Single-partition releases name their partition; None infers it from
     # --model-variant or the model path.
     release_partition: ClassVar[str | None] = None
+    # per-model canvas area cap; None keeps H3's 1344x768 cap
+    canvas_max_pixels: ClassVar[int | None] = None
 
     height: int = 512
     width: int = 896
@@ -328,6 +330,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                         if isinstance(self.seed, int)
                         else None
                     ),
+                    max_pixels=self.canvas_max_pixels,
                 )
             )
         elif (
@@ -436,8 +439,70 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                 )
 
 
+@dataclass
+class OpenH3RegenerateSamplingParams(MiniMaxH3SamplingParams):
+    """Open-H3-Regenerate-2K: refine a draft video at up to 2560x1440.
+
+    The draft (``source_video``) is encoded at its own ``source_short_edge``
+    H3 canvas, latent-upscaled to the ``target`` canvas, re-noised to the
+    first sigma and refined with Euler steps (CFG off). The request is a
+    t2va request: ``prompt`` describes the draft, ``target`` sets the output
+    canvas and duration.
+    """
+
+    canvas_max_pixels: ClassVar[int | None] = 2560 * 1440
+    num_inference_steps: int = 3
+    quality: str = "lossless"
+    task: str | None = "t2va"
+    source_video: str | None = None
+    source_short_edge: int = 768
+    # None keeps the release schedule (3 steps from 0.909375, or 2 from 0.7);
+    # lower values keep more of the draft (faces, identity)
+    start_sigma: float | None = None
+    # hold the draft's soundtrack clean; False conditions on silence instead
+    keep_source_audio: bool = True
+
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        return super().video_request_extra_fields() | {
+            "source_video",
+            "source_short_edge",
+            "start_sigma",
+            "keep_source_audio",
+        }
+
+    def __post_init__(self) -> None:
+        if self.target is None:
+            self.target = {
+                "short_edge": 1440,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 5.0,
+            }
+        super().__post_init__()
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.task is not None and self.task.strip().lower() != "t2va":
+            raise ValueError(
+                "Open-H3-Regenerate-2K refines a draft as a t2va request; "
+                f"got task={self.task!r}"
+            )
+        if self.start_sigma is None and self.num_inference_steps not in (2, 3):
+            raise ValueError(
+                "Open-H3-Regenerate-2K ships 2- and 3-step schedules; pass "
+                f"start_sigma for num_inference_steps={self.num_inference_steps}"
+            )
+        if self.start_sigma is not None and not 0.0 < float(self.start_sigma) < 1.0:
+            raise ValueError(f"start_sigma must be in (0, 1), got {self.start_sigma}")
+        if self.source_short_edge not in (576, 768):
+            raise ValueError(
+                f"source_short_edge must be 576 or 768, got {self.source_short_edge}"
+            )
+
+
 __all__ = [
     "FastH3OmniSamplingParams",
+    "OpenH3RegenerateSamplingParams",
     "FastH3SamplingParams",
     "MiniMaxH3SamplingParams",
     "PikaH3FlexSamplingParams",
