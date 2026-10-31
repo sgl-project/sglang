@@ -70,6 +70,35 @@ This section explains how to configure the request tracing and export the trace 
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
+## Cache checkpoint elapsed time
+
+With request tracing enabled at level 1 or higher, `cache_checkpoint_cpu` spans
+measure elapsed wall time around calls to the prefix cache's `checkpoint` method
+through the scheduler's
+`checkpoint_kv_cache` and `release_kv_cache` helpers. Direct backend calls outside
+these helpers are not instrumented by this stage.
+The span belongs to the request trace and carries:
+
+- `cache.checkpoint.phase`: `running` for an ongoing request, or `release` when
+  publishing a request's cache before releasing its KV row.
+- `cache.checkpoint.up_to`: the requested token boundary, not a count of newly
+  copied or retained tokens.
+- `cache.checkpoint.succeeded`: whether the checkpoint call returned normally.
+
+The interval is not CPU resource consumption: it includes insertion work and any
+blocking waits performed by
+the selected cache backend. Timestamps are captured around the backend call
+before creating or exporting the span, so tracing setup and export time are not
+included in this interval. Tracing can still affect end-to-end latency; the
+span does not measure that observer overhead. A tracing failure does not skip
+the cache call or replace its exception. The interval does not wait for an
+asynchronous copy just to
+measure it, and it is not GPU DMA time or proof of Host/Store recovery. A backend
+that drains shared work may include waits for other requests in this interval.
+Compare it with the request's prefill and output timeline; do not add overlapping
+CPU and GPU intervals or interpret this span alone as the end-to-end cost of
+enabling cache writes. Skipped cache insertions do not create checkpoint spans.
+
 ## Async Tracing (Reducing Performance Overhead)
 
 When batch sizes are large, synchronous OTel span creation can degrade inference throughput due to thread-safe locking and background export threads. Async tracing moves all span creation to a dedicated exporter process via ZMQ, keeping the scheduler and tokenizer hot paths free of OTel overhead.
