@@ -11,36 +11,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Dynamic adapter updates must match an eviction-free startup reference
+(ROUGE-L >= 0.9 per prompt). Reusing an all-module slot for a q,v-only adapter
+must clear stale weights; reusing a name must serve its current adapter.
+/v1/models must list exactly what is loaded.
+"""
 
 import json
 import multiprocessing as mp
 import unittest
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import requests
-import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     calculate_rouge_l,
-    is_in_ci,
     popen_launch_server,
 )
 
 register_cuda_ci(
-    est_time=487,
+    est_time=250,
     stage="base-b",
     runner_config="1-gpu-large",
 )
 register_amd_ci(
-    est_time=730,
+    est_time=380,
     suite="stage-b-test-1-gpu-large-amd",
 )
 
@@ -53,25 +55,38 @@ PROMPTS = [
 ]
 
 MEM_FRACTION_STATIC = 0.8
+ROUGE_L_TOL = 0.9
+
+BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+# target_modules = q, k, v, o, gate, up, down
+SQL_ADAPTER = "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+TOPIC_ADAPTER = "nvidia/llama-3.1-nemoguard-8b-topic-control"
+OCR_ADAPTER = "pbevan11/llama-3.1-8b-ocr-correction"
+# target_modules = q, v: loaded into a slot an all-module adapter used, the
+# untouched k/o/gate/up/down planes must be zeroed, not inherited.
+QV_ADAPTER = "faridlazuarda/valadapt-llama-3.1-8B-it-chinese"
+SHARED_NAME = "shared-name"
 
 
 class OperationType(Enum):
     LOAD = "load"
     UNLOAD = "unload"
     FORWARD = "forward"
+    LIST_MODELS = "list_models"
 
 
 @dataclass
 class Operation:
-    # Operation type, can be LOAD, UNLOAD, FORWARD
     type: OperationType
-    # Data associated with the operation. Exact type varies depending on the operation
-    data: Optional[Any]
-    # If the operation is expected to fail, this is the error message to expect
+    # LOAD: adapter path or {"lora_name", "lora_path", "pinned"}; UNLOAD: name;
+    # FORWARD: [(prompt, adapter name or None)].
+    data: Optional[Any] = None
+    # If the operation is expected to fail, the error message to expect.
     expected_error: Optional[str] = None
-    # Because the logic for implicitly evicting LoRA adapters can be complicated, we explicitly
-    # pass in LoRA adapters that should be implicitly evicted here
-    expected_implicit_evictions: Optional[set[str]] = None
+    # FORWARD only: index (among the recorded forwards) of an earlier forward
+    # whose outputs this one must reproduce; checked in the dynamic pass and
+    # excluded from the static comparison.
+    same_output_as: Optional[int] = None
 
 
 @dataclass
@@ -81,808 +96,102 @@ class TestCase:
     max_loras_per_batch: int
     all_adapters: List[str]
     op_sequence: List[Operation]
-    initial_adapters: Optional[List[str]] = None
+    initial_adapters: Optional[List[Union[str, dict]]] = None
     enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[List] = None
     max_new_tokens: int = 32
-    max_loaded_loras: Optional[int] = None
 
 
-def create_batch_data(adapters: Union[str, list]) -> List[tuple[str, str]]:
+def create_batch_data(adapters: Union[str, list, None]) -> List[tuple]:
     if not isinstance(adapters, list):
         adapters = [adapters]
     return [(prompt, adapter) for prompt in PROMPTS for adapter in adapters]
 
 
-BASIC_TESTS = [
-    TestCase(
-        description="dynamic lora update with initial lora_paths",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=3,
-        all_adapters=[
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",
-            "pbevan11/llama-3.1-8b-ocr-correction",
-        ],
-        initial_adapters=[
-            # Testing 3 supported lora-path formats.
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "nvidia/llama-3.1-nemoguard-8b-topic-control=nvidia/llama-3.1-nemoguard-8b-topic-control",
-            {
-                "lora_name": "pbevan11/llama-3.1-8b-ocr-correction",
-                "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
-                "pinned": False,
-            },
-        ],
-        op_sequence=[
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    None,
-                ),
-            ),
-        ],
-    ),
-    TestCase(
-        description="dynamic lora update without initial lora_paths",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        enable_lora=True,
-        max_lora_rank=256,
-        lora_target_modules=["all"],
-        max_loras_per_batch=4,
-        all_adapters=[
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",
-            "pbevan11/llama-3.1-8b-ocr-correction",
-        ],
-        op_sequence=[
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        None,
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        None,
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        None,
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(None),
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_error="already loaded",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-]
-TARGET_MODULE_TESTS = [
-    TestCase(
-        description="Test explicitly specified lora-target-modules.",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=3,
-        lora_target_modules=["all"],
-        max_lora_rank=64,
-        all_adapters=[
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",  # target_modules = q, k, v, o, gate, up, down
-            "algoprog/fact-generation-llama-3.1-8b-instruct-lora",  # target_modules = q, k, v, o, gate
-        ],
-        initial_adapters=["algoprog/fact-generation-llama-3.1-8b-instruct-lora"],
-        op_sequence=[
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-    TestCase(
-        description="Test inferred lora-target-modules - start with larger adapter",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=3,
-        max_lora_rank=64,
-        all_adapters=[
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",  # target_modules = q, k, v, o, gate, up, down
-            "algoprog/fact-generation-llama-3.1-8b-instruct-lora",  # target_modules = q, k, v, o, gate
-        ],
-        initial_adapters=["nvidia/llama-3.1-nemoguard-8b-topic-control"],
-        op_sequence=[
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
-                ),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-    TestCase(
-        description="Test inferred lora-target-modules - start with smaller adapter",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=3,
-        max_lora_rank=64,
-        all_adapters=[
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",  # target_modules = q, k, v, o, gate, up, down
-            "algoprog/fact-generation-llama-3.1-8b-instruct-lora",  # target_modules = q, k, v, o, gate
-        ],
-        initial_adapters=["algoprog/fact-generation-llama-3.1-8b-instruct-lora"],
-        op_sequence=[
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-                expected_error="incompatible",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-]
-MAX_LORA_RANK_TESTS = [
-    TestCase(
-        description="Test explicitly specified max-lora-rank.",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=3,
-        max_lora_rank=32,
-        all_adapters=[
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",  # r = 4
-            "pbevan11/llama-3.1-8b-ocr-correction",  # r = 32
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",  # r = 256
-        ],
-        initial_adapters=["nvidia/llama-3.1-nemoguard-8b-topic-control"],
-        op_sequence=[
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("nvidia/llama-3.1-nemoguard-8b-topic-control"),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        None,
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="incompatible",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                ),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-    TestCase(
-        description="test implicitly inferred max-lora-rank",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=3,
-        all_adapters=[
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",  # r = 4
-            "pbevan11/llama-3.1-8b-ocr-correction",  # r = 32
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",  # r = 256
-        ],
-        initial_adapters=["pbevan11/llama-3.1-8b-ocr-correction"],
-        op_sequence=[
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                expected_error="incompatible",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                expected_error="never been loaded",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-]
-MAX_LOADED_LORAS_TESTS = [
-    TestCase(
-        description="Test max_loaded_loras limit as well as implicit eviction and reloading",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=2,
-        max_loaded_loras=2,
-        all_adapters=[
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",
-            "pbevan11/llama-3.1-8b-ocr-correction",
-        ],
-        initial_adapters=["philschmid/code-llama-3-1-8b-text-to-sql-lora"],
-        op_sequence=[
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_implicit_evictions={
-                    "philschmid/code-llama-3-1-8b-text-to-sql-lora"
-                },
-            ),
-            # Implicitly load "philschmid/code-llama-3-1-8b-text-to-sql-lora"
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                    ]
-                ),
-                expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            # Implicitly load "pbevan11/llama-3.1-8b-ocr-correction" and make sure that "nvidia/llama-3.1-nemoguard-8b-topic-control"
-            # isn't implicitly unloaded even though it is LRU because it is needed for this forward pass
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                    ]
-                ),
-                expected_implicit_evictions={
-                    "philschmid/code-llama-3-1-8b-text-to-sql-lora"
-                },
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                    ]
-                ),
-                expected_implicit_evictions={
-                    "pbevan11/llama-3.1-8b-ocr-correction",
-                    "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
-                },
-            ),
-        ],
-    ),
-    TestCase(
-        description="Test implicit eviction and reloading with pinned LoRA adapters",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=2,
-        max_loaded_loras=2,
-        all_adapters=[
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",
-            "pbevan11/llama-3.1-8b-ocr-correction",
-        ],
-        initial_adapters=[
-            {
-                "lora_name": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                "pinned": True,
-            }
-        ],
-        op_sequence=[
-            Operation(
-                type=OperationType.LOAD,
-                data="nvidia/llama-3.1-nemoguard-8b-topic-control",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data="pbevan11/llama-3.1-8b-ocr-correction",
-                expected_implicit_evictions={
-                    "nvidia/llama-3.1-nemoguard-8b-topic-control"
-                },
-            ),
-            # Implicitly load "nvidia/llama-3.1-nemoguard-8b-topic-control"
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                    ]
-                ),
-                expected_implicit_evictions={"pbevan11/llama-3.1-8b-ocr-correction"},
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "pbevan11/llama-3.1-8b-ocr-correction",
-                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
-                    "pinned": True,
-                },
-                expected_error="starvation",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "pbevan11/llama-3.1-8b-ocr-correction",
-                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
-                    "pinned": True,
-                },
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                        "pbevan11/llama-3.1-8b-ocr-correction",
-                    ]
-                ),
-            ),
-        ],
-    ),
-]
-EVICTION_TESTS = [
-    TestCase(
-        description="dynamic lora update with evictions",
-        base="meta-llama/Llama-3.1-8B-Instruct",
-        max_loras_per_batch=2,
-        all_adapters=[
-            "lora1=philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "lora2=nvidia/llama-3.1-nemoguard-8b-topic-control",
-            "lora3=pbevan11/llama-3.1-8b-ocr-correction",
-        ],
-        enable_lora=True,
-        max_lora_rank=256,
-        lora_target_modules=["all"],
-        op_sequence=[
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora1",
-                    "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                    "pinned": True,
-                },
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora2",
-                    "lora_path": "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                    "pinned": True,
-                },
-                expected_error="starvation",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora2",
-                    "lora_path": "nvidia/llama-3.1-nemoguard-8b-topic-control",
-                    "pinned": False,
-                },
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora3",
-                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
-                    "pinned": False,
-                },
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="lora1",
-            ),
-            Operation(
-                type=OperationType.UNLOAD,
-                data="lora3",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora3",
-                    "lora_path": "pbevan11/llama-3.1-8b-ocr-correction",
-                    "pinned": True,
-                },
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora1",
-                    "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                    "pinned": True,
-                },
-                expected_error="starvation",
-            ),
-            Operation(
-                type=OperationType.LOAD,
-                data={
-                    "lora_name": "lora1",
-                    "lora_path": "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-                    "pinned": False,
-                },
-            ),
-            # pinned: lora3
-            # unpinned: lora1, lora2
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "lora1",
-                        "lora2",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "lora1",
-                        "lora3",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "lora1",
-                        "lora2",
-                    ]
-                ),
-            ),
-            Operation(
-                type=OperationType.FORWARD,
-                data=create_batch_data(
-                    [
-                        "lora1",
-                        "lora2",
-                        None,
-                    ]
-                ),
-            ),
-        ],
-    ),
-]
+def _load(name_or_dict, expected_error=None):
+    return Operation(OperationType.LOAD, name_or_dict, expected_error)
 
-ALL_TESTS = (
-    BASIC_TESTS
-    + TARGET_MODULE_TESTS
-    + MAX_LORA_RANK_TESTS
-    + MAX_LOADED_LORAS_TESTS
-    + EVICTION_TESTS
+
+def _unload(name):
+    return Operation(OperationType.UNLOAD, name)
+
+
+def _forward(adapters, same_output_as=None):
+    return Operation(
+        OperationType.FORWARD,
+        create_batch_data(adapters),
+        same_output_as=same_output_as,
+    )
+
+
+LIST_MODELS = Operation(OperationType.LIST_MODELS)
+
+# Recorded forwards (the ones compared with the static pass) are numbered in
+# the comments; `same_output_as` refers to those numbers.
+DYNAMIC_UPDATE_CASE = TestCase(
+    description="dynamic load/unload/reload, slot reuse under pressure, name reuse",
+    base=BASE_MODEL,
+    enable_lora=True,
+    max_lora_rank=256,
+    lora_target_modules=["all"],
+    # Four adapters plus base rows over three slots: eviction by construction.
+    max_loras_per_batch=3,
+    all_adapters=[SQL_ADAPTER, TOPIC_ADAPTER, OCR_ADAPTER, QV_ADAPTER],
+    initial_adapters=[
+        # The three supported lora-path formats.
+        SQL_ADAPTER,
+        f"{TOPIC_ADAPTER}={TOPIC_ADAPTER}",
+        {"lora_name": OCR_ADAPTER, "lora_path": OCR_ADAPTER, "pinned": False},
+    ],
+    op_sequence=[
+        _load(SQL_ADAPTER, expected_error="already loaded"),
+        _unload(SQL_ADAPTER),
+        _load(SQL_ADAPTER),
+        LIST_MODELS,
+        _forward([SQL_ADAPTER, TOPIC_ADAPTER, OCR_ADAPTER]),  # 0
+        # A fourth adapter: its first forward evicts one of the three and the
+        # q,v-only weights land in a slot that held an all-module adapter.
+        _load(QV_ADAPTER),
+        _forward(QV_ADAPTER),  # 1
+        _forward(SQL_ADAPTER),  # 2: the evicted all-module adapter comes back
+        _forward([None, TOPIC_ADAPTER, OCR_ADAPTER, None]),  # 3
+        _unload(TOPIC_ADAPTER),
+        _unload(OCR_ADAPTER),
+        LIST_MODELS,
+        _forward(TOPIC_ADAPTER),  # 4: implicit reload by path
+        _forward(OCR_ADAPTER),  # 5
+        _forward(None),  # 6: base only after unloads (freed slots replayed)
+        _load(TOPIC_ADAPTER, expected_error="already loaded"),
+        # Name reuse: the same name must serve whatever adapter is behind it.
+        _unload(QV_ADAPTER),
+        _load({"lora_name": SHARED_NAME, "lora_path": QV_ADAPTER, "pinned": False}),
+        _forward(SHARED_NAME, same_output_as=1),
+        _unload(SHARED_NAME),
+        _unload(SQL_ADAPTER),
+        _load({"lora_name": SHARED_NAME, "lora_path": SQL_ADAPTER, "pinned": False}),
+        _forward(SHARED_NAME, same_output_as=2),
+        _unload(SHARED_NAME),
+        _load(SQL_ADAPTER),
+        _forward([SQL_ADAPTER, TOPIC_ADAPTER, OCR_ADAPTER, None]),  # 7
+    ],
 )
 
 
-class LoRAUpdateTestSessionMode(Enum):
-    ENGINE = "engine"
-    SERVER = "server"
-
-
-class LoRAUpdateTestSessionBase:
-    """
-    Base context manager for testing LoRA adapters.
-    """
+class LoRAUpdateServerTestSession:
+    """A standalone server with dynamic LoRA loading; tracks what is loaded."""
 
     def __init__(
         self,
         *,
-        testcase: Optional[TestCase],
+        testcase: CustomTestCase,
         model_path: str,
-        lora_paths: List[Union[str, dict]],
+        lora_paths: Optional[List[Union[str, dict]]],
         max_loras_per_batch: int,
-        max_loaded_loras: Optional[int] = None,
         max_lora_rank: Optional[int],
         enable_lora: Optional[bool] = None,
         lora_target_modules: Optional[List[str]] = None,
         lora_backend: str = "csgmv",
-        disable_cuda_graph: bool = False,
         cuda_graph_max_bs_decode: int = 4,
     ):
         self.testcase = testcase
@@ -891,217 +200,20 @@ class LoRAUpdateTestSessionBase:
         self.max_lora_rank = max_lora_rank
         self.lora_target_modules = lora_target_modules
         self.max_loras_per_batch = max_loras_per_batch
-        self.max_loaded_loras = max_loaded_loras
         self.lora_backend = lora_backend
-        self.disable_cuda_graph = disable_cuda_graph
         self.cuda_graph_max_bs_decode = cuda_graph_max_bs_decode
         self.enable_lora = enable_lora
-
-        self.expected_adapters = set()
-        if self.lora_paths:
-            for adapter in self.lora_paths:
-                if isinstance(adapter, dict):
-                    lora_name = adapter["lora_name"]
-                elif "=" in adapter:
-                    lora_name = adapter.split("=")[0]
-                else:
-                    lora_name = adapter
-                self.expected_adapters.add(lora_name)
-
-        self.handle = None  # Will be set in __enter__
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # Don't suppress exceptions by default
-        return False
-
-    def load_lora_adapter(
-        self,
-        lora_name: str,
-        lora_path: Optional[str] = None,
-        expected_error: Optional[str] = None,
-        expected_implicit_evictions: Optional[set[str]] = None,
-    ):
-        """
-        Load a LoRA adapter by name and path.
-        """
-        raise NotImplementedError("Subclasses must implement load_lora_adapter")
-
-    def unload_lora_adapter(self, lora_name: str):
-        """
-        Unload a LoRA adapter by name.
-        """
-        raise NotImplementedError("Subclasses must implement unload_lora_adapter")
-
-    def forward(
-        self,
-        prompts: List[str],
-        lora_paths: List[str],
-        max_new_tokens: int = 32,
-        expected_error: Optional[str] = None,
-        expected_implicit_evictions: Optional[set[str]] = None,
-    ):
-        """
-        Perform a batch forward pass with the current set of loaded LoRA adapters.
-        """
-        raise NotImplementedError("Subclasses must implement forward")
-
-
-class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
-    """
-    Context manager for testing LoRA adapters with in-process engine.
-    """
-
-    def __enter__(self):
-        # in-process runner
-        self.handle = SRTRunner(
-            model_path=self.model_path,
-            model_type="generation",
-            lora_paths=self.lora_paths,
-            max_lora_rank=self.max_lora_rank,
-            lora_target_modules=self.lora_target_modules,
-            lora_backend=self.lora_backend,
-            torch_dtype=torch.float16,
-            mem_fraction_static=MEM_FRACTION_STATIC,
-            max_loras_per_batch=self.max_loras_per_batch,
-            max_loaded_loras=self.max_loaded_loras,
-            disable_cuda_graph=self.disable_cuda_graph,
-            cuda_graph_max_bs_decode=self.cuda_graph_max_bs_decode,
-            enable_lora=self.enable_lora,
-            disable_radix_cache=True,
-        )
-        self.handle.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.handle is not None:
-            # delegate cleanup to SRTRunner
-            return self.handle.__exit__(exc_type, exc_val, exc_tb)
-        # don't suppress exceptions
-        return False
-
-    def load_lora_adapter(
-        self,
-        lora_name: str,
-        lora_path: Optional[str] = None,
-        expected_error: Optional[str] = None,
-        pinned: bool = False,
-        expected_implicit_evictions: Optional[set[str]] = None,
-    ):
-        """
-        Load a LoRA adapter by name and path.
-        """
-        if lora_path is None:
-            lora_path = lora_name
-
-        response = self.handle.load_lora_adapter(
-            lora_name=lora_name,
-            lora_path=lora_path,
-            pinned=pinned,
-        )
-        if expected_error:
-            self.testcase.assertFalse(
-                response.success, f"Expected failure for {lora_name}, but got success."
-            )
-            self.testcase.assertIn(
-                expected_error,
-                response.error_message,
-                f"Expected error message to contain '{expected_error}', but got '{response.error_message}'",
-            )
-            print(f"Received error as expected: {response.error_message}")
-        else:
-            self.expected_adapters.add(lora_name)
-            if expected_implicit_evictions is not None:
-                self.expected_adapters -= expected_implicit_evictions
-
-            self.testcase.assertTrue(
-                response.success,
-                f"Failed to load LoRA adapter {lora_name}: {response.error_message}",
-            )
-            loaded_adapters = set(response.loaded_adapters)
-            print(f"loaded_adapters: {loaded_adapters}")
-            self.testcase.assertEqual(
-                loaded_adapters,
-                self.expected_adapters,
-                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-            )
-
-    def unload_lora_adapter(self, lora_name: str):
-        """
-        Unload a LoRA adapter by name.
-        """
-        self.expected_adapters.remove(lora_name)
-
-        response = self.handle.unload_lora_adapter(
-            lora_name=lora_name,
-        )
-        self.testcase.assertTrue(
-            response.success,
-            f"Failed to unload LoRA adapter {lora_name}: {response.error_message}",
-        )
-        loaded_adapters = set(response.loaded_adapters)
-
-        print(f"loaded_adapters: {loaded_adapters}")
-        self.testcase.assertEqual(
-            loaded_adapters,
-            self.expected_adapters,
-            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-        )
-
-    def forward(
-        self,
-        prompts: List[str],
-        lora_paths: List[str],
-        max_new_tokens: int = 32,
-        expected_error: Optional[str] = None,
-        expected_implicit_evictions: Optional[set[str]] = None,
-    ):
-        """
-        Perform a batch forward pass with the current set of loaded LoRA adapters.
-        """
-        try:
-            response = self.handle.batch_forward(
-                prompts=prompts,
-                lora_paths=lora_paths,
-                max_new_tokens=max_new_tokens,
-            )
-        except ValueError as e:
-            if expected_error:
-                error_message = str(e)
-                self.testcase.assertIn(
-                    expected_error,
-                    error_message,
-                    f"Expected error message to contain '{expected_error}', but got '{error_message}'",
-                )
-                print(f"Received error as expected: {error_message}")
-                return error_message
-
-            raise e
-
-        self.testcase.assertEqual(
-            len(response.output_strs),
-            len(prompts),
-            f"Expected {len(prompts)} outputs, but got {len(response.output_strs)}",
-        )
-        output = response.output_strs
-        print(f"output_strs: {output}")
-
-        self.expected_adapters.update(
-            [lora_path for lora_path in lora_paths if lora_path is not None]
-        )
-
-        if expected_implicit_evictions is not None:
-            self.expected_adapters -= expected_implicit_evictions
-
-        return output
-
-
-class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
-    """
-    Context manager for testing LoRA adapters with standalone server.
-    """
+        # name -> path of every adapter the server should currently list
+        self.expected_adapters: Dict[str, str] = {}
+        for adapter in self.lora_paths or []:
+            if isinstance(adapter, dict):
+                self.expected_adapters[adapter["lora_name"]] = adapter["lora_path"]
+            elif "=" in adapter:
+                name, path = adapter.split("=", 1)
+                self.expected_adapters[name] = path
+            else:
+                self.expected_adapters[adapter] = adapter
+        self.handle = None
 
     def __enter__(self):
         other_args = [
@@ -1127,16 +239,11 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
                 if isinstance(lora_path, dict):
                     lora_path = json.dumps(lora_path)
                 other_args.append(lora_path)
-        if self.disable_cuda_graph:
-            other_args.append("--disable-cuda-graph")
         if self.max_lora_rank is not None:
             other_args.extend(["--max-lora-rank", str(self.max_lora_rank)])
         if self.lora_target_modules is not None:
             other_args.extend(["--lora-target-modules"] + self.lora_target_modules)
-        if self.max_loaded_loras is not None:
-            other_args.extend(["--max-loaded-loras", str(self.max_loaded_loras)])
 
-        # launch external server
         self.handle = popen_launch_server(
             self.model_path,
             DEFAULT_URL_FOR_TEST,
@@ -1148,8 +255,16 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.handle is not None:
             kill_process_tree(self.handle.pid)
-        # don't suppress exceptions
         return False
+
+    def _assert_loaded(self, response):
+        self.testcase.assertTrue(response.ok, response.text)
+        loaded_adapters = set(response.json()["loaded_adapters"])
+        self.testcase.assertEqual(
+            loaded_adapters,
+            set(self.expected_adapters),
+            f"Expected loaded adapters {set(self.expected_adapters)}, got {loaded_adapters}",
+        )
 
     def load_lora_adapter(
         self,
@@ -1157,80 +272,32 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
         lora_path: Optional[str] = None,
         expected_error: Optional[str] = None,
         pinned: bool = False,
-        expected_implicit_evictions: Optional[set[str]] = None,
     ):
-        """
-        Load a LoRA adapter by name and path.
-        """
         if lora_path is None:
             lora_path = lora_name
-
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/load_lora_adapter",
             json={"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned},
         )
         if expected_error:
-            self.testcase.assertEqual(
-                response.status_code,
-                400,
-                f"Expected error for {lora_name}, but got success.",
-            )
-            self.testcase.assertIn(
-                expected_error,
-                response.text,
-                f"Expected error message to contain '{expected_error}', but got '{response.text}'",
-            )
+            self.testcase.assertEqual(response.status_code, 400, response.text)
+            self.testcase.assertIn(expected_error, response.text)
             print(f"Received error as expected: {response.text}")
-        else:
-            self.expected_adapters.add(lora_name)
-            if expected_implicit_evictions is not None:
-                self.expected_adapters -= expected_implicit_evictions
-
-            self.testcase.assertTrue(
-                response.ok, f"Failed to load LoRA adapter {lora_name}: {response.text}"
-            )
-            loaded_adapters = set(response.json()["loaded_adapters"])
-            print(f"loaded_adapters: {loaded_adapters}")
-            self.testcase.assertEqual(
-                loaded_adapters,
-                self.expected_adapters,
-                f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-            )
+            return
+        self.expected_adapters[lora_name] = lora_path
+        self._assert_loaded(response)
 
     def unload_lora_adapter(self, lora_name: str):
-        """
-        Unload a LoRA adapter by name.
-        """
-        self.expected_adapters.remove(lora_name)
-
+        del self.expected_adapters[lora_name]
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
             json={"lora_name": lora_name},
         )
-
-        self.testcase.assertTrue(
-            response.ok, f"Failed to unload LoRA adapter {lora_name}: {response.text}"
-        )
-        loaded_adapters = set(response.json()["loaded_adapters"])
-
-        print(f"loaded_adapters: {loaded_adapters}")
-        self.testcase.assertEqual(
-            loaded_adapters,
-            self.expected_adapters,
-            f"Expected loaded adapters to be {self.expected_adapters}, but got {loaded_adapters}",
-        )
+        self._assert_loaded(response)
 
     def forward(
-        self,
-        prompts: List[str],
-        lora_paths: List[str],
-        max_new_tokens: int = 32,
-        expected_error: Optional[str] = None,
-        expected_implicit_evictions: Optional[set[str]] = None,
+        self, prompts: List[str], lora_paths: List[Optional[str]], max_new_tokens: int
     ):
-        """
-        Perform a batch forward pass with the current set of loaded LoRA adapters.
-        """
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={
@@ -1243,310 +310,135 @@ class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
                 },
             },
         )
-        if expected_error:
-            self.testcase.assertEqual(
-                response.status_code,
-                400,
-                f"Expected error for forward pass, but got success: {response.text}",
-            )
-            self.testcase.assertIn(
-                expected_error,
-                response.text,
-                f"Expected error message to contain '{expected_error}', but got '{response.text}'",
-            )
-            output = response.text
-            print(f"Received error as expected: {response.text}")
-            return output
-        else:
-            self.testcase.assertTrue(
-                response.ok, f"Failed to generate text: {response.text}"
-            )
-            output = [r["text"] for r in response.json()]
-            self.testcase.assertEqual(
-                len(output),
-                len(prompts),
-                f"Expected {len(prompts)} outputs, but got {len(output)}",
-            )
-            print(f"output_strs: {output}")
+        self.testcase.assertTrue(
+            response.ok, f"Failed to generate text: {response.text}"
+        )
+        output = [r["text"] for r in response.json()]
+        self.testcase.assertEqual(len(output), len(prompts))
+        print(f"output_strs: {output}")
+        # A forward on an unloaded adapter path loads it implicitly.
+        for lora_path in lora_paths:
+            if lora_path is not None:
+                self.expected_adapters.setdefault(lora_path, lora_path)
+        return output
 
-            self.expected_adapters.update(
-                [lora_path for lora_path in lora_paths if lora_path is not None]
-            )
-
-            if expected_implicit_evictions is not None:
-                self.expected_adapters -= expected_implicit_evictions
-
-            return output
-
-
-# Factory function to create the appropriate LoRA test session based on mode
-def LoRAUpdateTestSession(
-    testcase: Optional[TestCase],
-    mode: LoRAUpdateTestSessionMode,
-    **kwargs: Any,
-):
-    if mode == LoRAUpdateTestSessionMode.ENGINE:
-        return LoRAUpdateEngineTestSession(testcase=testcase, **kwargs)
-    elif mode == LoRAUpdateTestSessionMode.SERVER:
-        return LoRAUpdateServerTestSession(testcase=testcase, **kwargs)
-    else:
-        raise ValueError(f"Unrecognized mode: {mode!r}")
+    def assert_models_listing(self):
+        response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+        self.testcase.assertTrue(response.ok, response.text)
+        models = response.json()
+        self.testcase.assertEqual(models["object"], "list")
+        base = [m for m in models["data"] if not m.get("parent")]
+        adapters = {m["id"]: m for m in models["data"] if m.get("parent")}
+        self.testcase.assertEqual(len(base), 1, models)
+        self.testcase.assertIn("meta-llama", base[0]["id"].lower())
+        self.testcase.assertEqual(set(adapters), set(self.expected_adapters), models)
+        for name, path in self.expected_adapters.items():
+            self.testcase.assertEqual(adapters[name]["root"], path)
+            self.testcase.assertEqual(adapters[name]["parent"], base[0]["id"])
 
 
 class TestLoRADynamicUpdate(CustomTestCase):
-    """
-    This test case verifies that the SRT runner can dynamically load and unload LoRA adapters
-    during a sequence of operations, and that the outputs of forward passes with dynamically loaded
-    adapters match the outputs of forward passes with statically loaded adapters.
-    """
-
-    def _repeat_each(lst, n):
-        return [x for x in lst for _ in range(n)]
-
     def _run_operation_sequence(
         self,
-        mode: LoRAUpdateTestSessionMode,
-        base: str,
-        initial_adapters: List[Union[str, dict]],
+        test_case: TestCase,
+        initial_adapters,
         op_sequence: List[Operation],
         max_loras_per_batch: int,
-        max_loaded_loras: Optional[int] = None,
-        enable_lora: Optional[bool] = None,
-        max_lora_rank: Optional[int] = None,
-        lora_target_modules: Optional[List[str]] = None,
-        max_new_tokens: int = 32,
-    ) -> List[tuple]:
-        """
-        Runs a sequence of operations on the SRT runner, including loading and unloading LoRA adapters,
-        and performing forward passes with the current set of loaded adapters.
-        """
-
+    ) -> List[List[str]]:
+        """Run the operations on one server; return the recorded forward outputs."""
         forward_outputs = []
-        with LoRAUpdateTestSession(
+        with LoRAUpdateServerTestSession(
             testcase=self,
-            mode=mode,
-            model_path=base,
+            model_path=test_case.base,
             lora_paths=initial_adapters,
             max_loras_per_batch=max_loras_per_batch,
-            max_loaded_loras=max_loaded_loras,
-            max_lora_rank=max_lora_rank,
-            lora_target_modules=lora_target_modules,
-            enable_lora=enable_lora,
+            max_lora_rank=test_case.max_lora_rank,
+            lora_target_modules=test_case.lora_target_modules,
+            enable_lora=test_case.enable_lora,
         ) as session:
             for op in op_sequence:
-                op_type = op.type
-                data = op.data
-                expected_error = op.expected_error
-                expected_implicit_evictions = op.expected_implicit_evictions
                 print("-" * 100)
-                print(
-                    f"Running operation: {op_type} --- data: {data} --- mode: {mode} ---"
-                )
-                if op_type == OperationType.LOAD:
-                    if isinstance(data, str):
-                        adapter_info = {
-                            "lora_name": data,
-                            "lora_path": data,
+                print(f"Running operation: {op.type} --- data: {op.data}")
+                if op.type == OperationType.LOAD:
+                    adapter_info = (
+                        op.data
+                        if isinstance(op.data, dict)
+                        else {
+                            "lora_name": op.data,
+                            "lora_path": op.data,
                             "pinned": False,
                         }
-                    else:
-                        adapter_info = data
-
-                    result = session.load_lora_adapter(
-                        expected_error=expected_error,
-                        expected_implicit_evictions=expected_implicit_evictions,
-                        **adapter_info,
                     )
-                elif op_type == OperationType.UNLOAD:
-                    result = session.unload_lora_adapter(
-                        lora_name=data,
+                    session.load_lora_adapter(
+                        expected_error=op.expected_error, **adapter_info
                     )
-                elif op_type == OperationType.FORWARD:
-                    prompts, adapters = zip(*data)
-                    result = session.forward(
+                elif op.type == OperationType.UNLOAD:
+                    session.unload_lora_adapter(lora_name=op.data)
+                elif op.type == OperationType.LIST_MODELS:
+                    session.assert_models_listing()
+                elif op.type == OperationType.FORWARD:
+                    prompts, adapters = zip(*op.data)
+                    output = session.forward(
                         prompts=list(prompts),
                         lora_paths=list(adapters),
-                        max_new_tokens=max_new_tokens,
-                        expected_error=expected_error,
-                        expected_implicit_evictions=expected_implicit_evictions,
+                        max_new_tokens=test_case.max_new_tokens,
                     )
-                    if not expected_error:
-                        forward_outputs.append(result)
+                    if op.same_output_as is None:
+                        forward_outputs.append(output)
+                    else:
+                        self._assert_outputs_match(
+                            forward_outputs[op.same_output_as],
+                            output,
+                            f"forward {op.same_output_as} vs the reused name",
+                        )
+        return forward_outputs
 
-            return forward_outputs
-
-    def _run_dynamic_adapter_updates(
-        self, mode: LoRAUpdateTestSessionMode, test_cases: Iterable[TestCase]
-    ):
-        for case_idx, test_case in enumerate(test_cases, start=1):
-            print("=" * 100)
-            print(
-                f"Starting test case {case_idx} in {mode.value} mode. Test description: {test_case.description}"
+    def _assert_outputs_match(self, expected: List[str], actual: List[str], label: str):
+        self.assertEqual(len(expected), len(actual), label)
+        for j, (e_out, a_out) in enumerate(zip(expected, actual), start=1):
+            rouge_score = calculate_rouge_l([e_out.strip()], [a_out.strip()])[0]
+            self.assertGreaterEqual(
+                rouge_score,
+                ROUGE_L_TOL,
+                f"ROUGE-L {rouge_score} below {ROUGE_L_TOL} ({label}, prompt {j}):"
+                f"\n- expected: '{e_out}'\n- actual:   '{a_out}'",
             )
-            print("=" * 100)
-
-            print(
-                f"--- Running dynamic update pass with {len(test_case.op_sequence)} operations ---"
-            )
-            # Test dynamic loading of adapters
-            dynamic_output = self._run_operation_sequence(
-                mode=mode,
-                initial_adapters=test_case.initial_adapters,
-                enable_lora=test_case.enable_lora,
-                base=test_case.base,
-                max_loras_per_batch=test_case.max_loras_per_batch,
-                max_loaded_loras=test_case.max_loaded_loras,
-                op_sequence=test_case.op_sequence,
-                max_new_tokens=test_case.max_new_tokens,
-                max_lora_rank=test_case.max_lora_rank,
-                lora_target_modules=test_case.lora_target_modules,
-            )
-
-            # static loading
-            forward_ops = [
-                x
-                for x in test_case.op_sequence
-                if x.type == OperationType.FORWARD and x.expected_error is None
-            ]
-
-            if not forward_ops:
-                print(
-                    f"No forward operations found in test case {case_idx}. Skipping static pass."
-                )
-                continue
-
-            print("=" * 100)
-            print(f"\n--- Running static pass with {len(forward_ops)} operations ---")
-            static_output = self._run_operation_sequence(
-                mode=mode,
-                initial_adapters=test_case.all_adapters,
-                enable_lora=test_case.enable_lora,
-                base=test_case.base,
-                max_loras_per_batch=test_case.max_loras_per_batch,
-                op_sequence=forward_ops,
-                max_new_tokens=test_case.max_new_tokens,
-            )
-
-            ROUGE_L_TOL = 0.9
-
-            print(f"Dynamic output: {dynamic_output}")
-            print(f"Static output: {static_output}")
-            print("=" * 100)
-            self.assertEqual(
-                len(dynamic_output),
-                len(static_output),
-                f"Dynamic output length {len(dynamic_output)} does not match static output length {len(static_output)}",
-            )
-            for i, (dynamic, static) in enumerate(
-                zip(dynamic_output, static_output), start=1
-            ):
-                self.assertEqual(
-                    len(dynamic),
-                    len(static),
-                    f"Output length mismatch at batch {i}:\n- Dynamic={len(dynamic)}\n- Static={len(static)}",
-                )
-                for j, (d_out, s_out) in enumerate(zip(dynamic, static), start=1):
-                    d_out_str = d_out.strip()
-                    s_out_str = s_out.strip()
-                    rouge_score = calculate_rouge_l([d_out_str], [s_out_str])[0]
-
-                    self.assertGreaterEqual(
-                        rouge_score,
-                        ROUGE_L_TOL,
-                        f"ROUGE-L score {rouge_score} of outputs is below tolerance of {ROUGE_L_TOL} "
-                        f"at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
-                    )
-
-    # def test_dynamic_lora_update_engine(self):
-    #     """
-    #     Test dynamic LoRA updates in engine mode.
-    #     """
-    #     test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
-    #     self._run_dynamic_adapter_updates(
-    #         mode=LoRAUpdateTestSessionMode.ENGINE,
-    #         test_cases=test_cases,
-    #     )
 
     def test_dynamic_lora_update_server(self):
-        """
-        Test dynamic LoRA updates in server mode.
-        """
-        test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
-        self._run_dynamic_adapter_updates(
-            mode=LoRAUpdateTestSessionMode.SERVER, test_cases=test_cases
+        test_case = DYNAMIC_UPDATE_CASE
+        recorded = [
+            op
+            for op in test_case.op_sequence
+            if op.type == OperationType.FORWARD and op.same_output_as is None
+        ]
+        # Eviction pressure by construction: more distinct adapters (plus the
+        # base slot) are served than the pool has slots.
+        served = {adapter for op in recorded for _, adapter in op.data} | {None}
+        self.assertGreater(len(served), test_case.max_loras_per_batch)
+
+        print("=" * 100)
+        print(f"Dynamic pass: {test_case.description}")
+        dynamic_output = self._run_operation_sequence(
+            test_case,
+            test_case.initial_adapters,
+            test_case.op_sequence,
+            max_loras_per_batch=test_case.max_loras_per_batch,
+        )
+        print("=" * 100)
+        print(f"Static pass: {len(recorded)} forwards with every adapter preloaded")
+        # The reference never evicts: every adapter and the base slot stay
+        # resident, so weights leaking through a reused slot in the dynamic
+        # pass cannot be reproduced here and show up as a mismatch.
+        static_output = self._run_operation_sequence(
+            test_case,
+            test_case.all_adapters,
+            recorded,
+            max_loras_per_batch=len(test_case.all_adapters) + 1,
         )
 
-    def test_v1_models_endpoint_with_lora(self):
-        """
-        Test that /v1/models endpoint returns base model and loaded LoRA adapters.
-        """
-        adapters = [
-            "philschmid/code-llama-3-1-8b-text-to-sql-lora",
-            "nvidia/llama-3.1-nemoguard-8b-topic-control",
-        ]
-
-        with LoRAUpdateTestSession(
-            testcase=self,
-            mode=LoRAUpdateTestSessionMode.SERVER,
-            model_path="meta-llama/Llama-3.1-8B-Instruct",
-            lora_paths=[],
-            max_loras_per_batch=2,
-            max_lora_rank=256,
-            lora_target_modules=["all"],
-            enable_lora=True,
-        ) as session:
-            # Test with no adapters loaded
-            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, response.text)
-            models_data = response.json()
-            self.assertEqual(models_data["object"], "list")
-            self.assertEqual(len(models_data["data"]), 1)  # Only base model
-            base_model = models_data["data"][0]
-            self.assertIn("meta-llama", base_model["id"].lower())
-            self.assertIsNone(base_model.get("parent"))
-
-            # Load first adapter
-            session.load_lora_adapter(lora_name="adapter1", lora_path=adapters[0])
-
-            # Test with one adapter loaded
-            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, response.text)
-            models_data = response.json()
-            self.assertEqual(len(models_data["data"]), 2)  # Base model + 1 adapter
-
-            # Verify adapter information
-            adapter_models = [m for m in models_data["data"] if m.get("parent")]
-            self.assertEqual(len(adapter_models), 1)
-            self.assertEqual(adapter_models[0]["id"], "adapter1")
-            self.assertEqual(adapter_models[0]["root"], adapters[0])
-            self.assertIsNotNone(adapter_models[0]["parent"])
-
-            # Load second adapter
-            session.load_lora_adapter(lora_name="adapter2", lora_path=adapters[1])
-
-            # Test with two adapters loaded
-            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, response.text)
-            models_data = response.json()
-            self.assertEqual(len(models_data["data"]), 3)  # Base model + 2 adapters
-
-            # Verify both adapters are listed
-            adapter_models = [m for m in models_data["data"] if m.get("parent")]
-            self.assertEqual(len(adapter_models), 2)
-            adapter_names = {m["id"] for m in adapter_models}
-            self.assertEqual(adapter_names, {"adapter1", "adapter2"})
-
-            # Unload one adapter
-            session.unload_lora_adapter(lora_name="adapter1")
-
-            # Test after unloading
-            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, response.text)
-            models_data = response.json()
-            self.assertEqual(len(models_data["data"]), 2)  # Base model + 1 adapter
-            adapter_models = [m for m in models_data["data"] if m.get("parent")]
-            self.assertEqual(len(adapter_models), 1)
-            self.assertEqual(adapter_models[0]["id"], "adapter2")
+        self.assertEqual(len(dynamic_output), len(static_output))
+        for i, (dynamic, static) in enumerate(zip(dynamic_output, static_output)):
+            self._assert_outputs_match(static, dynamic, f"recorded forward {i}")
 
 
 if __name__ == "__main__":
