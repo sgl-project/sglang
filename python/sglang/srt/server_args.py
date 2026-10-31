@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import importlib
 import logging
+import math
 import sys
 import tempfile
 import uuid
@@ -278,6 +279,12 @@ class ServerArgs:
 
             # Validate resolved arguments and checkpoint-derived constraints.
             cfg = resolving_view(self)
+            if not math.isfinite(
+                cfg.abort_dispatch_window
+            ) or cfg.abort_dispatch_window < 0:
+                raise ValueError(
+                    "abort_dispatch_window must be a finite non-negative number"
+                )
             if (
                 cfg.device == "mps"
                 and not use_mlx()
