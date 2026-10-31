@@ -208,13 +208,20 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        def _initialize() -> int:
+            from sglang.srt.disaggregation.common.utils import bind_thread_to_device
+
+            # run_with_deadline runs this on a new thread, which defaults to device 0.
+            bind_thread_to_device(self.gpu_id)
+            return self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
-            ),
+            )
+
+        ret_value = run_with_deadline(
+            _initialize,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )
