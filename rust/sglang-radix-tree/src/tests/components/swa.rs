@@ -5235,9 +5235,8 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
 }
 
 #[test]
-fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
-    // root -> a -> b -> c, one token each; anchor b, target c: the loaded
-    // window is missing its head and cannot be reused as a complete SWA window.
+fn prefetch_commit_attaches_a_sub_window_hit_under_a_non_root_anchor() {
+    // root -> a -> b -> c, one token each; anchor b, target c.
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a, b, c] = chain::<3>(&mut tc);
     let mut cache_actions = Vec::new();
@@ -5247,8 +5246,8 @@ fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
         ..InsertResult::default()
     };
     let storage_result = PoolTransferResult {
-        kv_hit_pages: 3,
-        extra_pool_hit_pages: HashMap::from([(PoolName::Swa, 2)]),
+        kv_hit_pages: 1,
+        extra_pool_hit_pages: HashMap::from([(PoolName::Swa, 1)]),
     };
     swa_component(4).commit_hicache_transfer(
         &mut tc,
@@ -5256,21 +5255,23 @@ fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
         CacheTransferPhase::Prefetch,
         vec![PoolTransfer {
             name: PoolName::Swa,
-            host_indices: Some(Tensor::from_slice(&[30i64, 31])),
+            host_indices: Some(Tensor::from_slice(&[31i64])),
             ..Default::default()
         }],
         &mut cache_actions,
         Some(&mut insert_result),
         Some(&storage_result),
     );
-    assert!(!tc.arena.node(c).has_host_value(SWA));
+    assert!(
+        tc.arena
+            .node(c)
+            .host_value(SWA)
+            .equal(&Tensor::from_slice(&[31i64]))
+    );
+    assert!(tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.arena.node(b).has_host_value(SWA));
     assert!(!tc.arena.node(a).has_host_value(SWA));
-    assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
-    assert_eq!(cache_actions.len(), 1);
-    let FreeComponentHostSlot { host_indices, .. } =
-        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
-    assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
+    assert!(cache_actions.is_empty());
 }
 
 #[test]
