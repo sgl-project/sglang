@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     reclaimed_snapshot,
     snapshot_chain,
 )
+from sglang.srt.mem_cache.kv.alloc.signals import NetworkWaiter
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
@@ -740,6 +741,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return ChainPrefillBudget(
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+
+    def set_network_waiter(self, waiter: Optional[NetworkWaiter]) -> None:
+        """Wait on the host for network transfers a move cannot avoid: every
+        band of the chain asks ``waiter``."""
+        for band in self.bands:
+            band.network_waiter = waiter
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
         """Each sub-pool's (capacity, available units), by sub-pool name."""

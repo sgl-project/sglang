@@ -62,6 +62,24 @@ class TransferCompletion(NamedTuple):
     timing_enabled: bool
 
 
+def host_dcp_size(transfer: L2Transfer) -> int:
+    """The decode-context-parallel width of the transfer's host pool: a host
+    pool that shards under DCP hands widened controller ids."""
+    return getattr(transfer.host_pool, "dcp_size", 1)
+
+
+def controller_virtual_ids(
+    transfer: L2Transfer, indices: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """The device pool's local virtual ids that a transfer's controller ids
+    name: what ``device_translate`` is applied to. Widened ids collapse by the
+    host pool's DCP width. The copy and any tracking of the rows it touches
+    read the ids through this one rule."""
+    ids = transfer.device_indices if indices is None else indices
+    dcp_size = host_dcp_size(transfer)
+    return ids // dcp_size if dcp_size > 1 else ids
+
+
 class L2TransferEngine:
     """Runs resolved device↔host transfers without owning cache state."""
 
@@ -111,12 +129,15 @@ class L2TransferEngine:
         indices = transfer.device_indices.to(
             getattr(transfer.device_pool, "device", original_device)
         ).contiguous()
-        dcp_size = getattr(transfer.host_pool, "dcp_size", 1)
+        dcp_size = host_dcp_size(transfer)
         if dcp_size > 1:
             # The MLA host pool selects this rank and collapses logical IDs.
             # Translate in local virtual space, then preserve that widened
             # interface (including token order) for the host pool.
-            resolved = translate(indices // dcp_size) * dcp_size + indices % dcp_size
+            resolved = (
+                translate(controller_virtual_ids(transfer, indices)) * dcp_size
+                + indices % dcp_size
+            )
         else:
             resolved = translate(indices)
         return resolved.to(original_device)

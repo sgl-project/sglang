@@ -814,6 +814,51 @@ class KVStorage:
             return self._allocator.state.slots.translate
         return lambda ids: self._host_token_ids(sub_pool, ids)
 
+    def record_host_transfer(self, signal, transfers, *, writes: bool) -> None:
+        """Record a submitted host copy, completing at ``signal``: a load-back
+        or restore ``writes`` its device rows, a backup reads them. A page move
+        then waits it only for the pages it touches. Transfers over a view this
+        storage does not own (a fused draft's) touch the same rows as their
+        target's transfer."""
+        sub_pools = {id(view): name for name, view in self._views.items()}
+        for transfer in transfers:
+            name = sub_pools.get(id(transfer.device_pool))
+            if name is None:
+                continue
+            self._member(name).record_transfer(
+                signal, self._host_copy_ids(name, transfer), writes=writes
+            )
+
+    def _host_copy_ids(self, sub_pool: str, transfer) -> torch.Tensor:
+        """The band-local virtual ids of the pages a host copy touches, in the
+        convention a band tracks transfers by (`UnitIds.translate` over
+        physical-row pages). The copy reads the controller's ids as
+        `host_ids` says: collapsed by the host pool's DCP width, then in pages
+        of the band's `page_size` unless the owner's page is one physical page.
+        Each id names its page by the page's first row. State slots keep their
+        ids. The ids may live on the host (a direct I/O backend); the band
+        translates them on its own device."""
+        from sglang.srt.mem_cache.l2_transfer import controller_virtual_ids
+
+        ids = transfer.device_indices
+        roles = self._allocator.roles
+        if sub_pool == roles.state:
+            return ids
+        ids = controller_virtual_ids(transfer)
+        band = self._member(sub_pool)
+        if sub_pool == roles.owner and band.page_size == band.pool_page_size:
+            return ids
+        return ids // band.page_size * band.pool_page_size
+
+    def _member(self, sub_pool: str):
+        """The chain member that holds ``sub_pool``'s rows."""
+        roles = self._allocator.roles
+        if sub_pool == roles.owner:
+            return self._allocator.full_attn_allocator
+        if sub_pool == roles.state:
+            return self._allocator.mamba_allocator
+        return self._allocator.window_allocators[sub_pool]
+
     def add_pin_source(
         self, sub_pools: Sequence[str], busy: Callable[[], bool]
     ) -> None:
