@@ -7,12 +7,15 @@ if TYPE_CHECKING:
 
 
 class RunningReqs:
-    """The requests in the running state, in join order (the same on every rank).
+    """The running requests, in join order (the same on every rank).
 
-    A request joins once a launched step runs its last prefill chunk, and leaves
-    when it finishes, is retracted or preempted, or a pause retracts it. Each
-    change rebinds a new dict, so iterating over the requests while some leave
-    stays safe.
+    A request is running once its whole prompt is launched, until it finishes:
+    the scheduler advances it every iteration, a decode step at a time, or by
+    finishing it when a prefill-only request's prefill is processed. The steps
+    still computing for it are tracked apart from this state. It leaves when it
+    finishes, is retracted or preempted, or a pause retracts it. Each change
+    rebinds a new dict, so iterating over the requests while some leave stays
+    safe.
     """
 
     def __init__(self) -> None:

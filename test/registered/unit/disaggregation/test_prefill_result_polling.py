@@ -1235,6 +1235,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
     _join_launched_reqs = Scheduler._join_launched_reqs
+    _prefill_launch_starts_running = Scheduler._prefill_launch_starts_running
 
     def __init__(self):
         self.scheduler_stage_metrics = None

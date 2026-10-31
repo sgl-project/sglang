@@ -70,8 +70,9 @@ class SchedulerInvariantChecker:
     # Under PP, the micro-batches' running batches and step batches.
     get_pp_running_mbs: Callable = field(default=lambda: ())
     get_pp_mbs: Callable = field(default=lambda: ())
-    # dLLM and HiSparse requests run only once merged into the running batch.
-    prefill_joins_at_merge: Callable = field(default=lambda: False)
+    # Whether a launched prefill step's requests are running; when not, the
+    # extend step batches hold no running request.
+    prefill_launch_starts_running: Callable = field(default=lambda: True)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -492,7 +493,7 @@ class SchedulerInvariantChecker:
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
         step_batches = [last_batch, *self.get_pp_mbs()]
-        if self.prefill_joins_at_merge():
+        if not self.prefill_launch_starts_running():
             step_batches = [
                 b
                 for b in step_batches

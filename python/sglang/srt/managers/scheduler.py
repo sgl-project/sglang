@@ -2575,9 +2575,7 @@ class Scheduler(
                 self.running_mbs if get_parallel().pp_size > 1 else ()
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
-            prefill_joins_at_merge=lambda: (
-                self.dllm_config is not None or self.enable_hisparse
-            ),
+            prefill_launch_starts_running=self._prefill_launch_starts_running,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -4598,21 +4596,22 @@ class Scheduler(
             if not req.finished()
         ]
 
+    def _prefill_launch_starts_running(self) -> bool:
+        """Whether launching a request's last prefill chunk starts it running.
+        PD prefill hands it to the KV transfer, a PD decode request starts at the
+        prebuilt merge, a HiSparse one when its staging is merged, and a dLLM one
+        never runs."""
+        return (
+            self.disaggregation_mode == DisaggregationMode.NULL
+            and self.dllm_config is None
+            and not self.enable_hisparse
+        )
+
     def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
         """A launched extend step starts running each request whose last prefill
         chunk it runs; its mixed decode rows are running already."""
-        if (
-            # PD prefill hands prefilled requests to the KV transfer; PD decode
-            # requests join where the prebuilt batch is merged.
-            self.disaggregation_mode != DisaggregationMode.NULL
-            or not batch.forward_mode.is_extend()
-            # dLLM requests never enter running_batch.
-            or self.dllm_config is not None
-            # HiSparse requests join when HiSparse merges them into running_batch.
-            or self.enable_hisparse
-        ):
-            return
-        self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
+        if self._prefill_launch_starts_running() and batch.forward_mode.is_extend():
+            self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
