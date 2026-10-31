@@ -16,7 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheEvents(unittest.TestCase):
@@ -85,7 +85,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.assertIsNone(plan.batch_to_run)
         s.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
-            self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
+            self.calls.mock_calls,
+            [
+                call.drain(),
+                call.retry(),
+                call.defer(self.running_batch),
+            ],
         )
 
     def test_pp_prefill_drains_before_admission(self):

@@ -65,7 +65,7 @@ The [operator guide's detector specification](../../../../../docs/docs/advanced_
 - **Repeated-context masking.** A context hash is forced at most once per request. Repeated contexts use ordinary sampling, preventing a deterministic short cycle from repeatedly excluding EOS. Only forced contexts enter the history.
 - **Greedy bypass.** Rows normalized to `top_k <= 1`, including `temperature=0`, use ordinary greedy selection and are not recorded.
 - **Entropy gate.** A row uses ordinary sampling when its largest truncated probability exceeds the server's `max_probability`. Skipped contexts remain eligible for a later higher-entropy occurrence.
-- **Speculative decoding.** NGRAM, EAGLE, EAGLE3, and NEXTN reconstruct verify-row contexts from the committed ring tail, tree mask, draft tokens, and positions. Normal decode preserves a clone for logprobs while speculative decode forces a clone, so both report the pre-watermark target distribution. Fused kernels admit contexts and append only accepted tokens.
+- **Speculative decoding.** NGRAM, EAGLE, EAGLE3, NEXTN, and DSPARK reconstruct verify-row contexts from the committed ring tail, tree mask, draft tokens, and positions. DSPARK verifies a linear chain, so its rows use a lower-triangular mask, and its rejection-sampling accept emits the forced token on every forced row. Normal decode preserves a clone for logprobs while speculative decode forces a clone, so both report the pre-watermark target distribution. Fused kernels admit contexts and append only accepted tokens.
 - **Selector paths.** Finite `top_k <= 8,192` uses `torch.topk`, canonicalizes boundary ties, and performs small-k truncation. Unlimited top-k retains full-vocabulary sorting. Both paths use the same hash and selection contract.
 - **Disabled-batch exit.** A host-side candidate bit follows filtering and merging. Fully disabled or greedy-only batches skip prompt initialization, verify cloning, selector work, and append kernels.
 - **Retraction and slot reuse.** Re-prefill rebuilds the distinct-context history from accepted output. A new request resets all state for a reused request-pool slot.
@@ -106,7 +106,7 @@ The Triton selector and state kernels live in `sglang/kernels/ops/sampling/texts
 
 Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in.
 
-Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, request-log, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
+Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Request logs redact watermark keys only when `--enable-watermark` is set. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
 
 ## Per-request control
 

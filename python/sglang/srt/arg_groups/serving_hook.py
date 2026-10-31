@@ -409,11 +409,6 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
-                "Rust-server mode does not run the Python sidecar lifecycle."
-            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(
@@ -721,7 +716,7 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        if cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",
