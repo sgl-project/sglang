@@ -803,6 +803,16 @@ def run_aisbench(
         metrics = {}
         full_output = "\n".join(output_lines)
 
+        # The raw path may run unscored warmup passes (cache-fill, then a
+        # full-shape pass) before the formal invocation; every invocation
+        # prints its own summarizer table, in order. All metrics must come
+        # from the LAST table - the formal run (run 41197446071 asserted
+        # the cache-fill warmup's TPOT because re.search matched the first
+        # table; the formal C12 run printed TPOT 24.1 ms).
+        last_table = full_output.rfind("Performance Parameters")
+        if last_table != -1:
+            full_output = full_output[last_table:]
+
         simplified_output = re.sub(r"[^\w\s.]", " ", full_output)
 
         tpot_match = re.search(r"TPOT\s+total\s+([\d.]+)\s+ms", simplified_output)
