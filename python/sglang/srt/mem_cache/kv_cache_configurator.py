@@ -198,13 +198,13 @@ def _should_enable_lazy_compaction() -> bool:
 def mm_runtime_reservation_gb(
     *, is_multimodal: bool, mm_feature_transport: Optional[str]
 ) -> float:
-    """Multimodal GPU memory allocated only after the KV pool is sized
-    (mm embedding cache + GPU feature-transport pools); reserve it out of
+    """Multimodal device memory allocated only after the KV pool is sized
+    (mm embedding cache + device feature-transport pools); reserve it out of
     the KV budget so it doesn't have to fit in the runtime slack."""
     if not is_multimodal:
         return 0.0
     reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
-    if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+    if mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc"):
         reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
     if reserved_mb > 0:
         logger.info(
