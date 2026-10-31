@@ -3366,6 +3366,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
             request.skip_special_tokens = False
+        if self.reasoning_parser == "xing4_0":
+            request.skip_special_tokens = False
 
         if (
             self.reasoning_parser in ["mistral"]
