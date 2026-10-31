@@ -130,6 +130,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_lora,
     get_mm,
+    get_model,
     get_parallel,
     get_spec,
 )
@@ -185,6 +186,22 @@ def _kda_fp8_modules() -> frozenset:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES runs FP8 GEMMs; unset SGLANG_FORCE_FP8_MARLIN"
         )
+    # A remote-instance load copies the seed's tensors into BF16 parameters and skips
+    # post-load processing; a transfer-engine seed lets peers write the parameters.
+    if modules and get_model().load_format == "remote_instance":
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--load-format remote_instance: the KDA projections are quantized at load"
+        )
+    if (
+        modules
+        and get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
+    ):
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine: "
+            "the KDA projections are quantized at load"
+        )
     return modules
 
 
@@ -210,10 +227,10 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
         return torch.cuda.use_mem_pool(self._bf16_pool)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # A second call (a weight update with post-load processing) would quantize
-        # the FP8 weight again.
+        # end_weight_update runs post-load processing again; the weights are FP8 already.
+        # Updates through sglang are refused before they write, and peer writes at startup.
         if self._quantized:
-            raise RuntimeError(layer._derived_weight_cache_error)
+            return
         weight = layer.weight.data
         # apply_fp8_linear takes the CUTLASS GEMM only when N % 16 == 0.
         if pad := -weight.shape[0] % 16:
@@ -228,6 +245,10 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
         torch.cuda.empty_cache()
         layer._derived_weight_cache_error = (
             "Online weight updates are not supported with "
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load."
+        )
+        layer._weight_export_error = (
+            "Weight export is not supported with "
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load."
         )
         # The cases where apply_fp8_linear takes its dynamic per-token CUTLASS path;

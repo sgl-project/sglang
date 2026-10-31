@@ -294,7 +294,7 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
         parallel.__enter__()
         self.addCleanup(parallel.__exit__, None, None, None)
 
-    def build(self, modules):
+    def build(self, modules, quant_config=None):
         with (
             envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(modules),
             patch.object(glm5_next, "cutlass_fp8_supported", return_value=True),
@@ -309,7 +309,7 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
                         "short_conv_kernel_size": 4,
                     }
                 ),
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=PREFIX,
             )
 
@@ -357,6 +357,36 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
                         else UnquantizedLinearMethod
                     )
                     self.assertIs(type(layer.quant_method), expected)
+
+    def test_fp8_checkpoint_keeps_the_bf16_projections_for_the_switch(self):
+        # GLM-5.3-Flash's block-FP8 checkpoint lists the KDA projections as unquantized.
+        attention = self.build(
+            KDA_FP8_ALL_MODULES, MockFp8Config(QKV + BFG + ("o_proj",))
+        )
+        for layer in (attention.fused_qkvbfg_a_proj, attention.o_proj):
+            self.assertIs(type(layer.quant_method), glm5_next._KdaFp8LinearMethod)
+        with self.assertRaisesRegex(ValueError, "needs a BF16 o_proj"):
+            self.build("o_proj", MockFp8Config(QKV + BFG))
+
+    def test_remote_instance_load_and_seed_are_rejected(self):
+        # A remote-instance load skips post-load processing; a transfer-engine seed lets
+        # peers write the parameters directly.
+        for args, error in (
+            ({"load_format": "remote_instance"}, "remote_instance"),
+            (
+                {"remote_instance_weight_loader_start_seed_via_transfer_engine": True},
+                "transfer-engine",
+            ),
+        ):
+            with self.subTest(**args):
+                override = get_context().override_server_args(
+                    device="cpu", enable_lora=False, lora_paths=None, **args
+                )
+                override.install()
+                self.addCleanup(override.restore)
+                with self.assertRaisesRegex(ValueError, error):
+                    kda_fp8_modules("o_proj")
+                self.assertEqual(kda_fp8_modules(""), frozenset())
 
     def test_unfused_input_projection_is_rejected(self):
         # LoRA turns the projection fusion off.

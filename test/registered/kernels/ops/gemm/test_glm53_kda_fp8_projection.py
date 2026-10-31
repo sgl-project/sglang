@@ -22,12 +22,21 @@ from sglang.kernels.spec import KernelBackend
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.model_executor.model_runner_components.weight_exporter import (
+    WeightExporter,
+)
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.model_loader.loader import _modules_with_quant_method
 from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+# H100 runs the default path of a Hopper GPU without tuned tables, in the per-commit stage.
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 register_cuda_ci(est_time=60, stage="base-c", runner_config="8-gpu-h20")
 
@@ -186,13 +195,14 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             self.assertGreater(tiles_seen, 0)
 
     def test_kernel_choice_matches_apply_fp8_linear(self):
-        # The projection calls the kernel apply_fp8_linear would pick: its output equals that
-        # kernel's bitwise, and the profiler shows that kernel ran and the other did not.
+        # The projection calls the kernel apply_fp8_linear would pick;
+        # its output equals that kernel's bitwise, and the profiler shows which kernels ran.
         import sgl_kernel
 
         n, k = SHAPES["input_tp1"]
 
         def check(method, layer, m, expected, other=None):
+            n, k = layer.output_size_per_partition, layer.input_size_per_partition
             x = make_input(m, k, seed=7)
             x_q, x_scale = sglang_per_token_quant_fp8(x)
             gemm = (x_q, layer.weight, x_scale, layer.weight_scale)
@@ -201,8 +211,10 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             self.assertTrue(
                 torch.equal(method.apply(layer, x), expected(x, gemm)[:, :n])
             )
+            self.assertTrue(want)
             self.assertLessEqual(want, ran)
             if other is not None:
+                self.assertTrue(kernel_names(lambda: other(gemm)) - want)
                 self.assertFalse((kernel_names(lambda: other(gemm)) - want) & ran)
 
         def aot(x, gemm):
@@ -219,6 +231,7 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         for m in (16, 8191):
             with self.subTest(case="aot", m=m):
                 check(method, layer, m, aot, other=lambda g: triton_default(None, g))
+                check(method, layer, m, generic)
         with self.subTest(case="8192 rows"):
             check(method, layer, 8192, generic)
 
@@ -244,12 +257,16 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                 other=lambda g: aot(None, g),
             )
 
-        tiles, _ = table_tokens(n, k)
-        if tiles:
+        for name in ("input_tp1", "input_tp8"):
+            n, k = SHAPES[name]
+            tiles, _ = table_tokens(n, k)
+            if not tiles:
+                self.assertFalse(TUNED, f"the {name} table selects no tuned tile")
+                continue
             tune_method, tune_layer, _ = make_layer(n, k)
             tile = get_w8a8_channelwise_fp8_config(N=padded(n), K=k, M=tiles[0])
 
-            def tiled(x, gemm):
+            def tiled(x, gemm, tile=tile):
                 return triton_scaled_mm(
                     *gemm,
                     torch.bfloat16,
@@ -262,7 +279,7 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                     num_stages=tile["num_stages"],
                 )
 
-            with self.subTest(case="tuned tile", m=tiles[0]):
+            with self.subTest(case="tuned tile", shape=name, m=tiles[0]):
                 check(
                     tune_method,
                     tune_layer,
@@ -270,8 +287,6 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                     tiled,
                     other=lambda g: aot(None, g),
                 )
-        elif TUNED:
-            self.fail("the input projection table selects no tuned tile")
 
     @torch.no_grad()
     def test_model_projections_match_bf16_reference(self):
@@ -417,11 +432,21 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         if TUNED:
             self.assertGreater(tile_captures, 0)
 
-    def test_rejects_a_second_post_load_pass(self):
-        # A weight update that reruns post-load processing would quantize FP8 again.
-        method, layer, _ = make_layer(*SHAPES["o_proj_tp8"])
-        with self.assertRaisesRegex(RuntimeError, "quantized at load"):
-            method.process_weights_after_loading(layer)
+    def test_second_post_load_pass_changes_nothing_and_updates_are_refused(self):
+        # end_weight_update reruns post-load processing; the FP8 weights must survive it,
+        # and the weight-update and weight-export guards must refuse these projections.
+        _, layer, _ = make_layer(*SHAPES["input_tp8"])
+        weight, scale = layer.weight.clone(), layer.weight_scale.clone()
+        updater = SimpleNamespace(get_model=lambda: layer, device="cuda")
+        WeightUpdater.end_weight_update(updater, run_post_load=False)
+        self.assertTrue(torch.equal(layer.weight, weight))
+        self.assertTrue(torch.equal(layer.weight_scale, scale))
+        error = _unsupported_derived_weight_cache_error(layer)
+        self.assertIsNotNone(error)
+        self.assertIn("SGLANG_OPT_GLM53_KDA_PTPC_MODULES", error)
+        exporter = SimpleNamespace(get_model=lambda: layer)
+        with self.assertRaisesRegex(RuntimeError, "SGLANG_OPT_GLM53_KDA_PTPC_MODULES"):
+            WeightExporter._check_weight_export_supported(exporter)
 
     def test_bf16_weight_memory_is_released_after_quantization(self):
         # TP8's padding copies the BF16 weight;
@@ -441,7 +466,10 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         # What stays is the FP8 weight (1 byte per element) and its scales.
-        self.assertLess(torch.cuda.memory_reserved() - before, 1.25 * padded(n) * k)
+        # Allocator rounding adds a few MiB; keeping the BF16 copy would add 26 MiB.
+        self.assertLess(
+            torch.cuda.memory_reserved() - before, padded(n) * k + 6 * 2**20
+        )
 
 
 if __name__ == "__main__":
