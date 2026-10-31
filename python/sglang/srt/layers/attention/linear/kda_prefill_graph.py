@@ -340,7 +340,12 @@ def kda_extend_in_graph(
             num_tokens=meta.num_logical_tokens,
         )
 
-    qkv = causal_conv1d_fn(
+    split_size = (
+        layer.q_dim
+        if meta.flashinfer is not None and layer.q_dim == layer.k_dim == layer.v_dim
+        else 0
+    )
+    conv_output = causal_conv1d_fn(
         mixed_qkv.transpose(0, 1),
         layer.conv_weights,
         layer.bias,
@@ -351,8 +356,15 @@ def kda_extend_in_graph(
         query_start_loc=meta.cu_seqlens,
         seq_lens_cpu=None,
         block_table=meta.conv_block_table,
-    ).transpose(0, 1)
-    q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        output_split_size=split_size,
+    )
+    q, k, v = (
+        conv_output.unbind(0)
+        if split_size
+        else conv_output.transpose(0, 1).split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+    )
     q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
     k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
     v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
