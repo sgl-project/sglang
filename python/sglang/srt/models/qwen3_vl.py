@@ -1411,6 +1411,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+    # Opt-in for the prefill graph runner's DeepStack replay slot; 0 means no slot.
+    def get_num_deepstack_embeddings(self) -> int:
+        return self.num_deepstack_embeddings
+
     def separate_deepstack_embeds(self, embedding):
         assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
             f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
