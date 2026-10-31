@@ -1411,7 +1411,7 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     is_mooncake = args.dataset_name == "mooncake"
-    # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
+    # Embedding string batches are one request, not chat turns. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
     if is_mooncake:
         # Mooncake dataset rows are raw trace dictionaries. They are converted
@@ -1420,7 +1420,8 @@ async def benchmark(
     else:
         first_prompt = input_requests[0].prompt
         is_multi_turn = (
-            isinstance(first_prompt, list)
+            backend not in _EMBEDDING_BACKENDS
+            and isinstance(first_prompt, list)
             and bool(first_prompt)
             and _normalize_round_messages(first_prompt[0]) is not None
         )
@@ -2333,6 +2334,7 @@ def cli_main():
             "sharegpt",
             "custom",
             "openai",
+            "embedding",
             "random",
             "random-ids",
             "generated-shared-prefix",
