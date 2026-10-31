@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.utils.common import ceil_align
 
@@ -62,9 +63,9 @@ def _recomputable_full_len(
     if full_len - matched_len < _MIN_GAIN_RATIO * replay_len:
         return matched_len, None
     window_start = full_len - window
-    if cache.tree_core.swa_tombstone_ranges(key, window_start, full_len) != [
-        (window_start, full_len)
-    ]:
+    if cache.tree_core.swa_tombstone_ranges(
+        key, window_start, full_len, component_type=cache.slot_id(TREE_WINDOW)
+    ) != [(window_start, full_len)]:
         return matched_len, None
     return full_len, node_id
 
@@ -113,6 +114,7 @@ def init_swa_recompute(
             full_len - window,
             full_len,
             swa_indices[-window:].to(torch.int64),
+            component_type=cache.slot_id(TREE_WINDOW),
         ):
             cache._apply_cache_action(action)
     finally:

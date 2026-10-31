@@ -41,6 +41,11 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
 )
+from sglang.srt.mem_cache.unified_cache.swa_recompute import (
+    init_swa_recompute,
+    release_swa_recompute_workspace,
+    swa_recompute_hit_length,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
 )
@@ -639,6 +644,35 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertFalse(req.lock.swa_released)
 
         cache.unlock(req.lock)
+        cache.sanity_check()
+
+    @requires_full_swa_ps1_window4
+    def test_swa_recompute_reopens_a_full_prefix_past_its_window(self):
+        """A FULL prefix whose window was evicted reports a replay hit, and binding
+        the replay rows lets later matches reach its end."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache.swa_recompute_len = 8
+        tokens = self._make_seq(1, 32)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+        # The leaf holding the live window goes; the tombstoned prefix stays.
+        cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        prefix_len = len(tokens) - self.cfg.sliding_window_size
+        match = match_prefix(cache, tokens)
+        self.assertEqual(match.device_prefix_len, 0)
+
+        key = RadixKey(array("q", tokens))
+        self.assertEqual(
+            swa_recompute_hit_length(cache, key, 0, len(tokens)), prefix_len
+        )
+        req = SimpleNamespace(
+            prefix_len=0, last_node=match.last_device_node, swa_recompute=None
+        )
+        gained, _, req.swa_recompute = init_swa_recompute(cache, req, key)
+
+        self.assertEqual(gained, prefix_len)
+        self.assertEqual(req.swa_recompute.start, prefix_len - 8)
+        self.assertEqual(match_prefix(cache, tokens).device_prefix_len, prefix_len)
+        release_swa_recompute_workspace(cache, req)
         cache.sanity_check()
 
     @requires_swa_only
