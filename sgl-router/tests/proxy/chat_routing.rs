@@ -38,6 +38,7 @@ fn config_for(_worker_url: &str) -> Config {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
@@ -995,6 +996,51 @@ async fn unknown_model_without_workers_returns_404() {
     assert_eq!(response.headers()["x-router-error-code"], "model_not_found");
 }
 
+/// A `--model-alias` is served as `--model-id`; a name that is neither stays
+/// `model_not_found`. The case: a gateway forwarding the engine's snapshot path.
+#[tokio::test]
+async fn model_alias_routes_as_the_configured_model() {
+    const ALIAS: &str = "/weights-repo/snapshots/d89b007b";
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut cfg = config_for(&worker.url);
+    cfg.model.aliases = vec![ALIAS.to_string()];
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let spec = WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        ..Default::default()
+    };
+    let _ = registry.add_with_cb(spec, Some(Default::default()), WireProtocol::default());
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    for (model, status) in [
+        (ALIAS, StatusCode::OK),
+        // SGLang's `base:adapter` LoRA syntax on an alias.
+        ("/weights-repo/snapshots/d89b007b:my-lora", StatusCode::OK),
+        ("tiny", StatusCode::OK),
+        ("/weights-repo/snapshots/other", StatusCode::NOT_FOUND),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), status, "model {model}");
+    }
+}
+
 /// A worker is registered for a model that is NOT the configured `cfg.model` (so the
 /// policy registry has no entry for it).  The handler returns 404
 /// `model_not_found` rather than 500 — clients can recover by sending a
@@ -1272,7 +1318,8 @@ async fn forward_json_to_records_failure_on_5xx() {
     use std::time::Duration;
 
     let worker = crate::common::mock_worker::MockWorker::start_returning_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
+        // 502, a genuine fault; a 500 is a per-request engine error and stays neutral.
+        StatusCode::BAD_GATEWAY,
         serde_json::json!({"error": {"type": "x"}}),
     )
     .await;

@@ -4,6 +4,7 @@ mod deepseek_v4;
 mod glm53;
 mod kimi_k25;
 mod kimi_k3;
+mod minimax_m3;
 mod pydantic_dump;
 mod qwen38;
 mod schema_types;
@@ -19,6 +20,9 @@ pub(crate) use self::deepseek_v4::{
 pub(super) use self::glm53::{is_glm53, render as render_glm53};
 pub(super) use self::kimi_k3::render as render_kimi_k3;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
+pub(super) use self::minimax_m3::{
+    is_minimax_m3, prints_arguments_as_xml, render as render_minimax_m3,
+};
 pub use self::pydantic_dump::continues_final_message;
 pub(crate) use self::pydantic_dump::pydantic_bool;
 pub(super) use self::pydantic_dump::{function_dump, split_continuation};

@@ -252,6 +252,13 @@ impl TokenizerRegistry {
         self.formatters.contains_key(model_id)
     }
 
+    /// Whether `model_id` is MiniMax-M3.1 (see [`ChatFormatter::is_minimax_m31`]).
+    pub fn is_minimax_m31(&self, model_id: &str) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|e| e.formatter.is_minimax_m31())
+    }
+
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {
         self.formatters
             .get(model_id)
@@ -323,6 +330,7 @@ mod tests {
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
+                aliases: Vec::new(),
                 id: "tiny".into(),
                 tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,

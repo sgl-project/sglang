@@ -37,6 +37,7 @@ fn config(_worker_url: &str) -> Config {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,

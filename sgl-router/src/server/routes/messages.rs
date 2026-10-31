@@ -52,12 +52,12 @@ pub(crate) async fn count_tokens(
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
-    let model = converted.echo.model;
-    if let Err(e) = tokenizer_for(&ctx, &model) {
+    let model = ctx.config.model.served_name(&converted.echo.model);
+    if let Err(e) = tokenizer_for(&ctx, model) {
         return adapt(e.into_response(), None).await;
     }
     // No raw-text fallback: a count without template and tool overhead is wrong.
-    match ctx.tokenizers.encode_chat(&model, &converted.chat) {
+    match ctx.tokenizers.encode_chat(model, &converted.chat) {
         Some(ids) => axum::Json(serde_json::json!({"input_tokens": ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
