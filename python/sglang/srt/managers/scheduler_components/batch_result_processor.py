@@ -1261,24 +1261,16 @@ class SchedulerBatchResultProcessor:
             max_accept = 1
 
         for j, tok_id in enumerate(accepted_ids):
-            req.logprob.output_token_logprobs_val.append(accepted_logprobs[j])
-            req.logprob.output_token_logprobs_idx.append(tok_id)
-            if req.logprob.top_logprobs_num > 0:
-                flat_idx = i * max_accept + j
-                req.logprob.output_top_logprobs_val.append(
-                    logits_output.next_token_top_logprobs_val[flat_idx]
-                )
-                req.logprob.output_top_logprobs_idx.append(
-                    logits_output.next_token_top_logprobs_idx[flat_idx]
-                )
-            if req.logprob.token_ids_logprob is not None:
-                flat_idx = i * max_accept + j
-                req.logprob.output_token_ids_logprobs_val.append(
-                    logits_output.next_token_token_ids_logprobs_val[flat_idx]
-                )
-                req.logprob.output_token_ids_logprobs_idx.append(
-                    logits_output.next_token_token_ids_logprobs_idx[flat_idx]
-                )
+            self.logprob_result_processor.append_output_token_logprobs(
+                req,
+                tok_id,
+                accepted_logprobs[j],
+                row=i * max_accept + j,
+                top_logprobs_val=logits_output.next_token_top_logprobs_val,
+                top_logprobs_idx=logits_output.next_token_top_logprobs_idx,
+                token_ids_logprobs_val=logits_output.next_token_token_ids_logprobs_val,
+                token_ids_logprobs_idx=logits_output.next_token_token_ids_logprobs_idx,
+            )
 
     def add_sampling_mask_return_values(
         self,
@@ -1586,6 +1578,35 @@ class SchedulerBatchResultProcessor:
             + result.num_non_draft_tokens_per_req
         )
         return len(retained[i]) == num_verified
+
+    def commit_handoff_token(
+        self,
+        req: Req,
+        token_id: int,
+        *,
+        logprob_token_id: Optional[int] = None,
+        logprob: Optional[float] = None,
+        top_logprobs_val: Optional[List[float]] = None,
+        top_logprobs_idx: Optional[List[int]] = None,
+        sampling_mask_idx: Optional[np.ndarray] = None,
+        sampling_mask_logprobs: Optional[np.ndarray] = None,
+    ) -> None:
+        """Commit the PD prefill worker's sampled token to a decode request."""
+        req.output_ids.append(token_id)
+        self._maybe_update_reasoning_tokens(req, token_id)
+        if req.return_logprob:
+            # Prefill omits token-ids scores; reserve a row for the streaming offset.
+            self.logprob_result_processor.append_output_token_logprobs(
+                req,
+                logprob_token_id,
+                logprob,
+                top_logprobs_val=[top_logprobs_val],
+                top_logprobs_idx=[top_logprobs_idx],
+                token_ids_logprobs_val=[[]],
+                token_ids_logprobs_idx=[[]],
+            )
+        if req.return_sampling_mask:
+            req.sampling_mask_rows.append(sampling_mask_idx, sampling_mask_logprobs)
 
     def _maybe_update_reasoning_tokens(
         self,
