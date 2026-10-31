@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+
+logger = logging.getLogger(__name__)
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
@@ -270,6 +273,34 @@ def _mega_moe_buffer(moe: DeepseekV2MoE):
         ),
         mma_type=_mega_moe_mma_type(moe.experts),
     )
+
+
+def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
+    """Allocate the symmetric buffers of the model's MegaMoE layers up front.
+
+    A buffer lives for the whole run, so allocating it before the KV cache is sized
+    charges it like the weights. Left to the first forward, it comes out of the
+    runtime slack, where the caching allocator may already hold the free memory.
+    """
+    if not get_moe_a2a_backend().is_megamoe() or _use_amd_flydsl_mega_moe():
+        return
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    buffers = {
+        id(buf): buf
+        for buf in (
+            _mega_moe_buffer(module)
+            for module in model.modules()
+            if isinstance(module, DeepseekV2MoE)
+            and is_mega_moe_experts_ready(module.experts)
+        )
+    }
+    if buffers:
+        logger.info(
+            "MegaMoE symmetric buffers resident before KV cache sizing: "
+            f"{len(buffers)}, "
+            f"{sum(b.buffer.nbytes for b in buffers.values()) / (1 << 30):.2f} GB"
+        )
 
 
 MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
