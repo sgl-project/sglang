@@ -1,5 +1,5 @@
-"""Unit tests for the mxfp8 moe_runner_backend constraints in
-srt/arg_groups/overrides.py."""
+"""Check the MoE backend quantization constraints and the SAIL A2A admission
+boundary."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import (
     ResolvedView,
+    _a2a_backend_overrides,
     _moe_runner_backend_quant_constraints,
 )
 from sglang.srt.runtime_context import override_platform
@@ -86,6 +87,46 @@ class TestMxfp8MoeRunnerBackend(CustomTestCase):
     def test_non_mxfp8_quantization_is_untouched(self):
         with _platform(is_hip=True, is_gfx95=False):
             self.assertEqual(_resolve("triton", quantization="fp8"), "triton")
+
+
+class TestSailMoeA2aBackend(CustomTestCase):
+    """An emulated CUDA capability must not let SAIL pick a MegaMoE it cannot run."""
+
+    def test_sail_rejects_megamoe_with_or_without_waterfill(self):
+        with override_platform(is_sail=True):
+            for waterfill in (False, True):
+                with self.subTest(waterfill=waterfill):
+                    view = ResolvedView(
+                        SimpleNamespace(
+                            moe_a2a_backend="megamoe", enable_waterfill=waterfill
+                        )
+                    )
+                    with self.assertRaisesRegex(ValueError, "SAIL.*MegaMoE"):
+                        _a2a_backend_overrides(view)
+
+    def test_sail_preserves_supported_backends_and_waterfill_resolution(self):
+        cases = (
+            ("none", False, {}),
+            ("deepep", False, {}),
+            ("none", True, {"moe_a2a_backend": "deepep"}),
+            ("deepep", True, {}),
+        )
+        with override_platform(is_sail=True):
+            for backend, waterfill, expected in cases:
+                with self.subTest(backend=backend, waterfill=waterfill):
+                    view = ResolvedView(
+                        SimpleNamespace(
+                            moe_a2a_backend=backend, enable_waterfill=waterfill
+                        )
+                    )
+                    self.assertEqual(_a2a_backend_overrides(view), expected)
+
+    def test_other_platforms_keep_megamoe(self):
+        with override_platform(is_sail=False):
+            view = ResolvedView(
+                SimpleNamespace(moe_a2a_backend="megamoe", enable_waterfill=True)
+            )
+            self.assertEqual(_a2a_backend_overrides(view), {})
 
 
 if __name__ == "__main__":

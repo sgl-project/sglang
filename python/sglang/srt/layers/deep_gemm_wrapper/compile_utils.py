@@ -29,7 +29,13 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
+from sglang.srt.utils import (
+    ceil_align,
+    ceil_div,
+    get_available_gpu_memory,
+    is_musa,
+    is_sail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +43,30 @@ _is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
+
+_is_sail = is_sail()
+
+
+def bf16_grouped_gemm_nt(shape: str):
+    """Resolve one BF16 grouped GEMM entry point on the installed DeepGEMM.
+
+    The CUDA build spells these ``m_grouped_bf16_gemm_nt_{shape}`` while the SAIL
+    build uses an explicit dtype triple, ``m_grouped_gemm_bf16_bf16_bf16_nt_{shape}``.
+    Probe for both instead of gating on the platform: which spelling exists is a
+    property of the installed library, not of the device.
+    """
+    for name in (
+        f"m_grouped_gemm_bf16_bf16_bf16_nt_{shape}",
+        f"m_grouped_bf16_gemm_nt_{shape}",
+    ):
+        fn = getattr(deep_gemm, name, None)
+        if fn is not None:
+            return fn
+    raise AttributeError(
+        f"deep_gemm exports no BF16 grouped GEMM '{shape}' entry point; "
+        f"checked m_grouped_gemm_bf16_bf16_bf16_nt_{shape} and "
+        f"m_grouped_bf16_gemm_nt_{shape}"
+    )
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -119,6 +149,46 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
 
+    # <NOTE>
+    # new added int8/bf16/fp4/int4 kernel type and nopad impl.
+    # </NOTE>
+    GROUPED_GEMM_NT_F8F8BF16_NOPAD = auto()
+    GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL = auto()
+    GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL = auto()
+    GEMM_NT_F8F8BF16_CHANNEL = auto()
+    GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL = auto()
+
+    GROUPED_GEMM_NT_I8I8BF16_MASKED = auto()
+    GROUPED_GEMM_NT_I8I8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_I8I8BF16_NOPAD = auto()
+    GEMM_NT_I8I8BF16 = auto()
+
+    GROUPED_GEMM_NT_BF16_NOPAD = auto()
+
+    GROUPED_GEMM_NT_F4F4BF16_MASKED = auto()
+    GROUPED_GEMM_NT_F4F4BF16_NOPAD = auto()
+    GEMM_NT_F4F4BF16 = auto()
+    GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS = auto()
+    GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS = auto()
+    GEMM_NT_F4F4BF16_BIAS = auto()
+
+    GROUPED_GEMM_NT_BF16I4BF16_MASKED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_NOPAD = auto()
+
+    # GEMM1 reads the routing indices directly, skipping the physical scatter.
+    GROUPED_GEMM_NT_F8F8BF16_FUSED = auto()
+    GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL = auto()
+    GROUPED_GEMM_NT_I8I8BF16_FUSED = auto()
+    GROUPED_GEMM_NT_BF16_FUSED = auto()
+    GROUPED_GEMM_NT_F4F4BF16_FUSED = auto()
+
+    # Appended at the end so the type values of existing warmup caches stay valid.
+    GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_FUSED = auto()
+    GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED = auto()
+
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
@@ -160,6 +230,7 @@ def _maybe_compile_deep_gemm_one_type_all(
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
+        and not torch.cuda.is_current_stream_capturing()
         and _INITIALIZATION_DICT.get(query_key) is None
     ):
         _INITIALIZATION_DICT[query_key] = True
@@ -204,12 +275,32 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        if kernel_type in [
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG,
+        ]:
+            # TODO: SAIL DeepGEMM has no get_mk_alignment_for_contiguous_layout,
+            # fall back to get_m_alignment_for_contiguous_layout instead.
+            if not _is_sail:
+                m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            else:
+                m_alignment = deep_gemm.get_m_alignment_for_contiguous_layout()
+            if isinstance(m_alignment, tuple):
+                m_alignment = m_alignment[0]
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
-            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            m_alignment = (
+                deep_gemm.get_m_alignment_for_contiguous_layout()
+                if _is_sail
+                else deep_gemm.get_mk_alignment_for_contiguous_layout()
+            )
+            if isinstance(m_alignment, tuple):
+                m_alignment = m_alignment[0]
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+
+        if not m_list:
+            return
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(
@@ -251,11 +342,12 @@ def _compile_deep_gemm_one_type_all(
             old_compile_mode = deep_gemm.get_compile_mode()
             deep_gemm.set_compile_mode(1)
 
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc="DeepGEMM warmup"):
-            executor.execute(m=m)
-        if has_compile_mode_api:
-            deep_gemm.set_compile_mode(old_compile_mode)
+        try:
+            for m in tqdm(m_list, desc="DeepGEMM warmup"):
+                executor.execute(m=m)
+        finally:
+            if has_compile_mode_api:
+                deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -266,7 +358,28 @@ def _compile_deep_gemm_one_type_all(
         restore_symmetric_memory_context(saved_context)
 
 
-class _BaseWarmupExecutor:
+def check_and_skip_execute(func):
+    """Decorator that checks if the m exceeds self.max_m"""
+
+    def wrapper(self, m):
+        if hasattr(self, "max_m") and m > self.max_m:
+            logger.warning(f"Skip DeepGEMM warmup: {m=} > max_m={self.max_m}.")
+            return
+        return func(self, m)
+
+    return wrapper
+
+
+class _BaseWarmupExecutorMeta(type):
+    """Metaclass that automatically decorates 'execute' methods"""
+
+    def __new__(cls, name, bases, attrs):
+        if "execute" in attrs:
+            attrs["execute"] = check_and_skip_execute(attrs["execute"])
+        return super().__new__(cls, name, bases, attrs)
+
+
+class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
     @staticmethod
     def create(kernel_type: DeepGemmKernelType, **kwargs):
         return {
@@ -279,6 +392,38 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
+            # <NOTE>
+            # new executor for the int8/bf16/fp4/int4 kernel types as well as the
+            # nopad interface on SAIL
+            # </NOTE>
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD: _GroupedNopadWarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL: _NormalWarmupExecutor_channel,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL: _GroupedContWarmupExecutor_channel,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL: _GroupedMaskedWarmupExecutor_channel,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL: _GroupedNopadWarmupExecutor_channel,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED: _GroupedMaskedWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG: _GroupedContWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD: _GroupedNopadWarmupExecutor_int8,
+            DeepGemmKernelType.GEMM_NT_I8I8BF16: _NormalWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD: _GroupedNopadWarmupExecutor_bf16,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED: _GroupedMaskedWarmupExecutor_fp4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD: _GroupedNopadWarmupExecutor_fp4,
+            DeepGemmKernelType.GEMM_NT_F4F4BF16: _NormalWarmupExecutor_fp4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS: _GroupedMaskedWarmupExecutor_fp4_bias,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS: _GroupedNopadWarmupExecutor_fp4_bias,
+            DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED: _GroupedFusedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL: _GroupedFusedWarmupExecutor_fp8_channel,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED: _GroupedFusedWarmupExecutor_fp4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED: _GroupedMaskedWarmupExecutor_int4_mma,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD: _GroupedNopadWarmupExecutor_int4_mma,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED: _GroupedFusedWarmupExecutor_int4_mma,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED: _GroupedFusedWarmupExecutor_int4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED: _GroupedFusedWarmupExecutor_mxfp4_valu,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -287,6 +432,69 @@ class _BaseWarmupExecutor:
     ) -> float:
         # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
+        name = kernel_type.name
+        if "FUSED" in name:
+            # Warmup uses topk=1; this bounds the vendor's block_m 16..256 metadata.
+            n_align = max_m + 1 - num_groups
+            max_blocks = num_groups - 1 + ceil_div(n_align, 16)
+            sorted_rows = (num_groups - 1 + ceil_div(n_align, 256)) * 256
+            block_size = 1 << max(0, num_groups - 1).bit_length()
+            padded_blocks = ceil_div(sorted_rows, block_size)
+            alignment_bytes = (
+                40
+                + num_groups * 4
+                + max_blocks * 16
+                + sorted_rows * 4
+                + 4
+                + max_m * 8
+                + (2 * padded_blocks + 2) * num_groups * 4
+            )
+            if "BF16I4BF16" in name:
+                scale_bytes = 1 if "MMA" in name or "VALU" in name else 2
+                tensor_bytes = (
+                    max_m * k * 2
+                    + num_groups * n * (k // 2)
+                    + num_groups * n * (k // 32) * scale_bytes
+                    + max_m * n * 2
+                )
+                return (tensor_bytes + alignment_bytes) / _GB
+            bf16 = kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED
+            tensor_bytes = (max_m * k + num_groups * n * k) * (
+                2 if bf16 else 1
+            ) + max_m * n * 2
+            if not bf16:
+                if "F4F4" in name:
+                    # K is the packed byte width; a uint16 holds the scales of
+                    # two g32 groups. During RHS preprocessing the raw scales and
+                    # the output are live at the same time, while the LHS is only
+                    # a view.
+                    tensor_bytes += (max_m + 2 * num_groups * n) * ceil_div(k, 32) * 2
+                elif "CHANNEL" in name or "I8I8" in name:
+                    tensor_bytes += (max_m + num_groups * n) * 4
+                else:
+                    tensor_bytes += (
+                        max_m * ceil_div(k, _BLOCK_SIZE)
+                        + num_groups
+                        * ceil_div(n, _BLOCK_SIZE)
+                        * ceil_div(k, _BLOCK_SIZE)
+                    ) * 4
+            return (tensor_bytes + alignment_bytes) / _GB
+        if "CHANNEL" in name or "I8I8" in name or "F4F4" in name:
+            masked = "MASKED" in name
+            grouped = name.startswith("GROUPED_")
+            lhs_groups = num_groups if masked else 1
+            rhs_groups = num_groups if grouped else 1
+            # For FP4 scales the input and the preprocessed output are live at the
+            # same time; the packed K is already a byte width.
+            scale_bytes = 2 * (k // 16) if "F4F4" in name else 4
+            return (
+                lhs_groups * max_m * k
+                + rhs_groups * n * k
+                + (lhs_groups * max_m + rhs_groups * n) * scale_bytes
+                + (num_groups if masked else max_m) * 4 * grouped
+                + lhs_groups * max_m * n * 2
+                + (rhs_groups * n * 4 if name.endswith("_BIAS") else 0)
+            ) / _GB
         is_dense_fp8 = kernel_type in (
             DeepGemmKernelType.GEMM_NT_F8F8BF16,
             DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
@@ -319,7 +527,10 @@ class _BaseWarmupExecutor:
                 + rhs_scales
                 + scale_workspace
             ) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        elif kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD,
+        ):
             return (
                 max_m * k
                 + num_groups * n * k
@@ -329,7 +540,10 @@ class _BaseWarmupExecutor:
                 + scale_workspace
                 + num_groups * rhs_scales
             ) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
+        elif kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD,
+        ):
             return (
                 max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
             ) / _GB
@@ -352,8 +566,75 @@ class _BaseWarmupExecutor:
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS]:
+            return (
+                max_m * k
+                + num_groups * n * k
+                + num_groups * n * 4
+                + max_m * 4
+                + max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS]:
+            return (
+                num_groups * max_m * k
+                + num_groups * n * k
+                + num_groups * n * 4
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS]:
+            return (max_m * k + n * k + n * 4 + max_m * n * 2) / _GB
+        elif kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED,
+        ):
+            lhs_groups = num_groups if "MASKED" in name else 1
+            return (
+                lhs_groups * max_m * k * 2
+                + num_groups * n * (k // 2)
+                + num_groups * n * (k // 32)
+                + (num_groups if "MASKED" in name else max_m) * 4
+                + lhs_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD]:
+            return (
+                max_m * k * 2
+                + num_groups * (k // 16) * (n * 2) * 4
+                + num_groups * (k // 32) * n * 2
+                + max_m * 4
+                + max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED]:
+            return (
+                num_groups * max_m * k * 2
+                + num_groups * (k // 16) * (n * 2) * 4
+                + num_groups * (k // 32) * n * 2
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.max_m = max_m
+        while True:
+            try:
+                self.setup_tensors(self.max_m, n, k, num_groups)
+                break
+            except torch.OutOfMemoryError:
+                if self.max_m <= 1:
+                    raise
+                # Drop the partially allocated tensors but keep executor config
+                # such as the recipe, then shrink M.
+                for name, value in list(vars(self).items()):
+                    if isinstance(value, torch.Tensor):
+                        delattr(self, name)
+                del value
+                torch.cuda.empty_cache()
+                self.max_m = max(1, self.max_m // 2)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        raise NotImplementedError
 
     def execute(self, m):
         raise NotImplementedError
@@ -416,6 +697,10 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
         self, max_m: int, n: int, k: int, num_groups: int, block_size: int = 128
     ):
         self.recipe = (1, block_size, block_size)
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        block_size = self.recipe[1]
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), block_size)
         self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), block_size)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
@@ -431,6 +716,9 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
@@ -447,13 +735,16 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
         self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+        bf16_grouped_gemm_nt("contiguous")(
             self.a[:m],
             self.b,
             self.out[:m],
@@ -463,6 +754,9 @@ class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
@@ -476,13 +770,13 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
 
 class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
         self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.float32)
@@ -493,6 +787,9 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
 
 class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty(
             (num_groups, max_m, k), device="cuda", dtype=torch.bfloat16
         )
@@ -503,12 +800,12 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        deep_gemm.m_grouped_bf16_gemm_nt_masked(
+        bf16_grouped_gemm_nt("masked")(
             self.a,
             self.b,
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -620,3 +917,565 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
         time.perf_counter() - t0,
         get_parallel().pp_rank,
     )
+
+
+def _empty_token_int8(size):
+    *dims, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.int8),
+        torch.empty((*dims, 1), device="cuda", dtype=torch.float32),
+    )
+
+
+def _empty_block_int8(size):
+    *dims, n, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.int8),
+        torch.empty(
+            (*dims, n, 1),
+            device="cuda",
+            dtype=torch.float32,
+        ),
+    )
+
+
+def _empty_token_fp8_channel(size):
+    *dims, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty((*dims, 1), device="cuda", dtype=torch.float32),
+    )
+
+
+def _empty_block_fp8_channel(size):
+    *dims, n, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty(
+            (*dims, n, 1),
+            device="cuda",
+            dtype=torch.float32,
+        ),
+    )
+
+
+def _empty_token_bf16(size):
+    *dims, k = size
+    return torch.empty(size, device="cuda", dtype=torch.bfloat16)
+
+
+def _empty_block_bf16(size):
+    *dims, n, k = size
+    return torch.empty(size, device="cuda", dtype=torch.bfloat16)
+
+
+def _empty_token_uint8(size):
+    *dims, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.uint8),
+        torch.empty((*dims, k // 16), device="cuda", dtype=torch.uint8),
+    )
+
+
+def _empty_block_uint8(size):
+    *dims, n, k = size
+    return (
+        torch.empty(size, device="cuda", dtype=torch.uint8),
+        torch.empty(
+            (*dims, n, k // 16),
+            device="cuda",
+            dtype=torch.uint8,
+        ),
+    )
+
+
+def _empty_marlin_int4(size, scale_dtype=torch.bfloat16):
+    # Currently deepgemm w4a16 only supports group_size=32
+    *dims, n, k = size
+    group_size = 32
+    return (
+        torch.empty(
+            (*dims, k // 16, n * 2),
+            device="cuda",
+            dtype=torch.int32,
+        ),
+        torch.empty(
+            (*dims, k // group_size, n),
+            device="cuda",
+            dtype=scale_dtype,
+        ),
+    )
+
+
+def _empty_mxfp4_w4a16_mma(size):
+    *dims, n, k = size
+    if n % 64 != 0 or k % 64 != 0:
+        raise ValueError(f"W4A16 MMA requires N/K aligned to 64, got N={n}, K={k}.")
+    return (
+        torch.empty((*dims, n, k // 2), device="cuda", dtype=torch.uint8),
+        torch.empty((*dims, n // 64, k * 2), device="cuda", dtype=torch.uint8),
+    )
+
+
+class _GroupedNopadWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _NormalWarmupExecutor_channel(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8_channel((n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.fp8_gemm_nt(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+        )
+
+
+class _GroupedContWarmupExecutor_channel(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8_channel((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_channel(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8_channel((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.fp8_m_grouped_gemm_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _GroupedNopadWarmupExecutor_channel(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_fp8_channel((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _NormalWarmupExecutor_int8(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int8((n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.gemm_int8_int8_bf16_nt(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+        )
+
+
+class _GroupedContWarmupExecutor_int8(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int8((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_int8(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int8((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _GroupedNopadWarmupExecutor_int8(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int8((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedNopadWarmupExecutor_bf16(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q = _empty_token_bf16((max_m, k))
+        self.rhs_q = _empty_block_bf16((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
+            self.lhs_q[:m],
+            self.rhs_q,
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_fp4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_uint8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_uint8((num_groups, n, k))
+        self.lhs_s = deep_gemm.preprocess_mxfp4_scales(self.lhs_s)
+        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.bias = None
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.bias,
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _GroupedNopadWarmupExecutor_fp4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_uint8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_uint8((num_groups, n, k))
+        self.lhs_s = deep_gemm.preprocess_mxfp4_scales(self.lhs_s)
+        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.bias = None
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.bias,
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _NormalWarmupExecutor_fp4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_uint8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_uint8((n, k))
+        self.lhs_s = deep_gemm.preprocess_mxfp4_scales(self.lhs_s)
+        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.bias = None
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.gemm_fp4_fp4_bf16_nt(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.bias,
+            self.out[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_fp4_bias(_GroupedMaskedWarmupExecutor_fp4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        super().setup_tensors(max_m, n, k, num_groups)
+        self.bias = torch.zeros((num_groups, n), device="cuda", dtype=torch.float32)
+
+
+class _GroupedNopadWarmupExecutor_fp4_bias(_GroupedNopadWarmupExecutor_fp4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        super().setup_tensors(max_m, n, k, num_groups)
+        self.bias = torch.zeros((num_groups, n), device="cuda", dtype=torch.float32)
+
+
+class _NormalWarmupExecutor_fp4_bias(_NormalWarmupExecutor_fp4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        super().setup_tensors(max_m, n, k, num_groups)
+        self.bias = torch.zeros((n,), device="cuda", dtype=torch.float32)
+
+
+class _GroupedMaskedWarmupExecutor_int4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_marlin_int4((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_w4a16_masked(
+            self.lhs,
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _GroupedMaskedWarmupExecutor_int4_mma(_GroupedMaskedWarmupExecutor_int4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_mxfp4_w4a16_mma((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+
+class _GroupedFusedWarmupExecutor_int4(_BaseWarmupExecutor):
+    scale_dtype = torch.bfloat16
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_marlin_int4(
+            (num_groups, n, k), self.scale_dtype
+        )
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        config, rows, experts, tokens, blocks, _, _ = deep_gemm.moe_align_block_size(
+            self.lhs[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=False
+        )
+        deep_gemm.m_grouped_gemm_w4a16_fused(
+            self.lhs[:m],
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            rows,
+            experts,
+            tokens,
+            blocks,
+            config,
+        )
+
+
+class _GroupedFusedWarmupExecutor_int4_mma(_GroupedFusedWarmupExecutor_int4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_mxfp4_w4a16_mma((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+
+class _GroupedFusedWarmupExecutor_mxfp4_valu(_GroupedFusedWarmupExecutor_int4):
+    scale_dtype = torch.uint8
+
+
+class _GroupedFusedWarmupExecutor(_BaseWarmupExecutor):
+    """Warm up the routing metadata and the gather-read GEMM without recursing into
+    the execution hook."""
+
+    dtype = "fp8"
+    perchannel = False
+    gemm_name = "m_grouped_gemm_fp8_fp8_bf16_nt_fused"
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        if self.dtype == "bf16":
+            self.lhs_q = _empty_token_bf16((max_m, k))
+            self.rhs_q = _empty_block_bf16((num_groups, n, k))
+        else:
+            if self.dtype == "int8":
+                token_factory, block_factory = _empty_token_int8, _empty_block_int8
+            elif self.perchannel:
+                token_factory, block_factory = (
+                    _empty_token_fp8_channel,
+                    _empty_block_fp8_channel,
+                )
+            else:
+                token_factory, block_factory = _empty_token_fp8, _empty_block_fp8
+            self.lhs_q, self.lhs_s = token_factory((max_m, k))
+            self.rhs_q, self.rhs_s = block_factory((num_groups, n, k))
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        config, rows, experts, tokens, blocks, _, _ = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m],
+            self.rhs_q,
+            self.topk_ids[:m],
+            perchannel_quant=self.perchannel,
+        )
+        lhs = self.lhs_q[:m]
+        rhs = self.rhs_q
+        if self.dtype != "bf16":
+            lhs = (lhs, self.lhs_s[:m])
+            rhs = (rhs, self.rhs_s)
+        getattr(deep_gemm, self.gemm_name)(
+            lhs, rhs, self.out[:m], rows, experts, tokens, blocks, config
+        )
+
+
+class _GroupedFusedWarmupExecutor_fp8_channel(_GroupedFusedWarmupExecutor):
+    perchannel = True
+
+
+class _GroupedFusedWarmupExecutor_int8(_GroupedFusedWarmupExecutor):
+    dtype = "int8"
+    perchannel = True
+    gemm_name = "m_grouped_gemm_int8_int8_bf16_nt_fused"
+
+
+class _GroupedFusedWarmupExecutor_bf16(_GroupedFusedWarmupExecutor):
+    dtype = "bf16"
+    gemm_name = "m_grouped_gemm_bf16_bf16_bf16_nt_fused"
+
+
+class _GroupedFusedWarmupExecutor_fp4(_GroupedFusedWarmupExecutor):
+    dtype = "fp4"
+    gemm_name = "m_grouped_gemm_fp4_fp4_bf16_nt_fused"
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_uint8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_token_uint8((num_groups, n, k))
+        # gather-read consumes K-major scales directly; only the RHS goes through
+        # the vendor preprocessing.
+        self.lhs_s = self.lhs_s.view(torch.uint16)
+        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+
+class _GroupedNopadWarmupExecutor_int4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_marlin_int4((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_w4a16_nopad(
+            self.lhs[:m],
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedNopadWarmupExecutor_int4_mma(_GroupedNopadWarmupExecutor_int4):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_mxfp4_w4a16_mma((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)

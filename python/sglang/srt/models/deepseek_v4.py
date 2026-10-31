@@ -3278,6 +3278,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
+            and not get_platform().is_sail
             and (get_platform().is_sm100 or get_platform().is_sm90)
             and self.hc_attn_fn.shape == (24, 20480)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
@@ -3402,7 +3403,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             )
             return y, post, comb, norm is not None
 
-        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get() and not get_platform().is_sail:
             y, post, comb = _flashinfer_hc_pre(
                 x,
                 hc_fn,
@@ -3456,6 +3457,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # dispatch cost dominates at small M (decode): dispatch by token count.
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not get_platform().is_sail
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
         ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (

@@ -6,15 +6,16 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import ceil_div, is_cuda, is_musa
+from sglang.srt.utils import ceil_div, get_device_sm, is_cuda, is_musa, is_sail
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
+_is_sail = is_sail()
 
-if _is_cuda or _is_musa:
+if _is_cuda or _is_musa or _is_sail:
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
@@ -461,6 +462,209 @@ def _silu_and_mul_post_quant_kernel(
         )
 
 
+# SAIL-only variant: channel-wise (per-token) scales plus the MXFP4 / INT8
+# output formats. Kept as a separate kernel so the per-token-group kernel above
+# stays byte-identical to upstream and CUDA never compiles this path.
+@triton.jit
+def _silu_and_mul_post_quant_kernel_sail(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    output_scale_ptr,
+    stride_output_scale_0,
+    stride_output_scale_1,
+    stride_output_scale_2,
+    masked_m_ptr,
+    size_n,
+    fp8_max,
+    fp8_min,
+    QUANT_GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
+    GEMM1_ALPHA: tl.constexpr,
+    GEMM1_CLAMP_LIMIT: tl.constexpr,
+    IS_MXFP4: tl.constexpr,
+    apply_swiglu_limit: tl.constexpr,
+    swiglu_limit,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    N_GROUPS: tl.constexpr = BLOCK_N // QUANT_GROUP_SIZE
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    if IS_MXFP4:
+        # MXFP4 quantization group size
+        GROUP_SIZE: tl.constexpr = 32
+        # Packed output: 2 e2m1 per uint8
+        offs_out_d = hidden_dim_block_index * (BLOCK_N // 2) + tl.arange(
+            0, BLOCK_N // 2
+        )
+        output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_out_d
+        # Scale output: one scale per GROUP_SIZE elements
+        NUM_GROUPS: tl.constexpr = BLOCK_N // GROUP_SIZE
+        NUM_SCALE_PAIRS: tl.constexpr = NUM_GROUPS // 2
+        offs_scale_pairs = hidden_dim_block_index * NUM_SCALE_PAIRS + tl.arange(
+            0, NUM_SCALE_PAIRS
+        )
+    else:
+        output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+    scale_base = (
+        output_scale_ptr
+        + expert_id * stride_output_scale_0
+        + hidden_dim_block_index * N_GROUPS * stride_output_scale_2
+    )
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        if GEMM1_ALPHA > 0:
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
+            gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
+
+            gate_up_2d = tl.reshape(gate_up, (N_GROUPS, QUANT_GROUP_SIZE))
+            group_absmax = tl.max(tl.abs(gate_up_2d), axis=1)
+            group_absmax = tl.maximum(group_absmax, 1e-10)
+
+            output_s = group_absmax / fp8_max
+            if SCALE_UE8M0:
+                output_s = tl.exp2(tl.ceil(tl.log2(output_s)))
+
+            inv_s = tl.reshape(1.0 / output_s, (N_GROUPS, 1))
+            output_q_2d = tl.clamp(gate_up_2d * inv_s, fp8_min, fp8_max)
+            output_q = tl.reshape(output_q_2d, (BLOCK_N,)).to(
+                output_ptr.dtype.element_ty
+            )
+
+            tl.store(
+                output_ptr_offs + token_index * stride_output_1,
+                output_q,
+                mask=offs_in_d < size_n,
+            )
+            scale_offs = scale_base + token_index * stride_output_scale_1
+            tl.store(
+                scale_offs + tl.arange(0, N_GROUPS) * stride_output_scale_2,
+                output_s,
+            )
+        else:
+            if apply_swiglu_limit:
+                gate = tl.minimum(gate, swiglu_limit)
+                up = tl.minimum(tl.maximum(up, -swiglu_limit), swiglu_limit)
+            gate = gate / (1 + tl.exp(-gate))
+            gate = gate.to(input_ptr.dtype.element_ty)
+            gate_up = up * gate
+
+            if IS_MXFP4:
+                # -- MXFP4 (e2m1) quantization with E8M0 scale, RTNE rounding --
+                # Support multiple groups per block: reshape to [NUM_GROUPS, GROUP_SIZE]
+                gate_up_grouped = tl.reshape(gate_up, [NUM_GROUPS, GROUP_SIZE])
+
+                # Per-group absmax: [NUM_GROUPS]
+                _absmax = tl.max(tl.abs(gate_up_grouped), axis=1)
+                _absmax = tl.maximum(_absmax, 1e-10)
+
+                # E8M0 scale: round-up to power-of-2, per group
+                dequant_scale = _absmax / fp8_max
+                ds_uint32 = dequant_scale.to(tl.uint32, bitcast=True)
+                ds_e8m0_uint32 = (ds_uint32 + 0x007FFFFF) & 0x7F800000
+                dequant_scale_rounded = ds_e8m0_uint32.to(tl.float32, bitcast=True)
+                quant_scale = 1.0 / dequant_scale_rounded
+                scale_e8m0 = (ds_e8m0_uint32 >> 23).to(tl.uint8)  # [NUM_GROUPS]
+
+                # Broadcast quant_scale to [NUM_GROUPS, GROUP_SIZE] for element-wise multiply
+                quant_scale_broadcast = tl.reshape(quant_scale, [NUM_GROUPS, 1])
+                quant_vals_grouped = gate_up_grouped * quant_scale_broadcast
+                quant_vals = tl.reshape(quant_vals_grouped, [BLOCK_N])
+
+                # FP32 -> e2m1 conversion
+                # Use PTX hardware instruction
+                pairs = tl.reshape(quant_vals, [BLOCK_N // 2, 2])
+                lo_f, hi_f = tl.split(pairs)
+                lo_f32 = lo_f.to(tl.float32)
+                hi_f32 = hi_f.to(tl.float32)
+
+                # PTX cvt.rn.satfinite.e2m1x2.f32: two f32 -> one packed e2m1x2 (uint8)
+                packed = tl.inline_asm_elementwise(
+                    """
+                    {
+                        .reg .b8 r;
+                        cvt.rn.satfinite.e2m1x2.f32 r, $1, $2;
+                        mov.b32 $0, {r, r, r, r};
+                    }
+                    """,
+                    constraints="=r,f,f",
+                    args=[hi_f32, lo_f32],
+                    dtype=tl.uint8,
+                    is_pure=True,
+                    pack=1,
+                )
+
+                tl.store(
+                    output_ptr_offs + token_index * stride_output_1,
+                    packed,
+                    mask=offs_out_d < (size_n // 2),
+                )
+                # Store scales
+                # Pack 2 uint8 scales into 1 uint16 and write to [E, S//2, T] layout
+                scale_pairs = tl.reshape(scale_e8m0, [NUM_SCALE_PAIRS, 2])
+                lo_s, hi_s = tl.split(scale_pairs)
+                scale_u16 = lo_s.to(tl.uint16) | (hi_s.to(tl.uint16) << 8)
+                tl.store(
+                    output_scale_ptr
+                    + expert_id * stride_output_scale_0
+                    + offs_scale_pairs * stride_output_scale_1
+                    + token_index * stride_output_scale_2,
+                    scale_u16,
+                    mask=offs_scale_pairs < (size_n // GROUP_SIZE // 2),
+                )
+            else:
+                # -- FP8 / INT8 quantization --
+                _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
+                output_s = _absmax / fp8_max
+                if SCALE_UE8M0:
+                    output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
+                output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
+                    output_ptr.dtype.element_ty
+                )
+                tl.store(
+                    output_ptr_offs + token_index * stride_output_1,
+                    output_q,
+                    mask=offs_in_d < size_n,
+                )
+                tl.store(
+                    scale_base + token_index * stride_output_scale_1,
+                    output_s,
+                )
+
+
 def silu_and_mul_masked_post_quant_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -592,6 +796,228 @@ def silu_and_mul_masked_post_quant_fwd(
     return
 
 
+# SAIL-only variant: channel-wise (per-token) scales plus the MXFP4 / INT8 output
+# formats. Kept apart from the wrapper above so the non-SAIL schedule and its
+# assertions stay exactly as upstream.
+def silu_and_mul_masked_post_quant_fwd_sail(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+    scale_ue8m0: bool = False,
+    gemm1_alpha: float = 0.0,
+    gemm1_clamp_limit: float = 0.0,
+    num_real_tokens: Optional[int] = None,
+    topk: Optional[int] = None,
+    use_int8: bool = False,
+    use_fp8: bool = True,
+    use_mxfp4: bool = False,
+    swiglu_limit: Optional[float] = None,
+):
+    """Masked (EP-MoE) fused silu_and_mul + per-token-group fp8 quant.
+
+    input  [expert_num, token_num_padded, hidden_dim * 2]
+    output [expert_num, token_num_padded, hidden_dim], dtype fp8
+    masked_m [expert_num]
+
+    ``output_scale``'s dtype selects the scale format and kernel schedule:
+      float32 [E, token_num_padded, G]: row-major scales (rounded to powers of
+        two when ``scale_ue8m0``); token axis grid-strides over the padded dim.
+      int32 [E, G // 4, token_num_padded]: packed UE8M0, 4 exponent bytes per
+        int32 (deep_gemm's MN-major packed layout, no separate transform
+        needed). Requires ``scale_ue8m0``, ``G % 4 == 0``, and
+        ``num_real_tokens``/``topk`` to size the dense flat-work grid.
+
+    ``gemm1_alpha > 0`` switches the activation to the gpt-oss swiglu
+    ``min(gate, limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
+
+    Unlike the upstream entry point above, this one also accepts channel-wise
+    (per-token) scales plus the INT8 / MXFP4 output formats, and applies
+    ``swiglu_limit`` inside the kernel. ``use_int8`` / ``use_fp8`` /
+    ``use_mxfp4`` / ``swiglu_limit`` have no upstream counterpart.
+    """
+
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+    # Channel-wise quant means intermediate_size does not have to be a multiple of
+    # the quant group size, so upstream's `size_n % quant_group_size == 0` check
+    # and its fp8 output-dtype check have no counterpart here.
+
+    apply_swiglu_limit = swiglu_limit is not None
+    swiglu_limit = float(swiglu_limit) if apply_swiglu_limit else 0.0
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+    gemm1_alpha = gemm1_alpha if gemm1_alpha is not None else 0.0
+    gemm1_clamp_limit = gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0
+
+    if output_scale.dtype == torch.int32:
+        assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
+        assert num_real_tokens is not None and topk is not None, (
+            "the packed schedule sizes its grid from num_real_tokens * topk"
+        )
+        E, m_max, _ = input.shape
+        G = size_n // quant_group_size
+        assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
+        BLOCK_N = quant_group_size * 4
+        assert size_n % BLOCK_N == 0, (
+            "packed UE8M0 path requires size_n % (4*group) == 0"
+        )
+        hidden_dim_split = size_n // BLOCK_N
+        assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
+
+        grid = (num_real_tokens * topk, hidden_dim_split)
+        _silu_and_mul_post_quant_packed_kernel[grid](
+            input,
+            *input.stride(),
+            output,
+            *output.stride(),
+            output_scale,
+            *output_scale.stride(),
+            masked_m,
+            E,
+            size_n,
+            fp8_max,
+            fp8_min,
+            QUANT_GROUP_SIZE=quant_group_size,
+            BLOCK_N=BLOCK_N,
+            GEMM1_ALPHA=gemm1_alpha,
+            GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+            E_PADDED=triton.next_power_of_2(E),
+            num_warps=1,
+        )
+        return
+
+    expert_num = len(masked_m)
+
+    if expert_num < 4:
+        BLOCK_NUM_PER_EXPERT = 64
+    else:
+        BLOCK_NUM_PER_EXPERT = 32
+    # In channel-wise quantization,
+    # the moe_intermediate_size is not a power of two for some models
+
+    quant_group_size = triton.next_power_of_2(quant_group_size)
+    if use_mxfp4:
+        if size_n > 256:
+            BLOCK_N = 256
+        elif size_n > 128:
+            BLOCK_N = 128
+        elif size_n > 64:
+            BLOCK_N = 64
+        else:
+            BLOCK_N = 32
+        num_warps = 1
+        NUM_STAGES = 3
+    elif use_int8:
+        BLOCK_N = quant_group_size
+        num_warps = 1
+        NUM_STAGES = 6
+    else:
+        # Rounding up a non-power-of-two channel-wise width still leaves a
+        # single group; a zero group count must not be treated as a multiple of
+        # an arbitrary gpb, or shared memory grows and extra scales get written.
+        groups_total = max(size_n // quant_group_size, 1)
+        gpb = 4
+        while gpb > 1:
+            block_n = quant_group_size * gpb
+            if (block_n & (block_n - 1) == 0) and (groups_total % gpb == 0):
+                break
+            gpb //= 2
+        BLOCK_N = quant_group_size * gpb
+
+        num_warps = 1
+        NUM_STAGES = 6
+
+    if not use_int8:
+        hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+    else:
+        hidden_dim_split_block_num = 1
+    assert BLOCK_N % quant_group_size == 0
+
+    if not use_mxfp4:
+        # The alpha branch writes N_GROUPS scales per hidden block; insufficient
+        # capacity would overwrite a neighboring token/expert. MXFP4 uses its own
+        # transposed scale-pair layout.
+        n_groups = BLOCK_N // quant_group_size
+        scale_slots = output_scale.shape[-1]
+        assert hidden_dim_split_block_num * n_groups <= scale_slots, (
+            f"output_scale too small: the kernel writes "
+            f"{hidden_dim_split_block_num} hidden block(s) x {n_groups} "
+            f"scale(s) per token, but output_scale.shape[-1] == {scale_slots}"
+        )
+
+    grid = (
+        hidden_dim_split_block_num,
+        BLOCK_NUM_PER_EXPERT,
+        expert_num,
+    )
+
+    fp8_max = 0
+    fp8_min = 0
+    if use_int8:
+        fp8_min = torch.iinfo(torch.int8).min
+        fp8_max = torch.iinfo(torch.int8).max
+    elif use_fp8:
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        fp8_max = finfo.max
+        fp8_min = -fp8_max
+    elif use_mxfp4:
+        assert output.dtype == torch.uint8, (
+            f"MXFP4 output must be uint8 (packed e2m1), got {output.dtype}"
+        )
+        assert output_scale.dtype == torch.uint16, (
+            f"MXFP4 scale must be uint16 (pack 2 e8m0), got {output_scale.dtype}"
+        )
+        assert quant_group_size == 32, (
+            f"MXFP4 requires quant_group_size=32 (MXFP block size), got {quant_group_size}"
+        )
+        assert get_device_sm() >= 89, (
+            "MXFP4 _silu_and_mul_post_quant_kernel impl requires the e2m1 PTX "
+            "instruction (SM 8.9+)"
+        )
+        assert not gemm1_alpha, (
+            "gemm1_alpha (oai-swiglu) has no MXFP4 e2m1 packing branch in "
+            "_silu_and_mul_post_quant_kernel; the alpha path only quantizes to "
+            "fp8/int8"
+        )
+        fp8_max = 6.0  # max abs value of e2m1 format
+        fp8_min = -6.0
+    else:
+        raise NotImplementedError
+
+    _silu_and_mul_post_quant_kernel_sail[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        output_scale,
+        *output_scale.stride(),
+        masked_m,
+        size_n,
+        fp8_max,
+        fp8_min,
+        QUANT_GROUP_SIZE=quant_group_size,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+        SCALE_UE8M0=scale_ue8m0,
+        GEMM1_ALPHA=gemm1_alpha,
+        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+        IS_MXFP4=use_mxfp4,
+        apply_swiglu_limit=apply_swiglu_limit,
+        swiglu_limit=swiglu_limit,
+    )
+    return
+
+
 @triton.jit
 def _silu_and_mul_post_quant_packed_kernel(
     input_ptr,
@@ -695,6 +1121,8 @@ def _silu_and_mul_kernel(
     size_n,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    GEMM1_ALPHA: tl.constexpr,
+    GEMM1_CLAMP_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -726,10 +1154,16 @@ def _silu_and_mul_kernel(
             mask=offs_in_d < size_n,
             other=0.0,
         ).to(tl.float32)
-        gate = gate / (1 + tl.exp(-gate))
-        gate_up = up * gate
-        # Compute SiLU in fp32 for better precision, then cast back to the
-        # input dtype.
+        if GEMM1_ALPHA > 0:
+            # Keep the same oai-swiglu formula and FP32 intermediates as the
+            # quantized activation.
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
+            gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
+        else:
+            gate = gate / (1 + tl.exp(-gate))
+            gate_up = up * gate
+        # The activation is computed in FP32 and cast back to the input dtype.
         gate_up = gate_up.to(input_ptr.dtype.element_ty)
         tl.store(
             output_ptr_offs + token_index * stride_output_1,
@@ -742,11 +1176,16 @@ def silu_and_mul_masked_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
     masked_m: torch.Tensor,
+    gemm1_alpha: float = 0.0,
+    gemm1_clamp_limit: float = 0.0,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
     output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
     masked_m shape [expert_num]
+
+    When gemm1_alpha > 0 this runs oai-swiglu: gate is only bounded from above,
+    up is clamped on both sides and then offset by 1.
     """
 
     assert input.is_contiguous()
@@ -786,6 +1225,8 @@ def silu_and_mul_masked_fwd(
         size_n,
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
+        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
+        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
         num_warps=num_warps,
     )
     return output
@@ -1129,6 +1570,47 @@ def _fwd_kernel_ep_scatter_1(
         )
 
 
+# SAIL-only variant: the runtime needs a forced sync between the cumsum store and
+# the per-expert load below, otherwise ``cur_expert_start`` reads stale data.
+# Duplicated instead of constexpr-gated so the kernel above stays byte-identical.
+@triton.jit
+def _fwd_kernel_ep_scatter_1_sail(
+    num_recv_tokens_per_expert,
+    num_valid_tokens_per_expert,
+    expert_start_loc,
+    m_indices,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_EXPERT_NUM: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+
+    offset_cumsum = tl.arange(0, BLOCK_EXPERT_NUM)
+    tokens_per_expert = tl.load(
+        num_recv_tokens_per_expert + offset_cumsum,
+        mask=offset_cumsum < num_experts,
+        other=0,
+    )
+    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
+    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
+
+    tl.debug_barrier()
+
+    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    cur_expert_padded_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_valid_token_num = tl.load(num_valid_tokens_per_expert + cur_expert)
+
+    m_indices_start_ptr = m_indices + cur_expert_start
+    off_expert = tl.arange(0, BLOCK_E)
+
+    for start_m in tl.range(0, cur_expert_padded_token_num, BLOCK_E, num_stages=4):
+        offsets = start_m + off_expert
+        tl.store(
+            m_indices_start_ptr + offsets,
+            tl.where(offsets < cur_expert_valid_token_num, cur_expert, -1),
+        )
+
+
 @triton.jit
 def _fwd_kernel_ep_scatter_2(
     total_token_num,
@@ -1217,6 +1699,118 @@ def _fwd_kernel_ep_scatter_2(
                         to_copy_s,
                         mask=mask_s,
                     )
+
+
+@triton.jit
+def _fwd_kernel_ep_scatter_2_optimal_sail(
+    total_token_num,
+    expert_start_loc,
+    recv_x,
+    recv_x_stride0,
+    recv_x_stride1,
+    recv_x_scale,
+    recv_x_scale_stride0,
+    recv_x_scale_stride1,
+    recv_topk,
+    recv_topk_stride0,
+    recv_topk_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_stride1,
+    output_tensor_scale,
+    output_tensor_scale_stride0,
+    output_tensor_scale_stride1,
+    output_index,
+    output_index_stride0,
+    output_index_stride1,
+    with_scale: tl.constexpr,
+    topk_num: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    SCALE_HIDDEN_SIZE: tl.constexpr,
+    COPY_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    num_stages: tl.constexpr,
+    is_block_wise=False,
+):
+    token_id_int32 = tl.program_id(0)
+    token_id = token_id_int32.to(tl.int64)
+
+    expert_offsets = tl.arange(0, BLOCK_SIZE)
+    expert_mask = expert_offsets < topk_num
+    expert_loc = tl.load(
+        recv_topk + token_id * recv_topk_stride0 + expert_offsets,
+        mask=expert_mask,
+        other=-1,
+    )
+
+    tt_mask = expert_mask & (expert_loc >= 0)
+    if tt_mask.sum() == 0:
+        return
+    dest_token_index_int32 = tl.atomic_add(
+        expert_start_loc + expert_loc, 1, mask=tt_mask
+    )
+    tl.store(
+        output_index + token_id * output_index_stride0 + expert_offsets,
+        dest_token_index_int32,
+        mask=tt_mask,
+        eviction_policy="evict_last",
+    )
+    tl.debug_barrier()
+    dest_token_index = tl.load(
+        output_index + token_id * output_index_stride0 + expert_offsets, mask=tt_mask
+    ).to(tl.int64)
+
+    value_offsets = tl.arange(0, COPY_SIZE)
+    for _ in tl.range(0, triton.cdiv(HIDDEN_SIZE, COPY_SIZE), num_stages=num_stages):
+        copy_mask = value_offsets < HIDDEN_SIZE
+        to_copy = tl.load(
+            recv_x + token_id * recv_x_stride0 + value_offsets, mask=copy_mask
+        )
+        output_offsets = (
+            dest_token_index[:, None] * output_tensor_stride0 + value_offsets[None, :]
+        )
+        to_copy = to_copy[None, :].broadcast_to(BLOCK_SIZE, COPY_SIZE)
+        tl.store(
+            output_tensor + output_offsets,
+            to_copy,
+            mask=(copy_mask[None, :] & tt_mask[:, None]),
+        )
+        value_offsets += COPY_SIZE
+
+    if with_scale:
+        if is_block_wise:
+            scale_offsets = tl.arange(0, COPY_SIZE)
+            for _ in tl.range(
+                0,
+                triton.cdiv(SCALE_HIDDEN_SIZE, COPY_SIZE),
+            ):
+                copy_mask = scale_offsets < SCALE_HIDDEN_SIZE
+                to_copy_scale = tl.load(
+                    recv_x_scale
+                    + token_id * recv_x_scale_stride0
+                    + scale_offsets * recv_x_scale_stride1,
+                    mask=copy_mask,
+                )
+                output_scale_offsets = (
+                    dest_token_index[:, None] * output_tensor_scale_stride0
+                    + scale_offsets[None, :] * output_tensor_scale_stride1
+                )
+                to_copy_scale = to_copy_scale[None, :].broadcast_to(
+                    BLOCK_SIZE, COPY_SIZE
+                )
+                tl.store(
+                    output_tensor_scale + output_scale_offsets,
+                    to_copy_scale,
+                    mask=(copy_mask[None, :] & tt_mask[:, None]),
+                )
+                scale_offsets += COPY_SIZE
+        else:
+            to_copy_scale = tl.load(recv_x_scale + token_id * recv_x_scale_stride0)
+            # to_copy_scale = to_copy_scale[None, :].broadcast_to(BLOCK_SIZE, 1)
+            output_scale_offsets = dest_token_index * output_tensor_scale_stride0
+            tl.store(
+                output_tensor_scale + output_scale_offsets, to_copy_scale, mask=tt_mask
+            )
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
@@ -1310,6 +1904,90 @@ def ep_scatter(
         ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
         IS_FP8=is_fp8,
     )
+    return
+
+
+# copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
+@torch.no_grad()
+def ep_scatter_sail(
+    recv_x: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    recv_x_scale: Optional[torch.Tensor],
+    output_tensor_scale: Optional[torch.Tensor],
+    BLOCK_E: int = 128,  # token num of per expert is aligned to BLOCK_E
+    BLOCK_D: int = 128,
+    is_block_wise=False,
+    num_valid_tokens_per_expert: Optional[torch.Tensor] = None,
+):
+
+    num_warps = 8
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+    if recv_x.dtype == torch.int8:
+        # current not support int8 blockwise quant, change the BLOCK_D to hidden_size
+        BLOCK_D = hidden_size
+    # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
+    grid = num_experts
+    if recv_x_scale is not None and recv_x_scale.dtype == torch.uint16:
+        # MXFP4 fused uint16 scale
+        scale_hidden_size = recv_x_scale.shape[1]
+    else:
+        scale_hidden_size = hidden_size // BLOCK_D
+
+    assert m_indices.shape[0] % BLOCK_E == 0
+
+    if num_valid_tokens_per_expert is None:
+        num_valid_tokens_per_expert = num_recv_tokens_per_expert
+
+    _fwd_kernel_ep_scatter_1_sail[(grid,)](
+        num_recv_tokens_per_expert,
+        num_valid_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+
+    grid = lambda meta: (recv_x.shape[0],)
+    _fwd_kernel_ep_scatter_2_optimal_sail[grid](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        0 if recv_x_scale is None else recv_x_scale.stride(0),
+        0 if recv_x_scale is None else recv_x_scale.stride(1),
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        0 if output_tensor_scale is None else output_tensor_scale.stride(0),
+        0 if output_tensor_scale is None else output_tensor_scale.stride(1),
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        with_scale=(recv_x_scale is not None),
+        topk_num=recv_topk.shape[1],
+        HIDDEN_SIZE=hidden_size,
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        BLOCK_SIZE=triton.next_power_of_2(recv_topk.shape[1]),
+        COPY_SIZE=512,
+        num_stages=3,
+        num_warps=8,
+        is_block_wise=is_block_wise,
+    )
+
     return
 
 
@@ -1482,6 +2160,76 @@ def _fwd_kernel_ep_gather(
         )
 
 
+# SAIL-only variant: folds ``routed_scaling_factor`` into the reduction, so the
+# caller needs no extra pass over the output. Every other target scales after the
+# gather, so the kernel above keeps its upstream signature and body.
+@triton.jit
+def _fwd_kernel_ep_gather_sail(
+    total_token_num,
+    input_tensor,
+    input_tensor_stride0,
+    input_tensor_stride1,
+    recv_topk_ids,
+    recv_topk_ids_stride0,
+    recv_topk_ids_stride1,
+    recv_topk_weight,
+    recv_topk_weight_stride0,
+    recv_topk_weight_stride1,
+    input_index,
+    input_index_stride0,
+    input_index_stride1,
+    output_tensor,
+    output_tensor_stride0,
+    output_tensor_stride1,
+    routed_scaling_factor,
+    topk_num: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    cur_block_int32 = tl.program_id(0)
+    cur_block = cur_block_int32.to(tl.int64)
+
+    start_cur_token_int32 = tl.program_id(1)
+
+    grid_num = tl.num_programs(1)
+
+    for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):
+        cur_token = cur_token_int32.to(tl.int64)
+
+        off_d = tl.arange(0, BLOCK_D)
+        accumulator = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+        for topk_index_int32 in range(0, topk_num):
+            topk_index = topk_index_int32.to(tl.int64)
+
+            expert_id = tl.load(
+                recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index
+            )
+            if expert_id >= 0:
+                source_token_index_int32 = tl.load(
+                    input_index + cur_token * input_index_stride0 + topk_index
+                )
+                source_token_index = source_token_index_int32.to(tl.int64)
+
+                acc_weight = tl.load(
+                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
+                )
+                tmp = tl.load(
+                    input_tensor
+                    + source_token_index * input_tensor_stride0
+                    + cur_block * BLOCK_D
+                    + off_d
+                )
+                accumulator += tmp.to(tl.float32) * acc_weight
+
+        tl.store(
+            output_tensor
+            + cur_token * output_tensor_stride0
+            + cur_block * BLOCK_D
+            + off_d,
+            (accumulator * routed_scaling_factor).to(output_tensor.dtype.element_ty),
+        )
+
+
 @torch.no_grad()
 def ep_gather(
     input_tensor: torch.Tensor,
@@ -1489,14 +2237,21 @@ def ep_gather(
     recv_topk_weight: torch.Tensor,
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
 ):
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
+
+    # for models (hidden_size % 128 != 0, such as gpt-oss model)
+    # avoid condition check error of the following ep_gather kernel
+    while hidden_size % BLOCK_D:
+        BLOCK_D = BLOCK_D // 2
+
     assert hidden_size % BLOCK_D == 0
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
-    _fwd_kernel_ep_gather[grid](
+    args = (
         num_tokens,
         input_tensor,
         input_tensor.stride(0),
@@ -1513,10 +2268,24 @@ def ep_gather(
         output_tensor,
         output_tensor.stride(0),
         output_tensor.stride(1),
-        topk_num=recv_topk_ids.shape[1],
-        num_warps=num_warps,
-        BLOCK_D=BLOCK_D,
     )
+    # The scaling factor is folded into the SAIL kernel only; every other caller
+    # keeps the unscaled reduction and applies the factor afterwards.
+    if routed_scaling_factor is None or routed_scaling_factor == 1.0:
+        _fwd_kernel_ep_gather[grid](
+            *args,
+            topk_num=recv_topk_ids.shape[1],
+            num_warps=num_warps,
+            BLOCK_D=BLOCK_D,
+        )
+    else:
+        _fwd_kernel_ep_gather_sail[grid](
+            *args,
+            routed_scaling_factor=routed_scaling_factor,
+            topk_num=recv_topk_ids.shape[1],
+            num_warps=num_warps,
+            BLOCK_D=BLOCK_D,
+        )
     return
 
 
@@ -1774,22 +2543,31 @@ def moe_ep_deepgemm_preprocess(
         topk_ids, num_local_experts, m_max, expert_start=expert_start
     )
 
-    gateup_input = torch.empty(
-        (num_local_experts, m_max, hidden_states.size(1)),
-        device=hidden_states.device,
-        dtype=output_dtype,
-    )
+    if output_dtype == torch.uint8:
+        # mxfp4
+        gateup_input = torch.empty(
+            (num_local_experts, m_max, hidden_states.size(1) // 2),
+            device=hidden_states.device,
+            dtype=output_dtype,
+        )
+    else:
+        gateup_input = torch.empty(
+            (num_local_experts, m_max, hidden_states.size(1)),
+            device=hidden_states.device,
+            dtype=output_dtype,
+        )
 
-    if block_shape is None:
-        block_shape = [128, 128]
-    assert len(block_shape) == 2
-    block_n, block_k = block_shape[0], block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
     # Quantize FP8 values with the UE8M0 scale directly. Rounding only the
     # scale afterward can change the represented activation by up to 2x.
     from sglang.srt.layers import deep_gemm_wrapper
 
     if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
+        if block_shape is None:
+            block_shape = [128, 128]
+        assert len(block_shape) == 2
+        block_k = block_shape[1]
+
         from sglang.kernels.ops.moe.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
@@ -1811,33 +2589,45 @@ def moe_ep_deepgemm_preprocess(
             group_size=block_k,
         )
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
-    elif is_fp8:
-        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
-        gateup_input_scale = torch.empty(
-            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
-            device=hidden_states.device,
-            dtype=scale.dtype,
-        )
-        fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            scale,
-            gateup_input,
-            gateup_input_scale,
-            src2dst,
-            topk_ids,
-            top_k,
-            hidden_states.size(1),
-            scale.size(1),
-            m_max,
-            scale.stride(0),
-            scale.stride(1),
-            BLOCK_SIZE=1024,
-            IS_FP8=True,
-            SCALE_MN_MAJOR=False,
-        )
     else:
-        scale = None
-        gateup_input_scale = None
+        # Quantize hidden_states based on output_dtype
+        if output_dtype == torch.float8_e4m3fn:
+            # SAIL quantizes channel-wise (one scale per token); every other
+            # target keeps upstream's 128-wide group when no block shape is set.
+            if block_shape is None:
+                block_k = hidden_states.size(-1) if _is_sail else 128
+            else:
+                assert len(block_shape) == 2
+                block_k = block_shape[1]
+            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        elif output_dtype == torch.int8:
+            from sglang.kernels.ops.quantization.int8_kernel import (
+                per_token_quant_int8,
+            )
+
+            assert block_shape is None
+            hidden_states, scale = per_token_quant_int8(hidden_states)
+        elif output_dtype == torch.uint8:
+            # mxfp4. `triton_kernels` is an optional dependency, so it is only
+            # imported when this SAIL-only format is actually requested.
+            from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+
+            hidden_states, scale = downcast_to_mxfp(hidden_states, torch.uint8, axis=1)
+        elif output_dtype == torch.bfloat16:
+            scale = None
+            gateup_input_scale = None
+        else:
+            raise NotImplementedError
+
+        # Allocate gateup_input_scale for quantized types
+        is_quantized = output_dtype != torch.bfloat16
+        if is_quantized:
+            gateup_input_scale = torch.empty(
+                (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+                device=hidden_states.device,
+                dtype=scale.dtype,
+            )
+
         fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
             scale,
@@ -1847,12 +2637,12 @@ def moe_ep_deepgemm_preprocess(
             topk_ids,
             top_k,
             hidden_states.size(1),
-            0,
+            scale.size(1) if is_quantized else 0,
             m_max,
-            0,
-            0,
+            scale.stride(0) if is_quantized else 0,
+            scale.stride(1) if is_quantized else 0,
             BLOCK_SIZE=1024,
-            IS_FP8=False,
+            IS_FP8=is_quantized,
             SCALE_MN_MAJOR=False,
         )
 
