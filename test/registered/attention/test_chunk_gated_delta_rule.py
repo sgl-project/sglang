@@ -483,6 +483,66 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             o[0].double(), ref, atol=2e-3, rtol=1e-2, check_dtype=False
         )
 
+    def test_output_buffer_is_written_in_place(self):
+        """A contiguous buffer of v's shape and dtype, such as the real rows of a
+        CUDA graph's static output, receives the output in place; any other
+        buffer is left alone and a new tensor is returned. The output and the
+        final states are the same either way."""
+        device = get_device()
+        dtype = torch.bfloat16
+        B, T_per_seq, pad, H, K, V, pool_size = 3, 100, 40, 4, 128, 128, 8
+        T = B * T_per_seq
+        torch.manual_seed(0)
+
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cache_indices = torch.arange(B, dtype=torch.int32, device=device)
+        cu_seqlens = torch.arange(0, T + 1, T_per_seq, dtype=torch.long, device=device)
+        q = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        k = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=dtype, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=dtype, device=device))
+        o_ref, pool_ref = self._run_chunk(
+            pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+        )
+
+        def nans(*shape, dtype=dtype):
+            return torch.full(shape, float("nan"), dtype=dtype, device=device)
+
+        padded = nans(1, T + pad, H, V)
+        for label, output, in_place in (
+            ("contiguous", nans(1, T, H, V), True),
+            ("real rows of a padded buffer", padded[:, :T], True),
+            ("other dtype", nans(1, T, H, V, dtype=torch.float32), False),
+            ("strided", nans(1, T, H, 2 * V)[..., :V], False),
+        ):
+            with self.subTest(label):
+                pool = pool_init.clone()
+                o, _, _ = chunk_gated_delta_rule(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=pool,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=cu_seqlens,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    output=output,
+                )
+                self.assertEqual(o.data_ptr() == output.data_ptr(), in_place)
+                self.assertTrue(torch.equal(o, o_ref))
+                self.assertTrue(torch.equal(pool, pool_ref))
+                if not in_place:
+                    self.assertTrue(torch.isnan(output.float()).all())
+        # Nothing is written past the rows of the output.
+        self.assertTrue(torch.isnan(padded[:, T:].float()).all())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -183,12 +183,16 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        # The FLA chunk kernel writes into the caller's buffer (e.g. the static
+        # output of a breakable prefill CUDA graph) instead of a new tensor.
+        output_args = {"output": kwargs.get("output")}
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
                     "GDN multi-item scoring is not supported by the CPU chunk kernel"
                 )
             inplace_update_args = {}
+            output_args = {}
         elif is_npu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -199,6 +203,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # The external NPU kernel does not expose the optional write-back
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
+            output_args = {}
 
         return chunk_gated_delta_rule(
             q=q,
@@ -212,6 +217,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **output_args,
         )
 
     def target_verify(
