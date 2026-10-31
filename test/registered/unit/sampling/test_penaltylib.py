@@ -379,7 +379,107 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         pen.teardown()
         self.assertFalse(hasattr(pen, "min_new_tokens"))
         self.assertFalse(hasattr(pen, "stop_token_penalties"))
+        self.assertFalse(hasattr(pen, "stop_token_ids"))
         self.assertFalse(hasattr(pen, "len_output_tokens"))
+
+    def test_ragged_stops_do_not_suppress_padding_token(self):
+        _, pen = self._setup([(3, {0, 5, 10}, 2), (3, None, 2), (3, None, None)])
+        logits = torch.arange(3 * VOCAB_SIZE, dtype=torch.float32).reshape(
+            3, VOCAB_SIZE
+        )
+        expected = logits.clone()
+        expected[0, [0, 2, 5, 10]] = -float("inf")
+        expected[1, 2] = -float("inf")
+        pen.apply(logits)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+    def test_merge_different_widths_then_filter_and_advance(self):
+        _, pen1 = self._setup([(2, None, None), (1, {5}, 2)])
+        _, pen2 = self._setup([(3, {0, 7, 8}, 2)])
+        pen1.merge(pen2)
+        pen1.filter(torch.tensor([2, 0, 1]))
+        for step in range(4):
+            logits = torch.ones(3, VOCAB_SIZE)
+            expected = logits.clone()
+            if step < 3:
+                expected[0, [0, 2, 7, 8]] = -float("inf")
+            if step < 1:
+                expected[2, [2, 5]] = -float("inf")
+            pen1.apply(logits)
+            torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+            pen1.cumulate_output_tokens(torch.tensor([10, 11, 12]))
+
+    def test_all_empty_stop_lists(self):
+        _, pen = self._setup([(3, None, None), (0, None, None)])
+        logits = torch.randn(2, VOCAB_SIZE)
+        expected = logits.clone()
+        pen.apply(logits)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+    def test_invalid_stop_ids_are_rejected_during_preparation(self):
+        for stop in (-1, VOCAB_SIZE + 1):
+            with self.subTest(stop=stop), self.assertRaises(RuntimeError):
+                self._setup([(3, {stop}, 2)])
+
+    def test_speculative_repeat_preserves_request_rows(self):
+        orch, pen = self._setup([(2, {0, 5}, 2), (0, {7}, 2), (3, None, None)])
+        for step in range(3):
+            logits = torch.ones(9, VOCAB_SIZE)
+            expected = logits.clone()
+            if step < 2:
+                expected[:3, [0, 2, 5]] = -float("inf")
+            orch.apply(logits, repeat=3)
+            torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+            pen.cumulate_output_tokens(torch.tensor([10, 11, 12]))
+
+    def test_matches_dense_reference_with_mixed_limits_and_dtypes(self):
+        generator = torch.Generator().manual_seed(42)
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for count in (1, 4, 16):
+                configs = [
+                    (
+                        i % 5,
+                        set(
+                            torch.randperm(VOCAB_SIZE, generator=generator)[
+                                : i % 7
+                            ].tolist()
+                        ),
+                        i % VOCAB_SIZE,
+                    )
+                    for i in range(count)
+                ]
+                _, pen = self._setup(configs)
+                for step in range(6):
+                    logits = torch.randn(count, VOCAB_SIZE, generator=generator).to(
+                        dtype
+                    )
+                    dense = torch.zeros(count, VOCAB_SIZE)
+                    for i, (limit, stops, eos) in enumerate(configs):
+                        if step < limit:
+                            dense[i, list(stops | {eos})] = -float("inf")
+                    expected = logits + dense.to(dtype)
+                    pen.apply(logits)
+                    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+                    pen.cumulate_output_tokens(torch.zeros(count, dtype=torch.int64))
+
+    def test_overlapping_stop_sources_and_nonfinite_logits(self):
+        req = _make_req(min_tokens=1, stop_ids={0, 2, 5}, eos_id=2)
+        req.eos_token_ids = {2, 5}
+        req.tokenizer.additional_stop_token_ids = {5, 7}
+        batch = _make_batch([req])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 0] = float("inf")
+        logits[0, 1] = float("nan")
+        logits[0, 3] = -float("inf")
+        dense = torch.zeros_like(logits)
+        dense[0, [0, 2, 5, 7]] = -float("inf")
+        expected = logits + dense
+        pen.apply(logits)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0, equal_nan=True)
 
 
 # _BatchedPenalizer base class edge cases
