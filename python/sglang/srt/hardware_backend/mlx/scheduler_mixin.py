@@ -101,6 +101,7 @@ class SchedulerMlxOverlapMixin:
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
         self.profiler_manager._profile_batch_predicate(batch)
+        self._join_launched_reqs(batch)
 
     def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
         result = self.tp_worker.finalize_mlx_result(pending.launch, pending.reqs)
@@ -213,6 +214,8 @@ class SchedulerMlxOverlapMixin:
                 # releasing host resources during graceful teardown.
                 mx.synchronize()
                 break
+
+            self.increment_scheduler_iterations()
 
             self.ingest_requests()
             if self._engine_paused:

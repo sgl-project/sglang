@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.memory_pool import (
     _set_kv_buffer_impl,
+    _set_mha_kv_buffer_prefix_valid,
     masked_set_kv_buffer_kernel,
     unwrap_write_loc,
     write_loc_is_physical,
@@ -430,10 +431,28 @@ class MHAView(MHAKVView):
             v_row_dim=self.v_row_dim,
         )
 
-    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
-        raise NotImplementedError(
-            "prefix-valid commit is unsupported under the unified layout "
-            "(it assumes token-id indexing)."
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Commit each request's live prefix at physical slot ids."""
+        _set_mha_kv_buffer_prefix_valid(
+            self,
+            layer,
+            loc_2d,
+            commit_lens,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

@@ -695,6 +695,7 @@ class SRTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
     ):
         if self.is_generation:
             return self.forward_generation_raw(
@@ -709,7 +710,10 @@ class SRTRunner:
         else:
             if self.model_type == "embedding":
                 response = self.engine.encode(
-                    prompt=prompts, image_data=image_data, dimensions=dimensions
+                    prompt=prompts,
+                    image_data=image_data,
+                    dimensions=dimensions,
+                    encoding_format=encoding_format,
                 )
                 if isinstance(response, list):
                     logits = [x["embedding"] for x in response]

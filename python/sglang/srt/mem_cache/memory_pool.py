@@ -661,6 +661,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        replayssm_request_ring: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -687,6 +688,7 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        self.replayssm_request_ring = False
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -774,11 +776,18 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                # GDN speculative replay is request-lifetime scratch. Size it by
-                # active requests instead of every persistent radix-cache slot.
+                # GDN speculative replay is request-lifetime scratch. KDA stays
+                # on every mamba slot unless host-only checkpoints index the
+                # ring by req_pool_idx (see replayssm_request_ring).
+                self.replayssm_request_ring = bool(
+                    replayssm_request_ring
+                    and enable_linear_replayssm_spec
+                    and cache_params.is_kda
+                )
                 num_slots = (
                     spec_state_size + 1
-                    if enable_linear_replayssm_spec and not cache_params.is_kda
+                    if enable_linear_replayssm_spec
+                    and (not cache_params.is_kda or self.replayssm_request_ring)
                     else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
@@ -914,9 +923,10 @@ class MambaPool:
                 # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
                 # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
                 # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
-                # with no numerical change: both the conv kernel write (idempotent
-                # overlapping stores) and `fused_conv_window_scatter_with_mask`
-                # consume the view through its strides.
+                # with no numerical change: both the conv kernel write (one tile
+                # store per row for width-4 chains, idempotent overlapping stores
+                # otherwise) and `fused_conv_window_scatter_with_mask` consume the
+                # view through its strides.
                 #
                 # Dedup the sliding-window conv-intermediate only when it is safe:
                 # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
@@ -1021,7 +1031,8 @@ class MambaPool:
             if _replayssm_on:
                 logger.info(
                     f"GDN ReplaySSM ring buffers allocated "
-                    f"(record_len={record_len}, fold={self.replayssm_spec_fold}): "
+                    f"(record_len={record_len}, fold={self.replayssm_spec_fold}, "
+                    f"slots={num_slots}, request_ring={self.replayssm_request_ring}): "
                     f"d={get_tensor_size_bytes(replayssm_d) / GB if replayssm_d is not None else 0.0:.3f}GB, "
                     f"k={get_tensor_size_bytes(replayssm_k) / GB if replayssm_k is not None else 0.0:.3f}GB, "
                     f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
@@ -1397,6 +1408,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_request_ring: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1435,6 +1447,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            replayssm_request_ring=replayssm_request_ring,
         )
 
     def _init_mamba_pool(
@@ -1455,6 +1468,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_request_ring: bool = False,
     ):
         self.state = StateStorage.empty(self.state_sub_pool)
         self.mamba_pool = self.mamba_pool_cls(
@@ -1470,6 +1484,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            replayssm_request_ring=replayssm_request_ring,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -2017,6 +2032,136 @@ class KVCache(abc.ABC):
 
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
+
+
+def _set_mha_kv_buffer_prefix_valid(
+    pool,
+    layer: RadixAttention,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    layer_id_override: Optional[int] = None,
+):
+    if layer_id_override is not None:
+        layer_id = layer_id_override
+    else:
+        layer_id = layer.layer_id
+
+    if loc_2d.ndim != 2:
+        raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+    if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+        raise ValueError(
+            "commit_lens must match loc_2d batch size: "
+            f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+        )
+
+    num_rows = int(loc_2d.numel())
+    if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+        raise ValueError(
+            "KV rows must match loc_2d size: "
+            f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
+        )
+
+    if loc_2d.device != pool.k_buffer[0].device:
+        loc_2d = loc_2d.to(device=pool.k_buffer[0].device, non_blocking=True)
+    if commit_lens.device != pool.k_buffer[0].device:
+        commit_lens = commit_lens.to(device=pool.k_buffer[0].device, non_blocking=True)
+    if loc_2d.dtype != torch.int64:
+        loc_2d = loc_2d.to(torch.int64)
+    if commit_lens.dtype != torch.int32:
+        commit_lens = commit_lens.to(torch.int32)
+
+    if not (_is_cuda or _is_hip):
+        row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            return
+        pool.set_kv_buffer(
+            layer,
+            KVWriteLoc(loc_2d.reshape(-1).index_select(0, valid_idx), physical=True),
+            cache_k.index_select(0, valid_idx),
+            cache_v.index_select(0, valid_idx),
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id,
+        )
+        return
+
+    # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
+    # row would be written at K's width and bleed into the next slot. Only this
+    # path needs the gate; the non-CUDA branch above handles both widths.
+    if pool.v_row_dim != pool.row_dim:
+        raise NotImplementedError(
+            "prefix-valid commit requires equal-width K/V rows, got "
+            f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
+        )
+
+    fused_k_scale = _resolve_fused_scale(
+        k_scale,
+        getattr(layer, "k_scale", None),
+        getattr(layer, "k_scale_float", None),
+    )
+    fused_v_scale = _resolve_fused_scale(
+        v_scale,
+        getattr(layer, "v_scale", None),
+        getattr(layer, "v_scale_float", None),
+    )
+    # fuse quantization and writing into the same kernel
+    if (
+        cache_k.dtype != pool.dtype
+        and pool.dtype == fp8_dtype
+        and fused_k_scale is not None
+        and fused_v_scale is not None
+    ):
+        _set_kv_buffer_prefix_valid_impl_fp8(
+            cache_k,
+            cache_v,
+            pool.k_buffer[layer_id - pool.start_layer].view(pool.dtype),
+            pool.v_buffer[layer_id - pool.start_layer].view(pool.dtype),
+            fused_k_scale,
+            fused_v_scale,
+            loc_2d,
+            commit_lens,
+            row_dim=pool.row_dim,
+            k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
+            v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
+        )
+        return
+
+    # fallback: eager quantization
+    if cache_k.dtype != pool.dtype:
+        if k_scale is not None:
+            cache_k.div_(k_scale)
+        if v_scale is not None:
+            cache_v.div_(v_scale)
+        if pool.dtype == fp8_dtype:
+            # Saturate like the fused kernel above; see saturate_to_fp8_range.
+            cache_k = saturate_to_fp8_range(cache_k, pool.dtype)
+            cache_v = saturate_to_fp8_range(cache_v, pool.dtype)
+        cache_k = cache_k.to(pool.dtype)
+        cache_v = cache_v.to(pool.dtype)
+
+    if pool.store_dtype != pool.dtype:
+        cache_k = cache_k.contiguous().view(pool.store_dtype)
+        cache_v = cache_v.contiguous().view(pool.store_dtype)
+    else:
+        cache_k = cache_k.contiguous()
+        cache_v = cache_v.contiguous()
+
+    _set_kv_buffer_prefix_valid_impl(
+        cache_k,
+        cache_v,
+        pool.k_buffer[layer_id - pool.start_layer],
+        pool.v_buffer[layer_id - pool.start_layer],
+        loc_2d,
+        commit_lens,
+        row_dim=pool.row_dim,
+        store_dtype=pool.store_dtype,
+    )
 
 
 class MHATokenToKVPool(KVCache, MHAKVView):
@@ -3139,124 +3284,16 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
-
-        if loc_2d.ndim != 2:
-            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
-        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
-            raise ValueError(
-                "commit_lens must match loc_2d batch size: "
-                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
-            )
-
-        num_rows = int(loc_2d.numel())
-        if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
-            raise ValueError(
-                "KV rows must match loc_2d size: "
-                f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
-            )
-
-        if loc_2d.device != self.k_buffer[0].device:
-            loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
-        if commit_lens.device != self.k_buffer[0].device:
-            commit_lens = commit_lens.to(
-                device=self.k_buffer[0].device, non_blocking=True
-            )
-        if loc_2d.dtype != torch.int64:
-            loc_2d = loc_2d.to(torch.int64)
-        if commit_lens.dtype != torch.int32:
-            commit_lens = commit_lens.to(torch.int32)
-
-        if not (_is_cuda or _is_hip):
-            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
-            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
-            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
-            if valid_idx.numel() == 0:
-                return
-            self.set_kv_buffer(
-                layer,
-                loc_2d.reshape(-1).index_select(0, valid_idx),
-                cache_k.index_select(0, valid_idx),
-                cache_v.index_select(0, valid_idx),
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id,
-            )
-            return
-
-        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
-        # row would be written at K's width and bleed into the next slot. Only this
-        # path needs the gate; the non-CUDA branch above handles both widths.
-        if self.v_row_dim != self.row_dim:
-            raise NotImplementedError(
-                "prefix-valid commit requires equal-width K/V rows, got "
-                f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
-            )
-
-        fused_k_scale = _resolve_fused_scale(
-            k_scale,
-            getattr(layer, "k_scale", None),
-            getattr(layer, "k_scale_float", None),
-        )
-        fused_v_scale = _resolve_fused_scale(
-            v_scale,
-            getattr(layer, "v_scale", None),
-            getattr(layer, "v_scale_float", None),
-        )
-        # fuse quantization and writing into the same kernel
-        if (
-            cache_k.dtype != self.dtype
-            and self.dtype == fp8_dtype
-            and fused_k_scale is not None
-            and fused_v_scale is not None
-        ):
-            _set_kv_buffer_prefix_valid_impl_fp8(
-                cache_k,
-                cache_v,
-                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
-                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
-                fused_k_scale,
-                fused_v_scale,
-                loc_2d,
-                commit_lens,
-                row_dim=self.row_dim,
-                k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
-                v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
-            )
-            return
-
-        # fallback: eager quantization
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            if self.dtype == fp8_dtype:
-                # Saturate like the fused kernel above; see saturate_to_fp8_range.
-                cache_k = saturate_to_fp8_range(cache_k, self.dtype)
-                cache_v = saturate_to_fp8_range(cache_v, self.dtype)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.contiguous().view(self.store_dtype)
-            cache_v = cache_v.contiguous().view(self.store_dtype)
-        else:
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
-
-        _set_kv_buffer_prefix_valid_impl(
-            cache_k,
-            cache_v,
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+        _set_mha_kv_buffer_prefix_valid(
+            self,
+            layer,
             loc_2d,
             commit_lens,
-            row_dim=self.row_dim,
-            store_dtype=self.store_dtype,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

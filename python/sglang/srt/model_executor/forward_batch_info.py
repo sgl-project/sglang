@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -215,9 +216,6 @@ class ForwardMode(IntEnum):
     # Represent a batch of requests having their KV cache ready to start decoding
     PREBUILT = auto()
 
-    # Split Prefill for PD multiplexing
-    SPLIT_PREFILL = auto()
-
     # Used in dLLM
     DLLM_EXTEND = auto()
 
@@ -230,7 +228,6 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.MIXED
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
         )
 
@@ -268,7 +265,6 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
-            or self == ForwardMode.SPLIT_PREFILL
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
@@ -285,9 +281,6 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
-
-    def is_split_prefill(self):
-        return self == ForwardMode.SPLIT_PREFILL
 
     def is_extend_without_speculative(self):
         return self.is_extend() and not self.is_target_verify()
@@ -625,6 +618,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Per-request target-verify geometry.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.
@@ -735,14 +730,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
-
-    # For split prefill
-    # intermediate values for split prefill
-    hidden_states: torch.Tensor = None
-    residual: torch.Tensor = None
-    model_specific_states: Dict[str, any] = None
-    # current split index of layer
-    split_index: int = 0
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
@@ -965,8 +952,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
     ):
@@ -1117,6 +1106,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            ragged_verify_layout=ragged_verify_layout,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
@@ -1293,7 +1283,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                model_runner.lora_manager.fetch_new_loras(
+                    set(ret.lora_ids), pp_loras=pp_loras
+                )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
@@ -2344,6 +2336,7 @@ def build_inner_fb_view(
         # A caller may hand in another view that does not carry this field.
         max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         spec_info=forward_batch.spec_info,
+        ragged_verify_layout=forward_batch.ragged_verify_layout,
     )
 
 

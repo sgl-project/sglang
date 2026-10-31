@@ -2,14 +2,14 @@
 title: Installation
 description: "Complete installation guide for SGLang on Ascend NPUs, including component version mapping, environment setup, and launching inference services."
 ---
-You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
+You can install SGLang using any of the methods below. Please go through [`System Settings`](#system-settings) section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
 ## Component Version Mapping For SGLang
 
 Each CANN version requires its own matched set of component versions — do not mix versions across sets.
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -28,7 +28,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -38,7 +38,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
@@ -58,7 +58,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">sgl-kernel-npu releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric-zbal</td>
@@ -69,7 +69,7 @@ Each CANN version requires its own matched set of component versions — do not 
 </table>
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -88,7 +88,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.1.0&driver=Ascend+HDK+25.5.2">HDK driver download</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -98,7 +98,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TorchNPU</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.10.0.post6</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/pytorch/releases">TorchNPU releases</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MemFabric</td>
@@ -118,7 +118,7 @@ Each CANN version requires its own matched set of component versions — do not 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2026.9.0.post9</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post9">sgl-kernel-npu releases</a></td>
     </tr>
   </tbody>
 </table>
@@ -135,14 +135,14 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 You can obtain the dependency of a specified version of CANN through an image.
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 docker pull quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
@@ -248,11 +248,11 @@ We provide SGL kernels for Ascend NPU, check [installation guide](https://github
 <Note>
 Gemma-family models (including Qwen3.5) call `sgl_kernel_npu.norm.gemma_rmsnorm`,
 whose implementation is chosen when the wheel is built: the native `torch_npu`
-operator for Ascend 910B/910C, and ACLNN RMSNorm for Ascend 950, which does not
-register that operator. **Ascend 950 users must install the `950` release
+operator for A2/A3 series, and ACLNN RMSNorm for 950PR/DT series, which does not
+register that operator. **950PR/DT series must install the `950` release
 package** (`950` appears in the asset name), or build from source with
 `bash build.sh -a kernels Ascend950PR_9599`, the target that package is built
-with. On Ascend 950, a `910b` or `a3` package fails on the first Gemma forward,
+with. On 950PR/DT, an `a2` or `a3` package fails on the first Gemma forward,
 and so does a package from a release that predates this module; check with
 `python -c "import sgl_kernel_npu.norm.gemma_rmsnorm"`.
 </Note>
@@ -261,7 +261,7 @@ and so does a package from a release that predates this module; check with
 
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
-#### Some other dependencies
+#### Additional dependencies
 
 ```bash Command
 # libGL
@@ -303,14 +303,14 @@ CANN 9.1.0 has no stable release yet, so use a validated build for now. The `can
 </Tip>
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
@@ -334,12 +334,12 @@ cd sglang/docker
 docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
 ```
 
-#### Create Docker
+#### Create Docker Container
 
-__Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
+**Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
@@ -362,7 +362,7 @@ drun --env "HF_TOKEN=<secret>" \
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 # Create a shortcut 'drun' to launch a privileged Docker container
@@ -429,7 +429,7 @@ cat /proc/sys/vm/swappiness # shows 10
 #### PD Mixed Scene
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -442,7 +442,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -464,7 +464,7 @@ python3 -m sglang.launch_server \
 1. Launch Prefill Server
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -488,7 +488,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 # Enabling CPU Affinity
@@ -521,7 +521,7 @@ python3 -m sglang.launch_server \
 2. Launch Decode Server
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 # PREFILL_IP: IP address of the first Prefill Server
@@ -541,7 +541,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
@@ -590,7 +590,7 @@ The `8995` in command script is the disaggregation bootstrap port. It must match
 #### PD Mixed Scene
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -608,7 +608,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT Series">
+  <Tab title="950PR/DT Series">
 
 ```bash Command
 # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
