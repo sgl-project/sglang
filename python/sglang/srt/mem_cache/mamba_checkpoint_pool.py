@@ -249,7 +249,13 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.store_from_pool(cache.temporal, active_slots, ckpt_slots)
         for i, c in enumerate(self.conv):
-            c[:, ckpt_slots] = cache.conv[i][:, active_slots]
+            src = cache.conv[i][:, active_slots]
+            if src.shape[2:] != c.shape[2:]:
+                raise ValueError(
+                    f"active and checkpoint conv state shapes differ at index {i}: "
+                    f"{tuple(src.shape[2:])} != {tuple(c.shape[2:])}"
+                )
+            c[:, ckpt_slots] = src
 
     def load_to_active(self, active_mamba_pool, ckpt_slots, active_slots) -> None:
         """Dequantize temporal + copy conv from checkpoint slots into the active pool
@@ -257,7 +263,13 @@ class MambaCheckpointPool:
         cache = active_mamba_pool.mamba_cache
         self.temporal.copy_to_pool(cache.temporal, ckpt_slots, active_slots)
         for i, c in enumerate(self.conv):
-            cache.conv[i][:, active_slots] = c[:, ckpt_slots].to(cache.conv[i].dtype)
+            active_conv = cache.conv[i]
+            if c.shape[2:] != active_conv.shape[2:]:
+                raise ValueError(
+                    f"checkpoint and active conv state shapes differ at index {i}: "
+                    f"{tuple(c.shape[2:])} != {tuple(active_conv.shape[2:])}"
+                )
+            active_conv[:, active_slots] = c[:, ckpt_slots].to(active_conv.dtype)
 
     @staticmethod
     def estimate_mem_usage_bytes(
@@ -302,6 +314,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     *,
     mamba_size: int,
     cache_params,
+    conv_shapes: List[tuple],
     mamba_layer_ids: List[int],
     device: str,
 ) -> Optional[MambaCheckpointPool]:
@@ -334,7 +347,9 @@ def maybe_init_int8_mamba_checkpoint_pool(
         num_heads=H,
         head_v_dim=d_v,
         head_k_dim=d_k,
-        conv_shapes=list(cache_params.shape.conv),
+        # Preserve the active pool's physical shape, including any backend-specific
+        # layout or speculative extension consumed by the kernels.
+        conv_shapes=list(conv_shapes),
         conv_dtype=cache_params.dtype.conv,
         temporal_dtype=cache_params.dtype.temporal,
     )
