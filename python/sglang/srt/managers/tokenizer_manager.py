@@ -2909,7 +2909,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else 0
                     )
                     meta_info.update(
-                        state.time_stats.convert_to_output_meta_info(completion_tokens)
+                        state.time_stats.convert_to_output_meta_info(
+                            _scheduler_time_stats(request_stats),
+                            completion_tokens,
+                            num_retractions=request_stats.retraction_count,
+                        )
                     )
 
                 del self.rid_to_state[rid]
