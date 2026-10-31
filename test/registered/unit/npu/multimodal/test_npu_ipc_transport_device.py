@@ -1,15 +1,4 @@
-"""Real-device coverage for the npu_ipc multimodal feature transport.
-
-Verifies the two NPU-specific assumptions behind the shared stream-ordered
-pool (``sglang/srt.multimodal.transport.memory_pool``):
-aclrtValueWait/aclrtValueWrite work on the consumer's IPC-opened mapping —
-so the ready/ack words need no interprocess event — including when the
-consumer sits on a different NPU than the pool.
-
-Each test spawns a producer that wraps a feature into the bounded pool and a
-consumer process that opens it, waits the ready word, reads the slice, and
-acknowledges the lease.
-"""
+"""Real-device tests for the npu_ipc multimodal feature transport."""
 
 import gc
 import multiprocessing as mp
@@ -23,12 +12,9 @@ from sglang.srt.multimodal.transport.cuda_ipc import MmItemMemoryPool
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Registered on a two-NPU suite so the cross-device case actually runs.
 register_npu_ci(est_time=30, suite="base-b-test-2-npu-a3")
 
 POOL_BYTES = 1 << 20
-# One consumer slot keeps the acknowledgement independent of the parallel
-# state, which a bare spawned process has not initialized.
 CONSUMER_SLOTS = 1
 
 
@@ -78,8 +64,6 @@ def _consume_pooled_tensor(proxy_queue, result_queue, rebuild_device=0):
             proxy, expected = proxy_queue.get(timeout=60)
         except queue.Empty:
             raise TimeoutError("consumer never received the NPU IPC proxy")
-        # This reconstruct value_waits the ready word the producer wrote in
-        # another process, on a mapping opened from the producer's handle.
         reconstructed = proxy.reconstruct_on_target_device(rebuild_device)
         torch.npu.synchronize()
         if reconstructed.cpu().tolist() != expected:
@@ -87,9 +71,6 @@ def _consume_pooled_tensor(proxy_queue, result_queue, rebuild_device=0):
     except Exception as exc:  # pragma: no cover - returned to the parent
         result_queue.put(("error", repr(exc)))
         return
-    # The process-wide pool mapping dies with this process; the transport
-    # has no manual cache teardown because the cache lives exactly as long
-    # as the process holding it.
     result_queue.put(("ok", None))
 
 
@@ -119,8 +100,6 @@ def _run_producer_consumer_test(test, consumer_device=0):
             test.fail(f"NPU IPC consumer failed: {consumer_result[1]}")
         test.assertEqual(consumer.exitcode, 0)
 
-        # The consumer's process-wide pool mapping died with its process,
-        # so the producer may now destroy the shared allocation.
         consumer_done.set()
         try:
             producer_result = producer_results.get(timeout=120)
@@ -130,8 +109,6 @@ def _run_producer_consumer_test(test, consumer_device=0):
         producer.join(timeout=10)
         test.assertEqual(producer.exitcode, 0)
     finally:
-        # Whatever failed, never strand the producer on its wait for the
-        # consumer, and leave no child process behind.
         consumer_done.set()
         for process in (consumer, producer):
             if process.is_alive():
