@@ -22,19 +22,14 @@ class TeaCacheParams(CacheParams):
             forward pass is skipped. Recommended values: 0.25 for ~1.5x speedup, 0.4 for ~1.8x,
             0.6 for ~2.0x.
         start_skipping (`int` or `float`, defaults to `5`):
-            The number of timesteps after which we may skip a forward pass. These early
-            steps define the global structure and are too critical to not skip.
-            int: The number of timesteps after which we can skip. If negative,
-                 this is an offset from the end of the schedule.
-            float (0.0 - 1.0): A percentage of the total steps (e.g., 0.1
-                               computes the first 10%).
+            The first zero-based denoising step where skipping is allowed.
+            With 5, step indices 0 through 4 are always computed.
+            Negative integers count from the end; floats specify a fraction
+            of the total denoising steps.
         end_skipping (`int` or `float`, defaults to `-1`):
-            The number of timesteps after which we are no longer able to skip
-            forward passes. The last steps refine fine textures and details.
-            int: The number of timesteps after which skipping ends. If negative,
-                 this is an offset from the total number of steps.
-            float (0.0 - 1.0): A percentage of the total steps (e.g., 0.1
-                               computes the first 10%).
+            The exclusive zero-based end of the skipping window.
+            With -1, the final denoising step is always computed.
+            These boundaries count denoising steps, not CFG forward calls.
         coefficients (`List[float]`, defaults to `[]`):
             Polynomial coefficients for rescaling the raw relative L1 distance,
             evaluated as `c[0]*x**4 + c[1]*x**3 + c[2]*x**2 + c[3]*x + c[4]`.
