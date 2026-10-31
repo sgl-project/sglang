@@ -1,7 +1,7 @@
 ---
 title: "GLM-5.3-Flash"
 metatags:
-  description: "Deploy GLM-5.3-Flash with SGLang on Ascend A3 and 950PR/DT series NPUs, including single-node and PD disaggregation modes."
+  description: "Deploy GLM-5.3-Flash with SGLang on A3 and 950PR/DT series NPUs, including single-node and PD disaggregation modes."
 ---
 
 ## Introduction
@@ -11,7 +11,7 @@ Attention (DSA), multi-token prediction (MTP), and ModelSlim quantized weights.
 
 This document demonstrates the deployment of GLM-5.3-Flash on Ascend NPUs using SGLang, including single-node
 prefill-decode mixed deployment, prefill-decode disaggregation, feature configuration, and performance tuning.
-The examples use W8A8 weights on Atlas 800I A3 and W8A8_MXFP8 weights on Ascend 950PR/DT series.
+The examples use W8A8 weights on A3 series and W8A8_MXFP8 weights on 950PR/DT series.
 
 ## Supported features
 
@@ -58,8 +58,8 @@ Before following this tutorial, complete the environment setup in the documents 
 Before downloading model weights, check the model size to reserve enough disk space.
 For PD disaggregation, download the weights to a shared directory accessible to both nodes.
 
-- [GLM-5.3-Flash-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) (W8A8, 332.97GB, for Atlas 800I A3)
-- [GLM-5.3-Flash-w8a8-mxfp8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) (W8A8_MXFP8, 338.12GB, for Ascend 950PR/DT series)
+- [GLM-5.3-Flash-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) (W8A8, 332.97GB, for A3 series)
+- [GLM-5.3-Flash-w8a8-mxfp8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) (W8A8_MXFP8, 338.12GB, for 950PR/DT series)
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model. For quantization guidance, see
   [Quantization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_quantization).
 
@@ -68,7 +68,7 @@ The checkpoint directory must contain the model configuration, tokenizer files, 
 Set `MODEL_PATH` to this directory inside the container.
 
 <Info>
-A3 single-node deployment uses one full Atlas 800I A3 node: eight cards and 16 dies, with `--tp-size 16`.
+A3 single-node deployment uses one full A3 series node: eight cards and 16 dies, with `--tp-size 16`.
 950PR/DT series single-node deployment uses eight NPU devices, with `--tp-size 8`.
 Each PD disaggregation configuration uses two nodes of the same platform: one for prefill and one for decode.
 </Info>
@@ -88,12 +88,12 @@ Replace `IMAGE`, `NAME`, and `MODEL_DIR` below, then start the container.
 For 950PR/DT series PD disaggregation, choose an image that supports DP attention.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="A3 series">
 
 ```bash Command
 # ============================================================
 # Before running, update the following variables:
-#   IMAGE: SGLang image for Ascend A3
+#   IMAGE: SGLang image for A3 series
 #   NAME: container name
 #   MODEL_DIR: model weights directory on the host
 # ============================================================
@@ -137,12 +137,12 @@ docker exec -it "$NAME" bash
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT series">
+  <Tab title="950PR/DT series">
 
 ```bash Command
 # ============================================================
 # Before running, update the following variables:
-#   IMAGE: SGLang image for Ascend 950PR/DT series
+#   IMAGE: SGLang image for 950PR/DT series
 #   NAME: container name
 #   MODEL_DIR: model weights directory on the host
 # ============================================================
@@ -194,9 +194,9 @@ docker exec -it "$NAME" bash
 Prefill and decode run in the same instance. Select the script for your platform and run it inside the container.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="A3 series">
 
-Use the ModelSlim W8A8 checkpoint on one Atlas 800I A3 node, with TP16.
+Use the ModelSlim W8A8 checkpoint on one A3 series node, with TP16.
 Replace `MODEL_PATH` with the checkpoint directory inside the container.
 
 ```shell
@@ -240,7 +240,7 @@ python3 -m sglang.launch_server \
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT series">
+  <Tab title="950PR/DT series">
 
 Use the ModelSlim W8A8_MXFP8 checkpoint on one 950PR/DT series node, with TP8 and no DP attention.
 Replace `MODEL_PATH` with the checkpoint directory inside the container.
@@ -300,9 +300,9 @@ IP address.
 Ensure the worker HTTP ports, prefill bootstrap port, and MemFabric store port are reachable between the nodes.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="A3 series">
 
-Use W8A8 weights on two Atlas 800I A3 nodes. The prefill instance uses TP4 / PP4 / DP4; the decode instance uses
+Use W8A8 weights on two A3 series nodes. The prefill instance uses TP4 / PP4 / DP4; the decode instance uses
 TP16 / PP1 / DP16 and NEXTN speculative decoding with three steps and four draft tokens.
 Run the CPU tuning commands with the required host privileges.
 
@@ -424,7 +424,7 @@ fi
 ```
 
   </Tab>
-  <Tab title="Ascend 950PR/DT series">
+  <Tab title="950PR/DT series">
 
 Use W8A8_MXFP8 weights on two 950PR/DT series nodes. Both instances use TP8 / PP1 / DP2 and NEXTN speculative decoding
 with four steps and five draft tokens. The nodes must be able to communicate over the `device_urma` transport.
