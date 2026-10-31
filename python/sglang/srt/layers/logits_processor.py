@@ -81,6 +81,7 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 _is_cpu = is_cpu()
 # On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
 _use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()

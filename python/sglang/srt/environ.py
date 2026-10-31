@@ -1082,6 +1082,19 @@ class Envs:
     # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
     SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # 5D prefix extend: FlyDSL a8w8 (fp8 Q/K/V, bf16 out) instead of bf16; used only when the layer K/V scales are 1.0.
+    SGLANG_OPT_FLYDSL_EXTEND_FP8 = EnvBool(False)
+    # aiter backend SHUFFLE 5D decode via FlyDSL pa_decode instead of pa_decode_gluon (gfx1250, sliding window aware).
+    SGLANG_OPT_FLYDSL_PA_DECODE = EnvBool(False)
+    # gfx1250 aiter backend: prefix-free causal extend attention via FlyDSL FMHA (sliding window aware).
+    SGLANG_OPT_FLYDSL_EXTEND_ATTN = EnvBool(False)
+    # gfx1250 only: Laguna fp32 router logits via FlyDSL GEMV/WMMA for M <= 64 (F.linear otherwise).
+    SGLANG_OPT_LAGUNA_ROUTER_FLYDSL = EnvBool(False)
+    # M>64 router logits: split the fp32 weight into 3 bf16 residuals and run
+    # one tuned bf16 GEMM. M<=64 stays on the FlyDSL GEMV when that flag is set.
+    SGLANG_OPT_LAGUNA_ROUTER_BF16X3 = EnvBool(False)
+    # Laguna decode: one Triton kernel for q/k RMSNorm + RoPE + fp8 KV store (triton backend, MHA pools).
+    SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)

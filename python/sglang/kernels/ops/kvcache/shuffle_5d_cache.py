@@ -265,3 +265,114 @@ def launch_gather_shuffle_5d_to_linear(
         BLOCK_D=BLOCK_D,
     )
     return key_out, value_out
+
+
+@triton.jit
+def gather_shuffle_5d_dequant(
+    key_cache_ptr,  # fp8 SHUFFLE 5D K
+    value_cache_ptr,  # fp8 SHUFFLE 5D V
+    key_out_ptr,  # (T, num_heads, head_size) contiguous, OUT dtype
+    value_out_ptr,
+    slot_mapping_ptr,  # per-token absolute slot ids (request-major)
+    token_index_ptr,  # (T,) rows of slot_mapping to read when HAS_INDEX
+    k_scale_ptr,  # [1] fp32 per-tensor scale
+    v_scale_ptr,
+    num_heads,
+    head_size,
+    block_size,
+    X: tl.constexpr,
+    HAS_INDEX: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """:func:`gather_shuffle_5d_to_linear` fused with an optional token-index lookup, fp8 -> OUT dequant
+    (x * scale) and NaN -> 0 (freed SWA slots may hold NaN bytes; masked keys must contribute 0)."""
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    if HAS_INDEX:
+        src_row = tl.load(token_index_ptr + token_idx)
+    else:
+        src_row = token_idx
+    slot_idx = tl.load(slot_mapping_ptr + src_row).to(tl.int64)
+
+    block_idx = slot_idx // block_size
+    slot_in_page = slot_idx % block_size
+    page_outer = slot_in_page // X
+    page_inner = slot_in_page % X
+
+    head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    head_mask = head_idx < num_heads
+    d = tl.arange(0, BLOCK_D)
+    d_mask = d < head_size
+    mask = head_mask[:, None] & d_mask[None, :]
+
+    layer_stride = num_heads * head_size * block_size
+    head_stride = head_size * block_size
+    k_src = (
+        block_idx * layer_stride
+        + head_idx[:, None] * head_stride
+        + (d // X)[None, :] * block_size * X
+        + slot_in_page * X
+        + (d % X)[None, :]
+    )
+    v_src = (
+        block_idx * layer_stride
+        + head_idx[:, None] * head_stride
+        + page_outer * head_size * X
+        + d[None, :] * X
+        + page_inner
+    )
+    k = tl.load(key_cache_ptr + k_src, mask=mask).to(tl.float32) * tl.load(k_scale_ptr)
+    v = tl.load(value_cache_ptr + v_src, mask=mask).to(tl.float32) * tl.load(v_scale_ptr)
+    k = tl.where(k == k, k, 0.0)
+    v = tl.where(v == v, v, 0.0)
+    out_ty = key_out_ptr.dtype.element_ty
+    dst = token_idx.to(tl.int64) * num_heads * head_size + head_idx[:, None] * head_size + d[None, :]
+    tl.store(key_out_ptr + dst, k.to(out_ty), mask=mask)
+    tl.store(value_out_ptr + dst, v.to(out_ty), mask=mask)
+
+
+def launch_gather_shuffle_5d_dequant(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    token_index: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
+    """Gather (optionally through ``token_index``) and dequantize fp8 SHUFFLE 5D K/V into contiguous
+    ``(T, num_heads, head_size)`` tensors of ``out_dtype``; T = len(token_index) or len(slot_mapping)."""
+    assert key_cache.dim() == 5 and value_cache.dim() == 5
+    num_blocks, num_heads, kc_D_over_X, block_size, X = key_cache.shape
+    head_size = kc_D_over_X * X
+    assert value_cache.shape == (num_blocks, num_heads, block_size // X, head_size, X)
+    num_tokens = (token_index if token_index is not None else slot_mapping).numel()
+    key_out = torch.empty(
+        (num_tokens, num_heads, head_size), dtype=out_dtype, device=key_cache.device
+    )
+    value_out = torch.empty_like(key_out)
+    if num_tokens == 0:
+        return key_out, value_out
+    HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
+    BLOCK_D = triton.next_power_of_2(head_size)
+    grid = (num_tokens, triton.cdiv(num_heads, HEAD_BLOCK))
+    gather_shuffle_5d_dequant[grid](
+        key_cache,
+        value_cache,
+        key_out,
+        value_out,
+        slot_mapping,
+        token_index if token_index is not None else slot_mapping,
+        k_scale.reshape(1).to(torch.float32),
+        v_scale.reshape(1).to(torch.float32),
+        num_heads,
+        head_size,
+        block_size,
+        X=X,
+        HAS_INDEX=token_index is not None,
+        HEAD_BLOCK=HEAD_BLOCK,
+        BLOCK_D=BLOCK_D,
+    )
+    return key_out, value_out
+
