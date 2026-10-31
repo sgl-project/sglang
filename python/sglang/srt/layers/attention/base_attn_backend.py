@@ -106,8 +106,10 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
     # How many window sub-pools one runner's layers may read and write through
-    # this backend: its window metadata, page tables and write ids exist once
-    # per window sub-pool it builds them for.
+    # this backend in every mode it will run: its window metadata, page tables
+    # and write ids exist once per window sub-pool it builds them for. A backend
+    # that builds them per window sub-pool in some modes only raises this, at
+    # construction, when the runner runs no other mode.
     max_window_sub_pools: int = 1
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal

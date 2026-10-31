@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
+import msgspec
 import torch
 import triton
 
@@ -115,6 +118,17 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         raise ValueError()
 
 
+class WindowRail(msgspec.Struct, kw_only=True):
+    """One window sub-pool's read rail and write ids for a forward, when a
+    runner's layers attend through several window sub-pools."""
+
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    # Extend: where each request's window starts in its prefix.
+    kv_offsets: Optional[torch.Tensor] = None
+    out_cache_loc: Optional[torch.Tensor] = None
+
+
 @dataclass
 class ForwardMetadata:
     attn_logits: torch.Tensor
@@ -145,6 +159,9 @@ class ForwardMetadata:
     lean_locks: Optional[torch.Tensor] = None
     # One int32, set by get_num_kv_splits when the decode seq lens are uneven
     uneven_batch: Optional[torch.Tensor] = None
+    # The window sub-pools other than the runner's window storage, keyed by
+    # sub-pool name (None for one window sub-pool).
+    other_windows: Optional[Dict[str, WindowRail]] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -155,6 +172,10 @@ class TritonAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+
+    # Window sub-pools other than the runner's window storage, with the window
+    # each attends over; set per instance in __init__.
+    other_windows: Mapping[str, int] = MappingProxyType({})
 
     def __init__(
         self,
@@ -427,6 +448,59 @@ class TritonAttnBackend(AttentionBackend):
             self.dllm_attention = DllmFlashAttention(self)
             self.supports_prefill_cuda_graph_max_context_size = True
 
+        # Window sub-pools other than the runner's window storage, by name, with
+        # the window each one's layers attend over; each gets its own read rail
+        # and write ids.
+        self.other_windows = self._other_window_lengths(model_runner)
+        self.other_window_kv_indptr = {
+            name: torch.zeros((max_bs + 1,), dtype=torch.int32, device=self.device)
+            for name in self.other_windows
+        }
+        if self._builds_rails_per_window(model_runner, kv_indptr_buf):
+            self.max_window_sub_pools = sys.maxsize
+
+    def _other_window_lengths(self, model_runner: ModelRunner) -> Dict[str, int]:
+        names = [
+            name
+            for name in self.runner_ids.window_sub_pools
+            if name != self.runner_ids.window_kv_kind
+        ]
+        if not names:
+            return {}
+        plan = model_runner.token_to_kv_pool_allocator.storage.plan
+        return {name: plan.sub_pool(name).lifetime.window for name in names}
+
+    def _builds_rails_per_window(
+        self, model_runner: ModelRunner, kv_indptr_buf: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether every mode this backend will run builds a rail per window
+        sub-pool: eager extend and decode, and decode graphs, without
+        speculative decoding, decode context parallelism, deterministic
+        windows, dLLM or MLA. Elsewhere one window rail is all there is, and a
+        runner over several window sub-pools is refused at binding."""
+        if (
+            self.use_mla
+            or self.dcp_size > 1
+            or self.enable_deterministic
+            or self.dllm_attention is not None
+            or self.dllm_block_size is not None
+            or self.skip_prefill
+            or kv_indptr_buf is not None
+            or model_runner.is_draft_worker
+            or not model_runner.spec_algorithm.is_none()
+        ):
+            return False
+        if not self.other_windows:
+            return True
+        # One attn_logits buffer serves every window layer: their value widths
+        # must agree, and each window must be stated.
+        plan = model_runner.token_to_kv_pool_allocator.storage.plan
+        widths = {
+            plan.sub_pool(name).geometry.v_head_dim
+            for name in (self.runner_ids.window_kv_kind, *self.other_windows)
+        }
+        return len(widths) == 1 and None not in self.other_windows.values()
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -532,6 +606,72 @@ class TritonAttnBackend(AttentionBackend):
         )
         return kv_indptr
 
+    def _other_window_rails(
+        self,
+        plan: IterationIds,
+        bs: int,
+        lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        *,
+        with_offsets: bool,
+        graph: bool = False,
+    ) -> Optional[Dict[str, WindowRail]]:
+        """Each other window sub-pool's read rail over the last ``lens`` tokens
+        of each request, clipped to that window; in the CUDA-graph buffers when
+        ``graph``."""
+        if not self.other_windows:
+            return None
+        rails = {}
+        for name, window in self.other_windows.items():
+            kv_indptr, kv_indices, _, kv_offsets = update_sliding_window_buffer(
+                self.other_window_kv_indptr[name],
+                self.runner_ids,
+                plan,
+                req_pool_indices,
+                window,
+                lens,
+                bs,
+                self.device,
+                self.token_to_kv_pool,
+                window_kv_indices=(
+                    self.cuda_graph_other_window_kv_indices[name] if graph else None
+                ),
+                kind=name,
+            )
+            rails[name] = WindowRail(
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_offsets=kv_offsets if with_offsets else None,
+            )
+        return rails
+
+    def _window_rail(self, layer: RadixAttention):
+        """``(kv_indptr, kv_indices, kv_offsets)`` of the window sub-pool
+        ``layer`` attends through."""
+        metadata = self.forward_metadata
+        if metadata.other_windows is not None:
+            rail = metadata.other_windows.get(
+                self.kv_layers.route(layer.layer_id).sub_pool
+            )
+            if rail is not None:
+                return rail.kv_indptr, rail.kv_indices, rail.kv_offsets
+        return (
+            metadata.window_kv_indptr,
+            metadata.window_kv_indices,
+            metadata.window_kv_offsets,
+        )
+
+    def _window_write_locs(self) -> Optional[Dict[str, torch.Tensor]]:
+        others = self.forward_metadata.other_windows
+        if others is None:
+            return None
+        locs = {
+            name: rail.out_cache_loc
+            for name, rail in others.items()
+            if rail.out_cache_loc is not None
+        }
+        return locs or None
+
     def _update_decode_kv_buffers(
         self,
         plan: IterationIds,
@@ -580,6 +720,9 @@ class TritonAttnBackend(AttentionBackend):
                 token_to_kv_pool=self.token_to_kv_pool,
                 window_kv_indices=self.cuda_graph_window_kv_indices,
             )
+        self._other_window_rails(
+            plan, bs, seq_lens, req_pool_indices, with_offsets=False, graph=True
+        )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
     def _target_verify_num_tokens_per_req(self, spec_info: Optional[SpecInput]) -> int:
@@ -824,6 +967,9 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
                 swa_out_cache_loc,
+                self._fill_cuda_graph_other_out_cache_locs(
+                    forward_batch, in_capture=True
+                ),
             )
         else:
             self._apply_cuda_graph_metadata(
@@ -835,8 +981,9 @@ class TritonAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             # Metadata view is reused from capture; the write loc is the
-            # runner's slot, so only the swa twin needs refilling.
+            # runner's slot, so only the window write ids need refilling.
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+            self._fill_cuda_graph_other_out_cache_locs(forward_batch)
 
     def _fill_cuda_graph_swa_out_cache_loc(
         self, forward_batch: ForwardBatch, in_capture: bool = False
@@ -864,6 +1011,23 @@ class TritonAttnBackend(AttentionBackend):
             )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
+    def _fill_cuda_graph_other_out_cache_locs(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """`_fill_cuda_graph_swa_out_cache_loc` for each other window sub-pool."""
+        if not self.other_windows or forward_batch.out_cache_loc is None:
+            return None
+        n = forward_batch.out_cache_loc.shape[0]
+        views = {}
+        for name, buffer in self.cuda_graph_other_out_cache_loc.items():
+            buffer[n:].zero_()
+            if in_capture:
+                buffer[:n].zero_()
+            else:
+                buffer[:n].copy_(self.runner_ids.write_ids(forward_batch, name))
+            views[name] = buffer[:n]
+        return views
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
@@ -883,6 +1047,7 @@ class TritonAttnBackend(AttentionBackend):
         # to None so the shared ForwardMetadata constructor works for extend/verify.
         lean_Mp = lean_Lp = lean_Op = lean_locks = None
         uneven_batch = None
+        other_windows = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
@@ -931,6 +1096,13 @@ class TritonAttnBackend(AttentionBackend):
                         (bs,), dtype=torch.int32, device=self.device
                     )
                     self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
+                other_windows = self._other_window_rails(
+                    forward_batch.iteration_ids,
+                    bs,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    with_offsets=False,
+                )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -1108,6 +1280,13 @@ class TritonAttnBackend(AttentionBackend):
                             bs,
                         )
                     )
+            other_windows = self._other_window_rails(
+                forward_batch.iteration_ids,
+                bs,
+                forward_batch.extend_prefix_lens,
+                forward_batch.req_pool_indices,
+                with_offsets=True,
+            )
 
             qo_indptr = self.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1128,6 +1307,8 @@ class TritonAttnBackend(AttentionBackend):
             swa_out_cache_loc = self.runner_ids.write_ids(
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
+            for name, rail in (other_windows or {}).items():
+                rail.out_cache_loc = self.runner_ids.write_ids(forward_batch, name)
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
@@ -1152,6 +1333,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Op=lean_Op,
             lean_locks=lean_locks,
             uneven_batch=uneven_batch,
+            other_windows=other_windows,
         )
 
     def init_cuda_graph_state(
@@ -1272,6 +1454,17 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        # Each other window sub-pool's read rail and write ids, as above.
+        self.cuda_graph_other_window_kv_indices = {
+            name: torch.zeros(
+                (max_num_tokens * window,), dtype=torch.int64, device=self.device
+            )
+            for name, window in self.other_windows.items()
+        }
+        self.cuda_graph_other_out_cache_loc = {
+            name: torch.zeros((max_num_tokens,), dtype=torch.int64, device=self.device)
+            for name in self.other_windows
+        }
 
     def _build_cuda_graph_forward_metadata(
         self,
@@ -1279,6 +1472,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         swa_out_cache_loc: Optional[torch.Tensor] = None,
+        other_out_cache_locs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> ForwardMetadata:
         """Construct ForwardMetadata from the current cuda-graph buffer state.
 
@@ -1314,6 +1508,22 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Op=self.cuda_graph_lean_Op,
                 lean_locks=self.cuda_graph_lean_locks,
                 uneven_batch=self.cuda_graph_uneven_batch,
+                other_windows=(
+                    {
+                        name: WindowRail(
+                            kv_indptr=self.other_window_kv_indptr[name][: bs + 1],
+                            kv_indices=self.cuda_graph_other_window_kv_indices[name],
+                            out_cache_loc=(
+                                None
+                                if other_out_cache_locs is None
+                                else other_out_cache_locs[name]
+                            ),
+                        )
+                        for name in self.other_windows
+                    }
+                    if self.other_windows
+                    else None
+                ),
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -1696,11 +1906,15 @@ class TritonAttnBackend(AttentionBackend):
 
         if k is None and v is None:
             cache_loc = forward_batch.out_cache_loc
-            if (
-                self.use_sliding_window_kv_pool
-                and self.kv_layers.route(layer.layer_id).sub_pool
-                == IdSpaceKind.SLIDING_WINDOW
-            ):
+            sub_pool = (
+                self.kv_layers.route(layer.layer_id).sub_pool
+                if self.use_sliding_window_kv_pool
+                else None
+            )
+            window_locs = self._window_write_locs()
+            if window_locs is not None and sub_pool in window_locs:
+                cache_loc = window_locs[sub_pool]
+            elif sub_pool == IdSpaceKind.SLIDING_WINDOW:
                 assert self.forward_metadata.swa_out_cache_loc is not None, (
                     "window-layer read-back before the metadata carried a "
                     "sliding-window write loc"
@@ -1717,6 +1931,7 @@ class TritonAttnBackend(AttentionBackend):
                 loc_info = KVWriteLoc.for_batch(
                     forward_batch,
                     swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    window_locs=self._window_write_locs(),
                 )
                 if layer.k_scale is None:
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
@@ -1816,9 +2031,7 @@ class TritonAttnBackend(AttentionBackend):
             sliding_window_size = (
                 -1 if bidirectional_extend else layer.sliding_window_size
             )
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
-            window_kv_offsets = self.forward_metadata.window_kv_offsets
+            kv_indptr, kv_indices, window_kv_offsets = self._window_rail(layer)
             # A null read rail reaches Triton as `None + offsets` and fails as
             # an unreadable IR-build error; say what is actually missing.
             assert kv_indices is not None, (
@@ -2332,6 +2545,7 @@ class TritonAttnBackend(AttentionBackend):
                     KVWriteLoc.for_batch(
                         forward_batch,
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=self._window_write_locs(),
                     ),
                     k,
                     v,
@@ -2343,6 +2557,7 @@ class TritonAttnBackend(AttentionBackend):
                     KVWriteLoc.for_batch(
                         forward_batch,
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=self._window_write_locs(),
                     ),
                     k,
                     v,
@@ -2351,8 +2566,7 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            kv_indptr = self.forward_metadata.window_kv_indptr
-            kv_indices = self.forward_metadata.window_kv_indices
+            kv_indptr, kv_indices, _ = self._window_rail(layer)
             # A null read rail reaches Triton as `None + offsets` and fails as
             # an unreadable IR-build error; say what is actually missing.
             assert kv_indices is not None, (
@@ -2791,12 +3005,14 @@ def update_sliding_window_buffer(
     device=None,
     token_to_kv_pool=None,
     window_kv_indices=None,
+    kind=None,
 ):
     """Fill window KV buffers for sliding-window attention.
 
     Pass ``window_kv_indices`` to write into a pre-allocated buffer (CUDA-graph
     path); omit it (or pass ``None``) to allocate a fresh tensor (eager path,
-    requires ``device``).
+    requires ``device``). ``kind`` names the window sub-pool to read, the
+    runner's window storage by default.
 
     Unified pool: the gather reads the swa sub-pool's own id space (built
     directly from virtual ids through the swa side's own v2p), so the window
@@ -2830,12 +3046,13 @@ def update_sliding_window_buffer(
         indptr=window_kv_indptr,
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        kind=runner_ids.window_kv_kind,
+        kind=runner_ids.window_kv_kind if kind is None else kind,
         token_mapping=token_mapping,
     )
     if not translated and runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None:
         kv_last_index = window_kv_indptr[-1]
         window_kv_indices[:kv_last_index] = runner_ids.ids_in(
-            IdSpaceKind.SLIDING_WINDOW, window_kv_indices[:kv_last_index]
+            IdSpaceKind.SLIDING_WINDOW if kind is None else kind,
+            window_kv_indices[:kv_last_index],
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
