@@ -165,11 +165,12 @@ def test_split_gate():
 
 
 def test_split_enabled_per_gpu_and_tp():
-    """Only measured (GPU, TP) pairs take the split; GB300 keeps the fused routing at every size."""
+    """Only measured (GPU, TP) pairs take the split, from their measured token count."""
     for tp in (4, 8):
         assert split_enabled(num_tokens=8, tp_size=tp, capability=(10, 7))
         assert split_enabled(num_tokens=1024, tp_size=tp, capability=(10, 7))
-        assert not split_enabled(num_tokens=1024, tp_size=tp, capability=(10, 3))
+        assert not split_enabled(num_tokens=256, tp_size=tp, capability=(10, 3))
+        assert split_enabled(num_tokens=512, tp_size=tp, capability=(10, 3))
     assert not split_enabled(num_tokens=4, tp_size=4, capability=(10, 7))
     assert not split_enabled(num_tokens=64, tp_size=2, capability=(10, 7))
 

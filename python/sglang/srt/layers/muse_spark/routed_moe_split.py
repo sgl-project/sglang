@@ -60,10 +60,11 @@ def _default_tile(*, num_tokens: int, top_k: int, num_local_experts: int) -> int
 
 
 # Smallest token count from which the split was measured to beat the fused routing, per
-# (compute capability, TP size); unlisted configurations keep the fused routing. SM107 gains at every
-# measured decode size (M = 8-1024, DFlash 8 tokens). GB300 (10, 3) is unlisted: with the cuBLAS router
-# GEMM its router stream gates the experts at nearly every token count, so the split only adds overhead.
+# (compute capability, TP size); unlisted configurations keep the fused routing. On GB300 the router
+# stream gates the experts below M = 512, where the split only adds overhead.
 _SPLIT_MIN_TOKENS: dict[tuple[tuple[int, int], int], int] = {
+    ((10, 3), 4): 512,
+    ((10, 3), 8): 512,
     ((10, 7), 4): 8,
     ((10, 7), 8): 8,
 }

@@ -30,6 +30,10 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
 from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
+from sglang.kernels.ops.gemm.muse_spark_router_gemm_cutedsl import (
+    router_tf32,
+    router_tf32_eligible,
+)
 from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
     router_gemv_cute,
     router_gemv_cute_eligible,
@@ -252,6 +256,8 @@ class MuseSpark1xRouter(nn.Module):
         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
         if router_gemv_cute_eligible(hidden_states, self.weight):
             return router_gemv_cute(hidden_states, self.weight)
+        if router_tf32_eligible(hidden_states, self.weight):
+            return router_tf32(hidden_states, self.weight)
         return F.linear(hidden_states, self.weight)
 
 
