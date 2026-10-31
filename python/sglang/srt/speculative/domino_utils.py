@@ -324,9 +324,14 @@ def domino_greedy_rollout(
     lm_head_org_vocab_start: int = 0,
     lm_head_num_org: int | None = None,
     lm_head_num_org_padded: int | None = None,
+    logits_mup_width_multiplier: float | None = None,
     in_cuda_graph: bool,
 ) -> torch.Tensor:
-    """Generate a Domino chain using one block-shared base-logit candidate pool."""
+    """Generate a Domino chain using one block-shared base-logit candidate pool.
+
+    ``logits_mup_width_multiplier`` (muP targets) divides only the base-logit
+    input; the correction path keeps the unscaled draft hidden.
+    """
     if draft_hidden.ndim != 3:
         raise ValueError(
             f"draft_hidden must have shape [batch, block, hidden], got {tuple(draft_hidden.shape)}."
@@ -378,6 +383,8 @@ def domino_greedy_rollout(
         )
     weight = lm_head_weight[:local_vocab_size]
     z_for_logits = z.to(weight.dtype) if z.dtype != weight.dtype else z
+    if logits_mup_width_multiplier:
+        z_for_logits = z_for_logits / logits_mup_width_multiplier
     logits_input = (
         z_for_logits.transpose(0, 1)
         .contiguous()

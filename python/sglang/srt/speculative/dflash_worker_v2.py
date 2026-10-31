@@ -333,6 +333,7 @@ class _DominoDraftSampler:
         lm_head_org_vocab_start=0,
         lm_head_num_org=None,
         lm_head_num_org_padded=None,
+        logits_mup_width_multiplier=None,
     ):
         self.target_embedding = target_embedding
         self.lm_head_weight = lm_head_weight
@@ -346,6 +347,7 @@ class _DominoDraftSampler:
         self.lm_head_org_vocab_start = int(lm_head_org_vocab_start)
         self.lm_head_num_org = lm_head_num_org
         self.lm_head_num_org_padded = lm_head_num_org_padded
+        self.logits_mup_width_multiplier = logits_mup_width_multiplier
         max_tokens = int(max_bs) * (self.block_size - 1)
         self.out = torch.empty(
             (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
@@ -371,6 +373,7 @@ class _DominoDraftSampler:
             lm_head_org_vocab_start=self.lm_head_org_vocab_start,
             lm_head_num_org=self.lm_head_num_org,
             lm_head_num_org_padded=self.lm_head_num_org_padded,
+            logits_mup_width_multiplier=self.logits_mup_width_multiplier,
             in_cuda_graph=True,
         )
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
@@ -440,6 +443,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        # Same contract as DSpark: muP targets declare
+        # logits_mup_width_multiplier and the draft was trained against the
+        # folded head. Set before init_cuda_graphs captures the draft head.
+        self.draft_model.logits_mup_width_multiplier = getattr(
+            target_worker.model_runner.model_config.hf_text_config,
+            "logits_mup_width_multiplier",
+            None,
+        )
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -971,6 +982,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head_num_org_padded=(
                     int(shard.num_org_elements_padded) if shard is not None else None
                 ),
+                logits_mup_width_multiplier=self.draft_model.logits_mup_width_multiplier,
             )
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
@@ -2748,6 +2760,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head_num_org_padded=(
                     int(shard.num_org_elements_padded) if shard is not None else None
                 ),
+                logits_mup_width_multiplier=self.draft_model.logits_mup_width_multiplier,
                 in_cuda_graph=False,
             )
         elif self._draft_sampler is not None and draft_out.can_run_graph:
