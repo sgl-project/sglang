@@ -16,6 +16,10 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
+# Mooncake registers the KV pool through HIP dma-buf, which MI355X charges against free
+# GPU memory a second time, so keep the pool small enough to fit.
+PD_MEM_FRACTION_STATIC = "0.4"
+
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
@@ -59,6 +63,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--disable-overlap-schedule",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -82,6 +88,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "4",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -153,6 +161,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--enable-dynamic-chunking",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -176,6 +186,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "4",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -246,6 +258,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--disable-overlap-schedule",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -271,6 +285,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "4",
             "--attention-backend",
             "aiter",
+            "--mem-fraction-static",
+            PD_MEM_FRACTION_STATIC,
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
