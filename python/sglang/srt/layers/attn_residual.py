@@ -24,7 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import bind_or_assign, is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -67,6 +67,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -77,9 +79,10 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
     return cw
 
 
