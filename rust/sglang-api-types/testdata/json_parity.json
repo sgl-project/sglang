@@ -36,7 +36,7 @@
           "weight_versions": []
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null}}"
     },
     {
       "type": "GenerateResponse",
@@ -54,7 +54,7 @@
           ]
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0,\"weight_versions\":[{\"version\":\"v1\",\"start\":0,\"end\":0}]}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0,\"weight_versions\":[{\"version\":\"v1\",\"start\":0,\"end\":0}],\"cached_tokens_details\":null}}"
     },
     {
       "type": "ListModelsResponse",
@@ -234,11 +234,11 @@
           8
         ]
       },
-      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"client-rid\",\"prompt_tokens\":5,\"completion_tokens\":2,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0},\"output_ids\":[7,8]}"
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"client-rid\",\"prompt_tokens\":5,\"completion_tokens\":2,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null},\"output_ids\":[7,8]}"
     },
     {
       "type": "GenerateResponse",
-      "name": "terminal batch frame with every logprob family, null rows, hidden states, e2e_latency, cache and reasoning counts, weight versions, media counts, index",
+      "name": "terminal batch frame with every logprob family, null rows, hidden states, e2e_latency, cache and reasoning counts, cached-token details by tier, weight versions, media counts, index",
       "input": {
         "text": "ok",
         "meta_info": {
@@ -319,14 +319,20 @@
               "end": 1
             }
           ],
-          "image_tokens": 8
+          "image_tokens": 8,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 2,
+            "storage": 1,
+            "storage_backend": "HiCacheFile"
+          }
         },
         "output_ids": [
           5
         ],
         "index": 0
       },
-      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01,\"cached_tokens\":4,\"reasoning_tokens\":2,\"weight_version\":\"new\",\"weight_versions\":[{\"version\":\"old\",\"start\":0,\"end\":1},{\"version\":\"new\",\"start\":1,\"end\":1}],\"image_tokens\":8},\"output_ids\":[5],\"index\":0}"
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":1,\"finish_reason\":{\"type\":\"stop\",\"matched\":[1,2]},\"output_token_logprobs\":[[-0.5,5,\"x\"],[null,6,null]],\"input_token_logprobs\":[],\"output_top_logprobs\":[null,[[-0.25,6,null]]],\"input_top_logprobs\":[[[-0.125,1,\"<s>\"]]],\"output_token_ids_logprobs\":[[[-0.5,9,null]]],\"input_token_ids_logprobs\":[null],\"hidden_states\":[[0.5,0.25],[]],\"e2e_latency\":0.01,\"cached_tokens\":4,\"reasoning_tokens\":2,\"weight_version\":\"new\",\"weight_versions\":[{\"version\":\"old\",\"start\":0,\"end\":1},{\"version\":\"new\",\"start\":1,\"end\":1}],\"image_tokens\":8,\"cached_tokens_details\":{\"device\":1,\"host\":2,\"storage\":1,\"storage_backend\":\"HiCacheFile\"}},\"output_ids\":[5],\"index\":0}"
     },
     {
       "type": "GenerateResponse",
@@ -343,7 +349,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9},\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null}}"
     },
     {
       "type": "GenerateResponse",
@@ -362,7 +368,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"abort\",\"message\":\"over the limit\",\"status_code\":400,\"err_type\":null},\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"abort\",\"message\":\"over the limit\",\"status_code\":400,\"err_type\":null},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null}}"
     },
     {
       "type": "GenerateResponse",
@@ -379,7 +385,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"detail\":3,\"type\":\"novel\"},\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"detail\":3,\"type\":\"novel\"},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null}}"
     },
     {
       "type": "GenerateStreamError",
@@ -505,7 +511,7 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]},\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null}}"
     },
     {
       "type": "AttachHiCacheStorageRequest",
