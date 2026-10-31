@@ -14,7 +14,7 @@ In long-context LLM inference, each decoding request holds a full-length KV cach
 
 - **Reducing GPU memory per request**: Each request occupies only a fixed-size device buffer (e.g., 4KB tokens) instead of the full sequence length.
 - **On-demand swap-in**: A CUDA kernel dynamically loads the top-k most relevant KV entries from host memory based on attention scores.
-- **Transparent to prefill**: HiSparse is entirely a decode-side optimization; the prefill instance requires no changes.
+- **Decode-side only**: HiSparse runs only on the decode instance; the prefill instance needs no HiSparse flags (see the DSA KV layout note below).
 
 ## Design Overview
 
@@ -144,6 +144,8 @@ python3 -m sglang.launch_server \
     --nnodes 1 --node-rank 0
 ```
 
+> **Note (DSA on SM100+)**: PD transfers KV rows byte for byte, so both instances must store the same row layout. With the default `--kv-cache-dtype auto` (FP8 on SM100+), a HiSparse decode stores FlashMLA's packed FP8 rows, while a prefill on its default `trtllm` backend stores raw rows. Add `--dsa-prefill-backend flashmla_kv --dsa-decode-backend flashmla_kv` to the prefill instance; the decode backend flag is needed because startup autotune runs a decode forward on the prefill too. A mismatched pair is rejected at the PD handshake.
+
 ### Decode Instance (with HiSparse)
 
 ```bash Command
@@ -195,7 +197,7 @@ python3 -m sglang.bench_serving \
 
 ### Key Notes
 
-- The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
+- The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse. For DSA models with FP8 KV on SM100+, it does need `--dsa-prefill-backend flashmla_kv --dsa-decode-backend flashmla_kv` so its KV rows match the HiSparse decode.
 - On the decode instance, `--enable-hisparse` and `--hisparse-config` are required for HiSparse.
 - For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
 - On SM120/SM121 (e.g. RTX PRO 6000, RTX 5090) with GLM DSA models and `--kv-cache-dtype fp8_e4m3`, both DSA backends resolve to `flashinfer_sparse_mla`, which is the only DSA kernel available on that architecture. HiSparse accepts it there; no extra flag is needed.
