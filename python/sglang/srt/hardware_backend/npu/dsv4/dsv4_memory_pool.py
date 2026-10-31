@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
+    HiSparseC4DevicePool,
 )
 from sglang.srt.runtime_context import get_schedule
 
@@ -90,6 +91,71 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
             kv_dim,
             dtype=kv_dtype,
             device=self.device,
+        )
+
+
+class NPUHiSparseC4DevicePool(NPUDeepSeekV4SingleKVPool):
+    """NPU counterpart of the CUDA ``HiSparseC4DevicePool``.
+
+    Adds ``compress_ratio`` / ``data_ptrs`` and the three-level
+    full -> compressed -> hisparse-device loc translation on top of the NPU
+    PA_ND single KV pool; write paths translate the loc to the sparse device
+    address before storing.
+    """
+
+    compress_ratio = 4
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.kv_layout is KVLayout.V4, (
+            f"HiSparse C4 pools support the V4 layout only, got {self.kv_layout}"
+        )
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
+        self.full_to_hisparse_device_index_mapping = (
+            full_to_hisparse_device_index_mapping
+        )
+
+    def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
+        mask = (full_indices + 1) % self.compress_ratio == 0
+        return full_indices[mask] // self.compress_ratio
+
+    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
+            torch.int32
+        )
+
+    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        return self.full_to_hisparse_device_index_mapping[compressed_indices]
+
+    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
+        return self._translate_loc_to_hisparse_device(
+            self.translate_loc_from_full_to_compressed(full_indices)
+        )
+
+    def set_key_buffer(self, layer_id, loc, cache_nope_fp8_rope_bf16_pack):
+        loc = self.translate_loc_to_hisparse_device(loc)
+        super().set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
+
+    def set_key_buffer_fused(self, layer_id, loc, cache_k, freqs_cis=None):
+        loc = self.translate_loc_to_hisparse_device(loc)
+        return super().set_key_buffer_fused(layer_id, loc, cache_k, freqs_cis)
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError(
+            "NPUHiSparseC4DevicePool does not support get_cpu_copy"
+        )
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        raise NotImplementedError(
+            "NPUHiSparseC4DevicePool does not support load_cpu_copy"
         )
 
 
@@ -292,11 +358,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         cls: type = DeepSeekV4SingleKVPool,
         kv_layout: KVLayout = KVLayout.V4,
     ) -> NPUDeepSeekV4SingleKVPool:
-        # NPU does not use the HiSparse c4 device pool; fail loud if someone
-        # enables it so the silent layout mismatch surfaces at init.
-        assert cls is DeepSeekV4SingleKVPool, (
-            "enable_hisparse is not supported on the NPU DSV4 KV pool "
-            f"(got c4 pool class {cls.__name__})."
+        # Only the plain single KV pool and the HiSparse C4 pool have NPU
+        # counterparts; anything else would silently mismatch the page layout.
+        assert cls in (DeepSeekV4SingleKVPool, HiSparseC4DevicePool), (
+            f"NPU DSV4 KV pool got an unsupported c4 pool class {cls.__name__}."
         )
         # The V4.1 fp8 / fp4 page layouts are CUDA FlashMLA formats.
         assert kv_layout is KVLayout.V4, f"NPU pools do not support {kv_layout}"
@@ -310,7 +375,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             kernel_page_size = self.c128_page_size
         else:
             kernel_page_size = global_page_size
-        return NPUDeepSeekV4SingleKVPool(
+        npu_pool_cls = (
+            NPUHiSparseC4DevicePool
+            if cls is HiSparseC4DevicePool
+            else NPUDeepSeekV4SingleKVPool
+        )
+        return npu_pool_cls(
             size,
             page_size,
             dtype,

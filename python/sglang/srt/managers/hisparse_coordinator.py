@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_npu, is_xpu
 
 if is_xpu():
     from sgl_kernel import (
@@ -62,6 +62,12 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
+
+# The host<->device KV backups below used to hardcode io_backend="kernel", which is
+# the CUDA binding: memory_pool_host imports transfer_kv_all_layer_mla only for
+# CUDA/HIP/XPU. NPU exposes transfer_kv_dim_exchange from sgl_kernel_npu.kvcacheio
+# and is served by the "kernel_ascend" backend, so pick it per platform.
+_HISPARSE_IO_BACKEND = "kernel_ascend" if is_npu() else "kernel"
 
 
 class HiSparseAct(NamedTuple):
@@ -394,7 +400,7 @@ class HiSparseSpecSwapManager:
                 coordinator.mem_pool_device,
                 host_locs,
                 device_locs,
-                io_backend="kernel",
+                io_backend=_HISPARSE_IO_BACKEND,
             )
             if host_locs.is_cuda:
                 host_locs.record_stream(coordinator.decode_backup_stream)
@@ -687,9 +693,11 @@ class HiSparseCoordinator:
             dtype=torch.int32,
             device=device,
         )
+        # aclnnArange has no int16 output on NPU (error 107000): build int32
+        # and cast down instead.
         self._lru_init = torch.arange(
-            self.device_buffer_size, dtype=torch.int16, device=device
-        )
+            self.device_buffer_size, dtype=torch.int32, device=device
+        ).to(torch.int16)
         self.lru_slots = (
             self._lru_init.view(1, 1, -1)
             .repeat(layer_num, max_num_req_slots, 1)
@@ -865,7 +873,7 @@ class HiSparseCoordinator:
                 self.mem_pool_device,
                 host_indices,
                 device_indices,
-                io_backend="kernel",
+                io_backend=_HISPARSE_IO_BACKEND,
             )
             finish_event.record()
             if host_indices.is_cuda:
@@ -931,7 +939,7 @@ class HiSparseCoordinator:
                 host_indices,
                 device_locs,
                 layer_id,
-                io_backend="kernel",
+                io_backend=_HISPARSE_IO_BACKEND,
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
@@ -1249,7 +1257,7 @@ class HiSparseCoordinator:
                     self.mem_pool_device,
                     host_locs,
                     device_locs,
-                    io_backend="kernel",
+                    io_backend=_HISPARSE_IO_BACKEND,
                 )
             self._backup_done_event.record()
             if host_locs.is_cuda:
@@ -1353,7 +1361,7 @@ class HiSparseCoordinator:
                         host_locs,
                         buffer_locs,
                         layer_id,
-                        io_backend="kernel",
+                        io_backend=_HISPARSE_IO_BACKEND,
                     )
 
             top_k_indices[i, :top_n] = device_indices.to(torch.int32)
