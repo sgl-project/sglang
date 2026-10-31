@@ -1857,21 +1857,10 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         # Apply chat template and its stop strings
-        tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
-                tools = [
-                    item.model_dump()
-                    for item in request.tools or []
-                    if item.function.name == request.tool_choice.function.name
-                ] or None
-            elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
-                if self.tool_call_parser == "muse" and request._template_tools:
-                    tools = request._template_tools
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
@@ -1957,6 +1946,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
+            tools = (
+                self._jinja_template_tools(request)
+                if effective_tools and request.tool_choice != "none"
+                else None
+            )
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
@@ -2009,6 +2003,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _jinja_template_tools(
+        self, request: ChatCompletionRequest
+    ) -> list[dict] | None:
+        if not isinstance(request.tool_choice, str):
+            return [
+                item.model_dump()
+                for item in request.tools or []
+                if item.function.name == request.tool_choice.function.name
+            ] or None
+        if not request.tools:
+            return None
+        if self.tool_call_parser == "muse" and request._template_tools:
+            return request._template_tools
+        return [item.model_dump() for item in request.tools]
 
     def _apply_jinja_template(
         self,

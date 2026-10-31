@@ -1,6 +1,7 @@
 import ast
 import threading
 import warnings
+from functools import lru_cache
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
@@ -10,6 +11,8 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+_MAX_CACHED_SCHEMA_BYTES = 64 * 1024
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -126,9 +129,39 @@ def normalize_json_schema_types(schema: Any) -> None:
     reaches the model as ``"string"``. ``$ref`` values are not resolved;
     callers pass tree-shaped schemas (HTTP JSON input is always a tree).
     """
+    # Many-tool clients resend the same schemas every turn; the walk is cached by
+    # exact input bytes and replayed onto the request's own objects.
+    try:
+        schema_json = orjson.dumps(schema)
+    except TypeError:
+        schema_json = None
+    if schema_json is None or len(schema_json) > _MAX_CACHED_SCHEMA_BYTES:
+        _rewrite_json_schema_types(schema, (), None)
+        return
+    for path, type_json in _json_schema_type_rewrites(schema_json):
+        node = schema
+        for key in path:
+            node = node[key]
+        node["type"] = orjson.loads(type_json)
+
+
+@lru_cache(maxsize=1024)
+def _json_schema_type_rewrites(
+    schema_json: bytes,
+) -> Tuple[Tuple[Tuple[Union[str, int], ...], bytes], ...]:
+    rewrites: List[Tuple[Tuple[Union[str, int], ...], bytes]] = []
+    _rewrite_json_schema_types(orjson.loads(schema_json), (), rewrites)
+    return tuple(rewrites)
+
+
+def _rewrite_json_schema_types(
+    schema: Any,
+    path: Tuple[Union[str, int], ...],
+    rewrites: Optional[List[Tuple[Tuple[Union[str, int], ...], bytes]]],
+) -> None:
     if isinstance(schema, list):
-        for item in schema:
-            normalize_json_schema_types(item)
+        for i, item in enumerate(schema):
+            _rewrite_json_schema_types(item, path + (i,), rewrites)
         return
     if not isinstance(schema, dict):
         return
@@ -136,9 +169,15 @@ def normalize_json_schema_types(schema: Any) -> None:
     if "type" in schema:
         t = schema["type"]
         if isinstance(t, str):
-            schema["type"] = _normalize_single_type(t)
+            normalized = _normalize_single_type(t)
         elif isinstance(t, list):
-            schema["type"] = _normalize_type_list(t)
+            normalized = _normalize_type_list(t)
+        else:
+            normalized = t
+        if normalized != t:
+            schema["type"] = normalized
+            if rewrites is not None:
+                rewrites.append((path, orjson.dumps(normalized)))
 
     for key in (
         "properties",
@@ -149,14 +188,14 @@ def normalize_json_schema_types(schema: Any) -> None:
     ):
         nested = schema.get(key)
         if isinstance(nested, dict):
-            for v in nested.values():
-                normalize_json_schema_types(v)
+            for name, v in nested.items():
+                _rewrite_json_schema_types(v, path + (key, name), rewrites)
 
     for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
         nested = schema.get(key)
         if isinstance(nested, list):
-            for v in nested:
-                normalize_json_schema_types(v)
+            for i, v in enumerate(nested):
+                _rewrite_json_schema_types(v, path + (key, i), rewrites)
 
     for key in (
         "items",
@@ -171,7 +210,7 @@ def normalize_json_schema_types(schema: Any) -> None:
         "unevaluatedProperties",
     ):
         if key in schema:
-            normalize_json_schema_types(schema[key])
+            _rewrite_json_schema_types(schema[key], path + (key,), rewrites)
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
