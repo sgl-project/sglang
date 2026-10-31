@@ -190,6 +190,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        scored_lens: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -236,6 +237,7 @@ class TargetVerifyExecutor:
             simulated_correct_len=self._simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            scored_lens=scored_lens,
         )
 
     def begin_simulated_step(self) -> None:
@@ -994,6 +996,7 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
+        draft_tokens = self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma)
         candidates = torch.zeros(
             (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
         )
@@ -1004,12 +1007,17 @@ class DsparkVerifyEpilogue:
             stride=self.stride,
             fill_value=0,
         )
+        candidates = candidates.view(bs, self.stride)
+        # A padding id of 0 past verify_len matches the argmax of a zero logits row;
+        # the eager accept compares the real drafts there, so take them here too.
+        candidates[:, 1:].copy_(draft_tokens)
         commit_lens = self._accept(
-            candidates=candidates.view(bs, self.stride),
+            candidates=candidates,
             logits=self.strided_logits[: bs * self.stride],
-            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            draft_tokens=draft_tokens,
             seq_lens=seq_lens,
             cutoff_verify_lens=verify_lens,
+            scored_lens=verify_lens,
         )
         if self.folds_commit:
             self._commit_inject(
@@ -1033,7 +1041,14 @@ class DsparkVerifyEpilogue:
         )
 
     def _accept(
-        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+        self,
+        *,
+        candidates,
+        logits,
+        draft_tokens,
+        seq_lens,
+        cutoff_verify_lens=None,
+        scored_lens=None,
     ) -> torch.Tensor:
         bs = candidates.shape[0]
         correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
@@ -1060,6 +1075,7 @@ class DsparkVerifyEpilogue:
             target_logits=None if self.simulate_fold else logits,
             out=self.read_accept(bs),
             block_accept_lens_out=self.read_block_accept_lens(bs),
+            scored_lens=scored_lens,
         )
         return accept.commit_lens
 
@@ -1116,10 +1132,19 @@ def build_accept_outs(
     simulate_bonus_sampling_info=None,
     out: Optional[AcceptOuts] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
+    scored_lens: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
-    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens."""
+    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
+    ``scored_lens``: target rows per request that carry real logits (compact
+    verify); the accept kernels also match past them, against padding rows."""
     bs = correct_len.shape[0]
+    if scored_lens is not None:
+        # Row j verifies draft j + 1, so the target observed at most scored_lens drafts.
+        cap_trim_lens = torch.minimum(
+            cap_trim_lens,
+            (scored_lens.to(correct_len.dtype) - correct_len).to(cap_trim_lens.dtype),
+        )
     if simulated_correct_len is not None:
         # The accept runs as served; only its length is replaced.
         correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
