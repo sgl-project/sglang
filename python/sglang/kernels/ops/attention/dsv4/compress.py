@@ -23,9 +23,10 @@ _is_xpu = is_xpu()
 
 
 class RankMajorScores(NamedTuple):
-    """Experimental CP8 gathered input; plans/output stay in logical order."""
+    """Rank-major CP gathered input; plans/output stay in logical order."""
 
     values: torch.Tensor
+    cp_size: int = 8
 
 
 if _is_xpu:
@@ -99,9 +100,16 @@ def _jit_compress_module(
     dtype_out: torch.dtype,
     ratio: Literal[4, 128],
     rank_major: bool = False,
+    cp_size: int = 8,
 ) -> Module:
     args = make_cpp_args(
-        head_dim, dtype_buffer, dtype_in, dtype_out, is_arch_support_pdl(), rank_major
+        head_dim,
+        dtype_buffer,
+        dtype_in,
+        dtype_out,
+        is_arch_support_pdl(),
+        rank_major,
+        cp_size,
     )
     kernel_class = f"FlashCompress{ratio}Kernel<{args}>"
     return load_jit(
@@ -118,10 +126,15 @@ def _jit_compress_module(
 
 @cache_once
 def _jit_compress_128_online_module(
-    head_dim: int, dtype_buffer: torch.dtype = torch.float32, rank_major: bool = False
+    head_dim: int,
+    dtype_buffer: torch.dtype = torch.float32,
+    rank_major: bool = False,
+    cp_size: int = 8,
 ) -> Module:
     assert head_dim == 512
-    args = make_cpp_args(head_dim, dtype_buffer, is_arch_support_pdl(), rank_major)
+    args = make_cpp_args(
+        head_dim, dtype_buffer, is_arch_support_pdl(), rank_major, cp_size
+    )
     kernel_class = f"FlashCompress128OnlineKernel<{args}>"
     return load_jit(
         make_name(f"compress_128_online_v2"),
@@ -422,7 +435,11 @@ def compress_forward(
     is_online: bool = False,
 ) -> torch.Tensor:
     rank_major = isinstance(kv_score_input, RankMajorScores)
+    cp_size = 8
     if rank_major:
+        cp_size = kv_score_input.cp_size
+        if type(cp_size) is not int or cp_size not in (2, 4, 8):
+            raise ValueError("RankMajorScores requires CP2, CP4 or CP8")
         kv_score_input = kv_score_input.values
         if (
             _is_xpu
@@ -431,12 +448,12 @@ def compress_forward(
             or (compress_ratio, head_dim) not in ((4, 128), (4, 512), (128, 512))
             or kv_score_input.ndim != 2
             or not 0 < kv_score_input.shape[0] <= 65536
-            or kv_score_input.shape[0] % 8 != 0
+            or kv_score_input.shape[0] % cp_size != 0
             or kv_score_input.dtype != torch.float32
             or not kv_score_input.is_contiguous()
         ):
             raise ValueError(
-                "RankMajorScores requires contiguous FP32 CP8 C4/C128 prefill"
+                "RankMajorScores requires contiguous FP32 equal-bucket CP C4/C128 prefill"
             )
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
@@ -444,7 +461,9 @@ def compress_forward(
     assert plan.compress_ratio == compress_ratio
     if is_online:
         assert compress_ratio == 128 and head_dim == 512
-        module = _jit_compress_128_online_module(512, kv_score_buffer.dtype, rank_major)
+        module = _jit_compress_128_online_module(
+            512, kv_score_buffer.dtype, rank_major, cp_size
+        )
     else:
         if _is_xpu:
             decode_fn, prefill_fn = _XPU_COMPRESS_FNS[compress_ratio]
@@ -457,6 +476,7 @@ def compress_forward(
                 dtype_out,
                 compress_ratio,
                 rank_major,
+                cp_size,
             )
 
     if _is_xpu:

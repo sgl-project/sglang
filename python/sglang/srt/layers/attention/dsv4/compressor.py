@@ -147,7 +147,7 @@ class Compressor(BaseFusedOp):
         return ret
 
     def supports_rank_major_scores(self, x, kv_score, forward_batch):
-        """Qualified zero-prefix, equal-bucket CP8 SM90 prefill only."""
+        """Qualified zero-prefix, equal-bucket CP2/4/8 SM90 prefill only."""
         if not envs.SGLANG_OPT_COMPRESSOR_RANK_MAJOR.get():
             return False
         if _is_hip or _is_npu or "metax" in torch.__version__:
@@ -164,7 +164,7 @@ class Compressor(BaseFusedOp):
         logical = getattr(meta, "per_rank_logical_token", None) or actual
         return (
             is_interleave()
-            and parallel.attn_cp_size == 8
+            and parallel.attn_cp_size in (2, 4, 8)
             and parallel.attn_tp_size == 1
             and parallel.attn_dp_size == 1
             and getattr(forward_batch, "batch_size", None) == 1
@@ -189,13 +189,13 @@ class Compressor(BaseFusedOp):
             and not kv_score.requires_grad
             and x.shape[0] == kv_score.shape[0]
             and actual is not None
-            and len(actual) == 8
-            and total == max(logical) * 8
+            and len(actual) == parallel.attn_cp_size
+            and total == max(logical) * parallel.attn_cp_size
             and max(actual) <= kv_score.shape[0]
             and tuple(kv_score.shape)
             == (x.shape[0], (4 if self.ratio == 4 else 2) * self.head_dim)
-            and actual == [max(actual)] * 8
-            and logical == [max(logical)] * 8
+            and actual == [max(actual)] * parallel.attn_cp_size
+            and logical == [max(logical)] * parallel.attn_cp_size
             and max(logical) <= max(actual)
             and not torch.cuda.is_current_stream_capturing()
             and torch.cuda.get_device_capability(x.device) == (9, 0)
@@ -228,14 +228,15 @@ class Compressor(BaseFusedOp):
 
                 # Match InterleaveCPStrategy: discard GEMM-only local padding
                 # before the equal-length collective (e.g.6256 ->6250 at50K).
-                rows = forward_batch.attn_cp_metadata.total_seq_lens // 8
+                cp_size = get_parallel().attn_cp_size
+                rows = forward_batch.attn_cp_metadata.total_seq_lens // cp_size
                 local_scores = kv_score[:rows]
                 with use_symmetric_memory(
                     get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
                 ):
-                    gathered = kv_score.new_empty((rows * 8, kv_score.shape[1]))
+                    gathered = kv_score.new_empty((rows * cp_size, kv_score.shape[1]))
                 attn_cp_all_gather_into_tensor(gathered, local_scores)
-                return RankMajorScores(gathered)
+                return RankMajorScores(gathered, cp_size)
             kv_score = cp_materialize_global_token_order(
                 kv_score,
                 forward_batch,

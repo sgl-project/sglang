@@ -120,6 +120,19 @@ def build():
 
 
 class Guards(unittest.TestCase):
+    def test_cp_degrees(self):
+        for cp_size in (2, 4, 8):
+            s = build()
+            s.parallel.attn_cp_size = cp_size
+            logical = 50000 // cp_size
+            physical = (logical + 15) // 16 * 16
+            s.meta.per_rank_actual_token = [physical] * cp_size
+            s.meta.per_rank_logical_token = [logical] * cp_size
+            s.x.shape = (physical, 4096)
+            s.score.shape = (physical, 2048)
+            with self.subTest(cp_size=cp_size), patch.dict(sys.modules, s.modules):
+                self.assertTrue(s.fn())
+
     def test_supported_lengths(self):
         for n in (128, 512, 4096, 8192, 50000, 64000, 65536):
             s = build()

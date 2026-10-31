@@ -1,10 +1,12 @@
-"""Compare CP8 rank-major input against logical-order compressor input.
+"""Compare CP rank-major input against logical-order compressor input.
 
 Run with one CUDA GPU; the AllGather result is materialized locally:
     python test/manual/dsv4/test_cp8_rank_major_compress.py
+Set CP_SIZE=2/4/8 to select the gathered layout (default 8).
 This is a kernel correctness test, not a distributed/model quality evaluation.
 """
 
+import os
 import struct
 import unittest
 
@@ -26,9 +28,10 @@ def packed_plan(rows, width):
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip is None, "CUDA required"
 )
-class TestCP8RankMajorCompress(unittest.TestCase):
+class TestCPRankMajorCompress(unittest.TestCase):
     def test_output_and_state(self):
         torch.manual_seed(1031)
+        cp_size = int(os.environ.get("CP_SIZE", "8"))
         for actual, padded in ((4096, 4096), (25001, 25008), (50000, 50000)):
             for ratio, dim, online in (
                 (4, 128, False),
@@ -39,7 +42,7 @@ class TestCP8RankMajorCompress(unittest.TestCase):
                 width = (4 if ratio == 4 else 2) * dim
                 x = torch.randn(padded, width, device="cuda")
                 ranked = (
-                    x.view(-1, 8, width)
+                    x.view(-1, cp_size, width)
                     .transpose(0, 1)
                     .reshape(padded, width)
                     .contiguous()
@@ -87,7 +90,7 @@ class TestCP8RankMajorCompress(unittest.TestCase):
                         )
                         reference = compress_forward(ref_state, x, ape, plan, **kwargs)
                         result = compress_forward(
-                            state, RankMajorScores(ranked), ape, plan, **kwargs
+                            state, RankMajorScores(ranked, cp_size), ape, plan, **kwargs
                         )
                         torch.testing.assert_close(result, reference, atol=0, rtol=0)
                         torch.testing.assert_close(state, ref_state, atol=0, rtol=0)
