@@ -695,6 +695,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
 
+        if self._is_full_backend:
+            self.model_runner.attn_backend.init_prefill_cuda_graph_state(
+                max_num_tokens=self.max_num_tokens,
+                max_req_slots=self._capture_req_slots,
+            )
+
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         get_parallel().tp_group.barrier()

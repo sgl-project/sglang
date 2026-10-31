@@ -29,6 +29,11 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    MAX_PAGE_PROMPT_TOKENS,
+    UocrDocumentConfig,
+)
+from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -358,6 +363,73 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
+
+
+class TestDefaultContextLength(CustomTestCase):
+    """The default context sizes one window, never the document."""
+
+    @staticmethod
+    def _context(window, page_tokens=8000):
+        return UocrDocumentConfig(
+            uocr_doc_split=True,
+            uocr_doc_page_window=window,
+            uocr_max_page_tokens=page_tokens,
+        ).default_context_length()
+
+    def test_longest_window_keeps_its_full_output_budget(self):
+        """A window whose pages all write MAX_PAGE_TOKENS must not be cut short
+        by the derived context (doc_split caps its completion by the context)."""
+        for window in (1, 2, 6, 10):
+            context = self._context(window)
+            capacity = doc_split.completion_capacity(
+                context_length=context, image_mode="gundam", input_pages=window + 1
+            )
+            self.assertGreaterEqual(capacity, window * 8000, window)
+            self.assertLess(context, 131072, window)
+
+    def test_wide_window_is_capped_at_128k(self):
+        """The cap is what saves memory; a wide window must not raise it."""
+        self.assertEqual(self._context(40), 131072)
+
+    def test_window_ask_fits_the_context_with_its_costliest_pages(self):
+        """Input at the per-page worst case plus the asked max_new_tokens must
+        fit the derived context, or the tokenizer truncates the window."""
+        for window in (1, 2, 6, 10):
+            context = self._context(window)
+            capacity = doc_split.completion_capacity(
+                context_length=context, image_mode="gundam", input_pages=window + 1
+            )
+            ask = min(
+                capacity,
+                doc_split.window_output_cap(own_pages=window, max_page_tokens=8000),
+            )
+            worst_input = (window + 1) * MAX_PAGE_PROMPT_TOKENS + 64
+            self.assertLessEqual(ask + worst_input, context, window)
+            self.assertGreaterEqual(ask, window * 8000, window)
+
+    def test_uncapped_pages_fall_back_to_128k(self):
+        """With no per-page cap a window has no bound; the 128K default applies."""
+        self.assertEqual(self._context(1, page_tokens=0), 131072)
+
+    def test_server_args_size_the_widest_window(self):
+        """The model config sizes the context from the launch flags: the unified
+        page window, default lookahead, and no bound when unsplit."""
+
+        def derived(**fields):
+            args = dict(
+                model_path="dummy",
+                uocr_doc_split=True,
+                uocr_doc_page_window=6,
+                uocr_max_page_tokens=8000,
+            )
+            args.update(fields)
+            server_args = ServerArgs(**args)
+            with mock.patch.object(ModelConfig, "__init__", return_value=None) as init:
+                ModelConfig.from_server_args(server_args)
+            return init.call_args.kwargs["uocr_v2_default_context_len"]
+
+        self.assertEqual(derived(), 7 * MAX_PAGE_PROMPT_TOKENS + 6 * 8000 + 1024)
+        self.assertEqual(derived(uocr_doc_split=False), 131072)
 
 
 if __name__ == "__main__":
