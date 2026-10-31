@@ -340,7 +340,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 pool.layout_dim = (
                     pool.layer_num * pool.head_num * pool.head_dim * pool.dtype.itemsize
                 )
-                pool.device_pool = SimpleNamespace(device="cuda")
+                pool._transfer_device = torch.device("cuda")
                 pool.device = "cpu"
                 pool.pin_memory = True
                 pool.allocator = object()

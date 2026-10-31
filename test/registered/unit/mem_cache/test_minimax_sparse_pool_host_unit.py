@@ -1,20 +1,18 @@
 import unittest
+from unittest.mock import patch
 
 import psutil
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MiniMaxSparseKVPool
 from sglang.srt.mem_cache.pool_host.base import HICACHE_HOST_MEMORY_RESERVE_BYTES
-from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
-    alloc_with_pin_memory,
-)
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, stage="stage-b", runner_config="1-gpu-small-amd")
@@ -59,7 +57,56 @@ def _make_cpu_minimax_sparse_pool(start_layer: int = 4) -> MiniMaxSparseKVPool:
     )
 
 
-class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
+class TestMiniMaxSparseHiCacheIntegration(CustomTestCase):
+    def test_k_only_page_axes_keep_token_addresses(self):
+        """Paged and FIA index views preserve token addresses and model layers."""
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKOnlyPool,
+        )
+
+        for fia in (None, False, True):
+            with (
+                self.subTest(fia=fia),
+                patch(
+                    "sglang.srt.hardware_backend.npu.memory_pool_npu.get_bool_env_var",
+                    return_value=fia,
+                ),
+            ):
+                pool_type = (
+                    MHATokenToKOnlyPool if fia is None else NPUMHATokenToKOnlyPool
+                )
+                pool = pool_type(
+                    size=8,
+                    page_size=4,
+                    dtype=torch.float32,
+                    head_num=2,
+                    head_dim=3,
+                    layer_num=2,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    start_layer=12,
+                    end_layer=14,
+                )
+                originals = pool.k_buffer if fia is None else pool.k_buffer_tensor
+                for layer, buffer in enumerate(originals):
+                    buffer.copy_(
+                        torch.arange(buffer.numel()).reshape(buffer.shape)
+                        + layer * 1000
+                    )
+                (info,) = pool.get_device_pool_infos()
+                info.buffer_info.validate(layer_ids=info.layer_ids)
+                self.assertEqual(info.layer_ids, (12, 13))
+                for layer, buffer in enumerate(info.buffer_info.buffers):
+                    original = originals[layer]
+                    pages = original.reshape(3, 4, 2, 3)
+                    self.assertEqual(buffer.data_ptr(), original.data_ptr())
+                    for token in (0, 3, 4, 11):
+                        torch.testing.assert_close(
+                            buffer[token], pages[token // 4, token % 4]
+                        )
+                    buffer[4, 0, 0] = -1
+                    self.assertEqual(pages[1, 0, 0, 0].item(), -1)
+
     def test_index_k_waits_for_full_local_layer(self):
         pool = _make_cpu_minimax_sparse_pool()
         counter = _FakeLayerTransferCounter()
@@ -106,13 +153,18 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
                     write_back_staging=pool.main_pool.hicache_write_back_staging,
                 )
                 index_host = MHATokenToKOnlyPoolHost(
-                    pool.index_k_pool,
-                    kv_host,
+                    buffer_info=pool.index_k_pool.get_device_pool_infos()[
+                        0
+                    ].buffer_info,
+                    anchor_host=kv_host,
                     layout=layout,
                     pin_memory=False,
                     device="cpu",
                     allocator_type="default",
                 )
+
+                self.addCleanup(kv_host.destroy)
+                self.addCleanup(index_host.destroy)
 
                 if layout == "layer_first":
                     self.assertEqual(
@@ -187,7 +239,7 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
                 self.assertEqual(sizes, [expected_size] * len(ptrs))
 
 
-class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
+class TestMiniMaxSparseHiCacheTransfer(CustomTestCase):
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for MiniMax sparse host transfer tests.")
@@ -231,7 +283,9 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             return host_pool.v_buffer[page_id, layer_id]
         raise ValueError(f"Unsupported layout: {host_pool.layout}")
 
-    def _run_device_to_host_copy(self, io_backend: str, layout: str):
+    def _run_device_to_host_copy(
+        self, io_backend: str, layout: str, index_dtype=torch.bfloat16
+    ):
         page_size = 64
         layer_num = 4
         size = page_size * 4
@@ -242,6 +296,7 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             size=size,
             page_size=page_size,
             dtype=torch.bfloat16,
+            index_dtype=index_dtype,
             head_num=4,
             head_dim=64,
             idx_head_dim=128,
@@ -256,38 +311,35 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
         assert device_pool.index_k_pool is not None
 
         pin_memory = io_backend == "kernel"
-        original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
-        if pin_memory:
-            ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
-        try:
-            kv_host = MHATokenToKVPoolHost(
-                buffer_info=device_pool.main_pool.get_device_pool_infos()[
-                    0
-                ].buffer_info,
-                host_to_device_ratio=2.0,
-                host_size=0,
-                page_size=page_size,
-                layout=layout,
-                pin_memory=pin_memory,
-                device="cpu",
-                allocator_type="default",
-                device_capacity_tokens=device_pool.main_pool.size
-                if device_pool.main_pool.host_capacity_tokens is None
-                else device_pool.main_pool.host_capacity_tokens,
-                start_layer=device_pool.main_pool.start_layer,
-                end_layer=device_pool.main_pool.end_layer,
-                write_back_staging=device_pool.main_pool.hicache_write_back_staging,
-            )
-            index_host = MHATokenToKOnlyPoolHost(
-                device_pool.index_k_pool,
-                kv_host,
-                layout=layout,
-                pin_memory=pin_memory,
-                device="cpu",
-                allocator_type="default",
-            )
-        finally:
-            ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
+        kv_host = MHATokenToKVPoolHost(
+            buffer_info=device_pool.main_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device="cpu",
+            allocator_type="default",
+            device_capacity_tokens=device_pool.main_pool.size
+            if device_pool.main_pool.host_capacity_tokens is None
+            else device_pool.main_pool.host_capacity_tokens,
+            start_layer=device_pool.main_pool.start_layer,
+            end_layer=device_pool.main_pool.end_layer,
+            write_back_staging=device_pool.main_pool.hicache_write_back_staging,
+        )
+        index_host = MHATokenToKOnlyPoolHost(
+            buffer_info=device_pool.index_k_pool.get_device_pool_infos()[0].buffer_info,
+            anchor_host=kv_host,
+            layout=layout,
+            pin_memory=pin_memory,
+            device="cpu",
+            allocator_type="default",
+        )
+
+        self.addCleanup(kv_host.destroy)
+        self.addCleanup(index_host.destroy)
+
+        index_host.k_buffer.fill_(13)
 
         for layer_id in range(layer_num):
             k_main, v_main = device_pool.get_kv_buffer(layer_id)
@@ -296,7 +348,8 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
 
         for local_id, global_id in enumerate(sparse_layer_ids):
             idx_k = device_pool.index_k_pool.k_buffer[local_id]
-            idx_k.copy_(torch.randn_like(idx_k) + float(global_id) + 100.0)
+            values = torch.arange(idx_k.numel(), device="cuda").reshape(idx_k.shape)
+            idx_k.copy_((values + global_id) % 127)
 
         device_pages = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int64)
         host_pages = torch.tensor(
@@ -324,7 +377,7 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             device_pool.main_pool, kv_host_indices, device_indices, io_backend
         )
         index_host.backup_from_device_all_layer(
-            device_pool.index_k_pool, host_indices, device_indices, io_backend
+            object(), host_indices, device_indices, io_backend
         )
 
         for layer_id in range(layer_num):
@@ -353,34 +406,52 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
                 expected = device_pool.index_k_pool.k_buffer[local_id][
                     device_page * page_size : (device_page + 1) * page_size
                 ].cpu()
-                self.assertTrue(torch.equal(got, expected))
+                self.assertTrue(
+                    torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+                )
 
-        # Round-trip H2D for one sparse index layer.
+        for host_page in range(3, index_host.page_num):
+            got = index_host.get_data_page(host_page * page_size)
+            expected = torch.full_like(got, 13)
+            self.assertTrue(
+                torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+            )
+
+        # Check full allocations, including rows not selected for restore.
         reload_pages = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
         host_device = "cuda" if io_backend == "kernel" else "cpu"
-        reload_host_pages = torch.tensor([3, 0], device=host_device, dtype=torch.int64)
+        reload_host_pages = torch.tensor([2, 0], device=host_device, dtype=torch.int64)
         reload_device_indices = self._token_indices_for_pages(
             reload_pages, page_size, device="cuda"
         )
         reload_host_indices = self._token_indices_for_pages(
             reload_host_pages, page_size, device=host_device
         )
-        device_pool.index_k_pool.k_buffer[0].zero_()
-        index_host.load_to_device_per_layer(
-            device_pool.index_k_pool,
-            reload_host_indices,
-            reload_device_indices,
-            0,
-            io_backend,
+        for local_id, buffer in enumerate(device_pool.index_k_pool.k_buffer):
+            buffer.zero_()
+            index_host.load_to_device_per_layer(
+                object(),
+                reload_host_indices,
+                reload_device_indices,
+                local_id,
+                io_backend,
+            )
+            expected = torch.zeros_like(buffer, device="cpu")
+            for host_page, device_page in zip(
+                reload_host_pages.tolist(), reload_pages.tolist()
+            ):
+                expected[device_page * page_size : (device_page + 1) * page_size] = (
+                    self._host_k_page(index_host, local_id, host_page, page_size)
+                )
+            got = buffer.cpu()
+            self.assertTrue(
+                torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+            )
+
+    def test_fp8_index_restore_with_bf16_main(self):
+        self._run_device_to_host_copy(
+            io_backend="kernel", layout="layer_first", index_dtype=torch.float8_e4m3fn
         )
-        for host_page, device_page in zip(
-            reload_host_pages.tolist(), reload_pages.tolist()
-        ):
-            got = device_pool.index_k_pool.k_buffer[0][
-                device_page * page_size : (device_page + 1) * page_size
-            ].cpu()
-            expected = self._host_k_page(index_host, 0, host_page, page_size).cpu()
-            self.assertTrue(torch.equal(got, expected))
 
     def test_device_to_host_kernel_layer_first(self):
         self._run_device_to_host_copy(io_backend="kernel", layout="layer_first")
