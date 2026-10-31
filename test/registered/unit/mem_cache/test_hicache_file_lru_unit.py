@@ -30,7 +30,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.cache_controller import HiCacheController, StorageCallLanes
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
@@ -744,6 +744,7 @@ class TestDcpStorage(unittest.TestCase):
             self.assertEqual(result.restorable_prefix_pages, checkpoints)
             cc = HybridCacheController.__new__(HybridCacheController)
             cc.storage_backend = backend
+            cc.storage_calls = StorageCallLanes(lambda: backend)
             cc.page_size = 128
             cc.prefetch_hits_sync_groups = []
             op = PrefetchOperation(

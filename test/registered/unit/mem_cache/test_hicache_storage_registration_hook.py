@@ -113,6 +113,7 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     controller.pp_group = None
     controller.prefetch_hits_sync_groups = []
     controller.prefetch_completion_sync_groups = []
+    controller.storage_calls = None
     if cls is HybridCacheController:
         controller.pp_prefetch_command_thread = None
         controller.pp_prefetch_command_group = None
