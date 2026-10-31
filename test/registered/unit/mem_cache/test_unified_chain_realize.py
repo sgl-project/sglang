@@ -1,9 +1,10 @@
 """A layout the chain planner finds is one the allocator can reach.
 
-Random histories leave holes in every band, pending pages in lazy ends and pins
-on some bands. Whenever `feasible` admits a demand, the least rearrangement
-serving it must realize: every live page keeps its bytes under its virtual id,
-no two bands' pages share a byte, and each band takes exactly its demand.
+Random histories leave holes in every band, pending pages in lazy ends, pins
+on some bands and fixed pages in others. Whenever `feasible` admits a demand,
+the least rearrangement serving it must realize: every live page keeps its
+bytes under its virtual id, every fixed page stays where it is, no two bands'
+pages share a byte, and each band takes exactly its demand.
 """
 
 import random
@@ -81,6 +82,20 @@ def _live_bytes(allocator):
     return out
 
 
+def _live_pages(band):
+    p2v = band.ids.physical_to_virtual.cpu().tolist()
+    return [p for p, v in enumerate(p2v) if v >= 0 and p >= band.min_page_index]
+
+
+def _fixed(allocator):
+    """Every fixed page and the virtual page it holds."""
+    return {
+        (band.sub_pool_name, page): int(band.ids.physical_to_virtual[page])
+        for band in allocator.bands
+        for page in band.fixed_pages()
+    }
+
+
 def _page_bytes(allocator, taken):
     """Byte ranges of every live page and every page just taken, per band."""
     ranges = []
@@ -120,6 +135,10 @@ class TestChainRealize(CustomTestCase):
         for band in allocator.bands:
             if rng.random() < 0.2:
                 band.pin_sources = (lambda: True,)
+            elif rng.random() < 0.3:
+                live = _live_pages(band)
+                if live:
+                    band.fix_pages("held", rng.sample(live, min(len(live), 2)))
 
     def _check(self, device, seed, count):
         rng = random.Random(seed)
@@ -140,8 +159,10 @@ class TestChainRealize(CustomTestCase):
                 continue
             growth = {b.name: rng.choice((0, 1, 2)) for b in snapshot.bands}
             before = _live_bytes(allocator)
+            fixed = _fixed(allocator)
             taken = allocator.realize(first_plan(snapshot, demands, growth=growth))
             realized += 1
+            self.assertEqual(_fixed(allocator), fixed)
             after = _live_bytes(allocator)
             self.assertEqual(before.keys(), after.keys())
             for key, payload in before.items():
@@ -152,6 +173,39 @@ class TestChainRealize(CustomTestCase):
             for (_, end, a), (start, _, b) in zip(ranges, ranges[1:]):
                 self.assertLessEqual(end, start, (a, b))
         self.assertGreater(refused, 0)
+
+    def test_a_load_reservation_is_fixed_until_submitted_or_cancelled(self):
+        # A HiCache load reserves window pages before its copy is submitted;
+        # the band compacts around them instead of refusing to move at all.
+        setup_allocator_context()
+        allocator = _allocator("cpu", "swa", lazy=True)
+        window = allocator.swa_attn_allocator
+        held = allocator.alloc(12)
+        allocator.free_swa(held[2:10])
+        tokens = window.alloc_physical(3)
+        reserved = set(tokens.tolist())
+        self.assertEqual(window.fixed_pages(), reserved)
+        before = {p: int(window.ids.physical_to_virtual[p]) for p in reserved}
+        self.assertGreater(window.flush_for_allocation(), 0)
+        self.assertEqual(
+            {p: int(window.ids.physical_to_virtual[p]) for p in reserved}, before
+        )
+        # Packed as far as the reservation allows, which stays below the frontier.
+        live = len(_live_pages(window)) + len(reserved)
+        if window.grow_direction == "up":
+            self.assertEqual(
+                window.watermark_physical,
+                max(window.min_page_index + live, max(reserved) + 1),
+            )
+        else:
+            self.assertEqual(
+                window.watermark_physical + 1,
+                min(window.num_pages - live, min(reserved)),
+            )
+        window.cancel_physical_reservation(tokens[:1])
+        self.assertEqual(window.fixed_pages(), reserved - {int(tokens[0])})
+        window.set_hicache_transfer_done_event("load", object())
+        self.assertEqual(window.fixed_pages(), set())
 
     def test_feasible_demands_realize_on_cpu(self):
         self._check("cpu", seed=7, count=800)

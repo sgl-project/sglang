@@ -746,6 +746,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         for name in sub_pools:
             self.bands[self._band_positions[name]].add_pin_source(busy)
 
+    def fix_pages(self, sub_pool: str, key: Hashable, pages: Sequence[int]) -> None:
+        """Keep these physical pages of ``sub_pool`` where they are, under
+        ``key``, until `unfix_pages`: a transfer that holds their physical ids,
+        or a page that must not be touched. Moves go around them, and every
+        plan keeps them inside their band."""
+        self.bands[self._band_positions[sub_pool]].fix_pages(key, pages)
+
+    def unfix_pages(
+        self, sub_pool: str, key: Hashable, pages: Optional[Sequence[int]] = None
+    ) -> None:
+        """Release the pages of ``sub_pool`` fixed under ``key``: every one, or
+        ``pages``."""
+        self.bands[self._band_positions[sub_pool]].unfix_pages(key, pages)
+
     def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
         # Every member a pin covers must also order its moves after the copy.
         for member in self.members:
@@ -875,11 +889,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             live = band.live_page_count if band.lazy_compaction else None
             if live is not None:
                 e = band.entry_bytes_per_page
-                packed = (
-                    (band.min_page_index * e, (band.min_page_index + live) * e)
-                    if band.grow_direction == "up"
-                    else ((band.num_pages - live) * e, band.num_pages * e)
-                )
+                fixed = band.fixed_extent()
+                if band.grow_direction == "up":
+                    top = band.min_page_index + live
+                    if fixed is not None:
+                        top = max(top, fixed[1])
+                    packed = (band.min_page_index * e, top * e)
+                else:
+                    bottom = band.num_pages - live
+                    if fixed is not None:
+                        bottom = min(bottom, fixed[0])
+                    packed = (bottom * e, band.num_pages * e)
                 if (low_byte, high_byte) != packed:
                     raise RuntimeError(
                         f"{name}: an urgent flush left {(low_byte, high_byte)}, "

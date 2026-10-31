@@ -71,6 +71,10 @@ _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
 _STATS_INSTANCES: weakref.WeakSet[Band] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
 
+# The key a HiCache load fixes its reserved pages under, from reservation to
+# the submission of its H2D copy.
+_LOAD_RESERVATION = "load"
+
 
 def _page_runs(pages: Sequence[int]) -> List[Tuple[int, int]]:
     """``pages`` as ascending half-open runs ``[first, end)``."""
@@ -450,11 +454,10 @@ class Band:
         self._retired_seq = 0
         self._event_seq: Dict[Hashable, int] = {}
         self._hicache_transfer_done_events: Dict[Hashable, torch.cuda.Event] = {}
-        # A host load's explicit pin: HiCache reserves physical pages during
-        # load-back, then binds them into the tree before the H2D copy is
-        # submitted. Compaction must not move those pages in that interval because
-        # the queued PoolTransfer still carries the original physical ids.
-        self._load_pinned_pages = 0
+        # Physical pages that must stay where they are, by the key that fixed
+        # them: a HiCache load reserves pages before its H2D copy is submitted,
+        # and the queued copy carries their physical ids.
+        self._fixed = {}
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so
         # a large backlog doesn't block ZMQ IPC. Urgent retries are uncapped.
@@ -567,7 +570,7 @@ class Band:
         self._retired_seq = self._forward_seq
         self._event_seq.clear()
         self._hicache_transfer_done_events.clear()
-        self._load_pinned_pages = 0
+        self._fixed = {}
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
@@ -876,11 +879,44 @@ class Band:
         return any(busy() for busy in self.pin_sources)
 
     def moves_blocked(self) -> bool:
-        """Whether a pin currently forbids relocating pages."""
-        if self._load_pinned_pages > 0:
-            # Physical H2D reservations must stay put even before queueing.
-            return True
-        return self.pinned_by_source()
+        """Whether a pin currently forbids relocating pages: a busy pin source,
+        or any fixed page for the paths that cannot move around one."""
+        return bool(self._fixed) or self.pinned_by_source()
+
+    def fix_pages(self, key: Hashable, pages: Sequence[int]) -> None:
+        """Keep these physical pages where they are, under ``key`` (added to
+        those already fixed under it). Moves go around them; a plan keeps them
+        inside this band."""
+        if not pages:
+            return
+        fixed = dict(self._fixed)
+        fixed[key] = fixed.get(key, ()) + tuple(int(p) for p in pages)
+        self._fixed = fixed
+
+    def unfix_pages(self, key: Hashable, pages: Optional[Sequence[int]] = None) -> None:
+        """Release the pages fixed under ``key``: every one, or ``pages``."""
+        if key not in self._fixed:
+            return
+        fixed = dict(self._fixed)
+        if pages is None:
+            del fixed[key]
+        else:
+            rest = list(fixed[key])
+            for page in pages:
+                rest.remove(int(page))
+            if rest:
+                fixed[key] = tuple(rest)
+            else:
+                del fixed[key]
+        self._fixed = fixed
+
+    def fixed_pages(self) -> Set[int]:
+        return {page for pages in self._fixed.values() for page in pages}
+
+    def fixed_extent(self) -> Optional[Tuple[int, int]]:
+        """Pages ``[first, end)`` spanning every fixed page, or None."""
+        pages = self.fixed_pages()
+        return (min(pages), max(pages) + 1) if pages else None
 
     def _credit_neighbors(self) -> tuple:
         """Chain members whose holes `schedulable_available_size` credits. Which
@@ -1126,16 +1162,21 @@ class Band:
         """
         n_free = int(self._free_phys_pages.shape[0])
         assert 0 < n <= n_free, f"take {n} of {n_free} free pages"
+        host = self._free_pages_host
         if n == n_free:
             taken = self._free_phys_pages
-            rest = taken[:0]
+            rest, rest_host = taken[:0], []
         else:
             free = self._sorted_free_phys_pages()
+            host = None if host is None else sorted(host)
             if end == "low":
                 taken, rest = free[:n], free[n:]
+                rest_host = None if host is None else host[n:]
             else:
                 taken, rest = free[n_free - n :], free[: n_free - n]
-        self._free_phys_pages = rest
+                rest_host = None if host is None else host[: n_free - n]
+        # The host copy stays known, in the device list's order.
+        self._set_free_pages(rest, host=rest_host)
         self._free_phys_sorted = rest
         return taken
 
@@ -1478,7 +1519,8 @@ class Band:
         virtuals, record inverse history. Does NOT clear p2v[src] -- callers own
         vacated-region clearing. Returns the moved virtual page ids.
         """
-        assert not self.moves_blocked(), (
+        # Callers keep fixed pages out of `src_pages`.
+        assert not self.pinned_by_source(), (
             f"[{self.sub_pool_name}] page copy while the band is pinned"
         )
         v_moved = self.ids.physical_to_virtual[src_pages].clone()  # read pre-wipe
@@ -1870,12 +1912,16 @@ class Band:
         route to `_pending_reuse`, or, when an urgent pass retreats the frontier
         past them, to a fence that later writes into them wait.
 
+        Fixed pages never move: a non-urgent walk stops at one, and an urgent
+        pass packs the other live pages below the frontier its farthest fixed
+        page allows, leaving the holes between free.
+
         `_topmost_survivor` excludes all p2v=-1 pages, so a negative virtual id in
         the batched mapping lookup is a corrupt-state bug and raises.
         """
         if not self.lazy_compaction:
             return 0
-        if self.moves_blocked():
+        if self.pinned_by_source():
             # Holes stay in the free list; the next flush picks them up. Fired
             # pending sources rejoin it now, since that copies nothing.
             self._drain_pending_reuse(urgent=False)
@@ -1905,6 +1951,21 @@ class Band:
             new_wm, holes_cpu = self._absorb_boundary_holes(all_cpu)
 
             latest_event = self._latest_forward_done_event
+
+            # The frontier an urgent pass leaves: just past the live pages packed
+            # from the base, or past the farthest fixed page if that is farther.
+            # Every survivor beyond it moves into a hole below it; none is fixed.
+            fixed = self.fixed_pages()
+            if self.grow_direction == "up":
+                live = new_wm - self.min_page_index - len(holes_cpu)
+                packed_end = self.min_page_index + live
+                if fixed:
+                    packed_end = max(packed_end, max(fixed) + 1)
+            else:
+                live = self.num_pages - (new_wm + 1) - len(holes_cpu)
+                packed_end = self.num_pages - live
+                if fixed:
+                    packed_end = min(packed_end, min(fixed))
 
             # Single-pass FULL-PACK (urgent only): every interior hole is filled
             # and the frontier retreats past the vacated survivors, which are
@@ -1948,6 +2009,14 @@ class Band:
                 )
                 if src is None:
                     break
+                if urgent and (
+                    src < packed_end
+                    if self.grow_direction == "up"
+                    else src >= packed_end
+                ):
+                    break  # packed: the rest stays where it is
+                if src in fixed:
+                    break  # non-urgent: a fixed page stops the walk
 
                 # Case A: write race.
                 if write_set is None:
@@ -2018,16 +2087,24 @@ class Band:
             n_moves += len(srcs)
 
             if single_pass_absorb:
-                # FULL-PACK reclaim (urgent): all interior holes now sit above the
-                # frontier, so retreat past the lot and EMPTY the free list; those
-                # pages are beyond-frontier space, so `released_fired` is dropped.
-                n_reclaimed = len(holes_cpu)
+                # FULL-PACK reclaim (urgent): the frontier retreats to the packed
+                # end; holes beyond it are beyond-frontier space, and only holes
+                # a fixed page keeps below it stay free. `released_fired` is
+                # dropped: every source lay beyond the packed end.
                 if self.grow_direction == "up":
-                    self.watermark_physical = new_wm - n_reclaimed
+                    kept = [h for h in holes_cpu[n_dst_consumed:] if h < packed_end]
+                    n_reclaimed = new_wm - packed_end
+                    self.watermark_physical = packed_end
                 else:
-                    self.watermark_physical = new_wm + n_reclaimed
+                    kept = [
+                        h
+                        for h in holes_cpu[: len(holes_cpu) - n_dst_consumed]
+                        if h >= packed_end
+                    ]
+                    n_reclaimed = packed_end - 1 - new_wm
+                    self.watermark_physical = packed_end - 1
                 self._stats_n_pages_absorbed += n_reclaimed
-                self._set_free_pages(self._free_phys_pages[:0], host=[])
+                self._set_free_pages(self._to_device(kept), host=kept)
             else:
                 # Non-urgent partial pass: the watermark stays. `_free_phys_pages`
                 # is still == holes_cpu, so the consumed dsts are exactly the front
@@ -2072,8 +2149,8 @@ class Band:
         """
         if not srcs:
             return
-        assert not self.moves_blocked(), (
-            f"[{self.sub_pool_name}] page copy while the band is pinned"
+        assert not self.pinned_by_source() and not set(srcs) & self.fixed_pages(), (
+            f"[{self.sub_pool_name}] page copy of a pinned or fixed page"
         )
         with record_function("Band._commit_move_batch"):
             src_pages_t = self._to_device(srcs)
@@ -2167,7 +2244,7 @@ class Band:
         self.size = num_pages * self.page_size
         self.clear()
 
-    _load_pinned_pages: _CapacityField[int] = _CapacityField()
+    _fixed: _CapacityField[Dict[Hashable, Tuple[int, ...]]] = _CapacityField()
 
     def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
         self._hicache_transfer_done_events[transfer_key] = event
@@ -2176,7 +2253,7 @@ class Band:
         ):
             # The H2D copy is now ordered before this event.  Future compaction
             # may proceed after _wait_hicache_transfers() waits on it.
-            self._load_pinned_pages = 0
+            self.unfix_pages(_LOAD_RESERVATION)
 
     def _wait_hicache_transfers(self) -> None:
         """Order the current stream after outstanding HiCache copies. Only moves
@@ -2208,23 +2285,42 @@ class Band:
         if need_size > self.available_size():
             if not relieve_for_alloc(self, need_size):
                 return None
+        free_before = set(self._free_pages_snapshot())
+        span_before = set(range(*self._span_range()))
         physical_pages = self.take_physical_pages(need_size // self.page_size)
         if physical_pages is None:
             return None
-        # Blocks page moves (`moves_blocked`) until the H2D is queued or cancelled.
-        self._load_pinned_pages += int(physical_pages.shape[0])
+        free_after = self._free_pages_host
+        if free_after is None:
+            taken = physical_pages.tolist()
+        else:
+            # The pages that left the free list, and those the span grew by.
+            taken = sorted(
+                (free_before - set(free_after))
+                | (set(range(*self._span_range())) - span_before)
+            )
+        # Fixed until the H2D is submitted or cancelled.
+        self.fix_pages(_LOAD_RESERVATION, taken)
         return self._expand_pages_to_tokens(physical_pages)
+
+    def _span_range(self) -> Tuple[int, int]:
+        """Pages ``[first, end)`` this band spans."""
+        if self.grow_direction == "up":
+            return self.min_page_index, self.watermark_physical
+        return self.watermark_physical + 1, self.num_pages
 
     def cancel_physical_reservation(self, free_index: torch.Tensor) -> None:
         """Roll back a HiCache physical allocation before its H2D is submitted."""
         if free_index is None or free_index.numel() == 0:
             return
-        num_pages = free_index.numel() // self.page_size
-        assert num_pages <= self._load_pinned_pages, (
-            f"Band({self.sub_pool_name!r}) released {num_pages} "
-            f"HiCache pages with only {self._load_pinned_pages} pending"
+        # Reads the device: a cancelled load is rare and off the step path.
+        pages = (free_index.detach()[:: self.page_size] // self.page_size).tolist()
+        reserved = self._fixed.get(_LOAD_RESERVATION, ())
+        assert all(page in reserved for page in pages), (
+            f"Band({self.sub_pool_name!r}) released pages {pages} it did not "
+            f"reserve for HiCache ({sorted(reserved)})"
         )
-        self._load_pinned_pages -= num_pages
+        self.unfix_pages(_LOAD_RESERVATION, pages)
         self.free_physical(free_index)
 
     def free_physical(self, free_index: torch.Tensor) -> None:
@@ -2343,6 +2439,9 @@ class FloatBand(Band):
 
     def _span_pages(self) -> int:
         return self.high_wm_page - self.low_wm_page
+
+    def _span_range(self) -> Tuple[int, int]:
+        return self.low_wm_page, self.high_wm_page
 
     def _hole_pages(self) -> int:
         return int(self._free_phys_pages.numel())
@@ -2765,13 +2864,17 @@ class FloatBand(Band):
         """Move this float into the page block ``[first, end)``: live pages
         already inside stay, the others are copied to free pages of the block,
         and the block's remaining pages become holes. The caller guarantees the
-        block holds every live page and meets no other band. Returns pages
-        moved."""
+        block holds every live page, contains every fixed page and meets no
+        other band. Returns pages moved."""
         holes = set(self._free_pages_snapshot())
         live = [p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes]
         assert len(live) <= end - first, "the block cannot hold the live pages"
         inside = {p for p in live if first <= p < end}
         srcs = [p for p in live if p not in inside]
+        assert not set(srcs) & self.fixed_pages(), (
+            f"[{self.sub_pool_name}] the block [{first}, {end}) leaves a fixed "
+            "page behind"
+        )
         # Not live, so never a source: one batched, disjoint move.
         dsts = [p for p in range(first, end) if p not in inside][: len(srcs)]
         if srcs:
