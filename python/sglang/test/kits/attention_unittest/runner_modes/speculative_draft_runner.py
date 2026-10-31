@@ -23,6 +23,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
     FrozenKVMTPCudaGraphRunner,
@@ -180,7 +181,7 @@ class _EagleDraftWorkerHarness:
         self.model_config = fixture.runner.model_config
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
-        self.megakernel = None
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
         # draft_forward's topk=1 fast path reads these prealloc buffers (built

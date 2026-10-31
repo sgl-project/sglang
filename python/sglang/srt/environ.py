@@ -1629,6 +1629,8 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300.
+    # Kernel groups requested from the NVIDIA megakernel plugin.
+    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get)
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
