@@ -4,6 +4,8 @@ import triton.language as tl
 
 # Vocabulary tile of the final-token draw. Each (request, tile) pair runs in its own program.
 _FINAL_BLOCK_V = 4096
+# Below this size, keeping the draw in the acceptance kernel avoids two launches.
+_MAX_INLINE_VOCAB = 16384
 
 
 @triton.jit
@@ -15,6 +17,7 @@ def speculative_sampling_classic_kernel(
     Candidates,
     RetriveIndex,
     UniformSamples,
+    UniformSamplesFinal,
     ResidualScale,
     TargetProbs,
     DraftProbs,
@@ -160,14 +163,37 @@ def speculative_sampling_classic_kernel(
                 continue_verifying = 0
 
     tl.store(AcceptTokenNum + pid, num_accept)
-    tl.store(ResidualScale + pid, residual_scale)
+    if ResidualScale is None:
+        offsets = tl.arange(0, BLOCK_REDUCE)
+        val = _final_token_weights(
+            TargetProbs,
+            DraftProbs,
+            residual_scale,
+            pid,
+            num_accept,
+            offsets,
+            stride_tp_b,
+            stride_tp_s,
+            stride_tp_v,
+            stride_dp_b,
+            stride_dp_s,
+            stride_dp_v,
+            NUM_SLOTS,
+            VOCAB_SIZE,
+        )
+        cdf = tl.cumsum(val, axis=0)
+        cutoff = tl.load(UniformSamplesFinal + pid) * tl.max(cdf, axis=0)
+        token = _draw_from_cdf(val, offsets, cdf, cutoff, VOCAB_SIZE)
+        tl.store(Predicts + last_accepted_global_idx, token)
+    else:
+        tl.store(ResidualScale + pid, residual_scale)
 
 
 @triton.jit
 def _final_token_weights(
     TargetProbs,
     DraftProbs,
-    ResidualScale,
+    residual_scale,
     pid,
     num_accept,
     v_offsets,
@@ -210,9 +236,21 @@ def _final_token_weights(
         # residual falls back to p. A comparison against NaN is false, so
         # the range test rejects it along with the infinities.
         q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
-        diff = tl.load(ResidualScale + pid) * p_val - q_val
+        diff = residual_scale * p_val - q_val
         val = tl.where(diff > 0.0, diff, 0.0)
     return val
+
+
+@triton.jit
+def _draw_from_cdf(val, offsets, cdf, cutoff, VOCAB_SIZE: tl.constexpr):
+    # A rounded prefix can already exceed the cutoff before the first positive lane.
+    positive = val > 0.0
+    token = tl.min(tl.where(positive & (cdf > cutoff), offsets, VOCAB_SIZE), axis=0)
+    if token == VOCAB_SIZE:
+        # The cutoff can round up to the total. Only an empty residual uses the sentinel.
+        last = tl.max(tl.where(positive, offsets, -1), axis=0)
+        token = tl.where(last >= 0, last, VOCAB_SIZE - 1)
+    return token
 
 
 @triton.jit
@@ -239,7 +277,7 @@ def _final_token_block_sums_kernel(
     val = _final_token_weights(
         TargetProbs,
         DraftProbs,
-        ResidualScale,
+        tl.load(ResidualScale + pid),
         pid,
         tl.load(AcceptTokenNum + pid),
         block * BLOCK_V + tl.arange(0, BLOCK_V),
@@ -290,19 +328,20 @@ def _final_token_kernel(
     block_cdf = tl.cumsum(block_sums, axis=0)
     target_u = tl.load(UniformSamplesFinal + pid) * tl.max(block_cdf, axis=0)
     crossed = (block_cdf > target_u) & (block_sums > 0.0)
+    block = tl.min(tl.where(crossed, blocks, NUM_BLOCKS_POW2), axis=0)
+    if block == NUM_BLOCKS_POW2:
+        # The FP32 cutoff can round up to the total. Use the last nonempty block.
+        block = tl.max(tl.where(block_sums > 0.0, blocks, -1), axis=0)
 
-    # Degenerate residual (total == 0, i.e. p == q everywhere on rejection)
-    # crosses no block, so final_token falls back to VOCAB_SIZE - 1; acceptable
-    # since this case is numerically near-impossible.
+    # Keep the last vocabulary index as the fallback only for an empty residual.
     final_token = VOCAB_SIZE - 1
-    if tl.max(crossed.to(tl.int32), axis=0) > 0:
-        block = tl.argmax(crossed.to(tl.int32), axis=0)
+    if block >= 0:
         cum_sum = tl.max(tl.where(blocks < block, block_cdf, 0.0), axis=0)
         v_offsets = block * BLOCK_V + tl.arange(0, BLOCK_V)
         val = _final_token_weights(
             TargetProbs,
             DraftProbs,
-            ResidualScale,
+            tl.load(ResidualScale + pid),
             pid,
             num_accept,
             v_offsets,
@@ -315,15 +354,8 @@ def _final_token_kernel(
             NUM_SLOTS,
             VOCAB_SIZE,
         )
-        candidates_mask = (cum_sum + tl.cumsum(val, axis=0)) > target_u
-        if tl.max(candidates_mask.to(tl.int32), axis=0) > 0:
-            final_token = block * BLOCK_V + tl.argmax(
-                candidates_mask.to(tl.int32), axis=0
-            )
-        else:
-            # FP32 rounding put target_u at the end of this block: take its
-            # last token with positive weight.
-            final_token = tl.max(tl.where(val > 0.0, v_offsets, 0), axis=0)
+        cdf = cum_sum + tl.cumsum(val, axis=0)
+        final_token = _draw_from_cdf(val, v_offsets, cdf, target_u, VOCAB_SIZE)
 
     last_accepted_global_idx = tl.load(
         RetriveIndex + pid * stride_idx_b + num_accept * stride_idx_s
@@ -354,12 +386,10 @@ def chain_speculative_sampling_triton(
     # Keep CDF tiles small, and cap multi-tile reductions to avoid register spills.
     block_reduce = min(triton.next_power_of_2(vocab_size), 32768)
     num_warps = 8 if block_verification and block_reduce > 4096 else 4
-    num_blocks = triton.cdiv(vocab_size, _FINAL_BLOCK_V)
-    residual_scale = torch.empty(
-        batch_size, dtype=torch.float32, device=target_probs.device
-    )
-    block_sums = torch.empty(
-        (batch_size, num_blocks), dtype=torch.float32, device=target_probs.device
+    residual_scale = (
+        torch.empty(batch_size, dtype=torch.float32, device=target_probs.device)
+        if vocab_size > _MAX_INLINE_VOCAB
+        else None
     )
     prob_strides = (*target_probs.stride(), *draft_probs.stride())
 
@@ -371,6 +401,7 @@ def chain_speculative_sampling_triton(
         candidates,
         retrive_index,
         uniform_samples,
+        uniform_samples_for_final_sampling,
         residual_scale,
         target_probs,
         draft_probs,
@@ -392,8 +423,14 @@ def chain_speculative_sampling_triton(
         BLOCK_REDUCE=block_reduce,
         num_warps=num_warps,
     )
+    if residual_scale is None:
+        return
     # Final token: the block sums run over all (request, block) pairs in
     # parallel, then one program per request searches a single block.
+    num_blocks = triton.cdiv(vocab_size, _FINAL_BLOCK_V)
+    block_sums = torch.empty(
+        (batch_size, num_blocks), dtype=torch.float32, device=target_probs.device
+    )
     _final_token_block_sums_kernel[(batch_size, num_blocks)](
         accept_token_num,
         residual_scale,
