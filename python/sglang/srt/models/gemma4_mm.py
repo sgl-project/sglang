@@ -340,7 +340,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         """
         attn_backend = get_attn_backend()
         prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
-        if getattr(prefill_backend, "fa_impl_ver", None) == 4:
+        if getattr(prefill_backend, "fa_impl_ver", None) == 4 or getattr(
+            prefill_backend, "fa3_upgrades_to_fa4", False
+        ):
             # O(query tokens) metadata instead of a dense Q x KV mask. Keep
             # absolute ranges so cached text prefixes retain the right offset.
             lengths = forward_batch.extend_seq_lens_cpu

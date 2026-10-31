@@ -176,6 +176,56 @@ class TestGemma4DiffusionImageMasks(unittest.TestCase):
         torch.testing.assert_close(without_signal, model.model.embed_tokens(input_ids))
 
 
+def _image_item(*offsets):
+    return SimpleNamespace(is_image=lambda: True, offsets=list(offsets))
+
+
+def _fa_batch(extend_lens, prefix_lens, mm_items_per_req):
+    return SimpleNamespace(
+        extend_seq_lens_cpu=list(extend_lens),
+        extend_prefix_lens_cpu=list(prefix_lens),
+        mm_inputs=[SimpleNamespace(mm_items=items) for items in mm_items_per_req],
+    )
+
+
+def _prepare_on(backend, forward_batch):
+    with patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
+        Gemma4ForConditionalGeneration.prepare_attn_masks(
+            None, forward_batch, torch.zeros(1, dtype=torch.int64), torch.bfloat16
+        )
+
+
+class TestGemma4Fa4ImageTokenRanges(unittest.TestCase):
+    """The FA4 metadata path: fa4, and fa3 upgraded to FA4 for the 512-wide
+    global layers, both emit image_token_ranges; other non-triton backends
+    fall back to causal attention and leave the metadata alone."""
+
+    @staticmethod
+    def _backend(**flags):
+        return SimpleNamespace(forward_metadata=SimpleNamespace(), **flags)
+
+    def test_fa3_upgraded_to_fa4_emits_image_token_ranges(self):
+        # A fresh request with an image at [2, 5] and a chunked one whose
+        # image at absolute [5, 7] sits inside the extend window.
+        backend = self._backend(fa3_upgrades_to_fa4=True)
+        _prepare_on(
+            backend,
+            _fa_batch((8, 5), (0, 4), ([_image_item((2, 5))], [_image_item((5, 7))])),
+        )
+
+        ranges = backend.forward_metadata.image_token_ranges
+        self.assertEqual(ranges.dtype, torch.int32)
+        expected = torch.full((13, 2), -1, dtype=torch.int32)
+        expected[2:6] = torch.tensor([2, 5], dtype=torch.int32)
+        expected[8 + 1 : 8 + 4] = torch.tensor([5, 7], dtype=torch.int32)
+        self.assertTrue(torch.equal(ranges, expected), (ranges, expected))
+
+    def test_plain_fa3_without_upgrade_leaves_metadata_alone(self):
+        backend = self._backend(fa_impl_ver=3, fa3_upgrades_to_fa4=False)
+        _prepare_on(backend, _fa_batch((4,), (0,), ([_image_item((1, 2))],)))
+        self.assertFalse(hasattr(backend.forward_metadata, "image_token_ranges"))
+
+
 class TestGemma4DiffusionExpertActivation(unittest.TestCase):
     def test_decoder_passes_checkpoint_activation_to_experts(self):
         for activation, expected in (
