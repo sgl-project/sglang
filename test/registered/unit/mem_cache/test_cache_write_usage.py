@@ -129,36 +129,6 @@ class TestCacheWriteUsage(CustomTestCase):
         usage.mark_supported()
         self.assertIsNone(usage.tokens)
 
-    def test_reported_reads_do_not_change_physical_cache_prefix(self):
-        from sglang.srt.managers.schedule_batch import Req
-
-        for suffix, cached, expected in (
-            (0, 511, 511),
-            (3, 511, 509),
-            (0, 512, 512),
-            (3, 512, 509),
-        ):
-            with self.subTest(suffix=suffix, cached=cached):
-                req = Req.__new__(Req)
-                req.origin_input_ids = array("q", range(512))
-                req.cached_tokens = cached
-                req._cache_write_usage = CacheWriteUsage(
-                    512, excluded_suffix_tokens=suffix
-                )
-                req._cache_write_usage.mark_supported()
-                req._cache_write_usage.record(
-                    [(cached, 512)], reusable_prefix_len=512, cached_prefix_len=cached
-                )
-                self.assertEqual(req.reported_cached_tokens, expected)
-                self.assertEqual(req.cached_tokens, cached)
-                self.assertEqual(
-                    req.cache_write_tokens, 512 - cached if suffix == 0 else 0
-                )
-                req.origin_input_ids = array("q", range(256))
-                self.assertEqual(req.reported_cached_tokens, 256 - suffix)
-                self.assertIsNone(req.cache_write_tokens)
-                self.assertEqual(req.cached_tokens, cached)
-
 
 class TestUnifiedCacheWriteUsage(CustomTestCase):
     """Exercise the actual insert and canonical match on CPU, without a model."""
@@ -312,6 +282,23 @@ class TestUnifiedCacheWriteUsage(CustomTestCase):
         with get_disagg().override(disaggregation_decode_enable_offload_kvcache=True):
             cache._prepare_cache_write_usage(req2)
         self.assertIsNone(req2.cache_write_tokens)
+
+    def test_disaggregated_decode_write_count_is_unknown(self):
+        from sglang.srt.runtime_context import get_disagg
+
+        for disabled in (False, True):
+            with self.subTest(disabled=disabled):
+                cache, allocator, pool = self._cache()
+                cache.disable = disabled
+                req = self._req(cache, allocator, pool, list(range(8)))
+                with get_disagg().override(disaggregation_mode="decode"):
+                    cache.checkpoint(req, up_to=8)
+                # The prefill worker's writes are not sent to decode.
+                self.assertIsNone(req.cache_write_tokens)
+                # A later local cache decision must not convert unknown to zero.
+                cache.disable = True
+                cache._prepare_cache_write_usage(req)
+                self.assertIsNone(req.cache_write_tokens)
 
     def test_tracking_flag_controls_adoption_without_a_second_match(self):
         """Accounting must not alter tree matching or run when disabled."""

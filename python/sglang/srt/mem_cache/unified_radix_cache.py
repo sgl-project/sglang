@@ -1186,6 +1186,10 @@ class UnifiedRadixCache(BasePrefixCache):
             usage.mark_unknown()
         elif req.session is not None or req.session_id is not None:
             usage.mark_unknown()
+        elif get_disagg().disaggregation_mode == "decode":
+            # The decode response does not receive the prefill worker's write
+            # count, even when the local radix cache is disabled.
+            usage.mark_unknown()
         elif self.disable:
             usage.mark_supported()
         elif (

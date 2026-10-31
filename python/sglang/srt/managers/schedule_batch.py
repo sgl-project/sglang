@@ -1577,12 +1577,6 @@ class Req(ReqDllmMixin):
         self._cache_write_usage.sync_prompt_tokens(len(self.origin_input_ids))
         return self._cache_write_usage.tokens
 
-    @property
-    def reported_cached_tokens(self) -> int:
-        # Preserve the physical hit prefix used by scheduling and cache locks.
-        self._cache_write_usage.sync_prompt_tokens(len(self.origin_input_ids))
-        return min(self.cached_tokens, self._cache_write_usage.reported_prompt_tokens)
-
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,

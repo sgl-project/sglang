@@ -190,7 +190,9 @@ class TestCacheWriteUsage(CustomTestCase):
                     cold = self._partition(api, self._request_usage(api, payload))
                     warm = self._partition(api, self._request_usage(api, payload))
                     self.assertEqual(cold[1], 0)
-                    self.assertGreater(cold[2], 0)
+                    self.assertEqual(
+                        cold[2], cold[0], "Cold writes must include every prompt chunk"
+                    )
                     self.assertEqual(warm[0], cold[0])
                     self.assertGreater(warm[1], 0)
                     self.assertEqual(warm[2], 0, "Duplicate KV is not a new write")
