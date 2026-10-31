@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
+from sglang.srt.disaggregation.utils import is_abort_failure_reason
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,6 +41,8 @@ def _manager(
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager._staging_outstanding = {}
+    manager.failure_records = {}
+    manager.failure_lock = threading.Lock()
     manager.check_status = lambda room: manager.request_status[room]
     manager.update_status = lambda room, value: manager.request_status.__setitem__(
         room, value
@@ -84,6 +87,19 @@ class TestMooncakeAbortNotification(
 
     def _make_abort_manager(self, status: KVPoll | None):
         return _manager(status=status)
+
+    def test_decode_abort_records_requested_abort_reason(self):
+        for enabled in (True, False):
+            with self.subTest(deferred_release=enabled):
+                manager = _manager(enabled=enabled, status=KVPoll.Transferring)
+
+                self.assertTrue(
+                    manager._handle_abort_notification(self._abort_message())
+                )
+
+                self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+                # Prefill must conclude the request as an abort, not a 500.
+                self.assertTrue(is_abort_failure_reason(manager.failure_records[ROOM]))
 
     def _provoke_worker_failure(self, manager) -> None:
         manager.enable_trace = False

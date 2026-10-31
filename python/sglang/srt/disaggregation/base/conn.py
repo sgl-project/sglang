@@ -231,6 +231,18 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def is_failure_requested_abort(self) -> bool:
+        """Whether this rank's recorded failure is a requested abort.
+
+        Read-only: unlike failure_exception, it must not consume failure state.
+        """
+        return False
+
+    def is_failure_requested_abort_pp_consensus(self) -> bool:
+        """PP0 only: whether every PP rank that failed this transfer recorded a
+        requested abort. Read-only, like is_failure_requested_abort."""
+        return self.is_failure_requested_abort()
+
     def clear(self):
         """
         Clear any internal states.

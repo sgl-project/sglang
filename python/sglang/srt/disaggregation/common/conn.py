@@ -44,10 +44,12 @@ from sglang.srt.disaggregation.common.bootstrap import (
 )
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
+    ABORT_REASON_REQUEST,
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    is_abort_failure_reason,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -98,6 +100,11 @@ def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
         )
         sessions[bootstrap_addr] = session
     return session
+
+
+def _pp_abort_key(bootstrap_room: int) -> str:
+    # PPConsensusStore keys are int | str; a str key cannot collide with a room.
+    return f"abort:{bootstrap_room}"
 
 
 class KVTransferError(Exception):
@@ -614,6 +621,19 @@ class CommonKVManager(BaseKVManager):
             return KVPoll.Bootstrapping
         return min(statuses)
 
+    def is_failure_requested_abort_pp_consensus(self, bootstrap_room: int) -> bool:
+        """PP0 only: whether every PP rank that failed the room recorded an abort.
+
+        A rank replicates its abort flag before its Failed status through the
+        same ordered channel, so a Failed rank without a flag failed otherwise.
+        """
+        statuses = self.request_status.collect(bootstrap_room)
+        aborts = self.request_status.collect(_pp_abort_key(bootstrap_room))
+        return all(
+            status != KVPoll.Failed or aborted == 1
+            for status, aborted in zip(statuses, aborts)
+        )
+
     def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
         """Aux (metadata) buffers pair up positionally, so a peer that
         registered a different number of them gets only the leading ones, and
@@ -664,6 +684,8 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                if isinstance(self.request_status, PPConsensusStore):
+                    self.request_status.pop(_pp_abort_key(bootstrap_room), None)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -718,6 +740,15 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+        # PP0 classifies the failure for every stage, so it needs each stage's
+        # reason. Only live rooms: a concluded room must not leak a key.
+        if (
+            isinstance(self.request_status, PPConsensusStore)
+            and bootstrap_room in self.request_status
+        ):
+            self.request_status[_pp_abort_key(bootstrap_room)] = int(
+                is_abort_failure_reason(failure_reason)
+            )
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)
@@ -2423,6 +2454,8 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if isinstance(self.kv_mgr.request_status, PPConsensusStore):
+            self.kv_mgr.request_status.pop(_pp_abort_key(self.bootstrap_room), None)
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
@@ -2455,13 +2488,18 @@ class CommonKVSender(BaseKVSender):
             is_from_another_rank=failure_reason is None,
         )
 
+    def is_failure_requested_abort(self) -> bool:
+        with self.kv_mgr.failure_lock:
+            reason = self.kv_mgr.failure_records.get(self.bootstrap_room)
+        return is_abort_failure_reason(reason)
+
+    def is_failure_requested_abort_pp_consensus(self) -> bool:
+        return self.kv_mgr.is_failure_requested_abort_pp_consensus(self.bootstrap_room)
+
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
+        self.kv_mgr.record_failure(self.bootstrap_room, ABORT_REASON_REQUEST)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})

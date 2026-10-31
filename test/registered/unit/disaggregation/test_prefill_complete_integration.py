@@ -487,9 +487,10 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.send_kv_chunk = Mock()
         enter_scope(
             self,
+            # Single rank: the TP/CP reduction is the identity.
             patch(
-                "sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group",
-                side_effect=lambda senders, *groups: [s.poll() for s in senders],
+                "sglang.srt.disaggregation.utils._all_reduce_polls",
+                side_effect=lambda polls, group: polls,
             ),
         )
         enter_scope(
