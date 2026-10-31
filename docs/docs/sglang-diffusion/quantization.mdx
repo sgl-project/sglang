@@ -1305,10 +1305,13 @@ sglang generate \
 
 ## MXFP4 Offline Quantization (msmodelslim)
 
-Pre-quantized MXFP4 weights exported by msmodelslim are auto-detected via
-`quant_model_description.json` (`W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` scheme).
-Use `wan_repack.py` to convert the quantized weights to Diffusers format, then load
-the converted model with `--model-path`:
+For Wan checkpoints quantized offline with msmodelslim, SGLang detects
+`W4A4_MXFP4` or `W4A4_MXFP4_DUALSCALE` per layer from `quant_model_description.json`.
+Run on Ascend 950PR/DT with CANN and torch_npu exposing the required MXFP operators.
+
+Use `python/sglang/multimodal_gen/tools/wan_repack.py` with the ModelSlim conversion
+command above to preserve the exported FP4 values, scales, and activation smoothing.
+Load the converted Diffusers directory without `--quantization`:
 
 ```bash
 sglang generate \
@@ -1317,7 +1320,62 @@ sglang generate \
   --save-output
 ```
 
-The offline MXFP4 checkpoint stores weights in an FP8 container and includes dual-level
-scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
-`mul_scale` is loaded and applied before activation quantization to keep activations
-aligned with the calibrated weights.
+The repacker accepts numeric FP8 containers or packed `uint8` weights and produces
+packed FP4 `[out, in/2]` with `weight_scale` `[out, in/32]`. Dual-scale layers also
+require `weight_dual_scale` `[out, in/512, 1]`. Single-level weights use ND layout;
+dual-scale weights require NZ. Each TP input partition must be divisible by 64 or
+512, respectively. Both `div.mul_scale` and `mul_scale` descriptors are accepted:
+single-level layers apply smoothing once before quantization; dual-scale layers
+pass it as `smooth_scale` to the quantization operator.
+
+Existing ModelSlim diffusion checkpoints with numeric FP8 containers `[out, in]`
+also load directly: the loader packs their FP4 values before dtype conversion and
+tensor-parallel slicing. Already-packed FP4 bytes and genuine MXFP8 weights retain
+their existing loading paths.
+
+Single-level layers follow MindIE-SD's schedule: W4A8 for the first two and last two
+denoising steps, and W4A4 otherwise. A 40-step run uses W4A8 at zero-based indices
+0, 1, 38, and 39 to retain higher activation precision at the ends of denoising.
+Checkpoint entries in `timestep_policy.w4a4_linear` override this schedule; set
+`{"default": "W4A4"}` there for W4A4 throughout. Dual-scale layers stay W4A4 and
+reject W4A8 switching.
+
+### MXFP4 attention
+
+Self-attention blocks whose description selects `MXFP4_DYNAMIC` run quantized
+attention on Ascend 950PR/DT: Q/K/V are dynamically quantized to packed FP4 and
+evaluated by the CANN experimental `quant_flash_attn` extension. The exported
+Q/K rotation matrices (`to_q_rot`/`to_k_rot`, or `q_rot`/`k_rot` in earlier
+exports) are registered by the attention blocks and applied on quantized steps.
+
+- Sequences are padded to a kernel-friendly length (256 or 512, from
+  `mxfp4_attention_pad_size`); the real lengths are passed to the kernel so
+  padded positions never enter the softmax.
+- Packed (varlen) inputs are supported: sequences are bucketed by padded
+  length and evaluated per bucket, which is the path varlen models such as
+  MiniMax-H3 use.
+- `timestep_policy.fa` can switch attention between `FLOAT` (unquantized) and
+  `MXFP4` per step.
+- FP8 attention descriptors (`FP8_DYNAMIC`) are rejected: FP8 attention
+  requires custom MindIE kernels that SGLang does not ship. Re-quantize such
+  checkpoints with MXFP4 attention or keep attention in BF16.
+
+### Linear backward compatibility
+
+Every single-level MXFP4 path uses MindIE-SD's activation-quantization defaults
+(`round_mode="rint"`, `scale_alg=2`, `dst_type_max=7.25`); checkpoint
+`mxfp4_scale_alg`/`mxfp4_dst_type_max` descriptors override the two kwargs.
+Only the W4A8 boundary steps keep operator-default rounding — their activation
+destination is FP8, to which the FP4-targeted kwargs do not apply.
+
+| Linear path | Weight layout | Activation rounding | Matmul bias |
+| --- | --- | --- | --- |
+| Offline single-level W4A4 (SRT and diffusion) | ND | `rint` + C7 kwargs | FP32, original shape |
+| Offline single-level W4A8 boundary steps (SRT and diffusion) | FP4-aware NZ (SRT) / same ND weights (diffusion) | Operator default (FP8 destination) | FP32, original shape (SRT) / BF16 `[1, out]` (diffusion) |
+| MXFP4 attention (Q/K/V) | — | `rint` + C7 kwargs | — |
+
+SRT online `--quantization mxfp4` and diffusion online `--quantization mxfp4_npu`
+retain their separate dual-level paths (operator-default arguments; the
+dual-level operator's support for these kwargs must be verified on device).
+CPU checks can verify dispatch and operator arguments; numerical accuracy,
+video quality, and performance require target-NPU validation.
