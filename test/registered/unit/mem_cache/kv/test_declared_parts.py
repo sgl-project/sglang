@@ -1701,32 +1701,20 @@ class TestDeclaredParts(CustomTestCase):
                     torch.testing.assert_close(
                         k[0][physical], torch.full_like(k[0][physical], 11)
                     )
-                    # Failure in the last physical reservation leaves every id
-                    # and live page untouched, including the earlier window.
-                    before = [
-                        (b, b.allocated_count(), b.ids.virtual_to_physical.clone())
-                        for b in allocator.bands
-                    ]
-                    free_ids = allocator.full_attn_allocator.free_virtual_ids.clone()
-                    with patch.object(
-                        allocator._windows[-1],
-                        "take_planned_physical_pages",
-                        return_value=None,
-                    ):
-                        self.assertIsNone(allocator.alloc(4))
-                    for band, count, mapping in before:
-                        self.assertEqual(band.allocated_count(), count)
-                        torch.testing.assert_close(
-                            band.ids.virtual_to_physical, mapping
-                        )
-                    torch.testing.assert_close(
-                        allocator.full_attn_allocator.free_virtual_ids, free_ids
-                    )
                     allocator.free(ids)
                     self.assertEqual(allocator.verify_byte_accounting(), [])
                     self.assertTrue(
                         all(b.allocated_count() == 0 for b in allocator.bands)
                     )
+                    # A band refusing a take its own planned layout reserved is
+                    # an internal error, raised rather than reported as no room.
+                    with patch.object(
+                        allocator._windows[-1],
+                        "take_physical_pages",
+                        return_value=None,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "was refused"):
+                            allocator.alloc(4)
 
     def test_request_cleanup_releases_independently_retained_windows(self):
         """Returning owner ids must not strand a longer window's physical pages."""
@@ -2265,7 +2253,7 @@ class TestDeclaredParts(CustomTestCase):
         )
         key = RadixKey(array("q", range(ids.numel())))
         cache.insert(InsertParams(key=key, value=ids.clone()))
-        need = next(n for n in empty_demands if not a.can_reserve(n, n))
+        need = next(n for n in empty_demands if not a.ensure_capacity(n, n))
         budget = a.create_prefill_budget(cache)
         before = a.pricing_snapshot()
         self.assertTrue(budget._fits(need, need, empty_pool=True))
@@ -2274,7 +2262,11 @@ class TestDeclaredParts(CustomTestCase):
         node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
         receipt = cache.inc_lock_ref(node)
         try:
-            self.assertFalse(budget._fits(need, need))
+            # The lock keeps the prefix's FULL pages, but window pages outside
+            # its windows stay reclaimable, and the bytes they free serve every
+            # band: the planner admits, and eviction then the take deliver it.
+            self.assertEqual(cache.full_evictable_size(), 0)
+            self.assertTrue(budget._fits(need, need))
             self.assertTrue(budget._fits(need, need, empty_pool=True))
         finally:
             cache.dec_lock_ref(node, receipt.to_dec_params())

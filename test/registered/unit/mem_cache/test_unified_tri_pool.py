@@ -33,7 +33,11 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
 )
-from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.chain import (
+    ChainAllocator,
+    ChainRoles,
+    take_new_pages,
+)
 from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
 from sglang.srt.mem_cache.kv.alloc.signals import wait_signals
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -71,6 +75,14 @@ _DEV = "cpu"
 # The owner page take behind the paged extend; stubbed so these CPU tests
 # never launch the GPU paging kernel.
 _TAKE_NEW_PAGES = "sglang.srt.mem_cache.kv.alloc.chain.take_new_pages"
+
+
+def _take_new_pages_on_host(owner, n, page_tokens, **kwargs):
+    """The owner page take with the extend kernel replaced by the token ids of
+    the new pages (an empty prefix), so the planned physical pages still bind."""
+    return take_new_pages(
+        owner, n, lambda free: owner._expand_pages_to_tokens(free[:n]), **kwargs
+    )
 
 
 class _PoolTestCase(unittest.TestCase):
@@ -152,10 +164,7 @@ class TestUnifiedTriPool(_PoolTestCase):
         # With an empty prefix, ordinary allocation supplies the same virtual
         # pages without launching the GPU extend kernel. All page binding and
         # capacity accounting still run through the real sub-allocators.
-        with patch(
-            _TAKE_NEW_PAGES,
-            side_effect=lambda owner, n, *a, **kw: owner.alloc(n * owner.page_size),
-        ):
+        with patch(_TAKE_NEW_PAGES, side_effect=_take_new_pages_on_host):
             virtual = allocator.alloc_extend_swa_tail(
                 prefix, prefix, seq, seq, torch.tensor([-1]), 12, swa_tail_len=5
             )
@@ -182,12 +191,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                     self.assertTrue(allocator.can_reserve(length, tail_len))
                     prefix = torch.tensor([0], dtype=torch.int64)
                     seq = torch.tensor([length], dtype=torch.int64)
-                    with patch(
-                        _TAKE_NEW_PAGES,
-                        side_effect=lambda owner, n, *a, **kw: owner.alloc(
-                            n * owner.page_size
-                        ),
-                    ):
+                    with patch(_TAKE_NEW_PAGES, side_effect=_take_new_pages_on_host):
                         virtual = allocator.alloc_extend_swa_tail(
                             prefix,
                             prefix,
@@ -1458,7 +1462,8 @@ class TestTriPoolHardening(_PoolTestCase):
         while not allocator.check_decode_capacity(num_tokens=need, tree_cache=None):
             self.assertGreater(len(reqs), 1, "retract must converge before bs=1")
             allocator.free(reqs.pop())
-        self.assertGreaterEqual(allocator.available_size(), need)
+        # A yes is the decode take succeeding, relayout included.
+        self.assertIsNotNone(allocator.alloc(need))
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
     def test_alternating_pressure_copy_traffic_bounded(self):
