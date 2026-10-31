@@ -35,25 +35,7 @@ register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=280, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
+class OpenAIServerMixin(AnthropicMessagesMixin):
     def test_ignore_eos(self):
         """ignore_eos=True must keep generating past EOS up to max_tokens."""
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -574,10 +556,10 @@ class TestOpenAICompletionWithRust(CustomTestCase):
 
     # Reuse the reference test methods directly so Python and Rust coverage
     # cannot drift into separate matrices.
-    run_completion = TestOpenAIServer.run_completion
-    run_completion_stream = TestOpenAIServer.run_completion_stream
-    test_completion = TestOpenAIServer.test_completion
-    test_completion_stream = TestOpenAIServer.test_completion_stream
+    run_completion = OpenAIServerMixin.run_completion
+    run_completion_stream = OpenAIServerMixin.run_completion_stream
+    test_completion = OpenAIServerMixin.test_completion
+    test_completion_stream = OpenAIServerMixin.test_completion_stream
 
 
 @unittest.skipUnless(
@@ -587,35 +569,17 @@ class TestOpenAICompletionWithRust(CustomTestCase):
 class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
     """Run the existing Chat matrix unchanged through the Rust frontend."""
 
-    run_chat_completion = TestOpenAIServer.run_chat_completion
-    run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
-    test_chat_completion = TestOpenAIServer.test_chat_completion
-    test_chat_completion_stream = TestOpenAIServer.test_chat_completion_stream
+    run_chat_completion = OpenAIServerMixin.run_chat_completion
+    run_chat_completion_stream = OpenAIServerMixin.run_chat_completion_stream
+    test_chat_completion = OpenAIServerMixin.test_chat_completion
+    test_chat_completion_stream = OpenAIServerMixin.test_chat_completion_stream
 
     # This class is a Chat gate; Completion already has its own Rust matrix.
     test_completion = None
     test_completion_stream = None
 
 
-class TestOpenAIServerv1Responses(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
+class OpenAIServerResponsesMixin:
     def run_response(
         self,
         input_text: str = "The capital of France is",
@@ -758,7 +722,9 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             final_usage_ok,
         )
 
-    def run_chat_completion_stream(self, logprobs=None, parallel_sample_num=1):
+    def run_responses_chat_completion_stream(
+        self, logprobs=None, parallel_sample_num=1
+    ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
             model=self.model,
@@ -836,7 +802,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_completed
         assert final_usage_ok or True  # final_usage's stats are not done for now
 
-    def test_regex(self):
+    def test_responses_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
@@ -885,7 +851,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("type", body["error"])
         self.assertIn("code", body["error"])
 
-    def test_penalty(self):
+    def test_responses_penalty(self):
         url = f"{self.base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -909,7 +875,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("output_tokens", body["usage"])
         self.assertIn("total_tokens", body["usage"])
 
-    def test_response_prefill(self):
+    def test_responses_response_prefill(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -941,7 +907,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
-    def test_model_list(self):
+    def test_responses_model_list(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         models = list(client.models.list())
         assert len(models) == 1
@@ -1107,31 +1073,12 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
 
-class TestOpenAIV1Score(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1/score"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
+class OpenAIServerScoreMixin:
     def run_score(
         self, query, items, label_token_ids, apply_softmax=False, item_first=False
     ):
         response = requests.post(
-            self.base_url,
+            self.score_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -1275,7 +1222,7 @@ class TestOpenAIV1Score(CustomTestCase):
 
         # Test with invalid token ID
         response = requests.post(
-            self.base_url,
+            self.score_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -1292,6 +1239,32 @@ class TestOpenAIV1Score(CustomTestCase):
         error_response = response.json()
         self.assertEqual(error_response["type"], "BadRequestError")
         self.assertIn("Token ID 999999 is out of vocabulary", error_response["message"])
+
+
+class TestOpenAIServer(
+    CustomTestCase,
+    OpenAIServerMixin,
+    OpenAIServerResponsesMixin,
+    OpenAIServerScoreMixin,
+):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1"
+        cls.score_url = cls.base_url + "/score"
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":
