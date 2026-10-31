@@ -22,17 +22,17 @@ def launch_server(args):
         for i in range(args.num_loras):
             lora_name = f"lora{i}"
             cmd += f"{lora_name}={lora_path} "
-    cmd += f"--disable-radix "
+    cmd += "--disable-radix "
     cmd += f"--max-loras-per-batch {args.max_loras_per_batch} "
     cmd += f"--max-running-requests {args.max_running_requests} "
     cmd += f"--lora-backend {args.lora_backend} "
     cmd += f"--tp-size {args.tp_size} "
     if args.disable_custom_all_reduce:
-        cmd += "--disable-custom-all-reduce"
+        cmd += "--disable-custom-all-reduce "
     if args.enable_mscclpp:
-        cmd += "--enable-mscclpp"
+        cmd += "--enable-mscclpp "
     if args.enable_torch_symm_mem:
-        cmd += "--enable-torch-symm-mem"
+        cmd += "--enable-torch-symm-mem "
     print(cmd)
     os.system(cmd)
 
