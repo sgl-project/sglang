@@ -262,24 +262,24 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         options = dict(options)
+        # Guard is selected exactly when a socket path is configured.
+        self._guard = options.get("kvcr_service_socket_path") is not None
         self._publish_inventory = options.pop("publish_inventory", False)
         if type(self._publish_inventory) is not bool:
             raise ValueError("KVCR publish_inventory must be a boolean")
-        if (
-            self._publish_inventory
-            and options.get("kvcr_service_socket_path", "/run/kvcr/memory.sock")
-            is not None
-        ):
+        if self._publish_inventory and self._guard:
             raise ValueError(
                 "KVCR linker inventory requires kvcr_service_socket_path=null"
             )
-        if self._publish_inventory and (
+        if (self._publish_inventory or self._guard) and (
             tp_size != 1
             or params.attn_cp_size != 1
             or params.pp_size != 1
             or get_parallel().nnodes != 1
         ):
-            raise ValueError("KVCR linker inventory requires single-node TP1/CP1/PP1")
+            raise ValueError(
+                "KVCR linker inventory and Guard mode require single-node TP1/CP1/PP1"
+            )
         shard = options.pop("shard_replicated", False)
         if type(shard) is not bool:
             raise ValueError("KVCR shard_replicated must be a boolean")
@@ -375,10 +375,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             raise ValueError("KVCR linker inventory requires process-local storage")
 
     def get_kv_hint_sources(self):
-        if not self._publish_inventory:
+        if not (self._publish_inventory or self._guard) or self._fatal is not None:
             return []
         parallel = get_parallel()
         rank = parallel.dp_rank or 0
+        if self._guard:
+            return [
+                {
+                    "dp_rank": rank,
+                    "capabilities": ["router_hint"],
+                    "source_control_endpoint": self._runtime.control_endpoint,
+                    "inventory_lifetime": "guard",
+                }
+            ]
         incarnation = self.layout.endpoint_name.rsplit("-", 1)[-1]
         namespace = self.layout.namespace
         return [

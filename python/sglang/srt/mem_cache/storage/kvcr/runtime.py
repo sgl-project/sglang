@@ -12,6 +12,10 @@ from collections import Counter, deque
 logger = logging.getLogger(__name__)
 
 
+class KVCRConfigError(ValueError):
+    """A Guard is configured but cannot be attached; there is no fallback."""
+
+
 class _TelemetryStats:
     """Bounded interval aggregates recorded on the KVCR API owner thread."""
 
@@ -52,9 +56,9 @@ class KVCRRuntime:
     def __init__(self, layout, options: dict, *, rank: int):
         defaults = {
             "dram_size_gb": 1,
-            "kvcr_service_socket_path": "/run/kvcr/memory.sock",
+            "kvcr_service_socket_path": None,
             "guard_index": 0,
-            "compatibility_digest": layout.namespace,
+            "compatibility_digest": None,
             "control_host": "0.0.0.0",
             "advertise_host": None,
             "control_port": 19500,
@@ -80,10 +84,13 @@ class KVCRRuntime:
             raise ValueError("KVCR kvcr_service_socket_path must be a path or null")
         if type(config["guard_index"]) is not int or config["guard_index"] < 0:
             raise ValueError("KVCR guard_index must be a nonnegative integer")
-        if (
-            not isinstance(config["compatibility_digest"], str)
-            or not config["compatibility_digest"]
-        ):
+        digest = config["compatibility_digest"]
+        if (guard_socket is None) != (digest is None):
+            raise ValueError(
+                "KVCR kvcr_service_socket_path and compatibility_digest must be "
+                "configured together"
+            )
+        if digest is not None and (not isinstance(digest, str) or not digest):
             raise ValueError("KVCR compatibility_digest must be a nonempty string")
         size_gb = config["dram_size_gb"]
         if (
@@ -214,12 +221,15 @@ class KVCRRuntime:
                     )
                     return
                 except KVCRSocketError as error:
-                    # A lost claim reply can leave a live lease; only retry before connect.
-                    if not isinstance(
-                        error.__cause__, (FileNotFoundError, ConnectionRefusedError)
-                    ):
-                        raise
-                    logger.warning("%s; using in-process KVCR DRAM", error)
+                    # Missing, busy, refusing or interrupted: never fall back.
+                    raise KVCRConfigError(
+                        "a configured Guard is required; refusing process-local "
+                        f"fallback: {error}"
+                    ) from error
+            logger.info(
+                "KVCR without Guard: process-local DRAM, pool layouts: %s",
+                layout.pool_layouts,
+            )
             pools = []
             for name, size in layout.pool_layouts:
                 length = (
