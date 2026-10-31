@@ -24,6 +24,12 @@ CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+# ROCm only: MFMA instruction size (16 for 16x16, 32 for 32x32; 0 leaves it to the compiler).
+GDN_CHUNK_H_MATRIX_INSTR_NONKDIM = (
+    int(os.getenv("SGLANG_GDN_CHUNK_H_MATRIX_INSTR_NONKDIM", "0"))
+    if torch.version.hip
+    else 0
+)
 
 
 @triton.autotune(
@@ -41,7 +47,12 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
     # tile without corrupting the state pool through multi-config autotune.
     configs=[
         triton.Config(
-            {"BV": GDN_CHUNK_H_BV},
+            {"BV": GDN_CHUNK_H_BV}
+            | (
+                {"matrix_instr_nonkdim": GDN_CHUNK_H_MATRIX_INSTR_NONKDIM}
+                if GDN_CHUNK_H_MATRIX_INSTR_NONKDIM
+                else {}
+            ),
             num_warps=GDN_CHUNK_H_NUM_WARPS,
             num_stages=GDN_CHUNK_H_NUM_STAGES,
         )
