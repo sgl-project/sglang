@@ -19,7 +19,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    StorageCallLanes,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -170,7 +173,10 @@ class TestSeaweedFSStore(CustomTestCase):
     def _controller(self, store, pool):
         store.register_mem_pool_host(pool)
         return SimpleNamespace(
-            storage_backend=store, storage_host_pool=pool, page_size=PAGE_SIZE
+            storage_backend=store,
+            storage_host_pool=pool,
+            page_size=PAGE_SIZE,
+            storage_calls=StorageCallLanes(lambda: store),
         )
 
     def _backup_and_reload(

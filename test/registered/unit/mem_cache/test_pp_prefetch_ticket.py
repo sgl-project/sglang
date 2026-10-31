@@ -14,7 +14,11 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchAck,
+    StorageCallLanes,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -76,6 +80,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c.storage_backend_type = "mooncake"
         c.storage_backend = Mock()
+        c.storage_calls = StorageCallLanes(lambda: c.storage_backend)
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
         ranks = {"pp": [0, 2, 4, 6], "tp": [0, 1], "command": [0, 2, 4, 6]}

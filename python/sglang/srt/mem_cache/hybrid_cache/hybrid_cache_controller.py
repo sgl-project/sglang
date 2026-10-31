@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -1449,11 +1450,11 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
         )
         if operation.pool_transfers:
-            hit_result = self.storage_backend.batch_exists_v2(
+            hit_result = self.storage_calls.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
         else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+            kv_hit_count = self.storage_calls.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
             )
@@ -1662,7 +1663,7 @@ class HybridCacheController(BaseHiCacheController):
                     transfers_nonkv,
                 ):
                     results.update(
-                        self.storage_backend.batch_get_v2(
+                        self.storage_calls.batch_get_v2(
                             transfers, extra_info=extra_info
                         )
                     )
@@ -1727,7 +1728,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
                 results.update(
-                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
+                    self.storage_calls.batch_set_v2(transfers, extra_info=extra_info)
                 )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
@@ -1789,8 +1790,19 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self.storage_calls.serve(operation)
+                if self.scheduler_agrees_storage:
+                    with self._inflight_lock:
+                        self._inflight_backups.add(operation)
                 self._page_backup_or_log(operation)
-                self.ack_backup_queue.put(operation)
+                if self.scheduler_agrees_storage:
+                    # Acked once no orphaned write of this operation still
+                    # reads its staging rows.
+                    self.storage_calls.when_idle(
+                        operation, functools.partial(self._finish_backup, operation)
+                    )
+                else:
+                    self.ack_backup_queue.put(operation)
             except Empty:
                 continue
 

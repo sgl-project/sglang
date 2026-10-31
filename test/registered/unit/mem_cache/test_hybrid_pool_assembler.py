@@ -14,6 +14,7 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
+from sglang.srt.managers.cache_controller import StorageCallLanes
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -1561,6 +1562,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
         )
         cc = HybridCacheController.__new__(HybridCacheController)
         cc.storage_backend = FailingStorage()
+        cc.storage_calls = StorageCallLanes(lambda: cc.storage_backend)
         cc.prefetch_sync_queue = Queue()
         operation = PrefetchOperation(
             CacheRequestHandle("r", 0),

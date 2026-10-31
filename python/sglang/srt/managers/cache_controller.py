@@ -14,9 +14,13 @@ limitations under the License.
 """
 
 
+import functools
 import logging
+import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
@@ -307,6 +311,141 @@ class PrefetchOperation(StorageOperation, LocalQueryOutcomeMixin):
             return self._terminated_flag
 
 
+class StorageCallTimeout(Exception):
+    """A bounded storage call did not return in time and keeps running orphaned."""
+
+
+class StorageCallLanes:
+    """The storage backend as the worker threads call it, with an optional bound.
+
+    Each worker thread gets its own helper thread for the calls. A call that
+    outlasts the bound is left running (orphaned) and raises
+    ``StorageCallTimeout``, which the worker treats as a failed call and moves
+    on; a fresh helper takes the thread's next call, so one hung call wedges
+    nothing behind it. The operation an orphaned call was serving stays
+    unfinished until the call returns, so the host rows it may still touch are
+    neither released nor reused: the operation is the quarantine. Without a
+    bound every call runs inline on the worker thread.
+    """
+
+    def __init__(
+        self, backend_getter: Callable[[], Any], timeout_s: Optional[float] = None
+    ):
+        if timeout_s is not None and not (math.isfinite(timeout_s) and timeout_s > 0):
+            raise ValueError(
+                f"call_timeout_s must be a positive number of seconds, got {timeout_s!r}"
+            )
+        # Read at every call, so the owner may swap its backend under the lanes.
+        self._backend = backend_getter
+        self.timeout_s = timeout_s
+        self.orphaned_calls = 0
+        self._lock = threading.Lock()
+        self._executors: dict[int, ThreadPoolExecutor] = {}
+        self._serving: dict[int, object] = {}
+        self._orphans: dict[int, int] = {}
+        self._on_idle: dict[int, list[Callable[[], None]]] = {}
+
+    def serve(self, operation) -> None:
+        """The calling worker thread names the operation its next calls serve."""
+        self._serving[threading.get_ident()] = operation
+
+    def when_idle(self, operation, callback: Callable[[], None]) -> None:
+        """Run ``callback`` once no orphaned call of ``operation`` is
+        outstanding: now when there is none, else from the call that returns
+        last."""
+        with self._lock:
+            if id(operation) in self._orphans:
+                self._on_idle.setdefault(id(operation), []).append(callback)
+                return
+        callback()
+
+    def idle(self) -> bool:
+        with self._lock:
+            return not self._orphans
+
+    def close(self) -> None:
+        with self._lock:
+            executors, self._executors = list(self._executors.values()), {}
+        for executor in executors:
+            executor.shutdown(wait=False)
+
+    def batch_exists(self, *args, **kwargs):
+        return self._run(self._backend().batch_exists, *args, **kwargs)
+
+    def batch_exists_v2(self, *args, **kwargs):
+        return self._run(self._backend().batch_exists_v2, *args, **kwargs)
+
+    def batch_get(self, *args, **kwargs):
+        return self._run(self._backend().batch_get, *args, **kwargs)
+
+    def batch_get_v1(self, *args, **kwargs):
+        return self._run(self._backend().batch_get_v1, *args, **kwargs)
+
+    def batch_get_v2(self, *args, **kwargs):
+        return self._run(self._backend().batch_get_v2, *args, **kwargs)
+
+    def batch_set(self, *args, **kwargs):
+        return self._run(self._backend().batch_set, *args, **kwargs)
+
+    def batch_set_v1(self, *args, **kwargs):
+        return self._run(self._backend().batch_set_v1, *args, **kwargs)
+
+    def batch_set_v2(self, *args, **kwargs):
+        return self._run(self._backend().batch_set_v2, *args, **kwargs)
+
+    def _run(self, fn, *args, **kwargs):
+        if self.timeout_s is None:
+            return fn(*args, **kwargs)
+        ident = threading.get_ident()
+        with self._lock:
+            executor = self._executors.get(ident)
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="hicache-storage-call"
+                )
+                self._executors[ident] = executor
+        future = executor.submit(fn, *args, **kwargs)
+        try:
+            return future.result(timeout=self.timeout_s)
+        except FuturesTimeout:
+            self._orphan(ident, executor, future, fn)
+            raise StorageCallTimeout(
+                f"{fn.__name__} exceeded {self.timeout_s:.3g}s and runs orphaned"
+            ) from None
+
+    def _orphan(self, ident: int, executor, future, fn) -> None:
+        operation = self._serving.get(ident)
+        key = None if operation is None else id(operation)
+        with self._lock:
+            self.orphaned_calls += 1
+            outstanding = self.orphaned_calls
+            if key is not None:
+                self._orphans[key] = self._orphans.get(key, 0) + 1
+            if self._executors.get(ident) is executor:
+                del self._executors[ident]  # the next call gets a fresh helper
+        executor.shutdown(wait=False)
+        logger.warning(
+            "HiCache storage call %s exceeded %.3gs; it keeps running orphaned "
+            "(%d orphaned so far)",
+            fn.__name__,
+            self.timeout_s,
+            outstanding,
+        )
+        if key is not None:
+            future.add_done_callback(lambda _f, key=key: self._orphan_done(key))
+
+    def _orphan_done(self, key: int) -> None:
+        with self._lock:
+            remaining = self._orphans[key] - 1
+            if remaining:
+                self._orphans[key] = remaining
+                return
+            del self._orphans[key]
+            callbacks = self._on_idle.pop(key, [])
+        for callback in callbacks:
+            callback()
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -359,6 +498,13 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        # The backend as the workers call it (bounded when configured), and the
+        # operations whose host rows a worker still holds.
+        self.storage_calls: Optional[StorageCallLanes] = None
+        self.storage_call_timeout_s: Optional[float] = None
+        self._inflight_lock = threading.Lock()
+        self._inflight_transfers: set = set()
+        self._inflight_backups: set = set()
         self.enable_storage_metrics = enable_storage_metrics
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
@@ -697,6 +843,16 @@ class HiCacheController:
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
             if not self._registers_host_pools_after_super_attach:
                 self.storage_backend.on_host_pools_registered()
+            extra_config = self.storage_config.extra_config
+            timeout = (
+                extra_config.get("call_timeout_s")
+                if isinstance(extra_config, dict)
+                else None
+            )
+            self.storage_call_timeout_s = None if timeout is None else float(timeout)
+            self.storage_calls = StorageCallLanes(
+                lambda: self.storage_backend, self.storage_call_timeout_s
+            )
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -770,6 +926,9 @@ class HiCacheController:
                         self.storage_backend.close()
             except Exception:
                 pass
+            if self.storage_calls is not None:
+                self.storage_calls.close()
+                self.storage_calls = None
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
@@ -815,6 +974,9 @@ class HiCacheController:
         except Exception:
             logger.exception("Failed to close storage backend cleanly.")
 
+        if self.storage_calls is not None:
+            self.storage_calls.close()
+            self.storage_calls = None
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
@@ -975,9 +1137,15 @@ class HiCacheController:
         return plan
 
     def reset(self):
-        # Reuse detach's queue wakeups and bounded joins, and fail if any
-        # storage thread remains alive before clearing shared state.
-        self._stop_storage_threads()
+        in_place = self.enable_storage and self.scheduler_agrees_storage
+        if in_place:
+            # The workers only do I/O: wait until they hold no host rows, then
+            # clear the queues under them. No thread is joined or restarted.
+            self._quiesce_storage_workers()
+        else:
+            # Reuse detach's queue wakeups and bounded joins, and fail if any
+            # storage thread remains alive before clearing shared state.
+            self._stop_storage_threads()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -993,11 +1161,49 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+        if in_place:
+            return
 
         self.storage_stop_event.clear()
 
         if self.enable_storage:
             self._spawn_storage_threads()
+
+    def _quiesce_storage_workers(self) -> None:
+        """Cancel the transfers the workers still hold host rows for and wait
+        until every worker is done with its rows: a bounded call ends within
+        its bound, an orphaned one keeps its operation unfinished until it
+        returns. Raises if rows are still held after the wait, which only an
+        unbounded hung call can cause."""
+        with self._inflight_lock:
+            transfers = list(self._inflight_transfers)
+        for operation in transfers:
+            operation.mark_terminate()
+        deadline = time.monotonic() + max(
+            10.0, (self.storage_call_timeout_s or 0.0) + 1.0
+        )
+        while True:
+            with self._inflight_lock:
+                held = len(self._inflight_transfers) + len(self._inflight_backups)
+            if not held:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"HiCache storage workers still own the host rows of {held} "
+                    "operation(s) after the reset wait: a storage call is hung "
+                    "without a bound (set call_timeout_s in the storage config)."
+                )
+            time.sleep(0.005)
+
+    def _finish_transfer(self, operation) -> None:
+        operation.mark_transfer_finished()
+        with self._inflight_lock:
+            self._inflight_transfers.discard(operation)
+
+    def _finish_backup(self, operation) -> None:
+        self.ack_backup_queue.put(operation)
+        with self._inflight_lock:
+            self._inflight_backups.discard(operation)
 
     def has_inflight_device_transfers(self) -> bool:
         """Whether queued or unacknowledged L2 transfers still use device rows."""
@@ -1260,9 +1466,7 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
-        results = self.storage_backend.batch_get_v1(
-            hash_values, host_indices, extra_info
-        )
+        results = self.storage_calls.batch_get_v1(hash_values, host_indices, extra_info)
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -1280,7 +1484,7 @@ class HiCacheController:
         dummy_page_dst = [
             self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
         ]
-        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+        page_data = self.storage_calls.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return 0
         count = 0
@@ -1390,7 +1594,7 @@ class HiCacheController:
                 )
                 for transfer in kv_derived_transfers
             ]
-            sidecar_results = self.storage_backend.batch_get_v2(
+            sidecar_results = self.storage_calls.batch_get_v2(
                 current_kv_derived_transfers, extra_info=extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
@@ -1409,13 +1613,20 @@ class HiCacheController:
                 continue
             if operation is None:
                 continue
+            self.storage_calls.serve(operation)
+            if self.scheduler_agrees_storage:
+                with self._inflight_lock:
+                    self._inflight_transfers.add(operation)
             try:
                 self._page_transfer(operation)
             finally:
                 if self.scheduler_agrees_storage:
-                    # The last touch of this operation's host rows: the tick
-                    # publishes the agreed completion once every rank is here.
-                    operation.mark_transfer_finished()
+                    # Finished once no call of this operation is still running
+                    # (an orphaned one keeps the rows held until it returns);
+                    # the tick publishes the agreed completion only after that.
+                    self.storage_calls.when_idle(
+                        operation, functools.partial(self._finish_transfer, operation)
+                    )
                 else:
                     self.prefetch_sync_queue.put(
                         PrefetchAck(
@@ -1479,7 +1690,7 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            hit_page_num = self.storage_calls.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1498,6 +1709,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self.storage_calls.serve(operation)
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
@@ -1575,11 +1787,11 @@ class HiCacheController:
             self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
-        return self.storage_backend.batch_set(hash_values, data)
+        return self.storage_calls.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
         return all(
-            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+            self.storage_calls.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
     # Backup batch by batch
@@ -1622,10 +1834,21 @@ class HiCacheController:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self.storage_calls.serve(operation)
+                if self.scheduler_agrees_storage:
+                    with self._inflight_lock:
+                        self._inflight_backups.add(operation)
 
                 if not self.backup_skip:
                     self._page_backup_or_log(operation)
-                self.ack_backup_queue.put(operation)
+                if self.scheduler_agrees_storage:
+                    # Acked once no orphaned write of this operation still
+                    # reads its staging rows.
+                    self.storage_calls.when_idle(
+                        operation, functools.partial(self._finish_backup, operation)
+                    )
+                else:
+                    self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue

@@ -371,14 +371,17 @@ class StorageAgreementEngine:
             if cut_transfer is not None and values[-1] < 0:
                 cut_transfer(operation)
             if state == TRANSFER_PENDING:
-                break  # a rank's worker still owns the host rows
+                # A worker (or an orphaned call) still owns these rows. The
+                # agreed state names the operation on every rank, so later
+                # transfers need not wait behind it.
+                continue
             if state == TRANSFER_FATAL:
                 raise RuntimeError(
                     "HiCache storage worker is gone on a rank; request "
                     f"{operation.request_id} and every later storage operation "
                     "can no longer be agreed across ranks"
                 )
-            self.transfers.popleft()
+            self.transfers.remove(operation)
             pool_hits = None
             if operation.pool_transfers:
                 pool_hits = {

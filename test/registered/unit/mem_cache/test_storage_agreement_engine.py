@@ -23,6 +23,11 @@ from unittest.mock import Mock
 import torch
 import torch.distributed as dist
 
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    StorageCallLanes,
+    StorageCallTimeout,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -402,6 +407,20 @@ class TestStorageAgreementTransfers(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "worker is gone"):
             healthy.tick()
 
+    def test_finished_transfer_publishes_past_a_pending_one(self):
+        """A transfer whose rows a slow (orphaned) call still holds does not
+        hold back later transfers: the agreed state names the operation."""
+        local, peer = _ranks()
+        for rank in (local, peer):
+            slow, fast = _operation("slow"), _operation("fast")
+            rank.engine.register_transfer(slow)
+            rank.engine.register_transfer(fast)
+            fast.publish_local_transfer_progress(8)
+            fast.mark_transfer_finished()
+        self.assertEqual(local.tick(), (0, 1))
+        self.assertEqual(local.acks[0][0].request_id, "fast")
+        self.assertEqual([op.request_id for op in local.engine.transfers], ["slow"])
+
     def test_query_rows_come_before_transfer_rows_in_one_agreement(self):
         """Both FIFOs ride one collective; a pending query does not hold back a
         finished transfer and vice versa."""
@@ -538,9 +557,6 @@ class TestAgreedHitReservations(unittest.TestCase):
         self.assertEqual(cache._prefetch_outcome_stats["declined_rate_limited"], 1)
 
 
-# ---------------------------------------------------------------- two ranks
-
-
 class _HoldingBackend:
     """Every call reports all pages present; the first query and the first
     read each block on an event when asked to."""
@@ -565,12 +581,120 @@ class _HoldingBackend:
         return [True] * len(hashes)
 
 
+class TestStorageCallLanes(unittest.TestCase):
+    def test_unbounded_lane_runs_inline(self):
+        backend = _HoldingBackend(hold_query=False, hold_get=False)
+        lanes = StorageCallLanes(lambda: backend)
+        self.assertEqual(lanes.batch_exists(CHAIN), 4)
+        self.assertTrue(lanes.idle())
+        ran = []
+        lanes.when_idle(object(), lambda: ran.append(True))
+        self.assertEqual(ran, [True])
+
+    def test_timed_out_call_is_orphaned_and_holds_its_operation(self):
+        backend = _HoldingBackend(hold_query=False, hold_get=True)
+        lanes = StorageCallLanes(lambda: backend, timeout_s=0.1)
+        operation = _operation("held")
+        lanes.serve(operation)
+        t0 = time.monotonic()
+        with self.assertRaises(StorageCallTimeout):
+            lanes.batch_get_v1(CHAIN, torch.arange(8))
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertFalse(lanes.idle())
+        finished = []
+        lanes.when_idle(operation, lambda: finished.append(True))
+        self.assertEqual(finished, [])  # the orphan still runs
+        # The thread's next call does not wait behind the orphan.
+        t0 = time.monotonic()
+        self.assertEqual(lanes.batch_get_v1(CHAIN, torch.arange(8)), [True] * 4)
+        self.assertLess(time.monotonic() - t0, 0.1)
+        backend.get_hold.set()
+        deadline = time.monotonic() + 2.0
+        while not finished and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(finished, [True])
+        self.assertTrue(lanes.idle())
+        self.assertEqual(lanes.orphaned_calls, 1)
+        lanes.close()
+
+    def test_bound_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            StorageCallLanes(lambda: object(), timeout_s=0)
+
+
+class TestResetInPlace(unittest.TestCase):
+    """With scheduler-thread agreement the workers only do I/O: reset waits
+    until they hold no rows and clears the queues under them, joining nothing."""
+
+    def _controller(self, backend):
+        cc = HiCacheController.__new__(HiCacheController)
+        cc.page_size = PAGE
+        cc.enable_storage = True
+        cc.scheduler_agrees_storage = True
+        cc.storage_backend = backend
+        cc.storage_calls = StorageCallLanes(lambda: backend, timeout_s=0.2)
+        cc.storage_call_timeout_s = 0.2
+        cc._inflight_lock = threading.Lock()
+        cc._inflight_transfers, cc._inflight_backups = set(), set()
+        cc.on_prefetch_dispatched = None
+        cc.storage_stop_event = threading.Event()
+        cc.write_queue, cc.load_queue = [], []
+        cc.ack_write_queue, cc.ack_load_queue = [], []
+        cc.prefetch_queue, cc.backup_queue = Queue(), Queue()
+        cc.prefetch_buffer, cc.prefetch_sync_queue = Queue(), Queue()
+        cc.prefetch_hit_queue, cc.ack_prefetch_queue = Queue(), Queue()
+        cc.ack_backup_queue, cc.host_mem_release_queue = Queue(), Queue()
+        cc.prefetch_tokens_occupied = 3
+        cc.page_get_func = cc._page_get_zero_copy
+        cc.prefetch_sync_thread = cc.backup_thread = cc.prefetch_thread = None
+        cc.prefetch_io_aux_thread = threading.Thread(
+            target=cc.prefetch_io_aux_func, daemon=True
+        )
+        cc.prefetch_io_aux_thread.start()
+        return cc
+
+    def test_reset_waits_for_held_rows_and_keeps_the_workers(self):
+        backend = _HoldingBackend(hold_query=False, hold_get=True)
+        cc = self._controller(backend)
+        operation = _operation("held")
+        operation.hash_value = list(CHAIN)
+        operation.host_indices = torch.arange(8)
+        cc.prefetch_hit_queue.put(object())
+        cc.dispatch_prefetch_transfer(operation)
+        deadline = time.monotonic() + 2.0
+        while not cc._inflight_transfers and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(cc._inflight_transfers)
+        # The read is held past the call bound: the worker orphans it, the
+        # operation stays held, and reset waits for the orphan to return.
+        threading.Timer(0.5, backend.get_hold.set).start()
+        t0 = time.monotonic()
+        cc.reset()
+        self.assertGreaterEqual(time.monotonic() - t0, 0.3)
+        self.assertFalse(cc._inflight_transfers)
+        self.assertTrue(operation.local_transfer_progress().finished)
+        self.assertTrue(cc.prefetch_io_aux_thread.is_alive())
+        self.assertFalse(cc.storage_stop_event.is_set())
+        self.assertTrue(cc.prefetch_hit_queue.empty())
+        self.assertEqual(cc.prefetch_tokens_occupied, 0)
+        cc.storage_stop_event.set()
+        cc.prefetch_buffer.put(None)
+
+
+# ---------------------------------------------------------------- two ranks
+
+
 def _controller(backend) -> HybridCacheController:
     """The real query and transfer workers over a scripted backend; agreement
     is the scheduler's, so the workers only record local outcomes."""
     cc = HybridCacheController.__new__(HybridCacheController)
     cc.page_size = PAGE
     cc.storage_backend = backend
+    cc.storage_calls = StorageCallLanes(lambda: backend)
+    cc.storage_call_timeout_s = None
+    cc._inflight_lock = threading.Lock()
+    cc._inflight_transfers = set()
+    cc._inflight_backups = set()
     cc.scheduler_agrees_storage = True
     cc.on_prefetch_dispatched = None
     cc.storage_stop_event = threading.Event()
@@ -744,6 +868,39 @@ def _slow_backend_body(rank: int) -> None:
     ack = cc.ack_prefetch_queue.get_nowait()
     _same_on_every_rank(ack.completed_tokens)
     cache.prefetch_stop_policy = "wait_complete"
+
+    # Orphan phase: calls are bounded on both ranks; rank 1 holds the read of
+    # the first operation past the bound, so its worker orphans the call and
+    # serves the next operation. That one publishes first on every rank; the
+    # held one stays unfinished (its rows quarantined) until the orphan
+    # returns, then publishes with the agreed prefix (0: it failed on rank 1).
+    cc.storage_calls = StorageCallLanes(lambda: backend, timeout_s=0.3)
+    cc.storage_call_timeout_s = 0.3
+    held = _submit(cache, "held")
+    behind = _submit(cache, "behind")
+    _tick_until(cache, lambda hits, acks: cc.prefetch_hit_queue.qsize() == 2)
+    cc.prefetch_hit_queue.get_nowait()
+    cc.prefetch_hit_queue.get_nowait()
+    backend.hold_get, backend.gets = rank == 1, 0
+    backend.get_hold.clear()
+    _dispatch(cache, held)
+    _dispatch(cache, behind)
+    if rank == 1:
+        threading.Timer(HOLD_S, backend.get_hold.set).start()
+    tick, _, elapsed = _tick_until(cache, lambda hits, acks: acks > 0)
+    ack = cc.ack_prefetch_queue.get_nowait()
+    assert ack.operation is behind, ack.operation.request_id
+    assert elapsed < HOLD_S * 0.9, elapsed  # did not wait behind the held call
+    _same_on_every_rank((tick, ack.completed_tokens))
+    assert cache.storage_engine.pending_transfers() == 1
+    _tick_until(cache, lambda hits, acks: acks > 0)
+    ack = cc.ack_prefetch_queue.get_nowait()
+    assert ack.operation is held
+    _same_on_every_rank(ack.completed_tokens)
+    assert ack.completed_tokens == 0
+    assert cc.storage_calls.idle()
+    cc.storage_calls = StorageCallLanes(lambda: backend)
+    cc.storage_call_timeout_s = None
 
     # Divergent submission: only rank 0 registers a query. The count exchange
     # catches it on every rank before the agreement collective could hang.
