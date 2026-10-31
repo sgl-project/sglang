@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
-from sglang.srt.utils import cdiv, device_context
+from sglang.srt.utils import cdiv, device_context, is_gfx95_supported
 
 MXFP4_BLOCK_SIZE = 32
 MXFP4_ROUND_UP = 1
@@ -111,6 +111,7 @@ def _mxfp4_quantize(
     FP4_BLOCK_SIZE: tl.constexpr,
     ROUND_MODE: tl.constexpr,
     ROUND_UP_MODE: tl.constexpr,
+    PK_FP4_CVT: tl.constexpr,
 ):
     """Quantize FP32 rows into packed E2M1 values plus E8M0 scales."""
     num_groups: tl.constexpr = BLOCK_N // FP4_BLOCK_SIZE
@@ -138,38 +139,54 @@ def _mxfp4_quantize(
         scale_e8m0 = scale_unbiased.to(tl.uint8) + 127
         quant_scale = tl.exp2(-scale_unbiased)
 
-    qx = (x * quant_scale).to(tl.uint32, bitcast=True)
+    if PK_FP4_CVT:
+        # gfx950 rounds a pair of values to E2M1 in one instruction, the same
+        # byte as the bit arithmetic below for every non-NaN input.
+        lo, hi = tl.split(tl.reshape(x * quant_scale, [BLOCK_M, num_groups, 16, 2]))
+        packed = tl.inline_asm_elementwise(
+            "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+            "=v,v,v,v",
+            args=[lo, hi, 1.0],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        ).to(tl.uint8)
+        packed = packed.reshape(BLOCK_M, BLOCK_N // 2)
+    else:
+        qx = (x * quant_scale).to(tl.uint32, bitcast=True)
 
-    sign = qx & 0x80000000
-    qx = qx ^ sign
-    qx_fp32 = qx.to(tl.float32, bitcast=True)
+        sign = qx & 0x80000000
+        qx = qx ^ sign
+        qx_fp32 = qx.to(tl.float32, bitcast=True)
 
-    saturate_mask = qx_fp32 >= 6.0
-    denormal_mask = (~saturate_mask) & (qx_fp32 < 1.0)
-    normal_mask = ~(saturate_mask | denormal_mask)
+        saturate_mask = qx_fp32 >= 6.0
+        denormal_mask = (~saturate_mask) & (qx_fp32 < 1.0)
+        normal_mask = ~(saturate_mask | denormal_mask)
 
-    denorm_exp: tl.constexpr = (127 - 1) + (23 - 1) + 1
-    denorm_mask_int: tl.constexpr = denorm_exp << 23
-    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
-    denormal_x = (qx_fp32 + denorm_mask_float).to(tl.uint32, bitcast=True)
-    denormal_x = (denormal_x - denorm_mask_int).to(tl.uint8)
+        denorm_exp: tl.constexpr = (127 - 1) + (23 - 1) + 1
+        denorm_mask_int: tl.constexpr = denorm_exp << 23
+        denorm_mask_float: tl.constexpr = tl.cast(
+            denorm_mask_int, tl.float32, bitcast=True
+        )
+        denormal_x = (qx_fp32 + denorm_mask_float).to(tl.uint32, bitcast=True)
+        denormal_x = (denormal_x - denorm_mask_int).to(tl.uint8)
 
-    mantissa_odd = (qx >> (23 - 1)) & 1
-    rounding_bias: tl.constexpr = ((1 - 127) << 23) + (1 << 21) - 1
-    # qx has had its sign bit removed, so signed arithmetic can apply the
-    # negative exponent-bias adjustment without an unsigned wraparound.
-    normal_x = qx.to(tl.int32, bitcast=True)
-    normal_x = normal_x + rounding_bias + mantissa_odd.to(tl.int32)
-    normal_x = (normal_x >> (23 - 1)).to(tl.uint8)
+        mantissa_odd = (qx >> (23 - 1)) & 1
+        rounding_bias: tl.constexpr = ((1 - 127) << 23) + (1 << 21) - 1
+        # qx has had its sign bit removed, so signed arithmetic can apply the
+        # negative exponent-bias adjustment without an unsigned wraparound.
+        normal_x = qx.to(tl.int32, bitcast=True)
+        normal_x = normal_x + rounding_bias + mantissa_odd.to(tl.int32)
+        normal_x = (normal_x >> (23 - 1)).to(tl.uint8)
 
-    e2m1 = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
-    e2m1 = tl.where(normal_mask, normal_x, e2m1)
-    e2m1 = tl.where(denormal_mask, denormal_x, e2m1)
-    e2m1 = e2m1 | (sign >> 28).to(tl.uint8)
+        e2m1 = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
+        e2m1 = tl.where(normal_mask, normal_x, e2m1)
+        e2m1 = tl.where(denormal_mask, denormal_x, e2m1)
+        e2m1 = e2m1 | (sign >> 28).to(tl.uint8)
 
-    e2m1 = tl.reshape(e2m1, [BLOCK_M, num_groups, 16, 2])
-    evens, odds = tl.split(e2m1)
-    packed = (evens | (odds << 4)).reshape(BLOCK_M, BLOCK_N // 2)
+        e2m1 = tl.reshape(e2m1, [BLOCK_M, num_groups, 16, 2])
+        evens, odds = tl.split(e2m1)
+        packed = (evens | (odds << 4)).reshape(BLOCK_M, BLOCK_N // 2)
     return packed, scale_e8m0.reshape(BLOCK_M, num_groups)
 
 
@@ -197,6 +214,7 @@ def _rmsnorm_gated_mxfp4_kernel(
     ROUND_MODE: tl.constexpr,
     ROUND_UP_MODE: tl.constexpr,
     SHUFFLE_SCALES: tl.constexpr,
+    PK_FP4_CVT: tl.constexpr,
 ):
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
     rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
@@ -243,6 +261,7 @@ def _rmsnorm_gated_mxfp4_kernel(
         FP4_BLOCK_SIZE=FP4_BLOCK_SIZE,
         ROUND_MODE=ROUND_MODE,
         ROUND_UP_MODE=ROUND_UP_MODE,
+        PK_FP4_CVT=PK_FP4_CVT,
     )
 
     packed_cols = tl.arange(0, BLOCK_N // 2)
@@ -341,6 +360,7 @@ def rmsnorm_gated_mxfp4_quant(
             ROUND_MODE=round_mode,
             ROUND_UP_MODE=MXFP4_ROUND_UP,
             SHUFFLE_SCALES=shuffle_scales,
+            PK_FP4_CVT=is_gfx95_supported(),
             num_warps=num_warps,
         )
 
