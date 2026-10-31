@@ -699,6 +699,262 @@ struct FusedKNormRopeFlashMLAKernel {
 };
 
 // ============================================================================
+// fp8 two-pool unified_kv decode for a query without head norm (DeepSeek-V4.1):
+// the K kernel's norm + RoPE + UE8M0 quant written into the two pools' rows,
+// and the query's RoPE + fp8 pack, in one launch. Block (token, 0) is the K row,
+// blocks (token, 1..q_blocks) pack kFusedQ2BuffHeadsPerBlock query heads each.
+// Row form (the v4 nm asm reader's): fp8 nope, then each of the nope/64 UE8M0
+// scales written twice, then pad; the rope half is DType in its own pool.
+// ============================================================================
+
+constexpr uint32_t kFusedQ2BuffHeadsPerBlock = 4;
+
+struct FusedQKNormRopeFp8TwoPoolParams {
+  const void* __restrict__ kv;          // (B, kHeadDim) DType
+  const void* __restrict__ kv_weight;   // (kHeadDim,) DType
+  const float* __restrict__ freqs_cis;  // (max_pos, kRopeDim) fp32
+  const void* __restrict__ positions;   // (B,) PosT
+  const int32_t* __restrict__ out_loc;  // (B,) row in both pools; < 0 skips the K store
+  uint8_t* __restrict__ k_nope;         // (rows, kHeadDim) bytes
+  void* __restrict__ k_rope;            // (rows, kRopeDim) DType
+  const void* __restrict__ q;           // (B, H, kHeadDim) DType, not yet RoPE'd
+  uint8_t* __restrict__ q_nope;         // (B, H, kHeadDim) bytes, the k_nope row form
+  void* __restrict__ q_rope;            // (B, H, kRopeDim) DType
+  int64_t kv_stride_batch;
+  int64_t q_stride_batch;
+  int64_t q_stride_head;
+  uint32_t batch_size;
+  uint32_t num_q_heads;
+  uint32_t q_blocks;
+  float eps;
+};
+
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+K_KERNEL void fused_qk_norm_rope_fp8_2buff(const __grid_constant__ FusedQKNormRopeFp8TwoPoolParams params) {
+  using namespace device;
+
+  constexpr int64_t kVecSize = 2;
+  constexpr int64_t kNopeDim = kHeadDim - kRopeDim;
+  constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
+  static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * kVecSize);
+  static_assert(kNopeDim == kRopeWarp * kWarpThreads * kVecSize);
+  static_assert(std::is_same_v<DType, bf16_t>, "the query rope reads bf16 pairs");
+  using Storage = AlignedVector<DType, kVecSize>;
+  using Float2 = AlignedVector<float, kVecSize>;
+
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+  const auto token = blockIdx.x / (params.q_blocks + 1);
+  const auto part = blockIdx.x % (params.q_blocks + 1);
+  if (token >= params.batch_size) return;
+
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[token]);
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float2 freq;
+  if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
+
+  if (part == 0) {
+    // K: fused_k_norm_rope_flashmla's V4 math, stored at the row's two-pool addresses.
+    const auto input_ptr = static_cast<const DType*>(params.kv) + token * params.kv_stride_batch;
+    const auto out_loc = params.out_loc[token];
+    Float2 data;
+    {
+      __shared__ float partial_sums[kFusedKNumWarps];
+
+      Storage input_vec, weight_vec;
+      input_vec.load(input_ptr, tx);
+      weight_vec.load(params.kv_weight, tx);
+
+      float sum_of_squares = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        const auto x = cast<float>(input_vec[i]);
+        sum_of_squares += x * x;
+      }
+      const auto warp_sum = warp::reduce_sum(sum_of_squares);
+      if (lane_id == 0) partial_sums[warp_id] = warp_sum;
+      __syncthreads();
+      sum_of_squares = warp::reduce_sum<kFusedKNumWarps>(partial_sums[lane_id % kFusedKNumWarps]);
+      const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        const auto x = cast<float>(input_vec[i]);
+        const auto w = cast<float>(weight_vec[i]);
+        data[i] = x * norm_factor * w;
+      }
+    }
+    if (out_loc < 0) return;
+    PDLTriggerSecondary<kUsePDL>();
+    const auto row = params.k_nope + static_cast<int64_t>(out_loc) * kHeadDim;
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto result =
+          cast<bf16x2_t>(fp32x2_t{x_real * freq[0] - x_imag * freq[1], x_real * freq[1] + x_imag * freq[0]});
+      const auto rope_ptr = static_cast<DType*>(params.k_rope) + static_cast<int64_t>(out_loc) * kRopeDim;
+      reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+    } else {
+      const auto x = data[0];
+      const auto y = data[1];
+      const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+      const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+      reinterpret_cast<fp8x2_e4m3_t*>(row)[tx] = pack_fp8(x * inv_scale, y * inv_scale);
+      if (lane_id == 0) {
+        row[kNopeDim + 2 * warp_id] = scale_ue8m0;
+        row[kNopeDim + 2 * warp_id + 1] = scale_ue8m0;
+      }
+    }
+    return;
+  }
+
+  // Q: the K kernel's in-place query rope (bitwise the Triton flat rope kernel's on gfx950)
+  // on the tail, the K quant on the nope part, one head per pass.
+  PDLTriggerSecondary<kUsePDL>();
+  const auto q_row = static_cast<const DType*>(params.q) + token * params.q_stride_batch;
+  const auto head_begin = (part - 1) * kFusedQ2BuffHeadsPerBlock;
+  const auto head_end = min(head_begin + kFusedQ2BuffHeadsPerBlock, params.num_q_heads);
+  for (uint32_t head = head_begin; head < head_end; ++head) {
+    Storage v;
+    v.load(q_row + head * params.q_stride_head, tx);
+    const auto out_row = static_cast<int64_t>(token) * params.num_q_heads + head;
+    if (warp_id == kRopeWarp) {
+      const auto qx = cast<float>(v[0]);
+      const auto qy = cast<float>(v[1]);
+      const float rot_real = -__fmul_rn(qy, freq[1]);
+      const float rot_imag = __fmul_rn(qx, freq[1]);
+      const auto result = cast<bf16x2_t>(fp32x2_t{fmaf(qx, freq[0], rot_real), fmaf(qy, freq[0], rot_imag)});
+      reinterpret_cast<bf16x2_t*>(static_cast<DType*>(params.q_rope) + out_row * kRopeDim)[lane_id] = result;
+    } else {
+      const auto x = cast<float>(v[0]);
+      const auto y = cast<float>(v[1]);
+      const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+      const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+      const auto row = params.q_nope + out_row * kHeadDim;
+      reinterpret_cast<fp8x2_e4m3_t*>(row)[tx] = pack_fp8(x * inv_scale, y * inv_scale);
+      if (lane_id == 0) {
+        row[kNopeDim + 2 * warp_id] = scale_ue8m0;
+        row[kNopeDim + 2 * warp_id + 1] = scale_ue8m0;
+      }
+    }
+  }
+}
+
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
+struct FusedQKNormRopeFp8TwoPoolKernel {
+  static_assert(kHeadDim == 512 && kRopeDim == 64, "the v4 nm row form requires (512, 64)");
+
+  template <typename PosT>
+  static constexpr auto kernel = fused_qk_norm_rope_fp8_2buff<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+
+  static void forward(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView k_nope,
+      const tvm::ffi::TensorView k_rope,
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView q_nope,
+      const tvm::ffi::TensorView q_rope,
+      float eps) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto H = SymbolicSize{"num_q_heads"};
+    auto R = SymbolicSize{"pool_rows"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B, kHeadDim})  //
+        .with_strides({-1, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(kv);
+    TensorMatcher({kHeadDim})  //
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(kv_weight);
+    TensorMatcher({-1, kRopeDim})  //
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B})  //
+        .with_dtype<int32_t, int64_t>(pos_dtype)
+        .with_device(device_)
+        .verify(positions);
+    TensorMatcher({B})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out_loc);
+    TensorMatcher({R, kHeadDim})  //
+        .with_strides({kHeadDim, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(k_nope);
+    TensorMatcher({R, kRopeDim})  //
+        .with_strides({kRopeDim, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(k_rope);
+    TensorMatcher({B, H, kHeadDim})  //
+        .with_strides({-1, -1, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q);
+    TensorMatcher({B, H, kHeadDim})  //
+        .with_strides({-1, kHeadDim, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(q_nope);
+    TensorMatcher({B, H, kRopeDim})  //
+        .with_strides({-1, kRopeDim, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_rope);
+    RuntimeCheck(q_nope.stride(0) == H.unwrap() * kHeadDim, "q_nope must be contiguous");
+    RuntimeCheck(q_rope.stride(0) == H.unwrap() * kRopeDim, "q_rope must be contiguous");
+    RuntimeCheck(q.stride(1) % 2 == 0 && q.stride(0) % 2 == 0, "q strides must be even");
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    if (batch_size == 0) return;
+    const auto num_q_heads = static_cast<uint32_t>(H.unwrap());
+    const auto q_blocks = host::div_ceil(num_q_heads, kFusedQ2BuffHeadsPerBlock);
+
+    const auto params = FusedQKNormRopeFp8TwoPoolParams{
+        .kv = kv.data_ptr(),
+        .kv_weight = kv_weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .k_nope = static_cast<uint8_t*>(k_nope.data_ptr()),
+        .k_rope = k_rope.data_ptr(),
+        .q = q.data_ptr(),
+        .q_nope = static_cast<uint8_t*>(q_nope.data_ptr()),
+        .q_rope = q_rope.data_ptr(),
+        .kv_stride_batch = kv.stride(0),
+        .q_stride_batch = q.stride(0),
+        .q_stride_head = q.stride(1),
+        .batch_size = batch_size,
+        .num_q_heads = num_q_heads,
+        .q_blocks = q_blocks,
+        .eps = eps,
+    };
+    const auto k = pos_dtype.is_type<int32_t>() ? kernel<int32_t> : kernel<int64_t>;
+    LaunchKernel(batch_size * (q_blocks + 1), kFusedKBlockSize, device_.unwrap())  //
+        .enable_pdl(kUsePDL)(k, params);
+  }
+};
+
+// ============================================================================
 // Indexer Q kernel: warp-per-(token, head) RoPE + Hadamard + fp8 act-quant.
 // ============================================================================
 
