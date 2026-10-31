@@ -2094,8 +2094,22 @@ class Req(ReqDllmMixin):
                     else:
                         finished_len = None
                     if finished_len is not None:
+                        # Store the matched span, not the pattern. The
+                        # detokenizer trims with a literal find, so "[0-9]+"
+                        # would be left in the text and no_stop_trim could
+                        # not keep or drop it.
+                        if matched:
+                            matched_text = matched.group(0)
+                        else:
+                            stopped = self.tokenizer.decode(
+                                self.output_ids[:finished_len]
+                            )
+                            found = re.search(stop_regex_str, stopped)
+                            matched_text = (
+                                found.group(0) if found is not None else stop_regex_str
+                            )
                         self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
+                            matched=matched_text
                         )
                         self.finished_len = finished_len
                         return True
