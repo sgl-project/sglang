@@ -810,6 +810,9 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Under overlap, publish decode KV destinations one iteration later instead of
+    # reading them back inline; False restores the inline publish.
+    SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1065,6 +1068,9 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Run Quark MXFP4 (W4A4) MoE checkpoints as W4A16 via triton_kernels on
+    # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
+    SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
@@ -1299,6 +1305,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
     SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
+    # Opt in to the dual decode graph for triton_v2 LoRA: a base-only graph for
+    # adapter-free batches next to the adapter graph (two graphs per batch
+    # size); off by default.
+    SGLANG_ENABLE_LORA_DUAL_GRAPH = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1388,6 +1398,7 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -2243,6 +2254,7 @@ class Envs:
     # KV-Canary and Token-Oracle (testing only)
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_ENABLE_INFO = EnvBool(False)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
     SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
@@ -2252,6 +2264,7 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    SGLANG_KV_CANARY_PERTURB_DETOKENIZER_SWAP_AT_OUTPUT = EnvInt(-1)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)

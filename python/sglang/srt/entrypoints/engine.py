@@ -660,6 +660,7 @@ class Engine(EngineScoreMixin, EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         embed_override_token_id: Optional[int] = None,
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
@@ -676,6 +677,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            encoding_format=encoding_format,
             lora_path=lora_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
@@ -693,6 +695,7 @@ class Engine(EngineScoreMixin, EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         embed_override_token_id: Optional[int] = None,
         embed_overrides: Optional[List[List[torch.Tensor]]] = None,
@@ -711,6 +714,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            encoding_format=encoding_format,
             lora_path=lora_path,
             embed_override_token_id=embed_override_token_id,
             embed_overrides=embed_overrides,
@@ -1668,7 +1672,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def update_weights_from_distributed(
         self,
         names: list[str],
-        dtypes: list[str],
+        dtypes: list[Union[str, torch.dtype]],
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
@@ -1677,7 +1681,8 @@ class Engine(EngineScoreMixin, EngineBase):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
-            dtypes=dtypes,
+            # msgpack IPC carries dtype names only.
+            dtypes=[str(dtype).removeprefix("torch.") for dtype in dtypes],
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,

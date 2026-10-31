@@ -442,9 +442,6 @@ POSITIONAL_FIELD_ORDER = (
     "encoder_bootstrap_port",
     "encoder_register_urls",
     "enable_adaptive_dispatch_to_encoder",
-    "enable_pdmux",
-    "pdmux_config_path",
-    "sm_group_num",
     "startup_weight_load_mode",
     "custom_weight_loader",
     "weight_loader_disable_mmap",
@@ -558,6 +555,7 @@ POSITIONAL_FIELD_ORDER = (
     "engram_config",
     "moe_ascend_ops_config",
     "cp_kv_layout",
+    "enable_prefill_weight_versions",
     "hicache_mamba_size",
 )
 # fmt: on

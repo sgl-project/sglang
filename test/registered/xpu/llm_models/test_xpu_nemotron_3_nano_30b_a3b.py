@@ -1,6 +1,6 @@
 """NVIDIA-Nemotron-3-Nano-30B-A3B GSM8K accuracy on Intel XPU (TP=4).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``.
+Scored by sgl-eval's ``gsm8k`` benchmark.
 """
 
 import unittest
@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=4800, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 
 @unittest.skipUnless(
