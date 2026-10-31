@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     feasible,
     first_plan,
     move_order,
-    no_relief_plan,
     plan,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -247,14 +246,6 @@ class TestChainPlan(CustomTestCase):
         # Both answers occur at every step: the generator exercises the edges.
         for step, (no, yes) in counts.items():
             self.assertGreater(min(no, yes), 200, step)
-
-    def test_no_move_agrees_with_the_no_relief_placement(self):
-        for chain, demands, _ in _instances(2, 2000):
-            self.assertEqual(
-                plan(chain, demands, NO_MOVE) is not None,
-                no_relief_plan(chain, tuple(demands.items())) is not None,
-                (chain, demands),
-            )
 
     def test_plans_describe_layouts_that_serve_the_demand(self):
         for chain, demands, rng in _instances(3, 2000):

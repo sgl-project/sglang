@@ -1,4 +1,4 @@
-"""No-relief placement is downward closed and its physical takes are realizable."""
+"""In-place placement is downward closed and its physical takes are realizable."""
 
 import itertools
 import random
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.band import FloatBand
-from sglang.srt.mem_cache.kv.alloc.pricing import no_relief_plan, sequential_fit
+from sglang.srt.mem_cache.kv.alloc.pricing import NO_MOVE, plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftBand,
@@ -176,17 +176,19 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 names = (owner.sub_pool_name,) + tuple(
                     window.sub_pool_name for window in allocator._windows
                 )
-                self.assertEqual(
-                    [
-                        sequential_fit(
-                            snapshot,
-                            ((allocator.roles.state, 1),)
-                            + tuple((name, n) for name in names),
-                        )
-                        for n in (2, 3, 4)
-                    ],
-                    [False, True, False],
-                )
+                # The in-place plan has no island: its answer falls once as the
+                # equal demand grows, so the chunk search may bisect it.
+                fits = [
+                    plan(
+                        snapshot,
+                        {allocator.roles.state: 1, **{name: n for name in names}},
+                        NO_MOVE,
+                    )
+                    is not None
+                    for n in range(1, 6)
+                ]
+                self.assertEqual(fits, sorted(fits, reverse=True))
+                self.assertTrue(fits[2])
                 cache = SimpleNamespace(
                     sliding_window_size=16,
                     # The target's window slot retains its own window.
@@ -265,17 +267,19 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     saved = _save(order)
                     for values in itertools.product(range(4), repeat=len(names)):
                         demands = tuple(zip(names, values))
-                        plan = no_relief_plan(snapshot, demands)
-                        fits[values] = plan is not None
-                        if sequential_fit(snapshot, demands):
-                            self.assertIsNotNone(plan, demands)
-                        if plan is None:
+                        layout = plan(
+                            snapshot, {n: v for n, v in demands if v}, NO_MOVE
+                        )
+                        fits[values] = layout is not None
+                        if layout is None:
                             continue
                         ranges = []
                         try:
                             for band in order:
-                                physical = band.take_planned_physical_pages(
-                                    plan.takes[band.sub_pool_name]
+                                if not dict(demands)[band.sub_pool_name]:
+                                    continue
+                                physical = band.take_planned_pages(
+                                    layout.takes[band.sub_pool_name]
                                 )
                                 self.assertIsNotNone(
                                     physical, (shape, demands, band.sub_pool_name)
@@ -305,20 +309,6 @@ class TestMultiwindowPlacement(unittest.TestCase):
                                         fits[lower], (values, lower, snapshot)
                                     )
 
-    def test_stale_source_geometry_refuses_without_taking(self):
-        allocator = _build(state=False, lazy=True, draft_dim=8)
-        window = allocator._windows[0]
-        plan = no_relief_plan(
-            allocator.pricing_snapshot(), ((window.sub_pool_name, 2),)
-        )
-        self.assertIsNotNone(plan)
-        self.assertIsNotNone(window.take_physical_pages(1))
-        before = allocator.pricing_snapshot()
-        self.assertIsNone(
-            window.take_planned_physical_pages(plan.takes[window.sub_pool_name])
-        )
-        self.assertEqual(allocator.pricing_snapshot(), before)
-
     def test_state_first_then_token_transaction_after_end_flush(self):
         for lazy, tokens in itertools.product((False, True), (4, 8, 16)):
             with self.subTest(lazy=lazy, tokens=tokens):
@@ -327,12 +317,12 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 self.assertIsNotNone(slots)
                 allocator.state_slots.free(slots[1:2])
                 allocator.mamba_allocator.flush_for_allocation()
-                demands = ((allocator.roles.state, 2),) + tuple(
-                    (band.sub_pool_name, tokens // allocator.page_size)
+                demands = {allocator.roles.state: 2} | {
+                    band.sub_pool_name: tokens // allocator.page_size
                     for band in (allocator.full_attn_allocator, *allocator._windows)
-                )
+                }
                 self.assertIsNotNone(
-                    no_relief_plan(allocator.pricing_snapshot(), demands)
+                    plan(allocator.pricing_snapshot(), demands, NO_MOVE)
                 )
                 self.assertIsNotNone(allocator.alloc_state_slots(2))
                 self.assertIsNotNone(allocator.alloc(tokens))
@@ -400,7 +390,11 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     )
                     # Only a relayout serves it: no layout in place does.
                     self.assertIsNone(
-                        no_relief_plan(allocator.pricing_snapshot(), pages)
+                        plan(
+                            allocator.pricing_snapshot(),
+                            {n: v for n, v in pages if v},
+                            NO_MOVE,
+                        )
                     )
                     self.assertIsNone(
                         allocator.reclaim_for_prealloc(None, *args, **kwargs)
