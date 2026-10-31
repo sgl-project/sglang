@@ -880,6 +880,7 @@ class TokenizerWorker(TokenizerManager):
                 await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        await self._refuse_continue_during_checkpoint()
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
         self._dispatch_to_scheduler(obj)

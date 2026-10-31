@@ -195,6 +195,10 @@ def check_server_args(server_args: Any):
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
 
+    assert not cfg.checkpoint_prepare_on_startup or cfg.enable_memory_saver, (
+        "--checkpoint-prepare-on-startup requires --enable-memory-saver"
+    )
+
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "
         "(--attn-dp-size) across nodes"
