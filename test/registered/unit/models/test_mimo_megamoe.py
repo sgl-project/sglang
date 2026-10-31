@@ -70,6 +70,23 @@ def test_target_mimo_megamoe_rejects_dflash_draft(monkeypatch):
     assert not mimo_v2._is_target_mimo_megamoe_eligible(_config(), 8, 8)
 
 
+@pytest.mark.parametrize(
+    ("specification", "layer_id", "expected"),
+    [
+        ("all", 12, True),
+        ("1,3,7", 3, True),
+        ("1,3,7", 4, False),
+        ("9-16", 9, True),
+        ("9-16", 16, True),
+        ("9-16", 17, False),
+    ],
+)
+def test_mimo_megamoe_layer_allowlist(monkeypatch, specification, layer_id, expected):
+    monkeypatch.setenv("SGLANG_MIMO_MEGA_LAYERS", specification)
+
+    assert mimo_v2._mimo_megamoe_layer_enabled(layer_id) is expected
+
+
 def test_mimo_megamoe_caller_preserves_normal_fallback(monkeypatch):
     moe = mimo_v2.MiMoV2MoE.__new__(mimo_v2.MiMoV2MoE)
     nn.Module.__init__(moe)

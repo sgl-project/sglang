@@ -144,6 +144,20 @@ def _is_target_mimo_megamoe_eligible(config, tp_size: int, ep_size: int) -> bool
     )
 
 
+def _mimo_megamoe_layer_enabled(layer_id: int) -> bool:
+    specification = os.getenv("SGLANG_MIMO_MEGA_LAYERS", "all")
+    if specification == "all":
+        return True
+    for item in specification.split(","):
+        if "-" in item:
+            start, stop = (int(value) for value in item.split("-", 1))
+            if start <= layer_id <= stop:
+                return True
+        elif item and int(item) == layer_id:
+            return True
+    return False
+
+
 def load_mimo_v2_qkv_proj_weight(
     name,
     param,
@@ -578,6 +592,7 @@ class MiMoV2MoE(nn.Module):
     ) -> torch.Tensor | MoeDeferredFinalize:
         if (
             self._use_target_mega_moe
+            and _mimo_megamoe_layer_enabled(self.layer_id)
             and forward_batch is not None
             and forward_batch.forward_mode.is_target_verify()
         ):

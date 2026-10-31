@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.moe.mega_moe_flydsl import forward_mega_moe
+from sglang.srt.layers.moe.mega_moe_flydsl import (
+    forward_mega_moe,
+    should_use_mega_moe,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import (
     ForwardMode,
     _update_gather_batch,
@@ -22,6 +25,17 @@ def test_forward_supports_moe_without_shared_experts(monkeypatch):
     )
 
     assert forward_mega_moe(SimpleNamespace(), torch.zeros(2, 3)) is expected
+
+
+def test_target_mimo_megamoe_respects_token_cap(monkeypatch):
+    moe = SimpleNamespace(
+        _use_target_mega_moe=True,
+        experts=SimpleNamespace(_mega_moe_weights_built=True),
+    )
+    monkeypatch.setenv("SGLANG_MIMO_MEGA_MAX_TOKENS", "32")
+
+    assert should_use_mega_moe(moe, torch.zeros(32, 3))
+    assert not should_use_mega_moe(moe, torch.zeros(33, 3))
 
 
 def test_mlp_sync_retains_full_vector_without_tp_gather():

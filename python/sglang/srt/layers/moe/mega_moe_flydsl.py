@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -168,10 +169,9 @@ def build_mega_moe_experts_weights(layer) -> None:
 
     w13_scale = scale_param("w13_weight_scale")
     w2_scale = scale_param("w2_weight_scale")
-    if (
-        tuple(layer.w13_weight.shape) == (48, 4096, 3072)
-        and tuple(layer.w2_weight.shape) == (48, 6144, 1024)
-    ):
+    if tuple(layer.w13_weight.shape) == (48, 4096, 3072) and tuple(
+        layer.w2_weight.shape
+    ) == (48, 6144, 1024):
         layer._mega_w1 = layer.w13_weight.data.contiguous().view(torch.uint8)
         layer._mega_w1_scale = w13_scale.data.contiguous().view(torch.uint8)
         layer._mega_w2 = layer.w2_weight.data.contiguous().view(torch.uint8)
@@ -264,7 +264,9 @@ def should_use_mega_moe(moe: Any, hidden_states: torch.Tensor) -> bool:
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
     if getattr(moe, "_use_target_mega_moe", False):
-        return _rank_consistent_max_tokens(hidden_states) <= 256
+        return _rank_consistent_max_tokens(hidden_states) <= int(
+            os.getenv("SGLANG_MIMO_MEGA_MAX_TOKENS", "256")
+        )
     if get_is_capture_mode():
         return True
     return _rank_consistent_max_tokens(hidden_states) <= _mtpr()
@@ -404,8 +406,12 @@ def _run_mega_routed(
             max_tokens=_rank_consistent_max_tokens(hidden_states),
         )[:num_tokens]
     else:
-        output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
+        output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[
+            :num_tokens
+        ]
 
     if not getattr(moe, "routed_scaling_factor_fused_in_topk", True):
         output.mul_(getattr(moe, "routed_scaling_factor", 1.0))
+    if getattr(moe, "_use_target_mega_moe", False):
+        output.mul_(1.0 / get_parallel().moe_ep_size)
     return output
