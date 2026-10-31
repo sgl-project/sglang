@@ -547,6 +547,15 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
+# Adapter over AITER's Gluon chunk_kda; returns None off gfx950 or without the kernel.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_aiter_prefill",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.attention.linear.kda_aiter_prefill:extend",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 register_kernel(
     KernelSpec(
         op="attention.fp8_attention",
