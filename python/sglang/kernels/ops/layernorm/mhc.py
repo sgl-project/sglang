@@ -2101,6 +2101,8 @@ def hc_post(
     return out.view(s, -1)
 
 
+# Ascend 950 (NPU arch35, SOC 3510) is the only SKU that ships the official
+# torch_npu mHC ops; A2/A3 keep the fused cann-recipes ``custom.npu_hc_pre``.
 def npu_hc_pre(
     x: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2112,10 +2114,13 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via the custom_ops kernel.
+    """NPU-accelerated hc_pre.
+
+    Ascend 950 (arch35) runs the official ``torch_npu`` ops; every other NPU
+    (A2/A3) keeps the legacy ``custom.npu_hc_pre`` so those SKUs are unaffected.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
-    because npu_hc_pre does not fold input_layernorm — the caller must
+    because neither path folds input_layernorm — the caller must
     apply it separately.
     """
     shape, dtype = x.size(), x.dtype
@@ -2137,11 +2142,37 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, post / comb are the hc_post inputs. The
-    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
-    # cast back to the input dtype before the downstream
-    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    # The NPU helper is imported lazily so this kernel module stays free of NPU
+    # backend imports elsewhere.
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    if is_npu_arch35():
+        # Ascend 950: the official torch_npu ops. npu_mhc_pre emits h_res
+        # *before* the Sinkhorn normalisation, so the doubly-stochastic comb that
+        # hc_post consumes is produced by the separate npu_mhc_sinkhorn op.
+        import torch_npu
+
+        h_in, h_post, h_res = torch_npu.npu_mhc_pre(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            gamma=None,
+            norm_eps=rms_norm_eps,
+            hc_eps=hc_eps,
+            out_flag=0,
+        )[:3]
+        # num_iters/eps only; out_flag defaults to 0 and is not exposed on every
+        # torch_npu build's sinkhorn op.
+        sink = torch_npu.npu_mhc_sinkhorn(
+            h_res,
+            eps=hc_eps,
+            num_iters=hc_sinkhorn_iters,
+        )
+        comb = sink[0] if isinstance(sink, (tuple, list)) else sink
+        return h_in.to(dtype), h_post, comb, False
+
+    # A2/A3: the fused cann-recipes op (RmsNorm + GEMM + Sinkhorn in one call).
     y, post, comb = torch.ops.custom.npu_hc_pre(
         x,
         hc_fn,
@@ -2152,9 +2183,8 @@ def npu_hc_pre(
         norm_eps=rms_norm_eps,
         hc_eps=hc_eps,
     )
-    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-    # not fold input_layernorm. Return norm_fused=False so the caller
-    # applies the layernorm itself, matching the deepgemm/torch paths.
+    # The fused op emits y in the sinkhorn fp32 dtype; cast back to the input
+    # dtype before the downstream aclnnRmsNorm (no x=fp32 / gamma=bf16 overload).
     return y.to(dtype), post, comb, False
 
 
