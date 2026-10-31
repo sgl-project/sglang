@@ -1146,6 +1146,23 @@ class KVCacheConfigurator:
 
         return sub_pool_names(self._kv_layer_decls())
 
+    def _unified_target_windows(self) -> tuple:
+        """The windows this runner's layers declare, as the plan names its
+        window sub-pools by them."""
+        from sglang.srt.mem_cache.kv.decl import WindowLifetime
+
+        return tuple(
+            sorted(
+                {
+                    part.lifetime.window
+                    for decl in self._kv_layer_decls()
+                    for part in decl.parts
+                    if isinstance(part.lifetime, WindowLifetime)
+                },
+                key=lambda window: WindowLifetime(window=window).retention(),
+            )
+        )
+
     def _fused_draft_decision(self):
         """Place each draft kind by lifetime and price its own row geometry.
 
@@ -1257,7 +1274,7 @@ class KVCacheConfigurator:
             num_runners=num_runners,
             ctx=PlacementContext(
                 host_names=self._unified_host_names(),
-                target_window=self.model_config.sliding_window_size,
+                target_windows=self._unified_target_windows(),
                 dcp_size=get_parallel().attn_dcp_size,
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),

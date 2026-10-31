@@ -1674,11 +1674,12 @@ class TestDeclaredParts(CustomTestCase):
                             host_names=("full", "swa", "mamba")
                             if target_state
                             else ("full", "swa"),
-                            target_window=16,
+                            target_windows=(16,),
                         ),
                         store_dtype=torch.bfloat16,
                     ).placement
-                    self.assertEqual(set(placement.new_bands), {"draft_swa"})
+                    band = f"swa_{draft_window}"
+                    self.assertEqual(set(placement.new_bands), {band})
                     storage, plan, _ = _build(
                         state=target_state,
                         window_with_state=True,
@@ -1688,11 +1689,9 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(len(allocator.bands), 4 if target_state else 3)
                     ids = allocator.alloc(8)
                     self.assertIsNotNone(ids)
-                    draft = allocator.window_allocators["draft_swa"]
+                    draft = allocator.window_allocators[band]
                     physical = draft.ids.translate(ids).long()
-                    k, v = plan.sub_pool("draft_swa").spec.draft_views(
-                        storage.allocator.arena
-                    )
+                    k, v = plan.sub_pool(band).spec.draft_views(storage.allocator.arena)
                     k[0][physical] = 11
                     v[0][physical] = 13
                     allocator.free_swa_segment(ids[:4], start_pos=0)
@@ -2456,7 +2455,9 @@ class TestDeclaredParts(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa", "mamba"), target_window=16),
+            ctx=PlacementContext(
+                host_names=("full", "swa", "mamba"), target_windows=(16,)
+            ),
             store_dtype=torch.bfloat16,
         ).placement
         storage, plan, _ = _build(
