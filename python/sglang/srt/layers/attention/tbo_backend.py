@@ -23,7 +23,7 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
-        self.kv_index_translator = primary.kv_index_translator
+        self.runner_ids = primary.runner_ids
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
@@ -31,6 +31,14 @@ class TboAttnBackend(AttentionBackend):
     @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.primary.supports_prefill_cuda_graph_max_context_size
+
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        return self.primary.prefill_cuda_graph_default_max_seq_len
+
+    @property
+    def dllm_attention(self):
+        return self.primary.dllm_attention
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
@@ -247,9 +255,13 @@ def _build_tbo_child_replay_fb_view(
     child_seq_lens_cpu = fb_view.seq_lens_cpu[seq_slice]
     parent_input_ids = getattr(fb_view, "input_ids", None)
     parent_out_cache_loc = getattr(fb_view, "out_cache_loc", None)
+    plan = getattr(fb_view, "iteration_ids", None)
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
+        # TBO is mutually exclusive with ragged verify; a parent layout would
+        # describe the full batch, not this child slice.
+        ragged_verify_layout=None,
         actual_forward_mode=getattr(
             fb_view, "actual_forward_mode", fb_view.forward_mode
         ),
@@ -265,6 +277,15 @@ def _build_tbo_child_replay_fb_view(
             parent_out_cache_loc[tok_slice]
             if parent_out_cache_loc is not None
             else None
+        ),
+        # Unified memory refuses two-batch overlap, so the plan's reads stay in
+        # `req_to_token`, which each child indexes at its own rows; each child
+        # writes its own tokens of the plan's window.
+        iteration_ids=plan,
+        iteration_cols=(
+            None
+            if plan is None
+            else plan.cols_slice(getattr(fb_view, "iteration_cols", None), tok_slice)
         ),
         spec_info=child_spec_info,
         max_seq_len_override=fb_view.max_seq_len_override,
