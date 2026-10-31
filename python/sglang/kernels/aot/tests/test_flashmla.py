@@ -1,7 +1,6 @@
 import math
 import random
 import sys
-from typing import Optional, Tuple
 
 import pytest
 import torch
@@ -11,6 +10,7 @@ from sgl_kernel.flash_mla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
+from torch.utils.checkpoint import checkpoint
 
 # ================ prefill usage ================ #
 S_Q_PREFILL = [1, 62]
@@ -72,7 +72,7 @@ def quantize_k_cache(
     result_k_rope_part = result[..., dv + num_tiles * 4 :].view(input_k_cache.dtype)
     result_k_rope_part[:] = input_k_cache[..., dv:]
 
-    for tile_idx in range(0, num_tiles):
+    for tile_idx in range(num_tiles):
         cur_scale_factors_inv = (
             torch.abs(
                 input_k_cache[..., tile_idx * tile_size : (tile_idx + 1) * tile_size]
@@ -122,7 +122,7 @@ def dequantize_k_cache(
     input_rope = quant_k_cache[..., dv + num_tiles * 4 :].view(torch.bfloat16)
     result[..., dv:] = input_rope
 
-    for tile_idx in range(0, num_tiles):
+    for tile_idx in range(num_tiles):
         cur_nope = input_nope[
             ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
         ].to(torch.float32)
@@ -170,6 +170,8 @@ def sdpa(query, key, value, attn_bias, softmax_scale=None):
     query = query.float().transpose(-3, -2)
     key = key.float().transpose(-3, -2)
     value = value.float().transpose(-3, -2)
+    h_k = key.shape[-3]
+    h = query.shape[-3]
     key = key.repeat_interleave(h // h_k, dim=-3)
     value = value.repeat_interleave(h // h_k, dim=-3)
     if softmax_scale is None:
@@ -187,7 +189,7 @@ def sdpa_checkpoint(*args, **kwargs):
 
 def reference_torch_prefill(
     s_q, s_kv, topk, indices, q, kv, sm_scale: float
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     def log2sumexp2(a: torch.Tensor, dim: int) -> torch.Tensor:
         return torch.logsumexp(a * math.log(2), dim=dim) * math.log2(math.e)
 
@@ -216,8 +218,8 @@ def reference_torch_decode(
     blocked_k: torch.Tensor,  # [?, block_size, h_kv, d]
     dv: int,
     is_causal: bool,
-    indices: Optional[torch.Tensor] = None,  # [batch_size, s_q, topk]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    indices: torch.Tensor | None = None,  # [batch_size, s_q, topk]
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     A reference implementation in PyTorch
     """
@@ -236,8 +238,8 @@ def reference_torch_decode(
         kv: torch.Tensor,  # [h_kv, s_k, d]
         dv: int,
         is_causal,
-        indices: Optional[torch.Tensor],  # [s_q, topk]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices: torch.Tensor | None,  # [s_q, topk]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         h_q = query.size(0)
         h_kv = kv.size(0)
         s_q = query.shape[-2]
@@ -299,7 +301,7 @@ def reference_torch_decode(
 @torch.inference_mode()
 def test_flashmla_prefill(
     s_q: int,
-    kv_topk: Tuple[int, int],
+    kv_topk: tuple[int, int],
 ):
 
     torch.cuda.empty_cache()
@@ -380,7 +382,7 @@ def test_flash_mla_decode(
     s_q: int,
     s_k: int,
     is_varlen: bool,
-    causal_topk: Tuple[bool, Optional[int]],
+    causal_topk: tuple[bool, int | None],
     dtype: torch.dtype,
 ):
     d = 576
