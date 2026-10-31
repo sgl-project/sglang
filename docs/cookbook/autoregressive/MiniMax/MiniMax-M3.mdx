@@ -119,6 +119,10 @@ The first import JIT-compiles the kernels, which can take 30 s to a few minutes 
 The gate requires `--attention-backend fa4` (MSA's sparse blocks are 128 tokens, so the page size must be 128). SGLang auto-forces `page_size` to 128 for the `fa4` backend — including the combined `--attention-backend fa4` the M3 recipe uses (#28976) — so `--page-size 128` is omitted from the Blackwell cells below. Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
 
 <Note>
+**GB300: MoE runner `flashinfer_trtllm` (MXFP8 recipe).** The GB300 cell routes the MoE to FlashInfer's fused MXFP8 MoE (`trtllm_fp8_block_scale_moe`) instead of the DeepGEMM composition. **Requires the first FlashInfer release containing [flashinfer#8042](https://github.com/flashinfer-ai/flashinfer/pull/8042)** (fused shared experts beyond DeepSeekV3 routing) plus the M3 `MiniMax2` routing declaration (its own fix PR); with those, 900 s agentic serving replays on GB300 (TP4) measure +13.1% median per-user interactivity at concurrency 8 and +7.5% median / +14.3% p90 at concurrency 20 from the shared-expert fusion alone, on top of the fused-MoE switch itself (+8.1% median at concurrency 20 vs `deep_gemm`), with single-stream also ahead of `deep_gemm`. On today's FlashInfer releases (without #8042) SGLang auto-disables shared-expert fusion on this runner and the switch is positive for concurrent serving (≥ ~8 sessions) but regresses single-stream ~9% — keep `deep_gemm` there until the FlashInfer release ships. B200/B300/GB200 carry the same recipe shape but were not benchmarked with this switch and keep `deep_gemm`.
+</Note>
+
+<Note>
 For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
 </Note>
 
