@@ -1,3 +1,4 @@
+import enum
 import importlib.util
 import sys
 import types
@@ -13,6 +14,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 def _load_megamoe_module(monkeypatch):
     """Load the adapter with only its small import-time dependencies stubbed."""
+    from sglang.srt.runtime_context import ForwardFlags
 
     class MoeQuantInfo:
         pass
@@ -48,6 +50,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
+        SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT=types.SimpleNamespace(
+            get=lambda: True
+        ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
         ),
@@ -57,6 +62,18 @@ def _load_megamoe_module(monkeypatch):
     )
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
+    buffers = {}
+
+    def get_buffer(name, factory):
+        if name not in buffers:
+            buffers[name] = factory()
+        return buffers[name]
+
+    runtime_context.get_buffer = get_buffer
+    forward_flags = ForwardFlags()
+    runtime_context.get_forward = lambda: forward_flags
+    resources = types.SimpleNamespace(flashinfer_megamoe_workspaces={})
+    runtime_context.get_resources = lambda: resources
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
     base.MoeQuantInfo = MoeQuantInfo
     base.MoeRunnerConfig = MoeRunnerConfig
@@ -96,6 +113,24 @@ def _load_autotune_module(monkeypatch):
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
     return module
+
+
+# Deliberately not 1: FlashInfer main writes version 2 and sglang must follow it.
+_FAKE_KNOB_CACHE_VERSION = 2
+
+
+def _install_fake_knob_cache_version(monkeypatch, moe_ep, version=None):
+    version = _FAKE_KNOB_CACHE_VERSION if version is None else version
+    core = types.ModuleType("flashinfer.moe_ep.core")
+    tuning = types.ModuleType("flashinfer.moe_ep.core.tuning")
+    tuning.KNOB_CACHE_VERSION = version
+    for name, module in (
+        ("flashinfer", types.ModuleType("flashinfer")),
+        ("flashinfer.moe_ep", moe_ep),
+        ("flashinfer.moe_ep.core", core),
+        ("flashinfer.moe_ep.core.tuning", tuning),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
 
 
 def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
@@ -228,7 +263,10 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
+    payload = {
+        "version": _FAKE_KNOB_CACHE_VERSION,
+        "entries": [{"knobs": {"native_tactic": 7}}],
+    }
     events = []
     staged = []
     native_paths = []
@@ -289,8 +327,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
         ),
     )
     fake_autotuner.AutoTuner = types.SimpleNamespace(get=lambda: tuner)
-    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
-    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
+    _install_fake_knob_cache_version(monkeypatch, fake_moe)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
 
@@ -356,6 +393,60 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     runtime_context = sys.modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 0
     assert module._resolve_max_tokens_per_rank() == 1024
+
+
+class _FakeFinalizeMode(enum.Enum):
+    # Mirrors flashinfer.moe_ep.FinalizeMode.
+    AUTO = 0
+    DEFAULT = 1
+    PERSISTENT = 2
+    CAKE = 3
+    NONE = 4
+
+
+def _install_fake_finalize_mode(monkeypatch):
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.FinalizeMode = _FakeFinalizeMode
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+
+
+def _use_cpu_for_shared_tensor(monkeypatch):
+    # The shared tensor is allocated on the current CUDA device; CPU CI has none.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+
+
+def test_persistent_finalize_kwargs_share_one_tensor(monkeypatch):
+    """The shared workspace borrows the first layer's tensor, so every layer
+    must hand out the same object or later layers update a tensor nobody reads."""
+    module = _load_megamoe_module(monkeypatch)
+    _use_cpu_for_shared_tensor(monkeypatch)
+    _install_fake_finalize_mode(monkeypatch)
+
+    first_layer = types.SimpleNamespace(_flashinfer_megamoe_num_valid_tokens=None)
+    second_layer = types.SimpleNamespace(_flashinfer_megamoe_num_valid_tokens=None)
+    first = module._persistent_finalize_kwargs(layer=first_layer)
+    second = module._persistent_finalize_kwargs(layer=second_layer)
+
+    # AUTO, not PERSISTENT: FlashInfer picks CAKE where it supports the problem
+    # and falls back to persistent because the tensor is set.
+    assert first["finalize_mode"] is _FakeFinalizeMode.AUTO
+    tensor = first["num_valid_tokens_tensor"]
+    assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (1,)
+    assert second["num_valid_tokens_tensor"] is tensor
+    assert first_layer._flashinfer_megamoe_num_valid_tokens is tensor
+    assert second_layer._flashinfer_megamoe_num_valid_tokens is tensor
+
+
+def test_persistent_finalize_env_off_requests_nothing(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    module.envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT = (
+        types.SimpleNamespace(get=lambda: False)
+    )
+
+    layer = types.SimpleNamespace(_flashinfer_megamoe_num_valid_tokens=None)
+    assert module._persistent_finalize_kwargs(layer=layer) == {}
+    assert layer._flashinfer_megamoe_num_valid_tokens is None
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
@@ -454,6 +545,111 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     assert mega.return_workspace_view is supports_output_view
 
 
+def _fake_megamoe_run(monkeypatch):
+    """(module, run, seen, owned): `run(rows, tensor)` launches the adapter and
+    `seen` collects the count the kernel would read at each launch."""
+    module = _load_megamoe_module(monkeypatch)
+
+    class FakeMoEEpTensors:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEEpTensors = FakeMoEEpTensors
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.moe_ep = fake_moe_ep
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+
+    owned = torch.zeros(1, dtype=torch.int32)
+    seen = []
+
+    class Mega:
+        supports_output_view = False
+
+        def forward(self, tensors):
+            seen.append(int(owned.item()))
+            return tensors.hidden_states
+
+    def run(rows, num_valid_tokens):
+        module.run_flashinfer_megamoe(
+            types.SimpleNamespace(
+                hidden_states=torch.zeros((rows, 4), dtype=torch.bfloat16),
+                topk_output=types.SimpleNamespace(
+                    topk_ids=torch.zeros((rows, 2), dtype=torch.int32),
+                    topk_weights=torch.ones((rows, 2)),
+                ),
+            ),
+            module.FlashInferMegaMoeQuantInfo(
+                mega=Mega(), num_valid_tokens=num_valid_tokens
+            ),
+            types.SimpleNamespace(routed_scaling_factor=1.0),
+        )
+
+    return module, run, seen, owned
+
+
+def test_adapter_refreshes_the_tensor_the_quant_info_holds_on_every_call(monkeypatch):
+    """The kernel reads the count at launch, so a stale value from an earlier
+    batch (or another graph shape) would make it reduce the wrong row count."""
+    _, run, seen, owned = _fake_megamoe_run(monkeypatch)
+
+    run(5, owned)
+    run(3, owned)
+    run(9, None)
+
+    assert seen == [5, 3, 3]
+
+
+def test_forward_scope_fills_once_and_never_carries_over_to_the_next_forward(
+    monkeypatch,
+):
+    """Layers of one forward share a fill. The next forward must refill even
+    with the same row count: a CUDA graph replay in between overwrites the
+    tensor with the value baked at capture time, so a skip that survived the
+    forward would hand the kernel that stale count."""
+    module, run, seen, owned = _fake_megamoe_run(monkeypatch)
+    forward = sys.modules["sglang.srt.runtime_context"].get_forward()
+
+    with module.megamoe_forward_scope():
+        run(5, owned)
+        owned.fill_(99)  # stands in for anything else that touches the tensor
+        run(5, owned)  # same rows in this forward: no second fill
+        run(3, owned)  # rows changed (e.g. two overlapped sub-batches): refill
+    assert forward.megamoe_valid_rows is None
+
+    owned.fill_(99)  # a graph replay between two forwards
+    with module.megamoe_forward_scope():
+        run(3, owned)  # new forward, same rows as the last one: must refill
+    owned.fill_(99)
+    run(3, owned)  # outside any forward scope every call fills
+
+    assert seen == [5, 99, 3, 3, 3]
+
+
+def test_autotune_geometry_key_serializes_enum_and_skips_tensor():
+    """Startup autotune keys on the megakernel config; the persistent finalize
+    config carries an enum and a tensor, neither of which json.dumps accepts."""
+    import dataclasses
+
+    from sglang.srt.layers.moe.flashinfer_megamoe_autotune import MegaMoeTunedForward
+
+    @dataclasses.dataclass
+    class Config:
+        knobs: object = None
+        finalize_mode: _FakeFinalizeMode = _FakeFinalizeMode.PERSISTENT
+        num_valid_tokens_tensor: torch.Tensor = dataclasses.field(
+            default_factory=lambda: torch.zeros(1, dtype=torch.int32)
+        )
+
+    tuned = MegaMoeTunedForward.__new__(MegaMoeTunedForward)
+    tuned.backend = types.SimpleNamespace(megakernel=Config())
+    tuned.bootstrap = types.SimpleNamespace(world_size=4)
+    tuned.fleet_params = types.SimpleNamespace(token_hidden_size=4096, num_experts=256)
+
+    assert '"finalize_mode": "PERSISTENT"' in tuned._geometry_key
+
+
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
 
@@ -487,6 +683,9 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
 ):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
+        module, "_num_valid_tokens_tensor", lambda: torch.zeros(1, dtype=torch.int32)
+    )
+    monkeypatch.setattr(
         module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
     )
     monkeypatch.setattr(
@@ -495,6 +694,7 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
         lambda: in_kernel_reduce,
     )
     fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.FinalizeMode = _FakeFinalizeMode
 
     def make_config(
         *,
@@ -505,7 +705,9 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
         enable_in_kernel_fc2_reduce,
         situ_beta=None,
         situ_linear_beta=None,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
+        finalize_mode=None,
+        num_valid_tokens_tensor=None,
         combine_dtype="bf16",
         input_norm_const=None,
     ):
@@ -516,7 +718,7 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
             gate_up_clamp=gate_up_clamp,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            apply_topk_in_fc1=apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             combine_dtype=combine_dtype,
             input_norm_const=input_norm_const,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
@@ -588,7 +790,7 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
     assert config.gate_up_clamp == (None if activation == "situ" else 8.0)
     assert config.situ_beta == (4.0 if activation == "situ" else None)
     assert config.situ_linear_beta == (25.0 if activation == "situ" else None)
-    assert config.apply_topk_in_fc1 is (not use_w4a16)
+    assert config.apply_routing_weights_before_fc2 is (not use_w4a16)
     assert config.input_norm_const == (None if use_w4a16 else 2.0)
     fc1, fc2 = mega.backend.transformed_weights
     assert len(fc1) == len(fc2) == 2
@@ -790,3 +992,22 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_native_knob_cache_is_valid_only_at_the_flashinfer_format_version(monkeypatch):
+    """Startup autotune failed with "did not record its selected tactic" even
+    though FlashInfer had tuned: its cache is written at its own format
+    version, and a hard-coded one rejected the winner."""
+    module = _load_autotune_module(monkeypatch)
+    _install_fake_knob_cache_version(monkeypatch, types.ModuleType("flashinfer.moe_ep"))
+    entry = {"knobs": {"native_tactic": 7}}
+
+    assert module._valid_native_cache(
+        {"version": _FAKE_KNOB_CACHE_VERSION, "entries": [entry]}
+    )
+    assert not module._valid_native_cache(
+        {"version": _FAKE_KNOB_CACHE_VERSION - 1, "entries": [entry]}
+    )
+    assert not module._valid_native_cache(
+        {"version": _FAKE_KNOB_CACHE_VERSION, "entries": [{"knobs": {}}]}
+    )
