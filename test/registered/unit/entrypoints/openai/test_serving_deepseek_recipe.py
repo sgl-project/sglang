@@ -1,5 +1,6 @@
 import json
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -200,6 +201,45 @@ class TestHandlerRequestSemantics(CustomTestCase):
         self.assertEqual(
             self._prompt(chat, reasoning_effort="low", **thinking).prompt_ids, low
         )
+
+    def test_tokenize_matches_chat_template_effort(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            TokenizeRequest,
+        )
+        from sglang.srt.entrypoints.openai.serving_tokenize import OpenAIServingTokenize
+
+        chat = _serving(self, self.tokenizer)
+        tokenize = OpenAIServingTokenize.__new__(OpenAIServingTokenize)
+        tokenize.chat_serving = chat
+        tokenize.tokenizer_manager = chat.tokenizer_manager
+
+        for effort, top_level_effort, budget in (
+            ("low", None, 50),
+            ("max", None, 100),
+            (30, None, 30),
+            ("low", "max", 50),
+        ):
+            with self.subTest(effort=effort, top_level_effort=top_level_effort):
+                body = {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "reasoning_effort": top_level_effort,
+                    "chat_template_kwargs": {
+                        "thinking": True,
+                        "reasoning_effort": effort,
+                    },
+                }
+                generated, _ = chat._convert_to_internal_request(
+                    ChatCompletionRequest(**deepcopy(body))
+                )
+                token_ids = tokenize._tokenize_chat_request(
+                    TokenizeRequest(**deepcopy(body))
+                )
+                self.assertEqual(token_ids, generated.input_ids)
+                self.assertIn(
+                    f"Reasoning Effort: {budget} ",
+                    self.tokenizer.decode(token_ids, skip_special_tokens=False),
+                )
 
     def test_trailing_assistant_follows_sglang_rules(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
