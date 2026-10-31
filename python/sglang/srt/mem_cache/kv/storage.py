@@ -746,12 +746,11 @@ class KVStorage:
 
     def device_room(self, sub_pool: str) -> int:
         """Free units a host load can take in the sub-pool now."""
-        if sub_pool in self._allocator.window_allocators:
-            return self._allocator.window_allocators[
-                sub_pool
-            ].schedulable_available_size()
-        assert sub_pool == self._allocator.roles.state, sub_pool
-        return self._allocator.state_slots.schedulable_available_size()
+        assert (
+            sub_pool in self._allocator.window_allocators
+            or sub_pool == self._allocator.roles.state
+        ), sub_pool
+        return self._allocator.units_available(sub_pool)
 
     def host_ids(
         self, sub_pool: str

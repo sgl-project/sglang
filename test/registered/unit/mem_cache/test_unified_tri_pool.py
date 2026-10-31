@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import (
     ChainRoles,
     take_new_pages,
 )
-from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
+from sglang.srt.mem_cache.kv.alloc.pricing import FLUSH_ENDS, float_fit, plan
 from sglang.srt.mem_cache.kv.alloc.signals import wait_signals
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
@@ -1426,10 +1426,13 @@ class TestTriPoolHardening(_PoolTestCase):
         b_high_pages = fa._current_gap_bytes() // fa.entry_bytes_per_page
         grab = fa.alloc(max(0, (b_high_pages - 2)))
         self.assertIsNotNone(grab)
-        # The gate under-reports (no slide credit), so asking BEYOND it fires
-        # the remedy; the ask still fits the free bytes the LOW band holds.
-        avail = allocator.available_size()
-        need = avail + 4
+        # The read credits sliding the float, so exactly what it reports must
+        # be taken, and no layout that leaves the float in place holds it.
+        need = allocator.available_size()
+        page = allocator.page_size
+        demands = {n: d for n, d in allocator.page_demands(need, need).items() if d}
+        self.assertIsNone(plan(allocator.pricing_snapshot(), demands, FLUSH_ENDS))
+        self.assertFalse(allocator.ensure_capacity(need + page, need + page))
         live_before = sa._live_pages()
         moves_before = len(sa._inverse_history)
         v1 = allocator.alloc(need)
@@ -1852,23 +1855,41 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         )
 
     def test_the_scheduler_budget_still_binds(self):
+        # Decode builds each side's budget as that side's availability minus
+        # the tokens it holds back for running requests; what a budget holds
+        # back is charged beside the request on both sides at once.
         _, allocator, _, _ = self._build()
         page_size = allocator.page_size
+        held = 2 * page_size
+        full_budget = allocator.full_available_size() - held
+        swa_budget = allocator.swa_available_size() - held
         self.assertTrue(
             allocator.prealloc_fits(
                 self._empty_tree(),
                 page_size,
                 page_size,
-                full_budget_tokens=page_size,
-                swa_budget_tokens=page_size,
+                full_budget_tokens=full_budget,
+                swa_budget_tokens=swa_budget,
             )
         )
+        # The request may not exceed its side's budget.
         self.assertFalse(
             allocator.prealloc_fits(
                 self._empty_tree(),
                 page_size,
                 page_size,
                 full_budget_tokens=page_size - 1,
+                swa_budget_tokens=swa_budget,
+            )
+        )
+        # Holding back nearly all of each side's own availability at once
+        # leaves no shared bytes for the request.
+        self.assertFalse(
+            allocator.prealloc_fits(
+                self._empty_tree(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size,
                 swa_budget_tokens=page_size,
             )
         )

@@ -114,10 +114,7 @@ class _OwnerEndPolicy(_InterimPolicy):
     def size(self, c: ChainAllocator) -> int:
         # TOKENS. MUST use the SAME available view as `available_size()`, so the
         # available term cancels out of the leak invariant.
-        return (
-            c.full_attn_allocator.schedulable_available_size()
-            + c.full_attn_allocator.allocated_count()
-        )
+        return c.available_size() + c.full_attn_allocator.allocated_count()
 
     # Realizable-with-compaction view, so the retract gate / evict / schedule_policy
     # do not over-retract while the state peer holds drainable holes.
