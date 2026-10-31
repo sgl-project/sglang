@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -127,11 +128,11 @@ class TestNetworkTransfers(CustomTestCase):
         owner.free(ids[2 * page : 6 * page])  # interior holes
         self.assertGreater(owner.flush_opportunistic(), 0)
         self.assertNotEqual(_physical_pages(owner, ids[:1]), top, "it moved")
-        self.assertIn(top[0], owner._pending_reuse_pages_cpu)
+        self.assertIn(top[0], owner.usage.pending_pages)
         self.assertNotIn(top[0], owner._free_pages_snapshot())
         end_network_transfer(allocator, req)
         owner.flush_opportunistic()
-        self.assertNotIn(top[0], owner._pending_reuse_pages_cpu)
+        self.assertNotIn(top[0], owner.usage.pending_pages)
 
     def test_only_a_needed_move_takes_a_written_page(self):
         """An opportunistic flush leaves a page a receive still writes; a
@@ -230,7 +231,7 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
         def __init__(self, sources):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
-            self._fixed = {}
+            self.usage = PageUsage()
             self.entry_bytes_per_page = 512
             self.pin_sources = sources
 

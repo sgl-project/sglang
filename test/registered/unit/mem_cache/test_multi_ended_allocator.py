@@ -398,7 +398,7 @@ class TestBand(unittest.TestCase):
 
     def test_lazy_retract_churn_no_ghost(self):
         """Regression: heavy free/flush churn in lazy mode must never leave a
-        'ghost' page -- p2v < 0 in neither _free_phys_pages nor _pending_reuse."""
+        'ghost' page -- p2v < 0 in neither _free_phys_pages nor the pending pages."""
         rng = random.Random(0x5373)
         _, alloc, kv = self._build_lazy_full(n_full_slots=64, move_cap=2)
         live = []
@@ -2219,7 +2219,7 @@ class TestLazyCompaction(unittest.TestCase):
         )
         # State untouched: hole still present.
         self.assertEqual(len(fa._free_phys_pages), 1)
-        self.assertEqual(len(fa._pending_reuse), 0)
+        self.assertEqual(len(fa.usage.pending_by_key()), 0)
         # Retiring the forward (its result processed) prunes the write-set
         # entry; the next flush then releases src directly, with no pending-reuse
         # entry needed. Firing alone decides nothing.
@@ -2228,12 +2228,12 @@ class TestLazyCompaction(unittest.TestCase):
         fa.retire_forward(ev)
         n_moves2 = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves2, 1)
-        self.assertEqual(len(fa._pending_reuse), 0)
+        self.assertEqual(len(fa.usage.pending_by_key()), 0)
 
     def test_lazy_non_urgent_read_race_uses_pending_reuse(self):
         """With no in-flight write-set, a non-urgent `_flush` compacts at once
         (read+read on KV[src] is safe) and parks `(src, latest_event)` in
-        `_pending_reuse`, so no later alloc writes KV[src] under a live read."""
+        pending, so no later alloc writes KV[src] under a live read."""
         _pool, fa, _kv = self._make_full(lazy=True)
         a = fa.alloc(5)
 
@@ -2254,18 +2254,18 @@ class TestLazyCompaction(unittest.TestCase):
         fa.set_inflight_forward(ev, None)
         n_moves = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves, 1)
-        # `_pending_reuse` holds one entry per BATCH (keyed by event), not per
-        # src; the page count lives in `_pending_reuse_pages_cpu`.
-        self.assertEqual(len(fa._pending_reuse), 1)
-        self.assertEqual(len(fa._pending_reuse_pages_cpu), n_moves)
+        # Pending pages group by the event they wait (one entry per BATCH), not per
+        # src; the page count lives in `usage.pending_pages`.
+        self.assertEqual(len(fa.usage.pending_by_key()), 1)
+        self.assertEqual(len(fa.usage.pending_pages), n_moves)
         # Firing alone does not release them; retiring the forward does.
         ev.fired = True
         fa._drain_pending_reuse(urgent=False)
-        self.assertEqual(len(fa._pending_reuse), 1)
+        self.assertEqual(len(fa.usage.pending_by_key()), 1)
         fa.retire_forward(ev)
         fa._drain_pending_reuse(urgent=False)
-        self.assertEqual(len(fa._pending_reuse), 0)
-        self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
+        self.assertEqual(len(fa.usage.pending_by_key()), 0)
+        self.assertEqual(len(fa.usage.pending_pages), 0)
 
 
 class TestO3FusedAllocBind(unittest.TestCase):

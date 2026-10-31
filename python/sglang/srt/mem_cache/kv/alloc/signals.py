@@ -136,14 +136,12 @@ class CompletionFlags:
 class TransferRelease:
     """The logical end of a transfer whose completion the host observes: set
     where every rank observes it, so move and reuse decisions that read it agree
-    across ranks. ``quarantined``: the transfer failed and its engine has not
-    confirmed that it stopped touching the pages."""
+    across ranks."""
 
-    __slots__ = ("released", "quarantined")
+    __slots__ = ("released",)
 
     def __init__(self):
         self.released = False
-        self.quarantined = False
 
 
 def signals_of(key) -> Iterator:

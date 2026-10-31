@@ -800,7 +800,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             raise RuntimeError("the arena must be backed before allocator.resize")
         for band in self.members:
-            if band.allocated_count() or band._pending_reuse:
+            if band.allocated_count() or band.usage.has_pending():
                 raise RuntimeError(
                     f"cannot resize non-empty band {band.sub_pool_name!r}"
                 )
@@ -1092,7 +1092,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
             if all(
-                m._free_phys_pages.numel() == 0 and not m._pending_reuse
+                m._free_phys_pages.numel() == 0 and not m.usage.has_pending()
                 for m in self.members
             ):
                 return 0

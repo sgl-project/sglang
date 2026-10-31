@@ -286,7 +286,7 @@ class BuilderAdapter:
                 out[f"{p}.edges"] = [m.watermark_physical]
             out[f"{p}.allocated_pages"] = m._allocated_pages()
             out[f"{p}.holes"] = sorted(m._free_phys_pages.tolist())
-            out[f"{p}.pending"] = sorted(m._pending_reuse_pages_cpu)
+            out[f"{p}.pending"] = sorted(m.usage.pending_pages)
             out[f"{p}.free_vids"] = (
                 None if m.free_virtual_ids is None else m.free_virtual_ids.tolist()
             )
