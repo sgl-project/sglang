@@ -17,7 +17,10 @@ from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import (  # noqa: E402
+    DisaggregationMode,
+    pre_alloc_fill_len,
+)
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
@@ -68,6 +71,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -437,6 +441,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
         scheduler.rust_server = None
+        scheduler.output_streamer = MagicMock()
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
         scheduler.dllm_config = None
@@ -791,9 +796,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
 
                 prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
 
-                self.assertEqual(
-                    DecodePreallocQueue._pre_alloc_fill_len(req), prefill_len
-                )
+                self.assertEqual(pre_alloc_fill_len(req), prefill_len)
                 self.assertEqual(req.output_ids, output_ids)
 
 
