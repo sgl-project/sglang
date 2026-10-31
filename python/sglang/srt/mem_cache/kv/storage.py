@@ -9,7 +9,17 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -104,9 +114,14 @@ class KVStorage:
         self.start_layer = start_layer
         # The request table: rows and the ids they hold.
         self.requests = requests
+        # Rows held with no work in flight on them (`park_row`).
+        self._parked_rows: Set[int] = set()
         self.scratch = scratch
         self._request_memory = request_memory
         state = allocator.state
+        if state is not None and requests is not None:
+            # The memory clip prices a fresh request's state as acquire does.
+            allocator.fresh_request_state_slots = state.fresh_request_slots(requests)
         self._views: Dict[str, Any] = {}
         sub_pools = []
         for s in plan.owner_first():
@@ -330,7 +345,39 @@ class KVStorage:
 
     def release_row(self, req: Req) -> None:
         """Give back the request's row; its ids went back before."""
+        self._parked_rows.discard(req.kv.req_pool_idx)
         self.requests.free(req)
+
+    def park_row(self, holder) -> None:
+        """``holder`` keeps its row with no work in flight on it (a
+        streaming session between turns): a row held this way gives nothing
+        back by itself, so it is not memory another request may wait for."""
+        if holder.kv.req_pool_idx is not None:
+            self._parked_rows.add(holder.kv.req_pool_idx)
+
+    def unpark_row(self, holder) -> None:
+        """Work runs on ``holder``'s parked row again."""
+        self._parked_rows.discard(holder.kv.req_pool_idx)
+
+    def others_hold_rows(self, req: Optional[Req]) -> bool:
+        """Whether work other than ``req`` (None: no request) holds a row of
+        the request table: a running request, a sent request whose transfer
+        is in flight, a request of another pipeline microbatch, or beam
+        members. Each gives its rows and ids back when it ends; a parked row
+        does not."""
+        held = self.requests.size - self.requests.available_size()
+        held -= len(self._parked_rows)
+        own = (
+            req is not None
+            and req.kv.req_pool_idx is not None
+            and req.kv.req_pool_idx not in self._parked_rows
+        )
+        return held > int(own)
+
+    def only_parked_rows_held(self) -> bool:
+        """Whether parked rows are the only rows held: their memory comes back
+        only when their sessions close, so waiting for it makes no progress."""
+        return bool(self._parked_rows) and not self.others_hold_rows(None)
 
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         """Rows bound to no request (beam search members); None when too few

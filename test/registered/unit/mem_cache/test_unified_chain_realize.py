@@ -83,6 +83,11 @@ def _live_bytes(allocator):
     return out
 
 
+def _live_pages(band):
+    p2v = band.ids.physical_to_virtual.cpu().tolist()
+    return [p for p, v in enumerate(p2v) if v >= 0 and p >= band.min_page_index]
+
+
 def _page_bytes(allocator, taken):
     """Byte ranges of every live page and every page just taken, per band."""
     ranges = []

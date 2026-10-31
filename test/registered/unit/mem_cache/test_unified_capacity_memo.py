@@ -249,11 +249,14 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                     def check_boundary():
                         capacity = allocator.available_size()
                         self.assertTrue(allocator.can_reserve(capacity, capacity))
-                        self.assertFalse(
-                            allocator.can_reserve(
-                                capacity + page_size, capacity + page_size
-                            )
-                        )
+                        # Admission may see room past the advertised capacity
+                        # (a relayout opens it); whatever it admits, the take
+                        # serves.
+                        more = capacity + page_size
+                        if allocator.can_reserve(more, more):
+                            taken = allocator.alloc(more)
+                            self.assertIsNotNone(taken)
+                            allocator.free(taken)
 
                     check_boundary()  # empty float is frontier-transparent
                     states = allocator.mamba_allocator.alloc(3)

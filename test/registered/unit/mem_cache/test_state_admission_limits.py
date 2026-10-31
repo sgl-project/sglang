@@ -13,6 +13,10 @@ from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
+# A request that holds no request row: no other holder of memory unless a
+# test takes rows for one.
+_NO_ROW_REQ = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
+
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
@@ -73,6 +77,7 @@ def _build(*, window, lazy):
 def _cache():
     return SimpleNamespace(
         sliding_window_size=16,
+        window_retain_size=lambda component: 16,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
         auxiliary_swa_evictable_size=lambda: 0,
@@ -131,13 +136,13 @@ class TestStateAdmissionLimits(unittest.TestCase):
         )
         while low < high:
             mid = (low + high + 1) // 2
-            if allocator.prefill_state_fits(mid, 0, 1):
+            if allocator.admits(mid, {}, 1):
                 low = mid
             else:
                 high = mid - 1
         self.assertGreater(low, 0)
-        self.assertTrue(allocator.prefill_state_fits(low, 0, 1))
-        self.assertFalse(allocator.prefill_state_fits(low + 0.5, 0, 1))
+        self.assertTrue(allocator.admits(low, {}, 1))
+        self.assertFalse(allocator.admits(low + 0.5, {}, 1))
 
     def test_pinned_window_keeps_the_physical_state_surcharge(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
@@ -249,6 +254,7 @@ class TestStateChunkProgress(unittest.TestCase):
                 budget.reserve(0, 0, state_slots=1)
                 limit = int(budget.available_chunk_tokens(1 << 20))
                 selected = budget.fit_chunk(
+                    _NO_ROW_REQ,
                     extend_input_len=limit + 1,
                     max_new_tokens=0,
                     chunk_limit=limit,
@@ -256,12 +262,9 @@ class TestStateChunkProgress(unittest.TestCase):
                 )
                 self.assertIsNotNone(selected)
                 self.assertGreater(selected, 0)
-                if window:
-                    # The split policy's nominal 512-token window bound is
-                    # already tighter than this arena's pending-state pressure.
-                    self.assertEqual(selected, limit)
-                else:
-                    self.assertLess(selected, limit)
+                # The pending state's bytes bound the chunk, with or without a
+                # window sub-pool: one admission rule prices both.
+                self.assertLess(selected, limit)
                 self.assertTrue(
                     budget.can_allocate_prefill(
                         paged_input=selected + allocator.page_size,

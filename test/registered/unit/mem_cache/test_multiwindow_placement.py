@@ -21,6 +21,10 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
+# A request that holds no request row: no other holder of memory unless a
+# test takes rows for one.
+_NO_ROW_REQ = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
+
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
@@ -191,7 +195,10 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 self.assertTrue(fits[2])
                 cache = SimpleNamespace(
                     sliding_window_size=16,
-                    window_retain_size=lambda component: 12,
+                    # The target's window slot retains its own window.
+                    window_retain_size=lambda component: (
+                        16 if component == "SWA" else 12
+                    ),
                     full_evictable_size=lambda: 0,
                     swa_evictable_size=lambda: 0,
                     auxiliary_swa_evictable_size=lambda: 0,
@@ -200,17 +207,24 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     mamba_evictable_size=lambda: 0,
                 )
                 budget = allocator.create_prefill_budget(cache)
-                cap = budget._joint_chunk_cap(
-                    max_chunk_tokens=11, chunk_limit=12, state_slots=1
+                cap = budget._chunk_cap(
+                    max_chunk_tokens=11,
+                    chunk_limit=12,
+                    host_hit_lengths=(0, 0),
+                    state_slots=1,
                 )
                 selected = budget.fit_chunk(
+                    _NO_ROW_REQ,
                     extend_input_len=12,
                     max_new_tokens=1,
                     chunk_limit=12,
                     state_slots=1,
                 )
                 self.assertEqual(cap, 8)
-                self.assertEqual(selected, cap)
+                # A continuation's chunk needs only the rows it writes now
+                # (its decode was committed when it was admitted), and the
+                # whole chunk's rows are there.
+                self.assertEqual(selected, 12)
                 # The scheduler can round the selected chunk down. Both the
                 # selected shape and every positive smaller page shape retain
                 # the same pending-state demand and remain realizable.
@@ -218,11 +232,8 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     self.assertTrue(
                         budget._fits(
                             rounded + 4,
-                            budget.swa_tokens(rounded, 0, chunk_limit=12),
-                            auxiliary_swa_tokens=budget.auxiliary_tokens(
-                                rounded, 0, chunk_limit=12
-                            ),
-                            state_slots=1,
+                            budget.window_tokens(rounded, 0, chunk_limit=12),
+                            1,
                         )
                     )
                 self.assertIsNotNone(allocator.alloc_state_slots(1))
