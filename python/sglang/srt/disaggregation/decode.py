@@ -87,6 +87,7 @@ from sglang.srt.disaggregation.utils import (
     pre_alloc_fill_len,
     prepare_abort,
     setup_state_kv_args,
+    wire_sub_pool,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -1975,7 +1976,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.QSA_PENDING: _qsa_pending_payload,
             StateType.QSA_COMPRESSED: _full_kv_pages_payload,
             StateType.SWA: _swa_payload,
-            StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
+            StateType.AUXILIARY_SWA: lambda: _swa_payload(
+                wire_sub_pool(
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ),
+                    StateType.AUXILIARY_SWA,
+                ),
+                None,
+            ),
             StateType.DSA: _dsa_pages_payload,
             StateType.DSA_TAIL: _dsa_tail_payload,
             StateType.MINIMAX_INDEX_K: _minimax_payload,
