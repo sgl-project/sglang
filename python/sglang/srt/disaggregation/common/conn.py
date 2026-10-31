@@ -2528,6 +2528,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self._lifecycle_lock = threading.RLock()
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        # Filled by send_metadata; staging cleanup can run before it under overlap.
+        self.chunk_staging_infos: List[Tuple[int, int, int, int, int]] = []
         self.init_time: Optional[float] = None
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
