@@ -215,6 +215,7 @@ class KVArgsRegisterInfo:
     dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    pack_layout: Optional[dict] = None
 
     @property
     def engine_key(self) -> str:
@@ -275,6 +276,11 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=dst_dcp_rank,
             dst_state_layer_ids=dst_state_layer_ids,
             dst_kv_layer_ids=dst_kv_layer_ids,
+            pack_layout=(
+                msgspec.msgpack.decode(payload[17])
+                if len(payload) > 17 and payload[17]
+                else None
+            ),
         )
 
 
@@ -397,6 +403,11 @@ class MoriKVManager(CommonKVManager):
         self.state_mem_descs: List[List[Optional[MemoryDesc]]] = []
         self.transfer_lock = threading.Lock()
         self._submission_local = _SubmissionLocal()
+        self._packing_enabled = envs.SGLANG_MORI_KV_PACKING.get()
+        self._packed_local = threading.local()
+        self._packed_senders = []
+        self._packed_senders_lock = threading.Lock()
+        self._quarantined_transfer_drains = []
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         # Set by teardown() to make worker threads exit (PoC: P<->D role switch).
@@ -731,6 +742,20 @@ class MoriKVManager(CommonKVManager):
             if item is None:
                 break
             kv_chunk, statuses = item
+            if any(
+                getattr(status, "untracked_submission", False) is True
+                for status in statuses
+            ):
+                # No status can prove these writes drained. Keep the room's
+                # outstanding hold and never ACK it, but do not retry/log at
+                # polling frequency forever or starve unrelated rooms.
+                self._quarantined_transfer_drains.append((kv_chunk, statuses))
+                logger.error(
+                    "Quarantining MoRI room %s after an untracked packed submission; "
+                    "remote KV release requires transport recovery",
+                    kv_chunk.room,
+                )
+                continue
             while True:
                 try:
                     self._drain_transfer_statuses(kv_chunk, statuses)
@@ -1088,6 +1113,12 @@ class MoriKVManager(CommonKVManager):
             self._zmq_ctx.destroy(linger=0)
         except Exception:
             logger.exception("Failed to destroy mori zmq context during teardown")
+        # Close bounded per-worker staging registrations only after workers stop.
+        # A timed-out/ambiguous sender retains its buffer and engine in quarantine.
+        with self._packed_senders_lock:
+            for sender in self._packed_senders:
+                sender.close()
+            self._packed_senders.clear()
         # Deregister RDMA memory and drop the IOEngine reference.
         try:
             for descs in (self.kv_mem_descs, self.aux_mem_descs):
@@ -1286,6 +1317,143 @@ class MoriKVManager(CommonKVManager):
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
 
+    def _get_proven_gqa_transfer_layout(
+        self,
+        peer_info,
+        component,
+        src_ptrs,
+        dst_descs,
+        src_pages,
+        dst_pages,
+        src_item_lens,
+        dst_item_lens,
+        src_layer_ids,
+        dst_layer_ids,
+    ):
+        """Prove byte geometry for packed or direct P<D NHD head-slice writes.
+
+        Independent of the packing flag: direct SWA transfer and the packed
+        optimization must enforce the same negotiated schema and bounds.
+        """
+        if (
+            not self.enable_deferred_decode_kv_release
+            or self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or self.pp_size != 1
+            or self.attn_cp_size != 1
+            or self.dcp_size != 1
+            or peer_info.requires_dcp_relayout
+            or peer_info.dst_dcp_size != 1
+            or getattr(self.kv_args, "num_draft_entries", 0)
+            or list(getattr(self.kv_args, "state_types", [])) not in ([], ["swa"])
+            or peer_info.decode_tp_size <= 0
+        ):
+            return None
+        from sglang.srt.disaggregation.mori.packed import (
+            negotiate_packed_slice,
+        )
+
+        local = getattr(self.kv_args, "mori_pack_layout", None)
+        remote = peer_info.pack_layout
+        layout = negotiate_packed_slice(
+            local,
+            remote,
+            component,
+            src_tp=self.attn_tp_size,
+            dst_tp=peer_info.decode_tp_size,
+            src_rank=self.attn_tp_rank,
+            dst_rank=peer_info.decode_tp_rank % peer_info.decode_tp_size,
+            total_heads=getattr(self.kv_args, "total_kv_head_num", 0),
+        )
+        if layout is None:
+            return None
+        source, destination = local[component], remote[component]
+        count = len(src_ptrs)
+        if (
+            not count
+            or count != len(dst_descs)
+            or len(src_item_lens) != count
+            or len(dst_item_lens) != count
+            or list(src_layer_ids) != list(dst_layer_ids)
+            or len(source["page_capacities"]) != count
+            or len(destination["page_capacities"]) != count
+            or any(n != layout.src_page_bytes for n in src_item_lens)
+            or any(n != layout.dst_page_bytes for n in dst_item_lens)
+        ):
+            return None
+        if len(src_pages) != len(dst_pages):
+            raise ValueError("MoRI packed transfer requires paired page indices")
+        if len(src_pages) == 0:
+            return layout
+        for pages, capacities in (
+            (src_pages, source["page_capacities"]),
+            (dst_pages, destination["page_capacities"]),
+        ):
+            if min(pages) < 0 or max(pages) >= min(capacities):
+                raise ValueError("MoRI packed page index exceeds registered KV storage")
+        return layout
+
+    def _try_send_packed(
+        self,
+        peer_info,
+        component,
+        src_ptrs,
+        dst_descs,
+        src_pages,
+        dst_pages,
+        src_item_lens,
+        dst_item_lens,
+        src_layer_ids,
+        dst_layer_ids,
+    ):
+        """Return None for an unsupported layout; never fall back after submit."""
+        if not getattr(self, "_packing_enabled", False):
+            return None
+        layout = self._get_proven_gqa_transfer_layout(
+            peer_info,
+            component,
+            src_ptrs,
+            dst_descs,
+            src_pages,
+            dst_pages,
+            src_item_lens,
+            dst_item_lens,
+            src_layer_ids,
+            dst_layer_ids,
+        )
+        if layout is None:
+            return None
+        if len(src_pages) == 0:
+            return []
+        from sglang.srt.disaggregation.mori.packed import MoriPackedKVSender
+
+        count = len(src_ptrs)
+        size_bytes = envs.SGLANG_MORI_KV_PACK_BUFFER_SIZE_MB.get() * 1024 * 1024
+        if size_bytes < count * layout.dst_page_bytes:
+            return None
+        sender = getattr(self._packed_local, "sender", None)
+        if sender is None:
+            sender = MoriPackedKVSender(
+                engine=self.engine,
+                gpu_id=self.kv_args.gpu_id,
+                size_bytes=size_bytes,
+                wait_completion=self._wait_transfer_completion,
+                record_statuses=self._record_submitted_statuses,
+            )
+            self._packed_local.sender = sender
+            with self._packed_senders_lock:
+                self._packed_senders.append(sender)
+        return sender.send(
+            src_ptrs=src_ptrs,
+            dst_descs=dst_descs,
+            src_pages=src_pages,
+            dst_pages=dst_pages,
+            src_page_bytes=layout.src_page_bytes,
+            dst_page_bytes=layout.dst_page_bytes,
+            page_size=layout.page_size,
+            head_offset_bytes=layout.head_offset_bytes,
+        )
+
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
@@ -1441,6 +1609,21 @@ class MoriKVManager(CommonKVManager):
         )
 
         if peer_info.decode_tp_size != self.attn_tp_size:
+            if getattr(self, "_packing_enabled", False):
+                packed_statuses = self._try_send_packed(
+                    peer_info,
+                    "full",
+                    self.kv_args.kv_data_ptrs,
+                    dst_k_descs + dst_v_descs,
+                    prefill_kv_indices,
+                    dst_kv_indices,
+                    self.kv_args.kv_item_lens,
+                    [peer_info.dst_kv_item_len] * len(self.kv_args.kv_data_ptrs),
+                    self.kv_args.kv_layer_ids,
+                    peer_info.dst_kv_layer_ids,
+                )
+                if packed_statuses is not None:
+                    return packed_statuses
             tp_cfg = self._build_tp_slice_config(peer_info)
             slice_plan = self._build_tp_slice_transfer_plan(
                 prefill_kv_indices, dst_kv_indices, tp_cfg
@@ -1851,6 +2034,72 @@ class MoriKVManager(CommonKVManager):
 
         return statuses
 
+    def _try_send_direct_swa_slice(
+        self,
+        peer_info,
+        src_indices,
+        dst_indices,
+        src_descs,
+        src_lens,
+        dst_descs,
+        dst_lens,
+        src_layer_ids,
+        dst_layer_ids,
+    ):
+        """Direct per-token SWA head slices for the proven P<D NHD contract.
+
+        This enables a previously unsupported transfer configuration. It is the
+        unpacked reference for measuring packing, not an upstream performance
+        baseline or a relaxation of the existing unsupported-layout guard.
+        """
+        if (
+            getattr(self.kv_args, "mori_pack_layout", None) is None
+            or getattr(peer_info, "pack_layout", None) is None
+        ):
+            return None
+        state_types = list(getattr(self.kv_args, "state_types", []))
+        state_ptrs = getattr(self.kv_args, "state_data_ptrs", [])
+        if "swa" not in state_types:
+            return None
+        component = state_types.index("swa")
+        if component >= len(state_ptrs) or len(state_ptrs[component]) != len(src_descs):
+            return None
+        layout = self._get_proven_gqa_transfer_layout(
+            peer_info,
+            "swa",
+            state_ptrs[component],
+            dst_descs,
+            src_indices,
+            dst_indices,
+            src_lens,
+            dst_lens,
+            src_layer_ids,
+            dst_layer_ids,
+        )
+        if layout is None:
+            return None
+        if not len(src_indices):
+            return []
+        cfg = TPSliceConfig(
+            page_size=layout.page_size,
+            src_item_len=layout.src_page_bytes,
+            dst_item_len=layout.dst_page_bytes,
+            bytes_per_token_src=layout.src_page_bytes // layout.page_size,
+            bytes_per_token_dst=layout.dst_page_bytes // layout.page_size,
+            src_head_slice_offset=layout.head_offset_bytes,
+            dst_head_slice_offset=0,
+            heads_bytes_per_token_to_send=layout.dst_page_bytes // layout.page_size,
+        )
+        plan = self._build_tp_slice_transfer_plan(
+            np.asarray(src_indices, dtype=np.int64),
+            np.asarray(dst_indices, dtype=np.int64),
+            cfg,
+        )
+        statuses = []
+        for src_desc, dst_desc in zip(src_descs, dst_descs):
+            statuses.extend(self._submit_batch_transfer_plan(src_desc, dst_desc, plan))
+        return statuses
+
     def _send_swa_dsa_state(
         self,
         peer_info: KVArgsRegisterInfo,
@@ -1870,6 +2119,35 @@ class MoriKVManager(CommonKVManager):
             and not self.is_mla_backend
             and peer_info.decode_tp_size != self.attn_tp_size
         ):
+            if getattr(self, "_packing_enabled", False):
+                component = list(self.kv_args.state_types).index("swa")
+                packed_statuses = self._try_send_packed(
+                    peer_info,
+                    "swa",
+                    self.kv_args.state_data_ptrs[component],
+                    dst_state_mem_descs,
+                    src_state_indices,
+                    dst_state_indices,
+                    src_state_item_lens,
+                    dst_state_item_lens,
+                    src_layer_ids,
+                    dst_layer_ids,
+                )
+                if packed_statuses is not None:
+                    return packed_statuses
+            direct_statuses = self._try_send_direct_swa_slice(
+                peer_info,
+                src_state_indices,
+                dst_state_indices,
+                src_state_mem_descs,
+                src_state_item_lens,
+                dst_state_mem_descs,
+                dst_state_item_lens,
+                src_layer_ids,
+                dst_layer_ids,
+            )
+            if direct_statuses is not None:
+                return direct_statuses
             raise RuntimeError(
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
@@ -2116,6 +2394,7 @@ class MoriKVManager(CommonKVManager):
             dcp_rank,
             packed_state_layer_ids,
             packed_kv_layer_ids,
+            msgspec.msgpack.encode(getattr(self.kv_args, "mori_pack_layout", None)),
         ]
 
     def build_receiver_metadata_message(
