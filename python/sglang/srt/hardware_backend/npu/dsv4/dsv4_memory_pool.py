@@ -268,11 +268,14 @@ class NPUCompressStatePool(CompressStatePool):
 
 
 class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
-    """NPU c4-indexer pool. Keeps the base packed CUDA buffer (read by
-    get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
+    """NPU c4-indexer pool. Allocates only dedicated int8 K + float16 scale
     buffers in PA_ND layout at the native C4 ``kernel_page_size``, written by
     ``torch_npu.npu_scatter_nd_update_`` and read by
-    ``torch.ops.custom.npu_quant_lightning_indexer``.
+    ``torch.ops.custom.npu_quant_lightning_indexer``. The base packed CUDA
+    ``index_k_with_scale_buffer`` is NOT allocated: every NPU consumer (the
+    compute scatter/read path, the PD ``get_contiguous_buf_infos`` override,
+    and the HiCache indexer regions) addresses the NPU buffers directly, so
+    the CUDA packed buffer would be dead memory.
     """
 
     def __init__(self, *args, kernel_page_size: int, **kwargs):
@@ -281,9 +284,11 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         super().__init__(*args, **kwargs)
 
     def _create_buffer(self):
-        # Base allocates the packed CUDA index_k_with_scale_buffer (kept for
-        # get_contiguous_buf_infos / NSA compat); then add the NPU buffers.
-        super()._create_buffer()
+        # No super()._create_buffer(): the packed CUDA index_k_with_scale_buffer
+        # is never read on the NPU path (compute, PD and HiCache all use the NPU
+        # buffers below), so allocating it would be dead memory. Keep the attr
+        # defined (as None) for generic ``is not None`` checks.
+        self.index_k_with_scale_buffer = None
         kp = self._kernel_page_size
         npu_num_pages = (self.size + kp + 1) // kp
         (
@@ -337,6 +342,20 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
 
     def get_index_scale(self, layer_id: int) -> torch.Tensor:
         return self.index_scale_buffer[layer_id]
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError(
+            "NPU indexer pools keep key and scale in separate PA_ND buffers; "
+            "use get_index_k / get_index_scale instead"
+        )
+
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        # NPU analogue of the base fp4 branch: expose the PA_ND K and scale
+        # buffers as 2D uint8 page-row views for generic row consumers.
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_buffer, *self.index_scale_buffer)
+        ]
 
     def set_index_k_scale(
         self,
