@@ -478,3 +478,16 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+
+
+## Bound rank-local vision batches
+
+Set `SGLANG_K3_VISION_MAX_FRAMES_PER_BATCH` to a positive frame budget to split
+preprocessing and vision encoding on each owning rank. For example, `8` keeps
+at most eight frames in a local encoding batch. A temporal item remains intact;
+a budget smaller than one item's frame count is rejected.
+
+The default `0` preserves one encoding batch per owner. Item order, temporal
+pooling and the existing vision-DP gather remain unchanged. This bounds local
+preprocessing and encoder temporaries; the final embeddings and language-model
+KV cache still grow with the request. It does not enable a new input format.
