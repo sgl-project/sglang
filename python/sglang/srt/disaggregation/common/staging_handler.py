@@ -501,6 +501,7 @@ class DecodeStagingHandler:
                 self.decode_tp,
                 dst_tp_rank,
                 self.total_kv_heads,
+                deduplicate=self.kv_manager.deduplicate_kv_staging,
             )
 
         return True
@@ -832,6 +833,7 @@ def handle_staging_req(
     kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
+    deduplicate: bool = False,
 ):
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
@@ -896,6 +898,7 @@ def handle_staging_req(
             chunk_tokens,
             bytes_per_head_per_token,
             num_kv_layers,
+            deduplicate=deduplicate,
         )
         result = staging_allocator.assign(required)
         if result is None:
@@ -985,6 +988,7 @@ class StagingManagerMixin:
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
+            deduplicate=self.deduplicate_kv_staging,
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
