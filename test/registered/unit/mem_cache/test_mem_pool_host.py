@@ -612,16 +612,14 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool._slot_siblings = []
         (info,) = pool.get_device_pool_infos()
         info.buffer_info.validate(layer_ids=info.layer_ids)
-        # CPU buffers: keep the XPU refusal off when this runs on an XPU host.
-        with unittest.mock.patch.object(mamba_pool_host, "_is_xpu", False):
-            host = MambaPoolHost(
-                info.buffer_info,
-                host_to_device_ratio=2,
-                host_size=0,
-                device_capacity=4,
-                layout="page_first",
-                pin_memory=False,
-            )
+        host = MambaPoolHost(
+            info.buffer_info,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=4,
+            layout="page_first",
+            pin_memory=False,
+        )
         try:
             self.assertEqual(info.layer_ids, ())
             self.assertEqual(host.num_mamba_layers, 0)
@@ -1004,23 +1002,100 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         self.assertEqual(packed.get_size_per_token(), 132 * 3)
 
 
-class TestMambaHostPoolOnXpu(CustomTestCase):
-    def test_refused_at_construction(self):
-        state = MambaStateBufferInfo(
-            temporal=torch.zeros(1, 4, 2, 2), conv=(torch.zeros(1, 4, 3, 2),)
+def _mamba_state(layers, slots, strided=False):
+    if strided:
+        # Slot views into a wider envelope, as unified memory lays them out.
+        return MambaStateBufferInfo(
+            temporal=torch.randn(layers, slots, 2, 6)[..., :3],
+            conv=(torch.randn(layers, slots, 4, 10)[..., :5],),
         )
+    return MambaStateBufferInfo(
+        temporal=torch.randn(layers, slots, 2, 3),
+        conv=(torch.randn(layers, slots, 4, 5),),
+    )
+
+
+class TestMambaXpuBackupDispatch(CustomTestCase):
+    """On XPU, transfer_kv_mamba_lf_pf takes one layer-first source tensor."""
+
+    SLOTS = 6
+
+    def _backup(self, mtp_draft_buffer_infos, strided=False, chunk_bytes=None):
+        target = _mamba_state(layers=2, slots=self.SLOTS, strided=strided)
+        host = MambaPoolHost(
+            target,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=self.SLOTS,
+            layout="page_first",
+            pin_memory=False,
+            mtp_draft_buffer_infos=mtp_draft_buffer_infos,
+        )
+        sources = []
+
+        def lf_pf(*, src_layers, dst, src_indices, dst_indices, **_):
+            # Reference semantics: dst[dst_i, layer, 0] = src_layers[layer][src_i].
+            self.assertIsInstance(src_layers, torch.Tensor)
+            sources.append(src_layers)
+            for layer in range(src_layers.shape[0]):
+                dst[dst_indices, layer, 0] = src_layers[layer][src_indices]
+
+        device_indices = torch.tensor([4, 1, 3])
+        host_indices = torch.tensor([0, 5, 2])
         with (
-            unittest.mock.patch.object(mamba_pool_host, "_is_xpu", True),
-            self.assertRaisesRegex(ValueError, "hybrid Mamba models on XPU"),
+            unittest.mock.patch.object(mamba_pool_host, "_use_xpu_mamba_ops", True),
+            unittest.mock.patch.object(
+                mamba_pool_host,
+                "_XPU_STACK_CHUNK_BYTES",
+                chunk_bytes or mamba_pool_host._XPU_STACK_CHUNK_BYTES,
+            ),
+            unittest.mock.patch.object(
+                mamba_pool_host, "transfer_kv_mamba_lf_pf", lf_pf, create=True
+            ),
         ):
-            MambaPoolHost(
-                state,
-                host_to_device_ratio=2,
-                host_size=0,
-                device_capacity=4,
-                layout="page_first",
-                pin_memory=False,
+            host.backup_from_device_all_layer(
+                None, host_indices, device_indices, "kernel"
             )
+        try:
+            layers = (target, *mtp_draft_buffer_infos)
+            device_temporal = torch.cat([info.temporal for info in layers])
+            device_conv = torch.cat([info.conv[0] for info in layers])
+            for host_buf, device_buf in (
+                (host.temporal_buffer, device_temporal),
+                (host.conv_buffer[0], device_conv),
+            ):
+                for layer in range(device_buf.shape[0]):
+                    torch.testing.assert_close(
+                        host_buf[host_indices, layer, 0],
+                        device_buf[layer][device_indices],
+                    )
+        finally:
+            host.destroy()
+        return target, sources
+
+    def test_target_only_passes_the_device_tensor(self):
+        target, sources = self._backup(())
+        self.assertIs(sources[0], target.temporal)
+        self.assertIs(sources[1], target.conv[0])
+
+    def test_mtp_draft_layers_are_stacked(self):
+        # Draft layers are separate allocations, so src_layers arrives as a list.
+        _, sources = self._backup((_mamba_state(layers=1, slots=self.SLOTS),))
+        self.assertEqual([tuple(s.shape[:2]) for s in sources], [(3, 3), (3, 3)])
+
+    def test_mtp_draft_layers_with_strided_slots(self):
+        # The strided-slot fallback reads `src_layers.device`, so the draft list
+        # must already be one tensor when it runs.
+        draft = _mamba_state(layers=1, slots=self.SLOTS, strided=True)
+        _, sources = self._backup((draft,), strided=True)
+        self.assertEqual([tuple(s.shape[:2]) for s in sources], [(3, 3), (3, 3)])
+
+    def test_each_chunk_keeps_its_src_and_dst_slots_paired(self):
+        # A 1-byte cap gives one slot per chunk, so a src/dst slice mismatch
+        # across chunks lands state in the wrong host slot.
+        draft = _mamba_state(layers=1, slots=self.SLOTS)
+        _, sources = self._backup((draft,), chunk_bytes=1)
+        self.assertEqual([tuple(s.shape[:2]) for s in sources], [(3, 1)] * 6)
 
 
 if __name__ == "__main__":
