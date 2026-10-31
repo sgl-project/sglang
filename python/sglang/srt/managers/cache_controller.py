@@ -332,6 +332,16 @@ class HiCacheController:
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
+        # Storage agreement runs on the scheduler thread of one PP stage: the
+        # workers then record local outcomes instead of reducing them, and the
+        # tree cache builds its agreement engine under the same rule.
+        self.scheduler_agrees_storage = (
+            pp_group is None or torch.distributed.get_world_size(group=pp_group) == 1
+        )
+        # The tree cache's engine learns the dispatch order of transfers here.
+        self.on_prefetch_dispatched: Optional[Callable[[PrefetchOperation], None]] = (
+            None
+        )
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -474,18 +484,6 @@ class HiCacheController:
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
 
-        self.prefetch_thread = threading.Thread(
-            target=self.prefetch_thread_func, daemon=True
-        )
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_sync_thread = threading.Thread(
-            target=self.prefetch_sync_thread_func, daemon=True
-        )
-        self.backup_thread = threading.Thread(
-            target=self.backup_thread_func, daemon=True
-        )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
         self.prefetch_buffer = Queue()
@@ -494,11 +492,33 @@ class HiCacheController:
         self.ack_prefetch_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
+        self._spawn_storage_threads()
 
-        self.prefetch_thread.start()
-        self.prefetch_io_aux_thread.start()
-        self.prefetch_sync_thread.start()
-        self.backup_thread.start()
+    def _spawn_storage_threads(self):
+        """Start the storage workers. With scheduler-thread agreement the
+        workers only do I/O, so no sync thread (and no worker collective) runs."""
+        self.prefetch_thread = threading.Thread(
+            target=self.prefetch_thread_func, daemon=True
+        )
+        self.prefetch_io_aux_thread = threading.Thread(
+            target=self.prefetch_io_aux_func, daemon=True
+        )
+        self.prefetch_sync_thread = (
+            None
+            if self.scheduler_agrees_storage
+            else threading.Thread(target=self.prefetch_sync_thread_func, daemon=True)
+        )
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True
+        )
+        for thread in (
+            self.prefetch_thread,
+            self.prefetch_io_aux_thread,
+            self.prefetch_sync_thread,
+            self.backup_thread,
+        ):
+            if thread is not None:
+                thread.start()
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -558,16 +578,31 @@ class HiCacheController:
     # returns fires on_host_pools_registered() itself, once.
     _registers_host_pools_after_super_attach = False
 
-    # Set by the tree cache when its scheduler-thread engine agrees hit queries
-    # across ranks: the query worker then records local outcomes instead of
-    # reducing them itself (the PP ticket path keeps the worker reduce).
-    scheduler_agrees_queries = False
+    # Instances compute this from the PP group in __init__ (True for one PP
+    # stage); the class default keeps hand-built controllers on the worker
+    # reduce, which the PP ticket path still uses.
+    scheduler_agrees_storage = False
 
-    def storage_query_worker_alive(self) -> bool:
-        """Whether this backend can still answer hit queries. A backend without
-        a query thread (a native controller) always can."""
-        thread = self.prefetch_thread
-        return thread is None or thread.is_alive()
+    def storage_workers_alive(self) -> bool:
+        """Whether every started storage worker can still report. A backend
+        without worker threads (a native controller) always can."""
+        return all(
+            thread is None or thread.is_alive()
+            for thread in (
+                self.prefetch_thread,
+                self.prefetch_io_aux_thread,
+                self.prefetch_sync_thread,
+                self.backup_thread,
+            )
+        )
+
+    def dispatch_prefetch_transfer(self, operation: PrefetchOperation) -> None:
+        """Hand an allocated hit to the transfer worker. The tree cache's
+        agreement engine learns the (lockstep) dispatch order through
+        ``on_prefetch_dispatched``."""
+        self.prefetch_buffer.put(operation)
+        if self.on_prefetch_dispatched is not None:
+            self.on_prefetch_dispatched(operation)
 
     def attach_storage_backend(
         self,
@@ -682,10 +717,12 @@ class HiCacheController:
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
-            # Use dedicated gloo groups so storage prefetch sync is isolated
-            # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            # The worker reduce (PP > 1) uses dedicated gloo groups so storage
+            # prefetch sync is isolated from other collectives and consistent
+            # across CPxTP participants. Scheduler-thread agreement needs none.
+            if not self.scheduler_agrees_storage:
+                self.prefetch_hits_sync_groups = self._create_sync_groups()
+                self.prefetch_completion_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -960,22 +997,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.prefetch_io_aux_thread = threading.Thread(
-                target=self.prefetch_io_aux_func, daemon=True
-            )
-            self.prefetch_sync_thread = threading.Thread(
-                target=self.prefetch_sync_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.prefetch_io_aux_thread.start()
-            self.prefetch_sync_thread.start()
-            self.backup_thread.start()
+            self._spawn_storage_threads()
 
     def has_inflight_device_transfers(self) -> bool:
         """Whether queued or unacknowledged L2 transfers still use device rows."""
@@ -1322,6 +1344,13 @@ class HiCacheController:
                 if prefix_keys is not None:
                     prefix_keys = prefix_keys + batch_hashes
                 completed_pages += hit_pages
+            if self.scheduler_agrees_storage:
+                # Local progress only; the scheduler tick agrees the prefix
+                # every rank holds once every worker is done with the rows.
+                operation.publish_local_transfer_progress(
+                    completed_pages * self.page_size
+                )
+                continue
             ack = PrefetchAck(
                 rid=operation.request_id,
                 completed_tokens=completed_pages * self.page_size,
@@ -1383,13 +1412,18 @@ class HiCacheController:
             try:
                 self._page_transfer(operation)
             finally:
-                self.prefetch_sync_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        completed_req=True,
-                        operation=operation,
+                if self.scheduler_agrees_storage:
+                    # The last touch of this operation's host rows: the tick
+                    # publishes the agreed completion once every rank is here.
+                    operation.mark_transfer_finished()
+                else:
+                    self.prefetch_sync_queue.put(
+                        PrefetchAck(
+                            rid=operation.request_id,
+                            completed_req=True,
+                            operation=operation,
+                        )
                     )
-                )
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1478,7 +1512,7 @@ class HiCacheController:
                     )
                     hash_value, storage_hit_count = [], 0
 
-                if self.scheduler_agrees_queries:
+                if self.scheduler_agrees_storage:
                     # The scheduler thread agrees this verdict with the other
                     # ranks and publishes it in submission order. A failed
                     # query is a miss without pool verdicts: nothing heals.

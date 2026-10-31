@@ -24,7 +24,7 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
-from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.managers.cache_controller import CacheOperation, PrefetchAck
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     fold_u64,
@@ -101,6 +101,7 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_agreement import (
+    OperationRowSource,
     StorageAgreementEngine,
     attention_group_min,
 )
@@ -351,15 +352,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
-        # Agrees storage hit queries across the attention group on this thread,
-        # one MIN per tick. The PP ticket path keeps its own agreement until it
-        # moves here too, so PP>1 runs without the engine.
+        # Agrees storage hit queries and transfer completion across the
+        # attention group on this thread, one MIN per tick. The PP ticket path
+        # keeps its own agreement until it moves here too, so PP>1 runs
+        # without the engine.
         self.storage_engine: Optional[StorageAgreementEngine] = (
             StorageAgreementEngine(
                 self.page_size,
                 attention_group_min(self._reduce_min_attn_groups),
-                self._storage_query_worker_alive,
-                backend_stopped=self._storage_query_worker_stopped,
+                self._storage_workers_alive,
+                OperationRowSource(
+                    self.page_size,
+                    query_expired=self._query_expired,
+                    transfer_expired=self._transfer_expired,
+                ),
+                backend_stopped=self._storage_workers_stopped,
             )
             if self.pp_size == 1
             else None
@@ -586,8 +593,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
-            if self.storage_engine is not None:
-                self.cache_controller.scheduler_agrees_queries = True
+            engine_on = self.storage_engine is not None
+            if self.cache_controller.scheduler_agrees_storage != engine_on:
+                raise RuntimeError(
+                    "HiCache storage agreement placement disagrees: tree cache "
+                    f"engine={engine_on}, controller scheduler_agrees_storage="
+                    f"{self.cache_controller.scheduler_agrees_storage}"
+                )
+            if engine_on:
+                self.cache_controller.on_prefetch_dispatched = (
+                    self.storage_engine.register_transfer
+                )
             if self.supports_swa():
                 swa = self.component_of(TREE_WINDOW)
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
@@ -2598,6 +2614,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         operation = self.ongoing_prefetch[request].operation
 
+        if self.storage_engine is not None and self.buffer_pipeline is not None:
+            # Buffer mode with scheduler-thread agreement: cuts and completion
+            # are agreed in the tick, so this per-request path runs no
+            # collective. The poll only starts the policy's clock.
+            self.storage_engine.admission_polled.add(request)
+            self._start_storage_prefetch_wait(operation)
+            return False
+
         if not operation.is_terminated():
             if not self._can_terminate_prefetch(operation):
                 self._start_storage_prefetch_wait(operation)
@@ -2613,6 +2637,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
+            if (
+                self.storage_engine is not None
+                and operation in self.storage_engine.transfers
+            ):
+                # No ack stream carries progress any more: agree the prefix
+                # every rank holds right now and insert that.
+                self._agree_cache_mode_progress(operation)
             self._handle_prefetch_result(operation)
         return True
 
@@ -2971,6 +3002,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
+        if self.storage_engine is not None:
+            self.storage_engine.admission_polled.discard(request)
         if (
             self.buffer_pipeline is not None
             and self.cache_controller.pp_prefetch_command_group is not None
@@ -3344,7 +3377,7 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
-            cc.prefetch_buffer.put(operation)
+            cc.dispatch_prefetch_transfer(operation)
             return True
 
         def _drain_and_alloc_storage_hit():
@@ -3496,9 +3529,9 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
-        pending_queries = (
-            0 if self.storage_engine is None else self.storage_engine.pending_queries()
-        )
+        engine = self.storage_engine
+        pending_queries = 0 if engine is None else engine.pending_queries()
+        pending_transfers = 0 if engine is None else engine.pending_transfers()
         local_qsize_list = [
             cc.prefetch_hit_queue.qsize(),
             cc.ack_prefetch_queue.qsize(),
@@ -3510,6 +3543,8 @@ class UnifiedRadixCache(BasePrefixCache):
             ],
             pending_queries,
             -pending_queries,
+            pending_transfers,
+            -pending_transfers,
         ]
         qsizes = torch.tensor(
             local_qsize_list,
@@ -3523,9 +3558,13 @@ class UnifiedRadixCache(BasePrefixCache):
             pool_name: count
             for pool_name, count in zip(extra_pool_names, qsize_list[4 : 4 + n_extra])
         }
-        # [n, -n] MIN-reduced to [min, -max].
-        lowest, neg_highest = qsize_list[4 + n_extra :]
-        n_storage_hit += self._agree_storage_queries(lowest, -neg_highest)
+        # Each FIFO's [n, -n] MIN-reduced to [min, -max].
+        q_lo, q_neg_hi, t_lo, t_neg_hi = qsize_list[4 + n_extra :]
+        hits, acks = self._agree_storage_operations(
+            (q_lo, -q_neg_hi), (t_lo, -t_neg_hi)
+        )
+        n_storage_hit += hits
+        n_ack_prefetch += acks
         self._drain_storage_control_queues_impl(
             n_storage_hit=n_storage_hit,
             n_ack_prefetch=n_ack_prefetch,
@@ -3628,16 +3667,14 @@ class UnifiedRadixCache(BasePrefixCache):
             # received tensor back in place, so all ranks must build the same
             # length or PP1+ would recv into a mismatched buffer.
             storage_queue_sizes = (
-                (0,) * (6 + len(extra_pool_names)) if self.enable_storage else ()
+                (0,) * (8 + len(extra_pool_names)) if self.enable_storage else ()
             )
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
-            pending_queries = (
-                0
-                if self.storage_engine is None
-                else self.storage_engine.pending_queries()
-            )
+            engine = self.storage_engine
+            pending_queries = 0 if engine is None else engine.pending_queries()
+            pending_transfers = 0 if engine is None else engine.pending_transfers()
             storage_queue_sizes = (
                 (
                     cc.prefetch_hit_queue.qsize(),
@@ -3645,17 +3682,19 @@ class UnifiedRadixCache(BasePrefixCache):
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
                     *(extra_release_queues[name].qsize() for name in extra_pool_names),
-                    # The agreement FIFO's length twice; the exchange turns the
+                    # Each agreement FIFO's length twice; the exchange turns a
                     # pair into [min, max] across ranks, equal iff every rank
                     # builds the same agreement rows this tick.
                     pending_queries,
                     pending_queries,
+                    pending_transfers,
+                    pending_transfers,
                 )
                 if self.enable_storage
                 else ()
             )
-        # Index of the FIFO pair in the row (after the two L2 ack counts).
-        fifo_at = 2 + len(storage_queue_sizes) - 2 if storage_queue_sizes else None
+        # Index of the first FIFO pair in the row (after the two L2 ack counts).
+        fifo_at = 2 + len(storage_queue_sizes) - 4 if storage_queue_sizes else None
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
@@ -3674,11 +3713,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 mins = [min(col) for col in zip(*rows)]
                 if fifo_at is not None:
-                    mins[fifo_at + 1] = max(row[fifo_at] for row in rows)
+                    for pair in (fifo_at, fifo_at + 2):
+                        mins[pair + 1] = max(row[pair] for row in rows)
                 return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
         gloo_sizes = list(storage_queue_sizes)
         if fifo_at is not None:
-            gloo_sizes[-1] = -gloo_sizes[-1]  # [n, -n] MIN-reduces to [min, -max]
+            # [n, -n] MIN-reduces to [min, -max].
+            gloo_sizes[-3] = -gloo_sizes[-3]
+            gloo_sizes[-1] = -gloo_sizes[-1]
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3700,7 +3742,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
         if fifo_at is not None:
-            count_values[fifo_at + 1] = -count_values[fifo_at + 1]
+            for pair in (fifo_at, fifo_at + 2):
+                count_values[pair + 1] = -count_values[pair + 1]
         return (
             count_values[0],
             count_values[1],
@@ -3724,9 +3767,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
-        # Row: 2 L2 ack counts, 4 storage queue counts, the agreement-FIFO
-        # pair and the 2 digest words; extra host pools push it to gloo.
-        return get_shm_exchange(group, "hicache", multihost=True, width=10)
+        # Row: 2 L2 ack counts, 4 storage queue counts, the two agreement-FIFO
+        # pairs and the 2 digest words; extra host pools push it to gloo.
+        return get_shm_exchange(group, "hicache", multihost=True, width=12)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
@@ -3934,29 +3977,115 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reduce_min_attn_groups(self, tensor: torch.Tensor) -> None:
         self._all_reduce_attn_groups(tensor, torch.distributed.ReduceOp.MIN)
 
-    def _storage_query_worker_alive(self) -> bool:
-        return self.cache_controller.storage_query_worker_alive()
+    def _storage_workers_alive(self) -> bool:
+        return self.cache_controller.storage_workers_alive()
 
-    def _storage_query_worker_stopped(self) -> bool:
+    def _storage_workers_stopped(self) -> bool:
         cc = self.cache_controller
         return cc is not None and cc.storage_stop_event.is_set()
 
-    def _agree_storage_queries(self, lowest: int, highest: int) -> int:
-        """Agree the pending hit queries across ranks on this thread, one MIN
-        over their local verdicts, and publish the agreed ones into the hit
-        queue in submission order; returns how many. ``lowest`` and ``highest``
-        are the count exchange's bounds of the FIFO length across ranks: every
+    def _query_expired(self, operation) -> bool:
+        """This rank's vote to cut a query still waiting for its verdict."""
+        policy = self.prefetch_stop_policy
+        if policy == "best_effort":
+            return operation.handle in self.storage_engine.admission_polled
+        if policy == "timeout":
+            return self._prefetch_deadline_expired(operation)
+        return False
+
+    def _transfer_expired(self, operation) -> bool:
+        """This rank's vote to cut a dispatched transfer."""
+        policy = self.prefetch_stop_policy
+        if policy == "best_effort":
+            return operation.handle in self.storage_engine.admission_polled
+        if policy != "timeout":
+            return False
+        progress = operation.local_transfer_progress()
+        if progress.completed_tokens >= len(operation.hash_value) * self.page_size:
+            # KV landed here: cutting the pending sidecar read salvages nothing.
+            return False
+        return self._prefetch_deadline_expired(operation)
+
+    def _cut_storage_operation(self, operation) -> None:
+        """Agreed cut: every rank runs this in the same tick. The worker stops
+        at its next batch boundary; the agreed outcome follows once it did."""
+        self.storage_engine.admission_polled.discard(operation.handle)
+        if operation.is_terminated():
+            return
+        if self.prefetch_stop_policy == "timeout":
+            self._mark_prefetch_deadline_expired(operation)
+        self.cache_controller.terminate_prefetch(operation)
+
+    def _publish_agreed_ack(
+        self, operation, completed_tokens: int, pool_hits: Optional[dict[str, int]]
+    ) -> None:
+        # One terminal ack carries the agreed progress; the ack drain applies
+        # it to the current operation and releases the tail beyond it.
+        self.cache_controller.ack_prefetch_queue.put(
+            PrefetchAck(
+                rid=operation.request_id,
+                operation=operation,
+                completed_tokens=completed_tokens,
+                pool_hits=pool_hits,
+                completed_req=True,
+            )
+        )
+
+    def _agree_cache_mode_progress(self, operation) -> None:
+        """Cache mode cuts on the admission path: agree the transfer prefix
+        every rank holds right now (one MIN) so the insert uses it. The
+        worker's remaining tail is released by the agreed terminal ack."""
+        progress = operation.local_transfer_progress()
+        hits = progress.pool_hits or {}
+        packed = torch.tensor(
+            [
+                progress.completed_tokens,
+                int(progress.pool_hits is not None),
+                *(int(hits.get(pool.value, 0)) for pool in PoolName),
+            ],
+            dtype=torch.int64,
+        )
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        agreed = packed.tolist()
+        operation.completed_tokens = agreed[0]
+        if operation.pool_transfers:
+            operation.pool_storage_result.update_extra_pool_hit_pages(
+                {pool.value: pages for pool, pages in zip(PoolName, agreed[2:])}
+            )
+            operation.pool_transfers_done = bool(agreed[1])
+
+    def _tick_storage_engine(self) -> tuple[int, int]:
+        """One agreement round: returns the hits and acks it published into the
+        controller queues (the drain consumes them in the same tick)."""
+        return self.storage_engine.tick(
+            self.cache_controller.prefetch_hit_queue.put,
+            self._publish_agreed_ack,
+            self._cut_storage_operation,
+            self._cut_storage_operation,
+        )
+
+    def _agree_storage_operations(
+        self, query_bounds: tuple[int, int], transfer_bounds: tuple[int, int]
+    ) -> tuple[int, int]:
+        """Agree the pending queries and transfers across ranks on this thread
+        and publish the agreed ones in submission order. The bounds are the
+        count exchange's (min, max) of each FIFO length across ranks: every
         rank must be about to build the same rows, or the collective itself
         would hang."""
         if self.storage_engine is None:
-            return 0
-        pending = self.storage_engine.pending_queries()
+            return 0, 0
+        pending = (
+            self.storage_engine.pending_queries(),
+            self.storage_engine.pending_transfers(),
+        )
+        lowest = (int(query_bounds[0]), int(transfer_bounds[0]))
+        highest = (int(query_bounds[1]), int(transfer_bounds[1]))
         if not lowest == highest == pending:
             raise RuntimeError(
-                "HiCache storage query FIFO diverged across ranks: "
-                f"local={pending} min={lowest} max={highest}"
+                "HiCache storage agreement FIFOs diverged across ranks "
+                f"(queries, transfers): local={pending} min={lowest} max={highest}"
             )
-        return self.storage_engine.tick(self.cache_controller.prefetch_hit_queue.put)
+        return self._tick_storage_engine()
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
@@ -4002,9 +4131,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             }
             # Agreed this tick and published FIFO: the drain takes them now.
-            n_storage_hit += self._agree_storage_queries(
-                *storage_queue_sizes[4 + n_extra :]
+            fifo_bounds = storage_queue_sizes[4 + n_extra :]
+            hits, acks = self._agree_storage_operations(
+                fifo_bounds[0:2], fifo_bounds[2:4]
             )
+            n_storage_hit += hits
+            n_ack_prefetch += acks
             self._drain_storage_control_queues_impl(
                 n_storage_hit=n_storage_hit,
                 n_ack_prefetch=n_ack_prefetch,

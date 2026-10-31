@@ -585,21 +585,40 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         cons.sanity_check()
 
     def _patch_tp_prefetch_sync(self, cache, drop_swa: bool):
-        """Fake all_reduce so _reduce_prefetch_ack runs the tp>1 path."""
+        """Fake the tp>1 agreement: a peer that missed every SWA page."""
         import torch.distributed as dist
 
         cc = cache.cache_controller
+        engine = cache.storage_engine
 
-        def fake_reduce(ack):
-            if drop_swa and ack.pool_hits is not None:
-                if PoolName.SWA.value in ack.pool_hits:
-                    ack.pool_hits[PoolName.SWA.value] = 0
+        if engine is not None:
+            # Transfer rows follow the query rows; the SWA hit column of a
+            # transfer row MIN-reduces to the peer's 0.
+            swa_column = 2 + list(PoolName).index(PoolName.SWA)
+            real_agree = engine._agree
 
-        p_reduce = mock.patch.object(
-            cc, "_reduce_prefetch_ack", side_effect=fake_reduce
-        )
-        p_reduce.start()
-        self.addCleanup(p_reduce.stop)
+            def fake_agree(rows):
+                agreed = real_agree(rows)
+                if drop_swa:
+                    for row in agreed[engine.pending_queries() :]:
+                        row[swa_column] = 0
+                return agreed
+
+            p_agree = mock.patch.object(engine, "_agree", side_effect=fake_agree)
+            p_agree.start()
+            self.addCleanup(p_agree.stop)
+        else:
+
+            def fake_reduce(ack):
+                if drop_swa and ack.pool_hits is not None:
+                    if PoolName.SWA.value in ack.pool_hits:
+                        ack.pool_hits[PoolName.SWA.value] = 0
+
+            p_reduce = mock.patch.object(
+                cc, "_reduce_prefetch_ack", side_effect=fake_reduce
+            )
+            p_reduce.start()
+            self.addCleanup(p_reduce.stop)
 
         p_dist = mock.patch.object(dist, "all_reduce", return_value=None)
         p_dist.start()

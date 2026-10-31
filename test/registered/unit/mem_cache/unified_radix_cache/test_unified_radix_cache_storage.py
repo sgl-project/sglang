@@ -486,6 +486,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
         deadline = time.time() + 10.0
         while time.time() < deadline:
+            # The agreed completion reaches the ack queue through the
+            # scheduler's agreement step once the worker is done.
+            cons._tick_storage_engine()
             cons._drain_storage_control_queues_impl(
                 n_storage_hit=0,
                 n_ack_prefetch=min(1, cc.ack_prefetch_queue.qsize()),
@@ -562,39 +565,46 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         swa_release_q = cc.extra_host_mem_release_queues.get(PoolName.SWA)
         self.assertIsNotNone(swa_release_q)
 
-        # Consume one queued event per iteration to stop in the window between the
-        # SWA pool ack and the whole-request ack. The hit verdict reaches the
-        # queue through the scheduler's agreement step, so run it each pass.
+        # Publish the hit and dispatch the read, then let the worker finish on
+        # its own: the agreed completion is published only by the scheduler's
+        # agreement step, which this test withholds until after the abort.
         deadline = time.time() + 10.0
         while time.time() < deadline:
-            cons.storage_engine.tick(cc.prefetch_hit_queue.put)
-            cons._drain_storage_control_queues_impl(
-                n_storage_hit=min(1, cc.prefetch_hit_queue.qsize()),
-                n_ack_prefetch=min(1, cc.ack_prefetch_queue.qsize()),
-                n_backup=0,
-                n_release=0,
-                extra_release_counts=None,
-                log_metrics=True,
-            )
-            if op.pool_transfers_done:
+            if op.host_indices is None:
+                cons._tick_storage_engine()
+                cons._drain_storage_control_queues_impl(
+                    n_storage_hit=min(1, cc.prefetch_hit_queue.qsize()),
+                    n_ack_prefetch=0,
+                    n_backup=0,
+                    n_release=0,
+                    extra_release_counts=None,
+                    log_metrics=True,
+                )
+            elif op.local_transfer_progress().finished:
                 break
             time.sleep(0.01)
         else:
-            self.fail("prefetch IO did not complete (pool_transfers_done) in time")
+            self.fail("prefetch IO did not complete in time")
 
         self.assertIsNotNone(op.host_indices)
-        self.assertTrue(op.pool_transfers_done)
+        self.assertFalse(op.pool_transfers_done)
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
         self.assertEqual(swa_release_q.qsize(), 0)
 
         cons.finish(req_id, CacheRequestOutcome.ABORT)
 
-        self.assertTrue(op.pool_transfers_done)
-        self.assertGreater(swa_release_q.qsize(), 0)
-        self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
+        # The abort retires the request; the rows are released only by the
+        # agreed completion, which says every rank's worker is done with them.
         self.assertNotIn(req_id, cons.ongoing_prefetch)
         self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
         self.assertEqual(cc.prefetch_tokens_occupied, occupied_before)
+        self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
+        self.assertEqual(swa_release_q.qsize(), 0)
+
+        cons.drain_storage_control_queues()  # Publishes and drains the agreed ack.
+        self.assertFalse(op.pool_transfers_done)  # retired before the ack
+        self.assertGreater(swa_release_q.qsize(), 0)
+        self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
 
         cons.drain_storage_control_queues()  # Drain release queue.
         self.assertEqual(
