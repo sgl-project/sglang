@@ -11,7 +11,7 @@ tag: NEW
 <Accordion title="Install SGLang">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-muse-spark-open     # NVIDIA B300 / GB300 / B200 / H200
+docker pull lmsysorg/sglang:latest                # NVIDIA B300 / GB300 / B200 / H200
 docker pull lmsysorg/sglang-rocm:muse-spark-open    # AMD MI355X
 docker pull lmsysorg/sglang:dev-muse-spark-xeon     # Intel Xeon CPU
 ```
@@ -20,7 +20,9 @@ The deployment panel can render a complete `docker run` command for the selected
 
 </Accordion>
 
-Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps the existing deployment settings; **High Throughput** removes all speculative decoding parameters. Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+Choose your **Hardware Platform**, **Strategy**, and **Quantization** below. The default is **B300 / Low Latency / NVFP4**. **Low Latency** keeps unified memory disabled; **High Throughput** removes all speculative decoding parameters and enables unified memory on NVIDIA GPUs (B300, GB300, B200, and H200). Use the Playground to tune parallelism, caching, speculative decoding, multimodal transport, and prefill/decode disaggregation.
+
+With a current SGLang build, the commands omit settings inferred from the checkpoint and GPU. Muse Spark NVFP4 selects `modelopt_fp4`, with `flashinfer_trtllm` MoE on B200/B300/GB300 or `marlin` on H200. The default static memory fraction is `0.8` on Blackwell and `0.85` on Hopper; recipes with a different budget keep an explicit override. LayerNorm-SP enables MegaMoE automatically for NVFP4 on data-center Blackwell when EP equals TP and is greater than 1, except on PD decode workers. Use `--no-enable-megamoe-for-layernorm-sp` to opt out. Muse Spark DFlash2 drafts default to FA4 on these NVIDIA platforms and eight draft tokens. Explicit settings take precedence.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
@@ -30,6 +32,8 @@ import { config } from "/src/snippets/configs/meta-models/muse-spark.jsx";
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+The **Unified Memory** control has **Enable** and **Disable** options. It initially inherits the current Deployment command and resets to that command when you change the Deployment selection. **Enable** is unavailable on MI355X and Xeon because their `aiter` and `intel_amx` attention backends do not support the unified KV layout.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 

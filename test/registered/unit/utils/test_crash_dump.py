@@ -19,6 +19,8 @@ maybe_stub_sgl_kernel()
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
+from sglang.srt.runtime_context import create_context, use_context  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -117,6 +119,29 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
             self.assertEqual(
                 running[1:], ({"text": " par", "output_ids": [7]}, 1001.0, 1002.0)
             )
+
+    def test_server_args_key_redacted_with_watermarking_off(self):
+        # The Python API accepts a server key without --enable-watermark, and
+        # validation then skips it.
+        secret = "abcdef0123456789"
+        server_args = ServerArgs(model_path="dummy", watermark_key=secret)
+        context = create_context(server_args, role="test")
+        self.assertFalse(context.config_bag("exec").features.enable_watermark)
+        tm = SimpleNamespace(server_args=server_args)
+        with use_context(context):
+            dumped = pickle.dumps(TokenizerManager._server_args_for_dump(tm))
+        self.assertNotIn(secret.encode(), dumped)
+        self.assertIn(b"<redacted>", dumped)
+
+    def test_server_args_snapshot_failure_keeps_the_dump(self):
+        # Before the redaction, a watermarking-off dump pickled ServerArgs
+        # without snapshotting it; a snapshot failure must not cost the dump.
+        class Unresolvable:
+            def resolved_dict(self):
+                raise RuntimeError("boom")
+
+        tm = SimpleNamespace(server_args=Unresolvable())
+        self.assertIsNone(TokenizerManager._server_args_for_dump(tm))
 
 
 if __name__ == "__main__":

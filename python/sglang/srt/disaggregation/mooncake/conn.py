@@ -176,6 +176,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dst_aux_item_lens: Optional[List[int]] = None
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
@@ -187,6 +188,11 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
+            dst_aux_item_lens=(
+                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
+                if len(msg) > 20
+                else None
+            ),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
@@ -1791,6 +1797,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
+        dst_aux_item_lens: Optional[List[int]],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
@@ -1801,12 +1808,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         transfer_blocks = []
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if dst_aux_item_lens is None:
+            dst_aux_item_lens = prefill_aux_item_lens
 
         # Stop at the shorter list; see check_peer_aux_buffer_count.
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_aux_item_lens[i] * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -2617,6 +2626,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        try:
+                            self.validate_aux_buffers(
+                                target_rank_registration_info.dst_aux_ptrs,
+                                target_rank_registration_info.dst_aux_item_lens,
+                            )
+                        except ValueError as exc:
+                            self.conclude_failure(
+                                bootstrap_room=kv_chunk.room, failure_reason=str(exc)
+                            )
+                            break
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2807,6 +2826,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
+                                target_rank_registration_info.dst_aux_item_lens,
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
@@ -3261,7 +3281,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
-        return [
+        message = [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -3286,6 +3306,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
         ]
+        if self.customized_info_enabled:
+            message.append(
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+            )
+        return message
 
     def build_receiver_metadata_message(
         self,
