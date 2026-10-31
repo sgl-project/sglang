@@ -1381,6 +1381,7 @@ class ModelRunner:
         load_kv_cache_scales(
             model=self.model,
             kv_cache_dtype=get_model().kv_cache_dtype,
+            device=self.device,
         )
 
         self.sliding_window_size = resolve_sliding_window_size(

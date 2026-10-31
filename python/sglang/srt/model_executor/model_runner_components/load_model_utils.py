@@ -27,6 +27,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -116,7 +117,25 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
+def _kv_cache_scales_to_tensors(model, device: str) -> None:
+    """The models' ``load_kv_cache_scales`` assign float scales, while attention
+    backends read a device tensor plus its host copy, the way
+    ``BaseKVCacheMethod`` stores checkpoint scales."""
+    for module in model.modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        for name in ("k_scale", "v_scale"):
+            scale = getattr(module, name)
+            if isinstance(scale, float):
+                setattr(module, f"{name}_float", scale)
+                setattr(
+                    module,
+                    name,
+                    torch.tensor(scale, dtype=torch.float32, device=device),
+                )
+
+
+def load_kv_cache_scales(*, model, kv_cache_dtype: str, device: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
@@ -124,6 +143,7 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(get_model().quantization_param_path)
+                _kv_cache_scales_to_tensors(model, device)
                 logger.info(
                     "Loaded KV cache scaling factors from %s",
                     get_model().quantization_param_path,
