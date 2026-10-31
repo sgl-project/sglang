@@ -928,7 +928,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--log-schedule-decisions`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log the outcome of every prefill pass that evaluates the waiting queue: picked vs left in queue, running and preempted counts, KV free/evictable tokens, and the picked rids. Passes that return early (e.g. running batch full, no free request slots) are not logged. Verbose, so off by default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log the outcome of every prefill pass that evaluates the waiting queue: picked vs left in queue, running and preempted counts, KV free/evictable tokens, and the picked rids (first 16). Logged on attention TP/CP rank 0 only. Passes that return early (e.g. running batch full, no free request slots) are not logged, and a pass that picks nothing is logged only when its counters differ from the previous empty pass. Verbose, so off by default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
