@@ -334,6 +334,32 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     assert worker._selector_sample is None
 
 
+def test_draft_sampler_is_staged_only_for_batches_its_buffers_hold():
+    """A decode batch past the largest captured bucket runs the draft eager; staging
+    it into the folded sampler's static buffers raised a size mismatch."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    sampler = worker_mod._SelectorDraftSampler(
+        draft_model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=2)),
+        block_size=8,
+        max_bs=4,
+        device="cpu",
+        sampling_enabled=True,
+    )
+    worker = SimpleNamespace(_draft_sampler=sampler)
+    for bs, temperature in ((4, 0.7), (5, 0.3)):
+        sampling_info = SimpleNamespace(
+            temperatures=torch.full((bs, 1), temperature),
+            top_ks=torch.full((bs, 1), 8),
+            is_all_greedy=False,
+        )
+        worker_mod.DFlashWorkerV2._stage_draft_sampler(
+            worker, bs=bs, sampling_info=sampling_info
+        )
+    torch.testing.assert_close(sampler.temperatures, torch.full((4,), 0.7))
+    assert sampler.greedy_mask.tolist() == [False] * 4
+
+
 def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
