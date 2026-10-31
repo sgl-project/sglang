@@ -22,6 +22,7 @@ from torch.distributed import P2POp
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
+from sglang.srt.eplb.communication import get_eplb_group
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -195,6 +196,7 @@ def update_expert_weights_single_layer(
     debug: bool = False,
     log_metrics: bool = False,
 ):
+    group = get_eplb_group()
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights
@@ -356,6 +358,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -406,6 +409,7 @@ def update_expert_weights_single_layer(
                             routed_experts_weights, i, src_expert_location
                         ),
                         peer=dst_rank,
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
