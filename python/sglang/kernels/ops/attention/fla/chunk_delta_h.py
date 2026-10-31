@@ -375,6 +375,7 @@ def chunk_gated_delta_rule_fwd_h(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    h: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
@@ -405,7 +406,12 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    # A caller's buffer for the per-chunk states, e.g. this run's chunks of a
+    # longer scan's states.
+    if h is None:
+        h = k.new_empty(B, NT, H, V, K)
+    else:
+        assert h.shape == (B, NT, H, V, K) and h.dtype == k.dtype and h.is_contiguous()
 
     v_new = torch.empty_like(u) if save_new_value else None
 
