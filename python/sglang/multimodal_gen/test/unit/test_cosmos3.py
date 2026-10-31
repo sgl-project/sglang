@@ -34,6 +34,7 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
@@ -47,6 +48,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    Qwen3VLTextRotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -104,6 +108,63 @@ def _cosmos3_server_args(config=None, batching_max_size=1):
         batching_max_size=batching_max_size,
         pipeline_config=config or Cosmos3Config(),
     )
+
+
+class _RopeOnlyTransformer(torch.nn.Module):
+    _maybe_install_step_mixed_precision = (
+        Cosmos3OmniTransformer._maybe_install_step_mixed_precision
+    )
+
+    def __init__(self, device, meta_rope, rope_theta, head_dim):
+        super().__init__()
+        self.rope_theta = rope_theta
+        self.hf_config = {}
+        self.modelopt_fp8_checkpoint = False
+        self.language_model = torch.nn.Module()
+        with torch.device("meta" if meta_rope else "cpu"):
+            self.language_model.rotary_emb = Qwen3VLTextRotaryEmbedding(
+                head_dim=head_dim, rope_theta=rope_theta
+            )
+        self.language_model.embed_tokens = torch.nn.Embedding(
+            num_embeddings=2, embedding_dim=2, device=device
+        )
+        self.time_embedder = torch.nn.Linear(
+            in_features=2, out_features=2, device=device
+        )
+        self.proj_in = torch.nn.Linear(in_features=2, out_features=2, device=device)
+        self.proj_out = torch.nn.Linear(in_features=2, out_features=2, device=device)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available(), "requires CUDA/ROCm for CPU/GPU RoPE parity"
+)
+class TestCosmos3RopePlacement(CustomTestCase):
+    def test_rope_table_does_not_depend_on_dit_placement(self):
+        """A CPU-offloaded DiT must build the RoPE table a resident one builds."""
+        rope_theta, head_dim = 100_000_000, 128
+        exponents = torch.arange(
+            start=0,
+            end=head_dim,
+            step=2,
+            dtype=torch.float32,
+            device=get_local_torch_device(),
+        )
+        reference = (1.0 / (rope_theta ** (exponents / head_dim))).cpu()
+        for device in ("cpu", "cuda"):
+            for meta_rope in (True, False):
+                with self.subTest(device=device, meta_rope=meta_rope):
+                    model = _RopeOnlyTransformer(
+                        device=device,
+                        meta_rope=meta_rope,
+                        rope_theta=rope_theta,
+                        head_dim=head_dim,
+                    )
+                    Cosmos3OmniTransformer.post_load_weights(model)
+                    rotary_emb = model.language_model.rotary_emb
+                    self.assertEqual(rotary_emb.inv_freq.device.type, device)
+                    self.assertEqual(rotary_emb.inv_freq.dtype, torch.float32)
+                    self.assertTrue(torch.equal(rotary_emb.inv_freq.cpu(), reference))
+                    self.assertNotIn("inv_freq", rotary_emb.state_dict())
 
 
 class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
