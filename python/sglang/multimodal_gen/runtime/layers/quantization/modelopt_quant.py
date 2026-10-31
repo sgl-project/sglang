@@ -901,7 +901,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 )
             output_dtype = x.dtype
             input_shape = x.shape
-            x = x.view(-1, input_shape[-1])
+            x = x.reshape(-1, input_shape[-1])
             output_shape = list(input_shape[:-1]) + [output_size]
 
             fp4_quantize = _get_fp4_quantize_op()
