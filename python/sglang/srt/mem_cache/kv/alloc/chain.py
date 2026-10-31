@@ -43,6 +43,8 @@ from sglang.srt.mem_cache.kv.alloc.interim import (
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
+    TakePlan,
+    move_order,
     no_relief_plan,
     snapshot_chain,
 )
@@ -856,6 +858,66 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         for window in self._windows:
             window.alloc_with_virtual(bind)
         return out
+
+    def realize(self, plan: TakePlan) -> Dict[str, torch.Tensor]:
+        """Lay the chain out as ``plan``, made from its current snapshot, says
+        and take the planned pages: the listed ends compact, the floats move
+        into their target blocks in an order where none is copied into a block
+        another still holds, then every band takes its pages in chain order.
+        Returns each demanded band's physical pages. A plan of the current
+        snapshot always realizes; a refusal is an internal error."""
+        bands = {band.sub_pool_name: band for band in self.bands}
+        for name in plan.flush:
+            band = bands[name]
+            band.flush_for_allocation()
+            low_byte = band._byte_low_frontier()
+            high_byte = band._byte_high_frontier()
+            live = band.live_page_count if band.lazy_compaction else None
+            if live is not None:
+                e = band.entry_bytes_per_page
+                packed = (
+                    (band.min_page_index * e, (band.min_page_index + live) * e)
+                    if band.grow_direction == "up"
+                    else ((band.num_pages - live) * e, band.num_pages * e)
+                )
+                if (low_byte, high_byte) != packed:
+                    raise RuntimeError(
+                        f"{name}: an urgent flush left {(low_byte, high_byte)}, "
+                        f"the plan needs {packed}"
+                    )
+        blocks = {
+            name: (
+                first * bands[name].entry_bytes_per_page,
+                end * bands[name].entry_bytes_per_page,
+            )
+            for name, (first, end) in plan.targets.items()
+        }
+        spans = {
+            name: (bands[name]._byte_low_frontier(), bands[name]._byte_high_frontier())
+            for name in plan.targets
+        }
+        for name in move_order(spans, blocks):
+            bands[name].relocate_into(*plan.targets[name])
+        taken = {}
+        for band in self.bands:
+            take = plan.takes.get(band.sub_pool_name)
+            if take is None:
+                continue
+            extended = 0 if take.pages is None else take.pages[1] - take.pages[0]
+            pages = take.reuse + extended
+            if not pages:
+                continue
+            if band.grow_direction == "float":
+                physical = band.take_physical_pages(pages, placement=take.pages)
+            else:
+                physical = band.take_physical_pages(pages)
+            if physical is None:
+                raise RuntimeError(
+                    f"{band.sub_pool_name}: the planned take of {pages} pages "
+                    "was refused"
+                )
+            taken[band.sub_pool_name] = physical
+        return taken
 
     def _reserve_token_pages(self, owner_pages, swa_tokens):
         bands = (self.full_attn_allocator, *self._windows)
