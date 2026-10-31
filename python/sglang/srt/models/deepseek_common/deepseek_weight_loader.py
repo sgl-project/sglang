@@ -250,6 +250,31 @@ class NextNEnabledConfig:
     nextn_layer_prefix: str
     nextn_spec_weight_names: List[str]
 
+    @classmethod
+    def from_config(cls, config):
+        if not hasattr(config, "num_nextn_predict_layers"):
+            raise ValueError("num_nextn_predict_layers is not in the config")
+
+        num_nextn_layers = config.num_nextn_predict_layers
+        assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+
+        # compatible with old design
+        nextn_layer_id = (
+            0 if config.num_hidden_layers == 1 else config.num_hidden_layers
+        )
+
+        return cls(
+            num_nextn_layers=num_nextn_layers,
+            nextn_layer_id=nextn_layer_id,
+            nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
+            nextn_spec_weight_names=[
+                "shared_head.norm",
+                "eh_proj",
+                "enorm",
+                "hnorm",
+            ],
+        )
+
 
 @dataclass(frozen=True)
 class NextNDisabledConfig:
@@ -606,28 +631,7 @@ class DeepseekV2WeightLoaderMixin:
         if not is_nextn:
             return NextNDisabledConfig()
 
-        if not hasattr(self.config, "num_nextn_predict_layers"):
-            raise ValueError("num_nextn_predict_layers is not in the config")
-
-        num_nextn_layers = self.config.num_nextn_predict_layers
-        assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-
-        # compatible with old design
-        nextn_layer_id = (
-            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
-        )
-
-        return NextNEnabledConfig(
-            num_nextn_layers=num_nextn_layers,
-            nextn_layer_id=nextn_layer_id,
-            nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
-            nextn_spec_weight_names=[
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ],
-        )
+        return NextNEnabledConfig.from_config(self.config)
 
     def post_load_weights(
         self,
