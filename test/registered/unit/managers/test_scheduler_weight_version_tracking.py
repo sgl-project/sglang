@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -156,6 +157,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
+        scheduler.running_reqs = RunningReqs()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
             device="cpu",
