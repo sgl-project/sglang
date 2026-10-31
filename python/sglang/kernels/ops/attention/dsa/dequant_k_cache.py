@@ -546,18 +546,21 @@ def gather_cast_kv_fp8_pad_paged(
     page_table_1_flattened: torch.Tensor,
     nope_dim: int,
 ) -> torch.Tensor:
-    """Q8KV8 prefix KV prep for a bf16 MLA pool: gather rows [latent | rope] by
+    """Q8KV8 prefix KV prep for a bf16 or raw NoPE fp8 MLA pool: gather rows by
     token slot, store-cast them into the fp8 buffer, and zero the trailing
     -1-sentinel landing-pad rows.
 
     ``out``: [num_tokens + pad_rows, head_dim] fp8, contents arbitrary;
-    ``kv_cache``: [slots, 1, head_dim] bf16;
+    ``kv_cache``: [slots, 1, head_dim] bf16, or raw fp8 with head_dim=nope_dim=512;
     ``page_table_1_flattened``: [num_tokens] int32 slot ids.
     """
     head_dim = out.shape[-1]
     num_tokens = page_table_1_flattened.shape[0]
     assert out.dtype == torch.float8_e4m3fn and out.is_contiguous()
-    assert kv_cache.dtype == torch.bfloat16 and kv_cache.shape[-1] == head_dim
+    assert kv_cache.shape[-1] == head_dim
+    assert kv_cache.dtype == torch.bfloat16 or (
+        kv_cache.dtype == torch.float8_e4m3fn and head_dim == nope_dim == 512
+    ), "Q8 prefix gather requires bf16 KV or raw 512-dim NoPE fp8 KV"
     # The gather addresses the source as loc * stride(0) + arange(0, nope_dim),
     # so only stride(0) is passed; a non-unit last-dim stride would silently read
     # the wrong elements. concat_cast_kv_fp8_pad asserts the same invariant.

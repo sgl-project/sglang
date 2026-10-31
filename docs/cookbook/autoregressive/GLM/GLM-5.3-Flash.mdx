@@ -185,9 +185,19 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination, and TRT-LLM DSA is not the MI355X backend.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together. On CUDA, TileLang FP8 KV uses raw rows rather than the scaled layout of `flashmla_kv`: use TileLang for both backends, or the Hopper Q8 prefill pairing below. TRT-LLM DSA is not the MI355X backend.
 
-On Hopper, BF16 KV can also run the sparse prefill in FP8 with `--dsa-prefill-backend flashmla_sparse_q8` (decode stays on `tilelang` and the cache stays BF16): on H200 this pairing measured 5.8–12.1% higher throughput on prefill-only requests, with GSM8K accuracy within noise of BF16 + TileLang. It is SM90-only and requires a build that includes [PR #41790](https://github.com/sgl-project/sglang/pull/41790); FP8 KV is not available with it for this model.
+On Hopper, BF16 KV can also run the sparse prefill in FP8 with `--dsa-prefill-backend flashmla_sparse_q8` (decode stays on `tilelang` and the cache stays BF16): on H200 this pairing measured 5.8–12.1% higher throughput on prefill-only requests, with GSM8K accuracy within noise of BF16 + TileLang. It is SM90-only and requires a build that includes [PR #41790](https://github.com/sgl-project/sglang/pull/41790).
+
+With the raw FP8 KV support in [PR #42957](https://github.com/sgl-project/sglang/pull/42957) and [PR #44217](https://github.com/sgl-project/sglang/pull/44217), you can also pair Q8 prefill with `--kv-cache-dtype fp8_e4m3` and TileLang decode on CUDA H100/H200 (SM90). This path requires NoPE MLA (`qk_rope_head_dim=0`, `kv_lora_rank=512`) and gathers only the requested prefix rows from the raw FP8 pool. It does not use the scaled/packed FP8 layout. HiSparse, mixed chunks, and `--dcp-size > 1` are not supported with this pairing. The BF16 benchmark results above do not measure this FP8 KV configuration.
+
+```bash
+sglang serve --model-path zai-org/GLM-5.3-Flash \
+  --tp-size 4 --ep-size 4 \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend flashmla_sparse_q8 \
+  --dsa-decode-backend tilelang
+```
 
 ### Extend the cache hierarchy
 

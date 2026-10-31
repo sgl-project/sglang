@@ -289,7 +289,9 @@ class TestTritonSparseMLARegistration(CustomTestCase):
                 patch.object(
                     overrides,
                     "model_config_of",
-                    return_value=SimpleNamespace(hf_config=hf_config),
+                    return_value=SimpleNamespace(
+                        hf_config=hf_config, kv_lora_rank=512, qk_rope_head_dim=64
+                    ),
                 ),
                 patch.object(overrides, "get_platform", return_value=platform),
                 patch(
