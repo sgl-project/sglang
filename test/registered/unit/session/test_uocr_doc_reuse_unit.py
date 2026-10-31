@@ -472,7 +472,6 @@ class TestDroppedRequest(CustomTestCase):
             holder=_FakeHolder(allocated=8),
             input_ids=[1],
             output_ids=[],
-            text_ok=True,
         )
         req = self._req(pending=torch.arange(3))
         req.uocr_doc.source = entry
@@ -491,7 +490,7 @@ class TestDroppedRequest(CustomTestCase):
         mine, other = _FakeHolder(allocated=8), _FakeHolder(allocated=8)
         for doc_id, holder in (("mine", mine), ("other", other)):
             cache.reuse.docs[doc_id] = r.DocEntry(
-                holder=holder, input_ids=[1], output_ids=[], text_ok=True
+                holder=holder, input_ids=[1], output_ids=[]
             )
         cache.reuse.release_doc("mine")
         cache.reuse.release_doc("mine")
@@ -527,7 +526,6 @@ class TestMemoryPressure(CustomTestCase):
             holder=_FakeHolder(allocated=tokens),
             input_ids=[1],
             output_ids=[],
-            text_ok=True,
         )
 
     def test_frees_oldest_windows_until_request_fits(self):
@@ -632,7 +630,6 @@ class TestDecodePressure(CustomTestCase):
                 holder=_FakeHolder(allocated=64),
                 input_ids=[1],
                 output_ids=[],
-                text_ok=True,
             )
         # Fits once two windows are gone.
         batch = SimpleNamespace(check_decode_mem=lambda: len(cache.freed_rows) >= 2)
@@ -645,7 +642,6 @@ class TestDecodePressure(CustomTestCase):
             holder=_FakeHolder(allocated=64),
             input_ids=[1],
             output_ids=[],
-            text_ok=True,
         )
         cache.reuse.free_for_decode(SimpleNamespace(check_decode_mem=lambda: True))
         self.assertEqual(list(cache.reuse.docs), ["doc0"])
@@ -660,7 +656,6 @@ class TestRequestRowPressure(CustomTestCase):
                 holder=_FakeHolder(allocated=64),
                 input_ids=[1],
                 output_ids=[],
-                text_ok=True,
             )
 
     def _window(self, doc_id, reuse=True):
@@ -728,7 +723,6 @@ class TestDeferNewDocument(CustomTestCase):
             holder=_FakeHolder(allocated=tokens),
             input_ids=[1],
             output_ids=[],
-            text_ok=True,
         )
 
     def test_new_document_waits_for_expected_follow_ups(self):
@@ -814,7 +808,6 @@ class TestTailOnlyRetention(CustomTestCase):
             holder=_FakeHolder(allocated=n),
             input_ids=list(self.PROMPT),
             output_ids=list(self.OUTPUT),
-            text_ok=True,
         )
         cache.reuse._backend = _backend_stub()
         cache.reuse._trim_to_tails(entry)
@@ -1281,7 +1274,6 @@ class TestPrefixHandOff(CustomTestCase):
             holder=holder,
             input_ids=list(self.OLD),
             output_ids=list(self.OUT),
-            text_ok=True,
             next_page=2,
         )
         req = self._follow_up()
@@ -1452,7 +1444,6 @@ class TestRetractedRewrittenWindow(CustomTestCase):
             holder=_FakeHolder(allocated=len(self.OLD) + len(self.OUT)),
             input_ids=list(self.OLD),
             output_ids=list(self.OUT),
-            text_ok=True,
             next_page=2,
         )
         req, items = self._window()
@@ -1488,7 +1479,7 @@ class TestFlushReset(CustomTestCase):
         afterwards would return slots and a row the pools already reissued."""
         cache = _FakeCache(backend=_backend_stub())
         cache.reuse.docs["doc"] = r.DocEntry(
-            holder=_FakeHolder(allocated=64), input_ids=[1], output_ids=[], text_ok=True
+            holder=_FakeHolder(allocated=64), input_ids=[1], output_ids=[]
         )
         cache.reuse._input_overrides[3] = PAGE
         cache.reuse._enqueue("w", lambda be: be.moves.append("stale"))

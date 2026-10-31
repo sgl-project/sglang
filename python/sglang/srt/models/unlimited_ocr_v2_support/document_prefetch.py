@@ -207,20 +207,16 @@ class DocPrefetch:
         if not envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get():
             return False
         self._parked[after] = req
-        self._maybe_encode_ahead(req)
-        return True
-
-    def _maybe_encode_ahead(self, req: Req) -> None:
         mm = req.multimodal_inputs
-        if not self._encode_ahead or mm is None or not mm.mm_items:
-            return
-        self._early.encode_ahead(
-            rid=req.rid,
-            items=mm.mm_items,
-            device=self._device,
-            forward_stream=self._forward_stream,
-            max_bytes=envs.SGLANG_UOCR_DOC_PREFETCH_MAX_MB.get() * 1024 * 1024,
-        )
+        if self._encode_ahead and mm is not None and mm.mm_items:
+            self._early.encode_ahead(
+                rid=req.rid,
+                items=mm.mm_items,
+                device=self._device,
+                forward_stream=self._forward_stream,
+                max_bytes=envs.SGLANG_UOCR_DOC_PREFETCH_MAX_MB.get() * 1024 * 1024,
+            )
+        return True
 
     def on_window_finished(self, req: Req) -> None:
         """Mark the follow-up of a finished ``req`` released, budget capped.

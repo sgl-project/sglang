@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import deque
+from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -432,7 +433,6 @@ class DocEntry(msgspec.Struct):
     holder: Any  # RetainedWindow owning the finished window's KV row
     input_ids: List[int]
     output_ids: List[int]
-    text_ok: bool
     # Document page the next window must start at: with no page in common, the
     # only proof that the copied tail is the page before it.
     next_page: int = 0
@@ -690,19 +690,6 @@ def _restore_prompt(req) -> None:
     req.full_untruncated_fill_ids = saved.fill_ids
 
 
-def _reuse_text_tail(
-    req, entry: DocEntry, page_id: int
-) -> Optional[Tuple[int, List[int]]]:
-    """The source window's text tail, or None if it is unusable or too long."""
-    if not entry.text_ok:
-        return None
-    text = text_tail(entry.output_ids, TAIL_TOKENS, page_id)
-    max_new = req.sampling_params.max_new_tokens
-    if text is not None and len(text[1]) + 2 >= (max_new or 0):
-        return None
-    return text
-
-
 def _mark_rewritten(req, *, alloc: torch.Tensor, page_base: int) -> None:
     """Record the per-request state a rewritten tail-copy prompt runs with."""
     st = req_state(req)
@@ -820,8 +807,8 @@ class DocReuse:
         """KV slots of a matched follow-up's prefix, or None if it has none."""
         return prefix_device_indices(req)
 
-    def _entries(self) -> List[DocEntry]:
-        return list(self.docs.values()) + list(self.sources.values())
+    def _entries(self):
+        return chain(self.docs.values(), self.sources.values())
 
     def held_slots(self) -> List[Any]:
         """Holder slots whose KV rows are owned by document reuse (for accounting)."""
@@ -1087,7 +1074,6 @@ class DocReuse:
 
     def _retain_finished(self, req) -> bool:
         from sglang.srt.managers.schedule_batch import (
-            FINISH_ABORT,
             FINISH_MATCHED_STR,
             FINISH_MATCHED_TOKEN,
         )
@@ -1111,7 +1097,6 @@ class DocReuse:
             not cp.get(KEY_KEEP)
             or not req.finished()
             or not text_ok
-            or isinstance(req.finished_reason, FINISH_ABORT)
             or not req.kv.holds_kv
             or self._backend is None
         ):
@@ -1169,7 +1154,6 @@ class DocReuse:
             holder=holder,
             input_ids=list(req.origin_input_ids),
             output_ids=out,
-            text_ok=text_ok,
             next_page=next_page,
             lookahead=lookahead,
         )
@@ -1191,7 +1175,7 @@ class DocReuse:
         kept = tail_ranges(
             entry.input_ids,
             entry.output_ids,
-            entry.text_ok,
+            True,
             self._backend.page_state.page_token_id,
             self._backend.page_state.image_token_id,
             self._cache.page_size,
@@ -1298,8 +1282,10 @@ class DocReuse:
             )
             return None
 
-        text = _reuse_text_tail(req, entry, page_id)
-        if text is None:
+        text = text_tail(entry.output_ids, TAIL_TOKENS, page_id)
+        if text is None or len(text[1]) + 2 >= (
+            req.sampling_params.max_new_tokens or 0
+        ):
             # Only the spliced marker makes decode skip the context page the
             # rewritten prompt carries, so without text there is nothing to reuse.
             logger.info(

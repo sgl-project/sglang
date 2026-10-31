@@ -195,10 +195,22 @@ def _estimate_window_capacity(request, plan, bi, *, context_length, image_mode) 
     return capacity if cap is None else min(capacity, cap)
 
 
-def _split_child_request(request, *, lo, hi, max_tokens):
-    """Deep copy of ``request`` over pages ``[lo, hi)`` with its own token limit."""
+def _window_request(
+    request,
+    *,
+    hf_config,
+    plan,
+    bi,
+    max_tokens,
+    doc_reuse_id,
+    after=None,
+    remaining=None,
+):
+    """owned child request with page guard, reuse and optional predecessor metadata"""
+    lo, hi, emit_from = plan[bi]
+    lookahead = _window_lookahead(request, plan, bi)
     sub = request.model_copy(deep=True)
-    sub.messages = doc_split.split_messages(sub.messages, lo, hi)
+    sub.messages = doc_split.split_messages(sub.messages, lo, hi + lookahead)
     # Whether the scheduler reused the previous window's KV only shows up in
     # meta_info; the parent's own flag is restored before it responds.
     sub.return_meta_info = True
@@ -208,14 +220,6 @@ def _split_child_request(request, *, lo, hi, max_tokens):
     else:
         sub.max_tokens = max_tokens
         sub.max_completion_tokens = None
-    return sub
-
-
-def _window_request(request, *, hf_config, plan, bi, max_tokens, doc_reuse_id):
-    """Child request for window ``bi`` of ``plan``, reuse params attached."""
-    lo, hi, emit_from = plan[bi]
-    lookahead = _window_lookahead(request, plan, bi)
-    sub = _split_child_request(request, lo=lo, hi=hi + lookahead, max_tokens=max_tokens)
     # Every split window, reused or recomputed, numbers RoPE pages globally.
     sub.custom_params = {
         **(sub.custom_params or {}),
@@ -233,13 +237,22 @@ def _window_request(request, *, hf_config, plan, bi, max_tokens, doc_reuse_id):
     if doc_reuse_id is not None:
         # Keep this window's last page so the next one can splice its KV tail
         # instead of recomputing it.
-        sub.custom_params = {
-            **(sub.custom_params or {}),
-            uocr_doc_reuse.KEY_DOC_ID: doc_reuse_id,
-            uocr_doc_reuse.KEY_KEEP: bi < len(plan) - 1,
-            uocr_doc_reuse.KEY_REUSE: bi > 0,
-            uocr_doc_reuse.KEY_OVERLAP: emit_from - lo,
-        }
+        sub.custom_params.update(
+            {
+                uocr_doc_reuse.KEY_DOC_ID: doc_reuse_id,
+                uocr_doc_reuse.KEY_KEEP: bi < len(plan) - 1,
+                uocr_doc_reuse.KEY_REUSE: bi > 0,
+                uocr_doc_reuse.KEY_OVERLAP: emit_from - lo,
+            }
+        )
+    sub.rid = f"{doc_reuse_id or 'uocr-doc'}-w{bi}-{uuid.uuid4().hex[:8]}"
+    if after is not None:
+        sub.custom_params.update(
+            {
+                uocr_doc_prefetch.KEY_AFTER: after,
+                uocr_doc_prefetch.KEY_BUDGET: remaining,
+            }
+        )
     return sub
 
 
@@ -895,9 +908,6 @@ class ChatDocSplitter:
                         max_tokens=max_tokens,
                         doc_reuse_id=doc_reuse_id,
                     )
-                    sub.rid = (
-                        f"{doc_reuse_id or 'uocr-doc'}-w{bi}-{uuid.uuid4().hex[:8]}"
-                    )
                     sub_rid = sub.rid
                     task = asyncio.ensure_future(self._handle_window(sub, raw_request))
                 # 2. send the successor before awaiting this window's response
@@ -986,13 +996,9 @@ class ChatDocSplitter:
             bi=bi,
             max_tokens=min(remaining, max(capacity, 1)),
             doc_reuse_id=doc_reuse_id,
+            after=after,
+            remaining=remaining,
         )
-        sub.rid = f"{doc_reuse_id}-w{bi}-{uuid.uuid4().hex[:8]}"
-        sub.custom_params = {
-            **(sub.custom_params or {}),
-            uocr_doc_prefetch.KEY_AFTER: after,
-            uocr_doc_prefetch.KEY_BUDGET: remaining,
-        }
         task = asyncio.ensure_future(self._handle_window(sub, raw_request))
         return task, sub.rid
 
@@ -1168,17 +1174,12 @@ class ChatDocSplitter:
             bi=bi,
             max_tokens=min(remaining, capacity),
             doc_reuse_id=doc_reuse_id,
+            after=after,
+            remaining=remaining,
         )
         # Reuse shows up in the internal meta_info, which every chunk
         # carries; return_meta_info is rejected on streams.
         sub.stream, sub.return_meta_info, sub.stream_options = True, False, None
-        sub.rid = f"{doc_reuse_id or 'uocr-doc'}-w{bi}-{uuid.uuid4().hex[:8]}"
-        if after is not None:
-            sub.custom_params = {
-                **(sub.custom_params or {}),
-                uocr_doc_prefetch.KEY_AFTER: after,
-                uocr_doc_prefetch.KEY_BUDGET: remaining,
-            }
         error = self._serving._validate_request(sub)
         if error:
             raise ValueError(error)
