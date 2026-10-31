@@ -29,13 +29,13 @@ def _reject_unsupported_serving_modes(cfg: Any) -> None:
             "Unlimited-OCR v2 does not support PD disaggregation "
             f"(--disaggregation-mode={cfg.disaggregation_mode})."
         )
-    if not cfg.disable_uocr_doc_split and (cfg.dp_size > 1 or attn_dp_enabled_of(cfg)):
+    if cfg.uocr_doc_split and (cfg.dp_size > 1 or attn_dp_enabled_of(cfg)):
         raise ValueError(
             "Unlimited-OCR v2 document splitting needs a single DP rank "
             f"(got --dp-size={cfg.dp_size}, --attn-dp-size={cfg.attn_dp_size}): "
             "the windows of one document would be routed to different ranks, "
             "and a window parked for its predecessor on another rank is never "
-            "released. Pass --disable-uocr-doc-split to serve with data parallelism."
+            "released. Omit --uocr-doc-split to serve with data parallelism."
         )
 
 

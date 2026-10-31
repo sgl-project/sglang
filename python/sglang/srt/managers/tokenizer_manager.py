@@ -173,7 +173,10 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
-from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    supports_sampling_mask,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
     redact_watermark_secrets,
@@ -1443,6 +1446,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 obj.custom_logit_processor
                 and not get_exec().features.enable_custom_logit_processor
+                and obj.custom_logit_processor != UOCR_PAGE_GUARD_PROCESSOR
             ):
                 raise ValueError(
                     "The server is not configured to enable custom logit processor. "

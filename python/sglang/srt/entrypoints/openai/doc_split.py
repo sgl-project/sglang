@@ -321,16 +321,3 @@ def page_guard_params(
         "page_token_id": int(page_token_id),
         "eos_token_id": int(eos_token_id),
     }
-
-
-# Unknown and absent modes use the conservative gundam limit.
-_LIGHT_IMAGE_MODES = frozenset(_TOKENS_PER_PAGE) - {"gundam"}
-
-
-def page_limit_for_mode(
-    image_mode: Optional[str], gundam_limit: Optional[int], base_limit: Optional[int]
-) -> Optional[int]:
-    """Use the base limit for light modes; otherwise use gundam."""
-    if _normalize_mode(image_mode) in _LIGHT_IMAGE_MODES:
-        return base_limit
-    return gundam_limit

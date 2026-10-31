@@ -67,12 +67,12 @@ class TestUnlimitedOCRV2Server(TestOpenAIMLLMServerBase):
     extra_args = [
         "--revision=5632329a32e103d5f1add270681e0f5c1233c6e4",
         "--chat-template=unlimited-ocr",
-        "--enable-custom-logit-processor",
         "--enable-streaming-session",
         # Small per-page cap and one page per base-mode window, so the
         # three-page document splits into three windows that reuse KV.
         "--uocr-max-page-tokens=512",
-        "--uocr-base-page-window=1",
+        "--uocr-doc-split",
+        "--uocr-doc-page-window=1",
         # Workaround: eager decode degenerates into repeated numbers on this
         # checkpoint; drop once it matches the decode CUDA graph path.
         "--cuda-graph-backend-decode=full",

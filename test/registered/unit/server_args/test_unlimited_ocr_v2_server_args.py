@@ -19,7 +19,7 @@ def _v2_hf_config() -> UnlimitedVLConfig:
     )
 
 
-def _declared_overrides(**fields) -> dict:
+def _declared_overrides(uocr_doc_split=True, **fields) -> dict:
     """What the v2 model override declares for a server launched with ``fields``."""
     declarations = collect_model_override_declarations(
         UNLIMITED_OCR_V2_ARCH,
@@ -34,21 +34,20 @@ def _declared_overrides(**fields) -> dict:
 
 
 class TestDocSplitPageWindows(CustomTestCase):
-    def test_a_non_positive_page_window_is_rejected(self):
-        for flag, field in (
-            ("--uocr-gundam-page-window", "uocr_gundam_page_window"),
-            ("--uocr-base-page-window", "uocr_base_page_window"),
+    def test_invalid_document_limits_are_rejected(self):
+        for field, values, flag in (
+            ("uocr_doc_page_window", (0, -3), "--uocr-doc-page-window"),
+            ("uocr_max_page_tokens", (-1,), "--uocr-max-page-tokens"),
         ):
-            for value in (0, -3):
+            for value in values:
                 with self.subTest(field=field, value=value):
                     server_args = ServerArgs(model_path="dummy", **{field: value})
                     with self.assertRaisesRegex(ValueError, flag):
                         server_args.resolve_once()
 
     def test_a_one_page_window_is_accepted(self):
-        # One page per window: KV reuse carries the previous page as context.
         ServerArgs(
-            model_path="dummy", uocr_gundam_page_window=1, uocr_base_page_window=1
+            model_path="dummy", uocr_doc_split=True, uocr_doc_page_window=1
         ).resolve_once()
 
 
@@ -64,13 +63,13 @@ class TestUnsupportedServingModes(CustomTestCase):
     def test_data_parallelism_is_rejected_while_documents_split(self):
         for fields in ({"dp_size": 2}, {"attn_dp_size": 2, "tp_size": 2}):
             with self.subTest(**fields):
-                with self.assertRaisesRegex(ValueError, "--disable-uocr-doc-split"):
-                    _declared_overrides(**fields)
+                with self.assertRaisesRegex(ValueError, "--uocr-doc-split"):
+                    _declared_overrides(uocr_doc_split=True, **fields)
 
     def test_data_parallelism_is_accepted_without_doc_split(self):
         for fields in ({"dp_size": 2}, {"attn_dp_size": 2, "tp_size": 2}):
             with self.subTest(**fields):
-                _declared_overrides(disable_uocr_doc_split=True, **fields)
+                _declared_overrides(**fields)
 
     def test_speculative_decoding_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "speculative decoding"):

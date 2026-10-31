@@ -30,6 +30,10 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    FALLBACK_CONTEXT_LENGTH,
+    UocrDocumentConfig,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
@@ -479,40 +483,6 @@ def get_unlimited_ocr_v2_sparse_config(config) -> dict:
     return sparse_cfg
 
 
-# Prompt tokens of the costliest gundam page: a marker, the 1024 global view
-# (16 + 1) * 16 + 1, and a 1x16 crop grid (10 + 1) * 160 (configs/unlimited_ocr.py).
-UOCR_V2_MAX_PAGE_PROMPT_TOKENS = 1 + 273 + 1760
-# Prefix, instruction and a reuse window's spliced marker, image and text
-# tails; arbitrary headroom over their ~400 tokens.
-_UOCR_V2_WINDOW_SLACK_TOKENS = 1024
-UOCR_V2_FALLBACK_CONTEXT_LEN = 131072
-
-
-def unlimited_ocr_v2_context_len(
-    *,
-    doc_split: bool,
-    page_window: int,
-    lookahead_pages: int,
-    max_page_tokens: int,
-) -> int:
-    """Default context of an Unlimited-OCR v2 server: its longest window request.
-
-    Retained KV is a window plus a small tail, so the document length never
-    enters. Unsplit, or with no per-page output cap, the window has no bound
-    and the fallback applies. The fallback also caps the estimate: context
-    sizes per-request buffers, and a wider window is rare enough to accept a
-    smaller output budget than ``window * MAX_PAGE_TOKENS``.
-    """
-    if not doc_split or max_page_tokens <= 0:
-        return UOCR_V2_FALLBACK_CONTEXT_LEN
-    needed = (
-        (page_window + lookahead_pages) * UOCR_V2_MAX_PAGE_PROMPT_TOKENS
-        + page_window * max_page_tokens
-        + _UOCR_V2_WINDOW_SLACK_TOKENS
-    )
-    return min(needed, UOCR_V2_FALLBACK_CONTEXT_LEN)
-
-
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
     text_cfg = getattr(config, "text_config", None)
     cfg = (
@@ -658,7 +628,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
-        uocr_v2_default_context_len: int = UOCR_V2_FALLBACK_CONTEXT_LEN,
+        uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -1056,12 +1026,9 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
-            uocr_v2_default_context_len=unlimited_ocr_v2_context_len(
-                doc_split=not cfg.disable_uocr_doc_split,
-                page_window=max(cfg.uocr_gundam_page_window, cfg.uocr_base_page_window),
-                lookahead_pages=cfg.uocr_doc_lookahead_pages,
-                max_page_tokens=cfg.uocr_max_page_tokens,
-            ),
+            uocr_v2_default_context_len=UocrDocumentConfig.from_args(
+                cfg
+            ).default_context_length(),
             **kwargs,
         )
 

@@ -23,7 +23,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "validate_prefill_decode_interval",
         "default_unset_prefill_decode_interval",
         "validate_response_store",
-        "validate_doc_split_page_limits",
+        "validate_uocr_document_config",
         "validate_sampling_mask_max_tokens",
         "handle_aux_hidden_state_capture",
         "validate_prefill_cp_platform",

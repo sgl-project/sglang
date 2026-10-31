@@ -21,6 +21,10 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
 from sglang.srt.configs.unlimited_ocr import merge_mm_processor_kwargs
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    DEFAULT_LOOKAHEAD_PAGES,
+    UocrDocumentConfig,
+)
 from sglang.srt.entrypoints.openai import doc_split
 from sglang.srt.entrypoints.openai.doc_kv_state import DocumentKVState
 from sglang.srt.entrypoints.openai.protocol import (
@@ -33,7 +37,7 @@ from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import should_include_usage
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_mm, get_serving
+from sglang.srt.runtime_context import get_mm, get_serving
 from sglang.srt.session import uocr_doc_prefetch, uocr_doc_reuse
 
 if TYPE_CHECKING:
@@ -139,7 +143,7 @@ def _doc_image_mode(request) -> Optional[str]:
     return None
 
 
-def _window_lookahead(plan, bi) -> int:
+def _window_lookahead(request, plan, bi) -> int:
     """Pages window ``bi`` reads past its own: the next windows' first pages.
 
     The last window has nothing after it. The plan's windows are
@@ -149,7 +153,13 @@ def _window_lookahead(plan, bi) -> int:
         return 0
     _, hi, _ = plan[bi]
     _, last_hi, _ = plan[-1]
-    return max(0, min(get_mm().uocr_doc_lookahead_pages, last_hi - hi))
+    options = request.doc_split_options
+    lookahead = (
+        options.lookahead_pages
+        if options is not None and options.lookahead_pages is not None
+        else DEFAULT_LOOKAHEAD_PAGES
+    )
+    return min(lookahead, last_hi - hi)
 
 
 def _estimate_window_capacity(request, plan, bi, *, context_length, image_mode) -> int:
@@ -164,11 +174,15 @@ def _estimate_window_capacity(request, plan, bi, *, context_length, image_mode) 
     capacity = doc_split.completion_capacity(
         context_length=context_length,
         image_mode=image_mode,
-        input_pages=hi - lo + _window_lookahead(plan, bi),
+        input_pages=hi - lo + _window_lookahead(request, plan, bi),
     )
+    params = dict(request.custom_params or {})
+    options = request.doc_split_options
+    if options is not None and options.max_page_tokens is not None:
+        params["max_page_tokens"] = options.max_page_tokens
     page_tokens = doc_split.effective_max_page_tokens(
         server_max_page_tokens=get_mm().uocr_max_page_tokens,
-        custom_params=request.custom_params,
+        custom_params=params,
     )
     cap = doc_split.window_output_cap(own_pages=hi - lo, max_page_tokens=page_tokens)
     return capacity if cap is None else min(capacity, cap)
@@ -193,7 +207,7 @@ def _split_child_request(request, *, lo, hi, max_tokens):
 def _window_request(request, *, hf_config, plan, bi, max_tokens, doc_reuse_id):
     """Child request for window ``bi`` of ``plan``, reuse params attached."""
     lo, hi, emit_from = plan[bi]
-    lookahead = _window_lookahead(plan, bi)
+    lookahead = _window_lookahead(request, plan, bi)
     sub = _split_child_request(request, lo=lo, hi=hi + lookahead, max_tokens=max_tokens)
     # Every split window, reused or recomputed, numbers RoPE pages globally.
     sub.custom_params = {
@@ -232,7 +246,7 @@ def _apply_page_cap(sub, *, hf_config, stop_only: bool = False) -> None:
     """
     from sglang.srt.sampling.custom_logit_processor import (
         NGRAM_OUTPUT_ONLY_KEY,
-        DeepseekOCRNoRepeatNGramLogitProcessor,
+        UOCR_PAGE_GUARD_PROCESSOR,
     )
 
     if sub.custom_logit_processor:
@@ -245,34 +259,27 @@ def _apply_page_cap(sub, *, hf_config, stop_only: bool = False) -> None:
     if isinstance(eos, (list, tuple, set)):
         # Several ids end a turn; the cap forces one, so take the lowest.
         eos = min(eos, default=None)
-    server_cap = get_mm().uocr_max_page_tokens
+    server_cap = UocrDocumentConfig.from_args(get_mm()).uocr_max_page_tokens
+    custom_params = dict(sub.custom_params or {})
+    options = sub.doc_split_options
+    if options is not None and options.max_page_tokens is not None:
+        custom_params["max_page_tokens"] = options.max_page_tokens
+    cap = doc_split.effective_max_page_tokens(
+        server_max_page_tokens=server_cap, custom_params=custom_params
+    )
     params = doc_split.page_guard_params(
-        max_page_tokens=server_cap,
+        max_page_tokens=cap,
         page_token_id=hf_config.sparse_attention_config.get("page_token_id"),
         eos_token_id=eos,
-        custom_params=sub.custom_params,
+        custom_params=None,
         stop_only=stop_only,
     )
     if not params:
         return
-    if doc_split.requested_max_page_tokens(sub.custom_params) > server_cap > 0:
-        logger.warning(
-            "request max_page_tokens=%s exceeds the server's %d; using %d "
-            "(the default context is sized from it)",
-            sub.custom_params.get("max_page_tokens"),
-            server_cap,
-            server_cap,
-        )
     if not sub.custom_logit_processor:
-        if not get_exec().features.enable_custom_logit_processor:
-            logger.warning(
-                "--uocr-max-page-tokens needs "
-                "--enable-custom-logit-processor; the page cap is off"
-            )
-            return
-        sub.custom_logit_processor = DeepseekOCRNoRepeatNGramLogitProcessor().to_str()
-        params[NGRAM_OUTPUT_ONLY_KEY] = True
-    sub.custom_params = {**(sub.custom_params or {}), **params}
+        sub.custom_logit_processor = UOCR_PAGE_GUARD_PROCESSOR
+    params[NGRAM_OUTPUT_ONLY_KEY] = True
+    sub.custom_params = {**custom_params, **params}
 
 
 def _requested_max_tokens(request) -> Optional[int]:
@@ -755,6 +762,7 @@ class ChatDocSplitter:
         self._tokenizer_manager = serving.tokenizer_manager
         self._hf_config = serving.tokenizer_manager.model_config.hf_config
         self._handle_window = handle_window
+        self._config = UocrDocumentConfig.from_args(get_mm())
 
     @classmethod
     def for_model(
@@ -773,12 +781,26 @@ class ChatDocSplitter:
         """
         if request.n != 1:
             return await self._handle_window(request, raw_request)
-        if request.doc_split_options is not None and get_mm().disable_uocr_doc_split:
+        options = request.doc_split_options
+        if (
+            not self._config.uocr_doc_split
+            and options is not None
+            and any(
+                value is not None
+                for value in (
+                    options.max_batch_pages,
+                    options.overlap_pages,
+                    options.lookahead_pages,
+                )
+            )
+        ):
             return self._serving.create_error_response(
-                "doc_split_options is not supported with --disable-uocr-doc-split"
+                "window options in doc_split_options require --uocr-doc-split"
             )
         try:
             plan = self._plan_doc_split(request)
+        except ValueError as e:
+            return self._serving.create_error_response(str(e))
         except Exception:
             # A planning bug must not take the request down; the base path still
             # answers (or rejects with its accurate message).
@@ -810,7 +832,7 @@ class ChatDocSplitter:
 
     def _plan_doc_split(self, request) -> Optional[list[tuple[int, int, int]]]:
         """``[(lo, hi, emit_from), ...]`` or None. Cheap: no tokenization."""
-        if get_mm().disable_uocr_doc_split:
+        if not self._config.uocr_doc_split:
             return None
         limit = self._tokenizer_manager.max_req_input_len
         if not limit:
@@ -824,13 +846,12 @@ class ChatDocSplitter:
         options = request.doc_split_options
         # A request cap overrides the per-mode server cap; server caps may force
         # splitting even when the full document fits.
-        mm_config = get_mm()
-        max_batch_pages = doc_split.page_limit_for_mode(
-            image_mode,
-            mm_config.uocr_gundam_page_window,
-            mm_config.uocr_base_page_window,
-        )
+        max_batch_pages = self._config.uocr_doc_page_window
         if options and options.max_batch_pages is not None:
+            if options.max_batch_pages > max_batch_pages:
+                raise ValueError(
+                    "doc_split_options.max_batch_pages exceeds --uocr-doc-page-window"
+                )
             max_batch_pages = options.max_batch_pages
         overlap_pages = (
             options.overlap_pages

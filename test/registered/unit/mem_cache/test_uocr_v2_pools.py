@@ -64,7 +64,7 @@ class TestRequestPoolRows(CustomTestCase):
         }
         configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         configurator.model_config = SimpleNamespace(hf_config=hf_config)
-        with get_context().override_server_args(disable_uocr_doc_split=disable_split):
+        with get_context().override_server_args(uocr_doc_split=not disable_split):
             return configurator._req_pool_rows(64)
 
     def test_split_v2_gets_a_retained_row_per_running_row(self):

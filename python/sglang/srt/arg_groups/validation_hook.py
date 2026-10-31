@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -115,16 +116,8 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
-def validate_doc_split_page_limits(server_args: Any) -> None:
-    """A split window transcribes at least one page."""
-    cfg = resolving_view(server_args)
-    windows = {
-        "--uocr-gundam-page-window": cfg.uocr_gundam_page_window,
-        "--uocr-base-page-window": cfg.uocr_base_page_window,
-    }
-    for flag, window in windows.items():
-        if window < 1:
-            raise ValueError(f"{flag} must be at least 1, got {window}")
+def validate_uocr_document_config(server_args: Any) -> None:
+    UocrDocumentConfig.from_args(resolving_view(server_args))
 
 
 def check_pipeline_parallel_compat(cfg: Any) -> None:

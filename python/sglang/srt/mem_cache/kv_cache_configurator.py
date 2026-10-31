@@ -1384,9 +1384,7 @@ class KVCacheConfigurator:
 
     def _req_pool_rows(self, max_running_requests: int) -> int:
         """Request rows; v2 doc split keeps one more per request for a retained window."""
-        if is_unlimited_ocr_v2(self.model_config.hf_config) and not (
-            get_mm().disable_uocr_doc_split
-        ):
+        if is_unlimited_ocr_v2(self.model_config.hf_config) and get_mm().uocr_doc_split:
             return 2 * max_running_requests
         return max_running_requests
 

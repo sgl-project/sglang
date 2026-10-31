@@ -81,16 +81,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
         handle_aux_hidden_state_capture,
-        validate_doc_split_page_limits,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
+        validate_uocr_document_config,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
-    run_hook(validate_doc_split_page_limits, server_args)
+    run_hook(validate_uocr_document_config, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
     # Before any reader of speculative_algorithm: the flag may reset it.
     run_hook(handle_aux_hidden_state_capture, server_args)

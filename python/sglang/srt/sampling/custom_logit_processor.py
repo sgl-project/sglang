@@ -14,12 +14,16 @@ from sglang.srt.sampling.doc_window_params import KEY_LOOKAHEAD
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+UOCR_PAGE_GUARD_PROCESSOR = "sglang:uocr-page-guard"
+
 
 @lru_cache(maxsize=None)
 def _cache_from_str(json_str: str):
     """Deserialize a json string to a Callable object.
     This function is cached to avoid redundant deserialization.
     """
+    if json_str == UOCR_PAGE_GUARD_PROCESSOR:
+        return DeepseekOCRNoRepeatNGramLogitProcessor
     data = orjson.loads(json_str)
     return dill.loads(bytes.fromhex(data["callable"]))
 

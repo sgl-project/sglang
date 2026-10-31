@@ -914,6 +914,8 @@ class DocSplitOptions(BaseModel):
 
     max_batch_pages: Optional[int] = Field(default=None, ge=1)
     overlap_pages: Optional[int] = Field(default=None, ge=0)
+    lookahead_pages: Optional[int] = Field(default=None, ge=0)
+    max_page_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 class ChatCompletionRequest(PDRoutingFields):

@@ -80,7 +80,7 @@ export const config = {
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--chat-template unlimited-ocr",
-        "--enable-custom-logit-processor",
+        "--uocr-doc-split",
         "--enable-streaming-session",
         "--uocr-max-page-tokens 8000",
         "--cuda-graph-backend-decode full",

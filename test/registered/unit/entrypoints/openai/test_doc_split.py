@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
+    DocSplitOptions,
     UsageInfo,
 )
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -374,7 +375,9 @@ class TestServerSidePageCap(CustomTestCase):
             eos_token_id=1,
         )
         sub = SimpleNamespace(
-            custom_params=custom_params, custom_logit_processor=processor
+            custom_params=custom_params,
+            custom_logit_processor=processor,
+            doc_split_options=None,
         )
         with get_context().override_server_args(
             uocr_max_page_tokens=cap, enable_custom_logit_processor=enabled
@@ -396,10 +399,17 @@ class TestServerSidePageCap(CustomTestCase):
         )
         self.assertTrue(sub.custom_logit_processor)
 
-    def test_the_cap_is_off_by_default_and_without_the_server_flag(self):
+    def test_the_builtin_guard_runs_without_enabling_external_processors(self):
+        from sglang.srt.sampling.custom_logit_processor import (
+            UOCR_PAGE_GUARD_PROCESSOR,
+            CustomLogitProcessor,
+        )
+
         self.assertIsNone(self._window(0).custom_params)
-        # Attaching a processor the server rejects would fail the whole request.
-        self.assertIsNone(self._window(8000, enabled=False).custom_params)
+        sub = self._window(3, enabled=False)
+        self.assertEqual(sub.custom_logit_processor, UOCR_PAGE_GUARD_PROCESSOR)
+        self.assertEqual(sub.custom_params["max_page_tokens"], 3)
+        self.assertIsNotNone(CustomLogitProcessor.from_str(sub.custom_logit_processor))
 
     def test_a_request_that_brought_its_own_cap_is_left_alone(self):
         sub = self._window(
@@ -407,7 +417,13 @@ class TestServerSidePageCap(CustomTestCase):
         )
         # Only the Unlimited-OCR v2 n-gram domain is added to its own processor.
         self.assertEqual(
-            sub.custom_params, {"max_page_tokens": 6000, "ngram_output_only": True}
+            sub.custom_params,
+            {
+                "max_page_tokens": 6000,
+                "ngram_output_only": True,
+                "page_token_id": 128827,
+                "eos_token_id": 1,
+            },
         )
         self.assertEqual(sub.custom_logit_processor, "client-sent")
 
@@ -476,16 +492,17 @@ class TestWindowLookahead(CustomTestCase):
         from sglang.srt.session import uocr_doc_reuse
 
         request = ChatCompletionRequest(
-            model="m", messages=self._messages(n), max_tokens=1000
+            model="m",
+            messages=self._messages(n),
+            max_tokens=1000,
+            doc_split_options=DocSplitOptions(lookahead_pages=lookahead),
         )
         hf_config = SimpleNamespace(
             architectures=["UnlimitedOCRV2ForCausalLM"],
             sparse_attention_config={"page_token_id": 128827},
             eos_token_id=1,
         )
-        with get_context().override_server_args(
-            uocr_doc_lookahead_pages=lookahead, enable_custom_logit_processor=True
-        ):
+        with get_context().override_server_args(enable_custom_logit_processor=False):
             sub = serving_chat_doc_split._window_request(
                 request,
                 hf_config=hf_config,
@@ -595,6 +612,11 @@ def _splitter(windows: _ScriptedWindows):
     )
     serving = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
+        template_manager=SimpleNamespace(chat_template_name="unlimited-ocr"),
+        _effective_tools=lambda request: None,
+        _should_return_input_ids=lambda request: False,
+        _should_return_output_ids=lambda request: False,
+        reasoning_parser=None,
         _validate_request=lambda request, **kwargs: None,
         create_error_response=lambda message: message,
         create_streaming_error_response=lambda message: message,
@@ -777,8 +799,62 @@ class TestPromptKeepsInlinePagePlaceholders(CustomTestCase):
         )
 
 
-class TestPerModePageLimit(CustomTestCase):
-    """Use separate caps for gundam and lighter image modes."""
+class TestDocumentPolicy(CustomTestCase):
+    def test_one_window_limit_applies_to_all_modes_and_requests_can_tighten_it(self):
+        with get_context().override_server_args(
+            uocr_doc_split=True, uocr_doc_page_window=3
+        ):
+            splitter = _splitter(_ScriptedWindows([]))
+        for mode in ("gundam", "base", "tiny", "large"):
+            with self.subTest(mode=mode):
+                request = _document_request(4, stream=False)
+                request.images_config = {"image_mode": mode}
+                self.assertEqual(
+                    splitter._plan_doc_split(request), [(0, 3, 0), (3, 4, 3)]
+                )
+                request.doc_split_options = DocSplitOptions(max_batch_pages=2)
+                self.assertEqual(
+                    splitter._plan_doc_split(request), [(0, 2, 0), (2, 4, 2)]
+                )
+                request.doc_split_options = DocSplitOptions(max_batch_pages=4)
+                with self.assertRaisesRegex(
+                    ValueError, "exceeds --uocr-doc-page-window"
+                ):
+                    splitter._plan_doc_split(request)
+
+    def test_unsplit_is_the_default(self):
+        splitter = _splitter(_ScriptedWindows([]))
+        self.assertIsNone(splitter._plan_doc_split(_document_request(4, stream=False)))
+
+    def test_request_page_limit_reaches_the_guard_and_window_budget(self):
+        request = _document_request(3, stream=False)
+        request.doc_split_options = DocSplitOptions(max_page_tokens=100)
+        with get_context().override_server_args(uocr_max_page_tokens=512):
+            sub = serving_chat_doc_split._window_request(
+                request,
+                hf_config=_HF_CONFIG,
+                plan=[(0, 1, 0), (1, 3, 1)],
+                bi=0,
+                max_tokens=356,
+                doc_reuse_id="doc",
+            )
+            capacity = serving_chat_doc_split._estimate_window_capacity(
+                request,
+                [(0, 1, 0), (1, 3, 1)],
+                0,
+                context_length=10000,
+                image_mode="base",
+            )
+        self.assertEqual(sub.custom_params["max_page_tokens"], 100)
+        self.assertEqual(
+            sub.custom_params["page_token_id"],
+            _HF_CONFIG.sparse_attention_config["page_token_id"],
+        )
+        self.assertEqual(capacity, 356)
+
+
+class TestImageModeBudget(CustomTestCase):
+    """Image modes change token budgets, while sharing one page-window policy."""
 
     def test_mode_token_estimates_match_processor_presets(self):
         self.assertEqual(
@@ -795,36 +871,6 @@ class TestPerModePageLimit(CustomTestCase):
         for mode in ("base ", " base", "BASE ", "base\n"):
             with self.subTest(mode=mode):
                 self.assertEqual(doc_split.tokens_per_page(mode), 274)
-                self.assertEqual(doc_split.page_limit_for_mode(mode, 10, 40), 40)
-
-    def test_absent_mode_takes_the_gundam_cap(self):
-        """Absent modes use gundam for both token budgets and page caps."""
-        self.assertEqual(doc_split.page_limit_for_mode(None, 10, 40), 10)
-        self.assertEqual(doc_split.page_limit_for_mode("", 10, 40), 10)
-
-    def test_unknown_mode_takes_the_gundam_cap(self):
-        self.assertEqual(doc_split.page_limit_for_mode("weird", 10, 40), 10)
-
-    def test_light_modes_take_the_base_cap(self):
-        for mode in ("base", "large", "small", "tiny"):
-            with self.subTest(mode=mode):
-                self.assertEqual(doc_split.page_limit_for_mode(mode, 10, 40), 40)
-
-    def test_unset_limits_stay_unset_so_the_budget_decides(self):
-        self.assertIsNone(doc_split.page_limit_for_mode("gundam", None, None))
-        self.assertIsNone(doc_split.page_limit_for_mode("base", None, None))
-        self.assertIsNone(doc_split.page_limit_for_mode(None, None, None))
-
-    def test_cap_and_token_paths_agree_on_which_mode_is_expensive(self):
-        """Both paths must classify an absent mode the same way, or one request is
-        budgeted as gundam and capped as base."""
-        for mode in (None, "", "gundam", "base", "tiny", "weird"):
-            with self.subTest(mode=mode):
-                expensive = doc_split.tokens_per_page(mode) > doc_split.tokens_per_page(
-                    "base"
-                )
-                takes_gundam_cap = doc_split.page_limit_for_mode(mode, 10, 40) == 10
-                self.assertEqual(expensive, takes_gundam_cap)
 
     def test_server_cap_splits_a_document_that_would_have_fitted(self):
         # 4 base pages fit the budget, yet a cap of 2 must still split.
