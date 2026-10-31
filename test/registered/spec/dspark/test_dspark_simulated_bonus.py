@@ -53,12 +53,12 @@ class TestSimulatedBonus(unittest.TestCase):
             bs=bs,
             verify_num_draft_tokens=rows,
         )
-        ref = (
-            logits.float()
-            .view(bs, rows, vocab)
-            .argmax(-1)[torch.arange(bs), correct_len]
-        )
-        self.assertTrue(torch.equal(out, ref))
+        picked_rows = logits.float().view(bs, rows, vocab)[
+            torch.arange(bs), correct_len
+        ]
+        # bf16 logits can tie at the row max; any tied token is a valid argmax.
+        picked = picked_rows.gather(1, out.view(-1, 1)).squeeze(1)
+        self.assertTrue(torch.equal(picked, picked_rows.max(dim=-1).values))
 
     def test_matches_softmax_distribution(self):
         torch.manual_seed(1)

@@ -5,7 +5,7 @@ from unittest import mock
 import torch
 from test_unified_byte_budget_sizing import _swa_factory
 
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_memory_pool import filter_window_cpu_copy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -14,10 +14,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 ROWS = 4
 
 
-def _pool(chunk_size: int = ROWS) -> SWAKVPool:
-    pool = object.__new__(SWAKVPool)
-    pool.swa_kv_pool = SimpleNamespace(cpu_offloading_chunk_size=chunk_size)
-    return pool
+def _window(chunk_size: int = ROWS) -> SimpleNamespace:
+    return SimpleNamespace(cpu_offloading_chunk_size=chunk_size)
 
 
 def _rows(t: int):
@@ -36,7 +34,9 @@ class TestSWACpuCopyFilter(unittest.TestCase):
         side produced, and a short chunk resumes against the wrong exponents."""
         row_mask = torch.tensor([True, False, True, False])
 
-        filtered = _pool()._filter_swa_cpu_copy(swa_kv_cpu=_chunk(4), row_mask=row_mask)
+        filtered = filter_window_cpu_copy(
+            _window(), swa_kv_cpu=_chunk(4), row_mask=row_mask
+        )
 
         self.assertEqual(len(filtered[0][0]), 4)
         for t, tensor in enumerate(filtered[0][0]):
@@ -46,7 +46,9 @@ class TestSWACpuCopyFilter(unittest.TestCase):
     def test_unquantized_chunk_is_unchanged(self):
         row_mask = torch.tensor([False, True, True, False])
 
-        filtered = _pool()._filter_swa_cpu_copy(swa_kv_cpu=_chunk(2), row_mask=row_mask)
+        filtered = filter_window_cpu_copy(
+            _window(), swa_kv_cpu=_chunk(2), row_mask=row_mask
+        )
 
         self.assertEqual(len(filtered[0][0]), 2)
         self.assertEqual(filtered[0][0][0].shape[0], 2)
@@ -55,8 +57,8 @@ class TestSWACpuCopyFilter(unittest.TestCase):
         original = _chunk(4)
 
         self.assertIs(
-            _pool()._filter_swa_cpu_copy(
-                swa_kv_cpu=original, row_mask=torch.tensor([True] * ROWS)
+            filter_window_cpu_copy(
+                _window(), swa_kv_cpu=original, row_mask=torch.tensor([True] * ROWS)
             ),
             original,
         )
@@ -74,11 +76,12 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 allocator = bundle.token_to_kv_pool_allocator
                 indices = allocator.alloc(12)
                 allocator.free_swa(indices[:tombstone_tokens])
-                raw = bundle.unified_memory_pool._raw
+                raw = bundle.arena.raw
                 raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
                 manager = object.__new__(DecodeKVCacheOffloadManager)
                 manager.token_to_kv_pool_allocator = allocator
                 manager.kv_cache = bundle.token_to_kv_pool
+                manager._unified_window = True
                 full, transfers = manager._resolve_offload_transfers(indices)
                 self.assertTrue(torch.equal(full, indices))
                 if tombstone_tokens == len(indices):
@@ -88,7 +91,9 @@ class TestUnifiedSWATransfers(CustomTestCase):
                     indices[tombstone_tokens::4] // 4
                 ]
                 pages = transfers[0].device_indices[::4] // 4
-                buffer = manager.kv_cache.swa_kv_pool.get_page_envelope_buffer()
+                buffer = manager.kv_cache.layer_router.view(
+                    "swa"
+                ).get_page_envelope_buffer()
                 self.assertTrue(
                     torch.equal(buffer[pages].clone(), buffer[expected_pages])
                 )
@@ -100,7 +105,7 @@ class TestUnifiedSWATransfers(CustomTestCase):
         pool = bundle.token_to_kv_pool
         indices = allocator.alloc(12)
         allocator.free_swa(indices[:4])
-        raw = bundle.unified_memory_pool._raw
+        raw = bundle.arena.raw
         raw.copy_(torch.arange(raw.numel()).remainder(251).to(torch.uint8))
         full_pages = allocator.translate_kv_indices_for_transfer(indices)[::4] // 4
         swa_pages = allocator.translate_swa_indices_for_transfer(indices[4:])[::4] // 4
@@ -117,9 +122,9 @@ class TestUnifiedSWATransfers(CustomTestCase):
         with mock.patch(
             "sglang.srt.mem_cache.memory_pool.current_platform.synchronize"
         ):
-            saved = pool.get_cpu_copy(indices, req_pool_index=0)
+            saved = allocator.get_cpu_copy(indices, req_pool_index=0)
             raw.zero_()
-            pool.load_cpu_copy(saved, indices, req_pool_index=0)
+            allocator.load_cpu_copy(saved, indices, req_pool_index=0)
 
         self.assertTrue(torch.equal(full_buffer[full_pages], expected_full))
         self.assertTrue(torch.equal(swa_buffer[swa_pages], expected_swa))

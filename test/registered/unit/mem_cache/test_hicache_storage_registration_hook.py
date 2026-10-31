@@ -127,11 +127,17 @@ def _attach(
     host_pools: Optional[List[PoolEntry]] = None,
 ) -> None:
     """Run ``attach_storage_backend`` with the heavy pieces stubbed out."""
-    storage_config = SimpleNamespace(is_mla_model=False, extra_config={})
+    storage_config = SimpleNamespace(
+        is_mla_model=False, extra_config={}, unified_suffixes=None
+    )
     # Only the hybrid attach accepts host_pools; the base attach's burst is
     # the anchor pool alone.
     kwargs = {"host_pools": host_pools} if host_pools is not None else {}
     with (
+        mock.patch(
+            "sglang.srt.managers.cache_controller.get_memory",
+            return_value=SimpleNamespace(hicache_storage_key_scheme="rank-suffix"),
+        ),
         mock.patch(
             "sglang.srt.managers.cache_controller.get_parallel",
             return_value=SimpleNamespace(attn_dcp_size=1),
