@@ -1200,7 +1200,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
-                )  # target_verify： [B*draft_token_num, hidden_dim], [B*draft_token_num, vocab_size]
+                )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
