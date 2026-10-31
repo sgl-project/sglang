@@ -182,8 +182,11 @@ def _validate_kda_inputs(
         raise ValueError(
             f"`state` must have shape [cache, 12, 128, 128], got {list(state.shape)}."
         )
-    if state.dtype != torch.float32:
-        raise ValueError("`state` must have dtype torch.float32.")
+    if state.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            "`state` must have dtype torch.float32 or torch.bfloat16, "
+            f"got {state.dtype}."
+        )
     if state.stride()[-3:] != (_DIM * _DIM, _DIM, 1):
         raise ValueError("`state` must be contiguous within each cache slot.")
     _check_tensor(
@@ -324,6 +327,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
     executable = create_kimi_k3_kda_decode_fb_kernel(
         float(norm_eps),
         float(lower_bound),
+        state_is_bf16=state.dtype == torch.bfloat16,
         **_fb_build_options(batch),
     )
     with torch.cuda.device(device):

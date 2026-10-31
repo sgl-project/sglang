@@ -60,7 +60,11 @@ class Inputs:
     norm_weight: torch.Tensor
 
 
-def _make_inputs(batch: int, seed: int = 20260728) -> Inputs:
+def _make_inputs(
+    batch: int,
+    seed: int = 20260728,
+    state_dtype: torch.dtype = torch.float32,
+) -> Inputs:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + batch)
     slots = batch + 2
 
@@ -95,6 +99,8 @@ def _make_inputs(batch: int, seed: int = 20260728) -> Inputs:
         device=_DEVICE,
         generator=generator,
     )
+    if state_dtype != torch.float32:
+        state_storage = state_storage.to(state_dtype)
     state = state_storage[:, : _HEADS * _DIM * _DIM].view(slots, _HEADS, _DIM, _DIM)
 
     raw_beta_storage = torch.randn(
@@ -274,6 +280,7 @@ def _relative_rmse(
 def _make_fb_inputs(
     batch: int,
     seed: int = 20260728,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, Inputs]:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + 10_000 + batch)
     f_a_storage = torch.randn(
@@ -292,7 +299,7 @@ def _make_fb_inputs(
             generator=generator,
         )
     ).to(torch.bfloat16)
-    inputs = _make_inputs(batch, seed)
+    inputs = _make_inputs(batch, seed, state_dtype=state_dtype)
     projected = F.linear(
         f_a.float(),
         f_b_weight.view(_HEADS * _DIM, _DIM).float(),
@@ -358,9 +365,20 @@ def test_f_b_batch_two_dispatch_is_guarded() -> None:
     }
 
 
-@pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
-    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+@pytest.mark.parametrize(
+    ("batch", "state_dtype"),
+    [
+        (1, torch.float32),
+        (8, torch.float32),
+        (16, torch.float32),
+        (1, torch.bfloat16),
+    ],
+    ids=["fp32-b1", "fp32-b8", "fp32-b16", "bf16-b1"],
+)
+def test_kimi_k3_kda_decode_with_f_b_matches_reference(
+    batch: int, state_dtype: torch.dtype
+) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(batch, state_dtype=state_dtype)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
 
@@ -387,9 +405,20 @@ def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_graph_replay() -> None:
-    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
-    out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
+@pytest.mark.parametrize(
+    ("batch", "state_dtype"),
+    [
+        (2, torch.float32),
+        (1, torch.bfloat16),
+        (2, torch.bfloat16),
+    ],
+    ids=["fp32-b2", "bf16-b1", "bf16-b2"],
+)
+def test_kimi_k3_kda_decode_with_f_b_graph_replay(
+    batch: int, state_dtype: torch.dtype
+) -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=batch, state_dtype=state_dtype)
+    out = torch.empty((1, batch, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
     _run_with_f_b(f_a, f_b_weight, inputs)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -442,6 +471,14 @@ def test_f_b_api_rejects_invalid_projection_inputs() -> None:
         _run_with_f_b(f_a, f_b_weight[:, :, :-1], inputs)
     with pytest.raises(ValueError, match="`f_b_weight` must have inner strides"):
         _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
+
+
+def test_f_b_api_rejects_fp16_state() -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=1)
+    inputs.state = inputs.state.to(torch.float16)
+
+    with pytest.raises(ValueError, match="torch.float32 or torch.bfloat16"):
+        _run_with_f_b(f_a, f_b_weight, inputs)
 
 
 def test_fused_kda_backend_is_opt_in(monkeypatch):
