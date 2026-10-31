@@ -397,12 +397,16 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     x = x.reshape(world_size, h_local, b, s_local, d)
 
     # Reorder dims to place 'world_size' adjacent to 's_local' to merge them into 's_global'
+    # clone, not contiguous(): with one head and one batch row per rank the
+    # reorder is a free view of the staging buffer the next exchange reuses.
     if head_dim == 1:
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, h_local, world_size, s_local, d]
-        x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, h_local, s_global, d)
+        x = x.permute(2, 1, 0, 3, 4).clone(memory_format=torch.contiguous_format)
+        x = x.reshape(b, h_local, s_global, d)
     else:  # head_dim == 2
         # Shape transition: [world_size, h_local, b, s_local, d] -> [b, world_size, s_local, h_local, d]
-        x = x.permute(2, 0, 3, 1, 4).contiguous().reshape(b, s_global, h_local, d)
+        x = x.permute(2, 0, 3, 1, 4).clone(memory_format=torch.contiguous_format)
+        x = x.reshape(b, s_global, h_local, d)
 
     return x
 
