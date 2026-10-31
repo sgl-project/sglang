@@ -16,9 +16,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 
 
-def _qkv(
-    q_len: int, kv_len: int, heads: int = 32, head_dim: int = 64, kv_heads=None
-):
+def _qkv(q_len: int, kv_len: int, heads: int = 32, head_dim: int = 64, kv_heads=None):
     def tensor(seq_len: int, num_heads: int):
         return SimpleNamespace(
             shape=(1, seq_len, num_heads, head_dim),
