@@ -1554,132 +1554,225 @@ class TestChatDisconnectAbort(CustomTestCase):
 
         asyncio.run(drive())
 
-    def test_batch_output_aborts_orphan_ongoing_request(self):
-        """When an unfinished output arrives for an rid deleted from rid_to_state,
-        TokenizerManager must force-dispatch an AbortReq to stop the scheduler."""
+    def test_orphan_unfinished_output_sends_no_abort(self):
+        """An output for an rid with no state must not abort by rid prefix.
+
+        The scheduler matches AbortReq rids with startswith, so aborting "job"
+        here would also stop a live "job-1".
+        """
         tm = _make_tokenizer_manager(self)
         tm._dispatch_to_scheduler = Mock()
-        orphan_rid = "orphan_decode_rid"
-        self.assertNotIn(orphan_rid, tm.rid_to_state)
+        live = _make_req_state("job-1")
+        tm.rid_to_state["job-1"] = live
 
-        batch_output = _make_batch_str_output(orphan_rid, finished_reason=_NOT_FINISHED)
-        asyncio.run(tm._handle_batch_output(batch_output))
-
-        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
-        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == orphan_rid]
-        self.assertEqual(len(aborts), 1, "orphan output must trigger forced AbortReq")
-
-    def test_batch_output_ignores_orphan_finished_request(self):
-        """When a finished output arrives for an rid already gone, no abort is sent."""
-        tm = _make_tokenizer_manager(self)
-        tm._dispatch_to_scheduler = Mock()
-        orphan_rid = "already_finished_rid"
-        self.assertNotIn(orphan_rid, tm.rid_to_state)
-
-        batch_output = _make_batch_str_output(
-            orphan_rid, finished_reason={"type": "stop"}
+        asyncio.run(
+            tm._handle_batch_output(
+                _make_batch_str_output("job", finished_reason=_NOT_FINISHED)
+            )
         )
-        asyncio.run(tm._handle_batch_output(batch_output))
 
-        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
-        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == orphan_rid]
-        self.assertEqual(len(aborts), 0)
+        tm._dispatch_to_scheduler.assert_not_called()
+        self.assertIs(tm.rid_to_state["job-1"], live)
+        self.assertFalse(live.abort_sent)
 
-    def test_force_abort_request(self):
-        """force=True must dispatch AbortReq even when rid is not in rid_to_state."""
+    def test_streaming_disconnect_aborts_before_next_chunk(self):
+        """A disconnected stream aborts on the next output instead of sending it."""
         tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
         tm.server_args.tokenizer_worker_num = 1
+        state = _make_req_state("stream_disconnect_rid")
+        state.obj.stream = True
+        state.obj.background = False
+        state.dispatched = True
+        state.out_list = [{"text": "token1", "meta_info": {}}]
+        state.event.set()
+        tm.rid_to_state[state.obj.rid] = state
+
+        request = Mock()
+        request.is_disconnected = AsyncMock(return_value=True)
+        sent_chunks = []
+
+        async def drive():
+            async for chunk in tm._stream_one_response(
+                obj=state.obj, state=state, request=request
+            ):
+                sent_chunks.append(chunk)
+
+        with self.assertRaisesRegex(ValueError, "type 3"):
+            asyncio.run(drive())
+
+        self.assertEqual(sent_chunks, [])
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual([m.rid for m in sent], [state.obj.rid])
+        self.assertTrue(state.abort_sent)
+
+
+class TestChatStreamDisconnect(CustomTestCase):
+    """A /v1/chat/completions stream that loses its client must stop its own
+    scheduler request, and only that one."""
+
+    @staticmethod
+    def _make_handler(tm):
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        tm.config_value = Mock(return_value=None)
+        tm.model_config = Mock(is_multimodal=False)
+        tm.model_config.get_default_sampling_params.return_value = {}
+        tm.model_config.hf_config = Mock(architectures=["LlamaForCausalLM"])
+        tm.model_config.hf_config.to_dict.return_value = {}
+        tm.tokenizer = Mock(chat_template=None)
+        tm.served_model_name = "m"
+        return OpenAIServingChat(tm, Mock())
+
+    def _make_tm(self):
+        tm = _make_tm_for_generate(self)
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
-        missing_rid = "not_in_state_rid"
-        self.assertNotIn(missing_rid, tm.rid_to_state)
 
-        # Without force, single-worker returns early
-        tm.abort_request(missing_rid, force=False)
-        self.assertFalse(tm._dispatch_to_scheduler.called)
+        async def tokenize(obj):
+            tokenized = MagicMock()
+            tokenized.rid = obj.rid
+            tokenized.mm_inputs = None
+            return tokenized
 
-        # With force, AbortReq is sent to the scheduler
-        tm.abort_request(missing_rid, force=True)
-        self.assertTrue(tm._dispatch_to_scheduler.called)
-        req = tm._dispatch_to_scheduler.call_args[0][0]
-        self.assertIsInstance(req, AbortReq)
-        self.assertEqual(req.rid, missing_rid)
+        tm._tokenize_one_request = tokenize
+        return tm
 
-    def test_streaming_disconnect_aborts_in_stream_one_response(self):
-        """Streaming request must detect client disconnect on intermediate chunk and abort."""
-        tm = _make_tokenizer_manager(self)
-        tm._dispatch_to_scheduler = Mock()
-        rid = "stream_disconnect_rid"
-        obj = Mock(spec=GenerateReqInput)
-        obj.rid = rid
+    @staticmethod
+    def _make_obj(rid):
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_prompt_token_ids = False
         obj.stream = True
         obj.background = False
         obj.return_logprob = False
         obj.lora_path = None
         obj.log_metrics = False
-        state = ReqState(
-            out_list=[{"text": "token1", "meta_info": {}}],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            time_stats=APIServerReqTimeStats(),
-        )
-        state.dispatched = True
-        state.event.set()
-        tm.rid_to_state[rid] = state
+        return obj
 
-        mock_request = Mock()
-        mock_request.is_disconnected = AsyncMock(return_value=True)
+    @staticmethod
+    def _make_raw_request():
+        raw = Mock()
+        raw.headers = {}
+        raw.is_disconnected = AsyncMock(return_value=False)
+        return raw
+
+    async def _start_stream(self, tm, rid):
+        """Return the StreamingResponse once the first chunk is ready."""
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        handler = self._make_handler(tm)
+        request = ChatCompletionRequest(
+            model="m", messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+        task = asyncio.create_task(
+            handler._handle_streaming_request(
+                self._make_obj(rid), request, self._make_raw_request()
+            )
+        )
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if rid in tm.rid_to_state and tm.rid_to_state[rid].dispatched:
+                break
+        self.assertTrue(tm.rid_to_state[rid].dispatched)
+        await tm._handle_batch_output(
+            _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
+        )
+        return await task
+
+    @staticmethod
+    def _aborted_rids(tm):
+        return [
+            c.args[0].rid
+            for c in tm._dispatch_to_scheduler.call_args_list
+            if isinstance(c.args[0], AbortReq)
+        ]
+
+    def test_send_failure_aborts_request_and_releases_state(self):
+        """A failed write must abort the request even though Starlette skips
+        the background task on ASGI spec >= 2.4."""
+        from starlette.requests import ClientDisconnect
 
         async def drive():
-            async for _ in tm._stream_one_response(
-                obj=obj, state=state, request=mock_request
-            ):
-                pass
+            tm = self._make_tm()
+            response = await self._start_stream(tm, "chat")
 
-        with self.assertRaisesRegex(
-            ValueError, "Request is disconnected from the client side"
-        ):
-            asyncio.run(drive())
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    raise OSError("connection reset")
 
-        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
-        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
-        self.assertTrue(aborts, "streaming disconnect must dispatch AbortReq")
+            scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+            with self.assertRaises(ClientDisconnect):
+                await response(scope, AsyncMock(), send)
 
-    def test_openai_serving_chat_cancellation_aborts_request(self):
-        """Cancellation of chat completion request must abort running request with force=True."""
-        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+            self.assertEqual(self._aborted_rids(tm), ["chat"])
+            # State is kept until the scheduler confirms the abort.
+            self.assertTrue(tm.rid_to_state["chat"].abort_sent)
+            tm._handle_abort_req(_make_abort_req("chat"))
+            self.assertNotIn("chat", tm.rid_to_state)
 
-        tm = _make_tokenizer_manager(self)
-        tm.abort_request = Mock()
-        template_manager = Mock()
-        handler = object.__new__(OpenAIServingChat)
-        handler.tokenizer_manager = tm
-        handler.template_manager = template_manager
+        asyncio.run(drive())
 
-        adapted_request = Mock(spec=GenerateReqInput)
-        adapted_request.rid = "cancelled_chat_rid"
-        adapted_request.is_single = True
+    def test_client_disconnect_aborts_running_request(self):
+        """An http.disconnect while waiting for tokens aborts the request."""
 
-        async def cancel_non_streaming():
-            class FailingGen:
-                def __aiter__(self):
-                    return self
+        async def drive():
+            tm = self._make_tm()
+            response = await self._start_stream(tm, "chat")
+            first_chunk_sent = asyncio.Event()
 
-                async def __anext__(self):
-                    raise asyncio.CancelledError()
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    first_chunk_sent.set()
 
-            tm.generate_request = Mock(return_value=FailingGen())
+            async def receive():
+                await first_chunk_sent.wait()
+                return {"type": "http.disconnect"}
 
-            req = Mock(spec=ChatCompletionRequest)
-            raw_req = Mock()
-            with self.assertRaises(asyncio.CancelledError):
-                await handler._handle_non_streaming_request(
-                    adapted_request, req, raw_req
-                )
+            scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                await response(scope, receive, send)
 
-        asyncio.run(cancel_non_streaming())
-        tm.abort_request.assert_called_with("cancelled_chat_rid", force=True)
+            self.assertEqual(self._aborted_rids(tm), ["chat"])
+            self.assertTrue(tm.rid_to_state["chat"].abort_sent)
+
+        asyncio.run(drive())
+
+    def test_closing_finished_stream_spares_prefix_related_request(self):
+        """Closing a stream whose request already finished must not abort
+        "job-1", which the scheduler would match against rid "job"."""
+        from starlette.requests import ClientDisconnect
+
+        async def drive():
+            tm = self._make_tm()
+            response = await self._start_stream(tm, "job")
+            live = _make_req_state("job-1")
+            live.dispatched = True
+            tm.rid_to_state["job-1"] = live
+            await tm._handle_batch_output(_make_batch_str_output("job"))
+            self.assertNotIn("job", tm.rid_to_state)
+
+            body_chunks = 0
+
+            async def send(message):
+                nonlocal body_chunks
+                if message["type"] == "http.response.body":
+                    body_chunks += 1
+                    if body_chunks == 2:
+                        raise OSError("connection reset")
+
+            scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+            with self.assertRaises(ClientDisconnect):
+                await response(scope, AsyncMock(), send)
+
+            self.assertEqual(self._aborted_rids(tm), [])
+            self.assertIs(tm.rid_to_state["job-1"], live)
+            self.assertFalse(live.abort_sent)
+
+        asyncio.run(drive())
 
 
 if __name__ == "__main__":

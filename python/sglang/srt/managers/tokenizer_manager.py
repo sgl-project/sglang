@@ -2279,23 +2279,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(
-        self, rid: str = "", abort_all: bool = False, force: bool = False
-    ):
+    def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         state = None if abort_all else self.rid_to_state.get(rid)
-        if not abort_all and not force:
+        if not abort_all:
             if state is not None:
                 if state.abort_sent:
                     return
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        if state is not None:
-            state.abort_sent = True
         req = AbortReq(rid=rid, abort_all=abort_all)
         try:
             self._dispatch_to_scheduler(req)
@@ -2545,10 +2541,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logger.warning(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
-                if recv_obj.finished_reasons[i] is None:
-                    # Request is still decoding on the scheduler without state in TokenizerManager.
-                    # Force an abort so the scheduler ceases decoding the zombie request.
-                    self.abort_request(rid=rid, force=True)
                 continue
 
             request_stats = state.update_request_stats(recv_obj.request_stats, i)
