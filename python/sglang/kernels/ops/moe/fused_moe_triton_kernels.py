@@ -1257,6 +1257,8 @@ def _moe_sum_reduce_kernel(
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    topk_ids_ptr=None,
+    HAS_TOPK_IDS: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -1279,13 +1281,26 @@ def _moe_sum_reduce_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
-        tile = tl.load(
-            base_ptrs + i * input_stride_1,
-            mask=mask_token[:, None] & mask_dim[None, :],
-            other=0.0,
-        )
-        accumulator += tile.to(tl.float32)
+    if HAS_TOPK_IDS:
+        # Slots routed to -1 were never written; skipping them is bitwise equal to
+        # adding the zeros the down GEMM would otherwise store (fp32 sum from +0.0).
+        tl.static_assert(BLOCK_M == 1)
+        for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+            if tl.load(topk_ids_ptr + token_block_id * topk_num + i) >= 0:
+                tile = tl.load(
+                    base_ptrs + i * input_stride_1,
+                    mask=mask_token[:, None] & mask_dim[None, :],
+                    other=0.0,
+                )
+                accumulator += tile.to(tl.float32)
+    else:
+        for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+            tile = tl.load(
+                base_ptrs + i * input_stride_1,
+                mask=mask_token[:, None] & mask_dim[None, :],
+                other=0.0,
+            )
+            accumulator += tile.to(tl.float32)
     accumulator *= routed_scaling_factor
 
     # -------- Write back --------
@@ -1298,18 +1313,24 @@ def _moe_sum_reduce_kernel(
 
 
 def moe_sum_reduce_triton(
-    input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
+    input: torch.Tensor,
+    output: torch.Tensor,
+    routed_scaling_factor: float,
+    topk_ids: Optional[torch.Tensor] = None,
 ):
     assert input.is_contiguous()
     assert output.is_contiguous()
 
     token_num, topk_num, hidden_dim = input.shape
     assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+    if topk_ids is not None:
+        assert topk_ids.shape == (token_num, topk_num) and topk_ids.is_contiguous()
 
     BLOCK_M = 1
     BLOCK_DIM = 2048
+    # Skipping path measured on H200 at top-k 8, hidden 3072 and 7168.
+    num_warps = 16 if topk_ids is None else 4
     NUM_STAGE = 1
-    num_warps = 16
 
     grid = (
         triton.cdiv(token_num, BLOCK_M),
@@ -1329,6 +1350,8 @@ def moe_sum_reduce_triton(
         BLOCK_M=BLOCK_M,
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
+        topk_ids_ptr=topk_ids,
+        HAS_TOPK_IDS=topk_ids is not None,
         num_warps=num_warps,
         **pdl_kwargs,
     )
