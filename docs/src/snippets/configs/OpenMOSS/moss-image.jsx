@@ -46,9 +46,9 @@ export const config = {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
       verifiedRecipes: [],
       // Every guidance recipe runs two or three branches, so an even GPU count
-      // splits them first (CFG parallel) and gives Ulysses the rest. On 2 GPUs,
-      // 1024x1024 50 steps: CFG 2 2.45 s vs Ulysses 2 3.18 s on B200, 4.28 s vs
-      // 4.48 s for vLLM-Omni's CFG 2 on H200.
+      // splits them first (CFG parallel) and gives Ulysses the rest. 1024x1024
+      // 50 steps on B200: CFG 2 2.44 s vs Ulysses 2 3.18 s on 2 GPUs, CFG 2 x
+      // Ulysses 2 1.88 s vs Ulysses 4 2.34 s on 4 GPUs.
       autoTopology: (s) => {
         const gpus = Number(s.gpus_per_node);
         const cfg = gpus % 2 === 0 ? 2 : 1;

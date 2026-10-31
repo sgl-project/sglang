@@ -308,7 +308,7 @@ const config = {
         { id: "dgx-spark-1-resident", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
       ],
       // B200 x2 (b200-2-tp above), 1024x1024 40 steps: TP2 1.43 s vs Ulysses 2
-      // 1.59 s, vLLM-Omni 1.61 s.
+      // 1.59 s.
       autoTopology: (s) => Number(s.gpus_per_node) === 2
         && ((s.weights === "turbo" && s.hw === "h200") || s.hw === "b200")
         ? { tp_size: 2, ulysses_degree: 1, ring_degree: 1 }
