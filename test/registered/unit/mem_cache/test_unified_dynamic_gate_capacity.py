@@ -1,4 +1,5 @@
-"""Dynamic PD gates invalidate peer-compaction credit without allocator writes."""
+"""Holding a band in place closes the peer-compaction credit its holes give,
+and releasing it reopens the credit; capacity queries never move a page."""
 
 import contextlib
 import unittest
@@ -10,7 +11,10 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
-    pin_every_band,
+    hold_band,
+    hold_every_band,
+    release_band,
+    release_every_band,
     reset_context,
     setup_allocator_context,
 )
@@ -23,13 +27,17 @@ class TestDynamicGateCapacity(CustomTestCase):
         self.addCleanup(reset_context)
         setup_allocator_context()
 
-    def assert_dynamic_views(self, allocator, state):
+    def assert_dynamic_views(self, allocator):
         members = allocator.members
         immediate = [x.available_size() for x in members]
-        epochs = [x._chain_capacity_epoch() for x in members]
         observed = []
+        held = False
         for opened in (True, False, True, False, True):
-            state["open"] = opened
+            if opened and held:
+                release_every_band(allocator)
+            elif not opened and not held:
+                hold_every_band(allocator)
+            held = not opened
             self.assertEqual(allocator.verify_byte_accounting(), [])
             values = []
             with contextlib.ExitStack() as stack:
@@ -50,30 +58,30 @@ class TestDynamicGateCapacity(CustomTestCase):
                     self.assertEqual(x.available_size(), original)
                     values.append(actual)
             self.assertEqual(allocator.verify_byte_accounting(), [])
-            self.assertEqual(epochs, [x._chain_capacity_epoch() for x in members])
             observed.append(values)
         self.assertEqual(observed[0], observed[2])
         self.assertEqual(observed[1], observed[3])
         self.assertNotEqual(observed[0], observed[1])
 
-    def test_two_pool_public_gate_transitions(self):
+    def test_two_pool_hold_transitions(self):
         for ps in (1, 4, 16):
             for initially_open in (False, True):
                 with self.subTest(page_size=ps, initially_open=initially_open):
                     a = build_swa_pool(page_size=ps)
                     slots = a.alloc(96 * ps)
                     a.free_swa(slots[: 40 * ps])
-                    # Prime the unpinned memo, then register a pin source.
+                    # Prime the open memo, then hold or not.
                     a.full_attn_allocator.schedulable_available_size()
-                    state = {"open": initially_open}
-                    pin_every_band(a, lambda: not state["open"])
+                    if not initially_open:
+                        hold_every_band(a)
                     x = a.full_attn_allocator
                     self.assertEqual(
                         x.schedulable_available_size(),
                         x._available_tokens(x._peer_drainable_hole_bytes()),
                     )
-                    self.assert_dynamic_views(a, state)
-                    pin_every_band(a, lambda: True)
+                    release_every_band(a)
+                    self.assert_dynamic_views(a)
+                    hold_every_band(a)
                     self.assertEqual(
                         x.schedulable_available_size(), x._available_tokens()
                     )
@@ -90,9 +98,7 @@ class TestDynamicGateCapacity(CustomTestCase):
                         a.free_swa(slots)
                     else:
                         a.free(slots[10 * ps : 11 * ps])
-                    state = {"open": True}
-                    pin_every_band(a, lambda: not state["open"])
-                    self.assert_dynamic_views(a, state)
+                    self.assert_dynamic_views(a)
 
     def test_a_network_transfer_leaves_credit_open(self):
         """A send reading a window page orders that page's moves; it neither
@@ -120,25 +126,23 @@ class TestDynamicGateCapacity(CustomTestCase):
         self.assertEqual(x.schedulable_available_size(), opened)
         self.assertEqual(a.verify_byte_accounting(), [])
 
-    def test_float_signature_distinguishes_asymmetric_gates(self):
-        """Closing opposite sides must not alias a single combined gate boolean."""
+    def test_float_credit_distinguishes_asymmetric_holds(self):
+        """Holding opposite sides must not alias one combined hold."""
         _, a = build_tri_pool()
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
         a.free_full(slots[10:11])
-        state = {"low": True, "high": True}
         x = a.swa_attn_allocator
-        x.low_peer.pin_sources = (lambda: not state["low"],)
-        x.high_peer.pin_sources = (lambda: not state["high"],)
-        epoch = x._chain_capacity_epoch()
         observed = {}
         for low, high in ((False, True), (True, False), (False, False), (True, True)):
-            state.update(low=low, high=high)
+            for peer, opened in ((x.low_peer, low), (x.high_peer, high)):
+                release_band(peer)
+                if not opened:
+                    hold_band(peer)
             expected = x._available_tokens(x._peer_drainable_hole_bytes())
             observed[low, high] = x.schedulable_available_size()
             self.assertEqual(observed[low, high], expected)
-            self.assertEqual(x._chain_capacity_epoch(), epoch)
             self.assertEqual(x._capacity_memo_violations(), [])
         self.assertNotEqual(observed[False, True], observed[True, False])
 
@@ -148,7 +152,6 @@ class TestDynamicGateCapacity(CustomTestCase):
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
-        pin_every_band(a, lambda: False)
         x = a.full_attn_allocator
         self.assertIs(x._growth_side_neighbor(), a.swa_attn_allocator)
         x.schedulable_available_size()
@@ -160,17 +163,13 @@ class TestDynamicGateCapacity(CustomTestCase):
         )
         self.assertEqual(a.verify_byte_accounting(), [])
 
-    def test_independent_pd_and_host_gates_refresh_memo(self):
+    def test_independent_holds_refresh_memo(self):
         for ps in (1, 4, 16):
             with self.subTest(page_size=ps):
                 a = build_swa_pool(page_size=ps)
                 slots = a.alloc(96 * ps)
                 a.free_swa(slots[: 40 * ps])
-                state = {"pd": True, "host": True}
-                pin_every_band(a, lambda: not state["pd"])
-                pin_every_band(a, lambda: not state["host"])
                 x = a.full_attn_allocator
-                epoch = x._chain_capacity_epoch()
                 opened = x.schedulable_available_size()
                 for pd, host in (
                     (True, False),
@@ -178,7 +177,11 @@ class TestDynamicGateCapacity(CustomTestCase):
                     (False, True),
                     (True, True),
                 ):
-                    state.update(pd=pd, host=host)
+                    # Two holders of every band, each released on its own.
+                    for key, released in (("pd", pd), ("host", host)):
+                        release_every_band(a, key)
+                        if not released:
+                            hold_every_band(a, key)
                     expected = x._available_tokens(x._peer_drainable_hole_bytes())
                     self.assertEqual(x.schedulable_available_size(), expected)
                     self.assertEqual(expected == opened, pd and host)
@@ -188,27 +191,24 @@ class TestDynamicGateCapacity(CustomTestCase):
                         side_effect=AssertionError("stable gate recomputed"),
                     ):
                         self.assertEqual(x.schedulable_available_size(), expected)
-                    self.assertEqual(x._chain_capacity_epoch(), epoch)
                     self.assertEqual(x._capacity_memo_violations(), [])
 
-    def test_float_opposite_gate_owners_do_not_alias(self):
+    def test_float_opposite_hold_owners_do_not_alias(self):
         _, a = build_tri_pool()
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
         a.free_full(slots[10:11])
         x = a.swa_attn_allocator
-        state = {"low": True, "high": True}
-        x.low_peer.pin_sources = (lambda: not state["low"],)
-        x.high_peer.pin_sources = (lambda: not state["high"],)
-        epoch = x._chain_capacity_epoch()
         observed = {}
         for low, high in ((False, True), (True, False), (False, False), (True, True)):
-            state.update(low=low, high=high)
+            for peer, opened in ((x.low_peer, low), (x.high_peer, high)):
+                release_band(peer)
+                if not opened:
+                    hold_band(peer)
             expected = x._available_tokens(x._peer_drainable_hole_bytes())
             observed[low, high] = x.schedulable_available_size()
             self.assertEqual(observed[low, high], expected)
-            self.assertEqual(x._chain_capacity_epoch(), epoch)
             self.assertEqual(x._capacity_memo_violations(), [])
         self.assertNotEqual(observed[False, True], observed[True, False])
 

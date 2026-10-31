@@ -13,6 +13,8 @@ from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     arena_of,
+    hold_band,
+    release_band,
     stand_in_views,
     tri_sub_pool_specs,
 )
@@ -86,7 +88,7 @@ def build_geometry(ps, ratio, lazy, pattern, gate):
         a.mamba_allocator.free(states[1:4])
     if gate:
         for x in a._flush_targets():
-            x.pin_sources = (lambda: True,)
+            hold_band(x)
     return (a, kv, mk)
 
 
@@ -145,7 +147,10 @@ class TestFloatMovementGate(CustomTestCase):
                 a, kv, mk = build_geometry(1, (1, 1), True, "swa_internal", False)
                 sa = a.swa_attn_allocator
                 saved = payload(a, kv, mk)
-                sa.pin_sources = (lambda: not gates[0], lambda: not gates[1])
+                # Two holders; the band stays while either holds it.
+                for key, opened in zip(("first", "second"), gates):
+                    if not opened:
+                        hold_band(sa, key)
                 before = snapshot(a)
                 low, high = sa._gap_pages()
                 gap = (low if side == "low" else high) * sa.entry_bytes_per_page
@@ -171,7 +176,8 @@ class TestFloatMovementGate(CustomTestCase):
                 self.assertEqual(settle.call_count, 0)
                 self.assertEqual(copies.call_count, 0)
                 self.assertEqual(snapshot(a), before)
-                sa.pin_sources = ()
+                release_band(sa, "first")
+                release_band(sa, "second")
                 with patch.object(
                     a.arena, "move_units", wraps=a.arena.move_units
                 ) as copies:
@@ -205,7 +211,7 @@ class TestFloatMovementGate(CustomTestCase):
                 self.check_saved(a, saved)
                 if got is None:
                     for member in a._flush_targets():
-                        member.pin_sources = ()
+                        release_band(member)
                     a.ensure_capacity(demand, demand)
                     self.assertIsNotNone(a.alloc(demand))
                     self.check_saved(a, saved)
@@ -222,12 +228,12 @@ class TestFloatMovementGate(CustomTestCase):
         sa = a.swa_attn_allocator
         saved = payload(a, kv, mk)
         demand = ma.available_size() + 1
-        sa.pin_sources = (lambda: True,)
+        hold_band(sa)
         with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
             self.assertIsNone(ma.alloc(demand))
         self.assertEqual(copies.call_count, 0)
         self.check_saved(a, saved)
-        sa.pin_sources = ()
+        release_band(sa)
         with patch.object(a.arena, "move_units", wraps=a.arena.move_units) as copies:
             self.assertIsNotNone(ma.alloc(demand))
         self.assertGreater(copies.call_count, 0)

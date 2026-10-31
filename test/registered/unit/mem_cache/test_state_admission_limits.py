@@ -10,7 +10,10 @@ from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_de
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import setup_allocator_context
+from sglang.test.unified_allocator_fixtures import (
+    hold_band,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -135,7 +138,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
         self.assertTrue(allocator.admits(low, {}, 1))
         self.assertFalse(allocator.admits(low + 0.5, {}, 1))
 
-    def test_pinned_window_keeps_the_physical_state_surcharge(self):
+    def test_held_window_admission_is_its_take(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
         from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
         from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -193,7 +196,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
         full = owner.alloc(20)
         self.assertIsNotNone(full)
         window.alloc_with_virtual(full)
-        allocator.add_pin_source(("swa",), lambda: True)
+        hold_band(window)
         self.assertEqual(state.available_size(), 20)
         self.assertEqual(owner.available_size(), 20)
         self.assertEqual(window.available_size(), 20)
@@ -201,17 +204,22 @@ class TestStateAdmissionLimits(unittest.TestCase):
         self.assertTrue(budget.state_slots_fit(12))
         self.assertGreaterEqual(budget.remaining_total, 12)
         self.assertGreaterEqual(budget.remaining_swa, 12)
-        self.assertFalse(
-            budget.check_prefill(
-                extend_input_len=11,
-                total_tokens=12,
-                max_new_tokens=0,
-                input_tokens=11,
-                swa_host_hit_length=0,
-                chunk_limit=None,
-                state_slots=12,
-            )[0]
-        )
+        held = {p: int(window.ids.physical_to_virtual[p]) for p in window.fixed_pages()}
+        fits = budget.check_prefill(
+            extend_input_len=11,
+            total_tokens=12,
+            max_new_tokens=0,
+            input_tokens=11,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+            state_slots=12,
+        )[0]
+        # The held window's pages stay; the admission answer is the takes'.
+        slots = state.alloc(12)
+        tokens = allocator.alloc(12) if slots is not None else None
+        self.assertEqual(fits, tokens is not None)
+        for page, virtual in held.items():
+            self.assertEqual(int(window.ids.physical_to_virtual[page]), virtual)
         self.assertFalse(allocator.verify_byte_accounting())
 
     def test_pending_state_still_consumes_shared_memory(self):

@@ -36,6 +36,8 @@ from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
     chain_snapshot,
+    hold_every_band,
+    release_every_band,
     setup_allocator_context,
 )
 
@@ -219,28 +221,28 @@ class TestNetworkTransfers(CustomTestCase):
         self.assertTrue(flag.query())
 
 
-class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
+class TestFixedPeerHolesAreNotSchedulable(CustomTestCase):
     """`schedulable_available_size` credits holes a peer urgent-flush would
-    release. While a pin source is busy that flush relocates nothing, so
+    release. While a peer holds a fixed page that flush relocates nothing, so
     crediting them lets the scheduler admit work `relieve_for_alloc` cannot
     satisfy; the alloc then returns None and the decode prealloc path treats
     that as a memory-estimation bug and aborts the scheduler.
     """
 
     class _Peer:
-        def __init__(self, sources):
+        def __init__(self, holders):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
             self.usage = PageUsage()
             self.entry_bytes_per_page = 512
-            self.pin_sources = sources
+            for key in holders:
+                self.usage.fix(key, [5])
 
         def _is_frontier_transparent(self):
             return False
 
-        # Exercise the production predicates when checking each source.
+        # Exercise the production predicate when checking each holder.
         moves_blocked = Band.moves_blocked
-        pinned_by_source = Band.pinned_by_source
 
     class _Owner:
         """Stands in for a grow-up END pool: the credit walks the chain from
@@ -254,31 +256,27 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
 
         _growth_side_neighbor = Band._growth_side_neighbor
 
-    def _credit(self, *sources):
-        peer = self._Peer(sources)
+    def _credit(self, *holders):
+        peer = self._Peer(holders)
         owner = self._Owner(peer)
         return Band._peer_drainable_hole_bytes(owner)
 
-    def test_credit_follows_the_pins(self):
-        # No pin source (non-disagg): holes are realizable as before.
+    def test_credit_follows_the_fixed_pages(self):
+        # Nothing fixed: holes are realizable.
         self.assertEqual(self._credit(), 4 * 512)
-        # Source idle: peer can compact, so the credit stands.
-        self.assertEqual(self._credit(lambda: False), 4 * 512)
-        # Source busy: an urgent flush would move nothing, so credit nothing.
-        self.assertEqual(self._credit(lambda: True), 0)
-        # Any one busy source (RDMA or HiCache) blocks compaction.
-        self.assertEqual(self._credit(lambda: False, lambda: False), 4 * 512)
-        self.assertEqual(self._credit(lambda: False, lambda: True), 0)
-        self.assertEqual(self._credit(lambda: True, lambda: False), 0)
+        # A fixed page: an urgent flush that cannot move around it moves
+        # nothing, so credit nothing.
+        self.assertEqual(self._credit("load"), 0)
+        # Any one holder blocks compaction.
+        self.assertEqual(self._credit("load", "other"), 0)
 
 
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
     """The unified allocator must translate virtual IDs before PD transfer.
 
     Inheriting the static allocator's identity would put virtual IDs on the
-    wire and silently corrupt KV. A pin source over every sub-pool must reach
-    every band of every chain, and so must every event that orders a
-    sub-pool's page moves.
+    wire and silently corrupt KV. Every event that orders a sub-pool's page
+    moves must reach every band of every chain.
     """
 
     # The layers of each chain shape: full + window, full + state, all three.
@@ -318,35 +316,14 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         self.assertEqual(physical.dtype, torch.int64)
         self.assertEqual(physical.tolist(), [17, 19])
 
-    def test_every_pin_source_reaches_every_member(self):
-        """A transfer's pin source, registered over every sub-pool the storage
-        lists, must protect every band from relocation."""
-
-        def busy() -> bool:
-            return True
-
-        for chain in self._CHAINS:
-            with self.subTest(chain=chain):
-                alloc = self._chain(chain)
-                storage = alloc.storage
-                storage.add_pin_source(storage.sub_pool_names(), busy)
-                self.assertEqual(
-                    {m.sub_pool_name for m in alloc.members if busy in m.pin_sources},
-                    self._sub_pools(alloc),
-                    f"{chain}'s pin source does not cover every sub-pool",
-                )
-                self.assertTrue(all(m.moves_blocked() for m in alloc.members))
-
-    def test_transfers_block_nothing_and_an_independent_pin_source_still_does(self):
+    def test_transfers_block_nothing_and_holding_still_does(self):
         """Network transfers order moves without blocking a band, so a role
-        switch has nothing to drop or leak; an independent pin source still
-        keeps every band it names in place on its own."""
+        switch has nothing to drop or leak; holding every band still keeps each
+        in place on its own."""
         for chain in self._CHAINS:
             with self.subTest(chain=chain):
                 alloc = self._chain(chain)
                 storage = alloc.storage
-                other = SimpleNamespace(busy=False)
-                storage.add_pin_source(storage.sub_pool_names(), lambda: other.busy)
                 owner = alloc.full_attn_allocator
 
                 def capacity_keys():
@@ -361,10 +338,13 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 self.assertEqual(capacity_keys(), keys)
                 end_network_transfer(alloc, req)
                 self.assertEqual(capacity_keys(), keys)
-                other.busy = True
-                self.assertTrue(all(m.moves_blocked() for m in alloc.members))
+                hold_every_band(alloc)
+                # A hold fixes live pages: a band with none has nothing to keep.
+                self.assertTrue(
+                    all(m.moves_blocked() for m in alloc.members if m.live_page_count)
+                )
                 self.assertNotEqual(capacity_keys(), keys)
-                other.busy = False
+                release_every_band(alloc)
                 self.assertFalse(any(m.moves_blocked() for m in alloc.members))
 
     def test_every_ordering_event_reaches_every_member(self):

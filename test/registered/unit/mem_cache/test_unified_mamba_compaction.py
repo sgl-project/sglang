@@ -14,6 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
+    hold_band,
     setup_allocator_context,
 )
 
@@ -456,7 +457,7 @@ class TestMambaCompaction(CustomTestCase):
                 observed[i].copy_(f.pool.raw[p * n : (p + 1) * n])
             done.record()
         self.assertFalse(done.query())
-        f.alloc.pin_sources = (lambda: True,)
+        hold_band(f.alloc)
         calls = f.move.call_count
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
         self.assertFalse(done.query(), "pending retention was not observed")
@@ -465,13 +466,19 @@ class TestMambaCompaction(CustomTestCase):
         done.synchronize()
         self.assertTrue(torch.equal(observed.cpu(), expected))
         # The reader's result is processed: its forward retires.
+        held_free = f.alloc.available_size()
         f.alloc.retire_forward(done)
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
         self.assertFalse(f.alloc.usage.pending_by_key())
         self.assertFalse(f.alloc.usage.pending_pages)
-        self.assertEqual(set(f.alloc._free_phys_pages.cpu().tolist()), set(old_sources))
+        # Every source is free again, as a hole or past the end's frontier
+        # (absorbed without a copy); none moved.
+        first, end = f.alloc._span_range()
+        holes = set(f.alloc._free_phys_pages.cpu().tolist())
+        for p in old_sources:
+            self.assertTrue(p in holes or not first <= p < end, p)
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
-        self.assertEqual(f.alloc._free_phys_pages.numel(), 8)
+        self.assertEqual(f.alloc.available_size(), held_free + 8)
         self.assertEqual(f.move.call_count, calls)
         self._verify(f, set(range(8, 16)))
         reused = f.alloc.alloc(1).clone()

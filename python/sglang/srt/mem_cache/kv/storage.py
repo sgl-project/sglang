@@ -839,15 +839,6 @@ class KVStorage:
             return self._allocator.mamba_allocator
         return self._allocator.window_allocators[sub_pool]
 
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Keep the named sub-pools' device rows where they are whenever
-        ``busy()`` holds: a DMA engine (a PD transfer, a HiCache copy) reads
-        or writes the addresses it was handed. Register each initiator once,
-        over the queues that live across iterations; tree locks are not pins."""
-        self._allocator.add_pin_source(sub_pools, busy)
-
     def record_forward(
         self,
         forward_done: torch.cuda.Event,

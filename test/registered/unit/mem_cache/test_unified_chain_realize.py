@@ -21,6 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
+    hold_band,
     setup_allocator_context,
 )
 
@@ -137,7 +138,7 @@ class TestChainRealize(CustomTestCase):
                 state.free(slot)
         for band in allocator.bands:
             if rng.random() < 0.2:
-                band.pin_sources = (lambda: True,)
+                hold_band(band)
             elif rng.random() < 0.3:
                 live = _live_pages(band)
                 if live:

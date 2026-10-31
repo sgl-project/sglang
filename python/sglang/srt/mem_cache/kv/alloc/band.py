@@ -31,7 +31,6 @@ import inspect
 import logging
 import os
 from typing import (
-    Callable,
     Generic,
     Hashable,
     List,
@@ -430,10 +429,6 @@ class Band:
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        # Pin sources: DMA initiators (PD transfers, HiCache copies) whose queues
-        # outlive an iteration. While any reports busy, no page of this band
-        # relocates: the engine reads or writes the addresses it was handed.
-        self.pin_sources: Tuple[Callable[[], bool], ...] = ()
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so
         # a large backlog doesn't block ZMQ IPC. Urgent retries are uncapped.
@@ -815,19 +810,10 @@ class Band:
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
 
-    def add_pin_source(self, busy: Callable[[], bool]) -> None:
-        """Keep this band's pages in place whenever ``busy()`` holds."""
-        self.pin_sources = (*self.pin_sources, busy)
-
-    def pinned_by_source(self) -> bool:
-        """Whether a pin source is busy now: its answer changes with no write
-        to the band, so capacity memos ask it each time."""
-        return any(busy() for busy in self.pin_sources)
-
     def moves_blocked(self) -> bool:
-        """Whether a pin currently forbids relocating pages: a busy pin source,
-        or any fixed page for the paths that cannot move around one."""
-        return bool(self.usage.fixed) or self.pinned_by_source()
+        """Whether a fixed page forbids relocating pages, for the paths that
+        cannot move around one."""
+        return bool(self.usage.fixed)
 
     def fix_pages(self, key: Hashable, pages: Sequence[int]) -> None:
         """Keep these physical pages where they are, under ``key`` (added to
@@ -1384,11 +1370,6 @@ class Band:
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
-        assert not self.pin_sources, (
-            f"_compact_pending({self.sub_pool_name!r}): eager compaction ran "
-            "with a pin source registered; PD disaggregation and HiCache both "
-            "require lazy_compaction."
-        )
         freed_set = set(int(x) for x in freed_physical_pages.tolist())
         if not freed_set:
             return
@@ -1455,9 +1436,6 @@ class Band:
         vacated-region clearing. Returns the moved virtual page ids.
         """
         # Callers keep fixed pages out of `src_pages`.
-        assert not self.pinned_by_source(), (
-            f"[{self.sub_pool_name}] page copy while the band is pinned"
-        )
         v_moved = self.ids.physical_to_virtual[src_pages].clone()  # read pre-wipe
         self._move_pages(src_pages, dst_pages)
         self.ids.virtual_to_physical[v_moved] = dst_pages
@@ -1903,11 +1881,6 @@ class Band:
         """
         if not self.lazy_compaction:
             return 0
-        if self.pinned_by_source():
-            # Holes stay in the free list; the next flush picks them up. Fired
-            # pending sources rejoin it now, since that copies nothing.
-            self._drain_pending_reuse(urgent=False)
-            return 0
         self.usage.prune()
         # Read the transfers' pages on the host before any stream wait below.
         transfer_sets = self._transfer_page_sets()
@@ -2156,8 +2129,8 @@ class Band:
         """
         if not srcs:
             return
-        assert not self.pinned_by_source() and not set(srcs) & self.fixed_pages(), (
-            f"[{self.sub_pool_name}] page copy of a pinned or fixed page"
+        assert not set(srcs) & self.fixed_pages(), (
+            f"[{self.sub_pool_name}] page copy of a fixed page"
         )
         with record_function("Band._commit_move_batch"):
             readers = self._readers_of(srcs, transfer_sets)
