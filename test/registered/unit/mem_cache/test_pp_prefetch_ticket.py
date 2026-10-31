@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -37,7 +38,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
 
 class TestPPPrefetchTicket(unittest.TestCase):
@@ -457,6 +458,51 @@ class TestPPPrefetchTicket(unittest.TestCase):
                             )
                         else:
                             c.mem_pool_host.free.assert_not_called()
+
+    def test_checkpoint_vote_stays_within_capacity_capped_hit(self):
+        """A stage whose hit is capped to free host space must not vote for
+        restorable checkpoints past that cap, or the agreed hit outgrows the
+        buffers it allocated."""
+        c = self.c
+        stored_pages, free_pages = 8, 2
+        c.mem_pool_host.available_size.return_value = free_pages * 4
+        c.mem_pool_host.get_pool.side_effect = lambda name: Mock(
+            page_size=4 if name == PoolName.KV else 1
+        )
+
+        def query(operation):
+            hashes = get_storage_hash_str(
+                operation.token_ids, operation.last_hash, page_size=4
+            )
+            operation.all_hash_values = hashes
+            operation.query_pool_hit_pages = {PoolName.KV: stored_pages}
+            operation.pool_storage_result.restorable_prefix_pages = list(
+                range(1, stored_pages + 1)
+            )
+            return hashes[:stored_pages], stored_pages * 4
+
+        c._storage_hit_query.side_effect = query
+        votes = []
+        c._all_reduce.side_effect = lambda tensor, *_: votes.append(tensor.tolist())
+        kda = PoolTransfer(
+            PoolName.MAMBA, keys=["kda"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        c.submit_prefetch(
+            CacheRequestHandle("capped", 0),
+            RadixKey(array("q", range(stored_pages * 4 + 1))),
+            None,
+            None,
+            [],
+            [kda],
+        )
+        self.run_commands(c.pp_prefetch_states["capped"].ticket)
+
+        operation = c.prefetch_buffer.get_nowait()
+        self.assertEqual(votes[0][: stored_pages + 1], [1, 1, 1] + [0] * 6)
+        self.assertEqual(operation.host_indices.numel(), free_pages * 4)
+        self.assertEqual(operation.storage_hit_count, free_pages * 4)
+        self.assertEqual(len(operation.hash_value), free_pages)
+        self.assertFalse(operation.is_terminated())
 
     def test_local_miss_or_query_error_completes_before_next_ticket(self):
         """A stage miss/error must complete admission without breaking ACK order."""

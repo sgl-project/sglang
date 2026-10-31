@@ -24,9 +24,17 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
+from functools import wraps
 from itertools import count
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 
 import msgspec
+from msgspec.structs import replace
+
+if TYPE_CHECKING:
+    from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval
 
 # Schema version. Must match the consumer (Dynamo's ForwardPassMetrics).
 # Bump when the schema changes incompatibly.
@@ -132,10 +140,125 @@ def decode(data: bytes) -> ForwardPassMetrics:
     return _decoder.decode(data)
 
 
+@dataclass(frozen=True, slots=True)
+class TimingSegment:
+    """One completed forward segment: its GPU time and a read-only metadata copy."""
+
+    elapsed_seconds: float
+    metadata: Mapping[str, Any]
+
+
+class FpmTiming:
+    """First-start to last-end GPU span on one stream, including segment gaps."""
+
+    def __init__(self):
+        self.num_intervals = 0
+        self._pending = 0
+        self._sealed = False
+        self._callbacks: list[Callable[[Optional[float]], None]] = []
+        self._intervals: list[_TimingInterval] = []
+        self._segments: Optional[tuple[TimingSegment, ...]] = None
+        self._first_interval = None
+        self._last_interval = None
+        self._same_stream = True
+
+    @property
+    def segments(self) -> tuple[TimingSegment, ...]:
+        """Completed segments in submission order; read once ready.
+
+        Built on first read, so a span-only consumer never queries per-segment
+        durations or copies metadata.
+        """
+        if self._segments is None:
+            if not self._sealed or self._pending:
+                raise RuntimeError("FpmTiming segments are read only once ready")
+            self._segments = tuple(
+                TimingSegment(
+                    elapsed_seconds=interval.elapsed_time() / 1000.0,
+                    metadata=MappingProxyType(dict(interval.metadata or {})),
+                )
+                for interval in self._intervals
+            )
+        return self._segments
+
+    def on_interval_start(self, interval):
+        self.num_intervals += 1
+        self._pending += 1
+        self._intervals.append(interval)
+        if self._first_interval is None:
+            self._first_interval = interval
+        elif interval.stream != self._first_interval.stream:
+            self._same_stream = False
+        self._last_interval = interval
+
+    def on_interval_ready(self, interval):
+        self._pending -= 1
+        self._notify()
+
+    def seal(self):
+        self._sealed = True
+        self._notify()
+
+    def when_ready(self, callback: Callable[[Optional[float]], None]):
+        self._callbacks.append(callback)
+        self._notify()
+
+    def _notify(self):
+        if not self._sealed or self._pending or not self._callbacks:
+            return
+        callbacks, self._callbacks = self._callbacks, []
+        if self._first_interval is None:
+            elapsed = 0.0
+        elif not self._same_stream:
+            elapsed = None
+        else:
+            elapsed = (
+                self._first_interval.start_event.elapsed_time(
+                    self._last_interval.end_event
+                )
+                / 1000.0
+            )
+        for callback in callbacks:
+            callback(elapsed)
+
+    def publish_when_ready(self, metrics, publisher):
+        # Hold only immutable scalar statistics, never a live batch/request.
+        def publish(elapsed):
+            if elapsed is None:
+                logger.warning(
+                    "FPM timing spans multiple CUDA streams; skipping ambiguous span"
+                )
+                return
+            publisher.publish(replace(metrics, wall_time=elapsed))
+
+        self.when_ready(publish)
+
+
+def wrap_forward_with_fpm(forward: Callable, timer: DeviceTimer) -> Callable:
+    """Capture a forward's existing intervals and attach them to its result."""
+
+    @wraps(forward)
+    def timed_forward(batch, *args, **kwargs):
+        # PREBUILT can recursively dispatch an inner idle forward for DP MLP
+        # synchronization. Let that real forward own the capture and result.
+        if batch.forward_mode.is_prebuilt():
+            return forward(batch, *args, **kwargs)
+        timing = FpmTiming()
+        try:
+            with timer.capture(timing):
+                result = forward(batch, *args, **kwargs)
+        finally:
+            timing.seal()
+        result.fpm_timing = timing
+        return result
+
+    return timed_forward
+
+
 class _FpmPublisherThread:
     """Background thread that serializes and sends ForwardPassMetrics over ZMQ.
 
-    Also emits periodic heartbeats when idle.
+    Heartbeats require an explicit idle state from the scheduler.
     """
 
     SHUTDOWN_TIMEOUT: float = 1.0
@@ -156,6 +279,7 @@ class _FpmPublisherThread:
         self._seq = count()
         self._worker_id = worker_id
         self._dp_rank = dp_rank
+        self._idle = False
 
         self._ctx = zmq.Context()
         self._pub = self._ctx.socket(zmq.PUB)
@@ -167,6 +291,10 @@ class _FpmPublisherThread:
             target=self._run, daemon=True, name="fpm-zmq-publisher"
         )
         self._thread.start()
+
+    def set_idle(self, idle: bool) -> None:
+        """Set whether the scheduler permits idle heartbeats."""
+        self._idle = idle
 
     def publish(self, metrics: ForwardPassMetrics) -> None:
         if not self._running:
@@ -200,7 +328,10 @@ class _FpmPublisherThread:
                 if metrics is None:
                     break
             except queue.Empty:
-                if time.monotonic() - last_publish >= self.HEARTBEAT_INTERVAL:
+                if (
+                    self._idle
+                    and time.monotonic() - last_publish >= self.HEARTBEAT_INTERVAL
+                ):
                     metrics = ForwardPassMetrics(
                         worker_id=self._worker_id,
                         dp_rank=self._dp_rank,

@@ -9,7 +9,6 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import UnifiedSWAAllocatorBase
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.utils.common import ceil_align
@@ -48,9 +47,7 @@ class SWARecompute(msgspec.Struct):
 
 def supports_swa_recompute(allocator) -> bool:
     return (
-        isinstance(allocator, SWATokenToKVPoolAllocator)
-        and not isinstance(allocator, UnifiedSWAAllocatorBase)
-        and not allocator.swa_req_ring
+        isinstance(allocator, SWATokenToKVPoolAllocator) and not allocator.swa_req_ring
     )
 
 

@@ -10,14 +10,12 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 
 
 class SWARecomputeOutput(msgspec.Struct):
     # Extend-shaped view of the replayed span: prefix_lens, extend_lens, out_cache_loc.
     batch: ScheduleBatch
     logits_output: LogitsProcessorOutput
-    kv_loc_plan: KVLocPlan
 
 
 def _replay_batch(batch: ScheduleBatch, i: int, start: int, runner) -> ScheduleBatch:
@@ -60,6 +58,17 @@ def _replay_batch(batch: ScheduleBatch, i: int, start: int, runner) -> ScheduleB
     return replay
 
 
+def swa_recompute_batches(batch: ScheduleBatch, runner) -> List[ScheduleBatch]:
+    """One extend-shaped view per request that owes a replay, in batch order."""
+    if batch.swa_recompute_starts is None:
+        return []
+    return [
+        _replay_batch(batch, i, start, runner)
+        for i, start in enumerate(batch.swa_recompute_starts)
+        if start is not None
+    ]
+
+
 def run_swa_recompute(
     worker, batch: ScheduleBatch, capture_hidden_mode
 ) -> List[SWARecomputeOutput]:
@@ -70,10 +79,7 @@ def run_swa_recompute(
 
     runner = worker.model_runner
     outputs = []
-    for i, start in enumerate(batch.swa_recompute_starts):
-        if start is None:
-            continue
-        replay = _replay_batch(batch, i, start, runner)
+    for replay in swa_recompute_batches(batch, runner):
         forward_batch = ForwardBatch.init_new(
             replay,
             runner,
@@ -83,10 +89,6 @@ def run_swa_recompute(
         forward_batch.swa_recompute = True
         out = runner.forward(forward_batch)
         outputs.append(
-            SWARecomputeOutput(
-                batch=replay,
-                logits_output=out.logits_output,
-                kv_loc_plan=forward_batch.kv_loc_plan,
-            )
+            SWARecomputeOutput(batch=replay, logits_output=out.logits_output)
         )
     return outputs
