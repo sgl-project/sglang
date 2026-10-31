@@ -21,7 +21,7 @@ from sglang.srt.managers.incremental_detokenize import (
     DetokenizeState,
     build_detokenize_header,
 )
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as r
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1551,6 +1551,18 @@ class TestRetainedWindowClaim(CustomTestCase):
         # The uncommitted tail goes back now; the holder keeps the rest.
         self.assertEqual(cache.aligned_frees, [(2, committed, committed + 5)])
         self.assertEqual(entry.holder.kv.kv_allocated_len, committed)
+
+    def test_interrupted_text_never_becomes_a_reuse_source(self):
+        """length and abort results must leave their KV with the release path"""
+        for reason in (FINISH_LENGTH(1), FINISH_ABORT()):
+            with self.subTest(reason=type(reason).__name__):
+                cache = _MatchCache(backend=_backend_stub())
+                req, _ = self._finished(self.PROMPT)
+                req.finished_reason = reason
+                self.assertFalse(cache.reuse.on_cache_finished_req(req))
+                self.assertTrue(req.kv.holds_kv)
+                self.assertEqual(req.lock, "tree-lock")
+                self.assertEqual(cache.reuse.docs, {})
 
     def test_unusable_layout_leaves_the_row_to_release_kv_cache(self):
         cache = _MatchCache(backend=_backend_stub())
