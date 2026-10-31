@@ -1130,7 +1130,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         run_compact = self._verify_planner.should_run_compact(
             layout=layout
-        )  # 返回值为True 判断走compact模式路径
+        ) 
 
         verify_ids_2d = proposal.verify_ids
         if verify_ids_2d is None:
