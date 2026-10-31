@@ -68,7 +68,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    get_is_main_process,
+    init_logger,
+)
 
 logger = init_logger(__name__)
 
@@ -622,7 +625,9 @@ class ComposedPipelineBase(ABC):
         )
 
         for spec in tqdm(
-            iterable=component_load_specs, desc="Loading required modules"
+            iterable=component_load_specs,
+            desc="Loading required modules",
+            disable=not get_is_main_process(),
         ):
             module_name: str = spec.module_name
             load_module_name: str = spec.load_module_name
