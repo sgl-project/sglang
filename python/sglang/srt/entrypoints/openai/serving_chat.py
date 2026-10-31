@@ -1009,7 +1009,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
 
         # Handle tool calls
-        if self._tool_call_parsing_active(request) and not self._answer_started(
+        if self._parses_tool_calls(request) and not self._answer_started(
             reasoning_parser_dict.get(index)
         ):
             async for chunk in self._process_tool_call_stream(
@@ -1064,7 +1064,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # to attach to either way, and a standalone empty-delta logprobs chunk
         # is not a shape clients expect.
         if remaining_logprobs is not None and (
-            self.reasoning_parser or self.tool_call_parser
+            self.reasoning_parser
+            or self.tool_call_parser
+            or self._parses_tool_calls(request)
         ):
             usage = None
             if continuous_usage_stats:
@@ -1097,6 +1099,17 @@ class OpenAIServingChat(OpenAIServingBase):
             detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
             return detector.parses_without_tools()
         return request.tool_choice != "none"
+
+    def _parses_tool_calls(self, request: ChatCompletionRequest) -> bool:
+        """Whether this request's output is read for tool calls: by the tool-call
+        parser, or, with none configured, as the JSON array that required and named
+        choices constrain it to."""
+        if self.tool_call_parser:
+            return self._tool_call_parsing_active(request)
+        return (
+            request.tool_choice == "required"
+            or isinstance(request.tool_choice, ToolChoice)
+        ) and bool(self._effective_tools(request))
 
     @staticmethod
     def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
@@ -2963,7 +2976,7 @@ class OpenAIServingChat(OpenAIServingBase):
             effective_tools = self._effective_tools(request)
             if (
                 encoding_output is None
-                and self._tool_call_parsing_active(request)
+                and self._parses_tool_calls(request)
                 and not answer_started
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)

@@ -1366,6 +1366,57 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(finishes, [expected_finish])
         return served
 
+    def test_forced_tool_call_without_parser_is_returned_as_tool_calls(self):
+        """Without a tool-call parser, the JSON array that required and named choices
+        are constrained to must come back as tool calls, not as content."""
+        self.chat.tool_call_parser = None
+        output = _spec_result(0)
+        output["text"] = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+        for tool_choice in (
+            "required",
+            {"type": "function", "function": {"name": "get_weather"}},
+        ):
+            adapted, _ = self._convert_rendered_as(
+                "<assistant>", tools=[_WEATHER_TOOL], tool_choice=tool_choice
+            )
+            self.assertIn("json_schema", adapted.sampling_params)
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    choice=tool_choice, stream=stream, incremental=incremental
+                ):
+                    self.assertEqual(
+                        self._served(
+                            output,
+                            stream,
+                            incremental=incremental,
+                            tools=[_WEATHER_TOOL],
+                            tool_choice=tool_choice,
+                        ),
+                        ("", "", [("get_weather", {"city": "Paris"})]),
+                    )
+
+    def test_unforced_tool_choice_without_parser_keeps_json_as_content(self):
+        """Choices that force no call leave JSON the model writes in the content when
+        no tool-call parser is configured."""
+        self.chat.tool_call_parser = None
+        output = _spec_result(0)
+        output["text"] = '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+        for tool_choice in ("auto", "none"):
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    choice=tool_choice, stream=stream, incremental=incremental
+                ):
+                    self.assertEqual(
+                        self._served(
+                            output,
+                            stream,
+                            incremental=incremental,
+                            tools=[_WEATHER_TOOL],
+                            tool_choice=tool_choice,
+                        ),
+                        ("", output["text"], []),
+                    )
+
     def test_markers_in_call_arguments_under_json_answer_stay_arguments(self):
         """Answer or thinking markers in call arguments must not open a region before a
         JSON answer."""
@@ -4611,6 +4662,53 @@ class ServingChatTestCase(CustomTestCase):
         self.assertTrue(
             logprob_chunks,
             "logprobs dropped: no flush chunk carried logprobs when tool parser buffered the delta",
+        )
+
+    def test_streaming_logprobs_flushed_when_forced_json_call_buffers_delta(self):
+        """Logprobs must still be sent for a delta the forced JSON tool call holds back
+        when no tool-call parser is configured."""
+        self.chat.tool_call_parser = None
+
+        content = {
+            "text": '[{"na',
+            "meta_info": {
+                "id": "chatcmpl-tool",
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [(0.3, 9, '[{"na')],
+                "output_top_logprobs": [],
+                "output_token_logprobs_length": 1,
+            },
+            "index": 0,
+        }
+        choice_logprobs = self.chat._process_streaming_logprobs(
+            content, 0, 1
+        ).model_dump()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[_WEATHER_TOOL],
+            tool_choice="required",
+            stream=True,
+            logprobs=True,
+        )
+
+        chunks = get_or_create_event_loop().run_until_complete(
+            self._collect_stream_content(content, choice_logprobs, req)
+        )
+
+        choices = [c["choices"][0] for c in self._parse_chunks(chunks)]
+        self.assertFalse(any(c["delta"].get("content") for c in choices))
+        self.assertEqual(
+            [
+                token["token"]
+                for c in choices
+                for token in (c.get("logprobs") or {}).get("content") or []
+            ],
+            ['[{"na'],
         )
 
     def test_streaming_logprobs_not_flushed_on_empty_delta_step_without_parser(self):
