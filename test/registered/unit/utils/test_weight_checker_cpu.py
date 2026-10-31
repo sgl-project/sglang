@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.utils.weight_checker import ChecksumInfo, WeightChecker
+from sglang.srt.utils.weight_checker import ChecksumInfo, WeightChecker, _hash_tensor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -15,6 +15,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestChecksumWithoutCuda(CustomTestCase):
+    def test_checksum_preserves_pre_identity_sha256(self):
+        """Cache identity changes must not change the trainer's weight checksum."""
+        tensor = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).T
+        expected = hashlib.sha256(
+            tensor.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        ).hexdigest()[:16]
+        self.assertEqual(_hash_tensor(tensor), expected)
+
     def test_checksum_does_not_require_cuda(self):
         """The checksum action must work on hosts without CUDA, e.g. TPU engines
         checked by an RL trainer after every weight update."""

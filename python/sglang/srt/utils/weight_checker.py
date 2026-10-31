@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
-from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.kernels.selector import get_kernel
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
@@ -277,7 +277,11 @@ class WeightChecker:
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
-    return f"{tensor_hash(t):016x}"
+    # preserve diagnostic checksums independently of multimodal cache identities
+    if t.is_cuda:
+        checksum = get_kernel("memory.gpu_tensor_hash", "triton")(t)
+        return f"{checksum:016x}"
+    return _sha256_tensor(t)[:16]
 
 
 def _sha256_tensor(t: torch.Tensor) -> str:
