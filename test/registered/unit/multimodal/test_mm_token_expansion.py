@@ -399,6 +399,7 @@ _MODEL_TYPES_BY_ARCH = {
     "Qwen3_5ForCausalLMMTP": ("qwen3_5",),
     "Qwen3OmniMoeForConditionalGeneration": ("qwen3_omni_moe",),
     "Qwen4ExpForConditionalGeneration": ("qwen4_exp",),
+    "Glm5NextForConditionalGeneration": ("glm5_next",),
 }
 
 
