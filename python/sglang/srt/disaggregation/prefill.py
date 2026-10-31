@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
@@ -67,6 +67,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
@@ -102,8 +103,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import is_npu, rank_consensus_checker
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -219,7 +221,6 @@ class PrefillBootstrapQueue:
             shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
-        self.pp_poll_sync_work_list: List = []
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -519,7 +520,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.pp_group,
                 self.pp_rank,
                 self.pp_size,
-                self.pp_poll_sync_work_list,
+                self.scheduler.pp_poll_sync_work_list_bootstrap,
+                P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1197,58 +1199,38 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[Dict[str, bool]] = None
-    ) -> List[Req]:
+    @rank_consensus(same_results=["[req.rid for req in result]"])
+    def process_disagg_prefill_inflight_queue(self: Scheduler) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, the PP consensus of concluded transfers as {rid: failed}.
-        Only these rids are concluded, and a rid failed on any stage is concluded as
-        failed on every stage, whatever this stage's own sender reports.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
         done_reqs = []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        parallel = get_parallel()
+        if parallel.pp_size > 1:
+            polls = poll_and_all_reduce_prefill_pp(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                self.pp_group,
+                parallel.pp_rank,
+                parallel.pp_size,
+                self.pp_poll_sync_work_list_inflight,
+                P2PTag.DISAGG_INFLIGHT_PP_SYNC,
+            )
+        else:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
-                    undone_reqs.append(req)
-                    continue
-
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
-                    logger.warning_once(
-                        f"PP rank {get_parallel().pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
-                    )
-                    undone_reqs.append(req)
-                    continue
-                # Conclude with the stage-consensus outcome: another stage may have
-                # failed this transfer (e.g. aborted after this stage finished).
-                if rids_to_check[req.rid]:
-                    poll = KVPoll.Failed
-                rank_consensus_checker.assert_same(
-                    "pp disagg prefill transfer concluded rid=%s failed=%s",
-                    req.rid,
-                    poll == KVPoll.Failed,
-                )
-
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
