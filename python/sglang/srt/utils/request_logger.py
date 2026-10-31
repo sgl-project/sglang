@@ -100,6 +100,7 @@ class RequestLogger:
         if not self.log_requests:
             return
 
+        obj = self._with_decoded_text(obj, tokenizer)
         max_length, skip_names, _ = self.metadata
         headers = _extract_whitelisted_headers(request)
         obj_to_log = _redact_client_watermark(obj)
@@ -117,23 +118,46 @@ class RequestLogger:
                 f"Receive: obj={_dataclass_to_string_truncated(obj_to_log, max_length, skip_names=skip_names)}{headers_str}"
             )
 
-        # FIXME: This is a temporary fix to get the text from the input ids.
-        # We should remove this once we have a proper way.
+    def _with_decoded_text(self, obj: Any, tokenizer: Any) -> Any:
         if (
-            self.log_requests_level >= 2
-            and obj.text is None
-            and obj.input_ids is not None
-            and tokenizer is not None
+            self.log_requests_level < 2
+            or obj.text is not None
+            or obj.input_ids is None
+            or tokenizer is None
         ):
-            if obj.input_ids and isinstance(obj.input_ids[0], list):
-                # Prefill node warmup while PD disaggregated.
-                decoded = [
-                    tokenizer.decode(_input_ids, skip_special_tokens=False)
-                    for _input_ids in obj.input_ids
-                ]
-            else:
-                decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
-            obj.text = decoded
+            return obj
+
+        # Bound decoding work as well as the formatted output at partial level.
+        # Share the budget across batch members rather than decoding it per row.
+        budget = 2048 if self.log_requests_level == 2 else None
+
+        def decode(ids, token_budget):
+            if token_budget is None or len(ids) <= token_budget:
+                return tokenizer.decode(ids, skip_special_tokens=False)
+            head = token_budget // 2
+            tail = token_budget - head
+            return (
+                tokenizer.decode(ids[:head], skip_special_tokens=False)
+                + " ... "
+                + tokenizer.decode(ids[-tail:], skip_special_tokens=False)
+            )
+
+        ids = obj.input_ids
+        if ids and isinstance(ids[0], list):
+            omitted = budget is not None and len(ids) > budget
+            if omitted:
+                head = budget // 2
+                ids = ids[:head] + ids[-(budget - head) :]
+            per_row = budget // len(ids) if budget is not None else None
+            decoded = [decode(row, per_row) for row in ids]
+            if omitted:
+                decoded.insert(head, "...")
+        else:
+            decoded = decode(ids, budget)
+
+        # Tokenization (including multimodal processing) still owns the request.
+        # A truncated logging preview must never become its inference text.
+        return dataclasses.replace(obj, text=decoded)
 
     def log_openai_received_request(
         self,
@@ -169,6 +193,7 @@ class RequestLogger:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         out: Any,
         request: Optional[fastapi.Request] = None,
+        tokenizer: Any = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -177,6 +202,7 @@ class RequestLogger:
         if self.log_exceeded_ms > 0 and e2e_latency_ms < self.log_exceeded_ms:
             return
 
+        obj = self._with_decoded_text(obj, tokenizer)
         max_length, skip_names, out_skip_names = self.metadata
         headers = _extract_whitelisted_headers(request)
         obj_to_log = _redact_client_watermark(obj)
