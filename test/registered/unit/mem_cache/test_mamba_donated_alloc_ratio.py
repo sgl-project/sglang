@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -111,7 +112,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     return component, cache, owned
 
 
-class TestMambaRatioEnvGate(unittest.TestCase):
+class TestMambaRatioEnvGate(CustomTestCase):
     """SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK gates the pool ratio: off restores the
     original base 3 (overlap 5, lazy 4, no_buffer 3), on drops the base to 2
     (overlap 4, lazy 3) while no_buffer stays 3. Guards the flag wiring so the
@@ -232,7 +233,7 @@ class _RecordingComp:
         pass
 
 
-class TestDecSwaLockSkip(unittest.TestCase):
+class TestDecSwaLockSkip(CustomTestCase):
     """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
     locks. On a node whose acquire skipped Mamba (decode hold), the release
     must skip it too, else it drops a mamba lock it never took -- another
@@ -284,7 +285,7 @@ class TestDecSwaLockSkip(unittest.TestCase):
         self.assertEqual(full.released, [])
 
 
-class TestMambaDonatedAllocRatio(unittest.TestCase):
+class TestMambaDonatedAllocRatio(CustomTestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
@@ -360,7 +361,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         )
 
 
-class TestPPMambaPoolSizing(unittest.TestCase):
+class TestPPMambaPoolSizing(CustomTestCase):
     """A PP rank only allocates mamba state for its own [start_layer, end_layer)
     slice, so charging it for the whole model's layers starves the pool. Sizing
     uses the largest per-stage share, which also keeps every rank on the same
@@ -476,7 +477,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         )
 
 
-class TestExtraMambaCacheSizing(unittest.TestCase):
+class TestExtraMambaCacheSizing(CustomTestCase):
     @staticmethod
     def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
         from sglang.srt import runtime_context as rc
