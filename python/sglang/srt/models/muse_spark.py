@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -94,11 +94,15 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
 from sglang.srt.utils.common import get_device_capability, is_cuda
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.muse_spark.routed_moe_split import RoutedMoeSplit
 
 _is_cpu = is_cpu()
 
@@ -768,6 +772,45 @@ class MuseSpark1xMoE(nn.Module):
         dp_scatter(local_output, output, forward_batch)
         return local_output
 
+    def _routed_moe_split(
+        self, packed_topk_ids: Optional[torch.Tensor]
+    ) -> Optional[RoutedMoeSplit]:
+        if not (
+            self.nvfp4_checkpoint
+            and packed_topk_ids is not None
+            and not self.experts.use_marlin
+            # Graph capture sees a fixed set of token counts; eager shapes would each cache routing metadata.
+            and get_is_capture_mode()
+        ):
+            return None
+        # Imports FlashInfer internals; only the NVFP4 FlashInfer path reaches here.
+        from sglang.srt.layers.muse_spark.routed_moe_split import (
+            get_routed_moe_split,
+            split_enabled,
+            split_supported,
+        )
+
+        num_tokens, top_k = packed_topk_ids.shape
+        if not (
+            split_enabled(
+                num_tokens=num_tokens,
+                tp_size=self.tp_size,
+                capability=torch.cuda.get_device_capability(packed_topk_ids.device),
+            )
+            and split_supported(
+                num_tokens=num_tokens,
+                top_k=top_k,
+                num_local_experts=self.experts.num_local_experts,
+            )
+        ):
+            return None
+        return get_routed_moe_split(
+            packed_topk_ids,
+            num_experts=self.experts.global_num_experts,
+            local_expert_offset=self.experts.local_expert_offset,
+            num_local_experts=self.experts.num_local_experts,
+        )
+
     def _forward_experts(
         self,
         hidden_states: torch.Tensor,
@@ -836,6 +879,9 @@ class MuseSpark1xMoE(nn.Module):
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
+            moe_split = None if sp_active else self._routed_moe_split(packed_topk_ids)
+            if moe_split is not None:
+                moe_split.populate(packed_topk_ids)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -870,6 +916,7 @@ class MuseSpark1xMoE(nn.Module):
                 pre_expert_norm=self.pre_expert_norm,
                 prepared_input=prepared_input,
                 packed_topk_ids=packed_topk_ids,
+                moe_split=moe_split,
                 ar_workspace=ar_workspace,
             )
         else:
