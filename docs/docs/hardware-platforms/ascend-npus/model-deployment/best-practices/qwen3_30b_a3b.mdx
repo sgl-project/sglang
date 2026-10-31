@@ -19,15 +19,15 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 10ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) |
-| Qwen3-30B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 6k+1.5k | 10.25ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in6k-out1k5-bs16) |
+| Qwen3-30B-A3B | A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 10ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) |
+| Qwen3-30B-A3B | A3 Series Products | 1 | PD Mixed | 6k+1.5k | 10.25ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-30B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 1k+100 | 10000ms | BF16 | [Optimal Configuration](#qwen3-30b-a3b-bf16-1p-in1k-out100) |
-| Qwen3-30B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
+| Qwen3-30B-A3B | A3 Series Products | 1 | PD Mixed | 1k+100 | 10000ms | BF16 | [Optimal Configuration](#qwen3-30b-a3b-bf16-1p-in1k-out100) |
+| Qwen3-30B-A3B | A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -37,7 +37,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: Qwen3-30B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -140,7 +140,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-30B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -240,7 +240,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-30B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -340,7 +340,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-30B-A3B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
