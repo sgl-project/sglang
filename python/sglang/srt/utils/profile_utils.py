@@ -40,6 +40,22 @@ logger = logging.getLogger(__name__)
 GRAPH_CAPTURE_PROFILE_DIRNAME = "graph_capture_profile"
 
 
+def sanitize_profile_filename_component(value: Optional[str]) -> Optional[str]:
+    """Make a caller-supplied profile_id or profile_prefix safe to use in a filename.
+
+    These values are joined into trace file names under the profiler output
+    directory, so path separators (and NUL) are replaced to keep the trace
+    from landing outside that directory.
+    """
+    if value is None:
+        return None
+    value = str(value)
+    for sep in {"/", "\\", os.sep, os.altsep, "\0"}:
+        if sep:
+            value = value.replace(sep, "_")
+    return value
+
+
 def graph_capture_profile_dir() -> str:
     """``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile`` — the one directory
     both capture-trace modes write to. Change the location here only."""
