@@ -43,46 +43,6 @@ export const Qwen3NextDeployment = () => {
           ],
       commandRule: (value) => value === 'thinking' ? '--reasoning-parser qwen3' : null
     },
-    modelPath: {
-      name: 'modelPath',
-      title: 'Main Model Path',
-      type: 'text',
-      condition: (values) => values.hardware === 'a3',
-      default: '/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8',
-      placeholder: '/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8',
-    },
-    draftModelPath: {
-      name: 'draftModelPath',
-      title: 'Draft Model Path',
-      type: 'text',
-      condition: (values) => values.hardware === 'a3',
-      default: '/path/to/Qwen3-Next-80B-A3B-Instruct',
-      placeholder: '/path/to/Qwen3-Next-80B-A3B-Instruct',
-    },
-    networkIface: {
-      name: 'networkIface',
-      title: 'HCCL/Gloo Interface',
-      type: 'text',
-      condition: (values) => values.hardware === 'a3',
-      default: 'eth0',
-      placeholder: 'eth0',
-    },
-    hostIp: {
-      name: 'hostIp',
-      title: 'Host IP',
-      type: 'text',
-      condition: (values) => values.hardware === 'a3',
-      default: '127.0.0.1',
-      placeholder: '127.0.0.1',
-    },
-    port: {
-      name: 'port',
-      title: 'Port',
-      type: 'text',
-      condition: (values) => values.hardware === 'a3',
-      default: '8888',
-      placeholder: '8888',
-    },
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
@@ -156,9 +116,9 @@ export const Qwen3NextDeployment = () => {
         'DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048',
         'DEEPEP_NORMAL_LONG_SEQ_ROUND=10',
         'FORCE_DRAFT_MODEL_NON_QUANT=1',
-        'GLOO_SOCKET_IFNAME={{networkIface}}',
+        'GLOO_SOCKET_IFNAME=eth0',
         'HCCL_OP_EXPANSION_MODE=AIV',
-        'HCCL_SOCKET_IFNAME={{networkIface}}',
+        'HCCL_SOCKET_IFNAME=eth0',
         'PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
         'SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400',
         'SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1',
@@ -176,7 +136,7 @@ export const Qwen3NextDeployment = () => {
       ];
       const npuFlags = [
         '--trust-remote-code',
-        '--model-path {{modelPath}}',
+        '--model-path /path/to/Qwen3-Next-80B-A3B-Instruct-W8A8',
         '--attention-backend ascend',
         '--device npu',
         '--quantization modelslim',
@@ -193,23 +153,17 @@ export const Qwen3NextDeployment = () => {
         '--speculative-eagle-topk 1',
         '--speculative-num-draft-tokens 4',
         '--speculative-draft-model-quantization unquant',
-        '--speculative-draft-model-path {{draftModelPath}}',
+        '--speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct',
         '--chunked-prefill-size -1',
         '--max-running-requests 2',
         '--cuda-graph-bs-decode 2',
         '--mamba-ssm-dtype bfloat16',
         '--reasoning-parser qwen3',
         '--tool-call-parser qwen3_coder',
-        '--host {{hostIp}}',
-        '--port {{port}}',
+        '--host 127.0.0.1',
+        '--port 30000',
       ];
-      const replacePlaceholders = (line) => line
-        .replaceAll('{{networkIface}}', values.networkIface)
-        .replaceAll('{{modelPath}}', values.modelPath)
-        .replaceAll('{{draftModelPath}}', values.draftModelPath)
-        .replaceAll('{{hostIp}}', values.hostIp)
-        .replaceAll('{{port}}', values.port);
-      return `${npuEnv.map(replacePlaceholders).join(' \\\n')} \\\npython -m sglang.launch_server \\\n${npuFlags.map(replacePlaceholders).map((flag) => `  ${flag}`).join(' \\\n')}`;
+      return `${npuEnv.join(' \\\n')} \\\nsglang serve \\\n${npuFlags.map((flag) => `  ${flag}`).join(' \\\n')}`;
     }
 
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
@@ -269,10 +223,6 @@ export const Qwen3NextDeployment = () => {
           .map((item) => item.id);
         return;
       }
-      if (option.type === 'text') {
-        initialState[key] = option.default || '';
-        return;
-      }
       let items = option.items || [];
       if (option.getDynamicItems) {
         const defaultValues = {};
@@ -281,8 +231,6 @@ export const Qwen3NextDeployment = () => {
             defaultValues[innerKey] = (innerOption.items || [])
               .filter((item) => item.default)
               .map((item) => item.id);
-          } else if (innerOption.type === 'text') {
-            defaultValues[innerKey] = innerOption.default || '';
           } else if (innerOption.items && innerOption.items.length > 0) {
             const defaultItem = innerOption.items.find((item) => item.default);
             defaultValues[innerKey] = defaultItem ? defaultItem.id : innerOption.items[0].id;
@@ -342,10 +290,6 @@ export const Qwen3NextDeployment = () => {
         [optionName]: currentValues.filter((id) => id !== itemId),
       };
     });
-  };
-
-  const handleTextChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const command = generateCommand(values);
@@ -417,15 +361,6 @@ export const Qwen3NextDeployment = () => {
     lineHeight: '1.1',
     opacity: 0.7,
   };
-  const textInputStyle = {
-    flex: 1,
-    padding: '8px 10px',
-    borderRadius: '4px',
-    border: `1px solid ${isDark ? '#4b5563' : '#d1d5db'}`,
-    background: isDark ? '#111827' : '#fff',
-    color: isDark ? '#e5e7eb' : '#111827',
-    fontSize: '13px',
-  };
   const commandDisplayStyle = {
     flex: 1,
     padding: '12px 16px',
@@ -452,15 +387,7 @@ export const Qwen3NextDeployment = () => {
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
             <div style={itemsStyle}>
-              {option.type === 'text' ? (
-                <input
-                  type="text"
-                  value={values[option.name] || ''}
-                  placeholder={option.placeholder || ''}
-                  onChange={(event) => handleTextChange(option.name, event.target.value)}
-                  style={textInputStyle}
-                />
-              ) : option.type === 'checkbox' ? (
+              {option.type === 'checkbox' ? (
                 (option.items || []).map((item) => {
                   const isChecked = (values[option.name] || []).includes(item.id);
                   const isDisabled =
