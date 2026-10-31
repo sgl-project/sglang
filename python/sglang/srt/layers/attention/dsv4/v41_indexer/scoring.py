@@ -5,7 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -22,6 +22,16 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_budget_bytes,
+    mqa_logits_needs_budget_check,
+    mqa_logits_row_bytes,
+    mqa_logits_static_budget_bytes,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -31,9 +41,45 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+# Below this many rows of the widest score row per tile, tiles get slow enough to
+# be worth returning the allocator's unused blocks before reading free memory.
+_RECLAIM_BELOW_ROWS = 256
+
+
+def _capturing() -> bool:
+    # Not get_is_capture_mode(): breakable-graph replay runs the scorers eagerly.
+    return (
+        capture_mode.is_capture_mode
+        or torch.cuda.is_current_stream_capturing()
+        or is_in_tc_piecewise_cuda_graph()
+    )
+
+
+def prefill_score_budget_bytes(
+    *, num_rows: int, max_seq_len: int, device: torch.device
+) -> int:
+    """Budget for one score tile and its declared scratch: the static budget
+    under graph capture, else a share of the memory the forward can allocate,
+    at most the fixed cap. Small forwards skip the query, and the allocator's
+    cache is emptied first only when free memory alone would leave tiles of
+    fewer than ``_RECLAIM_BELOW_ROWS`` rows."""
+    cap = _DEEP_GEMM_SCORE_BUDGET_BYTES
+    if not mqa_logits_needs_budget_check(num_rows=num_rows, num_cols=max_seq_len):
+        return cap
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if _capturing():
+        return min(cap, mqa_logits_static_budget_bytes(device_index=index))
+    budget = min(cap, mqa_logits_budget_bytes(device_index=index, allow_sync=True))
+    wanted = min(num_rows, _RECLAIM_BELOW_ROWS) * mqa_logits_row_bytes(max_seq_len)
+    if budget < min(cap, wanted):
+        # Free device memory leaves out the caching allocator's unused blocks, and
+        # a running server's allocator ends up holding nearly all of it, which would
+        # shrink every tile to a few rows. Return those blocks and read again, so
+        # the budget follows the memory that is actually in use.
+        torch.cuda.empty_cache()
+        budget = min(cap, mqa_logits_budget_bytes(device_index=index, allow_sync=True))
+    return budget
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -267,7 +313,19 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+def score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    scratch_bytes: Callable[[int], Tuple[int, int]] = lambda width: (0, 0),
+) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    """``flat_index_logits_tiles`` over the prefill rows, each tile with the
+    caller's declared scratch within ``prefill_score_budget_bytes``."""
+    budget = prefill_score_budget_bytes(
+        num_rows=data.num_rows,
+        max_seq_len=max(data.lens_per_request, default=0),
+        device=data.q_fp4.device,
+    )
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -275,7 +333,8 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=budget,
+        scratch_bytes=scratch_bytes,
     )
 
 
