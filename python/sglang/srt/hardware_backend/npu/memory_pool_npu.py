@@ -1114,11 +1114,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
                     [
-                        t[self._copy_indices_for_buffer(ci, uses_global)].to(
+                        t[self._cpu_offload_indices(ci, uses_global, buffer_id)].to(
                             "cpu", non_blocking=True
                         )
-                        for t, uses_global in zip(
-                            tensors_per_layer, uses_global_slots, strict=True
+                        for buffer_id, (t, uses_global) in enumerate(
+                            zip(tensors_per_layer, uses_global_slots, strict=True)
                         )
                         if t is not None
                     ]
@@ -1126,12 +1126,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             out.append(layer_chunks)
         return out
 
+    def _cpu_offload_indices(self, indices, uses_global_slots, buffer_id):
+        indices = self._copy_indices_for_buffer(indices, uses_global_slots)
+        if self.use_fia_nz and not self.dsa_kv_cache_store_fp8 and buffer_id < 2:
+            head_dim = self.kv_lora_rank if buffer_id == 0 else self.qk_rope_head_dim
+            return _mla_fia_nz_scatter_indices(
+                indices, head_dim, self.page_size
+            ).flatten()
+        return indices
+
     def _get_cpu_offload_layer_buffers(self, local_layer_id):
         # flatten(page, slot) also works for the zero-width packed V placeholder.
         buffers = [
             self.k_buffer[local_layer_id].flatten(0, 1),
             self.v_buffer[local_layer_id].flatten(0, 1),
         ]
+        if self.use_fia_nz and not self.dsa_kv_cache_store_fp8:
+            # Copy all NZ tiles belonging to each token, including partial pages.
+            # Packed FP8 records and indexer buffers use their own ND layouts.
+            buffers = [buf.view(-1, 16) for buf in buffers]
         slot = self.indexer_layer_id_to_slot.get(local_layer_id + self.start_layer)
         if slot is not None:
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
@@ -1177,18 +1190,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 chunk_indices = indices[i : i + chunk_size]
                 chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
                 cpu_index = 0
-                for buffer, uses_global_slots in zip(
-                    buffers,
-                    [self.is_draft_worker, self.is_draft_worker]
-                    + [True] * (len(buffers) - 2),
-                    strict=True,
+                for buffer_id, (buffer, uses_global_slots) in enumerate(
+                    zip(
+                        buffers,
+                        [self.is_draft_worker, self.is_draft_worker]
+                        + [True] * (len(buffers) - 2),
+                        strict=True,
+                    )
                 ):
                     if buffer is None:
                         continue
                     cpu = chunk[cpu_index]
                     cpu_index += 1
-                    target_indices = self._copy_indices_for_buffer(
-                        chunk_indices, uses_global_slots
+                    target_indices = self._cpu_offload_indices(
+                        chunk_indices, uses_global_slots, buffer_id
                     )
                     assert cpu.shape[0] == len(target_indices)
                     buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
