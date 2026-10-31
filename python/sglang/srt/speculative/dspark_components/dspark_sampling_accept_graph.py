@@ -119,7 +119,7 @@ def sampling_accept_commit_lens(
         sync_site=SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
         simulated_correct_len=epilogue.simulated_correct_len,
         target_logits=bonus_logits,
-        out=epilogue.read_accept(bs),
+        out=epilogue.accept_buffers(bs),
         block_accept_lens_out=epilogue.read_block_accept_lens(bs),
     ).commit_lens
     if not gated:
