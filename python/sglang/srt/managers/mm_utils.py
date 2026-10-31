@@ -339,11 +339,15 @@ def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
             continue
 
         for i, item in enumerate(items):
-            for offset in items[i].offsets:
-                input_ids_tensor[offset[0] : offset[1] + 1] = torch.as_tensor(
-                    item.padding_sequence(offset[1] - offset[0] + 1),
-                    dtype=input_ids_tensor.dtype,
-                )
+            for start, end in items[i].offsets:
+                # Auto-truncation can cut the prompt inside or before a span;
+                # pad only the part that is still in the prompt.
+                end = min(end + 1, len(padded_input_ids))
+                if start < end:
+                    input_ids_tensor[start:end] = torch.as_tensor(
+                        item.padding_sequence(end - start),
+                        dtype=input_ids_tensor.dtype,
+                    )
 
     return padded_input_ids
 
@@ -495,7 +499,10 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [value for item in items for value in item.padding_values()]
+            # Sorted for the searchsorted lookup in _get_multimodal_mask.
+            pad_values = sorted(
+                value for item in items for value in item.padding_values()
+            )
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(
