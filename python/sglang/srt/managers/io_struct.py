@@ -182,6 +182,40 @@ MultimodalDataInputFormat = Union[
     MultimodalDataInputItem,
 ]
 
+# Each routing label is copied into every BlockStored span that covers its
+# item, so a long label multiplies KV event payloads.
+MAX_MM_ROUTING_LABEL_BYTES = 128
+
+
+def _mm_input_count(*media) -> int:
+    """Media inputs in one request's image, video and audio data."""
+    count = 0
+    for data in media:
+        if isinstance(data, list):
+            count += sum(item is not None for item in data)
+        elif data is not None:
+            count += 1
+    return count
+
+
+def _check_mm_routing_labels(labels, field_name: str, input_count: int) -> None:
+    """Require one string per media input, each at most MAX_MM_ROUTING_LABEL_BYTES."""
+    if not isinstance(labels, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    if len(labels) != input_count:
+        raise ValueError(
+            f"{field_name} has {len(labels)} labels for {input_count} "
+            "image, video and audio inputs"
+        )
+    for label in labels:
+        if not isinstance(label, str):
+            raise ValueError(f"{field_name} must contain only strings")
+        if len(label.encode("utf-8")) > MAX_MM_ROUTING_LABEL_BYTES:
+            raise ValueError(
+                f"{field_name} has a label longer than "
+                f"{MAX_MM_ROUTING_LABEL_BYTES} bytes"
+            )
+
 
 @dataclass
 class GenerateReqInput:
@@ -223,6 +257,19 @@ class GenerateReqInput:
     # sglang's prefix-cache key to align. When unset, behavior is unchanged
     # (sglang hashes the processor feature tensor).
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
+    # Optional caller routing labels, one opaque string per media input: the
+    # image_data labels first, then video_data, then audio_data, each in input
+    # order. The count must equal the request's media inputs. An empty string
+    # leaves an input unlabeled. Labels are matched to processed items within
+    # each media type, since each type's inputs fill its placeholders in
+    # order; a type whose processing does not yield one item per input stays
+    # unlabeled. Each label is at most
+    # MAX_MM_ROUTING_LABEL_BYTES in UTF-8. Batch request: one list per request,
+    # or one string for a request with one input. Routing metadata only: they
+    # never affect identity, caching or reuse. KV events in the "dynamo"
+    # format report them back as `mm_routing_spans` on BlockStored; other
+    # formats ignore them.
+    mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None
     # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
     # mm_hashes, these identify processor inputs and never replace the
     # processor-output feature hash used by the embedding/prefix cache.
@@ -413,6 +460,22 @@ class GenerateReqInput:
             or has_valid_data(self.audio_data)
         )
 
+    def mm_routing_labels_by_modality(self) -> Optional[Dict[str, List[str]]]:
+        """This request's routing labels split by media type, in input order."""
+        if not self.mm_routing_labels:
+            return None
+        grouped, start = {}, 0
+        for modality, data in (
+            ("image", self.image_data),
+            ("video", self.video_data),
+            ("audio", self.audio_data),
+        ):
+            count = _mm_input_count(data)
+            if count:
+                grouped[modality] = self.mm_routing_labels[start : start + count]
+                start += count
+        return grouped
+
     def normalize_batch_and_arguments(self):
         """
         Normalize the batch size and arguments for the request.
@@ -565,6 +628,8 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            if self.mm_routing_labels is not None:
+                self.mm_routing_labels = [self.mm_routing_labels]
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -590,6 +655,12 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if self.mm_routing_labels is not None:
+            _check_mm_routing_labels(
+                self.mm_routing_labels,
+                "mm_routing_labels",
+                _mm_input_count(self.image_data, self.video_data, self.audio_data),
+            )
         if isinstance(self.kv_hints, list):
             raise ValueError("kv_hints should be a single envelope for one request.")
         self.kv_hints = (
@@ -613,6 +684,7 @@ class GenerateReqInput:
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
+        self._normalize_mm_routing_labels(num)
         self._normalize_sampling_params(num)
         self._normalize_watermark(num)
         self._normalize_logprob_params(num)
@@ -728,6 +800,37 @@ class GenerateReqInput:
                     )
                 normalized.append(per_request)
             setattr(self, field_name, normalized * self.parallel_sample_num)
+
+    def _normalize_mm_routing_labels(self, num):
+        """Split batched routing labels per request and validate them.
+
+        Runs after image, video and audio normalization: each request's
+        labels are counted against its inputs of every modality.
+        """
+        labels = self.mm_routing_labels
+        if labels is None:
+            self.mm_routing_labels = [None] * num
+            return
+        if not isinstance(labels, list) or len(labels) != self.batch_size:
+            raise ValueError(
+                "mm_routing_labels must be a list with one entry per request"
+            )
+        normalized = []
+        for request_index, request_labels in enumerate(labels):
+            if isinstance(request_labels, str):
+                request_labels = [request_labels]
+            if request_labels is not None:
+                _check_mm_routing_labels(
+                    request_labels,
+                    f"mm_routing_labels[{request_index}]",
+                    _mm_input_count(
+                        self.image_data[request_index],
+                        self.video_data[request_index],
+                        self.audio_data[request_index],
+                    ),
+                )
+            normalized.append(request_labels)
+        self.mm_routing_labels = normalized * self.parallel_sample_num
 
     def _normalize_video_data(self, num):
         """Normalize video data for batch processing."""
@@ -984,6 +1087,11 @@ class GenerateReqInput:
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
+            mm_routing_labels=(
+                self.mm_routing_labels[i]
+                if self.mm_routing_labels is not None
+                else None
+            ),
             mm_content_hashes=(
                 self.mm_content_hashes[i]
                 if self.mm_content_hashes is not None
@@ -1187,6 +1295,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # GenerateReqInput.mm_routing_labels split by media type ("image",
+    # "video", "audio"). Carried for multimodal inputs assembled in the
+    # scheduler (encoder disaggregation). A defaulted tail field, so older
+    # IPC senders decode as None.
+    mm_routing_labels: Optional[Dict[str, List[str]]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
