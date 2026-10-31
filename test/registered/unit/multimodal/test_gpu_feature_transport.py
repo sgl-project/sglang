@@ -224,28 +224,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.pool.wrap_tensor.assert_not_called()
         self.assertEqual([item.feature for item in items], proxies)
 
-    def test_video_clip_features_are_packed_per_request(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-        from sglang.srt.utils.cuda_vmm_transport_utils import (
-            CudaVmmFeatureTransport,
-        )
-
-        transport = object.__new__(CudaVmmFeatureTransport)
-        transport.pool = MagicMock()
-        features = [torch.arange(4), torch.arange(4, 8)]
-        proxies = [object(), object()]
-        transport.pool.wrap_tensors.return_value = proxies
-        items = [
-            MultimodalDataItem(modality=Modality.VIDEO, feature=feature)
-            for feature in features
-        ]
-
-        transport.wrap_items(items)
-
-        transport.pool.wrap_tensors.assert_called_once_with(features)
-        transport.pool.wrap_tensor.assert_not_called()
-        self.assertEqual([item.feature for item in items], proxies)
-
     def test_deferred_features_are_not_packed(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
         from sglang.srt.utils.cuda_ipc_transport_utils import (

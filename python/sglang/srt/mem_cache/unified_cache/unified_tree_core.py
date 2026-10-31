@@ -989,6 +989,47 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_validators=device_validators,
         )
 
+    def _device_prefix_covered_by_match(
+        self, best_match_node: UnifiedTreeNode
+    ) -> Optional[tuple[UnifiedTreeNode, int]]:
+        mamba = self.components_by_type.get(ComponentType.MAMBA)
+        host_only = mamba._mamba_host_only_checkpoint() if mamba is not None else False
+        if (
+            not self.enable_hicache
+            or not host_only
+            or best_match_node is self.root_node
+        ):
+            return None
+        path: list[UnifiedTreeNode] = []
+        node = best_match_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        device_validators = tuple(
+            comp.create_match_validator(match_device_only=True)
+            for comp in self.components
+            if comp.component_type != ComponentType.MAMBA
+        )
+        device_node = self.root_node
+        device_len = 0
+        running_len = 0
+        for n in path:
+            full_value = n.component_data[BASE_COMPONENT_TYPE].value
+            # Stop at the first evicted Full page and do not resume.
+            if n.evicted or full_value is None:
+                break
+            running_len += len(full_value)
+            # Call every validator. SWA's predicate is stateful and must see
+            # each GPU page, even when an earlier predicate already failed.
+            accepted = True
+            for validator in device_validators:
+                accepted = validator(n) and accepted
+            if accepted:
+                device_node = n
+                device_len = running_len
+        return device_node, device_len
+
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         """Read-only FULL-device match, independent of auxiliary components; the
         third result counts the whole deepest node (a partial match pins it all)."""
@@ -1047,8 +1088,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node if self.enable_hicache else best_match_device_node
         )
 
+        device_prefix_len = sum(len(v) for v in value[:best_match_device_value_len])
+        # The mamba state at best_match covers the whole prefix ending there.
+        # GPU Full pages in front of that checkpoint are device hits even when
+        # those nodes do not hold their own mamba value. The anchor still stops
+        # at the first evicted page, so backed-up pages stay a host hit.
+        covered = self._device_prefix_covered_by_match(best_match_node)
+        if covered is not None and covered[1] > device_prefix_len:
+            best_match_device_node, device_prefix_len = covered
+
         result = MatchResult(
-            device_prefix_len=sum(len(v) for v in value[:best_match_device_value_len]),
+            device_prefix_len=device_prefix_len,
             last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
@@ -3064,6 +3114,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         expected_dev_leaves: set[UnifiedTreeNode] = set()
         expected_hst_leaves: set[UnifiedTreeNode] = set()
         expected_duplicates: set[UnifiedTreeNode] = set()
+        mamba = self.components_by_type.get(ComponentType.MAMBA)
+        host_only_mamba = mamba is not None and mamba._mamba_host_only_checkpoint()
 
         for node in all_nodes:
             if node is self.root_node:
@@ -3082,7 +3134,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if cd.host_value is not None and not full_hst:
                     # write_back reclaim takes only the Full host layer; an
                     # aux host slice may outlive it while Full device is live.
-                    if not (self.is_write_back and full_dev):
+                    # Host-only mamba keeps Full on device and mamba on host.
+                    host_only_ok = (
+                        host_only_mamba and ct == ComponentType.MAMBA and full_dev
+                    )
+                    if not (self.is_write_back and full_dev) and not host_only_ok:
                         E(f"node {nid} {ct} host present but Full.host_value=None")
 
             # Every node must keep Full data on at least one layer.
