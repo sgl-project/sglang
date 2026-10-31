@@ -708,6 +708,7 @@ else
     exit 1
 fi
 
+source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
 if [ -n "${CMD_BASE:-}" ];then
     # Unscored warmup passes, mirroring the dev fixed-decode suite ordering
     # (cache_fill -> shape_warm -> formal). cache_fill sends WARMUP_DP
@@ -715,7 +716,10 @@ if [ -n "${CMD_BASE:-}" ];then
     # prefix on every DP rank; shape_warm runs one full-shape pass so the
     # hybrid-cache state settles before scoring. Each writes its own
     # work-dir, so the formal summarizer output below remains the only
-    # parsed result.
+    # parsed result. Runs AFTER the venv activation - the ais_bench entry
+    # point only exists on PATH inside the venv (run 41187594220 died with
+    # "ais_bench: command not found" because the warmup block originally
+    # sat before this source line).
     if [ "${WARMUP_DP:-0}" -gt 0 ];then
         echo "===== Warmup cache-fill: ${WARMUP_DP} request(s) x batch 1 (one per DP rank) ====="
         eval "${CMD_BASE} --num-prompts ${WARMUP_DP} --batch-size 1 --work-dir ${OUTPUT_PATH}/warmup_cache_fill"
@@ -725,6 +729,5 @@ if [ -n "${CMD_BASE:-}" ];then
         eval "${CMD_BASE} --num-prompts ${NUM_PROMPTS} --batch-size ${BATCH_SIZE} --work-dir ${OUTPUT_PATH}/warmup_shape"
     fi
 fi
-source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
 echo "Run command: ${CMD}"
 eval "${CMD}"
