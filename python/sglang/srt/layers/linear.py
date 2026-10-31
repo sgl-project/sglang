@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import msgspec
@@ -1576,6 +1577,12 @@ class RowParallelLinear(LinearBase):
         quant_config: Quantization configure.
         parallel_group: Select TP, attention TP, or an unsharded weight partition.
                         Reduction and allocation policies remain independent.
+        symmetric_output: Allocate the output from the symmetric-memory pool so
+                          a collective can consume it in place. Turn it off for
+                          an output that never feeds a collective; allocating
+                          such an output there only grows the pool, and growth
+                          on a side stream is rank-local, which can make the
+                          ranks disagree on whether a registration round runs.
     """
 
     def __init__(
@@ -1593,6 +1600,7 @@ class RowParallelLinear(LinearBase):
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
         parallel_group: Optional[LinearParallelGroup] = None,
+        symmetric_output: bool = True,
     ):
         self.tp_group = _resolve_linear_group(parallel_group)
         self.parallel_group = parallel_group
@@ -1605,6 +1613,7 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = use_dp_attention_reduce
+        self.symmetric_output = symmetric_output
 
         # Divide the weight matrix along the last dimension.
         _, tp_size = get_group_rank_size(self.tp_group)
@@ -1775,7 +1784,9 @@ class RowParallelLinear(LinearBase):
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
 
-        if self.use_dp_attention_reduce:
+        if not self.symmetric_output:
+            symm_ctx = nullcontext()
+        elif self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
