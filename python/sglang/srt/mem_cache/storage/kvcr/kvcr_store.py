@@ -919,15 +919,19 @@ class KVCRStore(HiCacheStorage):
         valid = sorted(restorable)
         return PoolTransferResult(max(valid, default=0), hits, valid)
 
+    def _release_claim_handles(self, handles):
+        if not handles:
+            return
+        released = self._runner.release(handles)
+        if len(released) != len(handles) or not all(ok for _, ok in released):
+            raise RuntimeError("KVCR trailing-state claim release failed")
+
     def _release_lookup_locked(self, scope):
         claims = self._lookup_claims.get(scope)
         if not claims:
             self._lookup_claims.pop(scope, None)
             return
-        handles = list(claims.values())
-        released = self._runner.release(handles)
-        if len(released) != len(handles) or not all(ok for _, ok in released):
-            raise RuntimeError("KVCR trailing-state claim release failed")
+        self._release_claim_handles(list(claims.values()))
         del self._lookup_claims[scope]
 
     def release_lookup(self, scope: str) -> None:
@@ -983,6 +987,17 @@ class KVCRStore(HiCacheStorage):
                             expected_layout=labels,
                         )
                         result = self._wait(handle)
+                    # The condition wait releases the lock: cancellation can
+                    # remove this scope while native fetch is still pending.
+                    if self._lookup_claims.get(scope) is not claims:
+                        self._release_claim_handles(
+                            [
+                                entry.release_handle
+                                for entry in result.values()
+                                if entry.success and entry.release_handle is not None
+                            ]
+                        )
+                        return False
                     complete = True
                     for key in pending:
                         entry = result.get(key)
@@ -997,7 +1012,8 @@ class KVCRStore(HiCacheStorage):
                         return False
                 return True
             except Exception:
-                self._release_lookup_locked(scope)
+                if self._lookup_claims.get(scope) is claims:
+                    self._release_lookup_locked(scope)
                 raise
 
     def batch_exists(self, keys, extra_info=None):
