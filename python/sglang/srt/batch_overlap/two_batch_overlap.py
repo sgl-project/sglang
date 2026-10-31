@@ -425,7 +425,9 @@ class TboDPAttentionPreparer:
 
         deepep_mode = get_deepep_mode()
         enable_a2a_moe = not get_moe_a2a_backend().is_none()
-        ll_supports_extend = get_moe_a2a_backend().low_latency_supports_extend()
+        tbo_splits_extend_in_low_latency = (
+            get_moe_a2a_backend().tbo_splits_extend_in_low_latency()
+        )
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
@@ -468,7 +470,7 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_a2a_moe
-                and not ll_supports_extend
+                and not tbo_splits_extend_in_low_latency
                 and (resolved_deepep_mode.is_low_latency())
             )
             if local_can_run_tbo and not local_batch.forward_mode.is_prebuilt():
@@ -478,6 +480,15 @@ class TboDPAttentionPreparer:
                     extend_seq_lens=local_batch.extend_lens,
                     token_num_per_seq=token_num_per_seq,
                 )
+                child_cap = get_moe_a2a_backend().tbo_child_dispatch_cap()
+                if (
+                    child_cap is not None
+                    and num_tokens - self.local_tbo_split_num_tokens > child_cap
+                ):
+                    # Micro-batch B dispatches through an op sized for child_cap
+                    # rows per rank; the gathered min keeps every rank unsplit.
+                    local_can_run_tbo = False
+                    self.local_tbo_split_num_tokens = 0
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True

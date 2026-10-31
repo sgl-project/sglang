@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPPDispatchHooks
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    get_moe_a2a_backend,
     is_tbo_enabled,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
@@ -118,8 +119,28 @@ def mori_recv_bound(
     return sum(sender_rows)
 
 
+def mori_tbo_child_max_dispatch_tokens_per_rank(max_dispatch_tokens: int) -> int:
+    """Rows per rank of the MORI EPv2 op that only carries TBO micro-batch B.
+
+    A split leaves micro-batch B at most ceil(M / 2) rows (two-chunk split) or
+    (1 - tbo_token_distribution_threshold) * M (0.52 M at the default threshold);
+    17/16 of half covers both (fuzzed worst case at M = 8192: 4258 of 4352 rows).
+    TboDPAttentionPreparer runs any step whose micro-batch B is larger unsplit.
+    """
+    half = -(-max_dispatch_tokens // 2)
+    rows = -(-half * 17 // 16)
+    return min(-(-rows // 256) * 256, max_dispatch_tokens)
+
+
 def _max_dispatch_tokens_per_rank() -> int:
     return mori_max_dispatch_tokens_per_rank(get_server_args())
+
+
+def mori_tbo_child_dispatch_cap() -> Optional[int]:
+    """Rows per rank TBO micro-batch B may dispatch, or None when unbounded."""
+    if not (get_moe_a2a_backend().is_mori() and envs.SGLANG_MORI_EP_V2.get()):
+        return None
+    return mori_tbo_child_max_dispatch_tokens_per_rank(_max_dispatch_tokens_per_rank())
 
 
 def _should_record_expert_distribution() -> bool:
@@ -1433,6 +1454,13 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         # EPv2 forwards exactly top-k routed experts and has no fake expert slot.
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
+        if self.instance_id > 0:
+            # TBO micro-batch B is the only caller of the second instance.
+            self.num_max_dispatch_tokens_per_rank = (
+                mori_tbo_child_max_dispatch_tokens_per_rank(
+                    self.num_max_dispatch_tokens_per_rank
+                )
+            )
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
         # Under SDMA or low_latency MORI derives its grids from the CU count, so
         # keep its geometry.
