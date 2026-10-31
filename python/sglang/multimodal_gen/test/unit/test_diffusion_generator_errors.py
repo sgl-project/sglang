@@ -195,9 +195,13 @@ def test_fatal_lora_error_rejects_later_generation(generator):
     assert client.forward.call_count == 1
 
 
-@pytest.mark.parametrize("fatal_first", [False, True])
-def test_fatal_lora_fanout_error_rejects_later_calls(generator, fatal_first):
-    """A recoverable replica error must not hide another replica's device failure."""
+@pytest.mark.parametrize(
+    "fatal_first, timeout_later", [(False, False), (True, False), (True, True)]
+)
+def test_fatal_lora_fanout_error_rejects_later_calls(
+    generator, fatal_first, timeout_later
+):
+    """Replica errors and timeouts must not hide another replica's device failure."""
     generator, client = generator
     scheduler = SchedulerClient()
     scheduler.server_args = SimpleNamespace(
@@ -210,6 +214,8 @@ def test_fatal_lora_fanout_error_rejects_later_calls(generator, fatal_first):
     ]
     if fatal_first:
         replies.reverse()
+    if timeout_later:
+        replies[1] = TimeoutError("Scheduler did not respond in time.")
     scheduler._forward_one = Mock(side_effect=replies)
     client.forward.side_effect = scheduler.forward
 

@@ -257,10 +257,21 @@ class SchedulerClient:
             else {}
         )
         if isinstance(batch, _CONTROL_REQ_TYPES):
-            results = [
-                self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
-                for ep in endpoints
-            ]
+            results = []
+            try:
+                for ep in endpoints:
+                    results.append(
+                        self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
+                    )
+            except Exception:
+                # A later transport failure must not hide a fatal reply.
+                if not any(
+                    isinstance(result, OutputBatch)
+                    and result.error
+                    and is_unrecoverable_device_error(result.error)
+                    for result in results
+                ):
+                    raise
             output_batch = _merge_fanout_results(results)
         else:
             if replica is None:
@@ -355,9 +366,19 @@ class AsyncSchedulerClient:
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
             # replica state (weights, LoRA, memory) must change everywhere
-            results = [
-                await self._forward_one(ep, batch, timeout_ms) for ep in endpoints
-            ]
+            results = []
+            try:
+                for ep in endpoints:
+                    results.append(await self._forward_one(ep, batch, timeout_ms))
+            except Exception:
+                # A later transport failure must not hide a fatal reply.
+                if not any(
+                    isinstance(result, OutputBatch)
+                    and result.error
+                    and is_unrecoverable_device_error(result.error)
+                    for result in results
+                ):
+                    raise
             output_batch = _merge_fanout_results(results)
         else:
             if replica is None:
