@@ -194,7 +194,7 @@ def build_kv_storage(
         "building one of its own"
     )
     owner = plan.owner()
-    window = plan.of_lifetime(WindowLifetime)
+    window = plan.primary_window()
     state = plan.of_lifetime(StateLifetime)
     for s in plan.sub_pools:
         expected = None if plan.fused_draft is None else plan.fused_draft.region(s.name)

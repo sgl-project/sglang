@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.kv.decl import (
     StateLifetime,
     TensorPartDecl,
     WindowLifetime,
+    window_sub_pool_name,
 )
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
@@ -39,10 +40,10 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     MLADraftRegion,
 )
 
-# The draft placement and the id spaces name sub-pools by these.
+# The draft placement and the id spaces name sub-pools by these; windows are
+# named by `window_sub_pool_name`.
 _SUB_POOL_NAMES: Dict[Type, str] = {
     FullLifetime: "full",
-    WindowLifetime: "swa",
     StateLifetime: "mamba",
 }
 
@@ -64,13 +65,33 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
     FullLifetime: SubPoolExternal(
         host_pool="kv", tree_component="FULL", metrics="full"
     ),
-    WindowLifetime: SubPoolExternal(
-        host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"
-    ),
     StateLifetime: SubPoolExternal(
         host_pool="mamba", tree_component="MAMBA", metrics="mamba", wire="mamba"
     ),
 }
+
+# A window's external names follow its window slot, the plan's windows in drive
+# order: the prefix tree, host pools and PD peers have two window entries.
+_WINDOW_SLOT_EXTERNALS = (
+    SubPoolExternal(host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"),
+    SubPoolExternal(
+        host_pool="auxiliary_swa",
+        tree_component="AUXILIARY_SWA",
+        metrics="swa",
+        wire="auxiliary_swa",
+    ),
+)
+
+
+def _window_external(slot: int, name: str) -> SubPoolExternal:
+    """A window slot beyond the consumers' entries gets its sub-pool's name,
+    which the tree and the PD wire refuse."""
+    if slot < len(_WINDOW_SLOT_EXTERNALS):
+        return _WINDOW_SLOT_EXTERNALS[slot]
+    return SubPoolExternal(
+        host_pool=name, tree_component=name.upper(), metrics="swa", wire=name
+    )
+
 
 # The order PD peers list state entries in: a window's before recurrent state.
 _WIRE_ORDER = (
@@ -177,11 +198,34 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         return frozenset(type(s.lifetime) for s in self.sub_pools)
 
     def of_lifetime(self, lifetime_type: Type) -> Optional[PlannedSubPool]:
+        """The plan's one sub-pool of a lifetime type; windows can be several,
+        see `windows` and `primary_window`."""
+        assert lifetime_type is not WindowLifetime, "a plan may hold several windows"
         found = [s for s in self.sub_pools if isinstance(s.lifetime, lifetime_type)]
-        if lifetime_type is WindowLifetime and len(found) > 1:
-            return next(s for s in found if s.name == "swa")
         assert len(found) <= 1, f"more than one {lifetime_type.__name__} sub-pool"
         return found[0] if found else None
+
+    def windows(self) -> Tuple[PlannedSubPool, ...]:
+        """The window sub-pools in window-slot order: the primary window, then
+        the rest in drive order."""
+        primary = self.primary_window()
+        rest = [
+            s
+            for s in self.drive_order()
+            if isinstance(s.lifetime, WindowLifetime) and s is not primary
+        ]
+        return tuple([primary] * (primary is not None) + rest)
+
+    def primary_window(self) -> Optional[PlannedSubPool]:
+        """The longest window the target's layers declare, or the longest
+        window when the target declares none: the window a single-window reader
+        sizes and retains by."""
+        drafts = set() if self.fused_draft is None else set(self.fused_draft.new_bands)
+        windows = [
+            s for s in self.drive_order() if isinstance(s.lifetime, WindowLifetime)
+        ]
+        target = [s for s in windows if s.name not in drafts]
+        return (target or windows or [None])[0]
 
     def owner(self) -> PlannedSubPool:
         """The sub-pool that owns the token id space."""
@@ -213,6 +257,11 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         """The prefix tree's slots, one per sub-pool, in drive order.
         ``window_reaches`` names the storage sub-pools additional readers use,
         and how far back from the committed length each reader needs them."""
+        if len(self.windows()) > len(_WINDOW_SLOT_EXTERNALS):
+            raise ValueError(
+                f"a prefix tree keeps at most {len(_WINDOW_SLOT_EXTERNALS)} windows; "
+                f"the plan has {[s.name for s in self.windows()]}"
+            )
         for sub_pool in self.sub_pools:
             lifetime = sub_pool.lifetime
             if isinstance(lifetime, StateLifetime) and (
@@ -278,6 +327,9 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                     ),
                 )
         entries.extend(groups.values())
+        unknown = [e.state_type for e in entries if e.state_type not in _WIRE_ORDER]
+        if unknown:
+            raise ValueError(f"PD transfers have no state type for {unknown}")
         return tuple(sorted(entries, key=lambda e: _WIRE_ORDER.index(e.state_type)))
 
 
@@ -288,7 +340,17 @@ def _unit(lifetime: KVLifetime, page_size: int) -> int:
 def _chain_key(key: Tuple[KVLifetime, int]) -> tuple:
     lifetime, unit = key
     rank, window = lifetime.retention()
-    return (rank, -window, unit, _SUB_POOL_NAMES[type(lifetime)])
+    return (rank, -window, unit)
+
+
+def _target_windows(groups) -> Tuple[Optional[int], ...]:
+    return tuple(lt.window for lt, _ in groups if isinstance(lt, WindowLifetime))
+
+
+def _sub_pool_name(lifetime: KVLifetime, target_windows) -> str:
+    if isinstance(lifetime, WindowLifetime):
+        return window_sub_pool_name(lifetime.window, target_windows)
+    return _SUB_POOL_NAMES[type(lifetime)]
 
 
 def _group_parts(
@@ -313,7 +375,8 @@ def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
     """The sub-pools a plan of these declarations holds, owner first: what the
     fused-draft placement needs before the plan exists."""
     keys = _group_parts(decls, page_size=1)
-    return tuple(_SUB_POOL_NAMES[type(lt)] for lt, _ in sorted(keys, key=_chain_key))[
+    windows = _target_windows(keys)
+    return tuple(_sub_pool_name(lt, windows) for lt, _ in sorted(keys, key=_chain_key))[
         ::-1
     ]
 
@@ -379,9 +442,9 @@ def plan_kv_storage(
     groups = _group_parts(decls, page_size)
     if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
         raise ValueError("unified storage needs a FULL virtual-id owner")
-    if len({lt for lt, _ in groups if isinstance(lt, WindowLifetime)}) > 1:
-        raise ValueError("multiple target windows require named model declarations")
-    names_by_key = {key: _SUB_POOL_NAMES[type(key[0])] for key in groups}
+    target_windows = _target_windows(groups)
+    names_by_key = {key: _sub_pool_name(key[0], target_windows) for key in groups}
+    target_window_keys = [key for key in groups if isinstance(key[0], WindowLifetime)]
     if fused_draft is not None:
         for name, band in fused_draft.new_bands.items():
             region = fused_draft.region(name)
@@ -414,9 +477,27 @@ def plan_kv_storage(
             key = (lifetime, _unit(lifetime, page_size))
             if key in groups:
                 raise ValueError(f"draft band {name!r} duplicates a target lifetime")
+            if name in names_by_key.values():
+                raise ValueError(f"draft band {name!r} takes a target sub-pool's name")
             groups[key] = ([], geometry)
             names_by_key[key] = name
-    chain = sorted(groups, key=_chain_key)
+    chain = sorted(groups, key=lambda key: (*_chain_key(key), names_by_key[key]))
+
+    def drive_key(key):
+        return (tuple(-r for r in key[0].retention()), key[1], names_by_key[key])
+
+    # Slot 0 is the longest window the target's layers declare (else the
+    # longest window): the window single-window readers size and retain by.
+    windows = sorted(
+        (key for key in groups if isinstance(key[0], WindowLifetime)), key=drive_key
+    )
+    primary = min(target_window_keys or windows, key=drive_key, default=None)
+    window_slots = {
+        key: slot
+        for slot, key in enumerate(
+            [primary] * (primary is not None) + [k for k in windows if k != primary]
+        )
+    }
     sub_pools = []
     for i, key in enumerate(chain):
         lifetime, unit = key
@@ -438,13 +519,8 @@ def plan_kv_storage(
                     fused_draft=fused_draft,
                 ),
                 external=(
-                    SubPoolExternal(
-                        host_pool="auxiliary_swa",
-                        tree_component="AUXILIARY_SWA",
-                        metrics="swa",
-                        wire="auxiliary_swa",
-                    )
-                    if name == "draft_swa"
+                    _window_external(window_slots[key], name)
+                    if key in window_slots
                     else _EXTERNAL[type(lifetime)]
                 ),
             )
