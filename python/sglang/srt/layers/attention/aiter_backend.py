@@ -3198,10 +3198,12 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla and self.dcp_world_size > 1:
                 global_kv_indptr = self.cuda_graph_global_kv_indptr[: bs + 1]
                 global_kv_indptr.copy_(kv_indptr[: bs + 1])
+                # kv_lens, as in eager: the asm cp verify reads the verify window
+                # from the cache, so its shard must span the draft tokens too.
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
-                    seq_lens[:bs].to(torch.int32).clone(),
+                    kv_lens[:bs].to(torch.int32).clone(),
                     None,
                     bs,
                     static_local_kv_lens_cpu=self.cuda_graph_dcp_static_local_kv_lens[
