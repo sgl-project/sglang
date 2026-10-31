@@ -142,7 +142,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                 new_item.model_specific_data["image_sizes"] = old_image_sizes[
                     image_idx : image_idx + 1
                 ]
-            new_item.hash = None
+            new_item.clear_identity()
             new_item.pad_value = None
             split_items.append(new_item)
         if offset_idx != len(all_offsets):

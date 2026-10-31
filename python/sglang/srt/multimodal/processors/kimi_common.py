@@ -3,7 +3,6 @@
 Shared by KimiVLImageProcessor and KimiK2_5VLImageProcessor.
 """
 
-import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Union
@@ -26,8 +25,8 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.cache.digest import media_identity
 
-_KIMI_IMAGE_IDENTITY_TAG = b"sglang-kimi-image-identity-v1"
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")
 
 
@@ -50,11 +49,11 @@ def kimi_image_identity(content_config_digest: str, grid_thw: Sequence[int]) -> 
     digest = parse_content_hash(content_config_digest)
     if digest is None:
         raise ValueError("Kimi image identity requires a content digest")
-    hasher = hashlib.sha256(_KIMI_IMAGE_IDENTITY_TAG)
-    hasher.update(bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :]))
-    for dim in grid_thw:
-        hasher.update(int(dim).to_bytes(8, byteorder="big", signed=True))
-    return hasher.digest()
+    return media_identity(
+        bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :]),
+        modality="image",
+        metadata=tuple(int(dim) for dim in grid_thw),
+    )
 
 
 def _item_grid_thw(item: MultimodalDataItem) -> List[int]:

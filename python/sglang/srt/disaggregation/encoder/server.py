@@ -54,6 +54,8 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model as load_model
+from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
@@ -633,6 +635,11 @@ class MMEncoder:
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
             encoder_media_processor_config=encoder_media_processor_config,
         )
+        self.cache_namespace = build_processor_fingerprint(
+            self.preprocessor,
+            self.model_config.hf_config,
+            extra={"encoder_model_path": self.model_config.model_path},
+        )
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
@@ -975,42 +982,20 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
-    ) -> List[int]:
-        """CPU Task: Compute hashes based on processed feature patches."""
-        preprocessed_items = (
-            get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
-        )
-        if preprocessed_items is not None:
-            if len(preprocessed_items) != len(grid_thw):
-                raise ValueError(
-                    "Encoder preprocess item/grid mismatch: "
-                    f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
+        self, mm_feature, preprocess_result: EncoderPreprocessResult, modality: Modality
+    ) -> List[bytes]:
+        """Identify each grid's exact model-facing features and metadata."""
+        return [
+            structured_digest(
+                tuple(
+                    item.cache_key
+                    for item in self._build_model_mm_items(
+                        mm_feature, preprocess_result, [index], modality
+                    )
                 )
-            hashes = []
-            for item in preprocessed_items:
-                item.set_pad_value()
-                hashes.append(item.hash)
-            return hashes
-
-        hashes = []
-        if modality == Modality.AUDIO and isinstance(mm_feature, list):
-            for feature in mm_feature:
-                tmp_item = MultimodalDataItem(modality=modality, feature=feature)
-                tmp_item.set_pad_value()
-                hashes.append(tmp_item.hash)
-            return hashes
-
-        offset = 0
-        logger.info(f"{mm_feature.shape=} with {modality=}")
-        for grid in grid_thw:
-            num_patches = self.preprocessor.get_num_patches(grid, modality)
-            feature_slice = mm_feature[offset : offset + num_patches]
-            tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
-            tmp_item.set_pad_value()
-            hashes.append(tmp_item.hash)
-            offset += num_patches
-        return hashes
+            )
+            for index in range(len(preprocess_result.grid_thw))
+        ]
 
     def _encode_missing(
         self,
@@ -1066,6 +1051,8 @@ class MMEncoder:
             selected = [preprocessed_items[index] for index in indices]
             if any(item.modality != modality for item in selected):
                 raise ValueError("Encoder preprocess output contains wrong modality")
+            for item in selected:
+                item.bind_processor_fingerprint(self.cache_namespace)
             return selected
 
         split_kimi_k3_images = (
@@ -1087,7 +1074,11 @@ class MMEncoder:
             for idx in indices:
                 feature_slices.append(mm_feature[offsets[idx] : offsets[idx + 1]])
             if not split_kimi_k3_images:
-                sub_feature = torch.cat(feature_slices, dim=0)
+                sub_feature = (
+                    feature_slices[0]
+                    if len(feature_slices) == 1
+                    else torch.cat(feature_slices, dim=0)
+                )
 
         if split_kimi_k3_images:
             mm_items = [
@@ -1123,6 +1114,8 @@ class MMEncoder:
             else:
                 for mm_item in mm_items:
                     mm_item.set(key, value)
+        for item in mm_items:
+            item.bind_processor_fingerprint(self.cache_namespace)
         return mm_items
 
     async def _prepare_encode_context(
@@ -1201,14 +1194,13 @@ class MMEncoder:
                             f"count {n} for req {req['req_id']}; hashes must be "
                             f"grid-space (1 per encoder grid entry)."
                         )
-                mm_hashes = [h for hashes in per_req_hashes for h in hashes]
             if self.rank == 0:
-                if mm_hashes is None:
-                    mm_hashes = self._calculate_hashes_from_features(
-                        mm_feature, grid_thw, modality, mm_inputs
-                    )
+                # Caller hints cannot replace the actual encoder-input identity.
+                mm_hashes = self._calculate_hashes_from_features(
+                    mm_feature, preprocess_result, modality
+                )
                 # Embedding stores use string cache keys.
-                str_mm_hashes = [str(h) for h in mm_hashes]
+                str_mm_hashes = [h.hex() for h in mm_hashes]
 
         return EncodeContext(
             req_id=requests[0]["req_id"],
@@ -1749,7 +1741,7 @@ class MMEncoder:
             if use_mm_cache:
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
-                mm_hashes = [mm_item.hash for mm_item in mm_items]
+                mm_hashes = [mm_item.cache_key for mm_item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
                     mm_cache = self.mm_cache.get(mm_hashes)

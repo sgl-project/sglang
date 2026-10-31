@@ -781,7 +781,7 @@ class MuseSpark1xOmniMultimodalProcessor(
                         content_digest=entry.content_digest,
                         artifact_key=entry.artifact_key,
                         feature_hash=resolve_multimodal_item_hash(
-                            existing_hash=0, namespace=entry.artifact_key
+                            feature=(feature, token_count), namespace=entry.artifact_key
                         ),
                         feature=feature if keep_device else cpu_feature,
                         token_count=token_count,
@@ -826,9 +826,11 @@ class MuseSpark1xOmniMultimodalProcessor(
                 },
             )
             input_ids = self._expand_mm_placeholders(input_ids, images, [], [])
-        output = self._build_output(input_ids, images, [], [])
+        output = self._build_output(input_ids, images, [], [], transport=False)
         for item, artifact in zip(output.mm_items, artifacts):
-            item.set_hash(artifact.feature_hash)
+            item.set_identity(artifact.feature_hash.to_bytes(32, "big"))
+        if self.preprocess_config.use_gpu_preprocess:
+            output.mm_items = self._prepare_mm_items_for_transport(output.mm_items)
         return output
 
     async def process_mm_data_async(

@@ -1,17 +1,4 @@
-"""Tests for caller-supplied mm_hashes plumbing.
-
-Verifies the contract that:
-  1. GenerateReqInput.mm_hashes is an optional list of hex strings.
-  2. MultimodalDataItem.set_pad_value() honors a pre-set hash and does NOT
-     overwrite it via hash_feature().
-  3. The derived pad_value is deterministic across requests with identical
-     mm_hashes — the property external KV routers depend on.
-
-The wiring step that copies GenerateReqInput.mm_hashes into per-item
-MultimodalDataItem.hash lives in tokenizer_manager.py and is exercised by
-the e2e serve tests; this file pins the unit-level invariants the wiring
-relies on.
-"""
+"""Legacy routing hashes must not replace content-verified cache identities."""
 
 import asyncio
 import pickle
@@ -24,7 +11,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.mm_utils import hash_feature
+from sglang.srt.managers.mm_utils import hash_feature_digest
 from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
@@ -53,21 +40,20 @@ class TestMmHashesContract(CustomTestCase):
         self.assertEqual(req[1].mm_hashes, ["02", "03"])
         self.assertEqual(len(req[1].mm_content_hashes), 2)
 
-    def test_set_pad_value_honors_preset_hash(self):
-        """set_pad_value() must use a pre-set hash without recomputing."""
-        item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xDEADBEEF)
-        # If hash_feature is invoked, the test fails — we patch it to
-        # raise so any accidental recompute is loud.
-        with patch(
-            "sglang.srt.managers.mm_utils.hash_feature",
-            side_effect=AssertionError(
-                "hash_feature must NOT be called when hash is preset"
-            ),
-        ):
+    def test_preset_hash_does_not_override_feature_contents(self):
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE, hash=0xDEADBEEF, feature=feature
+            )
+            for feature in (torch.zeros(4), torch.ones(4))
+        ]
+        for item in items:
             item.set_pad_value()
-        self.assertEqual(item.hash, 0xDEADBEEF)
-        self.assertEqual(len(item.padding_values()), 4)
-        self.assertEqual(item.pad_value, item.padding_values()[0])
+            self.assertEqual(item.hash, 0xDEADBEEF)
+            self.assertEqual(len(item.padding_values()), 4)
+            self.assertEqual(item.pad_value, item.padding_values()[0])
+        self.assertNotEqual(items[0].identity, items[1].identity)
+        self.assertNotEqual(items[0].padding_values(), items[1].padding_values())
 
     def test_set_hash_updates_an_existing_pad_value(self):
         item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xAAAA)
@@ -81,12 +67,7 @@ class TestMmHashesContract(CustomTestCase):
         self.assertEqual(item.padding_values(), expected.padding_values())
 
     def test_wide_padding_is_shared_by_all_modalities(self):
-        expected = (
-            4445679232235744898,
-            1252851680943950380,
-            4490111419971165939,
-            1999168716371743145,
-        )
+        identities = set()
         for modality in Modality.all():
             with self.subTest(modality=modality):
                 a = MultimodalDataItem(modality=modality, hash=7)
@@ -94,7 +75,11 @@ class TestMmHashesContract(CustomTestCase):
                 a.set_pad_value()
                 b.set_pad_value()
                 self.assertNotEqual(a.pad_value, b.pad_value)
-                self.assertEqual(a.padding_values(), expected)
+                repeated = MultimodalDataItem(modality=modality, hash=7)
+                repeated.set_pad_value()
+                self.assertEqual(a.padding_values(), repeated.padding_values())
+                self.assertNotIn(a.identity, identities)
+                identities.add(a.identity)
                 self.assertEqual(
                     a.padding_sequence(6), list(a.pad_values) + list(a.pad_values[:2])
                 )
@@ -139,7 +124,7 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
                     await self.executor.set_pad_values([item])
                     received = pickle.loads(pickle.dumps(item))
                     with patch(
-                        "sglang.srt.managers.mm_utils.hash_feature",
+                        "sglang.srt.managers.mm_utils.hash_feature_digest",
                         side_effect=AssertionError("scheduler rehashed a feature"),
                     ):
                         received.set_pad_value()
@@ -151,33 +136,53 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
     async def test_overrides_and_device_features_stay_on_caller_thread(self):
         caller_thread = threading.get_ident()
         overridden = MultimodalDataItem(modality=Modality.IMAGE, hash=1234)
-        padded = MultimodalDataItem(modality=Modality.IMAGE, hash=99, pad_value=1)
+        padded = MultimodalDataItem(modality=Modality.IMAGE)
+        padded.set_identity(b"p" * 32)
+        expected_padding = padded.padding_values()
         device_item = MultimodalDataItem(
             modality=Modality.IMAGE, feature=torch.empty(1, device="meta")
         )
 
-        def device_hash(feature):
-            self.assertEqual(threading.get_ident(), caller_thread)
-            self.assertIs(feature, device_item.feature)
-            return 42
+        def device_hash(payload):
+            if payload[5] is device_item.feature:
+                self.assertEqual(threading.get_ident(), caller_thread)
+                return b"d" * 32
+            return hash_feature_digest(payload)
 
-        with patch("sglang.srt.managers.mm_utils.hash_feature", device_hash):
+        with patch("sglang.srt.managers.mm_utils.hash_feature_digest", device_hash):
             await self.executor.set_pad_values([overridden, padded, device_item])
         self.assertEqual(overridden.hash, 1234)
-        self.assertEqual((padded.hash, padded.pad_value), (99, 1))
-        self.assertEqual(device_item.hash, 42)
+        self.assertEqual(padded.padding_values(), expected_padding)
+        self.assertEqual(device_item.identity, b"d" * 32)
 
     async def test_skip_hash_preserves_existing_semantics(self):
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
         with (
             envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(True),
             patch(
-                "sglang.srt.managers.mm_utils.hash_feature",
+                "sglang.srt.managers.mm_utils.hash_feature_digest",
                 side_effect=AssertionError("skip mode read a feature"),
             ),
         ):
             await self.executor.set_pad_values([item])
         self.assertIsNotNone(item.pad_value)
+
+    async def test_gpu_metadata_stays_on_caller_thread(self):
+        caller_thread = threading.get_ident()
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.ones(4),
+            model_specific_data={"grid": torch.empty(3, device="meta")},
+        )
+
+        def digest(payload):
+            self.assertEqual(threading.get_ident(), caller_thread)
+            self.assertIs(payload[7], item.model_specific_data)
+            return b"m" * 32
+
+        with patch("sglang.srt.managers.mm_utils.hash_feature_digest", digest):
+            await self.executor.set_pad_values([item])
+        self.assertEqual(item.identity, b"m" * 32)
 
     async def test_cancelled_native_reader_keeps_capacity_until_finished(self):
         """Repeated cancellation cannot admit another reader or free its input."""
@@ -189,15 +194,15 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
         second = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.zeros(4))
         reads = []
 
-        def blocking_hash(feature):
-            reads.append(feature)
-            if feature is first.feature:
+        def blocking_hash(payload):
+            reads.append(payload[5])
+            if payload[5] is first.feature:
                 loop.call_soon_threadsafe(started.set)
                 if not release.wait(5):
                     raise TimeoutError("test did not release hash worker")
-            return hash_feature(feature)
+            return hash_feature_digest(payload)
 
-        with patch("sglang.srt.managers.mm_utils.hash_feature", blocking_hash):
+        with patch("sglang.srt.managers.mm_utils.hash_feature_digest", blocking_hash):
             task = asyncio.create_task(self.executor.set_pad_values([first]))
             await asyncio.wait_for(started.wait(), 3)
             # Reaching here while the hash blocks also proves loop responsiveness.
@@ -222,7 +227,7 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
     async def test_error_releases_capacity_and_shutdown_rejects_new_work(self):
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
         with patch(
-            "sglang.srt.managers.mm_utils.hash_feature",
+            "sglang.srt.managers.mm_utils.hash_feature_digest",
             side_effect=ValueError("invalid feature"),
         ):
             with self.assertRaisesRegex(ValueError, "invalid feature"):
@@ -230,7 +235,7 @@ class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCas
         await asyncio.wait_for(self.executor.set_pad_values([item]), 3)
         self.executor.shutdown()
         self.executor.shutdown()
-        item.hash = item.pad_value = None
+        item.clear_identity()
         with self.assertRaisesRegex(RuntimeError, "shutdown"):
             await self.executor.set_pad_values([item])
 

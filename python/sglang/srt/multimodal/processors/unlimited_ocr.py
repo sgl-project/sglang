@@ -1,6 +1,5 @@
 """Standalone UNLIMITED-OCR processor."""
 
-import hashlib
 import logging
 from typing import List, Union
 
@@ -10,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
+from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -65,22 +65,11 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
 
     @staticmethod
     def _mix_config_into_hash(mm_items, processor_kwargs):
-        """Mix images_config into mm_item hashes so that different configs
-        produce different pad_values, avoiding radix/embedding cache collisions."""
-        from sglang.srt.managers.mm_utils import hash_feature
-
-        config_bytes = str(sorted(processor_kwargs.items())).encode()
+        """Scope finalized identities without reopening transported features."""
         for item in mm_items:
-            if item.feature is not None:
-                base_hash = hash_feature(item.feature)
-            elif item.precomputed_embeddings is not None:
-                base_hash = hash_feature(item.precomputed_embeddings)
-            else:
-                continue
-            combined = hashlib.sha256(
-                base_hash.to_bytes(8, byteorder="big") + config_bytes
-            ).digest()[:8]
-            item.hash = int.from_bytes(combined, byteorder="big", signed=False)
+            item.set_identity(
+                structured_digest(("ocr-config", item.cache_key, processor_kwargs))
+            )
 
     async def process_mm_data_async(
         self, image_data: List[Union[str, bytes]], input_text, *args, **kwargs

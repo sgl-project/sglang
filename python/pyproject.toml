@@ -26,6 +26,7 @@ dependencies = [
   "anthropic>=0.20.0",
   "apache-tvm-ffi==0.1.11",
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors==0.18.0",

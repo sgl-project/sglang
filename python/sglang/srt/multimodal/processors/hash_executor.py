@@ -1,6 +1,7 @@
 """Bounded CPU feature hashing for the tokenizer's event loop."""
 
 import asyncio
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -17,8 +18,12 @@ def _is_cpu_feature(value: object) -> bool:
         return value.device.type == "cpu"
     if isinstance(value, np.ndarray):
         return True
-    if isinstance(value, list):
-        return bool(value) and all(_is_cpu_feature(part) for part in value)
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return True
+    if isinstance(value, Mapping):
+        return all(_is_cpu_feature(part) for part in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_is_cpu_feature(part) for part in value)
     return False
 
 
@@ -46,16 +51,16 @@ class MultimodalHashExecutor:
         for item in items:
             if not isinstance(item, MultimodalDataItem):
                 continue
-            feature = (
-                item.feature
-                if item.feature is not None
-                else item.precomputed_embeddings
-            )
             if (
-                item.pad_value is None
-                and item.hash is None
+                item.identity is None
                 and not envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
-                and _is_cpu_feature(feature)
+                and _is_cpu_feature(
+                    (
+                        item.feature,
+                        item.precomputed_embeddings,
+                        item.model_specific_data,
+                    )
+                )
             ):
                 cpu_items.append(item)
             else:
