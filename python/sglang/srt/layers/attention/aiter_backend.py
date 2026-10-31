@@ -489,7 +489,11 @@ class AiterAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
-        # Only the DCP target verify reads it, and the query needs v_head_dim.
+        # Only the MLA DCP target verify reads these. Its absorbed attention
+        # writes the kv_lora_rank-wide latent, not the model's v_head_dim.
+        self.cprr_v_head_dim = (
+            model_runner.model_config.kv_lora_rank if self.use_mla else 0
+        )
         self.cprr_kernel_heads = (
             _asm_cprr_kernel_heads(
                 self.num_head * self.dcp_world_size,
@@ -497,7 +501,7 @@ class AiterAttnBackend(AttentionBackend):
                     heads, self.num_draft_tokens or 1
                 ),
             )
-            if self.dcp_world_size > 1
+            if self.use_mla and self.dcp_world_size > 1
             else 0
         )
 
@@ -1524,7 +1528,7 @@ class AiterAttnBackend(AttentionBackend):
             cp_world_size=self.dcp_world_size,
             fast_mode=self.cprr_fast_mode,
             intra_batch_mode=self.cprr_intra_batch_mode,
-            v_head_dim=self.v_head_dim,
+            v_head_dim=self.cprr_v_head_dim,
         )
 
     def _mla_decode_fwd_with_head_pad(

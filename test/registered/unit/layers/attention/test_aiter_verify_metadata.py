@@ -176,6 +176,23 @@ class TestAiterCprrKernelHeads(CustomTestCase):
                 support.calls[0].items(),
             )
 
+    def test_backend_asks_with_the_latent_width(self):
+        # Kimi-K3: v_head_dim 128, kv_lora_rank 512. The absorbed verify writes the
+        # 512-wide latent, and aiter's asm route only exists for 512.
+        support = _ShapeSupport({(96, 8), (128, 8)})
+        backend = SimpleNamespace(
+            dcp_world_size=8,
+            cprr_fast_mode=True,
+            cprr_intra_batch_mode=False,
+            v_head_dim=128,
+            cprr_v_head_dim=512,
+        )
+        with patch.object(aiter_backend, "get_mla_decode_shape_support", support):
+            self.assertTrue(
+                aiter_backend.AiterAttnBackend._asm_cprr_supports(backend, 96, 8)
+            )
+        self.assertEqual(support.calls[0]["v_head_dim"], 512)
+
     def test_table_decides_where_aiter_cannot(self):
         # An aiter that cannot tell (supported=None) or has no query at all.
         unknown = _ShapeSupport({(96, 8)}, supported=None)
