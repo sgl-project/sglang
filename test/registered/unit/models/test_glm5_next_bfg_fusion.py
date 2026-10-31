@@ -368,16 +368,20 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "needs a BF16 o_proj"):
             self.build("o_proj", MockFp8Config(QKV + BFG))
 
-    def test_remote_instance_load_and_seed_are_rejected(self):
-        # A remote-instance load skips post-load processing; a transfer-engine seed lets
-        # peers write the parameters directly.
-        for args, error in (
-            ({"load_format": "remote_instance"}, "remote_instance"),
+    def test_processed_state_loads_and_transfer_engine_seed_are_rejected(self):
+        # These load formats copy processed tensors into parameters built from the
+        # checkpoint; a transfer-engine seed serves its FP8 tensors to such peers.
+        cases = [
+            ({"load_format": fmt}, fmt)
+            for fmt in ("remote_instance", "sharded_state", "presharded", "remote")
+        ]
+        cases.append(
             (
                 {"remote_instance_weight_loader_start_seed_via_transfer_engine": True},
                 "transfer-engine",
-            ),
-        ):
+            )
+        )
+        for args, error in cases:
             with self.subTest(**args):
                 override = get_context().override_server_args(
                     device="cpu", enable_lora=False, lora_paths=None, **args

@@ -164,6 +164,12 @@ _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 # one GEMM, so they switch to FP8 together.
 _KDA_FP8_INPUT_MODULES = frozenset({"qkv_proj", "f_a_proj", "g_a_proj"})
 _KDA_FP8_MODULES = _KDA_FP8_INPUT_MODULES | {"o_proj"}
+_KDA_FP8_UNSUPPORTED_LOAD_FORMATS = (
+    "remote_instance",
+    "sharded_state",
+    "presharded",
+    "remote",
+)
 
 
 def _kda_fp8_modules() -> frozenset:
@@ -186,12 +192,13 @@ def _kda_fp8_modules() -> frozenset:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES runs FP8 GEMMs; unset SGLANG_FORCE_FP8_MARLIN"
         )
-    # A remote-instance load copies the seed's tensors into BF16 parameters and skips
-    # post-load processing; a transfer-engine seed lets peers write the parameters.
-    if modules and get_model().load_format == "remote_instance":
+    # These formats copy a seed's or a saved model's processed tensors into parameters
+    # built from the checkpoint; a transfer-engine seed serves its FP8 tensors to them.
+    load_format = get_model().load_format
+    if modules and load_format in _KDA_FP8_UNSUPPORTED_LOAD_FORMATS:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
-            "--load-format remote_instance: the KDA projections are quantized at load"
+            f"--load-format {load_format}: the KDA projections are quantized at load"
         )
     if (
         modules
@@ -227,8 +234,8 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
         return torch.cuda.use_mem_pool(self._bf16_pool)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # end_weight_update runs post-load processing again; the weights are FP8 already.
-        # Updates through sglang are refused before they write, and peer writes at startup.
+        # end_weight_update runs post-load processing again; the weights are FP8 already,
+        # and updates through sglang are refused before they write.
         if self._quantized:
             return
         weight = layer.weight.data

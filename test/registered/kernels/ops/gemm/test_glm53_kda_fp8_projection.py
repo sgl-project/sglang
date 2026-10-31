@@ -155,9 +155,12 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
     def setUp(self):
         # EnvField.override skips its restore when the body raises;
         # this outer override exits normally and restores the variable.
-        tune = envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(True)
-        tune.__enter__()
-        self.addCleanup(tune.__exit__, None, None, None)
+        for override in (
+            envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(True),
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""),
+        ):
+            override.__enter__()
+            self.addCleanup(override.__exit__, None, None, None)
 
     def test_load_pads_and_quantizes_per_channel(self):
         for name, (n, k) in SHAPES.items():
@@ -204,16 +207,19 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
 
         n, k = SHAPES["input_tp1"]
 
-        def check(method, layer, m, expected, other=None):
+        def check(method, layer, m, expected, other=None, tune=True):
             n, k = layer.output_size_per_partition, layer.input_size_per_partition
             x = make_input(m, k, seed=7)
             x_q, x_scale = sglang_per_token_quant_fp8(x)
             gemm = (x_q, layer.weight, x_scale, layer.weight_scale)
             ran = kernel_names(lambda: method.apply(layer, x))
             want = kernel_names(lambda: expected(x, gemm))
-            self.assertTrue(
-                torch.equal(method.apply(layer, x), expected(x, gemm)[:, :n])
-            )
+            y = method.apply(layer, x)
+            self.assertTrue(torch.equal(y, expected(x, gemm)[:, :n]))
+            # Bit-identical to the generic path it replaces, under the same tile setting.
+            with envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(tune):
+                replaced = Fp8LinearMethod.apply(method, layer, x)
+            self.assertTrue(torch.equal(y, replaced[:, :n]))
             self.assertTrue(want)
             self.assertLessEqual(want, ran)
             if other is not None:
@@ -233,16 +239,25 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             method, layer, _ = make_layer(n, k)
         for m in (16, 8191):
             with self.subTest(case="aot", m=m):
-                check(method, layer, m, aot, other=lambda g: triton_default(None, g))
-                check(method, layer, m, generic)
+                check(
+                    method,
+                    layer,
+                    m,
+                    aot,
+                    other=lambda g: triton_default(None, g),
+                    tune=False,
+                )
+                check(method, layer, m, generic, tune=False)
         with self.subTest(case="8192 rows"):
-            check(method, layer, 8192, generic)
+            check(method, layer, 8192, generic, tune=False)
 
         previous = get_fused_op_backend()
         set_fused_op_backend(KernelBackend.TORCH)
         try:
             with self.subTest(case="forced backend"):
-                check(method, layer, 16, generic, other=lambda g: aot(None, g))
+                check(
+                    method, layer, 16, generic, other=lambda g: aot(None, g), tune=False
+                )
         finally:
             set_fused_op_backend(previous)
 
