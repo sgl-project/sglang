@@ -191,6 +191,42 @@ class TestUnifiedMambaViews(unittest.TestCase):
                     f"(envelope regions overlap)",
                 )
 
+    def test_slot_lifecycle_updates_whole_entries(self):
+        from sglang.srt.mem_cache.kv.layout.state import StateView
+
+        arena, spec = _make_pool(**self.FALCON_KW)
+        pool = StateView(
+            arena=arena,
+            spec=spec,
+            spec_state_size=0,
+            mamba_layer_ids=list(range(spec.layer_num)),
+        )
+        entries = arena.entries(spec.name)
+        entries.copy_(torch.arange(entries.numel()).view_as(entries).to(torch.uint8))
+        before = entries.clone()
+        indices = torch.tensor([2, 5], dtype=torch.int32)
+
+        pool.clear_slots(indices)
+        self.assertTrue(bool((entries[indices] == 0).all().item()))
+        self.assertTrue(torch.equal(entries[1], before[1]))
+
+        pool.copy_from(
+            torch.tensor([1, 3], dtype=torch.int32),
+            torch.tensor([4, 6], dtype=torch.int32),
+        )
+        self.assertTrue(torch.equal(entries[4], before[1]))
+        self.assertTrue(torch.equal(entries[6], before[3]))
+
+        saved = pool.get_cpu_copy(indices)
+        for conv in saved[0]:
+            conv.fill_(1)
+        saved[1].fill_(2)
+        pool.load_cpu_copy(saved, indices)
+        for conv in pool.mamba_cache.conv:
+            self.assertTrue(bool((conv[:, indices] == 1).all().item()))
+        self.assertTrue(bool((pool.mamba_cache.temporal[:, indices] == 2).all().item()))
+        self.assertTrue(torch.equal(entries[1], before[1]))
+
     def test_alignment_guard_fires_on_misaligned_spec(self):
         """A per-slot entry that is not a multiple of the temporal itemsize would
         mis-offset the view and must trip the alignment assert; either guard can

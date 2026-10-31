@@ -16,8 +16,13 @@ from sglang.srt.mem_cache.layout.token_major import (
     align_part_offset,
     build_mamba_entry_views,
 )
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.memory_pool import (
+    MambaPool,
+    _state_slot_indices,
+    _store_state_slots,
+)
 from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -267,7 +272,14 @@ class StateView:
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
         entries = self._arena.entries(self._sub_pool_name)
-        entries[dst_indices] = entries[src_indices]
+        if is_npu():
+            entries[dst_indices] = entries[src_indices]
+        else:
+            entries.index_copy_(
+                0,
+                _state_slot_indices(dst_indices),
+                entries.index_select(0, _state_slot_indices(src_indices)),
+            )
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -287,11 +299,20 @@ class StateView:
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
         current_platform.synchronize()
+        indexed_indices = _state_slot_indices(indices)
         for i, conv in enumerate(self.mamba_cache.conv):
-            conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
-        self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
-            self.mamba_cache.temporal.device, non_blocking=True
-        )
+            _store_state_slots(
+                conv,
+                indexed_indices,
+                conv_cpu[i].to(conv.device, non_blocking=True),
+            )
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() > 0:
+            _store_state_slots(
+                temporal,
+                indexed_indices,
+                temporal_cpu.to(temporal.device, non_blocking=True),
+            )
         current_platform.synchronize()
 
     # -- host transfer and PD --
