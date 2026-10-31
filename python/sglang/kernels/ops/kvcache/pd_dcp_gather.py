@@ -18,7 +18,7 @@ def _copy_mla_rows_into_pack_kernel(
     metadata_offset = layer_id * 4
     src = tl.load(src_metadata + metadata_offset).to(pack.dtype)
     row_nbytes = tl.load(src_metadata + metadata_offset + 1)
-    pack_offset = tl.load(src_metadata + metadata_offset + 2)
+    pack_offset = tl.load(src_metadata + metadata_offset + 2) * num_rows
     src_row_stride = tl.load(src_metadata + metadata_offset + 3)
 
     offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -31,12 +31,39 @@ def _copy_mla_rows_into_pack_kernel(
     tl.store(pack + pack_offset + offsets, values, mask=mask)
 
 
+class MlaPackMetadataCache:
+    """One layout per serial pack-buffer consumer, on its gather stream.
+
+    A single entry bounds GPU metadata storage when pointers or layouts change.
+    The caller must synchronize the gather before sharing this cache across
+    streams, just as it must before reusing the pack buffer itself.
+    """
+
+    def __init__(self):
+        self.key = None
+        self.tensor = None
+
+    def get(self, device, pointers, widths, strides):
+        key = (torch.device(device), tuple(pointers), tuple(widths), tuple(strides))
+        if key != self.key:
+            metadata = []
+            prefix = 0
+            for ptr, width, stride in zip(pointers, widths, strides):
+                metadata.extend((int(ptr), int(width), prefix, int(stride)))
+                prefix += int(width)
+            tensor = torch.tensor(metadata, dtype=torch.int64, device=device)
+            self.key, self.tensor = key, tensor
+        return self.tensor
+
+
 def copy_mla_rows_into_pack(
     kv_data_ptrs: Sequence[int],
     row_indices: torch.Tensor,
     pack: torch.Tensor,
     token_item_lens: Sequence[int],
     src_token_item_lens: Optional[Sequence[int]] = None,
+    *,
+    metadata_cache: Optional[MlaPackMetadataCache] = None,
 ) -> None:
     if src_token_item_lens is None:
         src_token_item_lens = token_item_lens
@@ -49,18 +76,16 @@ def copy_mla_rows_into_pack(
         return
 
     n = int(row_indices.numel())
-    metadata = []
-    offset = 0
-    for ptr, item_len, src_item_len in zip(
-        kv_data_ptrs, token_item_lens, src_token_item_lens
-    ):
-        item_len = int(item_len)
-        if item_len <= 0:
+    if n == 0:
+        return
+    for item_len in token_item_lens:
+        if int(item_len) <= 0:
             raise ValueError(f"MLA token item length must be positive, got {item_len}")
-        metadata.extend((int(ptr), item_len, offset, int(src_item_len)))
-        offset += n * item_len
-
-    src_metadata = torch.tensor(metadata, dtype=torch.int64, device=pack.device)
+    if metadata_cache is None:
+        metadata_cache = MlaPackMetadataCache()
+    src_metadata = metadata_cache.get(
+        pack.device, kv_data_ptrs, token_item_lens, src_token_item_lens
+    )
     max_item_len = max(int(item_len) for item_len in token_item_lens)
     grid = (len(kv_data_ptrs), triton.cdiv(n * max_item_len, 1024))
     _copy_mla_rows_into_pack_kernel[grid](
