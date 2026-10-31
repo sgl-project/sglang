@@ -599,7 +599,7 @@ class MegakernelBinding:
 
         states: dict[int, KdaStateView] = {}
         for layer_id in mamba_map:
-            state = request_pool.mamba2_layer_cache(layer_id)
+            state = linear_backend.state_layer_cache(layer_id)
             if state.replayssm_d is not None or state.replayssm_rawv is not None:
                 raise ValueError(
                     f"megakernel binding: KDA layer {layer_id} has ReplaySSM state; "
@@ -627,7 +627,7 @@ class MegakernelBinding:
                     intermediate_conv_window[0],
                     lambda layer_id=layer_id: (
                         self._current_hybrid_sources()
-                        .request_pool.mamba2_layer_cache(layer_id)
+                        .linear_backend.state_layer_cache(layer_id)
                         .intermediate_conv_window[0]
                     ),
                 )
@@ -636,7 +636,7 @@ class MegakernelBinding:
                     intermediate_ssm,
                     lambda layer_id=layer_id: (
                         self._current_hybrid_sources()
-                        .request_pool.mamba2_layer_cache(layer_id)
+                        .linear_backend.state_layer_cache(layer_id)
                         .intermediate_ssm
                     ),
                 )
@@ -651,7 +651,7 @@ class MegakernelBinding:
                 conv[0],
                 lambda layer_id=layer_id: (
                     self._current_hybrid_sources()
-                    .request_pool.mamba2_layer_cache(layer_id)
+                    .linear_backend.state_layer_cache(layer_id)
                     .conv[0]
                 ),
             )
@@ -660,7 +660,7 @@ class MegakernelBinding:
                 state.temporal,
                 lambda layer_id=layer_id: (
                     self._current_hybrid_sources()
-                    .request_pool.mamba2_layer_cache(layer_id)
+                    .linear_backend.state_layer_cache(layer_id)
                     .temporal
                 ),
             )

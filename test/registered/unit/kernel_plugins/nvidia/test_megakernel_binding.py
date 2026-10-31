@@ -16,6 +16,8 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -102,38 +104,45 @@ class MambaPool:
         self.intermediate_conv_window = [torch.zeros(2, self.size + 1, q, 3)]
         self.intermediate_ssm = torch.zeros(2, self.size + 1, q, 4)
 
-
-class RequestPool(HybridReqToTokenPool):
-    def __init__(self, *, verify=False, q=4):
-        self.mamba_pool = MambaPool(verify=verify, q=q)
-        self.size = self.mamba_pool.size
-        self.mamba_map = {0: 0, 2: 1}
-
     def mamba2_layer_cache(self, layer_id):
-        dense = self.mamba_map[layer_id]
-        if self.mamba_pool.verify:
+        dense = layer_id
+        if self.verify:
             return StatePool.SpeculativeState(
-                conv=[self.mamba_pool.conv[0][dense]],
-                temporal=self.mamba_pool.temporal[dense],
-                intermediate_conv_window=[
-                    self.mamba_pool.intermediate_conv_window[0][dense]
-                ],
+                conv=[self.conv[0][dense]],
+                temporal=self.temporal[dense],
+                intermediate_conv_window=[self.intermediate_conv_window[0][dense]],
                 intermediate_ssm=(
-                    self.mamba_pool.intermediate_ssm[dense]
-                    if self.mamba_pool.intermediate_ssm is not None
+                    self.intermediate_ssm[dense]
+                    if self.intermediate_ssm is not None
                     else None
                 ),
             )
         return SimpleNamespace(
-            conv=[self.mamba_pool.conv[0][dense]],
-            temporal=self.mamba_pool.temporal[dense],
+            conv=[self.conv[0][dense]],
+            temporal=self.temporal[dense],
             replayssm_d=None,
             replayssm_rawv=None,
         )
 
 
+class RequestPool(HybridReqToTokenPool):
+    def __init__(self, *, verify=False, q=4):
+        self.state = StateStorage.empty(self.state_sub_pool)
+        self.mamba_pool = MambaPool(verify=verify, q=q)
+        self.size = self.mamba_pool.size
+        self.mamba_map = {0: 0, 2: 1}
+
+
 def hybrid_backend(*, verify=False, q=4):
     token_pool, request_pool = TokenPool(), RequestPool(verify=verify, q=q)
+    token_pool.layer_transfer_counter = None
+    token_pool.layer_router = KVLayerRouter.from_layer_maps(token_pool, [])
+    token_pool.layer_router.bind_part(
+        sub_pool=request_pool.state_sub_pool,
+        part=STATE_PART,
+        view=request_pool.mamba_pool,
+        indices=request_pool.mamba_map,
+    )
     full_metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.zeros(2, 4, dtype=torch.int32),
         seq_lens_k=torch.zeros(2, dtype=torch.int32),
@@ -166,6 +175,8 @@ def hybrid_backend(*, verify=False, q=4):
             [0, 3, 1, 2, 4], dtype=torch.int32
         ),
     )
+    linear.state_layer = KDAAttnBackend.state_layer.__get__(linear)
+    linear.state_layer_cache = KDAAttnBackend.state_layer_cache.__get__(linear)
     value = Mock(spec=HybridLinearAttnBackend, token_to_kv_pool=token_pool)
     value.req_to_token_pool = request_pool
     value.full_attn_backend = full
@@ -576,13 +587,13 @@ class TestMegakernelBinding(CustomTestCase):
             with self.subTest(layer_id=layer_id, field=field):
                 fixture = hybrid_backend()
                 binding = mb.MegakernelBinding(model=torch.nn.Module())
-                layer_cache = fixture.request_pool.mamba2_layer_cache
+                layer_cache = fixture.linear.state_layer_cache
                 replay_state = layer_cache(layer_id)
                 setattr(replay_state, field, torch.zeros(1))
                 with (
                     patch.object(
-                        fixture.request_pool,
-                        "mamba2_layer_cache",
+                        fixture.linear,
+                        "state_layer_cache",
                         side_effect=lambda current_layer: (
                             replay_state
                             if current_layer == layer_id
@@ -596,7 +607,9 @@ class TestMegakernelBinding(CustomTestCase):
                     binding.preparation_view(fixture.runner)
 
     def test_hybrid_preparation_is_typed_stable_and_capacity_is_live(self):
+        """Prepare routed KDA state without a legacy request-pool cache method."""
         fixture = hybrid_backend()
+        self.assertFalse(hasattr(fixture.request_pool, "mamba2_layer_cache"))
         binding = mb.MegakernelBinding(model=torch.nn.Module())
         prepared = binding.preparation_view(fixture.runner)
         hybrid = prepared.hybrid
