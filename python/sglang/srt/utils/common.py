@@ -198,23 +198,27 @@ def is_npu() -> bool:
     return True
 
 
+# Cache host CPU capability checks at import time to prevent TorchDynamo
+# from graph-breaking on `torch.cpu.is_available()` (torch op returning non-Tensor).
+_IS_HOST_CPU_X86 = (
+    platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+_IS_HOST_CPU_ARM64 = (
+    platform.machine().lower() in ("aarch64", "arm64")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_X86
 
 
 def is_host_cpu_arm64() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("aarch64", "arm64")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_ARM64
 
 
 @lru_cache(maxsize=1)
