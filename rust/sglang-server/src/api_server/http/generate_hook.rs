@@ -4,17 +4,26 @@
 
 use std::time::Duration;
 
+use axum::http::{HeaderMap, StatusCode};
 use serde_json::{Map, Value};
+pub use sglang_api_types::api::v1::GenerateMetaInfo;
 
-use crate::message::sampling::SamplingParams;
+use crate::message::request::GenerateRequest;
 
 /// Adds keys to native `/generate` frames; installed at launch with
 /// [`crate::Server::start_with_extensions`].
 pub trait GenerateHook: Send + Sync + std::fmt::Debug {
-    /// The annotator for one submitted request, from its sampling parameters
-    /// as submitted (the launch-time preferred params merged in, not yet
-    /// normalized).
-    fn start(&self, sampling_params: &SamplingParams) -> Box<dyn GenerateFrameHook>;
+    /// The annotator for one submitted request (one item of a batch):
+    /// `request` as submitted (the launch-time preferred sampling params
+    /// merged in, not yet normalized), the HTTP request's `headers`, and the
+    /// `sampling_params` object the client sent for it, before the preferred
+    /// params were merged, if it sent one.
+    fn start(
+        &self,
+        request: &GenerateRequest,
+        headers: &HeaderMap,
+        client_sampling_params: Option<&Map<String, Value>>,
+    ) -> Box<dyn GenerateFrameHook>;
 
     /// Whether this hook consumes a scheduler `customized_info` key: annotators
     /// still see its values ([`GenerateFrameInfo::new_customized_info`]), but
@@ -28,6 +37,13 @@ pub trait GenerateHook: Send + Sync + std::fmt::Debug {
 /// order, the terminal one last.
 pub trait GenerateFrameHook: Send {
     fn annotate(&mut self, frame: &GenerateFrameInfo<'_>, keys: &mut GenerateFrameKeys);
+
+    /// The request's terminal frame, after [`Self::annotate`] added its keys.
+    fn finished(&mut self, _terminal: &GenerateTerminal<'_>) {}
+
+    /// The request failed after it was submitted, with this HTTP status and
+    /// message; it has no terminal frame.
+    fn failed(&mut self, _status: StatusCode, _message: &str) {}
 }
 
 /// What an annotator sees of one frame.
@@ -58,6 +74,23 @@ impl<'a> GenerateFrameInfo<'a> {
             .iter()
             .find_map(|&(known, values)| (known == key).then_some(values))
     }
+}
+
+/// A request's terminal frame as the client receives it, apart from its
+/// `customized_info` keys (annotators see them in
+/// [`GenerateFrameInfo::customized_info`]) and the hook's own keys.
+#[derive(Clone, Copy, Debug)]
+pub struct GenerateTerminal<'a> {
+    /// The schema's `meta_info`.
+    pub meta_info: &'a GenerateMetaInfo,
+    /// The scheduler's stats for the request, reported in `meta_info` after
+    /// the schema's keys.
+    pub request_stats: Option<&'a Map<String, Value>>,
+    /// As [`GenerateFrameInfo::decode_latency`].
+    pub decode_latency: Option<Duration>,
+    /// The output token logprobs the request returned over all its frames
+    /// (an incremental stream's terminal frame carries only its last step's).
+    pub output_token_logprobs: usize,
 }
 
 /// Keys an annotator adds to one frame. They must not repeat a key the schema
