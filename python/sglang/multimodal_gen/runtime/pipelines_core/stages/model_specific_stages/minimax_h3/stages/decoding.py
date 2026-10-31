@@ -24,7 +24,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    rollout_output_without_decode,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
     streamed_video_output_path,
@@ -307,6 +310,14 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self, batch: OutputBatch, server_args: ServerArgs
     ) -> VerificationResult:
         result = VerificationResult()
+        if (
+            batch.output is None
+            and batch.output_file_paths is None
+            and batch.audio is None
+            and batch.rollout_trajectory_data is not None
+        ):
+            # rollout_output_without_decode: a rollout that asked for no generated output.
+            return result
         if not batch.output_file_paths:
             result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         result.add_check("audio", batch.audio, [V.is_tensor, V.with_dims(3)])
@@ -423,6 +434,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if not batch.rollout_return_generated_output:
+            return rollout_output_without_decode(batch)
         _minimax_h3_decoder_task(batch)
         visual_latent = _required_tensor(batch.latents, "batch.latents")
         audio_latent = _required_tensor(batch.audio_latents, "batch.audio_latents")
