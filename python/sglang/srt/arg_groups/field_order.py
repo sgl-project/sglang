@@ -556,5 +556,6 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",
+    "nvfp4_ckpt_fp8_dense_modules",
 )
 # fmt: on

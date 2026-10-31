@@ -19,7 +19,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_pp_stage_load_group,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_context, get_model, get_parallel
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -52,6 +52,17 @@ def _unsupported_derived_weight_cache_error(
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
     """
+    # A layer-specific selection can leave some PP stages without converted weights.
+    # Reject by process configuration so every stage takes the same update branch.
+    if (
+        get_context().is_config_namespace_published("model")
+        and get_model().nvfp4_ckpt_fp8_dense_modules
+    ):
+        return (
+            "Online weight updates are not supported while "
+            "--nvfp4-ckpt-fp8-dense-modules is set, including stages without matched "
+            "layers. Restart without the option to use online weight updates."
+        )
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
@@ -309,12 +320,20 @@ class WeightUpdater:
         )
         return bucket.reconstruct_tensors()
 
+    def validate_weight_update(self: WeightUpdater) -> None:
+        """Reject unsupported sessions before any runner restores or writes weights."""
+        error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is not None:
+            raise ValueError(error)
+
     def begin_weight_update(self: WeightUpdater) -> None:
+        self.validate_weight_update()
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
 
     def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+        self.validate_weight_update()
         if run_post_load:
             post_load_weights(self.get_model())
         DefaultModelLoader.postprocess_weights(

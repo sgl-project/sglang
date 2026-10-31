@@ -308,6 +308,13 @@ def _initialize_model(
     with get_model().override(shared_experts=shared_experts):
         model = model_class(**kwargs)
         check_stage_producers(model)
+        if quant_config is not None:
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                ModelOptQuantConfig,
+            )
+
+            if isinstance(quant_config, ModelOptQuantConfig):
+                quant_config.validate_online_fp8_selection(model)
     model.shared_experts_config = shared_experts
     return model
 

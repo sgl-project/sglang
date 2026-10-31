@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -44,7 +44,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
     can_auto_enable_marlin_fp8,
+    ceil_to_ue8m0,
     cutlass_fp8_supported,
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
     flashinfer_per_tensor_fp8_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -66,10 +68,12 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_context, get_flags, get_model, get_platform
 from sglang.srt.utils.common import (
+    ceil_div,
     get_device_capability,
     is_cuda,
+    print_warning_once,
     round_up,
     set_weight_attrs,
 )
@@ -305,12 +309,37 @@ def _use_nvfp4_dispatch() -> bool:
 _SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
 
 
+def _online_fp8_dense_modules() -> Optional[List[str]]:
+    """`--nvfp4-ckpt-fp8-dense-modules` (CUDA only; None where no model config is published)."""
+    if not get_context().is_config_namespace_published("model"):
+        return None
+    modules = get_model().nvfp4_ckpt_fp8_dense_modules
+    if modules and not is_cuda():
+        print_warning_once(
+            "--nvfp4-ckpt-fp8-dense-modules has no effect: needs NVIDIA GPUs."
+        )
+        return None
+    return modules
+
+
 @lru_cache(maxsize=8192)
 def _compile_exclusion_pattern(pattern: str) -> re.Pattern[str]:
     # Large checkpoints exceed regex's 500-entry cache. Keep compiled patterns
     # across layer checks without changing the regex module's global cache.
     # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*").
     return re.compile(pattern.replace(".", r"\.").replace("*", r".*"))
+
+
+def _matches_exclusion_pattern(pattern: str, prefix: str) -> bool:
+    compiled_pattern = _compile_exclusion_pattern(pattern)
+    prefixes = [prefix]
+    if prefix.startswith("language_model."):
+        prefixes.append(prefix.removeprefix("language_model."))
+    return any(
+        compiled_pattern.fullmatch(pfx)
+        or any(compiled_pattern.fullmatch(part) for part in pfx.split("."))
+        for pfx in prefixes
+    )
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -325,6 +354,99 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
+        self._online_fp8_config: Optional[Fp8Config] = None
+
+    # Whether --nvfp4-ckpt-fp8-dense-modules applies to this config's BF16 linears.
+    supports_online_fp8_dense = False
+
+    def _unquantized_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> LinearMethodBase:
+        """Linear method for a layer the checkpoint leaves unquantized."""
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        modules = _online_fp8_dense_modules()
+        # Draft (MTP / NextN) models are built in the speculative scope; they keep
+        # checkpoint precision.
+        if (
+            not modules
+            or isinstance(layer, ParallelLMHead)
+            or get_flags().moe.in_speculative_scope
+        ):
+            return UnquantizedLinearMethod()
+        if not self.supports_online_fp8_dense:
+            print_warning_once(
+                f"--nvfp4-ckpt-fp8-dense-modules has no effect on {self.get_name()} checkpoints."
+            )
+            return UnquantizedLinearMethod()
+        # Same module-path matching as quantization exclusion lists, fused shards included.
+        try:
+            selected = is_layer_skipped(
+                prefix,
+                modules,
+                self.packed_modules_mapping or {},
+                pattern_matcher=_matches_exclusion_pattern,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"--nvfp4-ckpt-fp8-dense-modules must list all parts of the fused {prefix} or none."
+            ) from e
+        if not selected:
+            return UnquantizedLinearMethod()
+        if self._online_fp8_config is None:
+            self._online_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,  # block-FP8 runtime contract
+                activation_scheme="dynamic",
+                weight_block_size=[128, 128],
+            )
+        logger.debug("%s: block-FP8 at load (--nvfp4-ckpt-fp8-dense-modules)", prefix)
+        return ModelOptOnlineBlockFp8LinearMethod(
+            self._online_fp8_config, prefix=prefix
+        )
+
+    def validate_online_fp8_selection(self, model: torch.nn.Module) -> None:
+        """Report actual selections after construction, including rank-local misses."""
+        from sglang.srt.layers.linear import LinearBase
+
+        modules = _online_fp8_dense_modules()
+        if not modules or get_flags().moe.in_speculative_scope:
+            return
+        selected = [
+            layer.quant_method.prefix
+            for layer in model.modules()
+            if isinstance(layer, LinearBase)
+            and isinstance(layer.quant_method, ModelOptOnlineBlockFp8LinearMethod)
+        ]
+        unmatched = []
+        for selector in modules:
+            for prefix in selected:
+                try:
+                    matched = is_layer_skipped(
+                        prefix,
+                        [selector],
+                        self.packed_modules_mapping or {},
+                        pattern_matcher=_matches_exclusion_pattern,
+                    )
+                except ValueError:
+                    # One selector may name a single shard; the full list was validated above.
+                    matched = True
+                if matched:
+                    break
+            else:
+                unmatched.append(selector)
+        logger.info(
+            "--nvfp4-ckpt-fp8-dense-modules selected %d linear modules on this rank; "
+            "module paths are logged at DEBUG.",
+            len(selected),
+        )
+        if unmatched:
+            logger.warning(
+                "--nvfp4-ckpt-fp8-dense-modules matched no eligible BF16 linears on "
+                "this rank for %s. Check checkpoint names, fused parts, existing "
+                "quantization, and pipeline placement. Use gate_proj up_proj, not "
+                "gate_up_proj, for a fused gate/up projection.",
+                ", ".join(unmatched),
+            )
 
     def _get_quant_method(
         self,
@@ -342,7 +464,7 @@ class ModelOptQuantConfig(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return self._unquantized_linear_method(layer, prefix)
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -401,16 +523,8 @@ class ModelOptQuantConfig(QuantizationConfig):
         fused_patterns = {"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"}
 
         for pattern in self.exclude_modules:
-            compiled_pattern = _compile_exclusion_pattern(pattern)
-
-            for pfx in prefixes_to_check:
-                if compiled_pattern.fullmatch(pfx):
-                    return True
-                # Part-by-part check: handles wildcards like "mtp*" matching
-                pfx_parts = pfx.split(".")
-                for part in pfx_parts:
-                    if compiled_pattern.fullmatch(part):
-                        return True
+            if _matches_exclusion_pattern(pattern, prefix):
+                return True
 
             # Check fused patterns: if the last segment of the exclude pattern
             # is a known fused component, check if it appears in the prefix's
@@ -422,6 +536,107 @@ class ModelOptQuantConfig(QuantizationConfig):
                         return True
 
         return False
+
+
+def quant_weight_block_fp8_online(
+    weight: torch.Tensor,
+    block_size: List[int],
+    pow2_scale: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """E4M3 weight and FP32 per-block `weight_scale_inv` = amax / 448.
+
+    Scales round up to powers of two when `pow2_scale` (DeepGEMM UE8M0 requant is then exact).
+    """
+    block_n, block_k = block_size
+    n, k = weight.shape
+    pn, pk = ceil_div(n, block_n) * block_n, ceil_div(k, block_k) * block_k
+    w = weight
+    if (pn, pk) != (n, k):
+        w = torch.zeros((pn, pk), dtype=weight.dtype, device=weight.device)
+        w[:n, :k] = weight
+    w = w.view(pn // block_n, block_n, pk // block_k, block_k).float()
+    amax = w.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+    scale = amax / torch.finfo(torch.float8_e4m3fn).max
+    if pow2_scale:
+        scale = ceil_to_ue8m0(scale)
+    q = (w / scale).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    q = q.view(pn, pk)[:n, :k].contiguous()
+    return q, scale.view(pn // block_n, pk // block_k).contiguous()
+
+
+class ModelOptOnlineBlockFp8LinearMethod(Fp8LinearMethod):
+    """Block-FP8 linear for a layer the NVFP4 checkpoint leaves in BF16, quantized after loading.
+
+    `quant_config` is a serialized block-FP8 Fp8Config with 128x128 blocks.
+    """
+
+    def __init__(self, quant_config: Fp8Config, *, prefix: str):
+        super().__init__(quant_config)
+        self.prefix = prefix
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        skip_block_quant_check: bool = False,
+        **extra_weight_attrs,
+    ):
+        Fp8LinearMethod.create_fp8_weight_(
+            layer,
+            block_quant=True,
+            quant_config=self.quant_config,
+            use_mxfp8=False,
+            output_size_per_partition=sum(output_partition_sizes),
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+            skip_block_quant_check=skip_block_quant_check,
+            input_size=input_size,
+            output_size=output_size,
+            is_checkpoint_fp8_serialized=False,  # BF16 weight, no scale params
+            params_dtype=params_dtype,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data
+        # Already block-FP8: the gathered DCP replica (model_runner._gather_block_fp8_linear).
+        if weight.dtype == torch.float8_e4m3fn:
+            return super().process_weights_after_loading(layer)
+        from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+
+        runner = self.w8a8_block_fp8_linear
+        if isinstance(runner, partial):
+            runner = runner.func
+        pow2_scale = (
+            runner is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=self.weight_block_size,
+                output_dtype=layer.orig_dtype,  # set by create_fp8_weight_
+                weight_shape=weight.shape,
+            )
+        )
+        qweight, scale = quant_weight_block_fp8_online(
+            weight, self.weight_block_size, pow2_scale
+        )
+        del weight
+        # Keep the Parameter object (weight_loader attrs), as _quantize_mxfp8_weights does.
+        layer.weight.data = qweight
+        layer.weight.requires_grad_(False)
+        layer.register_parameter(
+            "weight_scale_inv", Parameter(scale, requires_grad=False)
+        )
+        layer.input_scale = None
+        super().process_weights_after_loading(layer)
+        # Online updates would copy BF16 values into the FP8 weight under the old scales.
+        layer._derived_weight_cache_error = (
+            "Online weight updates are not supported with --nvfp4-ckpt-fp8-dense-modules: "
+            "those layers are quantized from the BF16 checkpoint at load. Restart "
+            "without the flag to use online weight updates."
+        )
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -806,6 +1021,8 @@ _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
+    supports_online_fp8_dense = True
+
     def __init__(
         self,
         kv_cache_quant_algo: Optional[str],
@@ -1049,7 +1266,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return self._unquantized_linear_method(layer, prefix)
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
@@ -1060,7 +1277,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
-            return UnquantizedLinearMethod()
+            return self._unquantized_linear_method(layer, prefix)
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
         # VocabParallelEmbedding, and a tied lm_head IS the embedding module.
@@ -1487,6 +1704,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
       1.0 when the checkpoint has no NVFP4 activation scale.
     - BF16/FP16/FP8 MoE + per-token FP32 activation scales: use `nvfp4_online`.
     """
+
+    supports_online_fp8_dense = True
 
     def __init__(
         self,

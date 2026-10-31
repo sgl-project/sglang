@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
@@ -71,7 +71,14 @@ def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
+    *,
+    pattern_matcher: Optional[Callable[[str, str], bool]] = None,
 ) -> bool:
+    def matches(ignored: str, name: str) -> bool:
+        return _module_path_match(ignored, name) or (
+            pattern_matcher is not None and pattern_matcher(ignored, name)
+        )
+
     # prefix: model.layers.0.self_attn.q_proj
     # proj_name: q_proj
     proj_name = prefix.split(".")[-1]
@@ -92,7 +99,7 @@ def is_layer_skipped(
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                _module_path_match(ignored, shard_prefix) for ignored in ignored_layers
+                matches(ignored, shard_prefix) for ignored in ignored_layers
             )
 
             if is_skipped is None:
@@ -104,9 +111,7 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(
-            _module_path_match(ignored, prefix) for ignored in ignored_layers
-        )
+        is_skipped = any(matches(ignored, prefix) for ignored in ignored_layers)
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")

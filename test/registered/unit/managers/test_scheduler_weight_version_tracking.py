@@ -26,6 +26,9 @@ from sglang.srt.mem_cache.kv_weight_version_tracker import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -301,6 +304,16 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
 def _runner(result=(True, "ok")):
     runner = Mock()
     runner.weight_updater.get_model.return_value = torch.nn.Module()
+
+    def validate_weight_update():
+        # Mirror WeightUpdater.validate_weight_update for the model each runner returns.
+        error = _unsupported_derived_weight_cache_error(
+            runner.weight_updater.get_model()
+        )
+        if error is not None:
+            raise ValueError(error)
+
+    runner.weight_updater.validate_weight_update.side_effect = validate_weight_update
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -548,6 +561,46 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         target.weight_updater.end_weight_update.assert_not_called()
         draft.weight_updater.begin_weight_update.assert_called_once_with()
         draft.weight_updater.end_weight_update.assert_called_once()
+
+    def test_begin_preflights_all_runners_before_restoring_any(self):
+        """An unsupported draft must not leave the target's packed weights restored."""
+        target, draft = _runner(), _runner()
+        storage = ["target-packed", "draft-packed"]
+        target.weight_updater.begin_weight_update.side_effect = lambda: (
+            storage.__setitem__(0, "restored")
+        )
+        draft.weight_updater.validate_weight_update.side_effect = ValueError(
+            "draft cache blocks updates"
+        )
+        manager = self._manager(target, draft, session=False)
+
+        result = manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+        self.assertFalse(result.success)
+        self.assertIn("draft cache", result.message)
+        self.assertIsNone(manager._session)
+        self.assertEqual(storage, ["target-packed", "draft-packed"])
+        self.assertEqual(self.recorded, [])
+
+    def test_end_preflights_before_postprocessing_any_runner(self):
+        """Rejected finalization must keep the session and both runners untouched."""
+        target, draft = _runner(), _runner()
+        storage = ["target-original", "draft-original"]
+        target.weight_updater.end_weight_update.side_effect = lambda **kw: (
+            storage.__setitem__(0, "processed")
+        )
+        draft.weight_updater.validate_weight_update.side_effect = ValueError(
+            "draft cache blocks updates"
+        )
+        manager = self._manager(target, draft)
+        session = manager._session
+
+        result = manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertFalse(result.success)
+        self.assertIs(manager._session, session)
+        self.assertEqual(storage, ["target-original", "draft-original"])
+        self.assertEqual(self.recorded, [])
 
     def test_begin_rejects_reentry(self):
         """A second begin would leave the first session's runners unfinalized."""

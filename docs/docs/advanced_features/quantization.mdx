@@ -567,6 +567,19 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
         --port 30000
     ```
 
+* **FP8 dense layers for NVFP4 checkpoints:**
+    ModelOpt NVFP4 checkpoints usually quantize only the routed experts and keep the dense layers (attention projections, shared experts, dense MLPs) in BF16. On NVIDIA GPUs, `--nvfp4-ckpt-fp8-dense-modules` serves the listed BF16 linears as block-FP8 (128x128 block scales), quantized while the model loads, with no separate checkpoint. For DeepSeek-V3 / V3.2 and GLM-5 NVFP4 checkpoints, the list below converts the attention projections, the DSA indexer's `wq_b`, the shared experts and the dense MLPs. It keeps `kv_b_proj` and the indexer's `wk` / `weights_proj` in BF16: the absorbed MLA path reads BF16 copies of `kv_b_proj` either way, and `wk` / `weights_proj` load into a fused BF16 weight. This option does not add FP8 quantization to speculative draft models (MTP / NextN layers); independent draft quantization settings still apply. Entries also accept the `*` patterns used by ModelOpt checkpoint exclusions, for example `"model.layers.*.self_attn.o_proj"` or `"*.mlp.shared_experts.*"`. Quote patterns in the shell. A fused layer must have all of its checkpoint parts matched, using names such as `gate_proj up_proj` or patterns covering both, not the fused name `gate_up_proj`. Selection only applies to eligible BF16 linears; it does not re-quantize the checkpoint's existing FP4 weights. Startup reports the actual rank-local selection count and warns about selectors that matched no eligible layers on that rank; DEBUG logs show individual module paths. Pipeline placement or existing checkpoint quantization can also explain a rank-local miss.
+    ```bash Command
+    python3 -m sglang.launch_server \
+        --model-path nvidia/GLM-5.2-NVFP4 \
+        --quantization modelopt_fp4 \
+        --nvfp4-ckpt-fp8-dense-modules q_a_proj kv_a_proj_with_mqa q_b_proj o_proj wq_b gate_proj up_proj down_proj \
+        --tp 8 \
+        --trust-remote-code \
+        --port 30000
+    ```
+    Which layers pay off depends on the GPU and parallelism, so measure your deployment. Converted `q_a_proj` / `kv_a_proj_with_mqa` and `q_b_proj` no longer use the BF16 min-latency GEMM SGLang runs for 1-16-token batches, so low-concurrency decode can get slower; leave them out (or list them only on prefill workers under prefill/decode disaggregation) if that matters. Setting this option disables online weight updates, including direct-write update sessions, on every stage even if a stage has no matched layers. This keeps update rejection consistent across pipeline stages.
+
 ##### Creating Your Own Quantized Checkpoints
 
 If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.
