@@ -1689,14 +1689,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return layout
 
     def pd_kv_layout(self) -> str:
-        """The main and compressed KV layouts, which PD peers must share."""
+        """The byte layouts PD peers must share: the main and compressed KV, and which
+        index-K pools use the page-8 layout (same size as page-64, so only this name
+        tells the two apart)."""
         if self.uniform_fp8:
-            return KVLayout.UNIFORM_FP8.value
-        compressed = [
-            f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
-            for ratio in sorted(set(self.compression_ratios) - {0})
+            names = [KVLayout.UNIFORM_FP8.value]
+        else:
+            names = [self.kv_layout.value] + [
+                f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
+                for ratio in sorted(set(self.compression_ratios) - {0})
+            ]
+        names += [
+            f"idx{ratio}:page8"
+            for ratio in sorted(self.low_ratio_index_k_page8_ratios())
         ]
-        return ",".join([self.kv_layout.value, *compressed])
+        return ",".join(names)
 
     def _make_indexer_pool(
         self,
