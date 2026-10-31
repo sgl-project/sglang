@@ -4606,9 +4606,16 @@ class Scheduler(
         )
 
     def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
-        """Launching a request's last prefill chunk starts it running."""
+        """Launching a request's last prefill chunk starts it running. The decode
+        rows of a mixed or DP-converted step do not join: they are running
+        already, or finished by a result processed just before this launch."""
         if self._prefill_launch_starts_running() and batch.forward_mode.is_extend():
-            self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
+            decoding_reqs = set(batch.decoding_reqs or ())
+            self.running_reqs.join(
+                r
+                for r in batch.reqs
+                if r is not batch.chunked_req and r not in decoding_reqs
+            )
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
