@@ -5,24 +5,21 @@
 //! engine's own RPC.
 
 use crate::common::cache_aware_fixture;
-use crate::common::mock_worker::MockWorker;
-use axum::body::Body;
 use axum::http::{Request as HttpRequest, Response as HttpResponse};
 use futures::future::{ready, BoxFuture, Ready};
 use futures::stream::{self, BoxStream, StreamExt};
-use serde_json::{json, Value};
+use serde_json::json;
 use sgl_router::config::PolicyKind;
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::policies_reorg::factory::build_resolver;
 use sgl_router::proxy::Proxy;
-use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{DecodeGate, EngineProfile, WireProtocol, WorkerRegistry};
-use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
+use sglang_api_types::api::v1 as proto;
+use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -33,7 +30,6 @@ use tonic::server::{Grpc, NamedService, ServerStreamingService, UnaryService};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 use tonic_prost::ProstCodec;
-use tower::ServiceExt;
 
 type Replies<T> = BoxStream<'static, Result<T, Status>>;
 type Handler =
@@ -48,7 +44,7 @@ struct Svc<F>(Arc<F>);
 
 impl<Req, Rep, F> ServerStreamingService<Req> for Svc<F>
 where
-    F: Fn(Req) -> Replies<Rep> + Send + Sync + 'static,
+    F: Fn(tonic::Request<Req>) -> Replies<Rep> + Send + Sync + 'static,
     Rep: Send + 'static,
 {
     type Response = Rep;
@@ -56,7 +52,7 @@ where
     type Future = Ready<Result<tonic::Response<Replies<Rep>>, Status>>;
 
     fn call(&mut self, request: tonic::Request<Req>) -> Self::Future {
-        ready(Ok(tonic::Response::new((self.0)(request.into_inner()))))
+        ready(Ok(tonic::Response::new((self.0)(request))))
     }
 }
 
@@ -78,7 +74,7 @@ impl MockEngine {
     fn stream<Req, Rep>(
         mut self,
         method: &'static str,
-        reply: impl Fn(Req) -> Replies<Rep> + Send + Sync + 'static,
+        reply: impl Fn(tonic::Request<Req>) -> Replies<Rep> + Send + Sync + 'static,
     ) -> Self
     where
         Req: prost::Message + Default + Send + 'static,
@@ -128,7 +124,7 @@ impl MockEngine {
 }
 
 impl NamedService for MockEngine {
-    const NAME: &'static str = "sglang.runtime.v1.SglangService";
+    const NAME: &'static str = "sglang.api.v1.SglangService";
 }
 
 impl tower::Service<HttpRequest<GrpcBody>> for MockEngine {
@@ -142,7 +138,11 @@ impl tower::Service<HttpRequest<GrpcBody>> for MockEngine {
 
     fn call(&mut self, request: HttpRequest<GrpcBody>) -> Self::Future {
         let method = request.uri().path().rsplit('/').next().unwrap_or_default();
-        let handler = Arc::clone(&self.0[method]);
+        let Some(handler) = self.0.get(method).cloned() else {
+            return Box::pin(async {
+                Ok(Status::unimplemented("mock RPC is not served").into_http())
+            });
+        };
         Box::pin(async move { Ok(handler(request).await) })
     }
 }
@@ -174,43 +174,58 @@ impl<T: Clone> Seen<T> {
     }
 }
 
-fn chunk(json: &str, finished: bool, status_code: Option<i32>) -> proto::OpenAiStreamChunk {
-    proto::OpenAiStreamChunk {
-        json_chunk: json.as_bytes().to_vec(),
-        finished,
-        status_code,
+fn frame(text: &str, finished: bool) -> proto::GenerateStreamItem {
+    proto::GenerateStreamItem {
+        item: Some(proto::generate_stream_item::Item::Frame(
+            proto::GenerateResponse {
+                text: text.into(),
+                meta_info: Some(proto::GenerateMetaInfo {
+                    finish_reason: finished.then(|| proto::FinishReason::stop(None)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
     }
 }
 
-/// An OpenAI streaming RPC that records each request and replays `chunks`.
-fn openai_rpc(
-    seen: &Seen<proto::OpenAiRequest>,
-    chunks: Vec<proto::OpenAiStreamChunk>,
-) -> impl Fn(proto::OpenAiRequest) -> Replies<proto::OpenAiStreamChunk> + Send + Sync + 'static {
+fn error(code: u32) -> proto::GenerateStreamItem {
+    proto::GenerateStreamItem {
+        item: Some(proto::generate_stream_item::Item::Error(
+            proto::GenerateStreamError {
+                error: Some(proto::ErrorBody {
+                    message: "engine failed".into(),
+                    code,
+                }),
+                index: None,
+            },
+        )),
+    }
+}
+
+fn generate(stream: bool) -> proto::GenerateRequest {
+    proto::GenerateRequest {
+        input_ids: Some(proto::TokenIdsOrList {
+            value: Some(proto::token_ids_or_list::Value::One(proto::TokenIds {
+                ids: vec![1, 2, 3],
+            })),
+        }),
+        stream: Some(stream),
+        ..Default::default()
+    }
+}
+
+fn generate_rpc(
+    seen: &Seen<proto::GenerateRequest>,
+    items: Vec<proto::GenerateStreamItem>,
+) -> impl Fn(tonic::Request<proto::GenerateRequest>) -> Replies<proto::GenerateStreamItem>
+       + Send
+       + Sync
+       + 'static {
     let record = seen.record();
     move |request| {
-        record(request);
-        stream::iter(chunks.clone().into_iter().map(Ok)).boxed()
-    }
-}
-
-fn body_of(request: &proto::OpenAiRequest) -> Value {
-    serde_json::from_slice(&request.json_body).unwrap()
-}
-
-fn chat(stream: bool) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "model": "tiny",
-        "messages": [{"role": "user", "content": "hi"}],
-        "stream": stream,
-    }))
-    .unwrap()
-}
-
-fn openai(body: Vec<u8>) -> proto::OpenAiRequest {
-    proto::OpenAiRequest {
-        json_body: body,
-        trace_headers: Default::default(),
+        record(request.into_inner());
+        stream::iter(items.clone().into_iter().map(Ok)).boxed()
     }
 }
 
@@ -242,7 +257,7 @@ fn router_ctx_with(
         let profile = EngineProfile {
             openai: None,
             protocol: WireProtocol::default(),
-            dp_ranks: 1,
+            dp_ranks: 2,
             grpc_port,
         };
         registry
@@ -287,16 +302,10 @@ async fn collect<T>(
         .collect()
 }
 
-fn without_rid(mut body: Value) -> Value {
-    assert!(body["rid"].is_string(), "the router mints an engine rid");
-    body.as_object_mut().unwrap().remove("rid");
-    body
-}
-
 /// One chunk, then nothing until the call is dropped; `dropped` hears about it.
 fn stalled_after_one_chunk(
     dropped: tokio::sync::mpsc::UnboundedSender<()>,
-) -> Replies<proto::OpenAiStreamChunk> {
+) -> Replies<proto::GenerateStreamItem> {
     struct Dropped(tokio::sync::mpsc::UnboundedSender<()>);
     impl Drop for Dropped {
         fn drop(&mut self) {
@@ -304,7 +313,7 @@ fn stalled_after_one_chunk(
         }
     }
     let guard = Dropped(dropped);
-    stream::iter([Ok(chunk("{}", false, None))])
+    stream::iter([Ok(frame("hi", false))])
         .chain(stream::pending())
         .map(move |item| {
             let _ = &guard;
@@ -314,59 +323,95 @@ fn stalled_after_one_chunk(
 }
 
 #[tokio::test]
-async fn openai_rpcs_send_the_http_body_and_relay_chunks_unchanged() {
-    let http = MockWorker::start(vec![]).await;
-    let reply = vec![chunk(r#"{"object":"error"}"#, true, Some(400))];
-    let (chats, completions) = (Seen::new(), Seen::new());
+async fn generate_preserves_fields_metadata_and_typed_replies() {
+    let seen = Seen::new();
+    let record = seen.record();
+    let replies = vec![frame("Paris", true)];
+    let replay = replies.clone();
     let port = MockEngine::default()
-        .stream("ChatComplete", openai_rpc(&chats, reply.clone()))
-        .stream("Complete", openai_rpc(&completions, reply.clone()))
+        .stream(
+            "Generate",
+            move |request: tonic::Request<proto::GenerateRequest>| {
+                let (metadata, _, body) = request.into_parts();
+                record((metadata, body));
+                stream::iter(replay.clone().into_iter().map(Ok)).boxed()
+            },
+        )
         .start()
         .await;
-    let ctx = router_ctx(&[(WorkerMode::Plain, &http.url, Some(port))]);
-    let request = HttpRequest::post("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(chat(false)))
-        .unwrap();
-    build_router(Arc::clone(&ctx))
-        .oneshot(request)
-        .await
-        .unwrap();
-    let mut client = serve_grpc(ctx).await;
-
-    let chunks = collect(client.chat_complete(openai(chat(false))).await).await;
-    assert_eq!(chunks.unwrap(), reply);
+    let mut client = serve_grpc(router_ctx(&[(
+        WorkerMode::Plain,
+        "http://127.0.0.1:1",
+        Some(port),
+    )]))
+    .await;
+    for streaming in [false, true] {
+        let mut body = generate(streaming);
+        body.sampling_params = Some(proto::SamplingParamsOrList {
+            value: Some(proto::sampling_params_or_list::Value::One(
+                proto::SamplingParams {
+                    temperature: Some(0.70000000001),
+                    max_new_tokens: Some(10),
+                    ..Default::default()
+                },
+            )),
+        });
+        let mut request = tonic::Request::new(body.clone());
+        let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        request
+            .metadata_mut()
+            .insert("traceparent", traceparent.parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer secret".parse().unwrap());
+        assert_eq!(
+            collect(client.generate(request).await).await.unwrap(),
+            replies
+        );
+        let (metadata, sent) = seen.last().await;
+        assert_eq!(metadata.get("traceparent").unwrap(), traceparent);
+        assert!(metadata.get("authorization").is_none());
+        assert!(
+            matches!(sent.rid.as_ref().and_then(|r| r.value.as_ref()), Some(proto::string_or_list::Value::One(rid)) if !rid.is_empty())
+        );
+        body.rid = sent.rid.clone();
+        assert_eq!(
+            sent, body,
+            "only the router's rid is added; absent fields stay absent"
+        );
+    }
     assert_eq!(
-        without_rid(body_of(&chats.last().await)),
-        without_rid(http.captured_json().await)
+        client
+            .health_check(proto::HealthCheckRequest {})
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unimplemented
     );
-
-    let prompt = json!({"model": "tiny", "prompt": "hi", "max_tokens": 4});
-    let chunks = collect(client.complete(openai(prompt.to_string().into())).await).await;
-    assert_eq!(chunks.unwrap(), reply);
-    let sent = without_rid(body_of(&completions.last().await));
-    assert_eq!(sent, prompt, "the prompt is forwarded as sent");
 }
 
 #[tokio::test]
 async fn retries_failures_before_a_response_on_another_worker() {
     for status_code in [None, Some(429), Some(503)] {
         let failed = MockEngine::default()
-            .stream("ChatComplete", move |_: proto::OpenAiRequest| {
-                let reply = match status_code {
-                    Some(code) => Ok(chunk("{}", true, Some(code))),
-                    None => Err(Status::unavailable("engine unavailable")),
-                };
-                stream::iter([reply]).boxed()
-            })
+            .stream(
+                "Generate",
+                move |_: tonic::Request<proto::GenerateRequest>| {
+                    let reply = match status_code {
+                        Some(code) => Ok(error(code)),
+                        None => Err(Status::unavailable("engine unavailable")),
+                    };
+                    stream::iter([reply]).boxed()
+                },
+            )
             .unary("Abort", |_: proto::AbortRequest| {
                 proto::AbortResponse::default()
             })
             .start()
             .await;
-        let reply = vec![chunk("{\"ok\":true}", true, Some(200))];
+        let reply = vec![frame("ok", true)];
         let healthy = MockEngine::default()
-            .stream("ChatComplete", openai_rpc(&Seen::new(), reply.clone()))
+            .stream("Generate", generate_rpc(&Seen::new(), reply.clone()))
             .start()
             .await;
         for max_attempts in [1, 2] {
@@ -377,10 +422,10 @@ async fn retries_failures_before_a_response_on_another_worker() {
                 ]);
                 Arc::get_mut(&mut ctx).unwrap().config.proxy.max_attempts =
                     std::num::NonZeroU32::new(max_attempts).unwrap();
-                let mut client = serve_grpc(Arc::clone(&ctx)).await;
+                let mut client = serve_grpc(ctx).await;
                 let mut successes = 0;
                 for _ in 0..2 {
-                    let result = collect(client.chat_complete(openai(chat(streaming))).await).await;
+                    let result = collect(client.generate(generate(streaming)).await).await;
                     successes += usize::from(result.is_ok_and(|chunks| chunks == reply));
                 }
                 assert_eq!(successes, max_attempts as usize);
@@ -390,95 +435,68 @@ async fn retries_failures_before_a_response_on_another_worker() {
 }
 
 #[tokio::test]
-async fn pd_legs_share_one_bootstrap_room() {
-    let done = vec![chunk("", true, None)];
-    let generated = || {
-        let reply = proto::GenerateResponse {
-            output_ids: vec![7],
-            finished: true,
-            ..Default::default()
-        };
-        stream::iter([Ok(reply)]).boxed()
-    };
-    let engine = |chats: &Seen<_>, generates: &Seen<proto::GenerateRequest>| {
-        let record = generates.record();
-        MockEngine::default()
-            .stream("ChatComplete", openai_rpc(chats, done.clone()))
-            .stream("Generate", move |request| {
-                record(request);
-                generated()
-            })
-    };
-    let (prefill_chats, prefill_generates) = (Seen::new(), Seen::new());
-    let (decode_chats, decode_generates) = (Seen::new(), Seen::new());
-    let prefill = engine(&prefill_chats, &prefill_generates).start().await;
-    let decode = engine(&decode_chats, &decode_generates).start().await;
-    // Legacy policies, then the reorg bucket path.
+async fn pd_legs_share_bootstrap_and_dp_placement() {
+    let (prefills, decodes) = (Seen::new(), Seen::new());
+    let reply = vec![frame("ok", true)];
+    let prefill = MockEngine::default()
+        .stream("Generate", generate_rpc(&prefills, reply.clone()))
+        .start()
+        .await;
+    let decode = MockEngine::default()
+        .stream("Generate", generate_rpc(&decodes, reply.clone()))
+        .start()
+        .await;
     for reorg in [false, true] {
         let workers = [
             (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
             (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
         ];
-        let mut client = serve_grpc(router_ctx_with(
-            &workers,
-            reorg,
-            Proxy::new(Duration::from_secs(5)).unwrap(),
-        ))
-        .await;
-
-        collect(client.chat_complete(openai(chat(true))).await)
-            .await
-            .unwrap();
-        let (p, d) = (
-            body_of(&prefill_chats.last().await),
-            body_of(&decode_chats.last().await),
-        );
-        assert!(p["bootstrap_room"].is_u64());
-        assert_eq!(p["bootstrap_room"], d["bootstrap_room"]);
-
-        let request = proto::GenerateRequest {
-            input_ids: vec![1, 2, 3],
-            stream: Some(true),
-            ..Default::default()
-        };
-        let replies = collect(client.generate(request).await).await.unwrap();
+        let mut ctx = router_ctx_with(&workers, reorg, Proxy::new(Duration::from_secs(5)).unwrap());
+        Arc::get_mut(&mut ctx).unwrap().config.model.dp_aware = true;
+        let mut client = serve_grpc(ctx).await;
+        let mut request = generate(true);
+        request.routed_dp_rank = Some(99);
         assert_eq!(
-            replies[0].output_ids,
-            [7],
-            "decode's reply reaches the client"
+            collect(client.generate(request).await).await.unwrap(),
+            reply
         );
-        let (p, d) = (
-            prefill_generates.last().await,
-            decode_generates.last().await,
-        );
-        let room = p.disaggregated_params.as_ref().unwrap();
-        assert_eq!(
-            (room.bootstrap_host.as_str(), room.bootstrap_port),
-            ("127.0.0.1", 8998)
-        );
-        assert_eq!(p.disaggregated_params, d.disaggregated_params);
-        assert!(
-            p.rid.is_some() && p.rid == d.rid,
-            "both legs carry the router's rid"
-        );
+        let (p, d) = (prefills.last().await, decodes.last().await);
+        assert!(p.rid.is_some() && p.rid == d.rid);
+        assert_eq!(p.bootstrap_host, d.bootstrap_host);
+        assert_eq!(p.bootstrap_port, d.bootstrap_port);
+        assert_eq!(p.bootstrap_room, d.bootstrap_room);
+        let p = serde_json::to_value(p).unwrap();
+        let d = serde_json::to_value(d).unwrap();
+        assert_eq!(p["bootstrap_host"], "127.0.0.1");
+        assert_eq!(p["bootstrap_port"], 8998);
+        assert!(p["bootstrap_room"]
+            .as_u64()
+            .is_some_and(|room| room <= i64::MAX as u64));
+        let rank = p["routed_dp_rank"].as_u64().unwrap();
+        assert!(rank < 2);
+        assert_eq!(p["bootstrap_room"].as_u64().unwrap() % 2, rank);
+        assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
+        assert_eq!(d["disagg_prefill_dp_rank"], rank);
     }
 }
 
 #[tokio::test]
 async fn decode_dispatch_limit_gates_decode_as_over_http() {
     let prefill = MockEngine::default()
-        .stream("ChatComplete", |_: proto::OpenAiRequest| {
+        .stream("Generate", |_: tonic::Request<proto::GenerateRequest>| {
             stream::once(async {
                 tokio::time::sleep(Duration::from_millis(800)).await;
-                Ok(chunk("{}", true, None))
+                Ok(frame("ok", true))
             })
             .boxed()
         })
         .start()
         .await;
-    let reply = vec![chunk("{}", true, None)];
     let decode = MockEngine::default()
-        .stream("ChatComplete", openai_rpc(&Seen::new(), reply))
+        .stream(
+            "Generate",
+            generate_rpc(&Seen::new(), vec![frame("ok", true)]),
+        )
         .start()
         .await;
     for (streaming, waits) in [(false, true), (true, false)] {
@@ -489,120 +507,109 @@ async fn decode_dispatch_limit_gates_decode_as_over_http() {
         Arc::get_mut(&mut ctx).unwrap().decode_gate = DecodeGate::new(std::num::NonZeroU32::new(1));
         let client = serve_grpc(ctx).await;
         let call = |mut client: SglangServiceClient<Channel>| async move {
-            collect(client.chat_complete(openai(chat(streaming))).await)
+            collect(client.generate(generate(streaming)).await)
                 .await
                 .unwrap()
         };
         let start = Instant::now();
         futures::future::join(call(client.clone()), call(client)).await;
-        let waited = start.elapsed() >= Duration::from_millis(700);
-        assert_eq!(waited, waits, "streaming={streaming}");
+        assert_eq!(
+            start.elapsed() >= Duration::from_millis(700),
+            waits,
+            "streaming={streaming}"
+        );
     }
 }
 
 #[tokio::test]
-async fn typed_unary_rpc_returns_the_engine_reply() {
-    let embeds = Seen::new();
-    let record = embeds.record();
+async fn text_generation_keeps_forwarding_guards() {
+    let seen = Seen::new();
+    let reply = vec![frame("Paris", true)];
     let port = MockEngine::default()
-        .unary("Embed", move |request: proto::EmbedRequest| {
-            record(request);
-            proto::EmbedResponse {
-                embedding: vec![0.5],
-                meta_info: Default::default(),
-            }
-        })
+        .stream("Generate", generate_rpc(&seen, reply.clone()))
         .start()
         .await;
-    let mut client = serve_grpc(router_ctx(&[(
-        WorkerMode::Plain,
-        "http://127.0.0.1:1",
-        Some(port),
-    )]))
-    .await;
-
-    let request = proto::EmbedRequest {
-        input_ids: vec![4, 5],
-        ..Default::default()
-    };
-    let mut request = tonic::Request::new(request);
-    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-    request
-        .metadata_mut()
-        .insert("traceparent", traceparent.parse().unwrap());
-    let reply = client.embed(request).await.unwrap().into_inner();
-    assert_eq!(reply.embedding, [0.5]);
-    let sent = embeds.last().await;
-    assert_eq!(sent.input_ids, [4, 5]);
-    assert!(sent.rid.is_some(), "the router mints an engine rid");
-    assert_eq!(
-        sent.trace_headers["traceparent"], traceparent,
-        "trace context reaches the engine"
-    );
+    for (disable_ids, text_logprobs, media) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let mut ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+        Arc::get_mut(&mut ctx)
+            .unwrap()
+            .config
+            .model
+            .disable_input_ids_forwarding = disable_ids;
+        let expected_ids = ctx.tokenizers.encode_prompt("tiny", "hello world").unwrap();
+        let mut client = serve_grpc(ctx).await;
+        let mut body = json!({"text": "hello world", "return_text_in_logprobs": text_logprobs});
+        if media {
+            body["image_data"] = json!("https://example.com/image.png");
+        }
+        let request: proto::GenerateRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            collect(client.generate(request.clone()).await)
+                .await
+                .unwrap(),
+            reply
+        );
+        let sent = seen.last().await;
+        if disable_ids || text_logprobs || media {
+            assert_eq!(sent.text, request.text);
+            assert_eq!(sent.image_data, request.image_data);
+            assert!(sent.input_ids.is_none());
+        } else {
+            assert!(sent.text.is_none());
+            assert_eq!(
+                sent.input_ids,
+                Some(proto::TokenIdsOrList {
+                    value: Some(proto::token_ids_or_list::Value::One(proto::TokenIds {
+                        ids: expected_ids.into_iter().map(i64::from).collect(),
+                    })),
+                })
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn text_rpcs_reach_the_engine_as_router_tokens() {
-    let (generates, embeds) = (Seen::new(), Seen::new());
-    let (record_generate, record_embed) = (generates.record(), embeds.record());
-    let port = MockEngine::default()
-        .stream("Generate", move |request: proto::GenerateRequest| {
-            record_generate(request);
-            let reply = proto::GenerateResponse {
-                text: Some("Paris".into()),
-                finished: true,
-                ..Default::default()
-            };
-            stream::iter([Ok(reply)]).boxed()
-        })
-        .unary("Embed", move |request: proto::EmbedRequest| {
-            record_embed(request);
-            proto::EmbedResponse {
-                embedding: vec![0.5],
-                meta_info: Default::default(),
-            }
-        })
-        .start()
-        .await;
+async fn unsupported_batches_and_unrepresentable_token_ids_are_rejected() {
     let mut client = serve_grpc(router_ctx(&[(
         WorkerMode::Plain,
         "http://127.0.0.1:1",
-        Some(port),
+        None,
     )]))
     .await;
-
-    let request = proto::TextGenerateRequest {
-        text: "hello world".into(),
-        ..Default::default()
-    };
-    let replies = collect(client.text_generate(request).await).await.unwrap();
-    assert_eq!(replies[0].text, "Paris");
-    let sent = generates.last().await;
-    assert!(!sent.input_ids.is_empty() && sent.return_text == Some(true));
-
-    let request = proto::TextEmbedRequest {
-        text: "hello world".into(),
-        ..Default::default()
-    };
-    let reply = client.text_embed(request).await.unwrap().into_inner();
-    assert_eq!(reply.embedding, [0.5]);
-    assert_eq!(
-        embeds.last().await.input_ids,
-        sent.input_ids,
-        "both tokenize alike"
-    );
+    for body in [
+        json!({"text": ["hi"]}),
+        json!({"input_ids": [[1]]}),
+        json!({"input_ids": [1], "rid": ["id"]}),
+        json!({"input_ids": [1], "sampling_params": [{}]}),
+        json!({"input_ids": [-1]}),
+        json!({"input_ids": [4294967296i64]}),
+        json!({"input_ids": [1], "text": "hi"}),
+    ] {
+        let request: proto::GenerateRequest = serde_json::from_value(body.clone()).unwrap();
+        let status = client.generate(request).await.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument, "{body}");
+        assert!(status.metadata().get("x-router-error-code").is_some());
+    }
 }
 
 #[tokio::test]
 async fn client_cancel_aborts_the_engine_request() {
     let (dropped_tx, mut dropped) = tokio::sync::mpsc::unbounded_channel();
-    let (chats, aborts) = (Seen::new(), Seen::new());
-    let (record_chat, record_abort) = (chats.record(), aborts.record());
+    let (generates, aborts) = (Seen::new(), Seen::new());
+    let (record_generate, record_abort) = (generates.record(), aborts.record());
     let port = MockEngine::default()
-        .stream("ChatComplete", move |request| {
-            record_chat(request);
-            stalled_after_one_chunk(dropped_tx.clone())
-        })
+        .stream(
+            "Generate",
+            move |request: tonic::Request<proto::GenerateRequest>| {
+                record_generate(request.into_inner());
+                stalled_after_one_chunk(dropped_tx.clone())
+            },
+        )
         .unary("Abort", move |request: proto::AbortRequest| {
             record_abort(request);
             proto::AbortResponse::default()
@@ -615,101 +622,113 @@ async fn client_cancel_aborts_the_engine_request() {
         Some(port),
     )]))
     .await;
-
-    let mut stream = client
-        .chat_complete(openai(chat(true)))
-        .await
-        .unwrap()
-        .into_inner();
+    let mut stream = client.generate(generate(true)).await.unwrap().into_inner();
     assert!(stream.message().await.unwrap().is_some());
     drop(stream);
-
     tokio::time::timeout(Duration::from_secs(5), dropped.recv())
         .await
         .expect("the engine call outlived the client");
-    // The engine's own abort on a dropped call targets another id, so the rid is aborted too.
-    let rid = body_of(&chats.last().await)["rid"].clone();
-    assert_eq!(aborts.last().await.rid, rid.as_str().unwrap());
+    let rid = generates.last().await.rid.unwrap().value.unwrap();
+    assert_eq!(
+        rid,
+        proto::string_or_list::Value::One(aborts.last().await.rid)
+    );
 }
 
 #[tokio::test]
 async fn stream_outcomes_reach_the_breaker_by_status() {
-    let calls = Arc::new(Mutex::new(0));
-    let counted = Arc::clone(&calls);
-    let port = MockEngine::default()
-        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
-            let mut calls = counted.lock().unwrap();
-            *calls += 1;
-            match *calls {
-                // Backpressure ends three streams; it must not open the breaker.
-                1..=3 => stream::iter([
-                    Ok(chunk("{}", false, None)),
-                    Err(Status::resource_exhausted("queue full")),
-                ])
-                .boxed(),
-                // A rejected request is one finished chunk with its status; faults count.
-                _ => stream::iter([Ok(chunk(r#"{"object":"error"}"#, true, Some(500)))]).boxed(),
-            }
-        })
-        .start()
+    for late in [false, true] {
+        let calls = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&calls);
+        let port = MockEngine::default()
+            .stream(
+                "Generate",
+                move |_: tonic::Request<proto::GenerateRequest>| {
+                    let mut calls = counted.lock().unwrap();
+                    *calls += 1;
+                    match *calls {
+                        1..=3 => stream::iter([
+                            Ok(frame("hi", false)),
+                            Err(Status::resource_exhausted("queue full")),
+                        ])
+                        .boxed(),
+                        _ => stream::iter(
+                            late.then(|| Ok(frame("hi", false)))
+                                .into_iter()
+                                .chain([Ok(error(500))]),
+                        )
+                        .boxed(),
+                    }
+                },
+            )
+            .start()
+            .await;
+        let mut client = serve_grpc(router_ctx(&[(
+            WorkerMode::Plain,
+            "http://127.0.0.1:1",
+            Some(port),
+        )]))
         .await;
-    let mut client = serve_grpc(router_ctx(&[(
-        WorkerMode::Plain,
-        "http://127.0.0.1:1",
-        Some(port),
-    )]))
-    .await;
-
-    for _ in 0..3 {
-        let result = collect(client.chat_complete(openai(chat(true))).await).await;
-        assert_eq!(result.unwrap_err().code(), Code::ResourceExhausted);
+        for _ in 0..3 {
+            assert_eq!(
+                collect(client.generate(generate(true)).await)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::ResourceExhausted
+            );
+        }
+        for _ in 0..3 {
+            let items = collect(client.generate(generate(true)).await)
+                .await
+                .unwrap();
+            assert_eq!(items.last(), Some(&error(500)));
+        }
+        assert_eq!(
+            client.generate(generate(true)).await.unwrap_err().code(),
+            Code::Unavailable
+        );
+        assert_eq!(*calls.lock().unwrap(), 6);
     }
-    for _ in 0..3 {
-        let chunks = collect(client.chat_complete(openai(chat(true))).await)
-            .await
-            .unwrap();
-        assert_eq!(chunks[0].status_code, Some(500));
-    }
-    let status = client.chat_complete(openai(chat(true))).await.unwrap_err();
-    assert_eq!(
-        status.code(),
-        Code::Unavailable,
-        "three 500s open the breaker"
-    );
-    assert_eq!(*calls.lock().unwrap(), 6);
 }
 
 #[tokio::test]
 async fn router_stream_failures_keep_their_error_code() {
     let (dropped_tx, _dropped) = tokio::sync::mpsc::unbounded_channel();
     let port = MockEngine::default()
-        .stream("ChatComplete", move |_: proto::OpenAiRequest| {
-            stalled_after_one_chunk(dropped_tx.clone())
+        .stream(
+            "Generate",
+            move |_: tonic::Request<proto::GenerateRequest>| {
+                stalled_after_one_chunk(dropped_tx.clone())
+            },
+        )
+        .unary("Abort", |_: proto::AbortRequest| {
+            proto::AbortResponse::default()
         })
         .start()
         .await;
-    // Both the request timeout and the stream idle timeout.
     let proxy = Proxy::new(Duration::from_millis(100))
         .unwrap()
         .with_stream_idle_timeout(Duration::from_millis(100));
     let workers = [(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))];
     let mut client = serve_grpc(router_ctx_with(&workers, false, proxy)).await;
-
-    for stream in [true, false] {
-        let result = collect(client.chat_complete(openai(chat(stream))).await).await;
+    for streaming in [true, false] {
+        let result = collect(client.generate(generate(streaming)).await).await;
         let status = result.unwrap_err();
-        assert_eq!(status.code(), Code::DeadlineExceeded, "stream={stream}");
-        let code = status.metadata().get("x-router-error-code");
-        assert_eq!(code.unwrap(), "upstream_timeout", "stream={stream}");
+        assert_eq!(status.code(), Code::DeadlineExceeded, "stream={streaming}");
+        assert_eq!(
+            status.metadata().get("x-router-error-code").unwrap(),
+            "upstream_timeout"
+        );
     }
 }
 
 #[tokio::test]
 async fn errors_arrive_as_grpc_status() {
     let port = MockEngine::default()
-        .stream("ChatComplete", |_: proto::OpenAiRequest| {
+        .stream("Generate", |_: tonic::Request<proto::GenerateRequest>| {
             stream::iter([
-                Ok(chunk("{}", false, None)),
+                Ok(frame("hi", false)),
                 Err(Status::internal("engine failed")),
             ])
             .boxed()
@@ -721,23 +740,14 @@ async fn errors_arrive_as_grpc_status() {
         (WorkerMode::Plain, "http://127.0.0.1:2", None),
     ]))
     .await;
-
-    let unknown_model = json!({"model": "nope", "messages": []}).to_string();
-    let status = client
-        .chat_complete(openai(unknown_model.into()))
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::NotFound);
-    assert_eq!(
-        status.metadata().get("x-router-error-code").unwrap(),
-        "model_not_found"
-    );
-
-    // Round robin reaches both workers: the engine fails mid-stream, the other has no gRPC port.
     let mut codes = Vec::new();
     for _ in 0..2 {
-        let result = collect(client.chat_complete(openai(chat(true))).await).await;
-        codes.push(result.unwrap_err().code());
+        codes.push(
+            collect(client.generate(generate(true)).await)
+                .await
+                .unwrap_err()
+                .code(),
+        );
     }
     codes.sort_by_key(|code| *code as i32);
     assert_eq!(codes, [Code::Internal, Code::Unavailable]);
