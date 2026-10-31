@@ -218,7 +218,11 @@ class TestMoeSourceRows(unittest.TestCase):
         )
         backend = SimpleNamespace(is_none=lambda: True)
         group = SimpleNamespace(all_reduce=lambda value: value * 2)
-        parallel = SimpleNamespace(attn_cp_size=2, attn_cp_rank=1, tp_group=group)
+        # attn_dp_size=1: this covers CP without attention DP, where the MoE
+        # consumes the CP gather directly instead of a DP slot.
+        parallel = SimpleNamespace(
+            attn_cp_size=2, attn_cp_rank=1, attn_dp_size=1, tp_group=group
+        )
         batch = SimpleNamespace(dp_padding_mode=None)
         with (
             patch.object(moe_transport, "get_moe_a2a_backend", return_value=backend),

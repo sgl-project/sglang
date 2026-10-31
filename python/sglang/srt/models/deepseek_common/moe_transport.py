@@ -5,7 +5,12 @@ from contextlib import contextmanager, nullcontext
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+from sglang.srt.layers.cp.interleave import (
+    attn_cp_interleave_gather,
+    cp_fit_slot_rows,
+    cp_moe_slot_rows,
+    cp_take_slot_rows,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -28,6 +33,7 @@ from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatt
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 from sglang.srt.layers.layer_boundary.row_transport import ComputeTransport
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe.utils import sum_post_experts_output
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -158,10 +164,25 @@ class MoeRowTransport(ComputeTransport):
         # its output is added after returning the routed experts' local slice.
         _shared_local = None
         do_shared_local = _use_tp_moe_gather and shared_expert_runs_locally(moe)
+        cp_local_rows = cp_slot_rows = None
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
+                # One DP slot holds this rank's complete CP rank-major buffer
+                # (its own CP shard per block, padding included), because the
+                # hash-routing IDs and the MoE output rows are read back through
+                # the same slots. The DP slot width comes from the batch, so fit
+                # every CP block to it rather than letting memcpy truncate the
+                # buffer at its head (which would drop whole CP blocks).
+                cp_local_rows = hidden_states.shape[0]
                 hidden_states = attn_cp_interleave_gather(hidden_states)
+                if get_parallel().attn_dp_size > 1:
+                    cp_slot_rows = cp_moe_slot_rows(forward_batch)
+                    cp_hidden_states = cp_fit_slot_rows(
+                        hidden_states, forward_batch, cp_slot_rows
+                    )
+                    hidden_states = get_global_dp_buffer(get_parallel().tp_group)
+                    dp_gather_replicate(hidden_states, cp_hidden_states, forward_batch)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -215,6 +236,7 @@ class MoeRowTransport(ComputeTransport):
         self.do_shared_local = do_shared_local
         self._a2a_scatter_chunks = _a2a_scatter_chunks
         self.gathered_rows = gathered_rows
+        self._cp_local_rows, self._cp_slot_rows = cp_local_rows, cp_slot_rows
 
     def return_output(self, hidden_states):
         forward_batch = self.batch
@@ -226,7 +248,22 @@ class MoeRowTransport(ComputeTransport):
         _shared_local = self._shared_local
         _a2a_scatter_chunks = self._a2a_scatter_chunks
         if _use_cp and get_moe_a2a_backend().is_none():
-            if self.cp_return_contiguous:
+            if get_parallel().attn_dp_size > 1:
+                # `mlp_reduce_scatter` told the MoE to leave its post-experts
+                # sum owed; complete exactly that sum, once. It collapses into
+                # one _TP all-reduce only while EP and MoE-TP merge
+                # (moe_dp_size == 1), so never name the group by hand.
+                hidden_states = sum_post_experts_output(hidden_states)
+                # The DP scatter returns this rank's whole slot, i.e. its CP
+                # rank-major buffer; take its own CP block back out of it.
+                cp_hidden_states = hidden_states.new_empty(
+                    (self._cp_slot_rows, *hidden_states.shape[1:])
+                )
+                dp_scatter(cp_hidden_states, hidden_states, forward_batch)
+                hidden_states = cp_take_slot_rows(
+                    cp_hidden_states, forward_batch, self._cp_local_rows
+                )
+            elif self.cp_return_contiguous:
                 parallel = get_parallel()
                 hidden_states = parallel.tp_group.all_reduce(hidden_states)
                 hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[

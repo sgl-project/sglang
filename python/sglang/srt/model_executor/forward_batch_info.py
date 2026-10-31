@@ -1831,6 +1831,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
+        # DSV4 TP-MoE consumes a complete rank-major CP slot, including each
+        # shard's physical padding. Size it before ANY model collective (and on
+        # idle peers too), rather than first correcting it at the late handoff.
+        from sglang.srt.layers.cp.base import is_cp_enabled
+        from sglang.srt.layers.cp.utils import is_mla_cp_enabled
+
+        if (
+            self.is_extend_in_batch
+            and get_parallel().attn_cp_size > 1
+            # Only attention DP needs this: the slot width is what the DP
+            # gather/scatter move, and an idle peer must size it the same way.
+            # Without DP there is no gather, and padding here would change the
+            # batch shape the CP prefill already agrees on.
+            and get_parallel().attn_dp_size > 1
+            and model_runner.model_config.hf_config.model_type == "deepseek_v41"
+            # Both predicates are config-level, so every rank agrees.
+            # `is_mla_cp_enabled()` reports False under DP attention, hence the
+            # second term; `is_cp_active(batch)` must NOT be used here because
+            # it is False on an idle peer, which would make this padding
+            # rank-dependent and desync every later DP collective.
+            and (is_mla_cp_enabled() or is_cp_enabled())
+        ):
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+            if get_moe_a2a_backend().is_none():
+                slot_align = get_parallel().attn_cp_size * get_cp_padding_align_size()
+                global_num_tokens = [
+                    ceil_align(n, slot_align) for n in global_num_tokens
+                ]
+
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
@@ -2029,6 +2060,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch
             and sync_group_size > 1
             and not model_runner.is_draft_worker
+            # Under attention CP a DP slot is the padded rank-major CP buffer,
+            # whose width is only known once the late-layer tail layout exists,
+            # so `late_layer_dp_counts` gathers it there instead. Config-level,
+            # so every rank skips the exchange together.
+            and get_parallel().attn_cp_size == 1
         ):
             local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
             if local_late_rows is not None:

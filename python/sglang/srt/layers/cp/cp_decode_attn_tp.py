@@ -213,6 +213,111 @@ class CpDecodeAttnTpContext:
 
     # ==================== Linear helpers ====================
 
+    def prepare_humming_decode_shard(self, layer, weight_schema, input_schema):
+        """Build a rank-local Humming layer from canonical schema tensors.
+
+        Called after conversion/requantization, BEFORE packing/padding. Schema
+        input/output dimensions describe channel/group/block scales and packed
+        K weights (or packed N zero points); a shard boundary must land on a
+        whole storage unit. Never slice an inference-layout Humming tensor.
+        """
+        if not self.is_enabled:
+            return
+        from humming.layer import HummingMethod
+
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        if isinstance(layer, RowParallelLinear):
+            dim_name, logical_dim = "input_dim", 1
+        elif isinstance(layer, ColumnParallelLinear):
+            dim_name, logical_dim = "output_dim", 0
+        else:
+            raise ValueError("CP Humming shard requires a parallel linear")
+        if len(layer.output_partition_sizes) != 1:
+            raise ValueError("CP Humming shard does not support merged linears")
+        n, k = layer.output_partition_sizes_sum, layer.input_size_per_partition
+        shape = [n, k]
+        extent = shape[logical_dim]
+        if extent % self.decode_tp_size:
+            raise ValueError("CP Humming logical dimension is not divisible by CP size")
+        shape[logical_dim] //= self.decode_tp_size
+        attrs = weight_schema.get_tensors_attrs(
+            shape_n=n,
+            shape_k=k,
+            param_dtype=layer.param_dtype,
+            has_bias=layer.with_bias,
+        )
+        local_attrs = weight_schema.get_tensors_attrs(
+            shape_n=shape[0],
+            shape_k=shape[1],
+            param_dtype=layer.param_dtype,
+            has_bias=layer.with_bias,
+        )
+        shard = torch.nn.Module()
+        for name, spec in attrs.items():
+            tensor = getattr(layer, name).detach()
+            if tuple(tensor.shape) != tuple(spec["shape"]):
+                raise ValueError(f"CP Humming canonical tensor shape mismatch: {name}")
+            axis = spec.get("extra_attrs", {}).get(dim_name)
+            if axis is not None:
+                units = tensor.shape[axis]
+                # This check covers packed words and scale blocks, including
+                # non-aligned boundaries that floor-divided schema shapes hide.
+                if not units or extent % units or units % self.decode_tp_size:
+                    raise ValueError(
+                        f"CP Humming shard boundary splits a packed word/scale block: {name}"
+                    )
+                count = units // self.decode_tp_size
+                tensor = tensor.narrow(axis, self.decode_tp_rank * count, count)
+            if tuple(tensor.shape) != tuple(local_attrs[name]["shape"]):
+                raise ValueError(f"CP Humming shard schema mismatch: {name}")
+            # Transform may process tensors in place; do not alias full weights.
+            shard.register_parameter(
+                name,
+                torch.nn.Parameter(tensor.clone().contiguous(), requires_grad=False),
+            )
+        shard.register_buffer("locks", torch.zeros_like(layer.locks))
+        HummingMethod.prepare_layer_meta(
+            layer=shard,
+            shape_n=shape[0],
+            shape_k=shape[1],
+            weight_schema=weight_schema,
+            input_schema=input_schema,
+            pad_n_to_multiple=256,
+            pad_k_to_multiple=128,
+            has_bias=layer.with_bias,
+            torch_dtype=layer.param_dtype,
+        )
+        HummingMethod.transform_humming_layer(shard)
+        # Keep a plain dict, not a child module: model weight-loader traversals
+        # must not process this already-transformed layout a second time.
+        names = (
+            "weight",
+            "weight_scale",
+            "weight_scale_2",
+            "zero_point",
+            "bias",
+            "locks",
+        )
+        layer._cp_decode_humming_state = {
+            name: getattr(shard, name, None) for name in names
+        }
+        layer._cp_decode_humming_state["humming_metas"] = shard.humming_metas
+        shard_bytes = sum(
+            value.numel() * value.element_size()
+            for value in layer._cp_decode_humming_state.values()
+            if isinstance(value, torch.Tensor)
+        )
+        logger.debug(
+            "Prepared CP decode Humming shard %s rank=%d/%d N=%d K=%d: %.2f MiB",
+            getattr(layer, "prefix", type(layer).__name__),
+            self.decode_tp_rank,
+            self.decode_tp_size,
+            shape[0],
+            shape[1],
+            shard_bytes / (1024 * 1024),
+        )
+
     def _get_linear_attrs(self, linear_instance) -> List[Tuple]:
         """Return (obj, attr_name, dim) list for a linear layer."""
         from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -269,12 +374,24 @@ class CpDecodeAttnTpContext:
         all_attrs = []  # (obj, attr_name) pairs to restore
         size_overrides = []  # (linear, size_attr, orig_size)
         row_parallel_decode_flags = []  # (RowParallelLinear, orig_flag) to restore
+        humming_states = []
         orig_tp_q_head_num = None
         try:
             for linear in modules:
-                for obj, attr_name, dim in self._get_linear_attrs(linear):
-                    self._activate(obj, attr_name, dim)
-                    all_attrs.append((obj, attr_name))
+                if hasattr(linear, "humming_metas"):
+                    state = getattr(linear, "_cp_decode_humming_state", None)
+                    if state is None:
+                        raise RuntimeError(
+                            "CP decode Humming shard was not prepared before weight transform"
+                        )
+                    original = {name: getattr(linear, name, None) for name in state}
+                    humming_states.append((linear, original))
+                    for name, value in state.items():
+                        setattr(linear, name, value)
+                else:
+                    for obj, attr_name, dim in self._get_linear_attrs(linear):
+                        self._activate(obj, attr_name, dim)
+                        all_attrs.append((obj, attr_name))
                 from sglang.srt.layers.linear import RowParallelLinear
 
                 size_attr = (
@@ -317,3 +434,6 @@ class CpDecodeAttnTpContext:
                 setattr(linear, size_attr, orig_size)
             for obj, attr_name in reversed(all_attrs):
                 self._restore(obj, attr_name)
+            for linear, original in reversed(humming_states):
+                for name, value in original.items():
+                    setattr(linear, name, value)

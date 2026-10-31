@@ -74,6 +74,11 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave import (
+    cp_interleave_local_input_ids,
+    cp_moe_slot_rows,
+    cp_sequence_to_interleave_order,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -1161,6 +1166,10 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
+        # Humming must shard the canonical (pre-transform) tensors, not its
+        # kernel-private packed layout. wo_a uses the plain absorbed BMM path.
+        self.wq_b._cp_decode_attn_tp_shard = True
+        self.wo_b._cp_decode_attn_tp_shard = True
 
         from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 
@@ -2510,11 +2519,15 @@ class MQALayer(MqaAttentionBase):
                     torch.cuda.current_stream(),
                 )
                 tail = attn_backend.forward_metadata.late_layer_tail
+                # `kv` carries the CP-materialized global row count and
+                # `get_swa_out_cache_loc` returns exactly that many destination
+                # slots, so the positions have to be trimmed to it. The tail's
+                # `pos_global` spans the whole tail range and can be longer
+                # (measured: kv=128, swa_loc=128, pos_global=131), which the
+                # fused store rejects on its symbolic batch_size.
                 global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
+                    tail.pos_global if tail is not None else forward_batch.positions
+                )[: kv.shape[0]]
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
                     swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -3986,6 +3999,9 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        # Engram's image gate reads one ID per local row, so it needs this rank's
+        # own rows even where the MoE's hash routing takes the CP-global order.
+        local_input_ids = input_ids
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4034,6 +4050,11 @@ class DeepseekV4Model(nn.Module):
                     tail.token_indices.shape[0]
                     if tail is not None
                     else hidden_states.shape[0]
+                ),
+                cp_metadata=(
+                    tail.cp_metadata
+                    if tail is not None
+                    else (forward_batch.attn_cp_metadata if cp_extend else None)
                 ),
                 in_graph=tail_in_graph,
             )
@@ -4135,11 +4156,27 @@ class DeepseekV4Model(nn.Module):
                 state = state.take_rows(tail.rows)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
-                input_ids = tail.rows(input_ids)
-                if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
-                ):
-                    input_ids_global = tail.rows(input_ids_global)
+                if tail.cp_metadata is not None and get_moe_a2a_backend().is_none():
+                    # CP tail rows are rank-local; rebuild the interleaved IDs the
+                    # layers expect from the full-prompt rows they came from.
+                    # Tail ownership follows original prompt indices, not indices
+                    # rebased at the tail start (which may begin on CP rank 1), so
+                    # use the same explicit map as the hidden-state CP gather.
+                    local_input_ids = tail.rows(input_ids)
+                    input_ids = cp_sequence_to_interleave_order(
+                        forward_batch.input_ids[tail.output_token_indices],
+                        forward_batch,
+                        sum(tail.cp_metadata.per_rank_actual_token),
+                    )
+                    input_ids_global = input_ids
+                else:
+                    input_ids = tail.rows(input_ids)
+                    if not (
+                        get_parallel().attn_dp_size > 1
+                        and get_moe_a2a_backend().is_none()
+                    ):
+                        input_ids_global = tail.rows(input_ids_global)
+                    local_input_ids = input_ids
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4189,7 +4226,7 @@ class DeepseekV4Model(nn.Module):
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
-                    input_ids=input_ids,
+                    input_ids=local_input_ids,
                     cp_all_tokens=cp_extend,
                 )
                 state = state.with_residual(hidden_states)
@@ -4445,11 +4482,25 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
+            if is_cp_active(forward_batch):
+                # Hash routing reads one ID per MoE row, so build the IDs with
+                # the hidden-state gather's own interleave map and fit them to
+                # the same DP slot: `input_ids` here is this rank's CP shard,
+                # not the full prompt.
+                local_input_ids = cp_interleave_local_input_ids(
+                    forward_batch,
+                    hidden_states.shape[0],
+                    cp_moe_slot_rows(forward_batch),
+                )
+            else:
+                local_input_ids = input_ids
             # Token ids are replicated within an attention-TP group. Use replicate
             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
             # Clone because the MAX_LEN gather may zero its local input in place.
             dp_gather_replicate(
-                input_ids_global, input_ids[:, None].clone(), forward_batch
+                input_ids_global,
+                local_input_ids[:, None].clone(),
+                forward_batch,
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:

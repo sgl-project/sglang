@@ -156,6 +156,15 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
     )
 
 
+def _dspark_tp_sync_group(parallel):
+    # Prefill-only CP partners share a request batch during draft/verify.
+    # Synchronize sampled tokens/acceptance over that effective decode TP
+    # group, not the static attention-TP=1 group or unrelated DP replicas.
+    if parallel.attn_dp_enabled and parallel.attn_cp_size > 1:
+        return parallel.attn_cp_group
+    return get_dp_tp_group()
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
@@ -197,6 +206,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_is_moe = draft_is_deepseek_v4()
+        if (
+            get_parallel().attn_dp_enabled
+            and get_parallel().attn_cp_size > 1
+            and not self._draft_is_moe
+        ):
+            raise ValueError(
+                "DSpark DP prefill CP requires a DeepSeek-V4 draft; "
+                "dense draft CP topology is not supported."
+            )
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             model_draft_parallel_spec(
                 target_worker.model_runner.spec_aux_config.draft_model_config,
@@ -215,6 +233,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._draft_is_moe
             and get_parallel().attn_tp_size > 1
         ):
+            # This is the static MoE topology, NOT the effective attention TP
+            # used by prefill-only CP during draft/verify. CP2 decode slices
+            # attention over CP partners but leaves this MoE topology at TP1.
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
@@ -271,7 +292,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._mask_token_id = runtime_config.mask_token_id
 
         parallel = get_parallel()
-        self._tp_sync = SpecTpSync(get_dp_tp_group())
+        self._tp_sync = SpecTpSync(_dspark_tp_sync_group(parallel))
         self._draft_graph_group = (
             self.draft_parallel_layout.tp_group or parallel.tp_group
         )

@@ -961,6 +961,18 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     # into the extend, padding rows to a dummy row past the end.
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
+    # prefill CP: the tail's indices into the whole extend. `token_indices` is
+    # this rank's CP shard there, so readers that must follow the global token
+    # order (hash-routing IDs) take these instead.
+    global_token_indices: Optional[torch.Tensor] = None
+
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        return (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else self.token_indices
+        )
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1997,6 +2009,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         # Same requests as the extend in use, so the same index-K slots; other rows,
         # so its own plans.
@@ -2124,6 +2137,12 @@ class DeepseekV4AttnBackend(
             )
         if tail.cp_metadata is not None:
             forward_batch.attn_cp_metadata = tail.cp_metadata
+            # This is the logical full sequence bound, not a padded CP shard
+            # length. The CP metadata separately describes physical collectives
+            # and each rank's logical MoE prefix.
+            forward_batch.global_num_token_non_padded_cpu = (
+                tail.cp_metadata.total_seq_lens
+            )
             set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 
