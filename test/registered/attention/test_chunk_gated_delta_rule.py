@@ -1,8 +1,10 @@
+import itertools
 import unittest
 
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -423,6 +425,63 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     torch.equal(pool[untouched], pool_init[untouched]),
                     f"{label}: padded rows wrote into the state pool",
                 )
+
+    # ------------------------------------------------------------------
+    # Chunk output kernel on its own (GQA, ragged sequences)
+    # ------------------------------------------------------------------
+    def test_chunk_output_matches_reference(self):
+        """chunk_fwd_o against a float64 evaluation of its formula: per chunk,
+        o = scale * (exp(g) * q @ h^T + causal(exp(g_i - g_j) * q @ k^T) @ v).
+
+        Ragged lengths (chunk tails, a 1-token sequence) and 3 value heads per
+        key head, so every launch tile and boundary shows up in the output.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        lens, Hg, H, K, V, BT = [1, 63, 64, 65, 300, 1000], 4, 12, 128, 128, 64
+        T = sum(lens)
+        torch.manual_seed(7)
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(lens)], dtype=torch.long, device=device
+        )
+        chunks = [
+            (bos + c * BT, min(bos + (c + 1) * BT, bos + n))
+            for bos, n in zip(cu_seqlens.tolist(), lens)
+            for c in range(-(-n // BT))
+        ]
+        q = torch.randn(1, T, Hg, K, dtype=dtype, device=device) * 0.1
+        k = torch.randn(1, T, Hg, K, dtype=dtype, device=device) * 0.1
+        v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+        h = torch.randn(len(chunks), H, V, K, dtype=dtype, device=device) * 0.1
+        # g is the in-chunk cumulative sum of the log decay
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=torch.float32, device=device)
+        )
+        for s, e in chunks:
+            g[:, s:e] = g[:, s:e].cumsum(1)
+        scale = K**-0.5
+
+        o = chunk_fwd_o(q=q, k=k, v=v, h=h, g=g, scale=scale, cu_seqlens=cu_seqlens)
+
+        ref = torch.empty(T, H, V, dtype=torch.float64, device=device)
+        rep = H // Hg
+        for n, (s, e) in enumerate(chunks):
+            qc = q[0, s:e].double().repeat_interleave(rep, dim=1)  # [L, H, K]
+            kc = k[0, s:e].double().repeat_interleave(rep, dim=1)
+            gc = g[0, s:e].double()  # [L, H]
+            inter = torch.einsum("lhk,hvk->lhv", qc, h[n].double())
+            inter = inter * gc.exp()[..., None]
+            attn = torch.einsum("lhk,mhk->hlm", qc, kc)
+            causal = torch.ones(e - s, e - s, device=device).tril().bool()
+            decay = (gc.T[:, :, None] - gc.T[:, None, :]).exp()
+            attn = torch.where(causal, attn * decay, 0.0)
+            intra = torch.einsum("hlm,mhv->lhv", attn, v[0, s:e].double())
+            ref[s:e] = scale * (inter + intra)
+
+        # bf16 output and the kernel's bf16 cast of the decayed q @ k^T: ~1e-4 here
+        torch.testing.assert_close(
+            o[0].double(), ref, atol=2e-3, rtol=1e-2, check_dtype=False
+        )
 
 
 if __name__ == "__main__":
