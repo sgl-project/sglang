@@ -169,7 +169,9 @@ class InternlmDetector(BaseFormatDetector):
             # No tool call marker found
             # If we've already processed tool calls, don't return text again
             if self.current_tool_id > 0:
-                self._buffer = ""
+                # Check if buffer might contain a partial bot_token
+                if not self._ends_with_partial_token(current_text, self.bot_token):
+                    self._buffer = ""
                 return StreamingParseResult(normal_text="")
 
             # Check if buffer could be partial start of bot_token
