@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 class TestBufferModeSidecar(unittest.TestCase):
@@ -434,6 +434,9 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         controller.write.side_effect = _write
         controller.write_storage.side_effect = [98, 99]
+        controller.extend_storage_prefix = (
+            HybridCacheController.extend_storage_prefix.__get__(controller)
+        )
 
         cache = MagicMock()
         cache.cache_controller = controller
@@ -510,7 +513,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         # No KV page in the SWA write; the window's keys ride the transfer.
         self.assertEqual(swa_call.args[0].numel(), 0)
         self.assertEqual(swa_call.args[2], [])
-        self.assertEqual(swa_call.args[3], ["page-p"])
+        self.assertEqual(swa_call.args[3], ["page-p", hashes[0]])
         storage_transfers = {
             transfer.name: transfer
             for call in (kv_call, swa_call)

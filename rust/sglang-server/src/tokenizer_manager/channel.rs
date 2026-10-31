@@ -19,10 +19,12 @@ use crate::message::request::SchedulerRequest;
 #[derive(Clone)]
 pub struct ToSchedulerTx {
     tx: flume::Sender<SchedulerRequest>,
+    priority_tx: flume::Sender<SchedulerRequest>,
 }
 
 pub struct ToSchedulerRx {
     rx: flume::Receiver<SchedulerRequest>,
+    priority_rx: flume::Receiver<SchedulerRequest>,
     /// One-slot buffer holding a message consumed by a blocking [`wait`] so the
     /// scheduler can park on idle without losing it — the next [`drain`] returns
     /// it first. Only ever touched by the single consumer (the Python thread),
@@ -32,6 +34,10 @@ pub struct ToSchedulerRx {
     /// [`wait`]: ToSchedulerRx::wait
     /// [`drain`]: ToSchedulerRx::drain
     stash: Mutex<Option<SchedulerRequest>>,
+    /// Wakes a parked [`wait`](ToSchedulerRx::wait) without a request (see
+    /// [`ToSchedulerRx::waker`]).
+    wake_tx: flume::Sender<()>,
+    wake_rx: flume::Receiver<()>,
 }
 
 impl ToSchedulerTx {
@@ -40,6 +46,14 @@ impl ToSchedulerTx {
     #[inline]
     pub fn try_push(&self, msg: SchedulerRequest) -> bool {
         self.tx.try_send(msg).is_ok()
+    }
+
+    /// Reserved, unbounded lane for scheduler cancellation. Active-request
+    /// cardinality bounds this queue, and request-ring saturation must not make
+    /// cancellation lossy.
+    #[inline]
+    pub fn push_priority(&self, msg: SchedulerRequest) -> bool {
+        self.priority_tx.send(msg).is_ok()
     }
 }
 
@@ -57,6 +71,12 @@ impl ToSchedulerRx {
         // A message parked by a prior blocking `wait` is delivered first.
         if let Some(m) = self.stash.lock().unwrap().take() {
             batch.push(m);
+        }
+        while batch.len() < max {
+            match self.priority_rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
         }
         while batch.len() < max {
             match self.rx.try_recv() {
@@ -77,19 +97,32 @@ impl ToSchedulerRx {
         if self.stash.lock().unwrap().is_some() {
             return true;
         }
-        match self.rx.recv_timeout(timeout) {
+        let stash = |r: Result<SchedulerRequest, flume::RecvError>| match r {
             Ok(m) => {
                 *self.stash.lock().unwrap() = Some(m);
                 true
             }
-            Err(_) => false, // Timeout or Disconnected
-        }
+            Err(_) => false, // Disconnected
+        };
+        let woken = flume::Selector::new()
+            .recv(&self.priority_rx, stash)
+            .recv(&self.rx, stash)
+            .recv(&self.wake_rx, |r| r.is_ok())
+            .wait_timeout(timeout);
+        woken.unwrap_or(false) // Timeout
+    }
+
+    /// A handle that ends a parked [`wait`](Self::wait) at once (returning
+    /// `true`), for a state change the scheduler must act on without a request:
+    /// the listeners closing at the end of a drain.
+    pub fn waker(&self) -> flume::Sender<()> {
+        self.wake_tx.clone()
     }
 }
 
 /// Scheduler output (`Server.push_decode_result_batch` / `push_control_result`
-/// / `push_error`) → Rust response dispatcher. The single producer is the
-/// Python thread; the consumer is the dispatcher.
+/// / `push_error` / `push_health_ack`) → Rust response dispatcher. The single
+/// producer is the Python thread; the consumer is the dispatcher.
 #[derive(Clone)]
 pub struct FromSchedulerTx {
     tx: flume::Sender<Bytes>,
@@ -127,11 +160,16 @@ impl FromSchedulerRx {
 /// Build both halves of a bounded ring.
 pub fn to_scheduler(cap: usize) -> (ToSchedulerTx, ToSchedulerRx) {
     let (tx, rx) = flume::bounded(cap);
+    let (priority_tx, priority_rx) = flume::unbounded();
+    let (wake_tx, wake_rx) = flume::unbounded();
     (
-        ToSchedulerTx { tx },
+        ToSchedulerTx { tx, priority_tx },
         ToSchedulerRx {
             rx,
+            priority_rx,
             stash: Mutex::new(None),
+            wake_tx,
+            wake_rx,
         },
     )
 }
@@ -181,6 +219,45 @@ mod tests {
         // push lands.
         assert!(rx.wait(Duration::from_secs(5)));
         assert_eq!(rx.drain(16).len(), 1);
+    }
+
+    #[test]
+    fn priority_lane_bypasses_full_request_ring() {
+        let (tx, rx) = to_scheduler(1);
+        assert!(tx.try_push(msg(b"request")));
+        assert!(!tx.try_push(msg(b"full")));
+        assert!(tx.push_priority(msg(b"abort")));
+
+        let drained = rx.drain(2);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].header, Bytes::from_static(b"abort"));
+        assert_eq!(drained[1].header, Bytes::from_static(b"request"));
+    }
+
+    #[test]
+    fn wait_wakes_on_priority_push() {
+        let (tx, rx) = to_scheduler(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = tx.push_priority(msg(b"abort"));
+        });
+        assert!(rx.wait(Duration::from_secs(5)));
+        assert_eq!(rx.drain(1)[0].header, Bytes::from_static(b"abort"));
+    }
+
+    /// The waker ends a parked `wait` without a message to drain.
+    #[test]
+    fn waker_ends_a_parked_wait() {
+        let (_tx, rx) = to_scheduler(8);
+        let waker = rx.waker();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = waker.send(());
+        });
+        let started = std::time::Instant::now();
+        assert!(rx.wait(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(rx.drain(16).is_empty());
     }
 
     /// A full from_scheduler channel parks the producer until the consumer drains — the
