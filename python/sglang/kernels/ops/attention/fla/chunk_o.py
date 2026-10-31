@@ -266,6 +266,7 @@ def chunk_fwd_o(
     chunk_indices: Optional[torch.LongTensor] = None,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -278,7 +279,20 @@ def chunk_fwd_o(
 
     if (out is None) != (output_indices is None):
         raise ValueError("out and output_indices must be supplied together")
-    o = torch.zeros_like(v) if out is None else out
+    # A caller's `output` buffer of the output's shape and dtype (e.g. a CUDA graph's
+    # static output) is written in place; it is zeroed first like a new tensor, since
+    # rows of a padded batch past the last sequence are never written.
+    if out is not None:
+        o = out
+    elif (
+        output is not None
+        and output.shape == v.shape
+        and output.dtype == v.dtype
+        and output.is_contiguous()
+    ):
+        o = output.zero_()
+    else:
+        o = torch.zeros_like(v)
 
     use_grouped = output_indices is None and _use_grouped_three_head(
         q, k, v, h, g, cu_seqlens, chunk_size, NT
