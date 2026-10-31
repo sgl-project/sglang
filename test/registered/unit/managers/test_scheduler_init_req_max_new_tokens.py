@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -29,6 +30,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     Each case asserts all rules hold and the result is tight: one more token
     would violate a rule or exceed the request. Over-long inputs degenerate to
     max_new_tokens = 0 and are rejected by later admission checks.
+
+    PD-prefill requests bypass all rules: they always budget exactly one
+    handoff token (test_pd_prefill_forces_one_handoff_token).
     """
 
     @classmethod
@@ -56,6 +60,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         kv_shard_widening: int = 1,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
@@ -228,6 +233,28 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 req = self._new_req(max_new_tokens=1, input_len=prompt_len)
                 scheduler.init_req_max_new_tokens(req)
                 self.assertEqual(req.sampling_params.max_new_tokens, 1)
+
+    def test_pd_prefill_forces_one_handoff_token(self):
+        """Bug regression: a PD-prefill request whose memory budget clamps to
+        0 became is_prefill_only, so the prefill node shipped a dummy token 0
+        that the decode node committed as the user's first output token.
+        Prefill must bypass the clamps and always budget exactly one token."""
+
+        # Pool of 32 with a 30-token prompt: the memory clamp below the
+        # PREFILL branch would compute max(0, 32 - 30 - 1 - 1) = 0.
+        scheduler = self._new_scheduler(max_total_num_tokens=32)
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+
+        req = self._new_req(max_new_tokens=64, input_len=30, min_new_tokens=8)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 1)
+        self.assertEqual(req.sampling_params.min_new_tokens, 1)
+
+        # Without a user minimum, EOS stays legal as the handoff token.
+        req = self._new_req(max_new_tokens=None, input_len=30, min_new_tokens=0)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 1)
+        self.assertEqual(req.sampling_params.min_new_tokens, 0)
 
 
 if __name__ == "__main__":

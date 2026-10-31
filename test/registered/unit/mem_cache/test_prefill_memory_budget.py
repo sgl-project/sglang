@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
@@ -171,6 +172,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             sampling_params=SamplingParams(max_new_tokens=1, ignore_eos=ignore_eos),
         )
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.max_req_len = 16 * page_size
         scheduler.max_total_num_tokens = allocator.size_full
         scheduler.page_size = page_size
