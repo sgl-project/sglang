@@ -699,7 +699,10 @@ def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
         )
         and logits.shape[1] >= 4096
     ):
-        from sglang.kernels.ops.speculative.row_argmax import row_argmax
+        if _is_npu:
+            from sgl_kernel_npu.operators.sample import row_argmax
+        else:
+            from sglang.kernels.ops.speculative.row_argmax import row_argmax
 
         return row_argmax(logits)
     return torch.argmax(logits, dim=-1)
