@@ -45,10 +45,11 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
-from sglang.srt.models.dflash import DFlashMLAAttention
+from sglang.srt.models.dflash import DFlashKDAAttention, DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -681,6 +682,28 @@ class DFlashWorkerV2(BaseSpecWorker):
                     None if self.use_compact_draft_cache else req_to_token_pool
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+        self._alloc_kda_context_state()
+
+    def _alloc_kda_context_state(self) -> None:
+        if not self.draft_model.scans_kda_context:
+            return
+        # The state lives per request slot, outside the prefix cache.
+        if not get_memory().disable_radix_cache:
+            raise ValueError(
+                "DFLASH drafts with context-scanning kda layers require "
+                "--disable-radix-cache."
+            )
+        # Indexed by req_pool_indices; row 0 is the CUDA-graph padding slot.
+        num_slots = self.model_runner.req_to_token_pool.size + 1
+        state_bytes = self.draft_model.allocate_kda_context_state(
+            num_slots=num_slots, device=torch.device(self.device)
+        )
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH kda context state: %.2f GB for %d request slots.",
+                state_bytes / (1 << 30),
+                num_slots,
             )
 
     def init_attention_backends(self):
@@ -1828,6 +1851,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         extend_lens: Optional[torch.Tensor] = None,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
+        extend_lens_cpu: Optional[List[int]] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1835,6 +1861,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
         `cache_loc_2d` holds the same ids as `cache_loc`, row-major.
+        Context-scanning kda layers also need `req_pool_indices`, and for
+        packed prefill rows `prefix_lens`, `extend_lens` and `extend_lens_cpu`.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1978,6 +2006,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                             commit_lens=commit_lens,
                         )
                         continue
+                    if isinstance(attn, DFlashKDAAttention):
+                        attn.write_context_state(
+                            hidden_states=layer_ctx_hidden,
+                            req_pool_indices=req_pool_indices,
+                            commit_lens=commit_lens,
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
@@ -2015,6 +2050,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+                extend_lens_cpu=extend_lens_cpu,
             )
 
     def _append_target_hidden_sequential(
@@ -2022,6 +2061,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
+        extend_lens: Optional[torch.Tensor] = None,
+        extend_lens_cpu: Optional[List[int]] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
@@ -2034,6 +2077,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     positions=ctx_positions,
                     hidden_states=layer_ctx_hidden,
                     cache_loc=ctx_cache_loc,
+                )
+                continue
+            if isinstance(attn, DFlashKDAAttention):
+                attn.write_context_state(
+                    hidden_states=layer_ctx_hidden,
+                    req_pool_indices=req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    extend_lens=extend_lens,
+                    extend_lens_cpu=extend_lens_cpu,
                 )
                 continue
             if _is_npu:
@@ -2431,6 +2483,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 cache_loc=self._draft_write_ids(iteration_ids),
                 positions=positions,
                 extend_lens=ctx_lens,
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=draft_seq_lens,
+                extend_lens_cpu=batch.extend_lens,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -3010,6 +3065,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
             commit_lens=commit_lens,
+            req_pool_indices=batch.req_pool_indices,
         )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.

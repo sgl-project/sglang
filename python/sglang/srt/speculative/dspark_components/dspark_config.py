@@ -214,6 +214,8 @@ def _get_dspark_config(config: Any) -> dict:
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    if base.kda is not None:
+        raise ValueError("DSpark drafts do not support kda attention layers yet.")
 
     dspark_cfg = _get_dspark_config(draft_hf_config)
     text_config = _get_text_config(draft_hf_config)

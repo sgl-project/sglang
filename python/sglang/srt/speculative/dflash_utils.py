@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -25,7 +27,7 @@ from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
-_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
+_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla", "kda"})
 
 logger = logging.getLogger(__name__)
 
@@ -529,8 +531,11 @@ def _parse_optional_int(
     return parsed
 
 
-def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> bool:
-    # SpecForge exports attention_mode; forks that mix modes list attention_modes.
+def _parse_dflash_attention_modes(
+    dflash_cfg: dict, num_hidden_layers: Optional[int]
+) -> Tuple[str, ...]:
+    """One mode per draft layer; a uniform attention_mode repeats."""
+    # SpecForge exports attention_mode, or attention_modes for hybrid stacks.
     if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
         raise ValueError(
             "DFLASH dflash_config sets both attention_mode and attention_modes; "
@@ -538,7 +543,7 @@ def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> 
         )
     raw_modes = dflash_cfg.get("attention_modes")
     if raw_modes is None:
-        raw_modes = [dflash_cfg.get("attention_mode", "gqa")]
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")] * (num_hidden_layers or 1)
     elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
         num_hidden_layers
     ):
@@ -547,22 +552,96 @@ def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> 
             f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
         )
 
-    modes = {str(mode).lower() for mode in raw_modes}
-    unsupported = modes - _DFLASH_ATTENTION_MODES
+    modes = tuple(str(mode).lower() for mode in raw_modes)
+    unsupported = set(modes) - _DFLASH_ATTENTION_MODES
     if unsupported:
         raise ValueError(
             f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
             f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
         )
-    if "mla" not in modes:
-        return False
-    # The draft KV pool has a single per-layer row layout.
-    if modes != {"mla"}:
+    # KDA layers own no KV; the remaining layers share one KV pool row layout.
+    context_modes = set(modes) - {"kda"}
+    if not context_modes:
+        raise ValueError(
+            "DFLASH kda drafts need at least one gqa/mha/mla layer to read the "
+            f"target context, got attention modes {list(modes)}."
+        )
+    if "mla" in context_modes and context_modes != {"mla"}:
         raise ValueError(
             "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
-            f"got attention modes {list(raw_modes)}."
+            f"got attention modes {list(modes)}."
         )
-    return True
+    return modes
+
+
+_DFLASH_KDA_CONTEXT_STATES = frozenset({"reset", "scan"})
+
+
+class DFlashKDAConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """SpecForge ``linear_attn_config`` of the draft's KDA layers."""
+
+    head_dim: int
+    num_heads: int
+    short_conv_kernel_size: int
+    gate_lower_bound: Optional[float]
+    # "scan": a proposal block starts from the state after the committed target
+    # context. "reset": every block starts from a zero state.
+    scans_context: bool
+    # SpecForge's use_full_rank_gate: a full-rank output gate g_proj; the decay
+    # gate stays low-rank (f_a_proj, f_b_proj).
+    full_rank_output_gate: bool
+
+
+def _parse_dflash_kda_config(text_config: Any) -> DFlashKDAConfig:
+    raw = _cfg_get(text_config, "linear_attn_config", None)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"DFLASH kda layers require a linear_attn_config mapping, got {raw!r}."
+        )
+    missing = [
+        key
+        for key in ("head_dim", "num_heads", "short_conv_kernel_size")
+        if raw.get(key) is None
+    ]
+    if missing:
+        raise ValueError(f"DFLASH kda linear_attn_config is missing {missing}.")
+    short_conv_kernel_size = _parse_optional_int(
+        raw["short_conv_kernel_size"],
+        field_name="DFLASH kda short_conv_kernel_size",
+        min_value=2,
+    )
+    full_rank_output_gate = raw.get("use_full_rank_gate", False)
+    if not isinstance(full_rank_output_gate, bool):
+        raise ValueError(
+            "DFLASH kda linear_attn_config.use_full_rank_gate must be a boolean, "
+            f"got {full_rank_output_gate!r}."
+        )
+    gate_lower_bound = raw.get("gate_lower_bound")
+    if gate_lower_bound is not None:
+        gate_lower_bound = float(gate_lower_bound)
+        if not math.isfinite(gate_lower_bound) or gate_lower_bound >= 0:
+            raise ValueError(
+                "DFLASH kda linear_attn_config.gate_lower_bound must be a finite "
+                f"negative number or null, got {gate_lower_bound!r}."
+            )
+    context_state = str(raw.get("context_state", "reset")).lower()
+    if context_state not in _DFLASH_KDA_CONTEXT_STATES:
+        raise ValueError(
+            "DFLASH kda linear_attn_config.context_state must be one of "
+            f"{sorted(_DFLASH_KDA_CONTEXT_STATES)}, got {context_state!r}."
+        )
+    return DFlashKDAConfig(
+        head_dim=_parse_optional_int(
+            raw["head_dim"], field_name="DFLASH kda head_dim", min_value=1
+        ),
+        num_heads=_parse_optional_int(
+            raw["num_heads"], field_name="DFLASH kda num_heads", min_value=1
+        ),
+        short_conv_kernel_size=short_conv_kernel_size,
+        gate_lower_bound=gate_lower_bound,
+        scans_context=context_state == "scan",
+        full_rank_output_gate=full_rank_output_gate,
+    )
 
 
 # The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
@@ -612,6 +691,9 @@ class DFlashDraftConfig:
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
     is_mla: bool = False
+    attention_modes: Tuple[str, ...] = ()
+    # Set iff some layer is "kda".
+    kda: Optional[DFlashKDAConfig] = None
 
     @property
     def is_domino(self) -> bool:
@@ -799,7 +881,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             )
         attention_value_scale = float(raw_attention_value_scale)
 
-    is_mla = _parse_dflash_is_mla(dflash_cfg, num_hidden_layers)
+    attention_modes = _parse_dflash_attention_modes(dflash_cfg, num_hidden_layers)
+    is_mla = "mla" in attention_modes
+    kda = (
+        _parse_dflash_kda_config(draft_text_config)
+        if "kda" in attention_modes
+        else None
+    )
     if is_mla and (attention_sink_bias or attention_value_scale is not None):
         raise ValueError(
             "DFLASH mla drafts support neither attention_sink_bias nor "
@@ -893,6 +981,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
         is_mla=is_mla,
+        attention_modes=attention_modes,
+        kda=kda,
     )
 
 
