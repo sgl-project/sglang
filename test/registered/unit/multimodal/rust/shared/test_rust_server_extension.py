@@ -737,7 +737,7 @@ class TestRustServerExtension(CustomTestCase):
                 server_module,
                 "get_exec",
                 return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                    moe=SimpleNamespace(is_ep_joiner=False, is_ep_scale_joiner=False)
                 ),
             ),
             patch.object(
@@ -783,6 +783,71 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
+    def test_gather_server_endpoints_skips_the_collective_on_an_ep_joiner(self):
+        """The serving ranks gathered at their own startup and never enter
+        this collective again, so an elastic-EP joiner (scale or recover)
+        returns an empty table without entering it and fans nothing out. A
+        serving rank under elastic EP gathers as any rank does."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [obj, None]
+
+        parallel = SimpleNamespace(
+            nnodes=1,
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        for is_ep_joiner, is_ep_scale_joiner in (
+            (True, True),
+            (True, False),
+            (False, False),
+        ):
+            with (
+                self.subTest(joiner=is_ep_joiner, scale=is_ep_scale_joiner),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(
+                            elastic_ep_backend="mooncake",
+                            is_ep_joiner=is_ep_joiner,
+                            is_ep_scale_joiner=is_ep_scale_joiner,
+                        )
+                    ),
+                ),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_serving",
+                    return_value=SimpleNamespace(host="10.0.0.1", port=30000),
+                ),
+            ):
+                gathered.clear()
+                tables = [
+                    RustServer.gather_server_endpoints(hosts_listener=hosts_listener)
+                    for hosts_listener in (True, False)
+                ]
+                if is_ep_joiner:
+                    self.assertEqual(tables, [[], []])
+                    self.assertEqual(gathered, [], "a joiner never enters the gather")
+                else:
+                    self.assertEqual(
+                        gathered,
+                        [{"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}, None],
+                    )
+                    self.assertEqual(tables, [gathered[:1], []])
+
     def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
         """A multi-node launch whose listener is loopback warns, naming the
         host and rendezvous address, unless the nodes rendezvous on loopback
@@ -800,6 +865,13 @@ class TestRustServerExtension(CustomTestCase):
                 world_group=SimpleNamespace(all_gather_object=all_gather_object),
             )
             with (
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
                 patch.object(server_module, "get_parallel", return_value=parallel),
                 patch.object(
                     server_module,

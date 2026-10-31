@@ -2931,6 +2931,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             else:
                 committed_output_id = output_id[0].item()
+                customized_info = self.metadata_buffers.get_customized_info(idx)
+                if customized_info is not None:
+                    if decode_req.req.customized_info is None:
+                        decode_req.req.customized_info = {}
+                    for key, values in customized_info.items():
+                        decode_req.req.customized_info.setdefault(key, []).extend(
+                            values
+                        )
             req = decode_req.req
             logprob_token_id = logprob = top_logprobs_val = top_logprobs_idx = None
             if req.return_logprob:
