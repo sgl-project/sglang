@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -16,23 +17,51 @@ def _reference_ada_values(table, batch_size, timestep, indices):
 
 
 class TestLTX2AdaValuesLayout(unittest.TestCase):
-    def test_values_are_contiguous_and_bitwise_equal(self):
+    def test_values_are_bitwise_equal_and_broadcast_values_are_contiguous(self):
         torch.manual_seed(0)
-        for table_dtype, tokens, indices in (
-            (torch.float32, 1, slice(0, 3)),
-            (torch.bfloat16, 1, slice(None)),
-            (torch.float32, 5, slice(6, 9)),
+        for batch_size, table_dtype, tokens, indices in (
+            (1, torch.float32, 1, slice(0, 3)),
+            (1, torch.bfloat16, 1, slice(None)),
+            (1, torch.float32, 5, slice(6, 9)),
+            (2, torch.float32, 1, slice(0, 3)),
+            (2, torch.bfloat16, 1, slice(None)),
+            (2, torch.float32, 5, slice(6, 9)),
         ):
             table = torch.randn(9, 16, dtype=table_dtype)
-            timestep = torch.randn(2, tokens, 9 * 16, dtype=torch.bfloat16)
+            timestep = torch.randn(batch_size, tokens, 9 * 16, dtype=torch.bfloat16)
             actual = LTX2TransformerBlock.get_ada_values(
-                SimpleNamespace(), table, 2, timestep, indices
+                SimpleNamespace(), table, batch_size, timestep, indices
             )
-            expected = _reference_ada_values(table, 2, timestep, indices)
+            expected = _reference_ada_values(table, batch_size, timestep, indices)
             self.assertEqual(len(actual), len(expected))
             for a, e in zip(actual, expected):
-                self.assertTrue(a.is_contiguous())
+                if tokens == 1:
+                    self.assertTrue(a.is_contiguous())
                 self.assertTrue(torch.equal(a, e))
+
+    def test_per_token_values_keep_the_reference_layout(self):
+        table = torch.randn(9, 16)
+        timestep = torch.randn(2, 5, 9 * 16, dtype=torch.bfloat16)
+        with patch("torch.empty", side_effect=AssertionError("unneeded layout buffer")):
+            actual = LTX2TransformerBlock.get_ada_values(
+                SimpleNamespace(), table, 2, timestep, slice(0, 3)
+            )
+        expected = _reference_ada_values(table, 2, timestep, slice(0, 3))
+        for a, e in zip(actual, expected):
+            self.assertEqual(a.stride(), e.stride())
+            self.assertTrue(torch.equal(a, e))
+
+    def test_singleton_does_not_allocate_a_layout_buffer(self):
+        table = torch.randn(4, 16)
+        timestep = torch.randn(1, 1, 4 * 16 * 2, dtype=torch.bfloat16)[..., ::2]
+        with patch("torch.empty", side_effect=AssertionError("unneeded layout buffer")):
+            actual = LTX2TransformerBlock.get_ada_values(
+                SimpleNamespace(), table, 1, timestep, slice(None)
+            )
+        expected = _reference_ada_values(table, 1, timestep, slice(None))
+        for a, e in zip(actual, expected):
+            self.assertTrue(a.is_contiguous())
+            self.assertTrue(torch.equal(a, e))
 
     def test_zero_one_mask_commutes_with_the_gate(self):
         torch.manual_seed(0)

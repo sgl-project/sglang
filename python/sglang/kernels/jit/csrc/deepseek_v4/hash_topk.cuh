@@ -111,7 +111,7 @@ struct HashTopKKernel {
     auto E = SymbolicSize{"num_routed_experts"};
     auto K = SymbolicSize{"topk_fused"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, E})  //
         .with_dtype<float>()
@@ -172,7 +172,7 @@ struct MaskKernel {
     auto K = SymbolicSize{"topk"};
     auto D = SymbolicSize{"stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({N, K})  //
         .with_strides({D, 1})
         .with_dtype<int32_t>()
@@ -183,7 +183,7 @@ struct MaskKernel {
     const int32_t* ntn_ptr = nullptr;
     int32_t ntn_value = 0;
     const auto ntn_dev = num_token_non_padded.device().device_type;
-    if (ntn_dev == kDLCUDA) {
+    if (ntn_dev == kDLGPU) {
       RuntimeCheck(is_type<int32_t>(num_token_non_padded.dtype()), "num_token_non_padded on CUDA must be int32");
       ntn_ptr = static_cast<const int32_t*>(num_token_non_padded.data_ptr());
     } else if (ntn_dev == kDLCPU) {

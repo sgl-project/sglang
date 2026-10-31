@@ -71,9 +71,9 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         model_runner.lora_manager.reset_lora_batch()
         super().__init__(model_runner, record_nolora_graph=forward_width > 1, **kwargs)
 
-    def capture_prepare(self, size, stream_idx=None, num_tokens=None):
+    def capture_prepare(self, size, num_tokens=None):
         forward_batch, attn_backend, pp_proxy_tensors = super().capture_prepare(
-            size, stream_idx=stream_idx, num_tokens=num_tokens
+            size, num_tokens=num_tokens
         )
         # UNO owns token-row routing directly. K2's generic graph runner now
         # keys LoRA setup off lora_manager presence, so suppress its synthetic
@@ -123,7 +123,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size,
         forward,
-        stream_idx=None,
         variant_label=None,
         attention_variant=None,
     ):
@@ -133,7 +132,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                 return super().capture_one_shape(
                     size,
                     forward,
-                    stream_idx,
                     None,
                     attention_variant,
                 )
@@ -146,7 +144,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                 return super().capture_one_shape(
                     size,
                     forward,
-                    stream_idx,
                     None,
                     attention_variant,
                 )
@@ -163,7 +160,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         super().capture_one_shape(
             size,
             forward,
-            stream_idx,
             variant_label,
             attention_variant,
         )
