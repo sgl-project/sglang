@@ -80,6 +80,23 @@ fn resolve_max_message_size_honors_env_var() {
 }
 
 #[tokio::test]
+async fn accepted_grpc_connections_have_tcp_nodelay() {
+    use tokio_stream::StreamExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut incoming = super::grpc_incoming(listener);
+
+    let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let accepted = incoming.next().await.unwrap().unwrap();
+    assert!(
+        accepted.nodelay().unwrap(),
+        "the gRPC listener must disable Nagle on accepted connections"
+    );
+    drop(client);
+}
+
+#[tokio::test]
 async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
     use sglang_api_types::runtime::v1::{GetServerInfoRequest, GetServerInfoResponse};
     use tonic_prost::ProstCodec;
