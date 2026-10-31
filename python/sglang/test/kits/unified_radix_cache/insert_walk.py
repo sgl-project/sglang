@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
@@ -258,7 +259,7 @@ class StreamingSessionLockLifecycleFixtures:
     def _admitted_turn(self, cache, allocator, pool, tokens, session):
         """A first turn with its own row and the root lock admission took."""
         req = self._turn(tokens, session)
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         pool.write(
             (req.kv.req_pool_idx, slice(0, len(tokens))),
             allocator.alloc(len(tokens)),

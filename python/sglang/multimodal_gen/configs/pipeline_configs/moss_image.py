@@ -68,6 +68,10 @@ class MOSSImagePipelineConfig(SpatialImagePipelineConfig):
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {"skip_layers": resolve_uncond_skip_layers(batch.sampling_params)}
 
+    def shard_latents_for_sp(self, batch, latents):
+        # The DiT shards the joint image/text tokens after building full-image RoPE.
+        return latents, False
+
     def post_denoising_loop(self, latents, batch):
         return latents
 
