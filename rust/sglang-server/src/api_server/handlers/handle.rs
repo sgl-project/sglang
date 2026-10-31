@@ -174,6 +174,11 @@ impl CoreHandle {
         self.inner.metrics.as_ref()
     }
 
+    /// The DP rank the local scheduler answers for.
+    pub(crate) fn dp_rank(&self) -> RankId {
+        self.inner.dp_rank
+    }
+
     /// Record successful completion of the startup warmup. The state is
     /// shared by every transport.
     pub(crate) fn mark_ready(&self) {
