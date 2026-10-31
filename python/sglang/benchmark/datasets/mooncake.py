@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import random
 import time
 from argparse import Namespace
+from array import array
 from dataclasses import dataclass
 from typing import AsyncGenerator, Dict, List
 
@@ -14,6 +16,39 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
 )
 from sglang.benchmark.utils import download_and_cache_file
+
+# A trace record lists its prompt as ids of 512-token blocks (Mooncake, FAST'25);
+# a block id two requests share is a shared prefix.
+MOONCAKE_BLOCK_TOKENS = 512
+# Stands in for an answer the trace does not contain.
+_PLACEHOLDER_TOKEN = 0
+
+
+class MooncakeBlocks:
+    """Token ids for a trace's blocks: a block id always expands to the same
+    MOONCAKE_BLOCK_TOKENS ids, drawn from the model's vocabulary."""
+
+    def __init__(self, vocab_size: int):
+        self._vocab_size = vocab_size
+        self._blocks: Dict[int, array] = {}
+
+    def block(self, hash_id: int) -> array:
+        ids = self._blocks.get(hash_id)
+        if ids is None:
+            rng = random.Random(hash_id)
+            ids = array(
+                "i",
+                (rng.randrange(self._vocab_size) for _ in range(MOONCAKE_BLOCK_TOKENS)),
+            )
+            self._blocks[hash_id] = ids
+        return ids
+
+    def prompt(self, record: Dict) -> List[int]:
+        ids: List[int] = []
+        for hash_id in record.get("hash_ids", []):
+            ids.extend(self.block(hash_id))
+        # The last block is partial: the record's input_length is the real count.
+        return ids[: record.get("input_length", len(ids))]
 
 
 @dataclass
@@ -55,12 +90,15 @@ async def get_mooncake_request_over_time(
 ) -> AsyncGenerator[DatasetRow, None]:
     """
     An async generator that yields requests based on the timestamps in the Mooncake trace file,
-    with support for multi-round sessions.
+    with support for multi-round sessions. Prompts are token ids: each block id of a
+    record expands to the same MOONCAKE_BLOCK_TOKENS ids for every record, so the
+    trace's prefix sharing and lengths are kept.
     """
     if not input_requests:
         return
 
     input_requests.sort(key=lambda r: r["timestamp"])
+    blocks = MooncakeBlocks(tokenizer.vocab_size)
 
     start_time = time.perf_counter()
     trace_start_time_ms = input_requests[0]["timestamp"]
@@ -77,47 +115,17 @@ async def get_mooncake_request_over_time(
 
         # Once the session starts, generate all rounds for it as a burst
         # This simulates a user engaging in a multi-turn conversation
-
-        # Base user query constructed from hash_ids
-        user_query_base = ""
-        hash_ids = record.get("hash_ids", [])
-        for hash_id in hash_ids:
-            user_query_base += f"{hash_id}" + " ".join(
-                ["hi"] * 128
-            )  # Shorter for multi-round
-        user_query_base += "Tell me a story based on this context."
-
+        query_ids = blocks.prompt(record)
         output_len_per_round = record.get("output_length", 256)
-        chat_history = []
+        history: List[int] = []
 
-        for i in range(num_rounds):
-            # Add user query for the current round
-            chat_history.append(
-                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
-            )
-
-            # Form the full prompt from history
-            try:
-                full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                )
-            except Exception:
-                full_prompt_text = "\n".join(
-                    [f"{msg['role']}: {msg['content']}" for msg in chat_history]
-                )
-
-            prompt_len = len(tokenizer.encode(full_prompt_text))
-
+        for _ in range(num_rounds):
+            prompt_ids = history + query_ids
             yield DatasetRow(
-                prompt=full_prompt_text,
-                prompt_len=prompt_len,
+                prompt=prompt_ids,
+                prompt_len=len(prompt_ids),
                 output_len=output_len_per_round,
             )
-
-            # Add a placeholder assistant response for the next round's context
-            # We use a placeholder because we don't know the real response
-            placeholder_response = " ".join(["story"] * output_len_per_round)
-            chat_history.append({"role": "assistant", "content": placeholder_response})
+            # The next round sees this prompt, a placeholder for the answer the
+            # trace does not contain, and the query again.
+            history = prompt_ids + [_PLACEHOLDER_TOKEN] * output_len_per_round
