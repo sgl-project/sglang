@@ -45,12 +45,21 @@ export const config = {
     resource: {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
       verifiedRecipes: [],
-      autoTopology: (s) => ({ tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 }),
+      // Every guidance recipe runs two or three branches, so an even GPU count
+      // splits them first (CFG parallel) and gives Ulysses the rest. On 2 GPUs,
+      // 1024x1024 50 steps: CFG 2 2.45 s vs Ulysses 2 3.18 s on B200, 4.28 s vs
+      // 4.48 s for vLLM-Omni's CFG 2 on H200.
+      autoTopology: (s) => {
+        const gpus = Number(s.gpus_per_node);
+        const cfg = gpus % 2 === 0 ? 2 : 1;
+        return { tp_size: 1, ulysses_degree: gpus / cfg, ring_degree: 1, cfg_degree: cfg };
+      },
       validateTopology: (s, t) => {
         const errors = [];
+        const cfg = t.cfg_degree || 1;
         if (![t.tp_size, t.ulysses_degree, t.ring_degree].every((n) => Number.isInteger(n) && n > 0)) errors.push("Parallel degrees must be positive integers.");
         if (t.tp_size !== 1) errors.push("Tensor parallelism is not implemented for this model.");
-        if (Number(s.nodes) !== 1 || Number(s.gpus_per_node) !== t.tp_size * t.ulysses_degree * t.ring_degree) errors.push("GPU count must match TP times Ulysses times Ring on one node.");
+        if (Number(s.nodes) !== 1 || Number(s.gpus_per_node) !== cfg * t.tp_size * t.ulysses_degree * t.ring_degree) errors.push("GPU count must match CFG times TP times Ulysses times Ring on one node.");
         if (24 % t.ulysses_degree) errors.push("Ulysses degree must divide the 24 attention heads.");
         if (t.ring_degree > 1 && s.attention === "sdpa") errors.push("Ring requires an LSE-capable backend, not Torch SDPA.");
         return errors;
@@ -64,12 +73,13 @@ export const config = {
       const errors = resource.validateTopology(s, topology);
       const flags = ["--model-path {{MODEL_NAME}}"];
       if (Number(s.gpus_per_node) > 1) flags.push(`--num-gpus ${s.gpus_per_node}`, "--tp-size 1", `--ulysses-degree ${topology.ulysses_degree}`, `--ring-degree ${topology.ring_degree}`);
+      if ((topology.cfg_degree || 1) > 1) flags.push(`--cfg-parallel-size ${topology.cfg_degree}`);
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
       return {
         match: { hw: s.hw }, nnodes: 1, verified: false, flags,
         builder: {
           topology, errors,
-          topologySummary: `TP ${topology.tp_size}, Ulysses ${topology.ulysses_degree}, Ring ${topology.ring_degree}`,
+          topologySummary: `CFG ${topology.cfg_degree || 1}, TP ${topology.tp_size}, Ulysses ${topology.ulysses_degree}, Ring ${topology.ring_degree}`,
           warnings: ["This exact hardware and workload recipe is not end-to-end verified."],
           verification: { serve: "unverified", request: "unverified" },
         },
