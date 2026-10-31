@@ -66,8 +66,6 @@ class UnlimitedOCRV2Attention(nn.Module):
         assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = config.hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.idx_head_dim = int(sparse_cfg.get("sparse_index_dim", 128))
         # sparse_num_index_heads is forced to 1 for the DASH router: the stride-0
@@ -402,10 +400,10 @@ class UnlimitedOCRV2ForCausalLM(UnlimitedOCRForCausalLM):
 
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
         """Batch matching crop geometries; encode mixed geometries separately."""
-        if len(mm_items) == 1:
-            return super()._process_image_input(mm_items)
-        shapes = {tuple(item.images_crop.shape) for item in mm_items}
-        if len(shapes) == 1:
+        if (
+            len(mm_items) == 1
+            or len({tuple(item.images_crop.shape) for item in mm_items}) == 1
+        ):
             return super()._process_image_input(mm_items)
         encode_one = super()._process_image_input
         features = [encode_one([item]) for item in mm_items]
@@ -454,62 +452,43 @@ class UnlimitedOCRV2ForCausalLM(UnlimitedOCRForCausalLM):
         """Trim crop padding, encode pages in batches, then assemble each page."""
         n = images_spatial_crop.size(0)
 
-        # Pass 1: collect each page's global view and trimmed local tiles.
-        global_views: List[torch.Tensor] = []
-        page_patches: List[Optional[torch.Tensor]] = []
-        crop_shapes: List[torch.Tensor] = []
-        use_local_flags: List[bool] = []
-        for jdx in range(n):
-            patches = images_crop[jdx][0].to(torch.bfloat16)
-            crop_shape = images_spatial_crop[jdx][0]
+        local_tiles = {}
+        for j in range(n):
+            patches = images_crop[j][0].to(torch.bfloat16)
+            crop_shape = images_spatial_crop[j][0]
             n_tiles = int(crop_shape[0]) * int(crop_shape[1])
             if 0 < n_tiles < patches.shape[0]:
                 patches = patches[:n_tiles]
-            use_local_crops = (
-                has_local_crops[jdx]
+            use_local = (
+                has_local_crops[j]
                 if has_local_crops is not None
                 else torch.sum(patches).item() != 0
             )
-            global_views.append(pixel_values[jdx])
-            crop_shapes.append(crop_shape)
-            use_local_flags.append(bool(use_local_crops))
-            page_patches.append(patches if use_local_crops else None)
+            if use_local:
+                local_tiles[j] = patches
 
         with torch.no_grad():
-            # Pass 2: two batched ViT launches (globals grouped, locals grouped).
-            global_feats = self._encode_ocr1_features_grouped(global_views)
-            local_idx = [j for j in range(n) if use_local_flags[j]]
-            local_feats_by_page: List[Optional[torch.Tensor]] = [None] * n
-            if local_idx:
-                encoded = self._encode_ocr1_features_grouped(
-                    [page_patches[j] for j in local_idx]
-                )
-                for slot, j in enumerate(local_idx):
-                    local_feats_by_page[j] = encoded[slot]
-
-            # Pass 3: per-page assembly, same layout as the single-page path.
-            images_in_this_batch = []
-            for jdx in range(n):
-                global_features = self._format_ocr1_global_features(global_feats[jdx])
-                if use_local_flags[jdx]:
-                    local_features = self._format_ocr1_local_features(
-                        local_feats_by_page[jdx], crop_shapes[jdx]
+            # group global and local views separately, preserving page and tile order
+            global_feats = self._encode_ocr1_features_grouped(
+                [pixel_values[j] for j in range(n)]
+            )
+            local_feats = {}
+            if local_tiles:
+                encoded = self._encode_ocr1_features_grouped(list(local_tiles.values()))
+                local_feats = dict(zip(local_tiles, encoded))
+            pages = []
+            for j in range(n):
+                parts = [
+                    self._format_ocr1_global_features(global_feats[j]),
+                    self.view_seperator[None, :],
+                ]
+                if j in local_feats:
+                    local = self._format_ocr1_local_features(
+                        local_feats[j], images_spatial_crop[j][0]
                     )
-                    global_local_features = torch.cat(
-                        [
-                            local_features,
-                            global_features,
-                            self.view_seperator[None, :],
-                        ],
-                        dim=0,
-                    )
-                else:
-                    global_local_features = torch.cat(
-                        [global_features, self.view_seperator[None, :]], dim=0
-                    )
-                images_in_this_batch.append(global_local_features)
-
-        return images_in_this_batch
+                    parts.insert(0, local)
+                pages.append(torch.cat(parts, dim=0))
+        return pages
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Use a full KV pool; DASH applies its local window in the kernel."""

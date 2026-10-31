@@ -127,6 +127,44 @@ class TestUnlimitedOCRSpatialMetadata(CustomTestCase):
         self.assertEqual(spatial.dtype, torch.long)
         self.assertEqual(spatial.tolist(), [[[2, 1]]])
 
+    def test_mixed_crop_pages_keep_their_own_tiles_and_ignore_padding(self):
+        """grouping local tiles must not shift later pages past a crop-free page"""
+        model = object.__new__(UnlimitedOCRV2ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.image_newline = torch.full((2,), -1.0)
+        model.view_seperator = torch.full((2,), -2.0)
+        global_views = torch.stack(
+            [torch.full((1, 3, 2, 2), float(i)) for i in (1, 2, 3)]
+        )
+        crops = torch.zeros(3, 1, 3, 3, 2, 2)
+        for page, values in ((0, (10, 11, 999)), (2, (30, 31, 999))):
+            for tile, value in enumerate(values):
+                crops[page, 0, tile].fill_(value)
+        shapes = torch.tensor([[[2, 1]], [[0, 0]], [[1, 2]]])
+        expected = [
+            [10, 10, 11, 11, -1] * 2 + [1, 1, -1] * 2 + [-2],
+            [2, 2, -1] * 2 + [-2],
+            [30, 30, -1] * 2 + [31, 31, -1] * 2 + [3, 3, -1] * 2 + [-2],
+        ]
+
+        def encode(tiles):
+            return tiles[:, 0, 0, 0, None, None].expand(-1, 4, 2).contiguous()
+
+        with patch.object(model, "_encode_ocr1_features", side_effect=encode):
+            for flags in ([True, False, True], None):
+                with self.subTest(flags=flags):
+                    actual = model._pixel_values_to_embedding(
+                        global_views, crops, shapes, has_local_crops=flags
+                    )
+                    self.assertEqual(len(actual), len(expected))
+                    for page, values in zip(actual, expected):
+                        torch.testing.assert_close(
+                            page,
+                            torch.tensor(values)[:, None].expand(-1, 2).to(page),
+                            rtol=0,
+                            atol=0,
+                        )
+
 
 class TestUnlimitedOCRPageSlices(CustomTestCase):
     def test_split_pages_pickle_only_their_own_crops(self):
