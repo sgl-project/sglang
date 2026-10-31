@@ -119,6 +119,13 @@ class Model(msgspec.Struct):
         bool,
         "Whether to use a CausalLM as an embedding model.",
     ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
+    ] = False
     revision: A[
         Optional[str],
         "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",

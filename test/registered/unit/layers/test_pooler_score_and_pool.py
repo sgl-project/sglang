@@ -16,6 +16,7 @@ from sglang.srt.layers.pooler import (
     PoolingType,
     score_and_pool,
 )
+from sglang.srt.runtime_context import get_context, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -266,6 +267,69 @@ class TestScoreAndPool(CustomTestCase):
         self.assertIsNotNone(out.pooled_hidden_states)
         self.assertEqual(len(out.pooled_hidden_states), 1)
         self.assertEqual(out.pooled_hidden_states[0].shape, (2, self.hidden_dim))
+
+
+class TestDisableNormalizeEmbedding(CustomTestCase):
+    """--disable-normalize-embedding turns off the Pooler's L2 normalization.
+
+    ``Pooler.__init__`` reads the resolved flag from the ``model`` config bag,
+    so these tests publish a context via ``override_server_args`` rather than
+    faking the accessor. Construction against an *unpublished* context stays
+    supported and keeps normalization — see
+    ``test_unpublished_context_keeps_normalization``.
+    """
+
+    def setUp(self):
+        torch.manual_seed(42)
+        self.hidden = torch.randn(4, 8)
+        self.fb = _make_forward_batch(extend_seq_lens=[2, 2])
+
+    def _pooled(self, pooler):
+        return pooler(self.hidden, self.fb).embeddings
+
+    def test_flag_disables_normalization(self):
+        with get_context().override_server_args(disable_normalize_embedding=True):
+            pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+            self.assertFalse(pooler.normalize)
+            pooled = self._pooled(pooler)
+
+        # Un-normalized rows keep the raw hidden-state norms.
+        expected = self.hidden[torch.tensor([1, 3])]
+        torch.testing.assert_close(pooled, expected)
+
+    def test_default_keeps_normalization(self):
+        with get_context().override_server_args(disable_normalize_embedding=False):
+            pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+            self.assertTrue(pooler.normalize)
+            pooled = self._pooled(pooler)
+
+        torch.testing.assert_close(
+            pooled.norm(p=2, dim=-1), torch.ones(pooled.shape[0])
+        )
+
+    def test_flag_does_not_force_enable_normalization(self):
+        """The override is one-way: normalize=False models stay un-normalized."""
+        with get_context().override_server_args(disable_normalize_embedding=True):
+            self.assertFalse(
+                Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
+            )
+        with get_context().override_server_args(disable_normalize_embedding=False):
+            self.assertFalse(
+                Pooler(pooling_type=PoolingType.LAST, normalize=False).normalize
+            )
+
+    def test_unpublished_context_keeps_normalization(self):
+        """Pooler stays constructible without a published server context.
+
+        Config bags fail closed before ``publish``, so reading the flag
+        unconditionally would make ``Pooler(normalize=True)`` raise in any
+        standalone/offline construction path. With no published model
+        namespace there is no override to honor, so normalization is kept.
+        """
+        self.addCleanup(reset_context)
+        reset_context()
+        pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.assertTrue(pooler.normalize)
 
 
 if __name__ == "__main__":

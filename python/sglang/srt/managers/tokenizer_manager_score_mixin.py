@@ -908,6 +908,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -939,6 +940,10 @@ class TokenizerManagerScoreMixin:
 
         stacked_query_item_embed_overrides replaces query_/item_embed_overrides with one
         [N, hidden] tensor per sequence (per item, or one under --enable-mis), query rows first.
+
+        rid, when set, is the base request id: every sub-request is sent as ``<rid>_<i>``
+        (``i`` zero-padded) so the call can be correlated across tokenizer, scheduler and
+        detokenizer logs.
         """
         is_generation = self.is_generation
 
@@ -1205,6 +1210,7 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                rid=rid,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1214,6 +1220,7 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                rid=rid,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
