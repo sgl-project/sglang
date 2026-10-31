@@ -9,6 +9,7 @@ from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -122,7 +123,8 @@ class TestPdDcpGather(CustomTestCase):
                     torch.cuda.synchronize()
                     return 0
 
-                manager = SimpleNamespace(
+                manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                manager.__dict__.update(
                     is_mla_backend=False,
                     kv_args=SimpleNamespace(
                         page_size=page,
@@ -135,10 +137,13 @@ class TestPdDcpGather(CustomTestCase):
                     max_transfer_batch_indices=37,
                     enable_custom_mem_pool=custom_pool,
                     enable_deferred_decode_kv_release=False,
-                    _transfer_data=transfer,
                 )
-                manager._await_transfer_futures = lambda futures: (
-                    MooncakeKVManager._await_transfer_futures(manager, futures)
+                attach_mooncake_transport(
+                    manager,
+                    engine_writes(transfer),
+                    kv=[x.data_ptr() for x in sources],
+                    staging=[pack.get_ptr()],
+                    peer_kv=[x.data_ptr() for x in destinations],
                 )
                 for start in range(0, tokens, chunk):
                     count = min(chunk, tokens - start)

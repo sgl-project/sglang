@@ -16,6 +16,7 @@ import requests
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.nixl.buffers import copy_ranges
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -24,10 +25,19 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
 )
+from sglang.srt.disaggregation.nixl.transport import (
+    NixlHandle,
+    NixlResult,
+    NixlTransport,
+)
+from sglang.srt.disaggregation.transport.base import Copy, Status
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.nixl_utils import attach_nixl_transport
 from sglang.test.test_utils import CustomTestCase
+
+DONE = NixlResult(Status.DONE)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -45,6 +55,9 @@ class StagingFakeAgent:
     def register_memory(self, addrs, mem_type):
         self.register_memory_calls.append((addrs, mem_type))
         return self.register_result
+
+    def add_remote_agent(self, metadata):
+        return metadata.decode("ascii")
 
     def get_xfer_descs(self, reqs, mem_type):
         self.get_xfer_descs_calls.append((reqs, mem_type))
@@ -101,6 +114,8 @@ class TestNixlBackendInitialization(CustomTestCase):
             ib_device=ib_device,
             kv_data_ptrs=[],
             kv_item_lens=[],
+            aux_data_ptrs=[],
+            state_data_ptrs=[],
             state_types=[],
         )
         mgr = object.__new__(NixlKVManager)
@@ -135,7 +150,7 @@ class TestNixlBackendInitialization(CustomTestCase):
             get_context().override_server_args(device="cuda") as server_args,
             patch.object(CommonKVManager, "__init__", return_value=None),
             patch(
-                "sglang.srt.disaggregation.nixl.conn.torch.get_device_module",
+                "sglang.srt.disaggregation.nixl.transport.torch.get_device_module",
                 return_value=device_module,
             ) as get_device_module,
             patch.object(NixlKVManager, "register_buffer_to_engine"),
@@ -256,10 +271,10 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         for src_stride, dst_stride in ((32, 16), (16, 32)):
             with self.subTest(src_stride=src_stride, dst_stride=dst_stride):
                 mgr = object.__new__(NixlKVManager)
-                mgr.agent = MagicMock()
+                agent = MagicMock()
+                mgr.transport = NixlTransport(agent=agent)
                 mgr.pp_size = mgr.state_tp_size = 1
                 mgr.is_mla_backend = False
-                mgr._use_strided_descs = True
                 mgr._prepared_state_components = frozenset({0})
                 mgr._prepared_state_plans = {}
                 mgr._state_layout_rejections = {}
@@ -287,7 +302,7 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
 
                 self.assertIn("stride mismatch", mgr._state_layout_rejections["decode"])
                 self.assertEqual(mgr._prepared_state_plans, {})
-                mgr.agent.prep_xfer_dlist.assert_not_called()
+                agent.prep_xfer_dlist.assert_not_called()
                 with self.assertRaisesRegex(RuntimeError, "stride mismatch"):
                     list(
                         mgr.maybe_send_extra(
@@ -295,15 +310,17 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
                             [[1]],
                             peer.dst_state_data_ptrs,
                             [[2]],
-                            0,
                             1,
                         )
                     )
-                mgr.agent.transfer.assert_not_called()
+                agent.transfer.assert_not_called()
 
     def test_paired_state_entries_reject_item_length_mismatch(self):
         mgr = object.__new__(NixlKVManager)
-        mgr.agent = StagingFakeAgent()
+        agent = StagingFakeAgent()
+        attach_nixl_transport(
+            mgr, agent, state=[[10]], peers=("decode",), peer_state=[[20]]
+        )
         mgr.is_mla_backend = False
         mgr.pp_size = 1
         mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1])
@@ -311,19 +328,18 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
             mgr._send_kvcache_generic(
                 peer_name="decode",
-                src_data_ptrs=[10],
-                dst_data_ptrs=[20],
+                src_keys=mgr._local_keys.state[0],
+                dst_keys=mgr._peers["decode"].keys.state[0],
                 item_lens=[32],
                 prefill_data_indices=np.array([3], dtype=np.int32),
                 dst_data_indices=np.array([5], dtype=np.int32),
-                dst_gpu_id=0,
                 state_type=StateType.QSA_PENDING,
                 force_flat=True,
                 src_layer_ids=[24],
                 dst_layer_ids=[24],
                 dst_item_lens=[48],
             )
-        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+        self.assertEqual(agent.initialize_xfer_calls, [])
 
 
 class TestNixlTransferWorker(CustomTestCase):
@@ -363,6 +379,7 @@ class TestNixlTransferWorker(CustomTestCase):
             )
         }
         mgr.req_to_decode_prefix_len = {room: 4}
+        mgr._peers = {}
         mgr.enable_staging = False
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
@@ -377,11 +394,11 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.failure_records = {}
         mgr.send_kv_status_message = MagicMock()
 
-        def check_xfer_state(_handle):
+        def status(_handle):
             mgr.update_status(room, KVPoll.Failed)
-            return "DONE"
+            return DONE
 
-        mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
+        mgr.transport = SimpleNamespace(status=status)
         return mgr
 
     def _make_chunk(self, room, prefill_kv_indices, is_last_chunk):
@@ -422,7 +439,7 @@ class TestNixlTransferWorker(CustomTestCase):
     ):
         room = 21
         mgr = self._make_manager(room)
-        mgr.send_aux = MagicMock(return_value="aux_handle")
+        mgr.send_aux = MagicMock(return_value=["aux_handle"])
         chunk = self._make_chunk(room, [], is_last_chunk=True)
 
         self._run_worker_once(mgr, chunk)
@@ -437,7 +454,7 @@ class TestNixlTransferWorker(CustomTestCase):
     ):
         room = 22
         mgr = self._make_manager(room)
-        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        mgr.send_kvcache = MagicMock(return_value=["kv_handle"])
         chunk = self._make_chunk(room, [1], is_last_chunk=False)
 
         self._run_worker_once(mgr, chunk)
@@ -506,11 +523,11 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.send_kvcache_dcp = MagicMock(side_effect=send_kvcache_dcp)
         submitted_counts_at_poll = []
 
-        def check_xfer_state(_handle):
+        def status(_handle):
             submitted_counts_at_poll.append(len(submitted))
-            return "DONE"
+            return DONE
 
-        mgr.agent = SimpleNamespace(check_xfer_state=check_xfer_state)
+        mgr.transport = SimpleNamespace(status=status)
         chunk = self._make_chunk(room, [1], is_last_chunk=False)
         chunk.num_kv_tokens = 4
 
@@ -545,10 +562,10 @@ class TestNixlTransferWorker(CustomTestCase):
         peer.dst_state_dim_per_tensor = [[1]]
         peer.dst_state_layer_ids = [[0]]
         events = []
-        mgr.send_kvcache = MagicMock(return_value="kv")
+        mgr.send_kvcache = MagicMock(return_value=["kv"])
         mgr.maybe_send_extra = MagicMock(return_value=["state0", "state1"])
-        mgr.send_aux = MagicMock(return_value="aux")
-        mgr.agent.check_xfer_state = lambda handle: events.append(handle) or "DONE"
+        mgr.send_aux = MagicMock(return_value=["aux"])
+        mgr.transport.status = lambda handle: events.append(handle) or DONE
         mgr.send_kv_status_message.side_effect = lambda **kwargs: events.append(
             kwargs["status"]
         )
@@ -567,9 +584,10 @@ class TestNixlTransferWorker(CustomTestCase):
     def test_failed_handle_never_emits_success(self):
         room = 25
         mgr = self._make_manager(room)
-        mgr.send_kvcache = MagicMock(return_value="kv")
-        mgr.send_aux = MagicMock(return_value="aux")
-        mgr.agent.check_xfer_state = lambda handle: "ERR" if handle == "kv" else "DONE"
+        mgr.send_kvcache = MagicMock(return_value=["kv"])
+        mgr.send_aux = MagicMock(return_value=["aux"])
+        err = NixlResult(Status.FAILED, reason="ERR", quiescent=True)
+        mgr.transport.status = lambda handle: err if handle == "kv" else DONE
         self._run_worker_once(mgr, self._make_chunk(room, [1], is_last_chunk=True))
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
         mgr.send_kv_status_message.assert_called_once()
@@ -589,8 +607,8 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.enable_staging = True
         mgr._staging_ctx = PrefillStagingContext()
         mgr._try_create_staging_strategy = MagicMock(return_value=object())
-        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
-        mgr.send_aux = MagicMock(side_effect=lambda peer, *args: f"aux-{peer}")
+        mgr.transport.status = MagicMock(return_value=DONE)
+        mgr.send_aux = MagicMock(side_effect=lambda peer, *args: [f"aux-{peer}"])
         mgr.send_chunk_ready = MagicMock()
         return mgr
 
@@ -621,7 +639,7 @@ class TestNixlTransferWorker(CustomTestCase):
             if len(attempts) == 1:
                 queue.put(chunk)
                 return None, True, 0
-            return f"kv-{page_start}", False, page_start
+            return [f"kv-{page_start}"], False, page_start
 
         mgr._do_staging_transfer = stage
         mgr.send_chunk_ready.side_effect = lambda **kw: events.append(
@@ -885,9 +903,8 @@ class TestNixlNodeFailure(CustomTestCase):
 
 
 class TestNixlStaging(CustomTestCase):
-    def _make_manager(self, agent=None):
+    def _make_manager(self):
         mgr = object.__new__(NixlKVManager)
-        mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
         mgr.kv_args = SimpleNamespace(
@@ -975,11 +992,68 @@ class TestNixlStaging(CustomTestCase):
                 )
 
 
+class TestNixlTransportWrites(CustomTestCase):
+    def test_write_all_posts_one_transfer_per_memory_kind_pair(self):
+        """A NIXL descriptor list holds one memory kind, so device KV and host
+        aux written together go out as two transfers; host memory is device 0."""
+        agent = StagingFakeAgent()
+        mgr = object.__new__(NixlKVManager)
+        transport = attach_nixl_transport(
+            mgr,
+            agent,
+            gpu_id=1,
+            kv=[0x1000],
+            aux=[0x2000],
+            peers=("decode",),
+            peer_kv=[0x3000],
+            peer_aux=[0x4000],
+            peer_gpu_id=2,
+        )
+        local, peer = mgr._local_keys, mgr._peers["decode"]
+
+        handles = transport.write_all(
+            peer.remote,
+            [
+                Copy(
+                    src=local.kv[0],
+                    dst=peer.keys.kv[0],
+                    ranges=copy_ranges([(16, 32, 8)]),
+                ),
+                Copy(
+                    src=local.aux[0],
+                    dst=peer.keys.aux[0],
+                    ranges=copy_ranges([(4, 8, 2)]),
+                ),
+            ],
+        )
+
+        self.assertEqual(len(handles), 2)
+        self.assertEqual(len(agent.initialize_xfer_calls), 2)
+        self.assertEqual(
+            [
+                (np.asarray(reqs).tolist(), kind)
+                for reqs, kind in agent.get_xfer_descs_calls
+            ],
+            [
+                ([[0x1000 + 16, 8, 1]], "VRAM"),
+                ([[0x3000 + 32, 8, 2]], "VRAM"),
+                ([[0x2000 + 4, 2, 0]], "DRAM"),
+                ([[0x4000 + 8, 2, 0]], "DRAM"),
+            ],
+        )
+
+
 class DlistCaptureAgent:
     """Records prep_xfer_dlist descriptor arrays so tests can inspect them."""
 
     def __init__(self):
         self.calls = []  # (peer_name, np.ndarray, mem_kind)
+
+    def register_memory(self, addrs, mem_type):
+        return addrs
+
+    def add_remote_agent(self, metadata):
+        return metadata.decode("ascii")
 
     def prep_xfer_dlist(self, peer_name, array, mem_kind):
         self.calls.append((peer_name, np.asarray(array), mem_kind))
@@ -1007,14 +1081,18 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
     DST_KV_ITEM_LEN = BYTES_PER_HEAD  # one replicated head per decode rank
     NUM_SLOTS = 4
     SRC_PTRS = [0x10000, 0x20000]  # K, V for the single local layer
+    DST_PTRS = [0x30000, 0x40000]
     REGION_LEN = NUM_SLOTS * SRC_KV_ITEM_LEN
 
-    def _make_manager(self):
+    def _make_manager(self, peer):
         mgr = object.__new__(NixlKVManager)
-        mgr.agent = DlistCaptureAgent()
+        self.agent = DlistCaptureAgent()
+        attach_nixl_transport(
+            mgr, self.agent, kv=self.SRC_PTRS, peers=(peer,), peer_kv=self.DST_PTRS
+        )
         mgr.attn_tp_size = 1  # prefill attention TP = 1 (DP attention)
-        mgr.prep_handle_slice_src = None
-        mgr.prep_handles_slice_dst = {}
+        mgr._slice_src = None
+        mgr._slice_dst = {}
         mgr.kv_args = SimpleNamespace(
             gpu_id=0,
             engine_rank=0,
@@ -1034,26 +1112,25 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
             decode_tp_size=self.DECODE_TP,
             decode_tp_rank=decode_tp_rank,
             dst_kv_item_len=self.DST_KV_ITEM_LEN,
-            dst_kv_ptrs=[0x30000, 0x40000],
+            dst_kv_ptrs=self.DST_PTRS,
             dst_num_slots=self.NUM_SLOTS,
             gpu_id=0,
         )
 
     def test_src_dlist_stays_within_registered_region_and_num_groups(self):
         # Src dlist is built once (shared across peers) on the first call.
-        mgr = self._make_manager()
+        mgr = self._make_manager("decode_0")
         mgr._init_hetero_tp_prep_handle(
             peer_name="decode_0", decode_kv_args=self._decode_args(0)
         )
 
         # num_groups must be 2 (one per unique KV head), not decode_tp//prefill_tp=4.
-        src_handle, num_groups, _num_ptr_pairs, _num_slots = mgr.prep_handle_slice_src
-        self.assertEqual(num_groups, 2)
+        self.assertEqual(mgr._slice_src.num_groups, 2)
 
         # Every source run must lie inside a registered base region
         # [ptr, ptr+REGION_LEN), gaps between its blocks included. Pre-fix,
         # num_groups=4 pushed the top group past the region -> NIXL_ERR_NOT_FOUND.
-        src_call = next(c for c in mgr.agent.calls if c[0] == "")
+        src_call = next(c for c in self.agent.calls if c[0] == "")
         src_array = src_call[1]
         regions = [(p, p + self.REGION_LEN) for p in self.SRC_PTRS]
         for addr, length, _dev, stride, count in src_array:
@@ -1070,13 +1147,11 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
         # Expected replicated-KV mapping: ranks 0,1 -> group 0; ranks 2,3 -> group 1.
         expected = {0: 0, 1: 0, 2: 1, 3: 1}
         for rank in range(self.DECODE_TP):
-            mgr = self._make_manager()
+            mgr = self._make_manager(f"decode_{rank}")
             mgr._init_hetero_tp_prep_handle(
                 peer_name=f"decode_{rank}", decode_kv_args=self._decode_args(rank)
             )
-            _dst_handle, _num_slots_dst, head_group_idx = mgr.prep_handles_slice_dst[
-                f"decode_{rank}"
-            ]
+            head_group_idx = mgr._slice_dst[f"decode_{rank}"].head_group_idx
             self.assertEqual(
                 head_group_idx,
                 expected[rank],
@@ -1093,6 +1168,9 @@ class ReloadFakeAgent:
         self.sections = {}
         self.generations = 0
         self.fail_prep_for = None
+
+    def register_memory(self, addrs, mem_type):
+        return addrs
 
     def add_remote_agent(self, metadata):
         name = metadata.decode("ascii")
@@ -1133,7 +1211,8 @@ class ReloadFakeAgent:
 class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
-        mgr.agent = ReloadFakeAgent()
+        self.agent = ReloadFakeAgent()
+        attach_nixl_transport(mgr, self.agent, kv=[0x1000, 0x2000])
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
@@ -1141,8 +1220,6 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr.pp_size = 1
         mgr.src_mem_kind = "VRAM"
         mgr._num_slots_src = 4
-        mgr.prep_handles = {}
-        mgr.prep_handles_slice_dst = {}
         mgr._prepared_state_plans = {}
         mgr._prepared_state_components = frozenset()
         mgr._state_layout_rejections = {}
@@ -1177,7 +1254,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 dst_num_slots=4,
             )
             mgr.decode_kv_args_table[name] = info
-            mgr.agent.add_remote_agent(info.agent_metadata)
+            mgr._peers[name] = mgr._import_peer(info)
             mgr._prepare_payload_xfer(info)
         return mgr
 
@@ -1186,7 +1263,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         the failed room's posted handles fail and the room is cleared."""
         peers = ["healthy", "dropped"]
         mgr = self._make_manager(peers)
-        healthy_dlist = mgr.prep_handles["healthy"]
+        healthy_layouts = dict(mgr.transport._layouts["healthy"])
         mgr.request_status = {}
         mgr.transfer_infos = {}
         mgr.req_to_decode_prefix_len = {}
@@ -1222,9 +1299,9 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         def send_aux(peer, *args):
             if peer in disconnect:
                 disconnect.discard(peer)
-                mgr.agent.remove_remote_agent(peer)
+                self.agent.remove_remote_agent(peer)
                 raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
-            return peer, mgr.agent.sections[peer]
+            return [NixlHandle(xfer=(peer, self.agent.sections[peer]))]
 
         mgr.send_aux = send_aux
         # The sender clears a room as soon as it sees it failed.
@@ -1255,34 +1332,52 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         self.assertEqual(mgr.request_status[31], KVPoll.Failed)
         self.assertIn(31, mgr.failure_records)
         self.assertEqual(mgr.request_status[32], KVPoll.Success)
-        self.assertIs(mgr.prep_handles["healthy"], healthy_dlist)
+        for name, layout in healthy_layouts.items():
+            self.assertIs(mgr.transport._layouts["healthy"][name], layout)
 
     def test_failed_rebuild_leaves_the_peer_to_a_later_reload(self):
         """A reload whose dlists cannot be rebuilt must leave the peer invalid,
         so a later failure past the interval reloads it."""
         mgr = self._make_manager(["dropped"])
-        mgr.agent.remove_remote_agent("dropped")
+        self.agent.remove_remote_agent("dropped")
         for now, prep_fails, reloaded in (
             (100.0, True, False),
             (100.5, False, False),
             (101.5, False, True),
         ):
-            mgr.agent.fail_prep_for = "dropped" if prep_fails else None
+            self.agent.fail_prep_for = "dropped" if prep_fails else None
             with patch(
                 "sglang.srt.disaggregation.nixl.conn.time.monotonic",
                 return_value=now,
             ):
                 mgr._reload_invalidated_peers(dict.fromkeys(["dropped"]))
-            self.assertEqual(mgr.agent.check_remote_metadata("dropped"), reloaded, now)
+            self.assertEqual(self.agent.check_remote_metadata("dropped"), reloaded, now)
 
-        handle = mgr.send_kvcache(
+        (handle,) = mgr.send_kvcache(
             "dropped",
             np.array([1], dtype=np.int32),
-            mgr.decode_kv_args_table["dropped"].dst_kv_ptrs,
             np.array([2], dtype=np.int32),
-            0,
         )
-        self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
+        self.assertEqual(handle.xfer, ("dropped", self.agent.sections["dropped"]))
+
+    def test_reload_hides_stale_dlists_and_keeps_them_after_a_failed_load(self):
+        """Once NIXL loads the peer again, a dlist prepared before the reload must
+        not be reachable; a failed load must keep the dlists for a later reload."""
+        mgr = self._make_manager(["dropped"])
+        self.agent.remove_remote_agent("dropped")
+        layouts = mgr.transport._layouts["dropped"]
+        reachable_while_loading = []
+
+        def add_remote_agent(metadata):
+            reachable_while_loading.append(mgr.transport._layouts.get("dropped"))
+            raise RuntimeError("NIXL_ERR_BACKEND")
+
+        self.agent.add_remote_agent = add_remote_agent
+        with self.assertRaises(RuntimeError):
+            mgr.transport.reload(mgr._peers["dropped"].remote)
+
+        self.assertEqual(reachable_while_loading, [None])
+        self.assertIs(mgr.transport._layouts.get("dropped"), layouts)
 
 
 if __name__ == "__main__":

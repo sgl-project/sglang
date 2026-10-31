@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.nixl import conn as nixl_conn
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.nixl_utils import attach_nixl_transport
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -165,13 +166,22 @@ class TestNixlAbortNotification(
         manager.transfer_source_rank = 0
         manager.src_mem_kind = "VRAM"
         manager._num_slots_src = 4
-        manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x1000], kv_item_lens=[16])
-        manager.prep_handles = {"": "src-prep"}
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000], kv_data_lens=[64], kv_item_lens=[16]
+        )
+        agent_names = [f"decode-{i}" for i in range(num_peers)]
+        self.agent = MagicMock()
+        self.agent.make_prepped_xfer.side_effect = lambda *args: object()
+        attach_nixl_transport(
+            manager, self.agent, kv=[0x1000], peers=agent_names, peer_kv=[0x2000]
+        )
+        manager._init_equal_tp_prep_handle("", manager._local_keys.kv, num_slots=4)
         manager.decode_kv_args_table = {}
         manager.transfer_infos = {ROOM: {}}
-        for i in range(num_peers):
-            agent_name = f"decode-{i}"
-            manager.prep_handles[agent_name] = f"dst-prep-{i}"
+        for agent_name in agent_names:
+            manager._init_equal_tp_prep_handle(
+                agent_name, manager._peers[agent_name].keys.kv, num_slots=4
+            )
             manager.decode_kv_args_table[agent_name] = SimpleNamespace(
                 decode_tp_size=1,
                 requires_dcp_relayout=False,
@@ -193,8 +203,6 @@ class TestNixlAbortNotification(
             )
         )
         manager._reload_invalidated_peers = MagicMock()
-        manager.agent = MagicMock()
-        manager.agent.make_prepped_xfer.side_effect = lambda *args: object()
 
     def test_rejected_post_never_acks(self):
         """NIXL raises when it rejects a post and does not wait for writes it
@@ -212,8 +220,8 @@ class TestNixlAbortNotification(
                 raise result
             return result
 
-        manager.agent.transfer.side_effect = post
-        manager.agent.check_xfer_state.return_value = "DONE"
+        self.agent.transfer.side_effect = post
+        self.agent.check_xfer_state.return_value = "DONE"
         queue = SimpleNamespace(
             get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
         )
@@ -222,7 +230,7 @@ class TestNixlAbortNotification(
             manager.transfer_worker(queue)
         self._dispatch_abort(manager)
 
-        self.assertEqual(manager.agent.transfer.call_count, 2)
+        self.assertEqual(self.agent.transfer.call_count, 2)
         manager.conclude_failure.assert_called_once()
         self.assertEqual(manager._staging_outstanding[ROOM], 0)
         self.assertEqual(manager._sent, [])

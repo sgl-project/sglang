@@ -14,6 +14,7 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -49,7 +50,13 @@ def _manager(rank, size, sources, destinations):
             ctypes.memmove(dst, src, length)
         return 0
 
-    mgr._transfer_data = copy_blocks
+    attach_mooncake_transport(
+        mgr,
+        engine_writes(copy_blocks),
+        state=mgr.kv_args.state_data_ptrs,
+        peer_state=[[x.ctypes.data for x in destinations]],
+        sessions=("cpu",),
+    )
     peer = SimpleNamespace(
         dst_state_data_ptrs=[[x.ctypes.data for x in destinations]],
         dst_state_item_lens=[
