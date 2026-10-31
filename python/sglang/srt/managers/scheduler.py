@@ -377,6 +377,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
 )
+from sglang.srt.weight_sync.weightbridge_receiver import WeightBridgeReceiver
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -688,6 +689,7 @@ class Scheduler(
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
+        self.maybe_init_weightbridge_receiver()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -2120,6 +2122,9 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        # Before any receive: PP stages > 0 block below on the previous stage's requests, so every
+        # rank must reach WeightBridge's per-pass hub barrier first.
+        self.maybe_apply_weightbridge_update()
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
@@ -2310,6 +2315,25 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
+        )
+
+    def maybe_init_weightbridge_receiver(self) -> None:
+        """Build this rank's WeightBridge receiver (and rank 0's coordinator) when enabled."""
+        self.weightbridge_receiver = None
+        if not get_exec().features.enable_weightbridge_receiver:
+            return
+        parallel = get_parallel()
+        self.weightbridge_receiver = WeightBridgeReceiver(
+            model=self.tp_worker.model_runner.model,
+            hf_checkpoint=get_model().model_path,
+            engine_port=get_serving().port,
+            rank=parallel.pp_rank * parallel.tp_size + parallel.tp_rank,
+            num_workers=parallel.pp_size * parallel.tp_size,
+            hub_addr=(
+                get_exec().features.weightbridge_hub_addr
+                if self.server_args.nnodes > 1
+                else None
+            ),
         )
 
     def init_lora_drainer(self) -> None:
@@ -5437,6 +5461,41 @@ class Scheduler(
 
         barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
+
+    def maybe_apply_weightbridge_update(self) -> None:
+        """Poll WeightBridge on every loop pass; apply an update under the pause-session semantics.
+
+        The session matches an HTTP-driven update: pause (drain + clear requests), write weights,
+        flush the cache, bump the weight version, resume. Every TP and PP rank calls this once per
+        loop pass, before receiving that pass's requests; WeightBridge's hub makes each call a barrier
+        across the engine, so all ranks act on rank 0's decision at the same pass.
+        """
+        if self.weightbridge_receiver is None:
+            return
+        was_paused = self._engine_paused
+        new_version = self.weightbridge_receiver.poll(
+            quiesce=self._quiesce_for_weightbridge_update
+        )
+        if new_version is None:
+            return
+        if not self.flush_cache():
+            raise RuntimeError("WeightBridge update left requests holding stale KV")
+        self.record_weight_version_change(new_version=new_version)
+        self._engine_paused = was_paused
+        self.weightbridge_receiver.flush_profile_outputs()
+
+    def _quiesce_for_weightbridge_update(self) -> None:
+        if get_parallel().pp_size > 1:
+            # Retire the micro-batches in flight across stages, then requeue their requests.
+            self._engine_paused = True
+            self.pp_retract_all_for_weight_update(mb_id=self._pp_cur_mb_id)
+        else:
+            # Retract drains the overlap batch still on the GPU and frees every running request's KV.
+            self.pause_generation(PauseGenerationReqInput(mode="retract"))
+        if get_exec().features.weightbridge_pause_mode == "abort":
+            self.abort_request(AbortReq(abort_all=True))
+        # No kernel launched under the old weights may still be reading them.
+        torch.get_device_module(self.tp_worker.model_runner.device).synchronize()
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
