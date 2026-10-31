@@ -24,6 +24,13 @@ def _qwen3_next_ignored_layers(layer_idx: int, name: str) -> list:
 
 
 class TestIsLayerSkipped(CustomTestCase):
+    def test_wildcard_matching_is_opt_in(self):
+        self.assertFalse(
+            is_layer_skipped(
+                "model.layers.3.self_attn.o_proj", ["model.layers.*.self_attn.*"]
+            )
+        )
+
     def test_qwen3_next_in_proj_ba_is_skipped(self):
         # Regression for #23467: in_proj_ba is a unified tensor in the FP8
         # checkpoint. modules_to_not_convert lists it explicitly, so it must

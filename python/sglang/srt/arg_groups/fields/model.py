@@ -194,6 +194,30 @@ class Model(msgspec.Struct):
             type_parser=nullable_str,
         ),
     ] = None
+    nvfp4_ckpt_fp8_dense_modules: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "For ModelOpt NVFP4 checkpoints (modelopt_fp4 / modelopt_mixed) on "
+                "NVIDIA GPUs: which of the linear layers the checkpoint leaves in BF16 "
+                "to quantize to block-FP8 (E4M3, 128x128 block scales, dynamic "
+                "per-token-group activations) while loading. Entries are checkpoint "
+                "module names or dotted paths, matched on module-path boundaries like "
+                "quantization exclusion lists: o_proj selects every o_proj, "
+                "mlp.down_proj selects dense-MLP down_proj but not "
+                "shared_experts.down_proj. ModelOpt exclusion-style * patterns are "
+                "also accepted (e.g. model.layers.*.self_attn.o_proj); quote patterns "
+                "in the shell. A layer SGLang fuses (e.g. gate_up_proj) "
+                "needs all of its checkpoint parts matched (gate_proj up_proj, not "
+                "gate_up_proj). Unmatched selectors produce a rank-local warning. "
+                "This option does not convert lm_head or speculative draft (MTP / "
+                "NextN) layers; independent draft quantization settings still apply. "
+                "Setting it disables online weight updates on every stage, including "
+                "stages with no matches. Unset: off."
+            ),
+            nargs="+",
+        ),
+    ] = None
     kv_cache_dtype: A[
         str,
         Arg(

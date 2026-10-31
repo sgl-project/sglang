@@ -314,20 +314,15 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        from sglang.srt.model_executor.model_runner_components.weight_updater import (
-            _unsupported_derived_weight_cache_error,
-        )
-
         runners = self._select_runners(recv_req.selector)
         # Restoring packed weights already mutates storage. Check every runner
         # before touching any of them, including sessions used by P2P/RDMA
         # writers which bypass update_weights_from_tensor/distributed.
-        for _, runner in runners:
-            error = _unsupported_derived_weight_cache_error(
-                runner.weight_updater.get_model()
-            )
-            if error is not None:
-                return BeginWeightUpdateReqOutput(success=False, message=error)
+        try:
+            for _, runner in runners:
+                runner.weight_updater.validate_weight_update()
+        except ValueError as e:
+            return BeginWeightUpdateReqOutput(success=False, message=str(e))
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
@@ -341,8 +336,14 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="no weight-update session is open; call begin_weight_update() first",
             )
+        runners = self._select_runners(self._session.selector)
+        try:
+            for _, runner in runners:
+                runner.weight_updater.validate_weight_update()
+        except ValueError as e:
+            return EndWeightUpdateReqOutput(success=False, message=str(e))
         run_post_load = not self._session.loaded_weights
-        for _, runner in self._select_runners(self._session.selector):
+        for _, runner in runners:
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)

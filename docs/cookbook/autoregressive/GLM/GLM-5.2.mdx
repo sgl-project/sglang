@@ -266,6 +266,39 @@ python -m sglang.launch_server \
 - **Memory.** The FP8 weights are large (MoE total, not active params). Start around `--mem-fraction-static 0.8` on H200 (TP8) and tune up; raise it for the 4-GPU GB300 single-node layout (TP4).
 - **DP-Attention + DeepEP** for the balanced/high-throughput strategies spreads attention across data-parallel ranks and routes MoE through DeepEP.
 - **BF16 weights need more GPUs.** The full-precision build (`zai-org/GLM-5.2`, ~1.5 TB) does not fit a single 8×H200 / 8×B200 / 4×GB300 node. It fits single-node on **8×B300** (TP8, ~2.1 TB HBM) — **verified**; on the smaller GPUs it needs a **multi-node** layout (e.g. 2×8×H200 or 2×8×B200 at TP16, 2×4×GB300 at TP8), and those **multi-node BF16 recipes are still proposed/inferred** (`verified: false`). FP8 is the recommended deployment. Use the same DSA / MTP / chunked-prefill guidance as FP8. On B300, BF16 low-latency matches FP8 (the sm103 FP8 path is not yet optimized), but FP8 wins at the balanced/high-throughput points.
+- **NVFP4: optional FP8 dense layers.** `nvidia/GLM-5.2-NVFP4` keeps dense projections in BF16. `--nvfp4-ckpt-fp8-dense-modules q_a_proj kv_a_proj_with_mqa q_b_proj o_proj wq_b gate_proj up_proj down_proj` selects them for block-FP8 conversion while loading, without a separate checkpoint. See the [quantization guide](../../../docs/advanced_features/quantization) for module selection, draft-model behavior, unsupported online updates, and the low-concurrency decode trade-off. Measure quality and latency for your workload; this is opt-in and does not change the Deploy panel recipes.
+
+  Example, 8×B300: the NVIDIA model-card TP8 command plus the option.
+
+  ```bash Command
+  python3 -m sglang.launch_server \
+    --model-path nvidia/GLM-5.2-NVFP4 \
+    --tensor-parallel-size 8 \
+    --quantization modelopt_fp4 \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --trust-remote-code \
+    --chunked-prefill-size 16384 \
+    --mem-fraction-static 0.80 \
+    --nvfp4-ckpt-fp8-dense-modules q_a_proj kv_a_proj_with_mqa q_b_proj o_proj wq_b gate_proj up_proj down_proj
+  ```
+
+  The option only touches linears the checkpoint leaves in BF16, i.e. modules matched by `exclude_modules` in `hf_quant_config.json`. For `nvidia/GLM-5.2-NVFP4` (78 decoder layers: 3 dense, 75 MoE, plus the MTP layer 78), this selection does the following to each excluded group. "FP8" is E4M3 with 128x128 block scales, quantized while loading.
+
+  | Checkpoint `exclude_modules` entry (BF16 in the checkpoint) | Converted to FP8 | Stays BF16 |
+  | --- | --- | --- |
+  | `model.layers.0*`, `model.layers.1.*`, `model.layers.2.*` (dense layers) | `fused_qkv_a_proj_with_mqa`, `q_b_proj`, `o_proj`, `indexer.wq_b`\*, `mlp.gate_up_proj`, `mlp.down_proj` | `kv_b_proj`, `indexer.wk_weights_proj`\* |
+  | `model.layers.{3..77}.self_attn*` (75 entries) | `fused_qkv_a_proj_with_mqa`, `q_b_proj`, `o_proj`, `indexer.wq_b`\* | `kv_b_proj`, `indexer.wk_weights_proj`\* |
+  | `model.layers.{3..77}.mlp.shared_experts*` (75 entries) | `gate_up_proj`, `down_proj` | none |
+  | `model.layers.78*` (MTP / NextN draft layer) | none | all of it: draft layers are never converted |
+  | `lm_head` | none | `lm_head`: never converted |
+  | `model.embed_tokens` | none | embedding (not a linear layer) |
+  | Not excluded: routed experts in layers 3-77 | none | already NVFP4, unchanged |
+
+  \* Only the 21 layers with their own DSA indexer. `fused_qkv_a_proj_with_mqa` is SGLang's fusion of `q_a_proj` + `kv_a_proj_with_mqa`, `gate_up_proj` of `gate_proj` + `up_proj`, and `wk_weights_proj` of `wk` + `weights_proj`. In total, 411 linear modules are converted and each rank logs `selected 411 linear modules`.
+
+  Under prefill/decode disaggregation, add the same option to both the prefill and decode workers. To keep the BF16 min-latency GEMM for small decode batches, leave `q_a_proj kv_a_proj_with_mqa q_b_proj` out of the decode workers' list.
+
 - **PD Disaggregation (prefill/decode).** GLM-5.2 is a DSA model and runs under prefill/decode disaggregation — toggle the **PD Disagg** card in the [Playground above](#playground) (pick a Prefill/Decode role + transfer backend, then front the roles with `sglang_router.launch_router --pd-disaggregation`). The Mooncake backend **auto-detects the InfiniBand HCA**, so no device flag is needed by default; only add `--disaggregation-ib-device mlx5_0` (your NIC) if auto-detection picks the wrong device or KV transfer fails to connect. On H200 Docker, expose the IB HCAs to the container (`--privileged --ulimit memlock=-1`, or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) — without IB exposure Mooncake silently falls back to TCP.
 - **Chunked-prefill size is regime-dependent.** At long input (8K+) the default `--chunked-prefill-size 2048` is too small and leaves the balanced point prefill-bound (queueing dominates TTFT). Raising it to `--chunked-prefill-size 32768` on the balanced recipe gave roughly **+34–78% output throughput and −39–59% TTFT** on 8×H200 and 8×B200 (8K-in / 1K-out) in our testing. It is **neutral for high-throughput** (decode-bound there) — keep the default. `--max-running-requests` tracks KV capacity, not a tuning free-for-all: ~60–90 concurrent 8K+1K FP8 requests fit on a single 8-GPU node, so pin balanced near `--max-running-requests 80` and let high-throughput run wider.
 
