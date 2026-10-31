@@ -1054,7 +1054,12 @@ class TestRustServerExtension(CustomTestCase):
             # Affinity is per thread: launch on a thread of its own, as the
             # scheduler's launch thread, so the test runner keeps its mask.
             scheduler = SimpleNamespace(
-                model_config=SimpleNamespace(is_multimodal=True)
+                processor=sentinel.processor,
+                model_config=SimpleNamespace(
+                    is_multimodal=True,
+                    hf_config=sentinel.config,
+                    model_path="test/model",
+                ),
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)
