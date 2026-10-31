@@ -1519,7 +1519,6 @@ def run_dsa_mtp_seed_handoff_case(
                 q_lora=fixture.input_hidden,
                 positions=batch.positions,
                 forward_batch=batch,
-                layer_id=0,
             )
         else:
             state = IndexTopKShareState.from_mtp_carry(batch)

@@ -200,7 +200,6 @@ def _capture(
                 q_lora=None,
                 positions=None,
                 forward_batch=batch,
-                layer_id=0,
             )
             assert indexer.call_args.kwargs["return_indices"]
         else:
