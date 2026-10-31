@@ -1278,22 +1278,19 @@ class ServerArgs(DisaggServerArgsMixin):
                         for role, backend in sorted(text_encoder_roles.items())
                     ),
                 )
-        from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
-            MiniMaxH3PipelineConfig,
-        )
-
         if (
             self.backend != Backend.DIFFUSERS
-            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and current_platform.is_npu()
+            and self.attention_backend is not None
+            and AttentionBackendEnum[self.attention_backend.upper()].is_sparse
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
-            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            # Keep NPU-specific DiT backends out of text encoders by default.
             logger.info(
-                "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
+                "Automatically set torch_sdpa backend for component text_encoder; "
+                "%s applies to the transformer",
+                self.attention_backend,
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 

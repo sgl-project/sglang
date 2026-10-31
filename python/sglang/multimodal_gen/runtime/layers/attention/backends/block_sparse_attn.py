@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-import attentions  # noqa: F401
+import sgl_kernel_npu  # noqa: F401
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -153,7 +153,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         sparsity: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.sparse_block_estimate(
+        return torch.ops.npu.sparse_block_estimate(
             query=query,
             key=key,
             actual_seq_lengths=None,
@@ -179,7 +179,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         smask: torch.Tensor,
         sct: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.attentions.ada_block_sparse_attention(
+        return torch.ops.npu.ada_block_sparse_attention(
             query=query,
             key=key,
             value=value,
