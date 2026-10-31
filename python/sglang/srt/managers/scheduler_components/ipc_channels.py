@@ -1,8 +1,12 @@
+import ipaddress
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
+from urllib.parse import urlsplit
 
 import zmq
 
+from sglang.srt.managers.delivery_clock import read_clock_domain
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.server_args import PortArgs
 from sglang.srt.utils.network import get_zmq_socket
@@ -11,6 +15,26 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _has_local_clock_domain(endpoint: str) -> bool:
+    """Conservatively identify endpoints that cannot route to another host."""
+    if endpoint.startswith(("ipc://", "inproc://")):
+        return True
+    # In libzmq's source;destination syntax, URL parsing sees the source.
+    if ";" in endpoint:
+        return False
+    try:
+        parsed = urlsplit(endpoint)
+        return (
+            parsed.scheme == "tcp" and ipaddress.ip_address(parsed.hostname).is_loopback
+        )
+    except ValueError:
+        # Names and nonstandard endpoints do not establish a shared clock.
+        return False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -30,6 +54,7 @@ class SchedulerIpcChannels:
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
+        detokenizer_router_metrics_enabled: bool = False,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
@@ -65,7 +90,30 @@ class SchedulerIpcChannels:
                 )
 
             send_to_tokenizer = SenderWrapper(send_to_tokenizer_raw)
-            send_to_detokenizer = SenderWrapper(send_to_detokenizer_raw)
+            timestamped = detokenizer_router_metrics_enabled and not skip_tokenizer_init
+            clock_domain = None
+            if timestamped:
+                endpoint = port_args.detokenizer_ipc_name
+                local_candidate = (
+                    getattr(port_args, "detokenizer_router_local_endpoint", None)
+                    == endpoint
+                    and endpoint.startswith("tcp://")
+                    and ";" not in endpoint
+                )
+                if _has_local_clock_domain(endpoint) or local_candidate:
+                    clock_domain = read_clock_domain()
+                if clock_domain is None:
+                    logger.warning(
+                        "Scheduler-to-detokenizer-router delivery latency is not "
+                        "recorded for endpoint %s: monotonic clock domain is unknown.",
+                        endpoint,
+                    )
+                    timestamped = False
+            send_to_detokenizer = SenderWrapper(
+                send_to_detokenizer_raw,
+                timestamped=timestamped,
+                clock_domain=clock_domain,
+            )
         else:
             recv_from_tokenizer = None
             recv_from_rpc = None
