@@ -1013,7 +1013,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         _log_qwen38_prefill_prologue_once(eligible=eligible, reason=reason)
         if not eligible:
             return None
-        return qwen38_gdn_prefill_prologue(*prologue_args)
+        # q and k leave the producer L2-normalized: the chunk scan skips its own norm.
+        return qwen38_gdn_prefill_prologue(*prologue_args, normalize_qk=True)
 
     def forward_extend(
         self,
@@ -1286,6 +1287,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
                 output=kwargs.get("linear_attn_output"),
+                qk_normalized=prologue is not None,
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
                 track_state=h_track_buf,

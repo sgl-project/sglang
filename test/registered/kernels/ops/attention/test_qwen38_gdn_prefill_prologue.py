@@ -375,6 +375,56 @@ class TestQwen38GDNPrefillPrologue(unittest.TestCase):
                         has_initial_state=has_initial_state,
                     )
 
+    def test_normalize_qk_matches_l2norm(self):
+        """With normalize_qk, q and k come out as l2norm_fwd of the raw
+        producer output to within one BF16 ulp (the norm is taken in the
+        producer's registers instead of a second kernel); v, g, beta and the
+        conv state do not change."""
+        tile = QWEN38_GDN_PROLOGUE_TILE_M
+        for lengths in ([64], [13, 17, 19, 23], [tile + 1, 2], [4096 + 7]):
+            for has_initial_state in (False, True):
+                with self.subTest(
+                    lengths=lengths,
+                    has_initial_state=has_initial_state,
+                ):
+                    inputs = _make_inputs(lengths, has_initial_state=has_initial_state)
+                    raw_state = inputs["conv_state"].clone()
+                    normed_state = inputs["conv_state"].clone()
+
+                    def run(state, **kwargs):
+                        return qwen38_gdn_prefill_prologue(
+                            inputs["x"],
+                            inputs["weight"],
+                            inputs["bias"],
+                            state,
+                            inputs["query_start_loc"],
+                            inputs["seq_lens_cpu"],
+                            inputs["cache_indices"],
+                            inputs["has_initial_state"],
+                            inputs["A_log"],
+                            inputs["a"],
+                            inputs["b"],
+                            inputs["dt_bias"],
+                            **kwargs,
+                        )
+
+                    raw = run(raw_state)
+                    normed = run(normed_state, normalize_qk=True)
+                    for name, candidate, raw_qk in zip("qk", normed, raw):
+                        reference = l2norm_fwd(raw_qk)
+                        self.assertEqual(candidate.shape, reference.shape, name)
+                        ulps = (
+                            candidate.view(torch.int16).int()
+                            - reference.view(torch.int16).int()
+                        ).abs()
+                        self.assertLessEqual(int(ulps.max()), 1, name)
+                        self.assertLess(float((ulps > 0).float().mean()), 1e-3, name)
+                    for name, candidate, reference in zip(
+                        ("v", "g", "beta"), normed[2:], raw[2:]
+                    ):
+                        self._assert_exact(name, candidate, reference)
+                    self._assert_exact("conv_state", normed_state, raw_state)
+
     def test_signed_zero_and_softplus_threshold_exact(self):
         inputs = _make_inputs([8], has_initial_state=False)
         inputs["A_log"].zero_()

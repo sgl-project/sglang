@@ -712,8 +712,8 @@ QWEN38_GDN_QKV_DIM = (
 QWEN38_GDN_PROLOGUE_WIDE_MIN_TOKENS = 2048
 QWEN38_GDN_PROLOGUE_WIDE_BLOCK_M = 16
 # _qwen38_gdn_prologue_kernel tile: TILE_M tokens x 256 channels (two 128-wide
-# heads, so a program's channels are all q, all k or all v, and the value-head
-# gates stay inside the program).
+# heads, so a program's channels are all q, all k or all v, and the q/k L2 norm
+# and the value-head gates stay inside the program).
 QWEN38_GDN_PROLOGUE_TILE_M = 32
 QWEN38_GDN_PROLOGUE_TILE_WARPS = 4
 QWEN38_GDN_PROLOGUE_TILE_MIN_TOKENS = 0
@@ -875,6 +875,8 @@ def _qwen38_gdn_prologue_kernel(
     NUM_QK_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    NORMALIZE_QK: tl.constexpr,
+    L2NORM_EPS: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -884,7 +886,8 @@ def _qwen38_gdn_prologue_kernel(
 
     The per-element math is _causal_conv1d_fwd_kernel's FUSE_QWEN38_GDN_PREP
     path (same tap order and BF16 products, same rounding point), so q, k, v,
-    g, beta and the conv state are bit-identical to it.
+    g, beta and the conv state are bit-identical to it. With NORMALIZE_QK, q
+    and k leave L2-normalized per head as l2norm_fwd would normalize them.
     """
     tl.static_assert(KERNEL_WIDTH == 4)
     STATE_LEN: tl.constexpr = KERNEL_WIDTH - 1
@@ -953,6 +956,13 @@ def _qwen38_gdn_prologue_kernel(
 
     out_mask = in_seq[:, None]
     if feat0 < 2 * QK_DIM:
+        if NORMALIZE_QK:
+            heads = tl.reshape(
+                y.to(tl.float32), (BLOCK_M, BLOCK_N // HEAD_DIM, HEAD_DIM)
+            )
+            var = tl.sum(heads * heads, axis=2)
+            heads = heads / tl.sqrt(var + L2NORM_EPS)[:, :, None]
+            y = tl.reshape(heads, (BLOCK_M, BLOCK_N)).to(x_ptr.dtype.element_ty)
         if feat0 < QK_DIM:
             out = q_ptr + tile_start * QK_DIM + feat0
         else:
@@ -1026,8 +1036,10 @@ def qwen38_gdn_prefill_prologue(
     b: torch.Tensor,
     dt_bias: torch.Tensor,
     activation: Optional[str] = "silu",
+    normalize_qk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse Conv1D, raw QKV layout emission, and raw gate preparation."""
+    """Fuse Conv1D, QKV layout emission, and raw gate preparation. With
+    normalize_qk, q and k come out L2-normalized per head (l2norm_fwd's eps)."""
     eligible, reason = can_use_qwen38_gdn_prefill_prologue(
         x,
         weight,
@@ -1068,7 +1080,7 @@ def qwen38_gdn_prefill_prologue(
     num_cache_lines = conv_states.shape[0]
     state_len = weight.shape[1] - 1
     np2_statelen = triton.next_power_of_2(state_len)
-    if num_tokens >= QWEN38_GDN_PROLOGUE_TILE_MIN_TOKENS:
+    if normalize_qk or num_tokens >= QWEN38_GDN_PROLOGUE_TILE_MIN_TOKENS:
         tile_n = 2 * QWEN38_GDN_HEAD_DIM
         grid = (
             len(seq_lens_cpu),
@@ -1105,6 +1117,8 @@ def qwen38_gdn_prefill_prologue(
             NUM_QK_HEADS=QWEN38_GDN_NUM_QK_HEADS,
             NUM_V_HEADS=QWEN38_GDN_NUM_V_HEADS,
             HEAD_DIM=QWEN38_GDN_HEAD_DIM,
+            NORMALIZE_QK=normalize_qk,
+            L2NORM_EPS=1e-6,
             SOFTPLUS_THRESHOLD=20.0,
             BLOCK_M=QWEN38_GDN_PROLOGUE_TILE_M,
             BLOCK_N=tile_n,
