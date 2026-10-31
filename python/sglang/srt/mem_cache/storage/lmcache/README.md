@@ -118,11 +118,12 @@ recomputation run, use `--expected-storage-hit 0` against a server that bypasses
 external loading, keeping the model and other serving settings fixed.
 
 On the validated stack, two runs per transport with the workload above gave
-85.61 output tokens/s for inline transfers and 592.27 output tokens/s for SHM,
-aggregated over measured wave durations. Median TTFT was 5229.15 ms and
-128.54 ms respectively. All 512 measured requests returned identical tokens
+83.82 output tokens/s for inline transfers and 610.47 output tokens/s for SHM,
+aggregated over measured wave durations. Median TTFT was 5369.17 ms and
+130.56 ms respectively. All 512 measured requests returned identical tokens
 across transports, with 3072 external hit tokens and zero device hits each.
 Both paths used the same non-lazy 16 GiB L1 pool, ordered inline/SHM/SHM/inline.
+Measurements used revision `a5b77ce1`, with stores ordered after the producer.
 These results compare engine-driven transports on this workload; they do not
 establish gains over IPC transfers or another serving engine.
 
