@@ -33,7 +33,8 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
     apt-get install -y \
         libze1 intel-metrics-discovery clinfo intel-gsc \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
-        libze-dev && \
+        libze-dev \
+        ffmpeg && \
     cd /tmp && \
     igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
     cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \

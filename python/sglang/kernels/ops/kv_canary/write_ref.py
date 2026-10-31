@@ -3,15 +3,17 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.consts import (
+    canary_chain_extend_hash,
+    to_signed_int64,
+)
 from sglang.kernels.ops.kv_canary.verify import (
     VerifyOrWriteContext,
 )
 from sglang.kernels.ops.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
-    _to_signed_int64,
     compute_slot_hash,
     materialize_real_kv_sources,
-    splitmix64_mix3,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan
 
@@ -162,7 +164,7 @@ def launch_canary_write_kernel_torch_reference(
                     row[consts.VIOLATION_FIELD_POSITION] = position
                     row[consts.VIOLATION_FIELD_STORED_TOKEN] = token
                     row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = expected_token
-                    row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
+                    row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = to_signed_int64(
                         running_prev_hash
                     )
                     row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position
@@ -178,7 +180,7 @@ def launch_canary_write_kernel_torch_reference(
                     row[consts.VIOLATION_FIELD_POSITION] = position
                     row[consts.VIOLATION_FIELD_STORED_TOKEN] = token
                     row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = token
-                    row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
+                    row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = to_signed_int64(
                         running_prev_hash
                     )
                     row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position_chain
@@ -190,14 +192,16 @@ def launch_canary_write_kernel_torch_reference(
 
             buf_i64[slot, consts.CANARY_FIELD_TOKEN] = token
             buf_i64[slot, consts.CANARY_FIELD_POSITION] = position
-            buf_i64[slot, consts.CANARY_FIELD_PREV_HASH] = _to_signed_int64(
+            buf_i64[slot, consts.CANARY_FIELD_PREV_HASH] = to_signed_int64(
                 running_prev_hash
             )
-            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = _to_signed_int64(
+            buf_i64[slot, consts.CANARY_FIELD_REAL_KV_HASH] = to_signed_int64(
                 real_kv_hash_u64
             )
 
-            running_prev_hash = splitmix64_mix3(running_prev_hash, token, position)
+            running_prev_hash = canary_chain_extend_hash(
+                running_prev_hash, token, position
+            )
 
             total_slots_written += 1
 
