@@ -1,4 +1,4 @@
-"""Rollout HTTP API (``POST /rollout/generate``)."""
+"""Rollout HTTP API (``POST /rollout/generate``, ``POST /rollout/abort``)."""
 
 from __future__ import annotations
 
@@ -9,8 +9,13 @@ import torch
 from fastapi import APIRouter, HTTPException, Response
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ABORTED_ERROR,
+    AbortReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    RolloutAbortRequest,
     RolloutRequest,
     RolloutResponse,
 )
@@ -317,7 +322,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     },
 )
 async def rollout_generate(request: RolloutRequest):
-    request_id = generate_request_id()
+    request_id = request.request_id or generate_request_id()
     server_args = get_global_server_args()
     sampling_kwargs = _build_sampling_kwargs(request)
     try:
@@ -338,6 +343,9 @@ async def rollout_generate(request: RolloutRequest):
         raise HTTPException(
             status_code=500, detail=f"Generation failed: {exc}"
         ) from exc
+    if output_batch.error == ABORTED_ERROR:
+        # 499: the client cancelled the request, not a server failure
+        raise HTTPException(status_code=499, detail=output_batch.error)
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
     rollout_responses = _build_response(
@@ -348,3 +356,16 @@ async def rollout_generate(request: RolloutRequest):
         content=msgspec.msgpack.encode(payload),
         media_type="application/msgpack",
     )
+
+
+@router.post("/abort")
+async def rollout_abort(request: RolloutAbortRequest):
+    """Abort queued rollout requests; a request already denoising runs to completion."""
+    if not request.abort_all and not request.request_ids:
+        raise HTTPException(status_code=400, detail="Pass request_ids or set abort_all")
+    output_batch: OutputBatch = await async_scheduler_client.forward(
+        AbortReq(request_ids=request.request_ids, abort_all=request.abort_all)
+    )
+    if output_batch.error:
+        raise HTTPException(status_code=500, detail=output_batch.error)
+    return output_batch.output
