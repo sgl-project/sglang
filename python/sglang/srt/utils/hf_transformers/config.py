@@ -278,6 +278,21 @@ class HfModelConfigParser(ModelConfigParserBase):
             _apply_deepseek_ocr_overrides(config, model)
         elif isinstance(config, DeepseekV41Config):
             config._name_or_path = model
+        elif config.model_type in ("lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni"):
+            from sglang.srt.configs import (
+                Lfm3AudioConfig,
+                Lfm3Config,
+                Lfm3OmniConfig,
+                Lfm3VlConfig,
+            )
+
+            config_class = {
+                "lfm3": Lfm3Config,
+                "lfm3_vl": Lfm3VlConfig,
+                "lfm3_audio": Lfm3AudioConfig,
+                "lfm3_omni": Lfm3OmniConfig,
+            }[config.model_type]
+            config = config_class.from_hf_config(config)
         elif config.model_type in _CONFIG_REGISTRY:
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:

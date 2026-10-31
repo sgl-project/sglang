@@ -67,6 +67,20 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
         )
         return force, config, parser
 
+    def test_lfm3_template_ignores_legacy_lfm2_vocab(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            "<think><tool_call><function=get_weather><parameter=city>Warsaw"
+            "</parameter></function></tool_call>"
+        )
+        vocab = ["<|tool_call_start|>", "<|tool_call_end|>", "<tool_call>"]
+        force, config, parser = self._detect(template, vocab)
+        self.assertEqual(parser, "qwen3")
+        self.assertEqual(
+            detect_tool_call_parser(template, _DummyTokenizer(vocab), config, force),
+            "qwen3_coder",
+        )
+
     def test_iquest_template_wins_over_generic_think_and_xml_rules(self):
         template = "<|iquest_assistant|><think><iquest_tool_call><arg_key><arg_value>"
         force, config, parser = self._detect(template, [])
