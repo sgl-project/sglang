@@ -278,6 +278,14 @@ def _validate_minimax_m3_request(request: ChatCompletionRequest) -> str | None:
                 "thinking.type must be 'adaptive', 'enabled' or 'disabled', "
                 f"got {thinking_type!r}."
             )
+    effort = request.reasoning_effort
+    if effort is None:
+        effort = (request.chat_template_kwargs or {}).get("reasoning_effort")
+    if effort is not None and effort not in _M3_REASONING_EFFORTS:
+        return (
+            f"reasoning_effort must be one of {', '.join(_M3_REASONING_EFFORTS)}, "
+            f"got {effort!r}."
+        )
     root_positions = [
         position
         for position, message in enumerate(request.messages)
@@ -338,8 +346,6 @@ def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     )
     if request.thinking is not None:
         template_kwargs.setdefault("thinking_mode", request.thinking["type"])
-    if effort in ("none", "minimal"):
-        template_kwargs.setdefault("thinking_mode", "disabled")
     if template_kwargs.get("thinking_mode") == "disabled":
         # An effort means nothing once thinking is off.
         effort = None

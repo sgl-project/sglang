@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused-layer LoRA groups: stack-vs-compose decision, loader wiring, IPC resolution."""
 
+import os
+import tempfile
 from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +10,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
@@ -287,6 +290,9 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
+    pipeline.loaded_adapter_files = {}
+    pipeline.loaded_adapter_configs = {}
+    pipeline.loaded_adapter_fingerprints = {}
     pipeline.loaded_adapter_alphas = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}
@@ -309,12 +315,18 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
 
 def _load_adapter(pipeline, state_dict, lora_alpha=None):
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
-    with (
-        patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
-        patch(f"{loader_mod}.load_file", return_value=state_dict),
-        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
-    ):
-        pipeline.load_lora_adapter("/adapter", "adapter", rank=0, lora_alpha=lora_alpha)
+    # The loader stats the adapter file, so it must exist on disk.
+    with tempfile.TemporaryDirectory() as tmp:
+        adapter_file = os.path.join(tmp, "adapter.safetensors")
+        save_file({"placeholder": torch.zeros(1)}, adapter_file)
+        with (
+            patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+            patch(f"{loader_mod}.load_file", return_value=state_dict),
+            patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        ):
+            pipeline.load_lora_adapter(
+                "/adapter", "adapter", rank=0, lora_alpha=lora_alpha
+            )
 
 
 def _qkv_state_dict(rank=2):

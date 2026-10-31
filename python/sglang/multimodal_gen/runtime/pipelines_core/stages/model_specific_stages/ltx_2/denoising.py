@@ -1496,7 +1496,9 @@ class LTX2DenoisingStage(DenoisingStage):
             step.current_model, ctx.use_ltx23_hq_timestep_semantics
         ):
             with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                current_timestep=step.step_index,
+                attn_metadata=step.attn_metadata,
+                quality=self._mounted_quality or "exact",
             ):
                 yield
 
