@@ -95,16 +95,32 @@ def _estimate_hicache_bytes(
 
 
 @contextmanager
+def _explicit_size_budget():
+    """Book explicitly sized host pools against a snapshot taken before any rank
+    allocates; re-sampling per pool charges a late rank for its peers' pools."""
+    budget = host_memory_budget_bytes()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+    with host_memory_budget_scope(budget):
+        yield
+
+
+@contextmanager
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
     """Reduce the default HiCache ratio until this machine's host pools fit.
 
-    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
+    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size;
+    those pools keep their size but still book one host memory snapshot.
     """
-    fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
+        return
+    fraction = get_memory().hicache_host_memory_fraction
+    if fraction is None:
+        with _explicit_size_budget():
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)

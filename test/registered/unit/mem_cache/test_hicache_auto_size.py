@@ -11,6 +11,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import (
+    ALLOC_MEMORY_FUNCS,
+    DeepSeekV4PagedHostPool,
+    DeepSeekV4StateHostPool,
+)
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -210,6 +215,126 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertIsNone(
             resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
         )
+
+    def test_explicit_size_books_a_snapshot_taken_before_peers_allocate(self):
+        """An explicit --hicache-size is checked against host memory sampled
+        before any rank allocates, not after its peers pinned their pools."""
+        pool = MHATokenToKVPool(
+            size=128,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        # 1e-5 GB is 79 pages of 2 tokens at 64 bytes per token on every rank.
+        pool_bytes = 79 * 2 * 64
+        rank_budget = 12_000
+        host_free = {"bytes": base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4 * rank_budget}
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=4),
+            patch.object(
+                base,
+                "available_host_memory_bytes",
+                side_effect=lambda **_: host_free["bytes"],
+            ),
+            sizing.auto_size_hicache(None, None, enabled=True),
+        ):
+            # Three peers on this host pin their pools before this rank builds its own.
+            host_free["bytes"] -= 3 * pool_bytes
+            host = MHATokenToKVPoolHost(
+                pool.get_device_pool_infos()[0].buffer_info,
+                2.0,
+                1e-5,
+                2,
+                "layer_first",
+                pin_memory=False,
+                device="cpu",
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                write_back_staging=pool.hicache_write_back_staging,
+            )
+            self.assertEqual(host.size * host.size_per_token, pool_bytes)
+            self.assertEqual(base.host_memory_budget_bytes(), rank_budget - pool_bytes)
+        self.assertIsNone(base._host_memory_budget.get())
+
+    def test_explicit_size_samples_host_memory_before_the_rank_barrier(self):
+        calls = Mock()
+        calls.free.return_value = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(base, "available_host_memory_bytes", calls.free),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(torch.distributed, "barrier", calls.barrier),
+            patch.object(
+                sizing,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    world_group=SimpleNamespace(cpu_group="cpu")
+                ),
+            ),
+            sizing.auto_size_hicache(None, None, enabled=True),
+        ):
+            self.assertEqual(base.host_memory_budget_bytes(), 1000)
+        names = [name for name, _, _ in calls.mock_calls]
+        self.assertEqual(names[:2], ["free", "barrier"])
+        calls.barrier.assert_called_once_with(group="cpu")
+
+    def test_deepseek_v4_host_pools_book_the_snapshot(self):
+        alloc = Mock(return_value=torch.empty(1, dtype=torch.uint8))
+        state_pools = [
+            SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.empty((4, 3), dtype=torch.uint8)
+                ),
+            )
+            for _ in range(2)
+        ]
+        with (
+            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
+            base.host_memory_budget_scope(1000),
+        ):
+            # 3 layers x 4 pages x 11 bytes
+            DeepSeekV4PagedHostPool(
+                pool_name="kv",
+                device_buffers=[torch.empty(1, dtype=torch.uint8) for _ in range(3)],
+                item_bytes=11,
+                num_host_pages=4,
+                slot_page_size=2,
+            )
+            self.assertEqual(base.host_memory_budget_bytes(), 1000 - 132)
+            state = DeepSeekV4StateHostPool(
+                pool_name="state",
+                state_pools=state_pools,
+                num_host_pages=4,
+                swa_page_size=2,
+            )
+            self.assertEqual(
+                base.host_memory_budget_bytes(),
+                1000 - 132 - state.layer_num * 4 * state.state_page_bytes,
+            )
+
+    def test_snapshot_budget_never_exceeds_host_memory_free_now(self):
+        """Pinned memory that books nothing (staging buffers, another engine)
+        still caps the allowance."""
+        free_now = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 300
+        with (
+            patch.object(base, "available_host_memory_bytes", return_value=free_now),
+            base.host_memory_budget_scope(1000),
+        ):
+            self.assertEqual(base.host_memory_budget_bytes(500), 300)
+            self.assertEqual(base.host_memory_budget_bytes(200), 300)
+            self.assertEqual(base._host_memory_budget.get(), 800)
 
 
 if __name__ == "__main__":
