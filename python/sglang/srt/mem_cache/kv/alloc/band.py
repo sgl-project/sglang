@@ -948,6 +948,16 @@ class Band:
                 return None
             return self.take_physical(num_pages * self.page_size)
 
+    def takes_at_frontier(self, take) -> bool:
+        """Whether a plan's ``take`` only extends this end's frontier, with no
+        hole to fill: `place_pages` then takes and binds the pages in one
+        kernel."""
+        return (
+            self.grow_direction != "float"
+            and not take.reuse
+            and (not self.lazy_compaction or self._free_phys_pages.numel() == 0)
+        )
+
     def take_planned_physical_pages(self, take) -> Optional[torch.Tensor]:
         """Apply a no-relief take only while its source geometry still holds."""
         from sglang.srt.mem_cache.kv.alloc.pricing import snapshot_band
