@@ -38,6 +38,10 @@ def _jit_qknorm_rope_module(
 ) -> Module:
     """``half_warp=False`` keeps the one-row-per-warp kernel where the two-rows
     variant would apply; tests use it as the bit-exactness oracle."""
+    if pack_kv and torch.version.hip is not None:
+        raise NotImplementedError(
+            "Fused QKNorm+RoPE KV packing requires numerical validation on HIP"
+        )
     template_args = [
         head_dim,
         rope_dim,
@@ -75,6 +79,9 @@ def _can_use_fused_qknorm_rope(
     pack_kv: bool,
     cache_has_full_width: bool,
 ) -> bool:
+    # Keep HIP on the separate QK-norm/RoPE and KV packing path until validated.
+    if pack_kv and torch.version.hip is not None:
+        return False
     if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
         logger.warning(
             "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",
