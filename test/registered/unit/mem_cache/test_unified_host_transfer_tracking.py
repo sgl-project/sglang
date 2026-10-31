@@ -18,6 +18,7 @@ from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 from sglang.srt.mem_cache.kv.alloc.band import Band, _span_growth
 from sglang.srt.mem_cache.kv.alloc.chain import ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
+from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
 from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -105,18 +106,17 @@ class TestHostCopyIds(CustomTestCase):
 
 class TestRetirementBookkeeping(CustomTestCase):
     def test_urgent_retirements_keep_the_event_map_bounded(self):
-        band = object.__new__(Band)
-        band._event_seq = {}
-        band._retired_seq = 0
-        band._forward_seq = 0
-        band._pending_reuse = {}
-        band._inflight_forwards = []
+        usage = PageUsage()
         for _ in range(10_000):
             event = object()
-            band._register_forward(event)
-            band._retire_through(event)  # an urgent wait retires it first
-            band.retire_forward(event)  # then the scheduler processes it
-        self.assertEqual(len(band._event_seq), 0)
+            usage.register_forward(event)
+            usage.retire_through(event)  # an urgent wait retires it first
+            usage.retire_forward(event)  # then the scheduler processes it
+        self.assertEqual(len(usage.event_seq), 0)
+        for _ in range(10_000):
+            usage.register_forward(object())
+            usage.retire_all()  # a settle waits the newest forward
+        self.assertEqual(len(usage.event_seq), 0)
 
 
 class TestSpanGrowth(CustomTestCase):

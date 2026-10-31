@@ -547,5 +547,35 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(live.awaiting_publish)
 
 
+class TestPublishedDestinationHandoff(CustomTestCase):
+    def test_transfer_queue_takes_published_destinations_over(self):
+        """BUG REGRESSION. Each published destination counts until the
+        transfer queue takes its request over; the handoff in
+        `DecodeTransferQueue.extend` was lost, so the count never fell back to
+        zero and the host backing's peer-write gate stayed closed after every
+        receive had drained, refusing host compaction for good."""
+        prealloc = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc._num_published_destinations = 2
+        transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer.queue = decode_queue(ListKind.PD_RECEIVING)
+        transfer._deferred_releases = IndexedReqList(
+            ListKind.PD_RELEASING, req_of=lambda entry: entry[0].req
+        )
+        transfer.scheduler = SimpleNamespace(disagg_decode_prealloc_queue=prealloc)
+        prealloc.transfer_queue = transfer
+        decode_reqs = [
+            SimpleNamespace(req=FakeReq(rid=f"r{i}"), host_staged=True)
+            for i in range(2)
+        ]
+
+        transfer.extend(decode_reqs)
+        self.assertFalse(prealloc.has_published_destinations)
+        self.assertFalse(prealloc._host_destinations_quiescent())
+
+        # Both receives complete and leave the queue.
+        transfer.queue = decode_queue(ListKind.PD_RECEIVING)
+        self.assertTrue(prealloc._host_destinations_quiescent())
+
+
 if __name__ == "__main__":
     unittest.main()
