@@ -322,3 +322,13 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         markov_head_type=markov_head_type,
         is_mla=base.is_mla,
     )
+
+
+def dspark_num_stages(*, draft_hf_config: Any) -> int:
+    """One draft stage per captured target layer, else per MTP layer."""
+    target_layer_ids = parse_dspark_draft_config(
+        draft_hf_config=draft_hf_config
+    ).target_layer_ids
+    if target_layer_ids is not None:
+        return len(target_layer_ids)
+    return int(_cfg_get(draft_hf_config, "num_nextn_predict_layers", 1) or 1)

@@ -8,6 +8,8 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.eplb.eplb_manager import EPLBFamily
+from sglang.srt.eplb.expert_location import DRAFT_EXPERT_LOCATION_FAMILY
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -242,6 +244,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        self._maybe_register_draft_eplb()
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -551,6 +554,21 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _draft_context(self):
         return draft_tp_context(self.draft_parallel_layout)
+
+    def _maybe_register_draft_eplb(self) -> None:
+        draft_runner = self.draft_model_runner
+        if draft_runner.expert_location_family != DRAFT_EXPERT_LOCATION_FAMILY:
+            return
+        eplb_manager = self.model_runner.eplb_manager
+        assert eplb_manager is not None, "draft EPLB rides on the target's EPLB"
+        eplb_manager.register_family(
+            EPLBFamily(
+                name=DRAFT_EXPERT_LOCATION_FAMILY,
+                model_config=draft_runner.model_config,
+                get_model=lambda: draft_runner.model,
+                expert_location_updater=draft_runner.expert_location_updater,
+            )
+        )
 
     def alloc_memory_pool(
         self,

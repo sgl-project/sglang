@@ -15,7 +15,11 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
-from sglang.srt.eplb import expert_location_dispatch
+from sglang.srt.eplb import draft_expert_location, expert_location_dispatch
+from sglang.srt.eplb.draft_expert_location import (
+    draft_eplb_refusal,
+    init_draft_expert_location,
+)
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
@@ -77,8 +81,8 @@ def _batch(real):
     return batch
 
 
-def _placement(num_layers=1):
-    logical_to_physical = torch.tensor([[2, 0, 3, 1]], dtype=torch.int64).repeat(
+def _placement(num_layers=1, logical_to_physical=(2, 0, 3, 1)):
+    logical_to_physical = torch.tensor([logical_to_physical], dtype=torch.int64).repeat(
         num_layers, 1
     )
     physical_to_logical = logical_to_physical.argsort(dim=-1)
@@ -149,6 +153,122 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(draft_ids.tolist(), [[0, 1], [0, 1], [-1, -1], [-1, -1]])
         self.assertFalse(draft.topk_config.allow_routed_experts_capture)
         self.assertTrue(target.topk_config.allow_routed_experts_capture)
+
+    def test_draft_family_routes_only_through_the_draft_placement(self):
+        """A draft-family layer maps through the draft's own placement, updated in
+        place; the target keeps its own and an opted-out draft stays logical."""
+        draft_metadata = _placement(logical_to_physical=(1, 3, 0, 2))
+        get_resources().draft_expert_location_metadata = draft_metadata
+        self.addCleanup(
+            setattr, get_resources(), "draft_expert_location_metadata", None
+        )
+        target = self._router()
+        with draft_model_build_scope():
+            draft = self._router(expert_location_family="draft")
+            opted_out = self._router()
+        self.assertEqual(
+            (target.expert_location_family, draft.expert_location_family),
+            ("target", "draft"),
+        )
+        self.assertIsNone(opted_out.expert_location_family)
+        self.assertIsNone(
+            self._router(expert_location_family="draft").expert_location_family
+        )
+        with forward_context(
+            ForwardContext(attn_backend=object()), forward_batch=_batch(4)
+        ):
+            ids = [
+                router.forward_native(self.hidden, self.logits).topk_ids[0].tolist()
+                for router in (target, draft, opted_out)
+            ]
+            info = draft.routing_inputs()[1]
+            rank_map = info.partial_logical_to_rank_dispatch_physical_map
+            draft_metadata.update(
+                _placement(logical_to_physical=(3, 2, 1, 0)), update_layer_ids=[0]
+            )
+            moved = draft.forward_native(self.hidden, self.logits).topk_ids[0]
+        self.assertEqual(ids, [[2, 0], [1, 3], [0, 1]])
+        self.assertEqual(
+            rank_map.data_ptr(),
+            draft_metadata.logical_to_rank_dispatch_physical_map.data_ptr(),
+        )
+        self.assertEqual(moved.tolist(), [3, 2])
+        self.assertEqual(
+            self.metadata.logical_to_rank_dispatch_physical_map.tolist(), [[2, 0, 3, 1]]
+        )
+
+    def test_draft_eplb_gate(self):
+        """Draft EPLB is opt-in and refuses what its placement cannot serve."""
+        megamoe = SimpleNamespace(is_megamoe=lambda: True)
+        dspark = "DeepseekV4ForCausalLMDSpark"
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[dspark])
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.utils.get_moe_a2a_backend", return_value=megamoe
+            ),
+            get_exec().moe.override(expert_distribution_recorder_mode="stat"),
+        ):
+            self.assertIsNone(draft_eplb_refusal(draft_architecture=dspark))
+            for enabled, moe_override in ((False, {}), (True, dict(enable_eplb=False))):
+                with (
+                    envs.SGLANG_DSPARK_ENABLE_DRAFT_EPLB.override(enabled),
+                    get_exec().moe.override(**moe_override),
+                ):
+                    self.assertIsNone(
+                        init_draft_expert_location(
+                            model_config=model_config, moe_ep_rank=0
+                        )
+                    )
+                self.assertIsNone(get_resources().draft_expert_location_metadata)
+            refusals = {
+                "enable_eplb": dict(enable_eplb=False),
+                "lp": dict(ep_dispatch_algorithm="lp"),
+                "fake": dict(ep_dispatch_algorithm="fake"),
+                "elastic": dict(elastic_ep_backend="mooncake"),
+            }
+            for name, moe_override in refusals.items():
+                with self.subTest(name), get_exec().moe.override(**moe_override):
+                    self.assertIsNotNone(draft_eplb_refusal(draft_architecture=dspark))
+            for name, architecture in (
+                ("nextn", "DeepseekV4ForCausalLMNextN"),
+                ("non_dsv4", "Qwen3NextForCausalLMMTP"),
+            ):
+                with self.subTest(name):
+                    self.assertIsNotNone(
+                        draft_eplb_refusal(draft_architecture=architecture)
+                    )
+        not_megamoe = SimpleNamespace(is_megamoe=lambda: False)
+        with patch(
+            "sglang.srt.layers.moe.utils.get_moe_a2a_backend", return_value=not_megamoe
+        ):
+            self.assertIsNotNone(draft_eplb_refusal(draft_architecture=dspark))
+
+    def test_draft_slots_must_split_evenly_over_ep(self):
+        expert_location = SimpleNamespace(num_logical_experts=128)
+        with patch.object(
+            draft_expert_location.ModelConfigForExpertLocation,
+            "from_model_config",
+            return_value=expert_location,
+        ):
+            for ep_size, num_redundant, ok in (
+                (16, 16, True),
+                (32, 32, True),
+                (4, 16, True),
+                (16, 8, False),
+                (32, 16, False),
+            ):
+                with (
+                    self.subTest(ep_size=ep_size, num_redundant=num_redundant),
+                    get_parallel().override(ep_size=ep_size),
+                    get_exec().moe.override(ep_num_redundant_experts=num_redundant),
+                ):
+                    if ok:
+                        draft_expert_location._check_draft_slots(None)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "divide evenly"):
+                            draft_expert_location._check_draft_slots(None)
 
     def test_late_preparation_and_in_place_rebalance(self):
         """Forward preparation and rebalance must be observed after scope entry."""

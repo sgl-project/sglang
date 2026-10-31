@@ -642,6 +642,11 @@ class Resources(_FlagGroupBase):
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
+    # The DSpark draft's own family (published only with draft EPLB on) and
+    # the family whose recorder the routing hooks write into right now.
+    draft_expert_distribution_recorder: Any = None
+    draft_expert_location_metadata: Any = None
+    active_expert_distribution_family: str = "target"
     # LPLB: layer_id -> solver.
     lplb_solvers: dict = msgspec.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.

@@ -9,11 +9,13 @@ from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
     _InfiniteBuffer,
     _SelectExpertsSinglePassGatherer,
+    draft_expert_distribution_scope,
+    get_global_expert_distribution_recorder,
     should_advance_eplb_counter,
     should_record_forward_pass,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.runtime_context import get_resources, override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -184,6 +186,74 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         recorder._current_debug_name = Withable()
         recorder._current_layer_idx = SimpleNamespace(value=0)
         return recorder
+
+
+def _counting_recorder(num_layers: int, num_physical_experts: int):
+    gatherer = _SelectExpertsSinglePassGatherer.__new__(
+        _SelectExpertsSinglePassGatherer
+    )
+    gatherer._expert_location_metadata = SimpleNamespace(
+        num_physical_experts=num_physical_experts
+    )
+    gatherer._data = torch.zeros((num_layers, num_physical_experts), dtype=torch.int32)
+    accumulator = Mock()
+    accumulator.get_single_pass_gatherer_key.return_value = "primary"
+    recorder = _ExpertDistributionRecorderReal.__new__(_ExpertDistributionRecorderReal)
+    recorder._recording = True
+    recorder._disable_all = False
+    recorder._record_current_pass = True
+    recorder._single_pass_gatherers = {"primary": gatherer}
+    recorder._accumulator = accumulator
+    recorder._current_debug_name = Withable()
+    recorder._current_layer_idx = Withable()
+    return recorder, gatherer._data
+
+
+class TestDraftFamilyRecorder(unittest.TestCase):
+    def setUp(self):
+        platform_override = override_platform(is_hip=False)
+        platform_override.install()
+        self.addCleanup(platform_override.restore)
+        self.target, self.target_counts = _counting_recorder(4, 8)
+        self.draft, self.draft_counts = _counting_recorder(2, 6)
+
+    def test_draft_routes_count_only_in_the_draft_buffers(self):
+        """Draft hooks and the fused count buffer resolve to the draft recorder by
+        stage index; the target's buffers never see a draft route."""
+        picks = torch.tensor([[0, 5], [5, 2], [-1, -1]], dtype=torch.int32)
+        with get_resources().override(
+            expert_distribution_recorder=self.target,
+            draft_expert_distribution_recorder=self.draft,
+        ):
+            with draft_expert_distribution_scope() as recorder:
+                self.assertIs(recorder, self.draft)
+                self.assertIs(
+                    get_global_expert_distribution_recorder("target"), self.target
+                )
+                with recorder.with_current_layer(1):
+                    get_global_expert_distribution_recorder().on_select_experts(picks)
+                    buffer = get_global_expert_distribution_recorder().get_current_pass_count_buffer()
+            self.assertIs(get_global_expert_distribution_recorder(), self.target)
+            self.assertIs(get_global_expert_distribution_recorder("draft"), self.draft)
+        self.assertEqual(buffer.data_ptr(), self.draft_counts[1].data_ptr())
+        self.assertEqual(self.draft_counts[1].tolist(), [1, 0, 1, 0, 0, 2])
+        self.assertEqual(self.draft_counts[0].tolist(), [0] * 6)
+        self.assertEqual(int(self.target_counts.abs().sum()), 0)
+
+    def test_without_draft_family_the_draft_records_nothing(self):
+        picks = torch.tensor([[0, 5]], dtype=torch.int32)
+        with get_resources().override(
+            expert_distribution_recorder=self.target,
+            draft_expert_distribution_recorder=None,
+        ):
+            with draft_expert_distribution_scope() as recorder:
+                self.assertIsNone(recorder)
+                with self.target.with_current_layer(0):
+                    get_global_expert_distribution_recorder().on_select_experts(picks)
+                    self.assertIsNone(
+                        get_global_expert_distribution_recorder().get_current_pass_count_buffer()
+                    )
+        self.assertEqual(int(self.target_counts.abs().sum()), 0)
 
 
 class TestInfiniteBuffer(unittest.TestCase):

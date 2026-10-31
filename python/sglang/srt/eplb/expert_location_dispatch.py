@@ -19,7 +19,11 @@ import torch
 
 from sglang.kernels.ops.moe.eplb_map_record import eplb_map_and_record
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ExpertLocationFamily,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.runtime_context import get_exec
 
 
@@ -43,15 +47,18 @@ class ExpertLocationDispatchInfo:
     mega_gate_maps: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     @classmethod
-    def init_new(cls, layer_id: int, *, is_draft: bool = False):
-        if is_draft:
-            return None
+    def init_new(
+        cls,
+        layer_id: int,
+        *,
+        family: ExpertLocationFamily = TARGET_EXPERT_LOCATION_FAMILY,
+    ):
         ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
         if ep_dispatch_algorithm is None:
             return None
-        expert_location_metadata = get_global_expert_location_metadata()
+        expert_location_metadata = get_global_expert_location_metadata(family)
         assert expert_location_metadata is not None, (
-            "Expert dispatch requires placement metadata"
+            f"Expert dispatch requires {family} placement metadata"
         )
 
         return cls(
