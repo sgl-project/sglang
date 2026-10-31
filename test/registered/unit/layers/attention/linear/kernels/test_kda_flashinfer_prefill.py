@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.linear import kda_backend
+from sglang.srt.layers.attention.linear import kda_backend, kda_prefill_graph
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
@@ -260,6 +260,82 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
                 )
                 if expected_split:
                     self.assertTrue(all(t.is_contiguous() for t in outputs))
+
+    def test_graph_keeps_unequal_qkv_widths_in_split_layout(self):
+        """The graph path must use the legacy split layout for unequal Q/K/V.
+
+        Grouped convolution is only valid when every Q/K/V group has the same
+        width.  ``meta.flashinfer`` selects the graph wrapper, but it must not
+        by itself enable grouped output for models with asymmetric projections.
+        """
+
+        class _RecordingGraph:
+            def __init__(self):
+                self.inputs = None
+
+            def run(self, **kwargs):
+                self.inputs = kwargs
+                return torch.zeros_like(kwargs["v"])
+
+        total_tokens = 3
+        layer = SimpleNamespace(
+            q_dim=2,
+            k_dim=2,
+            v_dim=3,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=3,
+            conv_weights=None,
+            bias=None,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
+            lower_bound=-5.0,
+        )
+        graph = _RecordingGraph()
+        meta = SimpleNamespace(
+            track=False,
+            flashinfer=graph,
+            cu_seqlens=torch.tensor([0, total_tokens], dtype=torch.int32),
+            has_initial_state=torch.zeros(1, dtype=torch.bool),
+            cache_indices=torch.zeros(1, dtype=torch.int32),
+            conv_block_table=torch.zeros(1, 2, dtype=torch.int32),
+            num_logical_tokens=torch.tensor([total_tokens], dtype=torch.int32),
+            token_index=torch.arange(total_tokens, dtype=torch.int32),
+        )
+        mixed_qkv = torch.arange(total_tokens * 7, dtype=torch.float32).view(
+            total_tokens, 7
+        )
+
+        def convolve(x, *args, output_split_size, **kwargs):
+            self.assertEqual(output_split_size, 0)
+            return x.clone()
+
+        with patch.object(
+            kda_prefill_graph, "causal_conv1d_fn", side_effect=convolve
+        ):
+            output = kda_prefill_graph.kda_extend_in_graph(
+                layer=layer,
+                meta=meta,
+                conv_pool=torch.zeros(1, 1, 7),
+                ssm_states=torch.zeros(1, 1, 3, 3),
+                kernel_dispatcher=SimpleNamespace(),
+                mixed_qkv=mixed_qkv,
+                a=torch.zeros(1, total_tokens, 1, 2),
+                b=torch.zeros(1, total_tokens, 1),
+            )
+
+        self.assertEqual(output.shape, (1, total_tokens, 1, 3))
+        self.assertEqual(
+            [
+                tensor.shape[-1]
+                for tensor in (
+                    graph.inputs["q"],
+                    graph.inputs["k"],
+                    graph.inputs["v"],
+                )
+            ],
+            [2, 2, 3],
+        )
 
 
 if __name__ == "__main__":
