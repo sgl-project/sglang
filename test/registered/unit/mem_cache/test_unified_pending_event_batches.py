@@ -99,14 +99,16 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                     all_sources = set()
 
                     def assert_pending():
-                        self.assertEqual(set(member._pending_reuse), set(expected))
+                        self.assertEqual(
+                            set(member.usage.pending_by_key()), set(expected)
+                        )
                         union = set().union(*expected.values()) if expected else set()
-                        self.assertEqual(member._pending_reuse_pages_cpu, union)
+                        self.assertEqual(member.usage.pending_pages, union)
                         free = member._free_phys_pages.tolist()
                         self.assertTrue(union.isdisjoint(free))
                         self.assertEqual(len(free), len(set(free)))
                         for event, sources in expected.items():
-                            cpu, device = member._pending_reuse[event]
+                            cpu, device = member.usage.pending_by_key()[event]
                             self.assertEqual(set(cpu), sources)
                             self.assertEqual(len(cpu), len(sources))
                             self.assertEqual(torch.cat(device).tolist(), cpu)
@@ -175,8 +177,8 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         member._drain_pending_reuse(urgent=False)
                         assert_pending()
                         assert_payload()
-                    self.assertFalse(member._pending_reuse)
-                    self.assertFalse(member._pending_reuse_pages_cpu)
+                    self.assertFalse(member.usage.pending_by_key())
+                    self.assertFalse(member.usage.pending_pages)
                     if mode != "fired_between":
                         self.assertEqual(
                             set(member._free_phys_pages.tolist()), all_sources

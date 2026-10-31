@@ -99,7 +99,7 @@ def snapshot(a):
             x.ids.virtual_to_physical.tolist(),
             x.ids.physical_to_virtual.tolist(),
             x.live_page_count,
-            [(id(e), v[0]) for e, v in x._pending_reuse.items()],
+            [(id(e), v[0]) for e, v in x.usage.pending_by_key().items()],
         )
         for x in a._flush_targets()
     ]

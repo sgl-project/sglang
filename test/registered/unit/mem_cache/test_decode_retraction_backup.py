@@ -375,7 +375,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
             pending_reqs=[],
             retracted_queue=[],
             _prefill_dp_rank_queries={},
-            _num_published_destinations=0,
             num_reserved_decode_tokens=0,
             scheduler=SimpleNamespace(
                 server_args=env.server_args,

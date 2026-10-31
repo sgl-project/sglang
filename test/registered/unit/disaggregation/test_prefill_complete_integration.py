@@ -749,7 +749,6 @@ class TestAllocationIntegration(CustomTestCase):
                     queue.transfer_queue = SimpleNamespace(
                         enable_staging=False, enable_deferred_kv_release=False
                     )
-                    queue._num_published_destinations = 0
                     events = Mock()
                     events.attach_mock(receiver.send_metadata, "metadata")
                     events.attach_mock(
@@ -766,7 +765,6 @@ class TestAllocationIntegration(CustomTestCase):
                         if policy == "early"
                         else ["recompute", "metadata"],
                     )
-                    self.assertEqual(queue._num_published_destinations, 1)
                 finally:
                     override.restore()
 

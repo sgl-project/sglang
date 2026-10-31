@@ -432,8 +432,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.host_pool = None
         self.host_reserved_tokens = 0
         self.gloo_group = parallel.attn_tp_group.cpu_group
-        # Destinations visible to prefill but not yet on the transfer queue.
-        self._num_published_destinations = 0
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
@@ -1935,7 +1933,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and get_disagg().disaggregation_decode_allocation_policy == "early"
         ):
             self._submit_prefill_recompute(decode_req)
-        self._num_published_destinations += 1
         decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
@@ -2054,18 +2051,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._pre_alloc(req)
         decode_req.host_staged = False
         return True
-
-    @property
-    def has_published_destinations(self) -> bool:
-        """Whether any destination address is visible to prefill but not yet
-        protected by the transfer queue."""
-        return self._num_published_destinations > 0
-
-    def note_destinations_queued(self, count: int) -> None:
-        """Hand `count` published destinations over to the transfer queue."""
-        self._num_published_destinations = max(
-            0, self._num_published_destinations - count
-        )
 
     @property
     def num_tokens_pre_allocated(self):
@@ -2680,10 +2665,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        # This queue now covers them.
-        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
-        if prealloc_queue is not None:
-            prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _kv_checksum_comparable(self, signature: int) -> bool:
         """Digests compare only when the prefill digested this decode's layout.
