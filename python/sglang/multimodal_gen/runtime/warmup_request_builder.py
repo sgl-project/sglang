@@ -128,10 +128,15 @@ def _resolve_default_warmup_resolution(
     width = sampling_defaults.width
     height = sampling_defaults.height
     is_image_gen = server_args.pipeline_config.task_type.is_image_gen()
+    # graphs replay only the captured shape, so BCG skips the video area cap
     if (
         width is not None
         and height is not None
-        and (not server_based_warmup or is_image_gen)
+        and (
+            not server_based_warmup
+            or is_image_gen
+            or server_args.enable_breakable_cuda_graph is True
+        )
     ):
         return width, height
 

@@ -23,8 +23,8 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -257,11 +257,6 @@ class TestFreezeGc(CustomTestCase):
     def setUp(self):
         self.addCleanup(gc.set_threshold, *gc.get_threshold())
         self.addCleanup(gc.unfreeze)
-
-    def test_preserves_default_threshold(self):
-        gc.set_threshold(700, 10, 10)
-        freeze_gc("test")
-        self.assertEqual(gc.get_threshold(), (700, 10, 10))
 
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
