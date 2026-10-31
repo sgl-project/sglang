@@ -31,10 +31,14 @@ from sglang.srt.layers.attention.base_attn_backend import (
     resolve_window_id_space,
     resolve_window_kv_pool,
 )
+from sglang.srt.layers.attention.graph_variants import SeqLenBucketGraphVariants
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_attention_variant,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -254,6 +258,8 @@ class ForwardMetadata:
     cprr_kv_indices: Optional[torch.Tensor] = None
     cprr_kv_indptr: Optional[torch.Tensor] = None
     cprr_empty_rows: Optional[torch.Tensor] = None
+    # paged_attention_ragged grid size; None means max_num_partitions.
+    decode_num_partitions: Optional[int] = None
 
 
 def _build_paged_kv_view(
@@ -293,6 +299,10 @@ def _paged_prefill_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
+# (graph variant label, longest request it serves), run with limit / 256 partitions;
+# aiter JIT-builds a reduce kernel per ceil(partitions / 64), so eager uses only these.
+_DECODE_PARTITION_BUCKETS = (("p16", 4096), ("p128", 32768))
+_DECODE_PARTITION_FALLBACK = "pmax"
 
 # Query rows one asm-prefill work tile covers. The scheduler, the partial
 # buffers and mla_reduce_v1 must all agree on it.
@@ -590,6 +600,12 @@ class AiterAttnBackend(AttentionBackend):
         self.max_num_partitions = (
             self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
         ) // _AITER_PARTITION_SIZE_ROCM
+        self._decode_partition_buckets = self._build_decode_partition_buckets()
+        if len(self._decode_partition_buckets) > 1:
+            logger.info(
+                "aiter decode partition buckets (label, max_seq_len, partitions): %s",
+                self._decode_partition_buckets,
+            )
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
@@ -2014,6 +2030,67 @@ class AiterAttnBackend(AttentionBackend):
             context_len=self.max_context_len,
         )
 
+    def _build_decode_partition_buckets(self) -> tuple[tuple[str, int, int], ...]:
+        """(label, max_seq_len, num_partitions), ascending; the last serves any length."""
+        fallback = (
+            _DECODE_PARTITION_FALLBACK,
+            self.max_context_len,
+            self.max_num_partitions,
+        )
+        paged_ragged_decode = not (
+            self.use_mla
+            or self.use_triton_unified_attention
+            or self.kv_cache_is_vectorized_5d
+        )
+        # Below 128 partitions buckets save little: at batch 256 and 1.5K tokens,
+        # 32 and 128 partitions cost 1% and 9% more than 16.
+        if not (
+            paged_ragged_decode
+            and self.max_num_partitions >= 128
+            and envs.SGLANG_AITER_DECODE_PARTITION_BUCKETS.get()
+        ):
+            return (fallback,)
+        buckets = [
+            (label, limit, limit // _AITER_PARTITION_SIZE_ROCM)
+            for label, limit in _DECODE_PARTITION_BUCKETS
+            if 4 * (limit // _AITER_PARTITION_SIZE_ROCM) <= self.max_num_partitions
+        ]
+        return (*buckets, fallback)
+
+    def _partitions_for_max_seq_len(self, max_seq_len: Optional[int]) -> int:
+        # Partitions past the longest request exit early, but too few drop KV silently.
+        if max_seq_len is not None and max_seq_len > 0:
+            for _, limit, num_partitions in self._decode_partition_buckets:
+                if max_seq_len <= limit:
+                    return num_partitions
+        return self.max_num_partitions
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[SeqLenBucketGraphVariants]:
+        if (
+            capture_forward_mode != ForwardMode.DECODE
+            or captured_req_width != 1
+            or len(self._decode_partition_buckets) == 1
+        ):
+            return None
+        return SeqLenBucketGraphVariants(
+            graph_limits=tuple(
+                (label, limit)
+                for label, limit, _ in self._decode_partition_buckets[:-1]
+            ),
+            fallback_label=self._decode_partition_buckets[-1][0],
+        )
+
+    def _capture_decode_num_partitions(self) -> Optional[int]:
+        label = get_capture_attention_variant()
+        if label is None or len(self._decode_partition_buckets) == 1:
+            return None
+        for bucket_label, _, num_partitions in self._decode_partition_buckets:
+            if label == bucket_label:
+                return num_partitions
+        raise ValueError(f"Unknown aiter decode graph variant {label!r}")
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -2038,6 +2115,10 @@ class AiterAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
             verify_tokens_per_req=verify_tokens_per_req,
         )
+        if in_capture and forward_batch.forward_mode.is_decode():
+            self.forward_metadata.decode_num_partitions = (
+                self._capture_decode_num_partitions()
+            )
 
         # Refill the SWA write-target buffer from the live out_cache_loc and
         # bind it onto the metadata before replay (_apply rebuilds it each call).
@@ -2226,6 +2307,11 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
                 swa_page_table=swa_page_table,
                 swa_out_cache_loc=swa_out_cache_loc,
+                decode_num_partitions=(
+                    self._partitions_for_max_seq_len(max_kv_len)
+                    if spec_info is None
+                    else None
+                ),
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -4876,7 +4962,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.forward_metadata.kv_indices,
                     self.kv_last_page_len,
                     1,
-                    self.max_num_partitions,
+                    self.forward_metadata.decode_num_partitions
+                    or self.max_num_partitions,
                     None,
                     aiter_kv_str,
                     "NHD",

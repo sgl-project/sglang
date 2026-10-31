@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -160,6 +161,15 @@ class TboAttnBackend(AttentionBackend):
             ):
                 if forward_batch_child.batch_size > 0:
                     child.init_forward_metadata(forward_batch=forward_batch_child)
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Children read the same capture label;
+        # init_new builds them with the primary's creator.
+        return self.primary.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
