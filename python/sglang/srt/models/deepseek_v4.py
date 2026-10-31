@@ -63,6 +63,9 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+    is_dsv4_trtllm_attn_enabled,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -998,6 +1001,7 @@ class MqaAttentionBase(nn.Module):
     # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
+    _trtllm_attn: bool = False
 
     def __init__(
         self,
@@ -1195,6 +1199,8 @@ class MqaAttentionBase(nn.Module):
         freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
+        # trtllm-gen consumes e4m3 q and per-rank head counts (no FlashMLA head padding).
+        self._trtllm_attn = is_dsv4_trtllm_attn_enabled()
 
     @functools.cached_property
     def use_flashinfer_mxfp8_wo_b(self) -> bool:
@@ -1210,6 +1216,10 @@ class MqaAttentionBase(nn.Module):
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        if self._trtllm_attn:
+            # trtllm-gen takes per-rank head counts natively.
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -1814,7 +1824,12 @@ class MQALayer(MqaAttentionBase):
             q_out.copy_(q)
             return q_out
         if q_out is None:
-            q_out = torch.empty_like(q)
+            # trtllm-gen consumes e4m3 q: let the fused kernel store it directly.
+            q_out = torch.empty(
+                q.shape,
+                dtype=torch.float8_e4m3fn if self._trtllm_attn else q.dtype,
+                device=q.device,
+            )
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -1944,6 +1959,9 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is read on stream_kv; freeing it before the join above lets the allocator
+        # reuse its block and race the side-stream KV store on replay.
         del qkv_a
 
         return q

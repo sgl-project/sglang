@@ -1120,6 +1120,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         stage_layer_num = len(stage_ratios)
         kv_pool_cls: type = DeepSeekV4SingleKVPool
+        if self.uniform_fp8:
+            # Every trtllm SWA, window, ring and compressed pool keeps 512-byte rows.
+            assert dtype == torch.float8_e4m3fn, (
+                "--dsv4-attn-backend trtllm requires "
+                f"kv_cache_dtype=fp8_e4m3, got {dtype}"
+            )
+            kv_pool_cls = DeepSeekV4UniformFP8KVPool
 
         self.request_window = None
         self.full_to_swa_index_mapping = None
@@ -1147,6 +1154,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     enable_memory_saver=enable_memory_saver,
                     global_page_size=swa_page_size,
                     kv_layout=self.kv_layout,
+                    cls=kv_pool_cls,
                 )
 
             self.swa_kv_pool = None
@@ -1177,6 +1185,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     graph_rows,
                     (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
                 ),
+                row_layout=KVLayout.UNIFORM_FP8 if self.uniform_fp8 else None,
             )
         elif uses_draft_swa_ring():
             # The DSpark draft writes SWA rows only from target hidden states, never
@@ -1224,12 +1233,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_req_ring_size = self.unified_swa_ring_size
         else:
             self.unified_kv_pool = None
-            if self.uniform_fp8:
-                assert dtype == torch.float8_e4m3fn, (
-                    "--dsv4-attn-backend trtllm requires "
-                    f"kv_cache_dtype=fp8_e4m3, got {dtype}"
-                )
-                kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
                 page_size=swa_kv_page_size,
@@ -2205,14 +2208,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
+            local_id = self._swa_local_layer_id(layer_id)
+            # Under encoder replay, rows land in the request-window workspace.
+            cache = (
+                self.request_window.buffer(local_id)
+                if self.request_window is not None
+                else self.swa_kv_pool.get_key_buffer(local_id)
+            )
             fused_k_norm_rope_uniform_fp8(
-                kv,
-                kv_weight,
-                eps,
-                freqs_cis,
-                positions,
-                swa_loc,
-                self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
+                kv, kv_weight, eps, freqs_cis, positions, swa_loc, cache
             )
             return
         fused_k_norm_rope_flashmla(
