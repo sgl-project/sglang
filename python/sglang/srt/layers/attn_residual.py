@@ -1,3 +1,14 @@
+import functools
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.utils import is_cuda, is_hip, is_npu
+
 # SPDX-License-Identifier: Apache-2.0
 # Kimi-K3 Attention Residual: snapshot bank + aggregation.
 #
@@ -16,15 +27,6 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional
-
-import torch
-import triton
-import triton.language as tl
-
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -61,6 +63,42 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
+
+
+def _same_storage_view(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """b is a same-shape view of a. The
+    stash holds a strong reference to a, so its storage cannot be freed and
+    reused: equal pointer/shape/strides/dtype means b aliases a's data."""
+
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+        and a.device == b.device
+    )
+
+
+@functools.cache
+def smallm_max_t() -> int:
+    """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
+    return 128 if is_hip() else 0
+
+
+@functools.cache
+def fused_max_t() -> int:
+    """Token ceiling of the fused AllReduce + aggregation (0 when disabled), the
+    same for the all-reduce and the all-gather variant."""
+    return 64 if is_hip() else 0
+
+
+def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:
+    """Whether an aggregation point of this shape takes attn_res_smallm_hip."""
+    return (
+        0 < num_tokens <= smallm_max_t()
+        and nvb >= 1
+        and _use_hip_fused(hidden_size, nvb)
+    )
 
 
 def get_cw(
@@ -289,17 +327,42 @@ def _aggregate_hip(
     score_norm: RMSNorm,
     out_norm: Optional[RMSNorm],
     write_bank_row: bool = False,
+    stream_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single ROCm Triton kernel: the bank stays in registers so scoring and
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
-    pre-norm mixture instead. Returns (result, prefix)."""
+    pre-norm mixture instead. Returns (result, prefix).
+
+    Small token counts take the single HIP
+    kernel instead (attn_res_smallm_hip), which can also emit the pre-norm
+    mixture into stream_out (only valid on that path; see use_hip_smallm)."""
     from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
+    from sglang.srt.layers.quantization import k3_rocm_dense_fp8
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
     out = torch.empty_like(prefix_sum)
-    attn_res_hip(
+    # The normalized row feeds a static-FP8 GEMM (MoE front / KDA q,k,v,g) when
+    # SGLANG_K3_TARGET_DENSE_FP8 is on: emit its E4M3 copy here instead of a
+    # separate quant launch in that GEMM.
+    out_fp8 = (
+        torch.empty(out.shape, dtype=torch.float8_e4m3fn, device=out.device)
+        if out_norm is not None and k3_rocm_dense_fp8.front_enabled()
+        else None
+    )
+    kernel = attn_res_hip
+    extra = {}
+    if use_hip_smallm(prefix_sum.shape[0], prefix_sum.shape[1], nvb):
+        from sglang.kernels.ops.attention.attn_res_smallm_hip import (
+            attn_res_smallm_hip,
+        )
+
+        kernel = attn_res_smallm_hip
+        extra["stream_out"] = stream_out
+    else:
+        assert stream_out is None, "stream_out needs the small-M kernel"
+    kernel(
         prefix_sum,
         bank,
         cw,
@@ -311,7 +374,11 @@ def _aggregate_hip(
         addend=addend,
         prefix_out=prefix,
         write_prefix=write_bank_row,
+        out_fp8=out_fp8,
+        **extra,
     )
+    if out_fp8 is not None:
+        k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
     return out, prefix
 
 
@@ -405,6 +472,7 @@ def _aggregate(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    stream_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single aggregation point: score → softmax → mix → norm.
 
@@ -435,7 +503,9 @@ def _aggregate(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            stream_out=stream_out,
         )[0]
+    assert stream_out is None
     assert not write_bank_row, "fused bank write is fast-path only"
     return _aggregate_fused(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
 
@@ -463,6 +533,9 @@ class AttnResidual:
         # Whether a write snapshotted only this rank's slice of the rows, which
         # leaves the bank's other rows stale on this rank.
         self.written_on_slice = False
+        # See defer_stream and forward_ag_fused.
+        self._stream_pending = None
+        self._agg_stash = None
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -480,6 +553,143 @@ class AttnResidual:
     def _count_write(self, rows: Optional[slice]) -> None:
         self.num_valid_blocks += 1
         self.written_on_slice |= rows is not None
+
+    def can_defer_stream(self, hidden_states: torch.Tensor, nvb: int) -> bool:
+        """Whether a dspark capture of the stream value over `nvb` rows can
+        ride the next aggregation of the same rows (small-M ROCm kernel)."""
+        return nvb == self.num_valid_blocks and use_hip_smallm(
+            hidden_states.shape[0], hidden_states.shape[1], nvb
+        )
+
+    def defer_stream(
+        self,
+        slot: torch.Tensor,
+        hidden_states: torch.Tensor,
+        nvb: int,
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+    ) -> None:
+        """Record a capture of aggregate_stream(hidden_states, bank, nvb,
+        score_proj, score_norm) into `slot` (a [T, H] view of the packed aux
+        buffer). The next forward() aggregating the same stream head with the
+        same weights writes it as a by-product (same pre-norm mixture its own
+        output norm consumes): one launch and one copy fewer per capture. Any
+        other next call materializes it first (flush_stream)."""
+        assert self._stream_pending is None
+        self._stream_pending = (slot, hidden_states, nvb, score_proj, score_norm)
+
+    def flush_stream(self) -> None:
+        """Materialize a deferred capture with a standalone aggregation."""
+        pending, self._stream_pending = self._stream_pending, None
+        if pending is not None:
+            slot, hidden_states, nvb, score_proj, score_norm = pending
+            slot.copy_(
+                aggregate_stream(
+                    hidden_states, self.block_residual, nvb, score_proj, score_norm
+                )
+            )
+
+    def _fused_outputs(self, like: torch.Tensor):
+        from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+
+        out_fp8 = (
+            torch.empty(like.shape, dtype=torch.float8_e4m3fn, device=like.device)
+            if k3_rocm_dense_fp8.front_enabled()
+            else None
+        )
+        return torch.empty_like(like), torch.empty_like(like), out_fp8
+
+    def forward_ar_fused(
+        self,
+        ca,
+        partial: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """All-reduce the TP-partial `partial`
+        (o_proj output) and aggregate in one kernel. Same result as
+        forward(all_reduce(partial), prefix_sum, ...) (no bank write). None
+        when the fused kernel does not apply; the caller then reduces."""
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        nvb = self.num_valid_blocks
+        T, H = partial.shape
+        if T > fused_max_t() or not k3_ar_agg_hip.usable(ca, T, H, nvb):
+            return None
+        if prefix_sum is not None and prefix_sum.shape != partial.shape:
+            return None
+        self.flush_stream()
+        out, prefix, out_fp8 = self._fused_outputs(partial)
+        k3_ar_agg_hip.ar_agg(
+            ca,
+            partial.contiguous(),
+            prefix_sum,
+            self.block_residual,
+            get_cw(score_proj, score_norm),
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            out=out,
+            prefix_out=prefix,
+            out_fp8=out_fp8,
+        )
+        if out_fp8 is not None:
+            from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+
+            k3_rocm_dense_fp8.offer_prequantized(out, out_fp8)
+        return out, prefix
+
+    def forward_ag_fused(
+        self,
+        ca,
+        y: torch.Tensor,
+        add_b: torch.Tensor,
+        add_c: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        write: bool,
+    ) -> Optional[torch.Tensor]:
+        """H = bf16(bf16(all_gather(y) + add_b)
+        [+ add_c]) (the MoE up_proj tail) and, in the same kernel, the NEXT
+        layer's attention-side aggregation of h (score_proj / score_norm /
+        out_norm / write are that layer's). Returns h; the aggregation is
+        stashed and handed out by the next forward() on exactly (h, None,
+        score_proj, write). None when the fused kernel does not apply."""
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        nvb = self.num_valid_blocks
+        T = y.shape[0]
+        H = add_b.shape[1]
+        if (
+            T > fused_max_t()
+            or not k3_ar_agg_hip.usable(ca, T, H, nvb)
+            or (write and self.block_residual.shape[1] <= nvb)
+            or self._stream_pending is not None
+        ):
+            return None
+        out, h, out_fp8 = self._fused_outputs(add_b)
+        k3_ar_agg_hip.ag_agg(
+            ca,
+            y.contiguous(),
+            add_b,
+            add_c,
+            self.block_residual,
+            get_cw(score_proj, score_norm),
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            out=out,
+            prefix_out=h,
+            out_fp8=out_fp8,
+            write_bank=write,
+        )
+        self._agg_stash = (h, out, out_fp8, score_proj, nvb, write)
+        return h
 
     def forward(
         self,
@@ -500,7 +710,42 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
+        stash, self._agg_stash = self._agg_stash, None
+        if stash is not None:
+            h, s_out, s_fp8, s_proj, s_nvb, s_write = stash
+            if (
+                (h is hidden_states or _same_storage_view(h, hidden_states))
+                and prefix_sum is None
+                and rows is None
+                and s_proj is score_proj
+                and s_nvb == self.num_valid_blocks
+                and s_write == write
+            ):
+                self.flush_stream()
+                if s_fp8 is not None:
+                    from sglang.srt.layers.quantization import k3_rocm_dense_fp8
+
+                    k3_rocm_dense_fp8.offer_prequantized(s_out, s_fp8)
+                if write:
+                    self.num_valid_blocks += 1  # row s_nvb written in-kernel
+                return s_out, hidden_states
         nvb = self.num_valid_blocks
+        stream_out = None
+        if self._stream_pending is not None:
+            slot, p_hidden, p_nvb, p_proj, p_norm = self._stream_pending
+            if (
+                prefix_sum is None
+                and rows is None
+                and hidden_states is p_hidden
+                and nvb == p_nvb
+                and score_proj is p_proj
+                and score_norm is p_norm
+                and use_hip_smallm(hidden_states.shape[0], hidden_states.shape[1], nvb)
+            ):
+                stream_out = slot
+                self._stream_pending = None
+            else:
+                self.flush_stream()
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None
@@ -530,6 +775,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                stream_out=stream_out,
             )
             prefix = hidden_states
         else:
@@ -561,6 +807,7 @@ class AttnResidual:
         write: bool = False,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Fuse a local aggregation point and the following row all-gather."""
+        self.flush_stream()
         nvb = self.num_valid_blocks
         if nvb == 0:
             return None
@@ -597,6 +844,7 @@ class AttnResidual:
         rows: slice,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Fuse o_proj RS, the pending local prefix add, and aggregation."""
+        self.flush_stream()
         nvb = self.num_valid_blocks
         if nvb == 0:
             return None

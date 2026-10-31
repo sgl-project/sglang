@@ -244,6 +244,12 @@ for _mod, _fn, _backend, _device in [
     ("attn_res", "attn_res_fused_tma", KernelBackend.JIT, CapabilityRequirement.CUDA),
     ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
     (
+        "attn_res_smallm_hip",
+        "attn_res_smallm_hip",
+        KernelBackend.JIT,
+        CapabilityRequirement.HIP,
+    ),
+    (
         "kda_decode_mtp",
         "fused_kda_decode_mtp_dspark",
         KernelBackend.CUTE_DSL,
