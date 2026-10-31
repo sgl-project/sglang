@@ -368,20 +368,20 @@ def _run_mega_routed(
     num_tokens: int,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
+    buf = _mega_moe_buffer(moe)
 
     routing = None
     if should_use_mega_gate(moe, hidden_states, forward_batch):
         import deep_gemm
 
-        # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
-        buf = (
-            _mega_moe_buffer(moe)
-            if _mega_moe_mma_type(moe.experts) == "fp8xfp4"
-            else None
-        )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
             routing = run_mega_gate(
-                moe, hidden_states, input_ids_global, buf, forward_batch
+                moe,
+                hidden_states,
+                input_ids_global,
+                # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
+                buf if _mega_moe_mma_type(moe.experts) == "fp8xfp4" else None,
+                forward_batch,
             )
 
     if routing is not None:
@@ -435,6 +435,7 @@ def _run_mega_routed(
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
+        buf=buf,
     )
 
 
@@ -455,14 +456,13 @@ def run_mega_routed_experts(
     shared_l1_weights=None,
     shared_l2_weights=None,
     routing_in_buffer: bool = False,
+    buf: Optional[SymmBuffer] = None,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
 
-    ep_group = get_parallel().moe_ep_group.device_group
-    num_experts = experts.num_experts
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -474,17 +474,18 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
-    buf = _get_mega_moe_symm_buffer(
-        ep_group,
-        num_experts=num_experts,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_topk=top_k,
-        hidden=hidden_size,
-        intermediate_hidden=intermediate_size,
-        num_shared_experts=num_shared_experts,
-        mma_type=mma_type,
-        activation=activation,
-    )
+    if buf is None:
+        buf = _get_mega_moe_symm_buffer(
+            get_parallel().moe_ep_group.device_group,
+            num_experts=experts.num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=top_k,
+            hidden=hidden_size,
+            intermediate_hidden=intermediate_size,
+            num_shared_experts=num_shared_experts,
+            mma_type=mma_type,
+            activation=activation,
+        )
 
     if routing_in_buffer:
         assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
