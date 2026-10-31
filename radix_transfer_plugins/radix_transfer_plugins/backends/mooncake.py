@@ -12,6 +12,11 @@ Mooncake 0.3.13 this relies on (probed against a live master):
   without the local buffer. It returns the bytes read; -704 for a missing part; -600
   when the part is larger than the destination; or another negative code, such as -707
   for a read that outlasted its lease. It releases the GIL while it waits.
+- ``get_into_ranges`` reads byte ranges of parts into registered memory in one call and
+  returns each range's bytes read; -704 for a missing part; -600 for a range outside its
+  part or outside registered memory; or another negative code. Only its successful
+  reads were probed; the error codes are read from the 0.3.13 source.
+- One registration serves any number of reads into any part of the registered memory.
 - A read leaves a lease on the key, and a remove without ``force`` fails (-706) while
   the lease lasts.
 """
@@ -19,17 +24,19 @@ Mooncake 0.3.13 this relies on (probed against a live master):
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import itertools
 import logging
 import threading
 import uuid
-from typing import Callable, Mapping, NoReturn, Sequence, Union
+from typing import Callable, Iterator, Mapping, NoReturn, Sequence, Union
 
 import msgspec
 import numpy as np
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 from radix_transfer_plugins.backend import StorageBackend
+from radix_transfer_plugins.schema import RangeRead
 
 logger = logging.getLogger(__name__)
 
@@ -140,13 +147,7 @@ class MooncakeBackend(StorageBackend):
         offsets: Sequence[int],
         sizes: Sequence[int],
     ) -> None:
-        base = memory.ctypes.data
-        status = self._store.register_buffer(base, memory.nbytes)
-        if status != 0:
-            raise RuntimeError(
-                f"Mooncake register_buffer of {memory.nbytes} bytes failed: {status}"
-            )
-        try:
+        with self._registered(memory) as base:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(_READ_THREADS, len(keys))
             ) as pool:
@@ -155,10 +156,6 @@ class MooncakeBackend(StorageBackend):
                         self._store.get_into, keys, [base + o for o in offsets], sizes
                     )
                 )
-        finally:
-            status = self._store.unregister_buffer(base)
-            if status != 0:
-                logger.error("Mooncake unregister_buffer failed: %s", status)
         failed = [
             (key, got, nbytes)
             for key, got, nbytes in zip(keys, results, sizes)
@@ -166,6 +163,51 @@ class MooncakeBackend(StorageBackend):
         ]
         if failed:
             _raise_failed_reads(failed)
+
+    def get_ranges(self, reads: Sequence[RangeRead], *, into: memoryview) -> None:
+        # Part key -> (dst offsets, src offsets, sizes) of its ranges.
+        ranges: dict[str, tuple[list[int], list[int], list[int]]] = {}
+        for read in reads:
+            dsts, srcs, sizes = ranges.setdefault(
+                _part_key(read.ref.key, read.field), ([], [], [])
+            )
+            dsts.append(read.dst_offset)
+            srcs.append(read.src_offset)
+            sizes.append(read.nbytes)
+        part_keys = list(ranges)
+        all_dsts, all_srcs, all_sizes = [list(c) for c in zip(*ranges.values())]
+        (results,) = self._store.get_into_ranges(
+            [_address(into)], [part_keys], [all_dsts], [all_srcs], [all_sizes]
+        )
+        failed = [
+            (key, got, nbytes)
+            for key, got_ranges, range_sizes in zip(part_keys, results, all_sizes)
+            for got, nbytes in zip(got_ranges, range_sizes)
+            if got != nbytes
+        ]
+        if failed:
+            _raise_failed_ranges(failed)
+
+    def register(self, memory: memoryview) -> None:
+        status = self._store.register_buffer(_address(memory), memory.nbytes)
+        if status != 0:
+            raise RuntimeError(
+                f"Mooncake register_buffer of {memory.nbytes} bytes failed: {status}"
+            )
+
+    def unregister(self, memory: memoryview) -> None:
+        status = self._store.unregister_buffer(_address(memory))
+        if status != 0:
+            logger.error("Mooncake unregister_buffer failed: %s", status)
+
+    @contextlib.contextmanager
+    def _registered(self, memory: np.ndarray) -> Iterator[int]:
+        view = memoryview(memory)
+        self.register(view)
+        try:
+            yield memory.ctypes.data
+        finally:
+            self.unregister(view)
 
     def delete_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[str]]
@@ -262,5 +304,26 @@ def _raise_failed_reads(failed: Sequence[tuple[str, int, int]]) -> NoReturn:
     )
 
 
+def _raise_failed_ranges(failed: Sequence[tuple[str, int, int]]) -> NoReturn:
+    """``failed`` holds (part key, get_into_ranges result, size) of each failed range.
+
+    OutputStore already checked each range against its field and the destination, so
+    -600 here is Mooncake rejecting the range, for example a stored part shorter than
+    its ref says; it is not the oversized part ``_raise_failed_reads`` reports.
+    """
+    for key, got, _ in failed:
+        if got == _OBJECT_NOT_FOUND:
+            raise KeyError(f"output store part not found: {key}")
+    key, got, nbytes = failed[0]
+    raise RuntimeError(
+        f"Mooncake could not read {len(failed)} byte ranges, such as {nbytes} bytes of "
+        f"{key}: {got} (see the Mooncake log)"
+    )
+
+
 def _part_key(object_key: str, name: str) -> str:
     return f"{object_key}/{name}"
+
+
+def _address(memory: memoryview) -> int:
+    return np.frombuffer(memory, dtype=np.uint8).ctypes.data

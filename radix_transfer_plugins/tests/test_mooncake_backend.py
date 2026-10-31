@@ -4,7 +4,12 @@ import threading
 import pytest
 from conftest import USING_FAKE_MOONCAKE, FakeMooncakeStore
 
-from radix_transfer_plugins import available_backends, create_backend
+from radix_transfer_plugins import (
+    RangeRead,
+    StoreRef,
+    available_backends,
+    create_backend,
+)
 from radix_transfer_plugins.backends.mooncake import (
     MooncakeBackend,
     MooncakeConfig,
@@ -31,6 +36,15 @@ def make_backend(**overrides) -> tuple[MooncakeBackend, FakeMooncakeStore]:
 
 def parts(*sizes):
     return {f"f{i}": memoryview(bytes([i]) * size) for i, size in enumerate(sizes)}
+
+
+def ranges(key, *spans):
+    """Range reads of object ``key``; each span is (part, src_offset, nbytes, dst_offset)."""
+    ref = StoreRef(backend="mooncake", key=key, fields=())
+    return [
+        RangeRead(ref=ref, field=part, src_offset=src, nbytes=size, dst_offset=dst)
+        for part, src, size, dst in spans
+    ]
 
 
 def test_client_holds_no_segment():
@@ -130,6 +144,49 @@ def test_a_failing_read_still_unregisters_its_memory():
     with pytest.raises(OSError):
         backend.get_many([key], parts=[[("f0", 3)]])
     assert store.registered == {}
+
+
+def test_range_reads_take_one_get_into_ranges_call_into_registered_memory():
+    backend, store = make_backend()
+    (key,) = backend.put_many(
+        [{"a": memoryview(bytes(range(10))), "b": memoryview(bytes(range(100, 110)))}]
+    )
+    into = memoryview(bytearray(7))
+    backend.register(into)
+
+    backend.get_ranges(
+        ranges(key, ("a", 2, 3, 4), ("b", 5, 2, 0), ("a", 7, 2, 2)), into=into
+    )
+    # get_ranges registers nothing itself: the same registration serves the next read.
+    backend.get_ranges(ranges(key, ("b", 0, 1, 6)), into=into)
+
+    assert store.range_calls == [[[f"{key}/a", f"{key}/b"]], [[f"{key}/b"]]]
+    assert bytes(into) == bytes([105, 106, 7, 8, 2, 3, 100])
+    assert list(store.registered.values()) == [7]
+    backend.unregister(into)
+    assert store.registered == {}
+
+
+def test_a_failed_range_read_names_the_part():
+    backend, store = make_backend()
+    (key,) = backend.put_many([parts(3)])
+    into = memoryview(bytearray(3))
+    backend.register(into)
+    with pytest.raises(KeyError, match=f"{key}/f9"):
+        backend.get_ranges(ranges(key, ("f0", 0, 3, 0), ("f9", 0, 3, 0)), into=into)
+    # Past the registered memory: Mooncake's -600 is a failed read, not a size mismatch.
+    with pytest.raises(RuntimeError, match=f"{key}/f0: -600"):
+        backend.get_ranges(ranges(key, ("f0", 0, 3, 1)), into=into)
+    backend.unregister(into)
+    with pytest.raises(RuntimeError, match=f"{key}/f0: -600"):
+        backend.get_ranges(ranges(key, ("f0", 0, 3, 0)), into=into)
+
+
+def test_a_failed_registration_raises():
+    backend, store = make_backend()
+    store.register_buffer = lambda ptr, size: -1
+    with pytest.raises(RuntimeError, match="register_buffer of 3 bytes failed: -1"):
+        backend.register(memoryview(bytearray(3)))
 
 
 def test_delete_is_forced_and_idempotent():

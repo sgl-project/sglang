@@ -40,6 +40,18 @@ class StoreRef(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         return msgspec.convert(value, cls)
 
 
+class RangeRead(msgspec.Struct, frozen=True):
+    """A byte range of one stored field and where it lands in the caller's memory."""
+
+    ref: StoreRef
+    field: str
+    # Offset in the field's stored bytes.
+    src_offset: int
+    nbytes: int
+    # Offset in the memory the range is read into.
+    dst_offset: int
+
+
 class RawField(msgspec.Struct, frozen=True):
     """A field at the bytes boundary: its dtype name, shape, and bytes."""
 
