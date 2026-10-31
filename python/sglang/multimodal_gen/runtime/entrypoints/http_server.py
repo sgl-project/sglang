@@ -540,7 +540,7 @@ def create_app(
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
-    if server_args.disagg_encode_only:
+    if getattr(server_args, "disagg_encode_only", False):
         app.include_router(encode_api.router)
 
     app.state.server_args = server_args
