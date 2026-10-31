@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -187,4 +192,35 @@ def fused_qk_norm_rope(
         high,
         attention_factor,
         rotary_dim,
+    )
+
+
+@cache_once
+def _rope_with_cache_module(cache_dtype: torch.dtype):
+    args = make_cpp_args(is_arch_support_pdl(), cache_dtype)
+    return load_jit(
+        "fused_qk_norm_rope_with_cache",
+        *args,
+        cuda_files=["elementwise/fused_qknorm_rope.cuh"],
+        extra_cuda_cflags=["-DJIT_HEAD_DIM=128", "-DJIT_INTERLEAVE=0", "-DJIT_YARN=0"],
+        cuda_wrappers=[("run", f"FusedQKNormRoPEWithCache<{args}>::run")],
+    )
+
+
+def fused_qk_norm_rope_with_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> None:
+    """Normalize and rotate Q/K in place; BF16, head size 128, full NeoX RoPE.
+
+    ``positions`` is 1D int64. A BF16 ``cos_sin_cache`` reproduces the Triton
+    MRoPE rotation, an FP32 one reproduces ``apply_rope_with_cos_sin_cache_inplace``.
+    """
+    _rope_with_cache_module(cos_sin_cache.dtype).run(
+        q, k, q_weight, k_weight, cos_sin_cache, positions, eps
     )
