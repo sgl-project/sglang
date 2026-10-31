@@ -1672,6 +1672,11 @@ class HybridCacheController(BaseHiCacheController):
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,
                 )
+        if self.scheduler_agrees_storage:
+            # Recorded even when cancelled or empty: the agreed row needs every
+            # rank's sidecar verdict, and an empty one MIN-reduces to 0 hits.
+            operation.publish_local_sidecar_hits(pool_hits)
+            return
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.

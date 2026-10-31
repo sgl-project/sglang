@@ -91,17 +91,19 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
             _shm_names(),
         ):
             # A row holds 6 ready counts, one more per extra host pool, the storage
-            # agreement FIFO's 2 words and the folded digest's 2 words: 10, 11 and
-            # 12 values here. The shm table holds 10.
+            # agreement FIFOs' 4 words and the folded digest's 2 words: 12, 13 and
+            # 14 values here. The shm table holds 12.
             for extra_pools in (0, 1, 2):
                 cache = _hicache_tp_rank(rank, extra_pools)
                 want = list(range(6 + extra_pools))
                 names = tuple(cache.cache_controller.extra_host_mem_release_queues)
                 got = cache._sync_hicache_ready_counts()
-                assert got == (want[0], want[1], tuple(want[2:]) + (0, 0), names), (
-                    extra_pools,
-                    got,
-                )
+                assert got == (
+                    want[0],
+                    want[1],
+                    tuple(want[2:]) + (0, 0, 0, 0),
+                    names,
+                ), (extra_pools, got)
             exchange = cache._shm_count_exchange()
             assert exchange.seq == 1, f"{exchange.seq} rows went through shm, not 1"
             exchange.close()
