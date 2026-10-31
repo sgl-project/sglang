@@ -2309,8 +2309,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return get_attention_sliding_window_size(config)
+
     def get_attention_sliding_window_size(self):
-        return get_attention_sliding_window_size(self.config)
+        return self.sliding_layer_window_size(self.config)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

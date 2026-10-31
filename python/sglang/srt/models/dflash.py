@@ -1002,8 +1002,12 @@ class DFlashDraftModel(nn.Module):
                 if conv is not None:
                     conv.block_size = self.block_size
 
+    @staticmethod
+    def sliding_layer_window_size(config) -> Optional[int]:
+        return get_dflash_attention_sliding_window_size(config)
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
-        return get_dflash_attention_sliding_window_size(self.config)
+        return self.sliding_layer_window_size(self.config)
 
     def get_input_embeddings(self) -> Optional[VocabParallelEmbedding]:
         return self.embed_tokens

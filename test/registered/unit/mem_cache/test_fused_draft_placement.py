@@ -104,7 +104,10 @@ def _place(profile, num_runners=1, host_names=_HOSTS, target_window=None):
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
-        ctx=PlacementContext(host_names=host_names, target_window=target_window),
+        ctx=PlacementContext(
+            host_names=host_names,
+            target_windows=() if target_window is None else (target_window,),
+        ),
         store_dtype=_DTYPE,
     )
 
@@ -164,9 +167,9 @@ class TestPlaceFusedDraft(CustomTestCase):
         placement = decision.placement
         self.assertIsNotNone(placement, decision.declined)
         self.assertEqual(placement.region("full").lane_num, 2)
-        self.assertEqual(placement.region("draft_swa").lane_num, 1)
+        self.assertEqual(placement.region("swa_64").lane_num, 1)
         self.assertEqual(placement.lanes_for(0, "full"), range(0, 1))
-        self.assertEqual(placement.lanes_for(1, "draft_swa"), range(0, 1))
+        self.assertEqual(placement.lanes_for(1, "swa_64"), range(0, 1))
         self.assertEqual(placement.lanes_for(1, "full"), range(0))
         self.assertEqual(placement.lanes_for(2, "full"), range(1, 2))
 
@@ -199,15 +202,17 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual({s.name for s in plan.sub_pools}, {"full", "swa"})
 
     def test_unmatched_windows_get_independent_bands(self):
-        for window, hosts, name in (
-            (256, _HOSTS, "draft_swa"),
-            (64, _HOSTS, "draft_swa"),
-            (64, ("full", "mamba"), "swa"),
+        # A target without window layers declares no window: the draft's band
+        # takes the name a lone window has.
+        for window, hosts, target_window, name in (
+            (256, _HOSTS, 128, "swa_256"),
+            (64, _HOSTS, 128, "swa_64"),
+            (64, ("full", "mamba"), None, "swa"),
         ):
             decision = _place(
                 _profile(window_layer_ids=(0,), window=window),
                 num_runners=2,
-                target_window=128,
+                target_window=target_window,
                 host_names=hosts,
             )
             placement = decision.placement
@@ -223,10 +228,10 @@ class TestPlaceFusedDraft(CustomTestCase):
             target_window=128,
         )
         self.assertIsNotNone(decision.placement, decision.declined)
-        self.assertEqual(decision.placement.hosts(), ("full", "draft_swa"))
+        self.assertEqual(decision.placement.hosts(), ("full", "swa_256"))
         self.assertNotEqual(
             decision.placement.region("full").head_num,
-            decision.placement.region("draft_swa").head_num,
+            decision.placement.region("swa_256").head_num,
         )
 
     def test_per_depth_head_needs_one_runner_per_depth(self):
@@ -348,9 +353,9 @@ class TestDraftKVProfile(CustomTestCase):
             hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         )
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
-            profile = draft_kv_profile(config, num_layers=2, attn_tp_size=1)
+            profile = draft_kv_profile(config, num_layers=2, attn_tp_size=1, window=128)
         placement = _place(profile, target_window=16).placement
-        for kind, host in ((LAYER_FULL, "full"), (LAYER_WINDOW, "draft_swa")):
+        for kind, host in ((LAYER_FULL, "full"), (LAYER_WINDOW, "swa_128")):
             self.assertIsInstance(profile.kinds[kind].geometry, DraftMLAGeometry)
             self.assertIsInstance(placement.region(host), MLADraftRegion)
 
@@ -364,7 +369,9 @@ class TestDraftKVProfile(CustomTestCase):
 
     def test_heads_are_divided_by_attn_tp(self):
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
-            profile = draft_kv_profile(_config(), num_layers=2, attn_tp_size=2)
+            profile = draft_kv_profile(
+                _config(), num_layers=2, attn_tp_size=2, window=128
+            )
         self.assertEqual(profile.num_depths, 1)
         self.assertEqual(set(profile.kinds), {LAYER_FULL, LAYER_WINDOW})
         full = profile.kinds[LAYER_FULL]
@@ -684,6 +691,28 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
         self.assertEqual(entry_bytes, spec.entry_bytes())
 
 
+class _RawWindowDraft:
+    """A draft architecture whose runner attends over its config's window."""
+
+
+class _MinusOneWindowDraft:
+    """A draft architecture attending over one less than its config's window."""
+
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return config.sliding_window - 1
+
+    def get_attention_sliding_window_size(self):
+        return self.sliding_layer_window_size(self.config)
+
+
+class _InstanceOnlyDraft:
+    """A draft architecture whose window rule reads the built model."""
+
+    def get_attention_sliding_window_size(self):
+        return self.config.sliding_window - 1
+
+
 class TestFusedDraftDecision(CustomTestCase):
     """The target's boot decision over a host whose full sub-pool fuses."""
 
@@ -706,6 +735,9 @@ class TestFusedDraftDecision(CustomTestCase):
         retraction_backup=None,
         draft_parallel_layout=None,
         is_hip=False,
+        resolved_window=128,
+        draft_window=None,
+        draft_cls=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
@@ -713,7 +745,7 @@ class TestFusedDraftDecision(CustomTestCase):
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
         # The window the runner resolved for its layers.
-        cfg.sliding_window_size = 128
+        cfg.sliding_window_size = resolved_window
         cfg.draft_parallel_layout = draft_parallel_layout
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
@@ -748,7 +780,13 @@ class TestFusedDraftDecision(CustomTestCase):
             draft_model_config=SimpleNamespace(
                 model_path="draft-model",
                 revision="test-revision",
-                is_hybrid_swa=False,
+                is_hybrid_swa=draft_window is not None,
+                swa_attention_layer_ids=[0],
+                sliding_window_size=draft_window,
+                attention_chunk_size=None,
+                get_swa_num_kv_heads=lambda tp: max(1, 4 // tp),
+                swa_head_dim=64,
+                swa_v_head_dim=64,
                 is_deepseek_v4_arch=False,
                 num_nextn_predict_layers=None,
                 get_num_kv_heads=lambda tp: max(1, 4 // tp),
@@ -759,7 +797,10 @@ class TestFusedDraftDecision(CustomTestCase):
                 kv_lora_rank=8,
                 qk_rope_head_dim=4,
                 hf_config=draft_hf_config
-                or SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"]),
+                or SimpleNamespace(
+                    architectures=["BailingMoeForCausalLMNextN"],
+                    sliding_window=draft_window,
+                ),
             ),
         )
         memory = SimpleNamespace(
@@ -799,11 +840,51 @@ class TestFusedDraftDecision(CustomTestCase):
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
             get_parallel().override(attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
+            patch(
+                "sglang.srt.model_loader.utils.get_model_architecture",
+                return_value=(draft_cls or _RawWindowDraft, "Draft"),
+            ),
         ):
             return cfg._fused_draft_decision()
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_a_draft_window_is_placed_by_the_drafts_own_rule(self):
+        # The target (gpt-oss, Gemma) states 128 and its runner attends over
+        # 127. A draft's window is what its own runner will resolve: its
+        # stated window less one under a -1 rule, the stated window under the
+        # raw rule. Equal to the target's: one lifetime, the target's window
+        # sub-pool. Any other length: a window sub-pool of its own.
+        for draft_cls, stated, host, band in (
+            (_MinusOneWindowDraft, 128, "swa", None),
+            (_RawWindowDraft, 128, None, "swa_128"),
+            (_RawWindowDraft, 127, "swa", None),
+            (_MinusOneWindowDraft, 65, None, "swa_64"),
+            (_RawWindowDraft, 64, None, "swa_64"),
+            (_MinusOneWindowDraft, 257, None, "swa_256"),
+            (_RawWindowDraft, 256, None, "swa_256"),
+        ):
+            with self.subTest(draft=draft_cls.__name__, stated=stated):
+                decision = self._decide(
+                    resolved_window=127, draft_window=stated, draft_cls=draft_cls
+                )
+                placement = decision.placement
+                self.assertIsNotNone(placement, decision.declined)
+                if host is not None:
+                    self.assertEqual(placement.hosts(), (host,))
+                    self.assertEqual(placement.new_bands, {})
+                else:
+                    self.assertEqual(set(placement.new_bands), {band})
+                    self.assertEqual(
+                        placement.new_bands[band].window, int(band.split("_")[1])
+                    )
+
+    def test_a_draft_window_known_only_once_built_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "sliding_layer_window_size"):
+            self._decide(
+                resolved_window=127, draft_window=128, draft_cls=_InstanceOnlyDraft
+            )
 
     def test_fused_placement_uses_resolved_width_for_every_protocol(self):
         from sglang.srt.configs.draft_parallel import DraftParallelLayout
