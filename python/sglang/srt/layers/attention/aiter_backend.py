@@ -10,7 +10,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 import triton
@@ -76,6 +76,11 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+try:
+    from aiter.ops.attention import get_mla_decode_shape_support
+except ImportError:  # aiter before ROCm/aiter#6107; drop once sglang requires it
+    get_mla_decode_shape_support = None
+
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
@@ -114,7 +119,10 @@ _MLA_ASM_PS_MAX_QLEN = 4
 
 # (query head count -> query lengths) at which aiter's scheduler treats the
 # count as native, on gfx950 with an fp8 query and KV. None means any length.
-# This map is copied from natively_supported in aiter/ops/attention.py. See
+# The keys are also the head counts a gathered query may be padded to.
+# Copied from natively_supported in aiter/ops/attention.py; it decides only where
+# aiter cannot: before ROCm/aiter#6107, and on a backend aiter has no kernel table
+# for, where aiter's fold verdict must agree. See
 # https://github.com/ROCm/aiter/blob/bf37db00749722ae29ac27c101f534da43c586f5/aiter/ops/attention.py#L1669-L1706
 _MLA_ASM_CPRR_NATIVE_QLENS = {
     16: None,
@@ -124,18 +132,44 @@ _MLA_ASM_CPRR_NATIVE_QLENS = {
 }
 
 
-def _asm_cprr_supports_shape(heads: int, q_len: int) -> bool:
+def _asm_cprr_supports_shape(
+    heads: int,
+    q_len: int,
+    *,
+    cp_world_size: int,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    v_head_dim: int,
+) -> bool:
     """Whether aiter schedules this head count natively at this query length."""
-    if heads not in _MLA_ASM_CPRR_NATIVE_QLENS:
-        return False
-    allowed = _MLA_ASM_CPRR_NATIVE_QLENS[heads]
-    return allowed is None or q_len in allowed
+    allowed = _MLA_ASM_CPRR_NATIVE_QLENS.get(heads, frozenset())
+    in_table = allowed is None or q_len in allowed
+    if get_mla_decode_shape_support is None:
+        return in_table
+    support = get_mla_decode_shape_support(
+        num_heads=heads,
+        max_seqlen_qo=q_len,
+        q_dtype=fp8_dtype,
+        kv_dtype=fp8_dtype,
+        v_head_dim=v_head_dim,
+        return_lse=True,
+        cp_world_size=cp_world_size,
+        cp_round_robin=True,
+        fast_mode=fast_mode,
+        intra_batch_mode=intra_batch_mode,
+    )
+    # native is aiter's planner verdict on any backend. supported=None means aiter
+    # has no kernel table for the selected backend; then the copied table decides
+    # availability, but never against a fold.
+    if support.supported is None:
+        return support.native and in_table
+    return support.native and support.supported
 
 
-def _asm_cprr_kernel_heads(gathered_heads: int, q_len: int) -> int:
-    """The smallest supported head count at or above the gathered one, or 0."""
+def _asm_cprr_kernel_heads(gathered_heads: int, supports: Callable[[int], bool]) -> int:
+    """The smallest head count at or above the gathered one that supports, or 0."""
     for heads in sorted(_MLA_ASM_CPRR_NATIVE_QLENS):
-        if heads >= gathered_heads and _asm_cprr_supports_shape(heads, q_len):
+        if heads >= gathered_heads and supports(heads):
             return heads
     return 0
 
@@ -445,10 +479,7 @@ class AiterAttnBackend(AttentionBackend):
         # buffer.
         self.cprr_fast_mode = True
         self.cprr_intra_batch_mode = False
-        gathered_heads = self.num_head * self.dcp_world_size
-        self.cprr_kernel_heads = _asm_cprr_kernel_heads(
-            gathered_heads, self.num_draft_tokens or 1
-        )
+        self._cprr_supports_cache: dict[tuple[int, int], bool] = {}
 
         # Get v_head_dim based on model type
         if self.use_mla:
@@ -462,6 +493,21 @@ class AiterAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
+        # Only the MLA DCP target verify reads these. Its absorbed attention
+        # writes the kv_lora_rank-wide latent, not the model's v_head_dim.
+        self.cprr_v_head_dim = (
+            model_runner.model_config.kv_lora_rank if self.use_mla else 0
+        )
+        self.cprr_kernel_heads = (
+            _asm_cprr_kernel_heads(
+                self.num_head * self.dcp_world_size,
+                lambda heads: self._asm_cprr_supports(
+                    heads, self.num_draft_tokens or 1
+                ),
+            )
+            if self.use_mla and self.dcp_world_size > 1
+            else 0
+        )
 
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
         # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
@@ -1437,7 +1483,7 @@ class AiterAttnBackend(AttentionBackend):
         """Whether the asm PS MLA kernels support both decode and target verify."""
         verify_q_len = self.num_draft_tokens or 1
         if self.dcp_world_size > 1:
-            if _asm_cprr_supports_shape(self.cprr_kernel_heads, verify_q_len):
+            if self._asm_cprr_supports(self.cprr_kernel_heads, verify_q_len):
                 return True
             logger.info(
                 "aiter MLA decode and verify stay on the Gluon kernel: the cp "
@@ -1475,9 +1521,25 @@ class AiterAttnBackend(AttentionBackend):
             and self.dcp_world_size > 1
             and self.kv_cache_dtype == fp8_dtype
             and q_len is not None
-            and self.cprr_kernel_heads > 0
-            and _asm_cprr_supports_shape(self.cprr_kernel_heads, q_len)
+            and self._asm_cprr_supports(self.cprr_kernel_heads, q_len)
         )
+
+    def _asm_cprr_supports(self, heads: int, q_len: int) -> bool:
+        """Whether aiter runs the DCP verify natively at this padded head count.
+
+        Cached: target verify asks on every step, and the answer is fixed.
+        """
+        key = (heads, q_len)
+        if key not in self._cprr_supports_cache:
+            self._cprr_supports_cache[key] = heads > 0 and _asm_cprr_supports_shape(
+                heads,
+                q_len,
+                cp_world_size=self.dcp_world_size,
+                fast_mode=self.cprr_fast_mode,
+                intra_batch_mode=self.cprr_intra_batch_mode,
+                v_head_dim=self.cprr_v_head_dim,
+            )
+        return self._cprr_supports_cache[key]
 
     def _mla_decode_fwd_with_head_pad(
         self,
