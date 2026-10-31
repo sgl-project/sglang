@@ -335,6 +335,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
         server_args.num_gpus = 1
+        server_args.scheduler_endpoints = ["tcp://replica-0"]
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
