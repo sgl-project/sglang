@@ -1672,9 +1672,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged
                 and isinstance(merged[-1], dict)
                 and merged[-1].get("role") == "assistant"
+                # Reasoning belongs to a following phased message; only a
+                # phase-less tool call may join the preceding assistant turn.
                 and (
-                    merged[-1].get("phase") == msg.get("phase")
-                    or set(merged[-1]) == {"role", "reasoning_content"}
+                    merged[-1].get("phase") is None
+                    or merged[-1].get("phase") == msg.get("phase")
+                    or (
+                        msg.get("phase") is None
+                        and msg.get("tool_calls")
+                        and merged[-1].get("phase") != "final_answer"
+                    )
                 )
             ):
                 prev = merged[-1] = dict(merged[-1])
