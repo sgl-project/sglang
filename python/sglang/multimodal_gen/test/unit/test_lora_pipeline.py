@@ -300,9 +300,63 @@ def test_merged_lora_still_uses_weight_update_context():
     assert pipeline.is_lora_merged["transformer"]
 
 
+def test_repeated_auto_lora_kept_unmerged_is_skipped():
+    layer = BaseLayerWithLoRA(torch.nn.Linear(64, 96, bias=False, dtype=torch.bfloat16))
+    pipeline = _make_pipeline(layer)
+    g = torch.Generator().manual_seed(0)
+    pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.randn(8, 64, generator=g)
+    pipeline.lora_adapters["adapter"]["linear.lora_B"] = 1e-5 * torch.randn(
+        96, 8, generator=g
+    )
+    pipeline.auto_merge_rounding_loss = {}
+    contexts = []
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: (
+        contexts.append(1) or nullcontext([])
+    )
+
+    def set_auto():
+        with patch(_RANK_PATCH, return_value=0):
+            pipeline.set_lora("adapter", None, target="transformer", merge_mode="auto")
+
+    set_auto()
+    assert not layer.merged  # the update is below a BF16 ulp
+    set_auto()
+    assert not layer.merged
+    assert len(contexts) == 1  # an unchanged request skips the weight update
+
+
+def test_lora_critic_is_covered_by_all_and_packed_checks():
+    pipeline = _make_pipeline(_make_layer())
+    critic = torch.nn.Module()
+    critic.register_parameter(
+        "qweight", torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+    )
+    pipeline.modules["fake_score_transformer"] = critic
+    pipeline.is_target_layer = lambda name: True
+    with pytest.raises(ValueError, match="fake_score_transformer"):
+        pipeline._reject_lora_on_packed_weights()
+
+    critic.disable_offload = critic.enable_offload = lambda: None
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+            "is_layerwise_offloaded_module",
+            side_effect=lambda module: module is critic,
+        ),
+        pipeline._temporarily_disable_offload(
+            target="all", use_module_names_only=True
+        ) as disabled,
+    ):
+        assert disabled == [critic]
+
+
 def test_lora_alpha_override_updates_cached_adapter_scale():
     layer = _make_layer()
     pipeline = _make_pipeline(layer)
+
+    pipeline.load_lora_adapter = lambda path, nickname, rank, lora_alpha: (
+        pipeline.loaded_adapter_alphas.update({nickname: lora_alpha})
+    )
 
     with patch(_RANK_PATCH, return_value=0):
         pipeline.set_lora(
