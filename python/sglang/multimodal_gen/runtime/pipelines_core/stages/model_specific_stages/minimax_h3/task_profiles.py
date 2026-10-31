@@ -23,6 +23,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 
 class MiniMaxH3RequestPolicy(msgspec.Struct, frozen=True):
+    """Release settings shared by request validation, geometry and execution."""
+
     name: str
     aspect_ratios: tuple[str, ...]
     max_pixels: dict[int, int]

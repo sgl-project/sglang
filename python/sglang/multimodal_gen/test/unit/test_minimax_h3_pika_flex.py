@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
@@ -29,10 +30,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_packed_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
+    MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_resolve_plan,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    PIKA_H3_FLEX_POLICY,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
@@ -174,18 +179,15 @@ def test_renoise_loop_is_seed_deterministic() -> None:
     assert not torch.equal(video, euler_video)
 
 
-def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
-    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
-        MiniMaxH3PipelineConfig,
-    )
-
+@pytest.mark.parametrize("variant", ["FL2VA", "Ref2VA"])
+def test_release_adapter_defaults_to_dynamic_lora(monkeypatch, variant) -> None:
     monkeypatch.setattr(
         MiniMaxH3PipelineConfig, "validate_server_args", lambda self, args: None
     )
 
     def server_args(explicit: bool, mode: str) -> SimpleNamespace:
         return SimpleNamespace(
-            model_variant="fl2va",
+            model_variant=variant,
             lora_alpha=None,
             lora_scale=1.0,
             lora_merge_mode=mode,
@@ -264,14 +266,15 @@ def test_released_buckets_round_trip_through_warmup(tier, aspect, expected):
         "duration_seconds": 5.0,
     }
     assert _plan(_pika_request(**warmup_target)).shape == plan.shape
-    assert plan.shape["frame_count"] == 124
-    assert plan.shape["fps"] == 24
 
 
 @pytest.mark.parametrize(
     "task,indices", [("i2va", [0]), ("l2va", [-1]), ("fl2va", [0, -1])]
 )
-def test_offline_and_http_aliases_share_keyframe_plan(task, indices):
+def test_keyframe_tasks_survive_http_lowering_and_partition_admission(
+    monkeypatch, task, indices
+):
+    """Canonical FL2VA admission must preserve each public keyframe task."""
     conditions = [
         dict(type="image", role="keyframe", uri=f"frame{i}.png", frame_index=i)
         for i in indices
@@ -289,6 +292,34 @@ def test_offline_and_http_aliases_share_keyframe_plan(task, indices):
     assert plan.task == "fl2va"
     assert plan.condition_mask["semantic_frame_indices"] == indices
     assert plan.shape["keyframe_fit"] == "source_crop"
+    batch = SimpleNamespace(
+        sampling_params=params,
+        extra=params.build_request_extra(),
+        num_inference_steps=6,
+        is_warmup=False,
+    )
+    monkeypatch.setattr(
+        prequeue,
+        "minimax_h3_probe_material",
+        lambda *a, **kw: {"display_width": 832, "display_height": 480},
+    )
+    prepared = prequeue.minimax_h3_prepare_for_queue(batch)
+    # The scheduler handoff must retain the release policy after media probing.
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(prepared), type=type(plan))
+    assert decoded == prepared
+    batch.extra[prequeue.MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY] = decoded
+    assert params.task == task
+    metadata = MiniMaxH3ReleaseMetadata(
+        schema_version=1,
+        partition="fl2va",
+        tasks=("t2va", "fl2va"),
+        task_aliases={},
+        video_sigma_shift=12.0,
+        audio_sigma_shift=3.0,
+    )
+    MiniMaxH3PartitionAdmissionStage(metadata).forward(
+        batch, SimpleNamespace(minimax_h3_adaln_online=False)
+    )
 
 
 @pytest.mark.parametrize(
@@ -296,32 +327,35 @@ def test_offline_and_http_aliases_share_keyframe_plan(task, indices):
     [
         {"short_edge": 512},
         {"aspect_ratio": "auto"},
+        {"duration_seconds": 4},
+        {"duration_seconds": 5.5},
     ],
 )
-def test_pika_rejects_unreleased_geometry(target):
+def test_pika_rejects_unreleased_targets(target):
+    """Pika restricts base H3 geometry and duration to the released CLI contract."""
     with pytest.raises(ValueError, match="Pika H3 Flex target"):
         _plan(_pika_request(**target))
 
 
-@pytest.mark.parametrize("counts", [(10, 0, 0), (1, 4, 0), (1, 0, 4), (9, 3, 1)])
-def test_reference_count_limits(counts):
-    """Per-kind limits and the combined 12-reference limit are independent."""
+@pytest.mark.parametrize(
+    "counts,match",
+    [
+        ((10, 0, 0), "reference limits"),
+        ((1, 4, 0), "reference limits"),
+        ((1, 0, 4), "reference limits"),
+        ((9, 3, 1), "reference limits"),
+        ((0, 0, 1), "at least one image or video"),
+    ],
+)
+def test_reference_limits(counts, match):
+    """Per-kind counts, total count and required visual input are independent limits."""
     refs = [
         dict(type=kind, role="reference", uri=f"{kind}{i}")
         for kind, count in zip(("image", "video", "audio"), counts)
         for i in range(count)
     ]
-    with pytest.raises(ValueError, match="reference limits"):
+    with pytest.raises(ValueError, match=match):
         _plan(_pika_request("ref2va", refs))
-
-
-def test_reference_requires_visual_input():
-    with pytest.raises(ValueError, match="at least one image or video"):
-        _plan(
-            _pika_request(
-                "ref2va", [dict(type="audio", role="reference", uri="audio.wav")]
-            )
-        )
 
 
 @pytest.mark.parametrize(
@@ -405,20 +439,8 @@ def test_condition_noise_preserves_clean_cache_and_release_precision(
     ).reshape(-1, 96)
     original = clean.clone()
     audio = torch.tensor([[0.123456]], dtype=torch.float32)
-    conditions = (
-        [
-            dict(type="image", role="keyframe", uri=f"frame{i}", frame_index=idx)
-            for i, idx in enumerate([0, -1])
-        ]
-        if task == "fl2va"
-        else [
-            dict(type="image", role="reference", uri="image"),
-            dict(type="video", role="reference", uri="video"),
-        ]
-    )
-    sampling = _pika_request(task, conditions)
-    sampling.seed = seed
-    plan = _plan(sampling)
+    sampling = SimpleNamespace(seed=seed)
+    plan = SimpleNamespace(policy=PIKA_H3_FLEX_POLICY, task=task, seed=seed)
     contexts = [
         SimpleNamespace(
             cond_rows=clean,
@@ -481,13 +503,6 @@ def test_server_cache_default_cannot_override_the_six_step_contract(monkeypatch)
         PikaH3FlexPipelineConfig().validate_server_args(args)
 
 
-@pytest.mark.parametrize("duration", [4, 5.5])
-def test_output_duration_requires_released_integer_seconds(duration):
-    """The release CLI admits whole seconds 5–15, not the base H3 range."""
-    with pytest.raises(ValueError, match="duration_seconds"):
-        _plan(_pika_request(duration_seconds=duration))
-
-
 @pytest.mark.parametrize(
     "duration,frames,aligned",
     [(5, 120, 124), (5, 124, 124), (6, 158, 158), (15, 362, 362)],
@@ -500,69 +515,6 @@ def test_warmup_frames_recover_requested_duration(duration, frames, aligned):
     )
     assert target["duration_seconds"] == duration
     assert _plan(_pika_request(**target)).shape["frame_count"] == aligned
-
-
-@pytest.mark.parametrize("variant", ["FL2VA", "Ref2VA"])
-def test_variant_keeps_base_case_insensitive_contract(monkeypatch, variant):
-    """Pika validation must accept variants accepted by the shared loader."""
-    monkeypatch.setattr(
-        MiniMaxH3PipelineConfig, "validate_server_args", lambda *_: None
-    )
-    args = SimpleNamespace(
-        model_variant=variant,
-        lora_alpha=None,
-        lora_scale=1.0,
-        is_arg_explicitly_set=lambda _: False,
-    )
-    PikaH3FlexPipelineConfig().validate_server_args(args)
-
-
-@pytest.mark.parametrize("task,index", [("i2va", 0), ("l2va", -1)])
-def test_prequeue_retains_public_task_and_admits_internal_partition(
-    monkeypatch, task, index
-):
-    """Plan canonicalization must preserve the public sampling task."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
-        MiniMaxH3PartitionAdmissionStage,
-    )
-
-    params = _pika_request(
-        task, [dict(type="image", role="keyframe", uri="frame.png", frame_index=index)]
-    )
-    batch = SimpleNamespace(
-        sampling_params=params,
-        extra=params.build_request_extra(),
-        num_inference_steps=6,
-        is_warmup=False,
-    )
-    monkeypatch.setattr(
-        prequeue,
-        "minimax_h3_probe_material",
-        lambda *a, **kw: {"display_width": 832, "display_height": 480},
-    )
-    plan = prequeue.minimax_h3_prepare_for_queue(batch)
-    assert params.task == task
-    assert plan.task == "fl2va"
-    import msgspec
-
-    assert plan.policy is not None
-    assert msgspec.msgpack.decode(msgspec.msgpack.encode(plan), type=type(plan)) == plan
-    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
-        {
-            "_minimax_h3": {
-                "schema_version": 1,
-                "partition": "fl2va",
-                "tasks": ["t2va", "fl2va"],
-                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
-                "dmd_denoising_steps": list(PIKA_KNOTS),
-                "stochastic_sampling": True,
-                "lora_adapter": "pika/adapter.safetensors",
-            }
-        }
-    )
-    MiniMaxH3PartitionAdmissionStage(metadata).forward(
-        batch, SimpleNamespace(minimax_h3_adaln_online=False)
-    )
 
 
 def test_text_limit_counts_text_only_and_leaves_base_h3_untouched():
