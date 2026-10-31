@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
+    decode_cuda_graph_max_bs,
     get_disagg,
     get_exec,
     get_memory,
@@ -422,7 +423,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=decode_cuda_graph_max_bs(),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 tp_sync=self._tp_sync,
@@ -665,7 +666,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._defer_context_kv_eligible(static_epilogue_supported):
             return None
         commit = DeferredContextCommit(
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=decode_cuda_graph_max_bs(),
             stride=self.verify_num_draft_tokens,
             device=self.device,
             kv_injector=self._kv_injector,
@@ -707,7 +708,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=decode_cuda_graph_max_bs(),
             device=self.device,
             tp_rank=self._target_tp_rank,
             noise=self._proposer.noise,

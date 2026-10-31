@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.model_executor.cuda_graph_config import decode_capture_max_bs
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -134,10 +135,13 @@ class EagleDraftWorkerBase(ABC):
             if get_exec().graph.cuda_graph_config is not None
             else None
         )
-        max_bs = max(
-            decode_max_bs or 0,
-            get_schedule().max_running_requests or 0,
-            1,
+        # Graph buckets and eager DP padding round the batch up to the
+        # attention-TP alignment; the bound holds before the draft parallel
+        # state exists.
+        max_bs = decode_capture_max_bs(
+            max(decode_max_bs or 0, get_schedule().max_running_requests or 0, 1),
+            tp_size=sa.tp_size,
+            enable_two_batch_overlap=sa.enable_two_batch_overlap,
         )
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.

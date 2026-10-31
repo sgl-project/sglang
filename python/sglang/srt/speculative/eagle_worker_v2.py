@@ -509,7 +509,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         }
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
-        capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
+        capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner, self.topk)
         draft_runner_cls = (
             _select_spec_graph_runner_cls(
                 builtin_runner_cls=lambda: Device2DraftCudaGraphRunner[
@@ -644,6 +644,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and not envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
             and extend_runner_cls is not None
         ):
+            capture_bs, _ = get_batch_sizes_to_capture(
+                self.draft_runner, self.speculative_num_draft_tokens
+            )
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(

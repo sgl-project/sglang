@@ -198,6 +198,21 @@ def default_cuda_graph_config() -> CudaGraphConfig:
     return CudaGraphConfig()
 
 
+def decode_capture_max_bs(
+    max_bs: int, *, tp_size: int, enable_two_batch_overlap: bool
+) -> int:
+    """Upper bound of every decode-family capture bucket at most ``max_bs``.
+
+    Capture pads the top bucket to the request alignment (attention TP x CP,
+    x2 under TBO), so it can exceed the configured max_bs; buffers baked into
+    decode graphs, and budgets they are checked against, size from this bound.
+    ``tp_size`` is the full TP, which bounds attention TP x CP before the
+    parallel state exists, or ``tp_size // attn_dp_size`` when that is known.
+    """
+    alignment = tp_size * (2 if enable_two_batch_overlap else 1)
+    return (max_bs + alignment - 1) // alignment * alignment
+
+
 def _diff_phase(actual: PhaseConfig, baseline: PhaseConfig) -> Dict[str, Any]:
     """Return only fields whose value differs from the per-phase default."""
     return {

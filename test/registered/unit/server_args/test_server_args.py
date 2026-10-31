@@ -743,6 +743,9 @@ class TestPrepareServerArgs(CustomTestCase):
                 speculative_algorithm=algorithm,
                 speculative_num_draft_tokens=draft_tokens,
                 max_running_requests=None,
+                tp_size=1,
+                attn_dp_size=1,
+                enable_two_batch_overlap=False,
             )
 
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(16384)), 16384)
@@ -771,6 +774,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 speculative_num_draft_tokens=6,
                 moe_a2a_backend="megamoe",
                 disaggregation_mode="decode",
+                enable_two_batch_overlap=False,
             )
 
         self.assertEqual(
@@ -780,6 +784,8 @@ class TestPrepareServerArgs(CustomTestCase):
         # The pool is padded to attn TP after the DP divide: 1 -> 8, 36 // 4 = 9 -> 12.
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(8, 1, 1, 4096)), 48)
         self.assertEqual(mega_moe_decode_tokens_per_rank(view(16, 4, 36, 4096)), 72)
+        # An unaligned graph max pads to attn TP 4 like the captured top bucket.
+        self.assertEqual(mega_moe_decode_tokens_per_rank(view(16, 4, 4096, 15)), 96)
 
         with (
             override_platform(is_hip=False),
@@ -4067,6 +4073,19 @@ class TestDeepEPv2Args(CustomTestCase):
                         validate_deepep_v2_dispatch_token_budget(args)
                 else:
                     validate_deepep_v2_dispatch_token_budget(args)
+
+    def test_decode_graph_capacity_counts_padded_top_bucket(self):
+        # max_bs 127 under attn TP 2 captures a 128 bucket.
+        args = self._args(
+            disaggregation_mode="decode",
+            max_running_requests=None,
+            tp_size=4,
+            attn_dp_size=2,
+        )
+        args.cuda_graph_config.decode.max_bs = 127
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(127):
+            with self.assertRaisesRegex(ValueError, "required=128"):
+                validate_deepep_v2_dispatch_token_budget(args)
 
     def test_dp_attention_divides_max_running_requests_per_rank(self):
         args = self._args(
