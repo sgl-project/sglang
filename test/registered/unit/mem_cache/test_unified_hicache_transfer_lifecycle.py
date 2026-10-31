@@ -734,6 +734,50 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 
+    def test_reserved_rows_moved_before_submission_receive_the_load(self):
+        # A queued load-back's window rows stop being fixed once the tree names
+        # them by owner ids; a move before submission is followed by the copy.
+        self._cache(write_policy="write_through", tokens=64)
+        swa = self.allocator.swa_attn_allocator
+        tokens = list(range(1, 17))
+        ids, expected = self._insert(tokens, 100)
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        # Window rows that end up below the load's reservation, freed once the
+        # load is queued so that compaction moves the reserved rows into them.
+        gap = self.allocator.alloc(2 * PAGE)
+        req = self._request(tokens + list(range(17, 21)))
+        verdict = self._adder().add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertIs(verdict, AddReqResult.CONTINUE)
+        (op,) = self.controller.load_queue
+        (window,) = [t for t in op.pool_transfers if t.name == PoolName.SWA]
+        prefix = self.cache.prefix_device_indices(req)
+        owner = prefix[-len(window.device_indices) :].to(torch.int64)
+        self.assertTrue(torch.equal(window.device_indices, owner))
+        # Queued and named by owner ids: nothing of it is fixed any more.
+        self.assertEqual(dict(swa.usage.fixed), {})
+        before = self.rows.swa_rows(owner)
+        self.allocator.free(gap)
+        moves = []
+        _record_moves(self.allocator, moves)
+        with _recorded_stream():
+            self.assertGreater(swa._flush(urgent=True), 0)
+        self.assertIn(("move", "swa"), moves)
+        after = self.rows.swa_rows(owner)
+        self.assertFalse(torch.equal(before, after))
+        self.cache.ready_to_load_host_cache()
+        self.cache.loading_check()
+        full, swa_rows = self.rows.read(self.cache.prefix_device_indices(req))
+        self.assertTrue(torch.equal(full, expected[0]))
+        self.assertTrue(
+            torch.equal(swa_rows[-self.window :], expected[1][-self.window :])
+        )
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+        self.cache.sanity_check()
+
 
 class TestWritePolicySwitch(_UnifiedHiCacheCase):
     """Attaching storage with write_through over a write_back host tree."""
