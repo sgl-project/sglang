@@ -771,6 +771,17 @@ class WeightsUpdater:
                 )
                 updated += len(layer_sections)
 
+        if updated:
+            # The synced adapter replaces whatever set_lora applied to this module.
+            lora_pipeline.is_lora_merged[target_module] = merge_weights
+            for state in (
+                lora_pipeline.cur_adapter_name,
+                lora_pipeline.cur_adapter_path,
+                lora_pipeline.cur_adapter_strength,
+                lora_pipeline.cur_adapter_config,
+            ):
+                state.pop(target_module, None)
+
         gc.collect()
         torch.cuda.empty_cache()
 
