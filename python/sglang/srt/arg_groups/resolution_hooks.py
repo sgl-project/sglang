@@ -24,6 +24,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "default_unset_prefill_decode_interval",
         "validate_response_store",
         "validate_sampling_mask_max_tokens",
+        "handle_aux_hidden_state_capture",
         "validate_prefill_cp_platform",
         "handle_hardware_runtime_validation",
         "handle_model_source_paths",
@@ -46,6 +47,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_npu_backends",
         "handle_mps_backends",
         "handle_xpu_backends",
+        "handle_sail_backends",
         "handle_symm_mem_device_support",
         "handle_platform_defaults",
         "handle_gpu_memory_settings",
@@ -94,6 +96,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_other_validations",
         "handle_model_capability_adjustments",
         "handle_monokernel",
+        "handle_nvidia_megakernel",
         "validate_deepep_v2_speculative_draft",
         "validate_deepep_v2_dispatch_token_budget",
     }

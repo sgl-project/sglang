@@ -19,7 +19,7 @@ MLP layers.
 """
 
 import logging
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, Optional, cast
 
 import torch
 from torch import nn
@@ -562,27 +562,6 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
-        )
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: Optional[torch.Tensor] = None,
-    ):
-        positions_device = (
-            input_embeds.device if input_embeds is not None else input_ids.device
-        )
-        positions = self._prepare_positions(positions, positions_device)
-        return super().forward_split_prefill(
-            input_ids,
-            positions,
-            forward_batch,
-            split_interval,
-            input_embeds,
         )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:

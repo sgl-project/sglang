@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.dsa import triton_kernel
+from sglang.kernels.ops.quantization import act_quant_triton
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -19,7 +19,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _eager(method):
@@ -285,7 +285,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
                 torch.cuda, "current_stream", side_effect=lambda: streams.current
             ),
             patch.object(torch.cuda, "stream", side_effect=streams.use),
-            patch.object(triton_kernel, "act_quant", side_effect=quant),
+            patch.object(act_quant_triton, "act_quant", side_effect=quant),
         ):
             actual = IndexerKPool._forward_cuda_impl(
                 indexer, x, x, torch.arange(num_tokens), batch, 0, return_indices
