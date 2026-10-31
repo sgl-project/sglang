@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import os
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -439,6 +440,8 @@ def _assign_direct_gpu_vae_state(
     component_name: str,
     device: torch.device,
     vae_config: VAEConfig,
+    key_filter: Callable[[str], bool] | None = None,
+    key_mapper: Callable[[str], str] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
     num_deparameterized = adopt_plain_weight_norm_state(
@@ -450,9 +453,9 @@ def _assign_direct_gpu_vae_state(
     metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for raw_name, tensor in safetensors_weights_iterator(
-            weight_files, to_cpu=device.type == "cpu"
+            weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
         ):
-            name = raw_name
+            name = key_mapper(raw_name) if key_mapper is not None else raw_name
             if name in metadata_names:
                 metadata[name] = tensor
                 continue
@@ -662,17 +665,6 @@ class VAELoader(WeightOverrideComponentLoader):
             vae = current_platform.optimize_vae(vae)
             return vae
 
-        # Load from ModelRegistry (standard VAE classes)
-        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        vae = initialize_model(
-            vae_cls,
-            {"config": vae_config},
-            vae_dtype,
-            torch.device("meta") if direct_gpu_weight_loading else None,
-        )
-        if not direct_gpu_weight_loading:
-            vae = vae.to(target_device)
-
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
                 raise ValueError(
@@ -700,13 +692,41 @@ class VAELoader(WeightOverrideComponentLoader):
         assert len(safetensors_list) >= 1, (
             f"Found no safetensors files in {component_weights_path}"
         )
-        if direct_gpu_weight_loading:
+        # Load from ModelRegistry (standard VAE classes)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        # A model hook may validate a serialized checkpoint and return a
+        # configurator to apply on meta before streaming mixed-dtype weights.
+        prepare_checkpoint_load = getattr(vae_cls, "prepare_checkpoint_load", None)
+        configure_checkpoint = (
+            prepare_checkpoint_load(safetensors_list, vae_dtype)
+            if prepare_checkpoint_load is not None
+            else None
+        )
+        stream_checkpoint = (
+            direct_gpu_weight_loading or configure_checkpoint is not None
+        )
+        vae = initialize_model(
+            vae_cls,
+            {"config": vae_config},
+            vae_dtype,
+            torch.device("meta") if stream_checkpoint else None,
+        )
+        if configure_checkpoint is not None:
+            configure_checkpoint(vae)
+        if not stream_checkpoint:
+            vae = vae.to(target_device)
+
+        checkpoint_key_filter = getattr(vae, "checkpoint_key_filter", None)
+        checkpoint_key_mapper = getattr(vae, "checkpoint_key_mapper", None)
+        if stream_checkpoint:
             adaptations = _assign_direct_gpu_vae_state(
                 vae,
                 safetensors_list,
                 component_name=component_name,
                 device=target_device,
                 vae_config=vae_config,
+                key_filter=checkpoint_key_filter,
+                key_mapper=checkpoint_key_mapper,
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
@@ -722,7 +742,19 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(_load_safetensors_file(sf_path))
+            state = _load_safetensors_file(sf_path)
+            if checkpoint_key_filter is not None:
+                state = {
+                    name: tensor
+                    for name, tensor in state.items()
+                    if checkpoint_key_filter(name)
+                }
+            if checkpoint_key_mapper is not None:
+                state = {
+                    checkpoint_key_mapper(name): tensor
+                    for name, tensor in state.items()
+                }
+            loaded.update(state)
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()

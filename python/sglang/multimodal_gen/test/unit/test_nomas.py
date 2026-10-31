@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weightless Nomas tests: DiT segment session, pipeline stages and request contracts."""
 
+import json
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.nomas import NomasArchConfig, NomasConfig
@@ -16,6 +19,30 @@ from sglang.multimodal_gen.configs.models.vaes.nomas import (
 from sglang.multimodal_gen.configs.pipeline_configs.nomas import (
     NomasPipelineConfig,
     nomas_postprocess_text,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+    Fp8Config,
+    _quantize_block_fp8_activation,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
+from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+    FP8_CHECKPOINT_FORMAT,
+    Fp8Linear,
+    NomasInt8Config,
+    QuantoInt8Linear,
+    configure_nomas_int8,
+    inspect_nomas_fp8_checkpoint,
+    inspect_nomas_int8_checkpoint,
+)
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
 from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
@@ -66,6 +93,170 @@ def tiny_model(device="cpu", backend="sdpa"):
             else:
                 p.normal_(0, 0.02)
     return model.to(device)
+
+
+@torch.inference_mode()
+def test_int8_checkpoint_roundtrip_matches_dequantized_dit(tmp_path):
+    """Official key aliases and mixed-dtype loading must retain full DiT output."""
+    from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+    from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+
+    reference = tiny_model().bfloat16()
+    state = reference.state_dict()
+    targets = (
+        "time_in.mlp.0",
+        "txt_in.input_embedder",
+        "double_blocks.0.img_attn_q",
+        "double_blocks.0.img_mlp.fc_in",
+        "double_blocks.0.img_mlp.fc_out",
+        "double_blocks.0.img_mod.linear",
+    )
+    manifest = {}
+    generator = torch.Generator().manual_seed(789)
+    for name in targets:
+        weight = state.pop(name + ".weight")
+        out_features, in_features = weight.shape
+        scales = (
+            torch.rand(out_features, in_features // 128, generator=generator) * 0.001
+            + 0.0001
+        )
+        quantized = torch.randint(
+            -127, 128, weight.shape, generator=generator, dtype=torch.int8
+        )
+        dequantized = (
+            (quantized.float().reshape(out_features, -1, 128) * scales[..., None])
+            .reshape_as(weight)
+            .bfloat16()
+        )
+        dict(reference.named_parameters())[name + ".weight"].copy_(dequantized)
+        source_name = name.replace(".fc_in", ".fc1").replace(".fc_out", ".fc2")
+        state[source_name + ".weight_q"] = quantized
+        state[source_name + ".weight_scale"] = scales
+        manifest[source_name] = list(weight.shape)
+    path = tmp_path / "nomas-int8.safetensors"
+    save_file(
+        state,
+        path,
+        metadata={
+            "format": "nomas-int8-bf16-single-v1",
+            "group_size": "128",
+            "quantization": "symmetric_int8_absmax",
+            "compute_dtype": "bfloat16",
+            "rounding": "half_away_from_zero",
+            "model_type": "HY-Nomas-G/2-32324-MMDiT",
+            "layers": json.dumps(manifest),
+        },
+    )
+    quant = NomasTransformer3DModel.resolve_checkpoint_quantization([path])
+    with pytest.raises(ValueError, match="one complete safetensors file"):
+        NomasTransformer3DModel.resolve_checkpoint_quantization([path, path])
+    spec = resolve_transformer_quant_load_spec(
+        hf_config={},
+        server_args=SimpleNamespace(quantization=None, nunchaku_config=None),
+        safetensors_list=[str(path)],
+        component_model_path=str(tmp_path),
+        model_cls=NomasTransformer3DModel,
+        cls_name="NomasTransformer3DModel",
+        checkpoint_quant_config=quant,
+    )
+    quant = spec.quant_config
+    assert isinstance(quant, NomasInt8Config)
+    assert set(quant.layer_shapes) == set(targets)
+    loaded = maybe_load_fsdp_model(
+        NomasTransformer3DModel,
+        {
+            "config": NomasConfig(arch_config=reference.config),
+            "quant_config": quant,
+            "attention_backend": "sdpa",
+        },
+        [str(path)],
+        torch.device("cpu"),
+        1,
+        1,
+        None,
+        torch.float32,
+        component_starts_on_cpu=True,
+        pin_cpu_memory=False,
+        strict=True,
+        weight_load_plan=WeightLoadPlan(checkpoint_load_device=torch.device("cpu")),
+    )
+    scales_before = {
+        name: module.weight_scale.clone()
+        for name, module in loaded.named_modules()
+        if hasattr(module, "weight_scale")
+    }
+    # The loader sets mixed parameter dtypes; residency only moves devices.
+    loaded.to("cpu")
+    for name, scales in scales_before.items():
+        layer = loaded.get_submodule(name)
+        assert layer.weight.dtype == torch.int8
+        assert layer.weight_scale.dtype == torch.float32
+        assert torch.equal(layer.weight_scale, scales)
+    latent = torch.randn(1, 32, 2, 2, 2, generator=generator).bfloat16()
+    cond = condition(dtype=torch.bfloat16)
+    timestep = torch.tensor([0.5], dtype=torch.bfloat16)
+
+    def predict(model):
+        return model(
+            latent,
+            cond.text_states,
+            timestep,
+            text_mask=cond.text_mask,
+            cache=model.allocate_cache(32),
+        )
+
+    torch.testing.assert_close(predict(loaded), predict(reference), rtol=0, atol=0)
+
+
+def test_int8_transformer_loader_rejects_fsdp(tmp_path):
+    """Checkpoint detection must reject FSDP before allocating a Nomas DiT."""
+    path = tmp_path / "nomas-int8.safetensors"
+    save_file(
+        {
+            "double_blocks.0.img_mlp.fc1.weight_q": torch.zeros(
+                2, 128, dtype=torch.int8
+            ),
+            "double_blocks.0.img_mlp.fc1.weight_scale": torch.ones(2, 1),
+        },
+        path,
+        metadata={
+            "format": "nomas-int8-bf16-single-v1",
+            "group_size": "128",
+            "quantization": "symmetric_int8_absmax",
+            "compute_dtype": "bfloat16",
+            "rounding": "half_away_from_zero",
+            "model_type": "HY-Nomas-G/2-32324-MMDiT",
+            "layers": json.dumps({"double_blocks.0.img_mlp.fc1": [2, 128]}),
+        },
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"_class_name": "NomasTransformer3DModel"})
+    )
+    args = SimpleNamespace(
+        component_weights_paths={},
+        component_quantizations={},
+        component_quantization_ignored_layers={},
+        transformer_weights_path=None,
+        quantization=None,
+        nunchaku_config=None,
+        model_paths={},
+        pipeline_config=SimpleNamespace(
+            dit_config=NomasConfig(), transformer_class_override=None
+        ),
+        should_start_component_on_cpu=lambda _: True,
+        should_use_fsdp_for_component=lambda _: True,
+    )
+    # Use real checkpoint discovery, model hook, resolver and capability check.
+    # Model allocation is forbidden: the error must happen before loading weights.
+    with (
+        patch.object(
+            NomasTransformer3DModel,
+            "__init__",
+            side_effect=AssertionError("FSDP must be rejected before model allocation"),
+        ),
+        pytest.raises(ValueError, match="nomas_int8 does not support FSDP"),
+    ):
+        TransformerLoader().load_customized(str(tmp_path), args, "transformer")
 
 
 def condition(device="cpu", dtype=torch.float32, padded=True):
@@ -320,17 +511,17 @@ def test_conditions_are_effective_and_meta_loading_restores_buffers():
     cond = condition()
     latent = torch.randn(1, 32, 2, 2, 2)
     cache = model.allocate_cache(64)
-    kwargs = dict(
-        hidden_states=latent,
-        timestep=torch.tensor([600.0]),
-        encoder_hidden_states=cond.text_states,
-        text_mask=cond.text_mask,
-        camera_embedding=cond.camera_embedding,
-        camera_has_mask=cond.camera_has_mask,
-        text_offsets=cond.text_offsets,
-        video_windows=cond.video_windows,
-        cache=cache,
-    )
+    kwargs = {
+        "hidden_states": latent,
+        "timestep": torch.tensor([600.0]),
+        "encoder_hidden_states": cond.text_states,
+        "text_mask": cond.text_mask,
+        "camera_embedding": cond.camera_embedding,
+        "camera_has_mask": cond.camera_has_mask,
+        "text_offsets": cond.text_offsets,
+        "video_windows": cond.video_windows,
+        "cache": cache,
+    }
     baseline, entries = model.predict(**kwargs, collect_cache=True)
     assert baseline.abs().max() > 0.01
     for name in ("hidden_states", "encoder_hidden_states", "camera_embedding"):
@@ -459,12 +650,12 @@ def test_action_head_only_without_intra_segment_windows():
 def test_segment_context_reuse_matches_rebuilding_every_prediction(monkeypatch, evict):
     model = tiny_model()
     cond = condition()
-    options = dict(
-        cache_capacity=32,
-        seed=7,
-        steps=3,
-        max_cache_segments=1 if evict else None,
-    )
+    options = {
+        "cache_capacity": 32,
+        "seed": 7,
+        "steps": 3,
+        "max_cache_segments": 1 if evict else None,
+    }
     reference = NomasLatentSession(model, **options)
     optimized = NomasLatentSession(model, **options)
     for session in (reference, optimized):
@@ -649,7 +840,6 @@ def test_pixelumm_fused_qk_norm_mrope_is_bitwise_exact(tokens, heads, batch):
 
 
 def test_scheduler_loader_uses_effective_shift(tmp_path):
-    import json
 
     from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
         SchedulerLoader,
@@ -835,3 +1025,443 @@ def test_latent_preparation_preserves_offline_noise_and_skips_online_draw(online
         expected = LatentPreparationStage(scheduler, None).forward(request(), args)
         torch.testing.assert_close(result.latents, expected.latents, atol=0, rtol=0)
         assert torch.equal(result.generator.get_state(), expected.generator.get_state())
+
+
+def _fp8_linear(in_features, out_features, device=None):
+    with torch.device(device or "cpu"):
+        return Fp8Linear(
+            in_features,
+            out_features,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+                activation_block_size=(128, 128),
+            ),
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="requires SM89+ FP8 tensor cores",
+)
+@pytest.mark.parametrize("tokens", [1, 127, 128, 129, 257])
+@torch.inference_mode()
+def test_pixelumm_fp8_linear_quantized_reference(tokens):
+
+    torch.manual_seed(17)
+    layer = _fp8_linear(256, 256, device="cuda").eval()
+    weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) / 16
+    layer.weight.data, weight_scales = _quantize_block_fp8_activation(weight)
+    layer.weight_scale_inv.data = weight_scales[::128].contiguous()
+    # Noncontiguous, higher-rank input also exercises flatten/reshape behavior.
+    x = torch.randn(1, 256, tokens, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    output = layer(x)
+    q, scales = _quantize_block_fp8_activation(x.reshape(tokens, 256))
+    a = q.float() * scales.repeat_interleave(128, dim=1)
+    b = layer.weight.float() * layer.weight_scale_inv.repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    reference = (a @ b.T).bfloat16().reshape(1, tokens, 256)
+    assert output.dtype == torch.bfloat16
+    # FP8 GEMM scales each K block before FP32 accumulation; BF16 rounding
+    # can differ from multiplying fully dequantized operands once.
+    torch.testing.assert_close(output, reference, rtol=0.008, atol=0.008)
+
+
+@pytest.mark.skipif(not is_nvidia_cuda, reason="requires CUDA transfers")
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_fp8_transfer_preserves_bytes_and_blocking_semantics(non_blocking):
+    model = torch.nn.Sequential(_fp8_linear(256, 256)).eval()
+    layer = model[0]
+    layer.weight.data = torch.randn(256, 256).to(torch.float8_e4m3fn).pin_memory()
+    layer.weight_scale_inv.data = torch.full((2, 2), 0.01003).pin_memory()
+    expected = {name: value.clone() for name, value in model.named_parameters()}
+    stream = torch.cuda.Stream()
+    ready = torch.cuda.Event()
+    with torch.cuda.stream(stream):
+        # A blocking copy would also wait for this preceding stream work.
+        torch.cuda._sleep(100_000_000)
+        ready.record()
+        model.to("cuda", dtype=torch.bfloat16, non_blocking=non_blocking)
+    assert ready.query() is (not non_blocking)
+    stream.synchronize()
+    for name, value in model.named_parameters():
+        assert value.is_cuda
+        assert value.dtype == expected[name].dtype
+        assert torch.equal(
+            value.cpu().view(torch.uint8), expected[name].view(torch.uint8)
+        )
+    model.cpu().bfloat16().half().float()
+    for name, value in model.named_parameters():
+        assert value.dtype == expected[name].dtype
+        assert torch.equal(value.view(torch.uint8), expected[name].view(torch.uint8))
+
+
+@pytest.fixture
+def checkpoint(tmp_path):
+    checkpoint = SimpleNamespace(path=tmp_path / "model.safetensors")
+    checkpoint.config = NomasVAEConfig(
+        arch_config=NomasVAEArchConfig(
+            hidden_size=128,
+            intermediate_size=256,
+            num_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=32,
+        )
+    )
+    checkpoint.original = NomasPixelUMMDecoder(checkpoint.config).bfloat16().eval()
+    checkpoint.state = dict(checkpoint.original.state_dict())
+    checkpoint.sources = []
+    for name in checkpoint.original.fp8_quantized_layer_names():
+        weight = checkpoint.state.pop(name + ".weight")
+        checkpoint.state[name + ".fp8_weight"] = weight.to(torch.float8_e4m3fn)
+        checkpoint.state[name + ".fp8_scale"] = torch.full(
+            (weight.shape[0] // 128, weight.shape[1] // 128), 0.01003
+        )
+        checkpoint.sources.append(name + ".weight")
+    # Official complete files contain an encoder unused by generation.
+    checkpoint.state["encoder.project_in.conv.conv.bias"] = torch.zeros(
+        32, dtype=torch.bfloat16
+    )
+    checkpoint.metadata = {
+        "format": FP8_CHECKPOINT_FORMAT,
+        "block_size": "128",
+        "weight_dtype": "float8_e4m3fn",
+        "scale_dtype": "float32",
+        "unquantized_float_dtype": "bfloat16",
+        "quantized_layers": "5",
+        "quantized_source_keys": json.dumps(checkpoint.sources),
+    }
+
+    def load(
+        direct=False,
+        model_cls=NomasPixelUMMDecoder,
+        runtime_device="cuda:0",
+        capability=(8, 9),
+        hip=None,
+    ):
+        save_file(checkpoint.state, checkpoint.path, metadata=checkpoint.metadata)
+        pipeline = SimpleNamespace(
+            vae_config=checkpoint.config,
+            vae_precision="bf16",
+            native_only_components=("vae",),
+        )
+        args = SimpleNamespace(
+            pipeline_config=pipeline,
+            component_precisions={},
+            component_weights_paths={},
+            model_paths={},
+            should_direct_gpu_weight_load_component=lambda _: direct,
+            should_start_component_on_cpu=lambda _: True,
+        )
+        loader = VAELoader()
+        # The config file is external to the weights-only release.
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader.get_diffusers_component_config",
+                return_value={"_class_name": "NomasPixelUMMDecoder"},
+            ),
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            # These tests materialize on CPU while emulating the execution GPU.
+            patch(
+                "sglang.multimodal_gen.runtime.loader.nomas_weights.get_local_torch_device",
+                return_value=torch.device(runtime_device),
+            ),
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=capability),
+            patch("torch.version.hip", hip),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader.ModelRegistry.resolve_model_cls",
+                return_value=(model_cls, None),
+            ),
+        ):
+            return loader.load_customized(str(checkpoint.path), args, "vae").eval()
+
+    checkpoint.load = load
+    return checkpoint
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_complete_checkpoint_load_and_offload_dtype_roundtrip(checkpoint, direct):
+    """Meta assignment must retain FP8/FP32 and ignore only the unused encoder."""
+
+    # Inherited checkpoint hooks must work for registered model aliases too.
+    class AliasedPixelUMMDecoder(NomasPixelUMMDecoder):
+        pass
+
+    model = checkpoint.load(direct, model_cls=AliasedPixelUMMDecoder)
+    model.bfloat16().to("cpu")
+    state = model.state_dict()
+    assert not any(t.is_meta for t in state.values())
+    for name, value in state.items():
+        source = name.replace(".weight_scale_inv", ".fp8_scale")
+        if source not in checkpoint.state:
+            source = name.removesuffix(".weight") + ".fp8_weight"
+        expected = checkpoint.state[source if source in checkpoint.state else name]
+        assert value.dtype == expected.dtype
+        torch.testing.assert_close(value.float(), expected.float(), rtol=0, atol=0)
+    assert sum(isinstance(m, Fp8Linear) for m in model.modules()) == 5
+
+
+@pytest.mark.parametrize(
+    "runtime_device,capability,hip",
+    [
+        ("cpu", (8, 9), None),
+        ("cuda:0", (8, 0), None),
+        ("cuda:0", (9, 0), "6.4"),
+    ],
+)
+def test_fp8_rejects_unsupported_execution_device_before_model_creation(
+    checkpoint, runtime_device, capability, hip
+):
+    """Unsupported FP8 execution must fail at load, before allocating the VAE."""
+    with patch(
+        "sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader.initialize_model",
+        side_effect=AssertionError("VAE must not be allocated on unsupported hardware"),
+    ):
+        with pytest.raises(RuntimeError, match="NVIDIA CUDA GPU with SM89"):
+            checkpoint.load(
+                runtime_device=runtime_device, capability=capability, hip=hip
+            )
+
+
+def test_rejects_missing_scale_and_invalid_scale_values(checkpoint):
+    """Partial or corrupt serialized blocks must fail before inference."""
+    name = checkpoint.sources[0].removesuffix(".weight") + ".fp8_scale"
+    scale = checkpoint.state.pop(name)
+    save_file(checkpoint.state, checkpoint.path, metadata=checkpoint.metadata)
+    with pytest.raises(ValueError, match="Incomplete"):
+        inspect_nomas_fp8_checkpoint([checkpoint.path])
+    checkpoint.state[name] = scale.fill_(float("nan"))
+    save_file(checkpoint.state, checkpoint.path, metadata=checkpoint.metadata)
+    with pytest.raises(ValueError, match="finite and positive"):
+        inspect_nomas_fp8_checkpoint([checkpoint.path])
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_bf16_checkpoint_ignores_encoder_but_keeps_decoder_strict(checkpoint, direct):
+    """Encoder filtering also applies to ordinary and direct BF16 loads."""
+    original = dict(checkpoint.original.state_dict())
+    original["encoder.project_in.conv.conv.bias"] = torch.zeros(
+        32, dtype=torch.bfloat16
+    )
+    checkpoint.metadata = {}
+    checkpoint.state = original
+    model = checkpoint.load(direct)
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, original[name], rtol=0, atol=0)
+    key = "decoder.layers.0.attn.k_proj.weight"
+    weight = checkpoint.state.pop(key)
+    with pytest.raises((RuntimeError, ValueError), match="[Mm]issing"):
+        checkpoint.load(direct)
+    checkpoint.state[key] = weight
+    checkpoint.state["decoder.unknown.weight"] = torch.zeros(1, dtype=torch.bfloat16)
+    with pytest.raises((RuntimeError, ValueError), match="[Uu]nexpected"):
+        checkpoint.load(direct)
+
+
+def test_rejects_incomplete_manifest(checkpoint):
+    """A self-consistent partial manifest must not silently leave BF16 projections."""
+    checkpoint.metadata["quantized_source_keys"] = json.dumps(checkpoint.sources[:-1])
+    checkpoint.metadata["quantized_layers"] = "4"
+    name = checkpoint.sources[-1].removesuffix(".weight")
+    del checkpoint.state[name + ".fp8_weight"], checkpoint.state[name + ".fp8_scale"]
+    with pytest.raises(ValueError, match="manifest"):
+        checkpoint.load()
+
+
+def test_rejects_missing_decoder_parameters(checkpoint):
+    """Ignoring the unused encoder must not weaken decoder completeness checks."""
+    del checkpoint.state["decoder.layers.0.attn.k_proj.weight"]
+    with pytest.raises(ValueError, match="missing tensors"):
+        checkpoint.load()
+
+
+@pytest.mark.parametrize("block_m", [16, 128])
+@pytest.mark.parametrize("tail", [-1, 0, 1])
+def test_activation_scale_is_shared_across_token_blocks(block_m, tail):
+    """The next token block gets independent scales even for a partial block."""
+    tokens = block_m + tail
+    x = torch.ones(tokens, 256, dtype=torch.bfloat16)
+    x[0, 0] = 224
+    x[-1, 128] = 448
+    q, scales = _quantize_block_fp8_activation(x, (block_m, 128))
+    torch.testing.assert_close(scales[0, 0], torch.tensor(0.5))
+    torch.testing.assert_close(q[0, 0].float(), torch.tensor(448.0))
+    torch.testing.assert_close(scales[-1, 1], torch.tensor(1.0))
+    if tail == 1:
+        torch.testing.assert_close(scales[-1, 0], torch.tensor(1 / 448))
+        torch.testing.assert_close(q[-1, 0].float(), torch.tensor(448.0))
+    else:
+        torch.testing.assert_close(scales[:, 0], torch.full((tokens,), 0.5))
+
+
+@pytest.fixture
+def int8_layer():
+    layer = QuantoInt8Linear(
+        130,
+        2,
+        bias=True,
+        params_dtype=torch.bfloat16,
+        quant_config=NomasInt8Config({"projection": [2, 130]}),
+        prefix="projection",
+    )
+    with torch.no_grad():
+        layer.weight.fill_(127)
+        layer.weight_scale.copy_(torch.tensor([[0.01003, 0.02007], [0.03009, 0.04013]]))
+        layer.bias.copy_(torch.tensor([0.5, -0.5]))
+    return layer
+
+
+def test_int8_group_boundary_and_partial_final_group(int8_layer):
+    inputs = torch.zeros(2, 130, dtype=torch.bfloat16)
+    inputs[0, 127] = 1
+    inputs[1, 128] = 1
+    expected = (127 * int8_layer.weight_scale).bfloat16().T + int8_layer.bias
+    torch.testing.assert_close(int8_layer(inputs), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "cls", [torch.nn.Linear, ColumnParallelLinear, RowParallelLinear]
+)
+def test_int8_dtype_moves_preserve_scales_and_output(int8_layer, cls):
+    model = tiny_model().bfloat16()
+    kwargs = {} if cls is torch.nn.Linear else {"params_dtype": torch.bfloat16}
+    model.projection = cls(130, 2, bias=True, **kwargs)
+    model.camera = torch.nn.Linear(64, 64, dtype=torch.bfloat16)
+    camera = model.camera
+    configure_nomas_int8(model, NomasInt8Config({"projection": [2, 130]}))
+    assert model.camera is camera
+    layer = model.projection
+    if cls is not torch.nn.Linear:
+        assert type(layer) is cls
+    with torch.no_grad():
+        for name, value in int8_layer.named_parameters():
+            getattr(layer, name).copy_(value)
+    loader = layer.weight_scale.weight_loader
+    inputs = torch.ones(1, 130, dtype=torch.bfloat16)
+    expected = int8_layer(inputs)
+    for dtype in (torch.bfloat16, torch.float16, torch.bfloat16):
+        model.to(device="cpu", dtype=dtype)
+        assert layer.weight.dtype == torch.int8
+        assert layer.weight_scale.dtype == torch.float32
+        assert layer.weight_scale.weight_loader == loader
+        torch.testing.assert_close(
+            layer.weight_scale, int8_layer.weight_scale, rtol=0, atol=0
+        )
+    output = layer(inputs)
+    torch.testing.assert_close(
+        output if cls is torch.nn.Linear else output[0], expected, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "key,value,error",
+    [
+        ("group_size", "64", "group_size"),
+        ("compute_dtype", "float16", "compute_dtype"),
+        ("layers", json.dumps({"projection": [2, 256]}), "shape/dtype mismatch"),
+        ("missing_scale", None, "manifest does not match"),
+    ],
+)
+def test_int8_rejects_incompatible_checkpoint(tmp_path, int8_layer, key, value, error):
+    metadata = {
+        "format": "nomas-int8-bf16-single-v1",
+        "group_size": "128",
+        "quantization": "symmetric_int8_absmax",
+        "compute_dtype": "bfloat16",
+        "rounding": "half_away_from_zero",
+        "model_type": "HY-Nomas-G/2-32324-MMDiT",
+        "layers": json.dumps({"projection": [2, 130]}),
+    }
+    tensors = {
+        "projection.weight_q": int8_layer.weight,
+        "projection.weight_scale": int8_layer.weight_scale,
+    }
+    if key == "missing_scale":
+        del tensors["projection.weight_scale"]
+    else:
+        metadata[key] = value
+    path = tmp_path / "weights.safetensors"
+    save_file(tensors, path, metadata=metadata)
+    with pytest.raises(ValueError, match=error):
+        inspect_nomas_int8_checkpoint(path)
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_int8_rejects_invalid_scales(int8_layer, value):
+    with torch.no_grad():
+        int8_layer.weight_scale[0, 0] = value
+    with pytest.raises(ValueError, match="finite and positive"):
+        int8_layer.quant_method.process_weights_after_loading(int8_layer)
+
+
+def test_int8_rejects_non_bf16_input(int8_layer):
+    with pytest.raises(TypeError, match="BF16 input"):
+        int8_layer(torch.zeros(1, 130))
+
+
+@pytest.mark.parametrize("cls", [ColumnParallelLinear, RowParallelLinear])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_parallel_weight_loaders_preserve_group_scales(cls, rank):
+    """Row TP shards scales along groups; column TP shards along outputs."""
+    weight = (torch.arange(4 * 256).reshape(4, 256) % 255 - 127).to(torch.int8)
+    scales = torch.arange(1, 9, dtype=torch.float32).reshape(4, 2) * 0.01003
+    full = (
+        (weight.float().reshape(4, 2, 128) * scales[..., None])
+        .reshape(4, 256)
+        .bfloat16()
+    )
+    inputs = torch.ones(3, 256, dtype=torch.bfloat16)
+    kwargs = (
+        {"gather_output": False}
+        if cls is ColumnParallelLinear
+        else {"input_is_parallel": True, "reduce_results": False}
+    )
+    layer = cls(
+        256,
+        4,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=NomasInt8Config({"projection": [4, 256]}),
+        prefix="projection",
+        tp_group=SimpleNamespace(world_size=2, rank_in_group=rank),
+        **kwargs,
+    )
+    layer.weight_loader(layer.weight, weight)
+    layer.weight_loader(layer.weight_scale, scales)
+    if cls is ColumnParallelLinear:
+        x, w = inputs, full[rank * 2 : (rank + 1) * 2]
+        expected_scales = scales[rank * 2 : (rank + 1) * 2]
+    else:
+        x, w = (
+            inputs[:, rank * 128 : (rank + 1) * 128],
+            full[:, rank * 128 : (rank + 1) * 128],
+        )
+        expected_scales = scales[:, rank : rank + 1]
+    torch.testing.assert_close(layer.weight_scale, expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(
+        layer(x)[0], torch.nn.functional.linear(x, w), rtol=0, atol=0
+    )
+
+
+def test_int8_row_parallel_rejects_unaligned_input_shards():
+    with pytest.raises(ValueError, match="align to 128"):
+        RowParallelLinear(
+            130,
+            4,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=NomasInt8Config({"projection": [4, 130]}),
+            prefix="projection",
+            tp_group=SimpleNamespace(world_size=2, rank_in_group=0),
+        )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
