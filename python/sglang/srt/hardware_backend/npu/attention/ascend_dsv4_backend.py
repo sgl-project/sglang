@@ -278,8 +278,13 @@ class CompressorAscendBackendMixin:
                 last_k = total // ratio
                 if last_k > first_k:
                     ratio_lists[ratio].append(
-                        torch.arange(first_k, last_k, device=device, dtype=torch.int64)
-                        * ratio
+                        torch.arange(
+                            first_k * ratio,
+                            last_k * ratio,
+                            ratio,
+                            device=device,
+                            dtype=torch.int64,
+                        )
                     )
 
         for ratio in (4, 128):
