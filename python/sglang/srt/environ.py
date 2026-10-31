@@ -1528,6 +1528,9 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # MiniMax-M3 MegaMoE: in captured graphs, run the shared MLP on the main stream
+    # beside the routed launch on the alt stream.
+    SGLANG_OPT_MINIMAX_M3_MEGA_MOE_SHARED_OVERLAP = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
 
     # ===================================================================
