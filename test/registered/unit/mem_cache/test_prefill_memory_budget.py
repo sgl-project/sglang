@@ -19,9 +19,6 @@ from sglang.srt.mem_cache.allocator.swa import (
 )
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-from sglang.srt.mem_cache.kv.alloc.interim import _FloatChainPolicy
-from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -70,7 +67,8 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
 def _cache():
     return SimpleNamespace(
         sliding_window_size=8,
-        window_retain_size=lambda component: 32,
+        # The target's window slot retains its own window; a draft window more.
+        window_retain_size=lambda component: 8 if component == "SWA" else 32,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
         auxiliary_swa_evictable_size=lambda: 0,
@@ -177,17 +175,14 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
         budget = allocator.create_prefill_budget(cache)
         # Running decode estimates can be fractional under new_token_ratio.
         budget.total_offset = 0.5
-        budget.swa_offset = 0.5
-        budget.auxiliary_swa_offset = 0.5
-        with unittest.mock.patch.object(
-            allocator._policy, "_demands", wraps=allocator._policy._demands
-        ) as demands:
-            self.assertTrue(budget._fits(4, 4, auxiliary_swa_tokens=4, state_slots=1))
-        pages = dict(
-            allocator._policy._demands(
-                *demands.call_args.args, **demands.call_args.kwargs
+        budget.window_offsets = {name: 0.5 for name in budget.window_offsets}
+        from sglang.srt.mem_cache.kv.alloc import chain
+
+        with unittest.mock.patch.object(chain, "feasible", wraps=chain.feasible) as fit:
+            self.assertTrue(
+                budget._fits(4, {name: 4 for name in budget.window_offsets}, 1)
             )
-        )
+        pages = fit.call_args.args[1]
         self.assertEqual(pages[allocator.roles.state], 1)
         self.assertEqual(pages[allocator.roles.owner], 2)
         for band in allocator._windows:
@@ -302,7 +297,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
         # Two more slots represent the next request and its host checkpoint.
         # Their placement must be checked even when token demand alone fits.
         with unittest.mock.patch.object(
-            allocator, "can_reserve", wraps=allocator.can_reserve
+            allocator, "admits", wraps=allocator.admits
         ) as fit:
             budget.can_allocate_prefill(
                 paged_input=12,
@@ -311,18 +306,16 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 chunk_limit=None,
                 state_slots=2,
             )
-            self.assertEqual(fit.call_args.kwargs["state_slots"], 3)
+            self.assertEqual(fit.call_args.args[2], 3)
             budget.fit_chunk(
                 extend_input_len=8,
                 max_new_tokens=0,
                 chunk_limit=8,
                 state_slots=2,
             )
-            self.assertTrue(
-                all(call.kwargs["state_slots"] == 3 for call in fit.call_args_list)
-            )
+            self.assertTrue(all(call.args[2] == 3 for call in fit.call_args_list))
         with unittest.mock.patch.object(
-            allocator, "reclaim_for_prealloc", return_value=None
+            allocator, "reclaim_for_load_back", return_value=None
         ) as reclaim:
             self.assertTrue(
                 budget.prepare_load_back(
@@ -361,10 +354,15 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
             20,
         )
         self.assertGreater(
-            self.allocator.swa_attn_allocator.available_size() - self.budget.swa_offset,
+            self.allocator.swa_attn_allocator.available_size()
+            - self.budget.window_offsets[self.allocator.roles.window],
             16,
         )
-        self.assertEqual(self.budget.check_prefill(**self.request), (False, None))
+        # The whole request no longer fits beside the pending one; only the
+        # chunk that fits beside it is admitted.
+        whole = {**self.request, "chunk_limit": None}
+        self.assertEqual(self.budget.check_prefill(**whole), (False, None))
+        self.assertEqual(self.budget.check_prefill(**self.request), (True, 8))
         self.assertEqual(self.allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(self.allocator.swa_attn_allocator.allocated_count(), 0)
 
@@ -374,10 +372,16 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
         )
         budget.reserve(12, 4, chunk_limit=16)
         self.assertEqual(
-            (budget.total_offset, budget.current_offset, budget.swa_offset),
+            (
+                budget.total_offset,
+                budget.current_offset,
+                budget.window_offsets[self.allocator.roles.window],
+            ),
             (24, 20, 20),
         )
-        self.assertEqual(budget.check_prefill(**self.request), (False, None))
+        whole = {**self.request, "chunk_limit": None}
+        self.assertEqual(budget.check_prefill(**whole), (False, None))
+        self.assertEqual(budget.check_prefill(**self.request), (True, 4))
 
     def test_prefix_lock_changes_admission_without_rebuilding_budget(self):
         self.assertIsNotNone(self.allocator.alloc(24))
@@ -400,7 +404,12 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
     def test_host_swa_load_is_part_of_joint_demand(self):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
         request = {**self.request, "swa_host_hit_length": 32}
-        self.assertEqual(self.budget.check_prefill(**request), (False, None))
+        # The restored window rows count against every chunk of the request.
+        self.assertEqual(
+            self.budget.check_prefill(**{**request, "chunk_limit": None}),
+            (False, None),
+        )
+        self.assertEqual(self.budget.check_prefill(**request), (True, 8))
 
     def test_prompt_clipping_uses_the_empty_pool(self):
         kwargs = dict(token_capacity=1, sliding_window_size=8, chunk_size=16)
@@ -456,6 +465,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
 
         cache = SimpleNamespace(
             sliding_window_size=page_size,
+            window_retain_size=lambda component: page_size,
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
@@ -596,43 +606,6 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         budget = allocator.create_prefill_budget(_cache())
         self.assertEqual(budget.remaining_total, 12)
         self.assertEqual(budget.remaining_swa, 64)
-
-    def test_tri_pool_keeps_fixed_admission_and_clipping(self):
-        allocator = self._allocator(ChainAllocator)
-        # A full + window + state chain's capacity policy, sized like the rest.
-        allocator._policy = object.__new__(_FloatChainPolicy)
-        allocator._policy._size_full = 128
-        allocator._policy._size_swa = 64
-        allocator.can_reserve = MagicMock(
-            side_effect=AssertionError("two-pool reservation")
-        )
-        allocator.prefill_state_fits = MagicMock(return_value=True)
-        allocator.full_attn_allocator = SimpleNamespace(
-            entry_bytes=64, entry_bytes_per_page=64 * allocator.page_size
-        )
-        allocator.swa_attn_allocator = SimpleNamespace(
-            entry_bytes=64, entry_bytes_per_page=64 * allocator.page_size
-        )
-        allocator.window_allocators = {"swa": allocator.swa_attn_allocator}
-        allocator.mamba_allocator = SimpleNamespace(
-            entry_bytes_per_page=256, schedulable_available_size=lambda: 8
-        )
-        cache = _cache()
-        cache.supports_mamba = lambda: False
-        budget = allocator.create_prefill_budget(cache)
-        self.assertIs(type(budget), ChainPrefillBudget)
-        self.assertEqual(budget.rules.window, "split")
-        self.assertTrue(budget.has_capacity())
-        self.assertEqual(
-            allocator.max_new_tokens_for_memory(
-                5,
-                100,
-                token_capacity=32,
-                sliding_window_size=8,
-                chunk_size=16,
-            ),
-            19,
-        )
 
     def test_tri_pool_eviction_does_not_reenter_common(self):
         from array import array

@@ -7,9 +7,8 @@ chain shape.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -32,7 +31,6 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_byte_shortfall,
     float_can_reserve,
     float_end_certificate,
-    float_fit,
     float_high_target,
     float_reclaim_satisfied,
     float_token_id_capacity,
@@ -43,20 +41,6 @@ from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-
-
-class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
-    """Which admission rule a unified chain uses.
-
-    `window` says how window tokens are admitted: "none" (no window sub-pool),
-    "split" (checked apart from the owner's tokens) or "joint" (owner and window
-    tokens in one reservation over the shared bytes).
-    """
-
-    window: Literal["none", "split", "joint"]
-    # FULL-token conversion used only by fixed/split admission. Joint policies
-    # keep raw state slots and do not use this conversion.
-    state_slot_cost: int = 0
 
 
 def _snapshot(c: ChainAllocator) -> ChainSnapshot:
@@ -81,25 +65,6 @@ class _InterimPolicy:
     # contract, where a census would mix physical and virtual ids.
     keeps_leak_census = True
 
-    def prealloc_fits_assumes_reclaim(self, c: ChainAllocator) -> bool:
-        return BaseTokenToKVPoolAllocator.prealloc_fits_assumes_reclaim(c)
-
-    def prealloc_ceiling_fits(
-        self, c: ChainAllocator, full_tokens: int, swa_tokens: int
-    ) -> bool | None:
-        return BaseTokenToKVPoolAllocator.prealloc_ceiling_fits(
-            c, full_tokens, swa_tokens
-        )
-
-    def prealloc_fits(self, c: ChainAllocator, tree_cache, *args, **kwargs) -> bool:
-        return BaseTokenToKVPoolAllocator.prealloc_fits(c, tree_cache, *args, **kwargs)
-
-    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
-        raise NotImplementedError
-
-    def max_new_tokens_for_memory(self, c: ChainAllocator, *args, **kwargs):
-        return BaseTokenToKVPoolAllocator.max_new_tokens_for_memory(c, *args, **kwargs)
-
     def get_extend_allocation_demand(self, c: ChainAllocator, *args, **kwargs) -> int:
         return BaseTokenToKVPoolAllocator.get_extend_allocation_demand(
             c, *args, **kwargs
@@ -110,66 +75,17 @@ class _InterimPolicy:
             c, tree_cache, num_tokens
         )
 
-    def prefill_state_fits(
-        self,
-        c,
-        full_tokens,
-        swa_tokens,
-        state_slots,
-        *,
-        full_evictable_tokens=0,
-        swa_evictable_tokens=0,
-        state_evictable_slots=0,
-    ):
-        """Shared-byte competition, separate from token quotas and per-side gates."""
-        from sglang.srt.mem_cache.kv.alloc.pricing import (
-            reclaimed_snapshot,
-            sequential_fit,
-        )
+    def prealloc_fits_assumes_reclaim(self, c: ChainAllocator) -> bool:
+        """Whether decode-node preallocation reclaims the evictable entries its
+        admission credits (`reclaim_for_prealloc`) before it takes."""
+        return False
 
-        credits = {c.roles.owner: int(full_evictable_tokens) // c.page_size}
-        if c.roles.window is not None:
-            credits[c.roles.window] = int(swa_evictable_tokens) // c.page_size
-        credits[c.roles.state] = int(state_evictable_slots)
-        snapshot = reclaimed_snapshot(_snapshot(c), credits)
-        demands = [
-            (c.roles.state, int(state_slots)),
-            (c.roles.owner, int(-(-full_tokens // c.page_size))),
-        ]
-        if c.roles.window is None:
-            # Two fixed ends use the same state-before-token take order.
-            return sequential_fit(snapshot, tuple(demands))
-        demands.append((c.roles.window, int(-(-swa_tokens // c.page_size))))
-        # Preserve the split policy's physical surcharge: a pinned window can
-        # strand bytes on either side even when the aggregate arena has room.
-        # State competes for these bytes, but never consumes FULL token IDs.
-        physical_full = c.full_attn_allocator._schedulable_physical_tokens()
-        if full_tokens + state_slots * self._state_slot_cost(c) > (
-            physical_full + full_evictable_tokens
-        ):
-            return False
-        # The old one-window policy retains its per-side physical placement
-        # checks. This additional byte gate prevents state from spending the
-        # same shared bytes as pending tokens, without treating it as FULL IDs.
-        occupied = sum(b.live * b.page_bytes for b in snapshot.bands)
-        requested = sum(
-            snapshot.band(name).page_bytes * pages for name, pages in demands
-        )
-        return (
-            occupied
-            + requested
-            + min(b.min_page * b.page_bytes for b in snapshot.bands)
-            <= snapshot.total_bytes
-        )
-
-    def _state_slot_cost(self, c: ChainAllocator) -> int:
-        """Logical token equivalents of one state slot in the shared arena."""
-        token_page_bytes = sum(
-            band.entry_bytes_per_page for band in (c.full_attn_allocator, *c._windows)
-        )
-        return -(
-            -c.mamba_allocator.entry_bytes_per_page * c.page_size // token_page_bytes
-        )
+    def reclaim_for_load_back(
+        self, c: ChainAllocator, tree_cache, full_tokens, swa_tokens, **demand
+    ) -> str | None:
+        """Reclaim before a host load pins its rows; None means ready. Chains
+        whose eviction has no named-demand protocol reclaim at the take."""
+        return None
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return None
@@ -231,14 +147,6 @@ class _OwnerEndPolicy(_InterimPolicy):
             return
         if target_size > c.mamba_allocator.available_size():
             relieve_for_alloc(c.mamba_allocator, target_size)
-
-    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
-        return ChainAdmissionRules(
-            window="none",
-            state_slot_cost=self._state_slot_cost(c)
-            if c.roles.state is not None
-            else 0,
-        )
 
 
 class _WindowPolicy(_InterimPolicy):
@@ -400,13 +308,11 @@ class _TokenEndsPolicy(_WindowPolicy):
         """No float in a two-END chain -- nothing can slide."""
         return None
 
-    def prealloc_fits_assumes_reclaim(self, c: ChainAllocator) -> bool:
+    def prealloc_fits_assumes_reclaim(self, c):
         return True
 
-    def prealloc_ceiling_fits(
-        self, c: ChainAllocator, full_tokens: int, swa_tokens: int
-    ) -> bool | None:
-        return c.can_reserve(full_tokens, swa_tokens, empty_pool=True)
+    def reclaim_for_load_back(self, c, tree_cache, full_tokens, swa_tokens, **demand):
+        return self.reclaim_for_prealloc(c, tree_cache, full_tokens, swa_tokens)
 
     def reclaim_for_prealloc(
         self, c: ChainAllocator, tree_cache, full_tokens: int, swa_tokens: int
@@ -424,40 +330,6 @@ class _TokenEndsPolicy(_WindowPolicy):
         return (
             "Unified FULL/SWA byte reclamation insufficient: "
             f"needed=({full_tokens}, {swa_tokens})"
-        )
-
-    def prealloc_fits(
-        self,
-        c: ChainAllocator,
-        tree_cache,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
-    ) -> bool:
-        """Price both sides against the shared byte envelope.
-
-        There is no per-side capacity for the scheduler's budget to be
-        compared against, so the gap between that budget and what this side
-        can currently hand out is folded back into the demand; `can_reserve`
-        then prices the whole ask in bytes. Reachable only for hybrid-SWA
-        models, so the tree's `full_*` accounting is the full-attention one.
-        """
-        full_evictable_tokens = tree_cache.full_evictable_size()
-        swa_evictable_tokens = tree_cache.swa_evictable_size()
-        full_tokens += (
-            c.full_available_size() + full_evictable_tokens - full_budget_tokens
-        )
-        if swa_budget_tokens is not None:
-            swa_tokens += (
-                c.swa_available_size() + swa_evictable_tokens - swa_budget_tokens
-            )
-        return c.can_reserve(
-            full_tokens,
-            swa_tokens,
-            full_evictable_tokens=full_evictable_tokens,
-            swa_evictable_tokens=swa_evictable_tokens,
         )
 
     def reclaim_plan(
@@ -532,9 +404,6 @@ class _TokenEndsPolicy(_WindowPolicy):
             _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
         )
 
-    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
-        return ChainAdmissionRules(window="joint")
-
     def swa_capacity_and_available(
         self, c: ChainAllocator, *, full_capacity, swa_capacity
     ):
@@ -548,50 +417,6 @@ class _TokenEndsPolicy(_WindowPolicy):
             c.roles.owner: (c.current_full_capacity, c.full_available_size()),
             c.roles.window: (c.current_swa_capacity, c.swa_available_size()),
         }
-
-    def max_new_tokens_for_memory(
-        self,
-        c: ChainAllocator,
-        input_tokens: int,
-        max_new_tokens: int,
-        *,
-        token_capacity: int,
-        sliding_window_size: int | None,
-        chunk_size: int | None,
-    ) -> int | None:
-        from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
-
-        # The search does not change the chain: price every candidate on one snapshot.
-        snap, ends = _snapshot(c), self._ends(c)
-
-        def fits(candidate):
-            return ends_can_reserve(
-                snap,
-                ends,
-                input_tokens + candidate + c.page_size,
-                estimate_swa_kv_tokens(
-                    input_tokens,
-                    candidate,
-                    sliding_window_size=sliding_window_size,
-                    page_size=c.page_size,
-                    allocation_limit=chunk_size,
-                ),
-                empty_pool=True,
-                require_token_slack=True,
-            )
-
-        if not fits(0):
-            return None
-        if fits(max_new_tokens):
-            return max_new_tokens
-        lo, hi = 0, max_new_tokens
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if fits(mid):
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
 
     @rank_consensus(same_params=["num_tokens", "swa_num_tokens"], same_results=True)
     def evict_to_free_tokens(
@@ -695,36 +520,6 @@ class _FloatChainPolicy(_WindowPolicy):
             full_evictable_tokens=full_evictable_tokens,
             swa_evictable_tokens=swa_evictable_tokens,
             empty_pool=empty_pool,
-        )
-
-    def prealloc_fits(
-        self,
-        c: ChainAllocator,
-        tree_cache,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
-    ) -> bool:
-        """Price the pair on the float chain's grid, then against the budgets.
-
-        Each side's `available_size` takes `schedulable_available_size()`,
-        which credits the peer's drainable holes, so the two are backed by the
-        same bytes and a pair that fits each side alone can fail together. The
-        budgets still apply on top: they carry decode headroom this allocator
-        cannot see.
-        """
-        page_size = c.page_size
-        if not float_fit(
-            _snapshot(c),
-            self._chain(c),
-            -(-full_tokens // page_size),
-            -(-swa_tokens // page_size),
-        ):
-            return False
-        return full_tokens <= full_budget_tokens and (
-            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
         )
 
     def reclaim_for_prealloc(
@@ -848,13 +643,6 @@ class _FloatChainPolicy(_WindowPolicy):
             return
         c.full_attn_allocator.flush_for_allocation()
         relieve_for_alloc(c.mamba_allocator, target_size)
-
-    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
-        # State competes for the shared gap too; keep the split token admission
-        # plus the state-slot gate until one reservation prices all three.
-        return ChainAdmissionRules(
-            window="split", state_slot_cost=self._state_slot_cost(c)
-        )
 
     def swa_capacity_and_available(
         self, c: ChainAllocator, *, full_capacity, swa_capacity
@@ -1143,9 +931,6 @@ class _MultiWindowPolicy(_WindowPolicy):
     def ask_float_for_room(self, c, need_tokens):
         self.ensure_capacity(c, need_tokens, need_tokens)
 
-    def admission_rules(self, c):
-        return ChainAdmissionRules(window="joint")
-
     def swa_capacity_and_available(self, c, *, full_capacity, swa_capacity):
         return (
             (self._size_full, c.conserve_full_available_size()),
@@ -1169,50 +954,19 @@ class _MultiWindowPolicy(_WindowPolicy):
         if target_size > c.mamba_allocator.available_size():
             relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def prealloc_fits(
-        self,
-        c,
-        tree_cache,
-        full_tokens,
-        swa_tokens,
-        *,
-        full_budget_tokens,
-        swa_budget_tokens=None,
-    ):
-        if full_tokens > full_budget_tokens or (
-            swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
-        ):
-            return False
-        full_evictable = tree_cache.full_evictable_size()
-        swa_evictable = tree_cache.swa_evictable_size()
-        # Budgets already subtract pending requests and decode headroom. Price
-        # those reservations together with this request in the shared envelope.
-        full_tokens += max(
-            0, c.full_available_size() + full_evictable - full_budget_tokens
-        )
-        if swa_budget_tokens is not None:
-            swa_tokens += max(
-                0, c.conserve_swa_available_size() + swa_evictable - swa_budget_tokens
-            )
-        return c.can_reserve(
-            full_tokens,
-            swa_tokens,
-            full_evictable_tokens=full_evictable,
-            swa_evictable_tokens=swa_evictable,
-            auxiliary_swa_evictable_tokens=tree_cache.auxiliary_swa_evictable_size(),
-            state_evictable_slots=(
-                tree_cache.mamba_evictable_size() if c.roles.state is not None else 0
-            ),
-        )
-
-    def prealloc_fits_assumes_reclaim(self, c):
-        return True
-
     def reclaim_plan(self, c, full_tokens, swa_tokens, **kwargs):
         # A two-token quota cannot describe independent state/window donors.
         # Report readiness only; eviction uses the named demands below.
         return (
             (0, 0) if self.can_reserve(c, full_tokens, swa_tokens, **kwargs) else None
+        )
+
+    def prealloc_fits_assumes_reclaim(self, c):
+        return True
+
+    def reclaim_for_load_back(self, c, tree_cache, full_tokens, swa_tokens, **demand):
+        return self.reclaim_for_prealloc(
+            c, tree_cache, full_tokens, swa_tokens, **demand
         )
 
     def reclaim_for_prealloc(

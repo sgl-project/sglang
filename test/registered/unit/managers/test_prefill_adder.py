@@ -26,7 +26,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
-from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     ChainPrefillBudget,
@@ -176,6 +175,8 @@ class TestPrefillAdder(CustomTestCase):
     def create_shared_adder(self, *, num_mixed_decode_tokens=0):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
+        # The tree's target window slot retains its sliding window.
+        self.mock_tree_cache.window_retain_size.side_effect = lambda component: 8
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
         allocator = build_test_unified_pools(
             device="cpu",
@@ -427,13 +428,17 @@ class TestPrefillAdder(CustomTestCase):
         )
         adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
         self.assertEqual(adder.can_run_list, [first])
+        # The second request is priced beside the first one's reservation: it
+        # does not fit whole, so only a chunk that fits beside it is admitted.
         self.assertEqual(
             adder.add_one_req(
                 second, has_chunked_req=False, truncation_align_size=None
             ),
-            AddReqResult.NO_TOKEN,
+            AddReqResult.OTHER,
         )
-        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(adder.can_run_list, [first, second])
+        self.assertIs(adder.new_chunked_req, second)
+        self.assertEqual(second.extend_len, 4)
 
     def test_shared_admission_rechecks_after_prefix_lock(self):
         adder = self.create_shared_adder()
@@ -463,13 +468,16 @@ class TestPrefillAdder(CustomTestCase):
                 req = self.create_shared_req("continuation")
                 before = (
                     adder.memory_budget.total_offset,
-                    adder.memory_budget.swa_offset,
+                    dict(adder.memory_budget.window_offsets),
                 )
                 self.assertIs(adder.add_chunked_req(req), req)
                 self.assertEqual(adder.can_run_list, [])
                 self.assertIsNone(req.extend_end)
                 self.assertEqual(
-                    (adder.memory_budget.total_offset, adder.memory_budget.swa_offset),
+                    (
+                        adder.memory_budget.total_offset,
+                        adder.memory_budget.window_offsets,
+                    ),
                     before,
                 )
 
@@ -479,7 +487,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 8)
         self.assertEqual(adder.memory_budget.total_offset, 12)
-        self.assertEqual(adder.memory_budget.swa_offset, 12)
+        self.assertEqual(list(adder.memory_budget.window_offsets.values()), [12])
 
     def test_storage_prefetch_fulfillment_resolves_at_admission(self):
         adder = self.create_adder(self.create_running_batch())
@@ -1610,18 +1618,16 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
         allocator = self.mock_token_allocator
-        allocator.prefill_state_fits.side_effect = (
-            lambda full, window, state, **kwargs: (
-                full + state * 64 <= allocator.available_size()
-            )
+        allocator.admission_windows.return_value = ()
+        allocator.admission_evictable.return_value = {}
+        allocator.reclaim_for_load_back.return_value = None
+        # A state slot takes free slot ids and 64 tokens' worth of shared bytes.
+        allocator.admits.side_effect = lambda full, windows, state=0, **kwargs: (
+            state <= allocator.mamba_allocator.schedulable_available_size()
+            and full + state * 64 <= allocator.available_size()
         )
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
-            ChainPrefillBudget(
-                allocator,
-                tree_cache,
-                rules=ChainAdmissionRules(window="none", state_slot_cost=64),
-                **kwargs,
-            )
+            ChainPrefillBudget(allocator, tree_cache, **kwargs)
         )
         adder = self.create_adder(self.create_running_batch())
         allocator.mamba_allocator.schedulable_available_size.return_value = (
@@ -1646,6 +1652,13 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.init_load_back.side_effect = load_back
         return adder, req
 
+    def _unreserved_state_slots(self, adder):
+        """Free state slots not yet promised to admitted requests."""
+        return (
+            self.mock_token_allocator.mamba_allocator.schedulable_available_size()
+            - adder.memory_budget.pending_state_slots
+        )
+
     def test_mamba_restore_admission_counts_request_and_checkpoint(self):
         for holds_state, slots, capacity, admitted in (
             (False, 1, 100_000, False),
@@ -1662,7 +1675,7 @@ class TestPrefillAdder(CustomTestCase):
                 result = adder.add_one_req(req, False, None)
                 self.assertEqual(adder.can_run_list, [req] if admitted else [])
                 self.assertEqual(
-                    adder.memory_budget.rem_state_slots, 0 if admitted else slots
+                    self._unreserved_state_slots(adder), 0 if admitted else slots
                 )
                 if admitted:
                     self.mock_tree_cache.init_load_back.assert_called_once()
@@ -1689,7 +1702,7 @@ class TestPrefillAdder(CustomTestCase):
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
         self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
-        self.assertEqual(next_adder.memory_budget.rem_state_slots, 0)
+        self.assertEqual(self._unreserved_state_slots(next_adder), 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
 
     def test_successful_load_back_commits_the_selected_shape_once(self):

@@ -39,7 +39,6 @@ from sglang.srt.mem_cache.kv.alloc.band import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
-    ChainAdmissionRules,
     interim_policy_for,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
@@ -493,7 +492,125 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.pricing_snapshot(), {n: d for n, d in demands.items() if d > 0}
         )
 
-    def _fits_after_reclaim(
+    def admission_windows(self, tree_cache) -> Tuple[Tuple[str, int, int, int], ...]:
+        """Each window sub-pool's name, its prefix-tree window slot, the
+        history its cache retains (what a request is charged at most) and its
+        evictable tokens. The tree keeps the target's window in slot 0 and one
+        further window in slot 1."""
+        windows = []
+        for window in self._windows:
+            component = "SWA" if window is self.swa_attn_allocator else "AUXILIARY_SWA"
+            if component == "AUXILIARY_SWA" and len(self._windows) > 2:
+                raise NotImplementedError(
+                    "the prefix tree keeps at most two window sub-pools"
+                )
+            windows.append(
+                (
+                    window.sub_pool_name,
+                    int(component == "AUXILIARY_SWA"),
+                    tree_cache.window_retain_size(component),
+                    (
+                        tree_cache.swa_evictable_size()
+                        if component == "SWA"
+                        else tree_cache.auxiliary_swa_evictable_size()
+                    ),
+                )
+            )
+        return tuple(windows)
+
+    def admission_evictable(self, tree_cache) -> Dict[str, int]:
+        """What the prefix tree could free per sub-pool: tokens, or state
+        slots for the state sub-pool."""
+        evictable = {
+            self.full_attn_allocator.sub_pool_name: tree_cache.full_evictable_size()
+        }
+        for name, _, _, tokens in self.admission_windows(tree_cache):
+            evictable[name] = tokens
+        if self.mamba_allocator is not None:
+            evictable[self.mamba_allocator.sub_pool_name] = (
+                tree_cache.mamba_evictable_size() if tree_cache.supports_mamba() else 0
+            )
+        return evictable
+
+    def admits(
+        self,
+        full_tokens: float,
+        window_tokens: Dict[str, float],
+        state_slots: int = 0,
+        *,
+        evictable: Optional[Dict[str, int]] = None,
+        empty_pool: bool = False,
+    ) -> bool:
+        """Whether a demand fits once ``evictable`` cached entries are evicted
+        (or in an empty pool): FULL tokens against the FULL cap and the owner's
+        ids, each window sub-pool's tokens (a window missing from
+        ``window_tokens`` is charged nothing), state slots in full, then one
+        layout search over the shared bytes. Every admission question asks
+        this, so an admitted demand is one the take serves."""
+        if full_tokens < 0 or any(t < 0 for t in window_tokens.values()):
+            return False
+        evictable = {} if empty_pool or evictable is None else evictable
+        owner = self.full_attn_allocator
+        # Expected decode lengths may be fractional; a page holds whole tokens.
+        full_tokens = math.ceil(full_tokens)
+        if self._full_cap_reclaim(full_tokens, empty_pool=True):
+            return False
+        if self._full_cap_reclaim(full_tokens, empty_pool=empty_pool) > evictable.get(
+            owner.sub_pool_name, 0
+        ):
+            return False
+        page = self.page_size
+        demands = {owner.sub_pool_name: -(-full_tokens // page)}
+        reclaim = {owner.sub_pool_name: evictable.get(owner.sub_pool_name, 0) // page}
+        owner_pages = owner.ids.num_virtual_ids - owner.min_page_index
+        for window in self._windows:
+            name = window.sub_pool_name
+            demands[name] = -(-math.ceil(window_tokens.get(name, 0)) // page)
+            # A window binds the owner's virtual pages: it can never hold more.
+            if demands[name] > owner_pages:
+                return False
+            reclaim[name] = evictable.get(name, 0) // page
+        free_ids = (
+            owner_pages
+            if empty_pool
+            else len(owner.free_virtual_ids) + reclaim[owner.sub_pool_name]
+        )
+        if demands[owner.sub_pool_name] > free_ids:
+            return False
+        state = self.mamba_allocator
+        if state is not None:
+            demands[state.sub_pool_name] = int(state_slots)
+            reclaim[state.sub_pool_name] = int(evictable.get(state.sub_pool_name, 0))
+            free_slots = (
+                state.ids.num_virtual_ids - state.min_page_index
+                if empty_pool
+                else len(state.free_virtual_ids) + reclaim[state.sub_pool_name]
+            )
+            if state_slots > free_slots:
+                return False
+        snapshot = reclaimed_snapshot(
+            self.pricing_snapshot(), reclaim, empty_pool=empty_pool
+        )
+        return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
+
+    def _window_demand(
+        self, full_tokens, swa_tokens, auxiliary_swa_tokens=None
+    ) -> Dict[str, float]:
+        """A two-number demand as tokens per window sub-pool: the target's
+        window takes ``swa_tokens``, every further window the auxiliary
+        demand, else the owner's."""
+        return {
+            window.sub_pool_name: (
+                swa_tokens
+                if window is self.swa_attn_allocator
+                else full_tokens
+                if auxiliary_swa_tokens is None
+                else auxiliary_swa_tokens
+            )
+            for window in self._windows
+        }
+
+    def can_reserve(
         self,
         full_tokens,
         swa_tokens,
@@ -507,68 +624,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         empty_pool=False,
         **_,
     ) -> bool:
-        """Whether some layout serves the demand once the credited cached
-        entries are evicted: the take's question, asked of the chain after the
-        reclaim (or of an empty pool)."""
-        page = self.page_size
-        # Expected decode lengths may be fractional; a page holds whole tokens.
-        demands = self.page_demands(
-            max(0, math.ceil(full_tokens)),
-            max(0, math.ceil(swa_tokens)),
-            auxiliary_swa_tokens=(
-                None
-                if auxiliary_swa_tokens is None
-                else max(0, math.ceil(auxiliary_swa_tokens))
-            ),
-            state_slots=int(state_slots),
+        """`admits` for the reclaim protocols' two-number demand."""
+        evictable = {self.full_attn_allocator.sub_pool_name: full_evictable_tokens}
+        evictable.update(
+            self._window_demand(0, swa_evictable_tokens, auxiliary_swa_evictable_tokens)
         )
-        owner = self.full_attn_allocator
-        reclaim = {owner.sub_pool_name: int(full_evictable_tokens) // page}
-        for window in self._windows:
-            reclaim[window.sub_pool_name] = (
-                int(swa_evictable_tokens)
-                if window is self.swa_attn_allocator
-                else int(auxiliary_swa_evictable_tokens)
-            ) // page
-        state = self.mamba_allocator
-        if state is not None:
-            reclaim[state.sub_pool_name] = int(state_evictable_slots)
-        free_ids = (
-            owner.ids.num_virtual_ids - owner.min_page_index
-            if empty_pool
-            else len(owner.free_virtual_ids) + reclaim[owner.sub_pool_name]
+        if self.mamba_allocator is not None:
+            evictable[self.mamba_allocator.sub_pool_name] = state_evictable_slots
+        return self.admits(
+            full_tokens,
+            self._window_demand(full_tokens, swa_tokens, auxiliary_swa_tokens),
+            state_slots,
+            evictable={n: int(v) for n, v in evictable.items()},
+            empty_pool=empty_pool,
         )
-        if demands[owner.sub_pool_name] > free_ids:
-            return False
-        snapshot = reclaimed_snapshot(
-            self.pricing_snapshot(), reclaim, empty_pool=empty_pool
-        )
-        return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
-
-    def prefill_state_fits(self, full_tokens, swa_tokens, state_slots, **kwargs):
-        """Check native state demand without charging it to the FULL-token cap."""
-        if self._full_cap_reclaim(full_tokens, empty_pool=True):
-            return False
-        if self._full_cap_reclaim(full_tokens) > kwargs.get("full_evictable_tokens", 0):
-            return False
-        # Admission never promises what the take refuses.
-        return self._policy.prefill_state_fits(
-            self, full_tokens, swa_tokens, state_slots, **kwargs
-        ) and self._fits_after_reclaim(
-            full_tokens, swa_tokens, state_slots=state_slots, **kwargs
-        )
-
-    def can_reserve(self, full_tokens, swa_tokens, **kwargs) -> bool:
-        if self._full_cap_reclaim(full_tokens, empty_pool=True):
-            return False
-        if self._full_cap_reclaim(
-            full_tokens, empty_pool=kwargs.get("empty_pool", False)
-        ) > kwargs.get("full_evictable_tokens", 0):
-            return False
-        # Admission never promises what the take refuses.
-        return self._policy.can_reserve(
-            self, full_tokens, swa_tokens, **kwargs
-        ) and self._fits_after_reclaim(full_tokens, swa_tokens, **kwargs)
 
     def reclaim_plan(self, full_tokens, swa_tokens, **kwargs):
         cap_reclaim = self._full_cap_reclaim(full_tokens)
@@ -583,11 +652,51 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self._policy.prealloc_fits_assumes_reclaim(self)
 
     def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
-        return self._policy.prealloc_ceiling_fits(self, full_tokens, swa_tokens)
+        return self.admits(
+            full_tokens,
+            self._window_demand(full_tokens, swa_tokens),
+            empty_pool=True,
+        )
 
-    def prealloc_fits(self, tree_cache, full_tokens, swa_tokens, **kwargs) -> bool:
-        return self._policy.prealloc_fits(
-            self, tree_cache, full_tokens, swa_tokens, **kwargs
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens,
+        swa_tokens,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """A decode-node preallocation on the admission rule. The budgets are
+        the scheduler's per-side token views after decode headroom and
+        retraction: the request stays within them, and what they hold back
+        from this side's reachable tokens is pending demand, charged alongside
+        the request."""
+        if full_tokens > full_budget_tokens or (
+            swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
+        ):
+            return False
+        evictable = self.admission_evictable(tree_cache)
+        if not self.prealloc_fits_assumes_reclaim():
+            # Nothing is reclaimed before the take: credit no eviction.
+            evictable = dict.fromkeys(evictable, 0)
+        owner = self.full_attn_allocator.sub_pool_name
+        full_tokens += max(
+            0, self.full_available_size() + evictable[owner] - full_budget_tokens
+        )
+        windows = self._window_demand(full_tokens, swa_tokens)
+        if swa_budget_tokens is not None and self.swa_attn_allocator is not None:
+            name = self.swa_attn_allocator.sub_pool_name
+            windows[name] += max(
+                0, self.swa_available_size() + evictable[name] - swa_budget_tokens
+            )
+        return self.admits(full_tokens, windows, evictable=evictable)
+
+    def reclaim_for_load_back(
+        self, tree_cache, full_tokens: int, swa_tokens: int, **demand
+    ) -> str | None:
+        return self._policy.reclaim_for_load_back(
+            self, tree_cache, full_tokens, swa_tokens, **demand
         )
 
     def reclaim_for_prealloc(
@@ -597,17 +706,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, full_tokens, swa_tokens, **kwargs
         )
 
-    def admission_rules(self) -> ChainAdmissionRules:
-        return self._policy.admission_rules(self)
-
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 
         return ChainPrefillBudget(
-            self,
-            tree_cache,
-            rules=self.admission_rules(),
-            num_mixed_decode_tokens=num_mixed_decode_tokens,
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
@@ -619,10 +722,60 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self, full_capacity=full_capacity, swa_capacity=swa_capacity
         )
 
-    def max_new_tokens_for_memory(self, input_tokens, max_new_tokens, **kwargs):
-        return self._policy.max_new_tokens_for_memory(
-            self, input_tokens, max_new_tokens, **kwargs
-        )
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        """The most new tokens a lone request of ``input_tokens`` can be
+        admitted with in an empty pool, at most ``max_new_tokens``; None when
+        even the prompt alone cannot. ``token_capacity`` is already the FULL
+        cap this pool applies."""
+        from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
+
+        windows = {
+            window.sub_pool_name: (
+                sliding_window_size
+                if window is self.swa_attn_allocator or self.storage is None
+                else self.storage.plan.sub_pool(window.sub_pool_name).lifetime.window
+            )
+            for window in self._windows
+        }
+        state_slots = 0 if self.mamba_allocator is None else 1
+
+        def fits(new_tokens):
+            return self.admits(
+                input_tokens + new_tokens + self.page_size,
+                {
+                    name: estimate_swa_kv_tokens(
+                        input_tokens,
+                        new_tokens,
+                        sliding_window_size=window,
+                        page_size=self.page_size,
+                        allocation_limit=chunk_size,
+                    )
+                    for name, window in windows.items()
+                },
+                state_slots,
+                empty_pool=True,
+            )
+
+        if not fits(0):
+            return None
+        if fits(max_new_tokens):
+            return max_new_tokens
+        low, high = 0, max_new_tokens
+        while low < high:
+            mid = (low + high + 1) // 2
+            if fits(mid):
+                low = mid
+            else:
+                high = mid - 1
+        return low
 
     def get_extend_allocation_demand(self, prefix_lens_cpu, seq_lens_cpu, **kwargs):
         return self._policy.get_extend_allocation_demand(
