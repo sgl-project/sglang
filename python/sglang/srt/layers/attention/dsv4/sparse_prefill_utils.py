@@ -181,7 +181,7 @@ class SparsePrefillChunkCache:
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
     # C128 is chunk-invariant; reuse fixed-width H16 indices across its layers.
-    c128_padded_combined_indices: dict[int, torch.Tensor] = field(default_factory=dict)
+    c128_padded_combined_indices: Optional[torch.Tensor] = None
     # Per-layer scratch only: combine overwrites all entries before attention.
     # c0/c128 are cached across layers and must retain separate storage.
     low_ratio_combined: dict = field(default_factory=dict)
@@ -391,11 +391,14 @@ class SparsePrefillChunkCache:
             raise ValueError("C128 width must be aligned and at least the live width")
         if padding == 0:
             return indices, lengths
-        if padded_width not in self.c128_padded_combined_indices:
-            self.c128_padded_combined_indices[padded_width] = torch.nn.functional.pad(
+        if (
+            self.c128_padded_combined_indices is None
+            or self.c128_padded_combined_indices.shape[1] != padded_width
+        ):
+            self.c128_padded_combined_indices = torch.nn.functional.pad(
                 indices, (0, padding), value=-1
             )
-        return self.c128_padded_combined_indices[padded_width], lengths
+        return self.c128_padded_combined_indices, lengths
 
     def ensure_compressed(
         self,

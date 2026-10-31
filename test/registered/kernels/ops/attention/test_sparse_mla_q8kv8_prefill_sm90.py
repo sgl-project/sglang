@@ -719,16 +719,19 @@ def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
 
 
 @pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
+@pytest.mark.parametrize("topk", [128, 8320, 16384])
 @torch.inference_mode()
-def test_native_h16_matches_bf16_sparse_prefill():
+def test_native_h16_matches_bf16_sparse_prefill(topk):
     from sglang.kernels.ops.attention.dsv4 import cute_sparse_mla_h16 as h16
     from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 
     q, kv, indices, scale, _, _, sink, lengths = _make_case(
-        512, True, s_q=4, topk=128, s_kv=40009
+        512, True, s_q=4, topk=topk, s_kv=40009
     )
     q, kv = (q.float() * 2).bfloat16(), (kv.float() * 2).bfloat16()
-    lengths.copy_(torch.tensor([0, 1, 127, 128], dtype=torch.int32, device="cuda"))
+    lengths.copy_(
+        torch.tensor([0, 1, topk - 1, topk], dtype=torch.int32, device="cuda")
+    )
     indices[0].fill_(-1)
     indices[1, 0, 0] = 32768  # Production rebased workspaces exceed int16 IDs.
     indices[3, 0, 1], indices[3, 0, 3] = -1, 40026
@@ -780,21 +783,25 @@ def test_native_h16_matches_bf16_sparse_prefill():
 @pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
 @pytest.mark.parametrize("heads,topk", [(64, 128), (16, 8192)])
 @torch.inference_mode()
-def test_native_h16_int64_offsets(heads, topk, monkeypatch):
+def test_native_h16_int64_offsets(heads, topk):
     from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
         cute_sparse_mla_h16_fwd,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     q, kv, indices, scale, qs, ks, sink, lengths = _make_case(
         512, True, s_q=2, topk=topk, s_kv=2
     )
     q, kv = q[:, :heads].bfloat16().contiguous(), kv[:2].bfloat16()
     indices[:, :, :2] = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     lengths.fill_(2)
-    expected = _torch_sparse_attention_ref(
-        q[:, :16], kv, indices, scale, qs, ks, sink[:16], lengths
-    )[0]
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected = _torch_sparse_attention_ref(
+            q[:, :16], kv, indices, scale, qs, ks, sink[:16], lengths
+        )[0]
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
 
     # Q and KV offsets pass Int32 in both rows, index and output offsets at TOPK 8192.
     # Only the two boundary queries attend to KV.

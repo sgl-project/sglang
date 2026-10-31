@@ -534,13 +534,21 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
-        for num_qo_tokens, builds in (
-            (_LARGE_INDEXER_QUERY_THRESHOLD, False),
-            (_LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            _original_forward_mode=None,
+            tbo_parent_token_range=None,
+        )
+        for backend_choice, num_qo_tokens, builds in (
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, False),
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+            ("cutedsl_h16", 1, False),
+            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD, False),
+            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
         ):
-            with self.subTest(num_qo_tokens=num_qo_tokens):
+            with self.subTest(backend=backend_choice, num_qo_tokens=num_qo_tokens):
                 backend = self._make_prefill_backend()
+                backend.dsv4_prefill_backend = backend_choice
                 build = backend._build_sparse_prefill_chunk_cache
 
                 with (

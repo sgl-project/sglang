@@ -195,9 +195,9 @@ def _use_dsv4_cutedsl_h16_forward(
 def _validate_dsv4_cutedsl_h16_combined_topk(max_context_len: int, c4_topk: int) -> int:
     """Validate configured widths and return the fixed C128 JIT bucket."""
     c128_width = combined_topk_width(max(max_context_len // 128, 1), SWA_WINDOW)
-    if max(c128_width, combined_topk_width(c4_topk, SWA_WINDOW)) > 8192:
+    if max(c128_width, combined_topk_width(c4_topk, SWA_WINDOW)) > 16384:
         raise ValueError(
-            "cutedsl_h16 combined TOPK exceeds 8192; reduce context length or index_topk"
+            "cutedsl_h16 combined TOPK exceeds 16384; reduce context length or index_topk"
         )
     return c128_width
 
@@ -2992,9 +2992,6 @@ class DeepseekV4AttnBackend(
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                or _use_dsv4_cutedsl_h16_forward(
-                    self.dsv4_prefill_backend, forward_batch
-                )
             )
         )
 
@@ -4565,16 +4562,6 @@ class DeepseekV4AttnBackend(
                 cute_sparse_mla_h16_fwd,
             )
 
-            if not getattr(self, "_cutedsl_h16_prefill_log_emitted", False):
-                logger.info(
-                    "DSV4_CUTEDSL_H16_SPARSE_PREFILL_HIT layer_id=%s "
-                    "compress_ratio=%s q_shape=%s topk=%s",
-                    layer_id,
-                    compress_ratio,
-                    tuple(q_flat.shape),
-                    combined_indices.shape[1],
-                )
-                self._cutedsl_h16_prefill_log_emitted = True
             # H64-padded Q returns compact H16, so o[:, :logical_heads] stays valid.
             return cute_sparse_mla_h16_fwd(
                 q=q_flat,

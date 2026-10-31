@@ -31,14 +31,15 @@ from sglang.srt.utils.custom_op import register_custom_op
 # SGLang DSV4 sparse-prefill contract.
 H = 16
 TOPK_ALIGNMENT = 128
-MAX_TOPK = 8192
+MAX_TOPK = 16384
 DQK = 512
 DV = 512
 BN = 64
 NTHR = 128
-NG_QK = 4  # four 128-channel WGMMA groups cover DQK=512
+NG_QK = 4
 
-# Interleaved shared-memory layout inherited from the tuned benchmark kernel.
+# Eight BF16 padding elements rotate each 64-element block by four 32-bit banks,
+# avoiding the bank overlap of a 64-element stride.
 DB_STRIDE = 72
 # Each 8-row group holds 64 d-blocks of 8 channels, all 512 channels of DQK.
 NB_STRIDE = 64 * DB_STRIDE
@@ -480,10 +481,7 @@ def _kernel(
                 sum_acc[i] = sum_acc[i] * alpha_qk_frag[i]
 
         for i in cutlass.range_constexpr(cute.size(score_acc)):
-            p = (
-                cute.math.exp2(score_acc[i] - max_frag[i], fastmath=True)
-                * current_mask_frag[i]
-            )
+            p = cute.math.exp2(score_acc[i] - max_frag[i], fastmath=True)
             prob_acc[i] = p.to(cutlass.BFloat16)
             sum_acc[i] = sum_acc[i] + p
 

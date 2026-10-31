@@ -957,9 +957,12 @@ def test_native_h16_sparse_prefill_reuses_bf16_workspace(compress_ratio):
         )
         expected = backend._forward_prefill_sparse(**args)[:, :16]
         cache = backend.forward_metadata.sparse_prefill_cache
+        assert cache.c128_padded_combined_indices is None
         actual = backend._forward_prefill_sparse(**args, use_cutedsl_h16=True)
         torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-3)
         assert backend.forward_metadata.sparse_prefill_cache is cache
+        if compress_ratio == 4:
+            assert cache.c128_padded_combined_indices is None
 
         # Expected IDs use the request mapping alone, independent of the helpers.
         c_lens = [s // compress_ratio for s in seq_lens]
