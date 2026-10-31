@@ -13,7 +13,7 @@ from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -363,6 +363,54 @@ def _add3(
     return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
 
+# The sharded tail adds one collective launch, so it only pays off at prefill
+# sizes.
+_SHARDED_UP_PROJ_MIN_TOKENS = 1024
+
+
+def _sharded_up_proj_eligible(
+    up_proj: Optional[nn.Module], tp_size: int, *, on_hip: bool
+) -> bool:
+    """ROCm, and a dense bias-free bf16/fp16 up_proj weight whose output rows
+    split evenly over TP. The sharded tail calls the GEMM directly, so any
+    bias would be dropped."""
+    weight = getattr(up_proj, "weight", None)
+    return (
+        on_hip
+        and tp_size > 1
+        and getattr(up_proj, "bias", None) is None
+        and isinstance(weight, torch.Tensor)
+        and type(weight.data) is torch.Tensor
+        and weight.dtype in (torch.bfloat16, torch.float16)
+        and weight.dim() == 2
+        and weight.shape[0] % tp_size == 0
+    )
+
+
+def _tp_row_slice(num_rows: int, *, tp_size: int, tp_rank: int) -> slice:
+    rows = num_rows // tp_size
+    return slice(tp_rank * rows, (tp_rank + 1) * rows)
+
+
+def _sharded_up_proj_tail(
+    latent: torch.Tensor,
+    shared_output: torch.Tensor,
+    up_weight: torch.Tensor,
+    rows: slice,
+    *,
+    reduce_latent: Callable[[torch.Tensor], torch.Tensor],
+    reduce_shared: Callable[[torch.Tensor], torch.Tensor],
+    prefix_sum: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """reduce(shared) + up_proj(reduce_latent(latent)) [+ prefix_sum], where
+    this rank computes only `rows` of up_proj and folds them into its shared
+    partial sum before that sum is reduced. Updates shared_output in place."""
+    latent = reduce_latent(latent)
+    shared_output[:, rows] += _k3_bf16_gemm(latent, up_weight[rows])
+    out = reduce_shared(shared_output)
+    return out if prefix_sum is None else out + prefix_sum
+
+
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
 
@@ -707,6 +755,15 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
+        self._shard_up_proj = _sharded_up_proj_eligible(
+            self.routed_expert_up_proj, self.tp_size, on_hip=_is_hip
+        )
+        if self._shard_up_proj:
+            self._up_proj_rows = _tp_row_slice(
+                self.routed_expert_up_proj.weight.shape[0],
+                tp_size=self.tp_size,
+                tp_rank=get_parallel().tp_rank,
+            )
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -1474,6 +1531,20 @@ class KimiK3MoE(nn.Module):
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            if (
+                self._shard_up_proj
+                and num_tokens >= _SHARDED_UP_PROJ_MIN_TOKENS
+                and not k3_ar_fusion.enabled()
+            ):
+                return _sharded_up_proj_tail(
+                    latent=latent,
+                    shared_output=shared_output,
+                    up_weight=self.routed_expert_up_proj.weight,
+                    rows=self._up_proj_rows,
+                    reduce_latent=self._reduce_latent,
+                    reduce_shared=self._reduce_shared,
+                    prefix_sum=prefix_sum,
+                )
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
