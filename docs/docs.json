@@ -1646,6 +1646,13 @@
                     ]
                   },
                   {
+                    "group": "HiDream",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/HiDream/HiDream-O1-Image"
+                    ]
+                  },
+                  {
                     "group": "MOVA",
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA"
