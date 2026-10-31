@@ -315,6 +315,38 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     encoder.assert_called_once()
 
 
+@pytest.mark.parametrize("backend", ["cuda", "npu", "hip", "xpu"])
+def test_cross_request_image_batching_by_backend(monkeypatch, backend):
+    """CUDA/NPU merge misses; HIP/XPU keep per-request encoding and output order."""
+    for name in ("hip", "npu", "xpu"):
+        monkeypatch.setattr(mm_schedule, f"_is_{name}", backend == name)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()[:2]
+    encoder = Mock(side_effect=_encoder_tensor)
+
+    def encode():
+        embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            [0, 1, 2],
+            [0, 0],
+            [TOTAL_LEN, TOTAL_LEN],
+            [[item.offsets[0]] for item in items],
+            torch.zeros(2 * TOTAL_LEN, dtype=torch.long),
+        )
+        return embedding
+
+    expected = _encoder_tensor(items)
+    torch.testing.assert_close(encode(), expected, rtol=0, atol=0)
+    expected_calls = (
+        [items] if backend in ("cuda", "npu") else [[item] for item in items]
+    )
+    assert [call.args[0] for call in encoder.call_args_list] == expected_calls
+    encoder.reset_mock()
+    torch.testing.assert_close(encode(), expected, rtol=0, atol=0)
+    encoder.assert_not_called()
+
+
 def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
