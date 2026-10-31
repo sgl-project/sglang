@@ -2,7 +2,7 @@ name: PR Test Extra
 # Label-gated extra CI workflow opted into per-PR via labels.
 #
 # Adds runtime to a PR only when the author asks for it: the PR must carry
-# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-extra` (explicit opt-in
+# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-nv-extra` (explicit opt-in
 # to this workflow). The label check happens at runtime in pr-gate.yml via
 # live `gh pr view --json labels`, so reruns after adding the labels via
 # slash command pick up the new label set (workflow-level `if` checks would
@@ -15,8 +15,8 @@ name: PR Test Extra
 
 on:
   # No `labeled` trigger: a label event would join the concurrency group and
-  # cancel the run in progress. Adding `run-ci-extra` after a push takes a
-  # rerun (/tag-and-rerun-ci extra, or a manual rerun), which the live label
+  # cancel the run in progress. Adding `run-ci-nv-extra` after a push takes a
+  # rerun (/run-extra-ci nv, or a manual rerun), which the live label
   # gate in pr-gate.yml then passes.
   pull_request:
   workflow_dispatch:
@@ -75,10 +75,10 @@ permissions:
 
 jobs:
   # =============================================== check changes ====================================================
-  # The actual `run-ci` + `run-ci-extra` label gate now lives in the
+  # The actual `run-ci` + `run-ci-nv-extra` label gate now lives in the
   # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
   # the PR's current labels at runtime, so a rerun (e.g. via
-  # /tag-and-rerun-ci extra, which adds labels via GITHUB_TOKEN — these
+  # /run-extra-ci nv, which adds labels via GITHUB_TOKEN — these
   # don't cascade-trigger labeled events) picks up the new label set and
   # passes. The previous workflow-level `if` checked the frozen event
   # payload, which never updates on rerun and made the slash-add-label flow
@@ -94,7 +94,7 @@ jobs:
 
   # =============================================== PR Gate ====================================================
   # Runtime live-fetch gate. Mirrors pr-test.yml's call-gate, but additionally
-  # requires `run-ci-extra`. Failure here cascades down to every test job
+  # requires `run-ci-nv-extra`. Failure here cascades down to every test job
   # via `needs`, so the workflow ends with one red gate job (~30s) plus a
   # row of skipped test jobs instead of consuming a runner.
   call-gate:
@@ -103,7 +103,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
-      require-run-ci-extra: true
+      require-label: run-ci-nv-extra
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
@@ -123,7 +123,7 @@ jobs:
 
   # =============================================== Rust extensions ====================================================
 
-  # Own build job because artifacts are per-run: a standalone `run-ci-extra` run
+  # Own build job because artifacts are per-run: a standalone `run-ci-nv-extra` run
   # cannot reach the base run's. Only artifact_name is suffixed; the cache prefix
   # stays at the default so the two workflows share one cache entry.
   rust-ext-build:

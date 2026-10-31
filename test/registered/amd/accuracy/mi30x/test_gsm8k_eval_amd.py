@@ -70,6 +70,11 @@ failing_models = {
     "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
     "google/gemma-2-9b-it",  # OOM on single GPU (exit code -9)
     "neuralmagic/gemma-2-2b-it-FP8",  # OOM on single GPU (exit code -9)
+    # Keeps generating Q&A after the answer, so the last-number scorer misses it
+    # (0.39 here, 0.51 when truncated at the next "Question:").
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",
+    # Static-scale FP8 MoE accuracy gap on ROCm, see #46628.
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
 }
 
 
