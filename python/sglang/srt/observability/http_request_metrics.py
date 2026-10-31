@@ -55,6 +55,14 @@ class _HttpRequestMetrics:
 
 _http_request_metrics: Optional[_HttpRequestMetrics] = None
 
+# Probes and scrapes come from the orchestrator and from Prometheus, not from
+# clients, so they stay out of the HTTP request metrics: a warming pod answers
+# /ready with 503, which would read as an error rate, and a scrape every second
+# adds one request per second to an idle server.
+HTTP_METRICS_EXCLUDED_PATHS = frozenset(
+    {"/health", "/health_generate", "/ready", "/ping", "/metrics"}
+)
+
 
 def init_http_request_metrics():
     # Call after PROMETHEUS_MULTIPROC_DIR is set: prometheus_client picks its
@@ -81,6 +89,8 @@ def add_http_request_metrics_middleware(app):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
+        if path in HTTP_METRICS_EXCLUDED_PATHS:
+            return await call_next(request)
         method = request.method
         routing_key = request.headers.get("x-smg-routing-key")
 
