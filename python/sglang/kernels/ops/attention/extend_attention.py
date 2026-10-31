@@ -969,6 +969,9 @@ def _fwd_kernel(
                     cur_kv_head,
                     0,
                 )
+                # Descriptors span requests; zero other requests' rows before
+                # P·V so masked probabilities cannot multiply NaN/Inf values.
+                v = tl.where(mask_n[:, None], v, 0.0)
             else:
                 offs_v = (
                     (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
