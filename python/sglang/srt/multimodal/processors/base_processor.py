@@ -8,7 +8,7 @@ import os
 import re
 import threading
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import (
     Any,
     Dict,
@@ -1077,6 +1077,22 @@ class BaseMultimodalProcessor(ABC):
                     return False
         return has_mm_data
 
+    def _load_single_item_for_processor(self, data, modality, *args):
+        # Current device is thread-local; IO workers need this instance's device.
+        bind_npu = (
+            modality == Modality.IMAGE
+            and self.device_image_decode is True
+            and self.server_args.device == "npu"
+            and not self._is_preprocessed_input(data)
+        )
+        context = (
+            torch.npu.device(self.server_args.base_gpu_id)
+            if bind_npu
+            else nullcontext()
+        )
+        with context:
+            return self._load_single_item(data, modality, *args)
+
     def _submit_mm_data_loading_tasks_simple(
         self,
         data_list: Optional[list],
@@ -1107,7 +1123,7 @@ class BaseMultimodalProcessor(ABC):
                 type(data),
             )
             future = self.io_executor.submit(
-                self.__class__._load_single_item,
+                self._load_single_item_for_processor,
                 data,
                 modality,
                 None,  # frame_count_limit: no consider for fast path
@@ -1167,7 +1183,7 @@ class BaseMultimodalProcessor(ABC):
 
                 futures.append(
                     self.io_executor.submit(
-                        self.__class__._load_single_item,
+                        self._load_single_item_for_processor,
                         data,
                         modality,
                         frame_count_limit,

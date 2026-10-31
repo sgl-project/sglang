@@ -5,15 +5,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import io
+import threading
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import torch
 from PIL import Image
 
 from sglang.srt.hardware_backend.npu import jpeg
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils import common
 
 
@@ -277,6 +284,89 @@ class TestDeviceImageDecodeDispatch(unittest.TestCase):
         ):
             result, _ = common.load_image(image, device_image_decode=True)
         self.assertIs(result, image)
+
+
+class TestProcessorIoDevice(unittest.TestCase):
+    def test_both_submit_paths_use_each_instances_device(self):
+        state = threading.local()
+
+        @contextmanager
+        def device(index):
+            previous = getattr(state, "device", 0)
+            state.device = index
+            try:
+                yield
+            finally:
+                state.device = previous
+
+        class Processor(BaseMultimodalProcessor):
+            @classmethod
+            def _load_single_item(cls, data, modality, *args):
+                return getattr(state, "device", 0)
+
+            async def process_mm_data_async(self, *args, **kwargs):
+                raise NotImplementedError
+
+        with (
+            patch.object(
+                torch, "npu", types.SimpleNamespace(device=device), create=True
+            ),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            for index in (1, 0):
+                processor = object.__new__(Processor)
+                processor.server_args = types.SimpleNamespace(
+                    device="npu", base_gpu_id=index
+                )
+                processor.io_executor = pool
+                simple = processor._submit_mm_data_loading_tasks_simple(
+                    [b"image"], Modality.IMAGE, None, True
+                )
+                self.assertEqual(simple[0][2].result(), index)
+                futures, _ = processor.submit_data_loading_tasks(
+                    ["<image>"],
+                    MultimodalSpecialTokens(image_token="<image>"),
+                    {Modality.IMAGE: iter([b"image"])},
+                )
+                self.assertEqual(futures[0].result(), index)
+
+    def test_cpu_cuda_optouts_and_other_modalities_do_not_bind_npu(self):
+        class Processor(BaseMultimodalProcessor):
+            @classmethod
+            def _load_single_item(cls, data, modality, *args):
+                return data
+
+            async def process_mm_data_async(self, *args, **kwargs):
+                raise NotImplementedError
+
+        for backend, mode, modality in [
+            ("cpu", True, Modality.IMAGE),
+            ("cuda", True, Modality.IMAGE),
+            ("npu", False, Modality.IMAGE),
+            ("npu", "nvjpeg_fancy", Modality.IMAGE),
+            ("npu", True, Modality.AUDIO),
+            ("npu", True, Modality.VIDEO),
+        ]:
+            processor = object.__new__(Processor)
+            processor.server_args = types.SimpleNamespace(device=backend, base_gpu_id=1)
+            with (
+                self.subTest(backend=backend, mode=mode, modality=modality),
+                patch.object(Processor, "device_image_decode", mode),
+                patch.object(
+                    torch,
+                    "npu",
+                    types.SimpleNamespace(
+                        device=Mock(
+                            side_effect=AssertionError("unexpected NPU binding")
+                        )
+                    ),
+                    create=True,
+                ),
+            ):
+                self.assertEqual(
+                    processor._load_single_item_for_processor(b"data", modality),
+                    b"data",
+                )
 
 
 class TestProcessorDecodePolicyMigration(unittest.TestCase):

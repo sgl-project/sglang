@@ -162,17 +162,28 @@ class VPCJPEGDecoder:
     def close(self):
         d = self.decoder
         with d.lock:
-            if self.channel:
-                d._activate()
-                if self.channel_created:
+            if not self.channel and d.context is None:
+                return
+            context, ret = d.acl.rt.get_context()
+            check(ret, "get caller context for close")
+            if not context:
+                raise ACLFailure("decoder cleanup requires an active caller context")
+            try:
+                if self.channel:
+                    d._activate()
+                    if self.channel_created:
+                        check(
+                            d.acl.media.dvpp_destroy_channel(self.channel),
+                            "VPC destroy channel",
+                        )
+                        self.channel_created = False
                     check(
-                        d.acl.media.dvpp_destroy_channel(self.channel),
-                        "VPC destroy channel",
+                        d.acl.media.dvpp_destroy_channel_desc(self.channel),
+                        "VPC destroy descriptor",
                     )
-                    self.channel_created = False
+                    self.channel = None
+                d.close()
+            finally:
                 check(
-                    d.acl.media.dvpp_destroy_channel_desc(self.channel),
-                    "VPC destroy descriptor",
+                    d.acl.rt.set_context(context), "restore caller context after close"
                 )
-                self.channel = None
-            d.close()

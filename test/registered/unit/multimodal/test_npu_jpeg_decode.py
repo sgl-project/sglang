@@ -254,6 +254,38 @@ class TestOddJpegAdaptation(unittest.TestCase):
 
 
 class TestVpcCleanup(unittest.TestCase):
+    def test_close_restores_exact_context_after_success_or_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                decoder = VPCJPEGDecoder.__new__(VPCJPEGDecoder)
+                current = [101]
+                acl = Mock()
+                acl.rt.get_context.return_value = (101, 0)
+                acl.rt.set_context.side_effect = lambda context: (
+                    current.__setitem__(0, context) or 0
+                )
+                decoder.channel = None
+                owner = types.SimpleNamespace(
+                    acl=acl, context=202, lock=threading.RLock()
+                )
+
+                def close():
+                    current[0] = owner.context
+                    if fail:
+                        raise dvpp.ACLFailure("release failed")
+                    owner.context = None
+
+                owner.close = close
+                decoder.decoder = owner
+                if fail:
+                    with self.assertRaisesRegex(dvpp.ACLFailure, "release failed"):
+                        decoder.close()
+                else:
+                    decoder.close()
+                    decoder.close()
+                self.assertEqual(current[0], 101)
+                acl.rt.set_context.assert_called_once_with(101)
+
     def test_cleanup_error_keeps_original_failure_and_releases_remaining_resources(
         self,
     ):

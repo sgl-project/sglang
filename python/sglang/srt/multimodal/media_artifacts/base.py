@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -157,7 +158,16 @@ class MediaArtifactCacheMixin:
         if isinstance(data, Image.Image):
             data.load()
             return data
-        image, _ = load_image(data, self.device_image_decode)
+        server_args = getattr(self, "server_args", None)
+        context = (
+            torch.npu.device(server_args.base_gpu_id)
+            if self.device_image_decode is True
+            and server_args is not None
+            and server_args.device == "npu"
+            else nullcontext()
+        )
+        with context:
+            image, _ = load_image(data, self.device_image_decode)
         if isinstance(image, Image.Image):
             image.load()
         return image

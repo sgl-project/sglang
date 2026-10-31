@@ -4,6 +4,7 @@ import importlib.util
 import io
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -114,7 +115,7 @@ class TestNpuJpegDecode(unittest.TestCase):
         self.assertIsInstance(enabled, Image.Image)
         np.testing.assert_array_equal(np.asarray(enabled), np.asarray(baseline))
 
-    def test_processor_io_threads_decode_without_worker_device_setup(self):
+    def _check_processor_io_device(self, device):
         from sglang.srt.managers.schedule_batch import Modality
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
@@ -131,6 +132,7 @@ class TestNpuJpegDecode(unittest.TestCase):
         data = buffer.getvalue()
         expected = np.asarray(Image.open(io.BytesIO(data))).transpose(2, 0, 1)
         processor = object.__new__(Processor)
+        processor.server_args = SimpleNamespace(device="npu", base_gpu_id=device.index)
         with ThreadPoolExecutor(max_workers=2) as pool:
             processor.io_executor = pool
             tasks = processor._submit_mm_data_loading_tasks_simple(
@@ -138,9 +140,43 @@ class TestNpuJpegDecode(unittest.TestCase):
             )
             for _, _, future in tasks:
                 result = future.result()
-                self.assertEqual(result.device, self.device)
+                self.assertEqual(result.device, device)
                 self.assertTrue(result.is_contiguous())
                 np.testing.assert_array_equal(result.cpu().numpy(), expected)
+
+    def test_processor_io_threads_decode_without_worker_device_setup(self):
+        self._check_processor_io_device(self.device)
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.device_count() >= 2,
+        "requires two visible NPUs",
+    )
+    def test_processor_io_threads_follow_nonzero_device(self):
+        with torch.npu.device(1):
+            self._check_processor_io_device(torch.device("npu:1"))
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.device_count() >= 2,
+        "requires two visible NPUs",
+    )
+    def test_close_restores_another_devices_context(self):
+        import acl
+
+        from sglang.srt.hardware_backend.npu.jpeg.vpc import VPCJPEGDecoder
+
+        decoder = VPCJPEGDecoder(0)
+        try:
+            with torch.npu.device(1):
+                torch.empty(1, device="npu:1")
+                context, ret = acl.rt.get_context()
+                self.assertEqual(ret, 0)
+                decoder.close()
+                self.assertEqual(acl.rt.get_context(), (context, 0))
+                self.assertEqual(acl.rt.get_device(), (1, 0))
+                self.assertEqual(torch.npu.current_device(), 1)
+                self.assertEqual(torch.ones(4, device="npu:1").sum().item(), 4)
+        finally:
+            decoder.close()
 
 
 if __name__ == "__main__":
