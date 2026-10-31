@@ -364,6 +364,8 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.req_to_decode_prefix_len = {room: 4}
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)
@@ -564,6 +566,36 @@ class TestNixlTransferWorker(CustomTestCase):
         )
         self.assertNotIn(room, mgr.transfer_infos)
 
+    def test_packed_kv_from_this_worker_settles_before_success(self):
+        """Prefill TP < decode TP with packing on: the worker posts through its own packer, then settles."""
+        room = 26
+        mgr = self._make_manager(room)
+        mgr.decode_kv_args_table["agent"].decode_tp_size = 2
+        mgr.enable_kv_packing = True
+        mgr._kv_packers = ["packer0", "packer1"]
+        events = []
+
+        def send_packed(*, packer, peer_name, src_pages, dst_pages, handles):
+            events.append(packer)
+            handles.append("packed")
+
+        mgr._send_packed_kvcache = MagicMock(side_effect=send_packed)
+        mgr.send_kvcache_slice = MagicMock(side_effect=AssertionError("slice path"))
+        mgr.send_aux = MagicMock(return_value="aux")
+        mgr.agent.check_xfer_state = lambda handle: events.append(handle) or "DONE"
+        mgr.send_kv_status_message.side_effect = lambda **kwargs: events.append(
+            kwargs["status"]
+        )
+        queue = SimpleNamespace(
+            get=MagicMock(
+                side_effect=[self._make_chunk(room, [1], is_last_chunk=True), SystemExit()]
+            )
+        )
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue, worker_index=1)
+
+        self.assertEqual(events, ["packer1", "packed", "aux", KVPoll.Success])
+
     def test_failed_handle_never_emits_success(self):
         room = 25
         mgr = self._make_manager(room)
@@ -734,6 +766,8 @@ class TestNixlDecodeListener(CustomTestCase):
         mgr._deferred_ack_poisoned_rooms = set()
         mgr._staging_outstanding = {}
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr._staging_handler = MagicMock()
         receiver = NixlKVReceiver(mgr, "prefill:8998", 11)
         mgr.update_status(11, KVPoll.WaitingForInput)
@@ -767,6 +801,8 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         mgr = object.__new__(NixlKVManager)
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
         queue = SimpleNamespace(put=MagicMock())
         mgr.transfer_queues = [queue]
@@ -1207,6 +1243,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 for i, name in enumerate(peers)
             }
         mgr.enable_staging = False
+        mgr.enable_kv_packing = False
+        mgr._kv_packers = []
         mgr.enable_deferred_decode_kv_release = False
         mgr._staging_ctx = None
         mgr._staging_outstanding = defaultdict(int)

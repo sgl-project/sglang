@@ -1474,6 +1474,25 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
+def _nixl_kv_packable(owner_view, draft_token_to_kv_pool) -> bool:
+    """NIXL KV packing gathers [tokens, heads, head_dim] pages; validated only on
+    SWA hybrids whose full and SWA pools are plain NHD MHA pools. Each pool is
+    gathered with one page size for K and V, and both are sliced with the
+    full-attention head count, so K/V head dims and the head counts must match."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    if draft_token_to_kv_pool is not None or not isinstance(owner_view, SWAKVPool):
+        return False
+    pools = (owner_view.full_kv_pool, owner_view.swa_kv_pool)
+    return all(
+        type(pool) is MHATokenToKVPool
+        and pool.kv_cache_layout == "nhd"
+        and pool.head_dim == pool.v_head_dim
+        for pool in pools
+    ) and pools[0].head_num == pools[1].head_num
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
@@ -1502,6 +1521,7 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+    kv_args.kv_packable = _nixl_kv_packable(owner_view, draft_token_to_kv_pool)
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool)
         state_type = _wire_state_type(entry.state_type)

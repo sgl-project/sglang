@@ -89,6 +89,8 @@ class KVArgs:
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
+    # NIXL KV packing: an SWA hybrid of NHD MHA pools (see setup_state_kv_args).
+    kv_packable: bool = False
     ib_device: str
     gpu_id: int
     kv_head_num: int
