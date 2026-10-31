@@ -9,57 +9,34 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_VL_8B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, terminate_and_kill_process_tree
 
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
-class TestNpuViTBatching(CustomTestCase):
+class TestNpuViTBatching(DefaultServerBase):
+    model = os.environ.get("SGLANG_TEST_MODEL", QWEN3_VL_8B_INSTRUCT_WEIGHTS_PATH)
+    base_url = os.environ.get("SGLANG_TEST_BASE_URL", DEFAULT_URL_FOR_TEST)
+    other_args = (
+        "--attention-backend ascend --dtype bfloat16 --context-length 8192 "
+        "--chunked-prefill-size 512 --max-running-requests 8 "
+        "--mem-fraction-static 0.7 --disable-cuda-graph"
+    ).split()
+    server_env = {"ASCEND_USE_FIA": "1", "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1"}
+
     @classmethod
     def setUpClass(cls):
-        cls.model = os.environ.get(
-            "SGLANG_TEST_MODEL", QWEN3_VL_8B_INSTRUCT_WEIGHTS_PATH
-        )
-        cls.url = os.environ.get("SGLANG_TEST_BASE_URL", DEFAULT_URL_FOR_TEST)
         cls.process = None
         if "SGLANG_TEST_BASE_URL" not in os.environ:
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--attention-backend",
-                    "ascend",
-                    "--dtype",
-                    "bfloat16",
-                    "--context-length",
-                    "8192",
-                    "--chunked-prefill-size",
-                    "512",
-                    "--max-running-requests",
-                    "8",
-                    "--mem-fraction-static",
-                    "0.7",
-                    "--disable-cuda-graph",
-                ],
-                env={
-                    "ASCEND_USE_FIA": "1",
-                    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
-                },
-            )
+            super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid)
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def ask(self, spec):
         colors, size, prefix = spec
@@ -85,7 +62,7 @@ class TestNpuViTBatching(CustomTestCase):
             }
         )
         response = requests.post(
-            self.url + "/v1/chat/completions",
+            self.base_url + "/v1/chat/completions",
             json={
                 "model": self.model,
                 "messages": [{"role": "user", "content": content}],
