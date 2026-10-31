@@ -1083,11 +1083,20 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    # Kimi-K3 TP8 on gfx950: run the latent-MoE tail (latent RMSNorm, up-projection,
+    # shared + residual add) as one kernel for decode-sized batches.
+    SGLANG_ROCM_K3_FUSED_LATENT_TAIL = EnvBool(True)
+    # Run that tail column-parallel (1/8 of the up_proj per rank), its all-gather fused
+    # with the next layer's attention read, up to 64 tokens.
+    SGLANG_ROCM_K3_COLUMN_TAIL = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
+    # Complete the attention output's all-reduce, the residual add and the FFN-side
+    # read in one LL kernel for 4-token batches (EAGLE C1 verify).
+    SGLANG_ROCM_K3_FUSED_ATTN_AR_READ = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
