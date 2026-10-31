@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_lists import RequestList
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -59,29 +60,17 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.addCleanup(patcher.stop)
         return serving
 
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            _deferred_responses=None,
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(
-                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
-                )
-                if staging
-                else None
-            ),
-        )
-
-    def test_every_source_of_live_requests_is_stamped(self):
-        """A request missed here keeps attributing its next tokens to the superseded version."""
+    def test_every_listed_request_is_stamped(self):
+        """A request missed here keeps attributing its next tokens to the
+        superseded version, including one the idle check never counts."""
         self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
+        running, queued, held = (object() for _ in range(3))
+        scheduler = SimpleNamespace(
+            request_lists=lambda: [
+                RequestList(name="running", reqs=[running], health_check=True),
+                RequestList(name="waiting", reqs=[queued], waiting=True),
+                RequestList(name="deferred", reqs=[held], never_busy=True),
+            ]
         )
 
         with patch(
@@ -90,9 +79,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         ) as recorder:
             Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
-        self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
-        )
+        self.assertEqual(list(recorder.call_args.args[0]), [running, queued, held])
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):

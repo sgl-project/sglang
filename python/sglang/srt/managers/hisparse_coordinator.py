@@ -39,6 +39,7 @@ else:
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_lists import RequestList
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
@@ -1059,6 +1060,17 @@ class HiSparseCoordinator:
 
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
+
+    def request_lists(self) -> List[RequestList]:
+        """The requests from their last prefill chunk's result until their host
+        copy lands; then they run. Between that chunk's launch and its result
+        only the step holds them."""
+        return [
+            RequestList(
+                name="hisparse_staging",
+                reqs=[act.req for act in self.ack_staging_queue],
+            )
+        ]
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []

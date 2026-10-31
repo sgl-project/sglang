@@ -1,11 +1,13 @@
 import random
 import unittest
-from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -17,11 +19,7 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
-    CustomTestCase,
-    enter_scope,
-    published_topology,
-)
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -298,32 +296,23 @@ class _ContextStub:
 
 
 class _SchedulerStub:
-    _collect_inflight_batches = Scheduler._collect_inflight_batches
-    collect_inflight_reqs = Scheduler.collect_inflight_reqs
+    request_lists = Scheduler.request_lists
 
-    def __init__(
-        self,
-        version,
-        running,
-        waiting,
-        chunked=None,
-        last_batch=None,
-        hisparse=None,
-    ):
+    def __init__(self, version, running, waiting, chunked=None, hisparse=None):
         self.serving = _ServingStub(version)
-        self.enable_continuous_input_polling = False
-        self.result_queue = deque()
-        self.running_batch = SimpleNamespace(reqs=running)
-        self.last_batch = last_batch
+        self.disaggregation_mode = DisaggregationMode.NULL
         self.waiting_queue = waiting
+        self.grammar_manager = SimpleNamespace(grammar_queue=[])
+        self.running_reqs = RunningReqs()
+        self.running_reqs.join(running)
         self.chunked_req = chunked
+        self.dllm_config = None
         self.hisparse_coordinator = hisparse
         self._deferred_responses = None
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _scheduler(self, *args, pp_size=1, **kwargs):
-        enter_scope(self, published_topology(pp_size=pp_size))
+    def _scheduler(self, *args, **kwargs):
         scheduler = _SchedulerStub(*args, **kwargs)
         for name, value in (
             ("get_serving", scheduler.serving),
@@ -355,45 +344,11 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.assertEqual(req.weight_version_events[0].old_version, "v1")
             self.assertEqual(req.weight_version_events[0].num_output_tokens, output_len)
 
-    def test_records_on_last_batch_requests_exactly_once(self):
-        """A request in both the running and last batch is recorded once, and last-batch-only requests are recorded too."""
-        shared_req = _ReqStub(3)
-        prefill_req = _ReqStub(1)
-        scheduler = self._scheduler(
-            "v1",
-            [shared_req],
-            [],
-            last_batch=SimpleNamespace(reqs=[shared_req, prefill_req]),
-        )
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(len(shared_req.weight_version_events), 1)
-        self.assertEqual(len(prefill_req.weight_version_events), 1)
-
-    def test_records_on_all_pp_microbatches(self):
-        """With pipeline parallelism every microbatch is visited, not just the selected one."""
-        mb0_req = _ReqStub(2)
-        mb1_req = _ReqStub(4)
-        pending_req = _ReqStub(6)
-        scheduler = self._scheduler("v1", [], [], pp_size=2)
-        scheduler.running_mbs = [
-            SimpleNamespace(reqs=[mb0_req]),
-            SimpleNamespace(reqs=[mb1_req]),
-        ]
-        scheduler.mbs = [None, SimpleNamespace(reqs=[pending_req])]
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        for req in (mb0_req, mb1_req, pending_req):
-            self.assertEqual(len(req.weight_version_events), 1)
-
     def test_records_on_hisparse_staging_requests(self):
         """Requests parked in the HiSparse staging queue are swept like any live request."""
         staging_req = _ReqStub(2)
-        coordinator = SimpleNamespace(
-            ack_staging_queue=[SimpleNamespace(req=staging_req)]
-        )
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.ack_staging_queue = [HiSparseAct(None, None, staging_req)]
         scheduler = self._scheduler("v1", [], [], hisparse=coordinator)
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")

@@ -77,6 +77,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.request_lists import RequestList
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -578,6 +579,19 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    def disagg_prefill_request_lists(self: Scheduler) -> List[RequestList]:
+        """The PD prefill lists: bootstrapping, and sending the KV. Between the
+        launch of a request's last chunk and its result only the step holds it.
+        """
+        return [
+            RequestList(
+                name="prefill_bootstrap", reqs=self.disagg_prefill_bootstrap_queue.queue
+            ),
+            RequestList(
+                name="prefill_transfer", reqs=self.disagg_prefill_inflight_queue
+            ),
+        ]
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""

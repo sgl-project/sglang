@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.weight_versions import (
@@ -44,7 +45,10 @@ def _scheduler():
     scheduler = object.__new__(Scheduler)
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.waiting_queue = []
+    scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+    scheduler.running_reqs = RunningReqs()
     scheduler.chunked_req = None
+    scheduler.dllm_config = None
     scheduler.hisparse_coordinator = None
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.ipc_channels = Mock()
@@ -202,13 +206,9 @@ def test_held_responses_do_not_change_idle_state():
     scheduler._engine_paused = False
     scheduler.enable_overlap = False
     scheduler.last_batch = None
-    scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
     scheduler.result_queue = deque()
-    scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
-    scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False
-    scheduler.enable_hisparse = False
     scheduler.defer_response(_req("held"), Future())
 
     assert scheduler.has_pending_deferred_outputs()

@@ -9,6 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -41,17 +42,17 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.chunked_req = None
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
-        scheduler.running_batch.is_empty.return_value = True
+        scheduler.running_reqs = RunningReqs()
         scheduler.result_queue = deque()
         scheduler.waiting_queue = []
-        scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.dllm_config = None
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
-        scheduler.enable_hisparse = False
+        scheduler.hisparse_coordinator = None
+        scheduler._deferred_responses = None
         scheduler.tree_cache = MagicMock()
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
