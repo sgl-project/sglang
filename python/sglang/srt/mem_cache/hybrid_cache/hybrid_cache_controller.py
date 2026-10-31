@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
     count_pool_hits,
+    merge_source_transfers,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
@@ -994,7 +995,9 @@ class HybridCacheController(BaseHiCacheController):
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
             if t.indices_from_pool is None and t.host_indices is not None:
-                source_len[t.name] = transferred_tokens(t.host_indices)
+                source_len[t.name] = source_len.get(t.name, 0) + transferred_tokens(
+                    t.host_indices
+                )
         for t in op.pool_transfers or []:
             entry = self.mem_pool_host.entry_map.get(t.name)
             if entry is None:
@@ -1791,14 +1794,8 @@ class HybridCacheController(BaseHiCacheController):
             if transfer.indices_from_pool is None:
                 continue
             if transfer.indices_from_pool != PoolName.KV:
-                source = next(
-                    (
-                        t
-                        for t in operation.pool_transfers
-                        if t.indices_from_pool is None
-                        and t.name == transfer.indices_from_pool
-                    ),
-                    None,
+                source = merge_source_transfers(
+                    operation.pool_transfers, transfer.indices_from_pool
                 )
                 if source is None:
                     raise AssertionError(
@@ -1905,15 +1902,7 @@ class HybridCacheController(BaseHiCacheController):
                     pool.device_indices = kv_device_indices
                 continue
 
-            source = next(
-                (
-                    transfer
-                    for transfer in extra_pools
-                    if transfer.indices_from_pool is None
-                    and transfer.name == pool.indices_from_pool
-                ),
-                None,
-            )
+            source = merge_source_transfers(extra_pools, pool.indices_from_pool)
             if source is None:
                 rollback_allocated()
                 return None

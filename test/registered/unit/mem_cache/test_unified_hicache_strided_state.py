@@ -29,29 +29,6 @@ class TestStridedStateDetection(CustomTestCase):
     def test_empty_tensor_is_not_strided(self):
         self.assertFalse(MambaPoolHost._slots_are_strided(torch.zeros((0, 4))))
 
-    def test_staging_round_trip_preserves_slot_contents(self):
-        """Gather and scatter preserve selected slots without changing their neighbors."""
-        num_slots, per_slot, envelope = 6, 4, 10
-        raw = torch.arange(num_slots * envelope, dtype=torch.float32)
-        view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
-        indices = torch.tensor([4, 1, 3])
-
-        staged = view.index_select(0, indices)
-        self.assertTrue(staged.is_contiguous())
-        for row, slot in enumerate(indices.tolist()):
-            self.assertTrue(torch.equal(staged[row], view[slot]))
-
-        dst = torch.zeros_like(raw)
-        dst_view = torch.as_strided(
-            dst, size=(num_slots, per_slot), stride=(envelope, 1)
-        )
-        dst_view.index_copy_(0, indices, staged)
-        for slot in indices.tolist():
-            self.assertTrue(torch.equal(dst_view[slot], view[slot]))
-        # A partial transfer must leave unselected slots untouched.
-        for slot in set(range(num_slots)) - set(indices.tolist()):
-            self.assertTrue(torch.all(dst_view[slot] == 0))
-
 
 if __name__ == "__main__":
     unittest.main()

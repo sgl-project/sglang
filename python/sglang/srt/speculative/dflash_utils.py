@@ -9,7 +9,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
@@ -18,6 +17,7 @@ from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
 )
+from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec

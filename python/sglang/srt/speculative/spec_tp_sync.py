@@ -41,7 +41,9 @@ class SpecTpSyncSite(IntEnum):
 
 _ALL = frozenset(SpecTpSyncSite)
 _INIT = frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
-# Sites that draw from the RNG, so they can differ under identical logits.
+# Sites that draw from the RNG, so they can differ under identical logits; so did the
+# renorm output the accept sites consume, before sampling_renorm.py made it
+# bit-identical across ranks whenever tp_size > 1.
 _RNG = frozenset(
     {
         SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
