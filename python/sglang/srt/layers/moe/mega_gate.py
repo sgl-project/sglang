@@ -96,7 +96,7 @@ def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> boo
     )
 
 
-def _captures_routed_experts(moe) -> bool:
+def captures_routed_experts(moe) -> bool:
     return (
         not moe.is_hash
         and moe.topk.topk_config.allow_routed_experts_capture
@@ -203,7 +203,7 @@ def run_mega_gate(
 
     routed_scaling_factor = float(moe.routed_scaling_factor)
     fused_in_topk = moe.routed_scaling_factor_fused_in_topk
-    in_buffer = buf is not None and not _captures_routed_experts(moe)
+    in_buffer = buf is not None and not captures_routed_experts(moe)
     to_physical_map = logical_count = None
     if in_buffer and dispatch_info is not None:
         # NOTE(kpham-sgl): MegaMoE reads physical expert slots from this buffer, so
