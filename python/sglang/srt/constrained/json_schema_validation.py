@@ -290,18 +290,44 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
         # Leave unsupported syntax to the backend compiler.
         return None
 
-    # Without a start anchor, a suffix such as a[ab]{100}$ can require
-    # exponential states to remember all candidate match positions.
-    if (
-        not parsed
-        or parsed.state.flags & sre_parse.SRE_FLAG_MULTILINE
-        or parsed[0]
-        not in (
-            (sre_parse.AT, sre_parse.AT_BEGINNING),
-            (sre_parse.AT, sre_parse.AT_BEGINNING_STRING),
-        )
-    ):
+    if not parsed or parsed.state.flags & sre_parse.SRE_FLAG_MULTILINE:
         return None
+
+    is_start_anchored = parsed[0] in (
+        (sre_parse.AT, sre_parse.AT_BEGINNING),
+        (sre_parse.AT, sre_parse.AT_BEGINNING_STRING),
+    )
+    if not is_start_anchored:
+        # An unanchored suffix can require exponential states to remember
+        # candidate match positions (for example, a[ab]{100}$). A single
+        # fixed repetition of one character atom is different: it only needs
+        # to track the current run length, so its state count is linear.
+        body = list(parsed)
+        if body and body[-1] in (
+            (sre_parse.AT, sre_parse.AT_END),
+            (sre_parse.AT, sre_parse.AT_END_STRING),
+        ):
+            body.pop()
+        if len(body) != 1 or body[0][0] not in (
+            sre_parse.MAX_REPEAT,
+            sre_parse.MIN_REPEAT,
+        ):
+            return None
+        min_rep, max_rep, child = body[0][1]
+        if (
+            min_rep != max_rep
+            or max_rep == sre_parse.MAXREPEAT
+            or len(child) != 1
+            or child[0][0]
+            not in (
+                sre_parse.LITERAL,
+                sre_parse.NOT_LITERAL,
+                sre_parse.IN,
+                sre_parse.ANY,
+                sre_parse.CATEGORY,
+            )
+        ):
+            return None
 
     def fixed_width(subpattern):
         width = 0

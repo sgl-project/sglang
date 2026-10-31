@@ -234,6 +234,7 @@ class TestBoundedLinearPatterns(CustomTestCase):
         "^[0-9a-f]{40}$",  # SHA-1
         "^[0-9a-f]{64}$",  # SHA-256
         "^[0-9a-f]{128}$",  # SHA-512
+        "[0-9a-f]{64}",  # Unanchored SHA-256: a homogeneous repetition is linear.
         "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         "^(?:[0-9a-f]{8}){8}$",
         "^[*+?()|]{64}$",  # Metacharacters inside a class are character atoms.
@@ -273,7 +274,11 @@ class TestBoundedLinearPatterns(CustomTestCase):
 
     def test_linear_patterns_still_obey_state_budget(self):
         validate_schema_bounds({"type": "string", "pattern": "^[ab]{64}$"})
-        for pattern in ("^[ab]{10001}$", "^(?:[ab]{100}){101}$"):
+        for pattern in (
+            "^[ab]{10001}$",
+            "[ab]{10001}",
+            "^(?:[ab]{100}){101}$",
+        ):
             with self.subTest(pattern=pattern):
                 with self.assertRaises(JSONSchemaStateExplosion):
                     validate_schema_bounds({"type": "string", "pattern": pattern})
