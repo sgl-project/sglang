@@ -232,6 +232,8 @@ class TestPhysicalReservation(_ConfigCase):
 
             load_done = _Copy()
             allocator.set_hicache_transfer_done_event(H2D, load_done)
+            # Submitted: the load names the rows it writes by the owner's ids.
+            swa.record_transfer(load_done, target, writes=True)
             # Queued: compaction waits on the copy, then relocates rows.
             self.assertGreater(swa._flush(urgent=True), 0)
         self.assertEqual(waits[0], ("wait", load_done))

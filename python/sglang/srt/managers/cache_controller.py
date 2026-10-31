@@ -995,13 +995,17 @@ class HiCacheController:
                 self.write_fence_stream
             )
 
-        completion = self.l2_transfer_engine.submit_device_to_host(
-            self._l2_transfers(host_indices, device_indices, pool_transfers)
-        )
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        completion = self.l2_transfer_engine.submit_device_to_host(transfers)
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "write"), completion.finish_event
         )
+        storage = self.mem_pool_device_allocator.storage
+        if storage is not None:
+            storage.record_host_transfer(
+                completion.finish_event, transfers, writes=False
+            )
 
         self.ack_write_queue.append(
             HiCacheAck(
@@ -1140,8 +1144,11 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
@@ -1150,6 +1157,11 @@ class HiCacheController:
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event
         )
+        storage = self.mem_pool_device_allocator.storage
+        if storage is not None:
+            storage.record_host_transfer(
+                completion.finish_event, transfers, writes=True
+            )
 
         self.ack_load_queue.append(
             HiCacheAck(

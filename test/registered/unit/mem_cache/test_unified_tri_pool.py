@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.kv.alloc.band import (
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
+from sglang.srt.mem_cache.kv.alloc.signals import wait_signals
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -1717,7 +1718,9 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
         there would land on the alloc-shortfall path every time the float moves."""
         settle = inspect.getsource(Band._settle_inflight_forward)
         self.assertIn("_wait_on_stream", settle)
-        src = inspect.getsource(Band._wait_on_stream)
+        # The wait itself is issued by the signal helper the band delegates to.
+        src = inspect.getsource(Band._wait_on_stream) + inspect.getsource(wait_signals)
+        self.assertIn("wait_signals", src)
         self.assertIn("wait_event", src)
         for src in (settle, src):
             self.assertNotIn(".item()", src)

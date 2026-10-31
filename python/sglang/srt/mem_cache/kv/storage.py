@@ -755,6 +755,30 @@ class KVStorage:
             return self._allocator.state.slots.translate
         return lambda ids: self._host_token_ids(sub_pool, ids)
 
+    def record_host_transfer(self, signal, transfers, *, writes: bool) -> None:
+        """Record a submitted host copy, completing at ``signal``: a load-back
+        or restore ``writes`` its device rows, a backup reads them. A page move
+        then waits it only for the pages it touches. Transfers over a view this
+        storage does not own (a fused draft's) touch the same rows as their
+        target's transfer."""
+        sub_pools = {id(view): name for name, view in self._views.items()}
+        for transfer in transfers:
+            name = sub_pools.get(id(transfer.device_pool))
+            if name is None:
+                continue
+            self._member(name).record_transfer(
+                signal, transfer.device_indices, writes=writes
+            )
+
+    def _member(self, sub_pool: str):
+        """The chain member that holds ``sub_pool``'s rows."""
+        roles = self._allocator.roles
+        if sub_pool == roles.owner:
+            return self._allocator.full_attn_allocator
+        if sub_pool == roles.state:
+            return self._allocator.mamba_allocator
+        return self._allocator.window_allocators[sub_pool]
+
     def add_pin_source(
         self, sub_pools: Sequence[str], busy: Callable[[], bool]
     ) -> None:
