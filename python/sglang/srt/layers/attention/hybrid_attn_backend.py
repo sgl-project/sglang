@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -87,6 +88,13 @@ class HybridAttnBackend(AttentionBackend):
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        return self._select_backend(capture_forward_mode).get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
+        )
 
     def _snapshot_prefill_shared_reads(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int

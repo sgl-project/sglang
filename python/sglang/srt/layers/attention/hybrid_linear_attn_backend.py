@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -1333,6 +1334,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
             b.shared_read_ends(fm) for b in self.attn_backend_list
+        )
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Linear layers capture identically under every label.
+        return self.full_attn_backend.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
