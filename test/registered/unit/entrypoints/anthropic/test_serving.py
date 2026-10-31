@@ -9,7 +9,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 from fastapi import HTTPException  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
@@ -21,6 +21,9 @@ from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
+)
+from sglang.srt.entrypoints.openai.serving_base import (  # noqa: E402
+    raise_pre_stream_abort,
 )
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
@@ -56,6 +59,57 @@ class _FakeOpenAIServingChat:
 
     def wrap_reasoning_history(self, text):
         return f"<think>\n{text}\n</think>"
+
+
+class _FakeStreamingEntryOpenAI(_FakeOpenAIServingChat):
+    """Also supports the ``AnthropicServing._handle_streaming`` entry path.
+
+    With ``abort_status`` set, the stream aborts before its first chunk the
+    way ``OpenAIServingChat._generate_chat_stream`` does for a rejection; with
+    ``pre_first_chunk_error`` set, it raises that instead.
+    """
+
+    def __init__(
+        self, stream_lines=None, abort_status=None, pre_first_chunk_error=None
+    ):
+        super().__init__(stream_lines)
+        self.abort_status = abort_status
+        self.pre_first_chunk_error = pre_first_chunk_error
+        self.tokenizer_manager.create_abort_task = lambda adapted_request: None
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        return SimpleNamespace(), chat_request
+
+    def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
+        if self.abort_status is None and self.pre_first_chunk_error is None:
+            return super()._generate_chat_stream(
+                adapted_request, processed_request, raw_request
+            )
+
+        async def _gen():
+            if self.pre_first_chunk_error is not None:
+                raise self.pre_first_chunk_error
+            raise_pre_stream_abort(self.abort_status, "The request queue is full.")
+            yield  # pragma: no cover
+
+        return _gen()
+
+
+async def _handle_streaming(serving, anthropic_request):
+    chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+    return await serving._handle_streaming(chat_request, anthropic_request, object())
+
+
+async def _collect_response_events(response):
+    events = []
+    async for sse in response.body_iterator:
+        for line in sse.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
 
 
 class _FakeNonStreamingErrorOpenAI:
@@ -123,6 +177,9 @@ async def _collect_anthropic_events(serving, anthropic_request):
         processed_request=object(),
         anthropic_request=anthropic_request,
         raw_request=object(),
+        openai_stream=serving.openai_serving_chat._generate_chat_stream(
+            object(), object(), object()
+        ),
     ):
         for line in sse.splitlines():
             if line.startswith("data: "):
@@ -1410,30 +1467,96 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("error", types)
         self.assertEqual(types[-1], "message_stop")
 
-    def test_stream_pre_first_chunk_value_error_emits_envelope(self):
-        """ValueError before any chunk must yield a clean Anthropic error sequence."""
-
-        class _RaisingOpenAI(_FakeOpenAIServingChat):
-            def _generate_chat_stream(
-                self, adapted_request, processed_request, raw_request
-            ):
-                async def _gen():
-                    raise ValueError("tokenization failed")
-                    yield  # pragma: no cover
-
-                return _gen()
-
-        serving = AnthropicServing(_RaisingOpenAI())
-        events = asyncio.run(
-            _collect_anthropic_events(serving, self._anthropic_request())
+    def test_stream_pre_first_chunk_value_error_returns_http_400(self):
+        """A ValueError before any chunk (e.g. tokenization failure) is a real
+        HTTP 400, not an error event under HTTP 200."""
+        serving = AnthropicServing(
+            _FakeStreamingEntryOpenAI(
+                pre_first_chunk_error=ValueError("tokenization failed")
+            )
         )
-        types = [e["type"] for e in events]
-        self.assertEqual(types[0], "message_start")
-        self.assertIn("error", types)
-        err = next(e for e in events if e["type"] == "error")
-        self.assertEqual(err["error"]["type"], "invalid_request_error")
-        self.assertIn("tokenization failed", err["error"]["message"])
-        self.assertEqual(types[-1], "message_stop")
+        response = asyncio.run(_handle_streaming(serving, self._anthropic_request()))
+        self.assertNotIsInstance(response, StreamingResponse)
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.body)
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("tokenization failed", body["error"]["message"])
+
+    def test_stream_abort_before_first_chunk_returns_http_error(self):
+        """A rejection before the first OpenAI chunk is a real HTTP error with
+        the matching Anthropic error type, not an error event under HTTP 200."""
+        cases = [
+            (HTTPStatus.SERVICE_UNAVAILABLE, "overloaded_error"),
+            (HTTPStatus.BAD_REQUEST, "invalid_request_error"),
+            (HTTPStatus.TOO_MANY_REQUESTS, "rate_limit_error"),
+            (HTTPStatus.GATEWAY_TIMEOUT, "api_error"),
+            (499, "api_error"),
+            (599, "api_error"),
+        ]
+        for status, want_type in cases:
+            with self.subTest(status=status):
+                serving = AnthropicServing(
+                    _FakeStreamingEntryOpenAI(abort_status=status)
+                )
+                response = asyncio.run(
+                    _handle_streaming(serving, self._anthropic_request())
+                )
+                self.assertNotIsInstance(response, StreamingResponse)
+                self.assertEqual(response.status_code, int(status))
+                body = json.loads(response.body)
+                self.assertEqual(body["error"]["type"], want_type)
+                expected_message = (
+                    "Internal server error"
+                    if status >= 500
+                    else "The request queue is full."
+                )
+                self.assertEqual(body["error"]["message"], expected_message)
+
+    def test_stream_pre_first_chunk_5xx_scrubs_internal_details(self):
+        for status in (500, 503, 504):
+            with self.subTest(status=status):
+                serving = AnthropicServing(
+                    _FakeStreamingEntryOpenAI(
+                        pre_first_chunk_error=HTTPException(
+                            status_code=status,
+                            detail="worker rejected request: sensitive internals /opt/secret",
+                        )
+                    )
+                )
+                response = asyncio.run(
+                    _handle_streaming(serving, self._anthropic_request())
+                )
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(
+                    json.loads(response.body)["error"]["message"],
+                    "Internal server error",
+                )
+
+    def test_stream_entry_keeps_first_chunk(self):
+        """The chunk pulled before HTTP 200 is still converted and streamed."""
+        lines = [
+            _chunk([_choice({"role": "assistant", "content": "first"})]),
+            _chunk([_choice({"content": " second"})]),
+            _chunk([_choice({}, finish_reason="stop")]),
+            "data: [DONE]\n\n",
+        ]
+        serving = AnthropicServing(_FakeStreamingEntryOpenAI(lines))
+
+        async def run():
+            # One event loop for both steps: closing the loop that started
+            # the OpenAI stream would close the stream too.
+            response = await _handle_streaming(serving, self._anthropic_request())
+            self.assertIsInstance(response, StreamingResponse)
+            return await _collect_response_events(response)
+
+        events = asyncio.run(run())
+        text = "".join(
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta"
+        )
+        self.assertEqual(text, "first second")
+        self.assertEqual(events[-1]["type"], "message_stop")
 
     def test_server_tool_only_with_tool_choice_any_raises_400(self):
         """A request with only server-side tools cannot honor tool_choice=any."""
