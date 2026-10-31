@@ -6,11 +6,14 @@ import torch
 import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=130, stage="nightly", runner_config="1-gpu-large")
+# backend-specific: ROCm tensors must pass the JIT launchers' DLPack device checks.
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 def sglang_aot_qknorm(
@@ -65,6 +68,7 @@ DTYPE = torch.bfloat16
 # so we allow a small rel/abs tolerance in correctness test.
 
 
+@pytest.mark.skipif(is_hip(), reason="The AOT reference requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,n_k,n_q,head_dim",
     list(itertools.product(BS_LIST, N_K_LIST, N_Q_LIST, HEAD_DIM_LIST)),
@@ -80,6 +84,36 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
     sglang_jit_qknorm(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
     triton.testing.assert_close(q_k_aot[0], q_k_jit[0], atol=1e-2, rtol=1e-2)
     triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qknorm_packed_qkv(head_dim: int, dtype: torch.dtype) -> None:
+    """Both fused launchers must accept ROCm tensors and packed-QKV strides."""
+    from sglang.kernels.ops.layernorm.norm import can_use_fused_inplace_qknorm
+
+    batch_size, n_q, n_k = 9, 32, 8
+    qkv = torch.randn(
+        batch_size, (n_q + 2 * n_k) * head_dim, device=DEVICE, dtype=dtype
+    )
+    q, k, v = qkv.split([n_q * head_dim, n_k * head_dim, n_k * head_dim], dim=-1)
+    q = q.view(batch_size, n_q, head_dim)
+    k = k.view(batch_size, n_k, head_dim)
+    v_ref = v.clone()
+    q_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    k_weight = torch.randn(head_dim, device=DEVICE, dtype=dtype)
+    expected = []
+    for x, weight in [(q, q_weight), (k, k_weight)]:
+        x_fp32 = x.float()
+        normed = x_fp32 * (x_fp32.square().mean(dim=-1, keepdim=True) + 1e-6).rsqrt()
+        expected.append((normed * weight.float()).to(dtype))
+
+    assert can_use_fused_inplace_qknorm(head_dim, dtype)
+    sglang_jit_qknorm(q, k, q_weight, k_weight)
+
+    torch.testing.assert_close(q, expected[0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k, expected[1], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v, v_ref, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
