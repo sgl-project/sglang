@@ -3,6 +3,14 @@ import triton.language as tl
 
 
 @triton.jit
+def _raise_target_prob(p, threshold_acc):
+    # min(1, p / threshold_acc). At 1.0 this equals p for probabilities (p <= 1),
+    # so the accept test matches the unscaled rejection check.
+    p_scaled = p / threshold_acc
+    return tl.where(p_scaled < 1.0, p_scaled, 1.0)
+
+
+@triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
     Predicts,
@@ -27,6 +35,7 @@ def speculative_sampling_classic_kernel(
     stride_dp_b,
     stride_dp_s,
     stride_dp_v,
+    threshold_acc,
     # Constants
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
@@ -69,7 +78,10 @@ def speculative_sampling_classic_kernel(
                 + draft_token * stride_dp_v
             )
             q_is_prob = (q > 0.0) & (q <= 1.0)
-            prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
+            p_adj = _raise_target_prob(p, threshold_acc)
+            prefix_prob = tl.where(
+                q_is_prob, tl.minimum(prefix_prob * p_adj / q, 1.0), 0.0
+            )
             prefix_probs += (prefix_prob,)
 
         for step in tl.static_range(NUM_SLOTS - 1, 0, -1):
@@ -145,8 +157,10 @@ def speculative_sampling_classic_kernel(
             )
             coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
             # A proposal token must have positive probability under its draft distribution.
+            # threshold_acc < 1 raises p, so the draft token is easier to accept.
             q_is_prob = (q > 0.0) & (q <= 1.0)
-            if q_is_prob & (coin * q < p):
+            p_adj = _raise_target_prob(p, threshold_acc)
+            if q_is_prob & (coin * q < p_adj):
                 num_accept += 1
                 cur_prob_row = step
                 tl.store(Predicts + last_accepted_global_idx, draft_token)
@@ -259,6 +273,8 @@ def chain_speculative_sampling_triton(
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    # Guard the p / threshold_acc scale. 1.0 matches the unscaled accept test.
+    threshold_acc = max(float(threshold_acc), 1e-9)
     # Keep CDF tiles small, and cap multi-tile reductions to avoid register spills.
     block_reduce = min(triton.next_power_of_2(vocab_size), 32768)
     num_warps = 8 if block_verification and block_reduce > 4096 else 4
@@ -286,6 +302,7 @@ def chain_speculative_sampling_triton(
         draft_probs.stride(0),
         draft_probs.stride(1),
         draft_probs.stride(2),
+        threshold_acc,
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
