@@ -237,6 +237,11 @@ class HiCacheNixl(HiCacheStorage):
             self.backend_selector.backend_name,
             mem_type=self.backend_selector.mem_type,
         )
+        if self.backend_selector.mem_type == "FILE":
+            # Failed writes can leave empty files behind after registration.
+            return [
+                res is not None and int(res.get("size", 0)) > 0 for res in query_res
+            ]
         return [res is not None for res in query_res]
 
     def _xfer_and_wait(
@@ -289,6 +294,20 @@ class HiCacheNixl(HiCacheStorage):
         if len(host_buffers) != len(keys):
             logger.error("Mismatch between number of host buffers and keys")
             return False
+
+        if direction == "READ" and self.backend_selector.mem_type == "FILE":
+            # NIXL <= 1.4 can report short reads as successful. Check here,
+            # including restores that bypass batch_exists via assume_stored.
+            query_res = self.agent.query_memory(
+                [(0, 0, 0, key) for key in keys],
+                self.backend_selector.backend_name,
+                mem_type="FILE",
+            )
+            if len(query_res) != len(host_buffers) or any(
+                res is None or int(res.get("size", 0)) < size
+                for res, (_, size) in zip(query_res, host_buffers)
+            ):
+                return False
 
         host_descs = self.agent.get_xfer_descs(
             [(addr, size, 0) for (addr, size) in host_buffers], "DRAM"
