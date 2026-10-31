@@ -649,6 +649,15 @@ class NomasStreamingDecoder:
 
 
 class NomasPixelUMMDecoder(nn.Module):
+    @staticmethod
+    def prepare_checkpoint_load(weight_files, dtype):
+        """Return a meta-model configurator when loading serialized FP8 weights."""
+        from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+            resolve_nomas_vae_checkpoint_configurator,
+        )
+
+        return resolve_nomas_vae_checkpoint_configurator(weight_files, dtype)
+
     def fp8_quantized_layer_names(self) -> tuple[str, ...]:
         """Decoder projections serialized as FP8 by the official checkpoint."""
         projections = (
@@ -668,6 +677,14 @@ class NomasPixelUMMDecoder(nn.Module):
     def checkpoint_key_filter(name: str) -> bool:
         """Official VAE checkpoints also contain a DCAE encoder unused by decode."""
         return not name.startswith("encoder.")
+
+    @staticmethod
+    def checkpoint_key_mapper(name: str) -> str:
+        from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+            map_nomas_vae_checkpoint_key,
+        )
+
+        return map_nomas_vae_checkpoint_key(name)
 
     def __init__(self, config: NomasVAEConfig):
         super().__init__()

@@ -24,10 +24,12 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
-from sglang.multimodal_gen.runtime.layers.quantization.configs.nomas_int8_config import (
-    NomasInt8Config,
-)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
+from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+    configure_nomas_int8,
+    resolve_nomas_checkpoint_quantization,
+    validate_nomas_int8_config,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -271,6 +273,11 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # general SGL attention backend.
     _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
 
+    @staticmethod
+    def resolve_checkpoint_quantization(weight_files):
+        """Detect and validate the official INT8 format before model creation."""
+        return resolve_nomas_checkpoint_quantization(weight_files)
+
     def __init__(
         self,
         config: NomasConfig,
@@ -286,8 +293,8 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             raise ValueError("Conflicting Nomas quantization configs")
         quant_config = quant_config or config.quant_config
-        if quant_config is not None and not isinstance(quant_config, NomasInt8Config):
-            raise ValueError("Nomas supports only its official INT8 checkpoint format")
+        if quant_config is not None:
+            validate_nomas_int8_config(quant_config)
         if attention_backend == "auto":
             # FA3 + log-sum-exp merge is about 2x FlexAttention on Hopper.
             attention_backend = "fa3" if current_platform.is_hopper() else "flex"
@@ -325,8 +332,7 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.c2ws_hidden_states_layer1 = nn.Linear(64, 64)
         self.c2ws_hidden_states_layer2 = nn.Linear(64, 64)
         if quant_config is not None:
-            quant_config.remap_checkpoint_prefixes(self.param_names_mapping)
-            quant_config.configure_model(self)
+            configure_nomas_int8(self, quant_config)
 
     def post_load_weights(self):
         # Meta initialization / to_empty() does not restore nonpersistent buffers

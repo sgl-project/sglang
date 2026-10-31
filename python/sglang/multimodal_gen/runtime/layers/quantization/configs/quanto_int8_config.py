@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config and checkpoint admission for Optimum Quanto qint8 weights."""
+"""Weight-only INT8 configuration and Optimum Quanto checkpoint admission."""
 
 from __future__ import annotations
 
@@ -33,13 +33,29 @@ _FLOAT_DTYPES = {"BF16", "F16", "F32"}
 
 
 class QuantoInt8Config(QuantizationConfig):
-    """Dispatch linears declared qint8 in an Optimum Quanto quantization map."""
+    """Select per-channel or groupwise weight-only INT8 linear methods."""
 
     supports_srt_linear_layers = True
 
-    def __init__(self, layer_prefixes: set[str]) -> None:
+    def __init__(
+        self,
+        layer_prefixes: set[str],
+        *,
+        group_size: int | None = None,
+        scale_dtype: torch.dtype | None = None,
+        compute_dtype: torch.dtype | None = None,
+        layer_shapes: dict[str, list[int]] | None = None,
+        supports_fsdp: bool = True,
+        supports_quantized_cpu_load: bool = False,
+    ) -> None:
         super().__init__()
         self.layer_prefixes = layer_prefixes
+        self.group_size = group_size
+        self.scale_dtype = scale_dtype
+        self.compute_dtype = compute_dtype
+        self.layer_shapes = layer_shapes
+        self.supports_fsdp = supports_fsdp
+        self.supports_quantized_cpu_load = supports_quantized_cpu_load
         self.selected: set[str] = set()
 
     @classmethod
@@ -76,7 +92,28 @@ class QuantoInt8Config(QuantizationConfig):
         if prefix not in self.layer_prefixes:
             return unquantized_method()
         self.selected.add(prefix)
-        return QuantoInt8LinearMethod()
+        return QuantoInt8LinearMethod(
+            group_size=self.group_size,
+            scale_dtype=self.scale_dtype,
+            compute_dtype=self.compute_dtype,
+        )
+
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        # Quanto admission already maps its prefixes. Shape manifests from other
+        # serialized formats retain checkpoint names until loader resolution.
+        if self.layer_shapes is None:
+            return
+        from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+        mapper = get_param_names_mapping(param_names_mapping)
+        mapped = {}
+        for name, shape in self.layer_shapes.items():
+            target = mapper(name + ".weight")[0].removesuffix(".weight")
+            if target in mapped:
+                raise ValueError(f"Duplicate mapped INT8 layer: {target}")
+            mapped[target] = shape
+        self.layer_shapes = mapped
+        self.layer_prefixes = set(mapped)
 
 
 def inspect_quanto_int8_checkpoint(

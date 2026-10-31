@@ -441,6 +441,7 @@ def _assign_direct_gpu_vae_state(
     device: torch.device,
     vae_config: VAEConfig,
     key_filter: Callable[[str], bool] | None = None,
+    key_mapper: Callable[[str], str] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
     num_deparameterized = adopt_plain_weight_norm_state(
@@ -454,7 +455,7 @@ def _assign_direct_gpu_vae_state(
         for raw_name, tensor in safetensors_weights_iterator(
             weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
         ):
-            name = raw_name
+            name = key_mapper(raw_name) if key_mapper is not None else raw_name
             if name in metadata_names:
                 metadata[name] = tensor
                 continue
@@ -693,31 +694,31 @@ class VAELoader(WeightOverrideComponentLoader):
         )
         # Load from ModelRegistry (standard VAE classes)
         vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        fp8_shapes = None
-        if vae_cls.__name__ == "NomasPixelUMMDecoder":
-            from sglang.multimodal_gen.runtime.layers.quantization.configs.nomas_fp8_config import (
-                configure_nomas_fp8,
-                inspect_nomas_fp8_checkpoint,
-            )
-
-            fp8_shapes = inspect_nomas_fp8_checkpoint(safetensors_list)
-            if fp8_shapes is not None and vae_dtype != torch.bfloat16:
-                raise ValueError("PixelUMM FP8 requires BF16 VAE compute precision")
+        # A model hook may validate a serialized checkpoint and return a
+        # configurator to apply on meta before streaming mixed-dtype weights.
+        prepare_checkpoint_load = getattr(vae_cls, "prepare_checkpoint_load", None)
+        configure_checkpoint = (
+            prepare_checkpoint_load(safetensors_list, vae_dtype)
+            if prepare_checkpoint_load is not None
+            else None
+        )
+        stream_checkpoint = (
+            direct_gpu_weight_loading or configure_checkpoint is not None
+        )
         vae = initialize_model(
             vae_cls,
             {"config": vae_config},
             vae_dtype,
-            torch.device("meta")
-            if direct_gpu_weight_loading or fp8_shapes is not None
-            else None,
+            torch.device("meta") if stream_checkpoint else None,
         )
-        if fp8_shapes is not None:
-            configure_nomas_fp8(vae, fp8_shapes)
-        if not direct_gpu_weight_loading and fp8_shapes is None:
+        if configure_checkpoint is not None:
+            configure_checkpoint(vae)
+        if not stream_checkpoint:
             vae = vae.to(target_device)
 
         checkpoint_key_filter = getattr(vae, "checkpoint_key_filter", None)
-        if direct_gpu_weight_loading or fp8_shapes is not None:
+        checkpoint_key_mapper = getattr(vae, "checkpoint_key_mapper", None)
+        if stream_checkpoint:
             adaptations = _assign_direct_gpu_vae_state(
                 vae,
                 safetensors_list,
@@ -725,6 +726,7 @@ class VAELoader(WeightOverrideComponentLoader):
                 device=target_device,
                 vae_config=vae_config,
                 key_filter=checkpoint_key_filter,
+                key_mapper=checkpoint_key_mapper,
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
@@ -746,6 +748,11 @@ class VAELoader(WeightOverrideComponentLoader):
                     name: tensor
                     for name, tensor in state.items()
                     if checkpoint_key_filter(name)
+                }
+            if checkpoint_key_mapper is not None:
+                state = {
+                    checkpoint_key_mapper(name): tensor
+                    for name, tensor in state.items()
                 }
             loaded.update(state)
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)

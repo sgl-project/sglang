@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     LinearMethodBase,
+    ReplicatedLinear,
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -111,12 +113,67 @@ def _apply_gfx1250_triton_fp8(
     return output.view(*x.shape[:-1], weight.shape[1])
 
 
+def validate_fp8_block_device(device):
+    """Serialized e4m3fn block GEMM requires NVIDIA SM89+ tensor cores."""
+    device = torch.device(device)
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or not torch.cuda.is_available()
+        or torch.cuda.get_device_capability(device) < (8, 9)
+    ):
+        raise RuntimeError("Block FP8 requires an NVIDIA CUDA GPU with SM89 or newer")
+
+
+def _quantize_block_fp8_activation(x, block_size=(128, 128), scale_min=1e-4):
+    """Share an activation scale over token/channel blocks, padding final tokens."""
+    m, k = x.shape
+    block_m, block_k = block_size
+    if k % block_k:
+        raise ValueError("FP8 activation channels must align to the block size")
+    blocks = (
+        F.pad(x, (0, 0, 0, (-m) % block_m))
+        .float()
+        .reshape(-1, block_m, k // block_k, block_k)
+    )
+    scales = blocks.abs().amax(dim=(1, 3)).clamp_min(scale_min) / 448.0
+    quantized = (blocks / scales[:, None, :, None]).to(torch.float8_e4m3fn)
+    return (
+        quantized.reshape(-1, k)[:m].contiguous(),
+        scales.repeat_interleave(block_m, dim=0)[:m].contiguous(),
+    )
+
+
 class Fp8Config(SRTFp8Config, QuantizationConfig):
     """Config class for FP8.
 
     No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
     ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
+    ``activation_block_size`` opts serialized block weights into shared scales
+    over multiple tokens/channels, using the Triton block GEMM without repacking.
     """
+
+    def __init__(
+        self,
+        *args,
+        activation_block_size: tuple[int, int] | None = None,
+        activation_scale_min: float = 1e-4,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if activation_block_size is not None:
+            if (
+                len(activation_block_size) != 2
+                or any(size <= 0 for size in activation_block_size)
+                or self.weight_block_size is None
+                or activation_block_size[1] != self.weight_block_size[1]
+                or activation_scale_min <= 0
+            ):
+                raise ValueError(
+                    "FP8 activation blocks must match the weight channel blocks"
+                )
+        self.activation_block_size = activation_block_size
+        self.activation_scale_min = activation_scale_min
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -155,6 +212,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Union[Fp8Config, RowwiseFp8Config, W4AFp8Config]):
         self.quant_config = quant_config
+        self.activation_block_size = getattr(
+            quant_config, "activation_block_size", None
+        )
+        if self.activation_block_size is not None:
+            # This mode uses serialized blocks verbatim and the Triton backend;
+            # skip backend probes/repacking for the default per-token path.
+            self.block_quant = True
+            self.per_channel_serialized = False
+            return
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.per_channel_serialized = (
             getattr(quant_config, "weight_qscheme", None) == "per_channel"
@@ -198,6 +264,15 @@ class Fp8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
+        if self.activation_block_size is not None:
+            block_n, block_k = self.quant_config.weight_block_size
+            if (
+                input_size_per_partition % block_k
+                or output_size_per_partition % block_n
+            ):
+                raise ValueError(
+                    "Serialized FP8 dimensions must align to the weight block size"
+                )
         if self.block_quant:
             tp_size = get_tensor_model_parallel_world_size()
             block_n, block_k = (
@@ -314,6 +389,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.activation_block_size is not None:
+            scales = layer.weight_scale_inv
+            if not torch.isfinite(scales).all() or not (scales > 0).all():
+                raise ValueError("FP8 scales must be finite and positive")
+            return
         if self.per_channel_serialized:
             # Rowwise FP8 checkpoints store weights in the conventional
             # (out_features, in_features) layout, while apply_fp8_linear expects
@@ -474,12 +554,51 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def _apply_block_activation(self, layer, x, bias):
+        from sglang.kernels import KernelBackend, get_kernel
+
+        if layer.training or torch.is_grad_enabled():
+            raise RuntimeError("Block FP8 requires eval and no_grad inference")
+        if x.shape[-1] != layer.input_size_per_partition:
+            raise ValueError("Block FP8 input dimension does not match the weight")
+        validate_fp8_block_device(x.device)
+        if x.dtype != layer.orig_dtype:
+            if (
+                not torch.is_autocast_enabled("cuda")
+                or torch.get_autocast_dtype("cuda") != layer.orig_dtype
+            ):
+                raise TypeError(
+                    f"Block FP8 requires {layer.orig_dtype} input or matching CUDA autocast"
+                )
+            x = x.to(layer.orig_dtype)
+        if x.numel() == 0:
+            return x.new_empty((*x.shape[:-1], layer.output_size_per_partition))
+        quantized, scales = _quantize_block_fp8_activation(
+            x.reshape(-1, layer.input_size_per_partition),
+            self.activation_block_size,
+            self.quant_config.activation_scale_min,
+        )
+        output = get_kernel("gemm.w8a8_block_fp8_matmul_triton", KernelBackend.TRITON)(
+            quantized,
+            layer.weight,
+            scales,
+            layer.weight_scale_inv,
+            self.quant_config.weight_block_size,
+            output_dtype=layer.orig_dtype,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.reshape(*x.shape[:-1], layer.output_size_per_partition)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.activation_block_size is not None:
+            return self._apply_block_activation(layer, x, bias)
+
         # The activation quantization kernels assert on row-major input, and
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
@@ -559,3 +678,27 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
+
+
+class Fp8Linear(ReplicatedLinear):
+    """Replicated serialized FP8 linear with nn.Linear's tensor return contract."""
+
+    def _apply(self, fn, recurse=True):
+        # Byte views keep serialized FP8 weights and FP32 scales intact while
+        # carrying device/non_blocking semantics through the supplied transform.
+        protected = [
+            parameter
+            for name, parameter in self.named_parameters(recurse=False)
+            if parameter.dtype == torch.float8_e4m3fn
+            or name in ("weight_scale", "weight_scale_inv", "input_scale")
+        ]
+
+        def preserve_serialized_dtype(tensor):
+            if any(tensor is parameter for parameter in protected):
+                return fn(tensor.view(torch.uint8)).view(tensor.dtype)
+            return fn(tensor)
+
+        return super()._apply(preserve_serialized_dtype, recurse=recurse)
+
+    def forward(self, x):
+        return super().forward(x)[0]
