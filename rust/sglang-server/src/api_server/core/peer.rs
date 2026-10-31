@@ -16,7 +16,8 @@ pub(crate) const FORWARD_PEER_PATH: &str = "/internal/peer";
 
 /// The DP rank a forwarded control request is meant for; a listener serving
 /// another rank refuses it with 421, since its reply would be recorded under
-/// the wrong rank.
+/// the wrong rank. Every listener in a deployment runs the same binary, so a
+/// request without it did not come from `Peer::forward` and gets 400.
 pub(crate) const FORWARD_PEER_RANK_HEADER: &str = "x-sglang-dp-rank";
 
 /// Peers only need a connection to come up; the scheduler-side wait (a
@@ -221,6 +222,9 @@ mod tests {
                 assert_eq!(error.to_string(), "why");
                 assert_eq!(error.http_status(), status);
             }
+            if status == StatusCode::MISDIRECTED_REQUEST {
+                assert_eq!(error.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+            }
         }
 
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -229,29 +233,6 @@ mod tests {
         let peer = Peer::new(reqwest::Client::new(), 1, &unreachable);
         let error = peer.control(&build).await.remove(0).outcome.unwrap_err();
         assert!(matches!(error, CoreError::Unavailable), "{error}");
-    }
-
-    /// A fan-out whose table points a rank at another rank's listener fails
-    /// that rank with a server-side error instead of recording its reply.
-    #[tokio::test]
-    async fn fan_out_fails_a_rank_relayed_to_another_ranks_listener() {
-        use crate::api_server::core::fanout::testing::status_bytes;
-        let (url, _) = peer_listener((
-            StatusCode::MISDIRECTED_REQUEST,
-            Bytes::from_static(b"relayed to dp rank 0's listener"),
-        ))
-        .await;
-        let peers: [Arc<dyn ControlTarget>; 1] =
-            [Arc::new(Peer::new(reqwest::Client::new(), 2, &url))];
-        let replies = fan_out(0, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
-        let error = replies
-            .decode::<serde::de::IgnoredAny>("status")
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "control request failed on 1 of 2 dp ranks: dp rank 2: relayed to dp rank 0's listener"
-        );
-        assert_eq!(error.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// The peer list is every listener in the table but this rank's own,

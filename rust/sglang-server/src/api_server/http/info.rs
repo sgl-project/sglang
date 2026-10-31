@@ -78,8 +78,6 @@ async fn forward_control_req(
             )
                 .into_response();
         }
-        // Every listener in a deployment runs the same binary, so only a
-        // caller other than `Peer::forward` omits the header.
         None => {
             return (
                 StatusCode::BAD_REQUEST,
