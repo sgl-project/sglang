@@ -234,6 +234,10 @@ class MultimodalPreprocessCache(Generic[K, V]):
             self.current_size_bytes += size_bytes
             return True
 
+    def __setitem__(self, key: K, value: V) -> None:
+        """Map-style insert; a value ``put`` cannot retain is dropped."""
+        self.put(key, value)
+
     def pop(self, key: K) -> Optional[V]:
         """Remove and return one entry without changing hit/miss counters."""
         with self._lock:
