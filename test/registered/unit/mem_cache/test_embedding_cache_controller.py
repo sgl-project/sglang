@@ -123,6 +123,30 @@ class TestRangePageAllocator(unittest.TestCase):
         self.assertIsNone(allocator.allocate(num_tokens=2, page_size=2))
         self.assertEqual(allocator.free_pages, 0)
 
+    def test_scatter_fallback_partial_last_run_and_free_pages(self):
+        allocator = RangePageAllocator(num_pages=7)
+        a = allocator.allocate(num_tokens=2, page_size=2)  # [0..1]
+        b = allocator.allocate(num_tokens=2, page_size=2)  # [1..2]
+        c = allocator.allocate(num_tokens=4, page_size=2)  # [2..4]
+        d = allocator.allocate(num_tokens=2, page_size=2)  # [4..5]
+        e = allocator.allocate(num_tokens=4, page_size=2)  # [5..7]
+        allocator.free(a)
+        allocator.free(c)
+        allocator.free(e)
+        self.assertEqual(allocator.free_ranges, [(0, 1), (2, 2), (5, 2)])
+        self.assertEqual(allocator.free_pages, 5)
+
+        runs = allocator.allocate(num_tokens=8, page_size=2)  # needs 4 pages
+
+        self.assertEqual(
+            runs,
+            [PageRun(start=0, length=1), PageRun(start=2, length=2), PageRun(start=5, length=1)],
+        )
+        self.assertEqual(allocator.free_ranges, [(6, 1)])
+        self.assertEqual(allocator.free_pages, 1)
+        self.assertEqual(b, [PageRun(start=1, length=1)])
+        self.assertEqual(d, [PageRun(start=4, length=1)])
+
 
 class TestEntryStateAndPins(unittest.TestCase):
     def test_ready_entry_with_no_pins_is_evictable(self):
