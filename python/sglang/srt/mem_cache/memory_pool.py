@@ -5094,7 +5094,12 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        sparse_manager = getattr(self, "sparse_kv_manager", None)
+        if sparse_manager is not None:
+            sparse_manager.move_host_kv(tgt_loc_flat, src_loc_flat)
         for kv_cache in self.kv_buffer:
+            if kv_cache.shape[0] == 0:
+                continue
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):

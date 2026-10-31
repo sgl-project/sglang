@@ -1,4 +1,4 @@
-"""Opt-in pre-LIM metadata preparation for Q1 LIM + Copy-SFA."""
+"""Pre-LIM request metadata for Q1 and Q4 union LIM + Copy-SFA."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def fused_prepare_lim_metadata(
     request_rows: int,
     full_visible: bool,
 ) -> None:
-    """Fill fixed-address Q1 inputs and LIM source table in one Triton launch."""
+    """Fill request inputs and source pages; Q4 supplies its full union length."""
     if seq_lens.dtype not in (torch.int32, torch.int64):
         raise TypeError("seq_lens must be int32 or int64")
     if request_slots.dtype not in (torch.int32, torch.int64):

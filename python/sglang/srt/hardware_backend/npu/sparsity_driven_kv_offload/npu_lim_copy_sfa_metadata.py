@@ -21,6 +21,7 @@ def _lim_copy_sfa_metadata_kernel(
     num_cache_tokens_ptr,
     hbm_block_table_ptr,
     dram_block_table_ptr,
+    host_block_table_ptr,
     B: tl.constexpr,
     K: tl.constexpr,
     Q: tl.constexpr,
@@ -31,6 +32,10 @@ def _lim_copy_sfa_metadata_kernel(
     DRAM_PAGES: tl.constexpr,
     B_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
+    PAGED_HOST: tl.constexpr,
+    HOST_COLS: tl.constexpr,
+    HOST_S0: tl.constexpr,
+    HOST_S1: tl.constexpr,
 ):
     tile_id = tl.program_id(0).to(tl.int32)
     row_id = tl.program_id(1).to(tl.int32)
@@ -64,7 +69,15 @@ def _lim_copy_sfa_metadata_kernel(
 
     if tile_id * BLOCK < DRAM_PAGES:
         dram_base = row_id.to(tl.int64) * DRAM_PAGES
-        dram_values = base_request * DRAM_PAGES + col
+        if PAGED_HOST:
+            pages = tl.load(
+                host_block_table_ptr + row_id * HOST_S0 + col * HOST_S1,
+                mask=col < HOST_COLS,
+                other=0,
+            ).to(tl.int32)
+            dram_values = tl.where(active, pages, 0)
+        else:
+            dram_values = base_request * DRAM_PAGES + col
         tl.store(
             dram_block_table_ptr + dram_base + col.to(tl.int64),
             dram_values,
@@ -134,6 +147,7 @@ def fused_lim_copy_sfa_metadata(
     host_context_len: int,
     request_rows: int,
     query_width: int = 1,
+    host_block_table: torch.Tensor | None = None,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
@@ -207,6 +221,16 @@ def fused_lim_copy_sfa_metadata(
     device = source_ids.device
     if device.type != "npu":
         raise ValueError("fused_lim_copy_sfa_metadata requires NPU tensors.")
+    if host_block_table is not None:
+        if (
+            host_block_table.dtype != torch.int32
+            or host_block_table.device != device
+            or host_block_table.ndim != 2
+            or host_block_table.shape[0] != batch
+            or host_block_table.shape[1] > dram_block_table.shape[1]
+            or any(s < 0 for s in host_block_table.stride())
+        ):
+            raise ValueError("host_block_table must be same-device int32 [B, pages].")
     int32_tensors = (
         source_ids,
         topk_misses,
@@ -254,6 +278,7 @@ def fused_lim_copy_sfa_metadata(
         num_cache_tokens,
         hbm_block_table,
         dram_block_table,
+        host_block_table if host_block_table is not None else dram_block_table,
         batch,
         2048,
         query_width,
@@ -264,6 +289,10 @@ def fused_lim_copy_sfa_metadata(
         dram_pages,
         triton.next_power_of_2(batch),
         2048,
+        host_block_table is not None,
+        host_block_table.shape[1] if host_block_table is not None else 0,
+        host_block_table.stride(0) if host_block_table is not None else 0,
+        host_block_table.stride(1) if host_block_table is not None else 0,
     )
 
 

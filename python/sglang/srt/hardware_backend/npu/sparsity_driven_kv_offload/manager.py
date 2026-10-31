@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -133,11 +134,7 @@ class SparseKVCacheManager:
                 raise ValueError(
                     "Experimental native MTP requires a Q4 chain with topk=1."
                 )
-        if (
-            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
-            and envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get()
-        ):
-            raise ValueError("Experimental Q4 LIM does not support fused pre-metadata.")
+        self.req_to_token_pool = req_to_token_pool
         self.max_context_len = copy_sfa_host_row_stride(
             self.logical_max_context_len, self.copy_sfa_enabled
         )
@@ -169,6 +166,9 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
+        self.host_token_capacity = (
+            (int(paged_kv_cache.size) + int(paged_kv_cache.page_size) + 127) // 128
+        ) * 128
         self.budget = get_sparse_kv_budget(
             request_rows=self.size,
             context_len=self.max_context_len,
@@ -179,6 +179,16 @@ class SparseKVCacheManager:
             graph_batch_capacity=self.batch_capacity,
         )
         self.device_cache_size = self.budget.cache_tokens
+        self.budget = replace(
+            self.budget,
+            host_kv_bytes=(
+                self.host_token_capacity
+                * self.layer_num
+                * self.head_num
+                * self.head_dim
+                * self.store_dtype.itemsize
+            ),
+        )
         self.indexer_impl = get_sparse_kv_indexer_impl()
         self.use_lru = (
             self.device_cache_size > self.sparse_context_len
@@ -190,7 +200,7 @@ class SparseKVCacheManager:
             else (self.max_context_len // 8 + 1) * 8
         )
         logger.info(
-            "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, LRU=%s",
+            "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, LRU=%s, host_layout=paged",
             self.sparse_context_len,
             self.device_cache_size,
             self.budget.managed_hbm_bytes / 1024**2,
@@ -394,9 +404,13 @@ class SparseKVCacheManager:
         self.host_ptr_list: list[int] = []
         self.dev_ptr_list: list[int] = []
 
+        # Radix prefixes and accepted-token relocation are expressed in native
+        # physical token IDs. Keep host payloads in that same address space;
+        # request slots own only the bounded HBM residency maps.
+        self.host_kv_is_paged = True
         host_kv_shape = (
-            self.size,
-            self.max_context_len,
+            1,
+            self.host_token_capacity,
             self.head_num,
             self.head_dim,
         )
@@ -450,6 +464,69 @@ class SparseKVCacheManager:
             "The sparse KV request capacity may be too large; set a smaller "
             "--max-running-requests for sparse KV offload."
         ) from exc
+
+    def host_source_indices(self, request_ids, positions):
+        """Resolve logical positions through the allocator's shared token map."""
+        if not getattr(self, "host_kv_is_paged", False):
+            return request_ids * self.max_context_len + positions
+        # Invalid/padded entries are masked by the caller. Clamp only their
+        # speculative address calculation, never an active token's mapping.
+        rows = request_ids.long().clamp(0, self.size - 1)
+        columns = positions.long().clamp(0, self.logical_max_context_len - 1)
+        return self.req_to_token_pool.req_to_token[rows, columns].long()
+
+    def fill_host_block_table(self, request_ids, valid_rows, output):
+        """Publish native physical pages for shared host KV, including padding."""
+        if not getattr(self, "host_kv_is_paged", False):
+            return fill_request_block_table(
+                request_ids,
+                valid_rows,
+                self.dram_page_offsets,
+                self.max_context_len // 128,
+                output,
+            )
+        positions = self.dram_page_offsets[None, :] * 128
+        tokens = self.host_source_indices(request_ids[:, None], positions)
+        valid = valid_rows[:, None] & (positions < self.logical_max_context_len)
+        output.copy_(torch.where(valid, tokens // 128, 0).to(torch.int32))
+
+    def move_host_kv(self, target, source):
+        """Mirror accepted-token compaction before native physical IDs recycle."""
+        if not getattr(self, "host_kv_is_paged", False) or source.numel() == 0:
+            return
+        count = source.numel()
+        scratch = torch.empty(
+            (count, self.head_num, self.head_dim),
+            dtype=self.store_dtype,
+            device=self.device,
+        )
+        rows = torch.arange(count, device=self.device, dtype=torch.long)
+        valid = torch.ones(count, device=self.device, dtype=torch.bool)
+        # Stage the complete source set so overlapping/permuted moves have the
+        # same snapshot semantics as native advanced-index assignment.
+        for layer, pointer in zip(self.host_kv_buffer, self.dev_ptr_list):
+            unidex_copy_inplace(
+                layer,
+                scratch,
+                source,
+                rows,
+                valid,
+                2,
+                1,
+                block_dim=48,
+                src_ptr=pointer,
+            )
+            unidex_copy_inplace(
+                scratch,
+                layer,
+                rows,
+                target,
+                valid,
+                1,
+                2,
+                block_dim=48,
+                dst_ptr=pointer,
+            )
 
     def init_req(self, req: Req) -> None:
         if req.inflight_middle_chunks > 0:
@@ -543,13 +620,7 @@ class SparseKVCacheManager:
             hbm_block_table,
         )
         dram_block_table = self.planner_dram_block_table[:batch_size]
-        fill_request_block_table(
-            req_ids_i32,
-            valid_req,
-            self.dram_page_offsets,
-            self.max_context_len // 128,
-            dram_block_table,
-        )
+        self.fill_host_block_table(req_ids_i32, valid_req, dram_block_table)
         return (
             self.planner_topk_src_ids[:batch_size],
             self.planner_topk_dst_slots[:batch_size],
@@ -591,6 +662,11 @@ class SparseKVCacheManager:
                 host_context_len=self.max_context_len,
                 request_rows=self.size,
                 query_width=4,
+                host_block_table=(
+                    adapter.block_table[:batch]
+                    if getattr(self, "host_kv_is_paged", False)
+                    else None
+                ),
             )
         else:
             plan.topk_misses.masked_fill_(~route_valid, 0)
@@ -616,6 +692,10 @@ class SparseKVCacheManager:
             ):
                 fill_request_block_table(
                     plan.request_slots, valid, offsets, pages, output[:batch]
+                )
+            if getattr(self, "host_kv_is_paged", False):
+                self.fill_host_block_table(
+                    plan.request_slots, valid, self.planner_dram_block_table[:batch]
                 )
         padded_heads = self.mtp_attn_out.shape[1]
         if query_nope.shape[1] < padded_heads:
@@ -854,6 +934,9 @@ class SparseKVCacheManager:
         # kv_device rows:                 [token_slot]
         # host_kv_buffer[layer] rows:     [req_id, seq_pos]
         # block dims must match on [nhead, 2*dim]
+        if getattr(self, "host_kv_is_paged", False):
+            dst_token_indices = src_token_indices
+            valid_mask = valid_mask & (src_token_indices < self.host_token_capacity)
         assert kv_device.shape[1:] == self.host_kv_buffer[layer_idx].shape[2:]
         # torch.npu.synchronize()
         actual_stream = stream if stream is not None else torch.npu.current_stream()
@@ -1056,6 +1139,11 @@ class SparseKVCacheManager:
                 )
             valid_mask = valid_mask.contiguous()
 
+        if getattr(self, "host_kv_is_paged", False):
+            dst_index = forward_batch.out_cache_loc.to(torch.long).reshape(-1)
+            valid_mask = (
+                valid_mask & (dst_index >= 0) & (dst_index < self.host_token_capacity)
+            )
         assert src_tensor.shape[1:] == dst_tensor.shape[2:]
         assert src_index.shape == dst_index.shape == valid_mask.shape
 
@@ -1165,7 +1253,7 @@ class SparseKVCacheManager:
         token_pos = (
             torch.arange(total_tokens, device=device, dtype=torch.long) - src_seq_starts
         )
-        src_index = (src_req_ids * self.max_context_len + token_pos).contiguous()
+        src_index = self.host_source_indices(src_req_ids, token_pos).contiguous()
         dst_index = torch.arange(total_tokens, device=device, dtype=torch.long)
         valid_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
 
@@ -1274,6 +1362,14 @@ class SparseKVCacheManager:
                 device_cache_row_indices,
                 self.max_context_len,
             )
+            if getattr(self, "host_kv_is_paged", False):
+                miss_src_index = (
+                    self.host_source_indices(
+                        device_cache_row_indices[:, None], topk_indices
+                    )
+                    .reshape(-1)
+                    .contiguous()
+                )
 
             cache_slot_ids = self._device_cache_slot_ids[:topk_len]
             plan = None

@@ -192,7 +192,7 @@ class LIMDecodeAdapter:
         reference_indexer=None,
     ):
         batch = query.shape[0]
-        use_fused_pre_metadata = self.fused_pre_metadata and query.shape[1] == 1
+        use_fused_pre_metadata = self.fused_pre_metadata
         if (
             batch != forward_batch.req_pool_indices.numel()
             or batch > self.batch_capacity
@@ -360,15 +360,11 @@ class LIMDecodeAdapter:
             torch.int32
         )
         layer_index = layer_id - manager.start_layer
-        previous = self.last_prefix[layer_index][slots.long()]
-        warm = sparse & (previous >= 0) & (lengths >= previous)
-        states = torch.where(sparse, torch.where(warm, -1, -2), -3).to(torch.int32)
         if block_table.shape[0] != batch:
             raise ValueError("MTP LIM block-table batch must match the request batch.")
         # Graph metadata may reserve extra speculative pages beyond the logical
         # host context. prepare_mtp_rows rejects positions outside that context.
         table = self.block_table[:batch]
-        table.zero_()
         columns = min(block_table.shape[1], table.shape[1])
         if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
             from sglang.srt.utils.async_probe import maybe_assert_async
@@ -377,7 +373,39 @@ class LIMDecodeAdapter:
                 ((~valid) | (lengths <= columns * 128)).all(),
                 "Native MTP index block table does not cover the live context.",
             )
-        table[:, :columns].copy_(block_table[:, :columns])
+        if self.fused_pre_metadata:
+            # Q4 has one request-level union plan. Its visible length already
+            # includes all four candidate positions; the Q1 metadata kernel's
+            # full-visible row contract therefore applies without a /4 reshape.
+            self._fused_prepare_lim_metadata(
+                seq_lens=lengths,
+                request_slots=forward_batch.req_pool_indices,
+                last_prefix=self.last_prefix[layer_index],
+                block_table=block_table[:, :columns],
+                out_block_table=table,
+                safe_slots=self._pre_safe_slots[:batch],
+                lengths=self._pre_lengths[:batch],
+                prefixes=self._pre_prefixes[:batch],
+                sparse_rows=self._pre_sparse[:batch],
+                valid_rows=self._pre_valid[:batch],
+                request_states=self._pre_states[:batch],
+                next_prefixes=self._pre_next_prefix[:batch],
+                cache_sizes=self._pre_cache_sizes[:batch],
+                capacity=self.capacity,
+                request_rows=self.rows,
+                full_visible=True,
+            )
+            slots = self._pre_safe_slots[:batch]
+            lengths = self._pre_lengths[:batch]
+            sparse = self._pre_sparse[:batch]
+            valid = self._pre_valid[:batch]
+            states = self._pre_states[:batch]
+        else:
+            previous = self.last_prefix[layer_index][slots.long()]
+            warm = sparse & (previous >= 0) & (lengths >= previous)
+            states = torch.where(sparse, torch.where(warm, -1, -2), -3).to(torch.int32)
+            table.zero_()
+            table[:, :columns].copy_(block_table[:, :columns])
         sources = self.mtp_source_ids[:rows]
         fused_lightning_indexer_manage(
             weights=weights[:rows].contiguous(),
@@ -391,7 +419,11 @@ class LIMDecodeAdapter:
             query_ends=self.mtp_query_ends[:batch],
             seq_lens=lengths,
             prefix_lens=lengths,
-            cache_sizes=torch.where(sparse, self.capacity, 0).to(torch.int32),
+            cache_sizes=(
+                self._pre_cache_sizes[:batch]
+                if self.fused_pre_metadata
+                else torch.where(sparse, self.capacity, 0).to(torch.int32)
+            ),
             request_state=states,
             request_slots=slots,
             slot_pool=manager.device_slot_map[layer_index],
@@ -447,6 +479,11 @@ class LIMDecodeAdapter:
                 capacity=self.capacity,
                 host_context_len=manager.max_context_len,
                 request_rows=self.rows,
+                host_block_table=(
+                    self.block_table[:batch]
+                    if getattr(manager, "host_kv_is_paged", False)
+                    else None
+                ),
             )
         else:
             valid = plan.valid_rows & plan.sparse_rows
@@ -474,6 +511,12 @@ class LIMDecodeAdapter:
                 fill_request_block_table(
                     plan.request_slots, valid, offsets, pages, output[:batch]
                 )
+        if not self.fused_copy_metadata and getattr(manager, "host_kv_is_paged", False):
+            manager.fill_host_block_table(
+                plan.request_slots,
+                plan.valid_rows & plan.sparse_rows,
+                manager.planner_dram_block_table[:batch],
+            )
         return (
             plan.source_ids.unsqueeze(1),
             plan.device_slots.unsqueeze(1),
@@ -501,7 +544,7 @@ class LIMDecodeAdapter:
         copy(
             manager.host_kv_buffer[layer_index],
             selected,
-            (rows[:, None] * manager.max_context_len + sources)
+            manager.host_source_indices(rows[:, None], sources)
             .reshape(-1)
             .contiguous(),
             torch.arange(batch * self.top_k, device=selected.device),
@@ -532,7 +575,7 @@ class LIMDecodeAdapter:
             copy(
                 manager.host_kv_buffer[layer_index],
                 manager.device_kv_buffer[layer_index],
-                (safe_req[:, None] * manager.max_context_len + miss_src)
+                manager.host_source_indices(safe_req[:, None], miss_src)
                 .reshape(-1)
                 .contiguous(),
                 (safe_req[:, None] * self.capacity + miss_dst).reshape(-1).contiguous(),
@@ -559,7 +602,7 @@ class LIMDecodeAdapter:
             copy(
                 manager.host_kv_buffer[layer_index],
                 selected,
-                (safe_req[:, None] * manager.max_context_len + plan.source_ids.long())
+                manager.host_source_indices(safe_req[:, None], plan.source_ids.long())
                 .reshape(-1)
                 .contiguous(),
                 dst,
@@ -591,7 +634,7 @@ class LIMDecodeAdapter:
         copy(
             manager.host_kv_buffer[layer_index],
             combined,
-            (request[:, None] * manager.max_context_len + tail.long())
+            manager.host_source_indices(request[:, None], tail.long())
             .reshape(-1)
             .contiguous(),
             dst.long().reshape(-1).contiguous(),

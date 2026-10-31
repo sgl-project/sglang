@@ -214,6 +214,9 @@ class TestSparseKVManager(unittest.TestCase):
             unidex_copy_inplace=self.copy,
             is_sparse_mtp_batch=mtp_module.is_sparse_mtp_batch,
             prepare_mtp_rows=mtp_module.prepare_mtp_rows,
+            prepare_prefill_gather_rows=load_source(
+                "block_tables"
+            ).prepare_prefill_gather_rows,
         )
         exec(
             compile(
@@ -343,6 +346,74 @@ class TestSparseKVManager(unittest.TestCase):
         manager.device_slot_map[0][2].fill_(7)
         manager.invalidate_mtp_cache(layer, batch.req_pool_indices)
         self.assertTrue(torch.all(manager.device_slot_map[0][2] == -1))
+
+    def test_paged_host_prefix_survives_request_slot_reuse(self):
+        manager = self.manager()
+        manager.host_kv_is_paged = True
+        manager.host_token_capacity = 256
+        manager.logical_max_context_len = 64
+        manager.head_num, manager.head_dim = 1, 3
+        manager.kv_lora_rank, manager.qk_rope_head_dim = 2, 1
+        manager.store_dtype = torch.float32
+        manager.host_kv_buffer = [torch.full((1, 256, 1, 3), -999.0)]
+        mapping = torch.zeros((4, 64), dtype=torch.int32)
+        mapping[1, :5] = torch.tensor([40, 41, 42, 43, 44])
+        mapping[2, :5] = torch.tensor([40, 41, 42, 43, 80])
+        manager.req_to_token_pool = SimpleNamespace(req_to_token=mapping)
+        mode = SimpleNamespace(
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+            is_decode=lambda: False,
+        )
+
+        def batch(slot, prefix, locations):
+            return SimpleNamespace(
+                forward_mode=mode,
+                req_pool_indices=torch.tensor([slot]),
+                req_pool_indices_cpu=torch.tensor([slot]),
+                seq_lens=torch.tensor([prefix + len(locations)]),
+                seq_lens_cpu=torch.tensor([prefix + len(locations)]),
+                extend_prefix_lens=torch.tensor([prefix]),
+                extend_seq_lens=torch.tensor([len(locations)]),
+                extend_seq_lens_cpu=[len(locations)],
+                out_cache_loc=torch.tensor(locations),
+            )
+
+        layer = SimpleNamespace(layer_id=0)
+        original = torch.arange(15).float().view(5, 1, 3)
+        manager.offload_v2(
+            original[..., :2],
+            original[..., 2:],
+            layer,
+            batch(1, 0, [40, 41, 42, 43, 44]),
+            self.main,
+        )
+        # Radix retains physical prefix 40..43 while request slot 1 is freed
+        # and used for an unrelated cold prompt at different physical tokens.
+        manager.reset_requests([1])
+        mapping[1, :2] = torch.tensor([100, 101])
+        fresh = torch.full((2, 1, 3), 123.0)
+        manager.offload_v2(
+            fresh[..., :2], fresh[..., 2:], layer, batch(1, 0, [100, 101]), self.main
+        )
+        tail = torch.full((1, 1, 3), 321.0)
+        hot = batch(2, 4, [80])
+        manager.offload_v2(tail[..., :2], tail[..., 2:], layer, hot, self.main)
+        nope, rope = manager.get_forward_kv(layer, hot, self.main)
+        torch.testing.assert_close(
+            torch.cat([nope, rope], dim=-1), torch.cat([original[:4], tail])
+        )
+
+    def test_paged_host_accepted_token_overlap_move(self):
+        manager = self.manager()
+        manager.host_kv_is_paged = True
+        manager.head_num, manager.head_dim = 1, 3
+        manager.store_dtype = torch.float32
+        before = manager.host_kv_buffer[0].clone()
+        manager.move_host_kv(torch.tensor([41, 42, 40]), torch.tensor([40, 41, 42]))
+        actual = manager.host_kv_buffer[0].view(-1, 1, 3)
+        expected = before.view(-1, 1, 3)
+        torch.testing.assert_close(actual[[41, 42, 40]], expected[[40, 41, 42]])
 
     def test_mtp_tp_suffix_cannot_overwrite_committed_position_zero(self):
         manager = self.manager()

@@ -10,7 +10,7 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from sgl_kernel_npu.sparsity_driven_kv_offload import free_shm
+from sgl_kernel_npu.sparsity_driven_kv_offload import create_shm_tensor, free_shm
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
@@ -37,6 +37,8 @@ class _IndexPool(MLATokenToKVPool):
         self.kv_lora_rank, self.qk_rope_head_dim = 512, 64
         self.store_dtype = torch.bfloat16
         self.start_layer, self.layer_num = 0, 2
+        self.page_size = 128
+        self.size = key.shape[0] * 128 - self.page_size
 
     def get_index_k_buffer(self, layer_id):
         return self.key
@@ -46,13 +48,19 @@ class _IndexPool(MLATokenToKVPool):
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("async_checks", [False, True])
 @pytest.mark.parametrize("heads", [4, 8])
+@pytest.mark.parametrize("capacity", [11392, 12288, 16384, 16768])
 def test_real_manager_mtp_owner_share_lifecycle(
-    fused_metadata, graph, async_checks, heads
+    fused_metadata, graph, async_checks, heads, capacity
 ):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
     device = torch.device("npu", device_id)
+    C = capacity
+    # Keep the rollback inside the sparse branch for both capacities. Falling
+    # below C correctly produces zero resident-cache misses instead.
+    L = max(16389, C + 261)
+    CONTEXT = (L + 127) // 128 * 128
     batch = 3
     keys = torch.zeros(batch, CONTEXT, 128, dtype=torch.bfloat16, device=device)
     keys[:, :, 0] = -8
@@ -70,6 +78,8 @@ def test_real_manager_mtp_owner_share_lifecycle(
     query[:, :, 0] = 1
     weights = torch.full((token_rows, 32), 1 / 32, dtype=query.dtype, device=device)
     pool = ReqToTokenPool(2, CONTEXT, "npu", False)
+    pool.req_to_token[1, :CONTEXT] = torch.arange(CONTEXT, device=device)
+    pool.req_to_token[2, :CONTEXT] = torch.arange(CONTEXT, 2 * CONTEXT, device=device)
     index_pool = _IndexPool(keys)
     budget = resolve_sparse_kv_budget(
         request_rows=3,
@@ -97,7 +107,9 @@ def test_real_manager_mtp_owner_share_lifecycle(
             device=device,
         ),
         out_cache_loc=torch.tensor(
-            [1] * (2 * Q) + [-1] * (token_rows - 2 * Q),
+            list(range(L - Q, L))
+            + list(range(CONTEXT + L - Q, CONTEXT + L))
+            + [-1] * (token_rows - 2 * Q),
             dtype=torch.int32,
             device=device,
         ),
@@ -133,7 +145,9 @@ def test_real_manager_mtp_owner_share_lifecycle(
             stack.enter_context(
                 envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.override(fused_metadata)
             )
-            stack.enter_context(envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.override(False))
+            stack.enter_context(
+                envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.override(fused_metadata)
+            )
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
             )
@@ -254,7 +268,7 @@ def test_real_manager_mtp_owner_share_lifecycle(
                         in_prefix = (ids[idx] >= row * K) & (ids[idx] < (row + 1) * K)
                         in_tail = ids[idx] >= L - Q
                         assert torch.all(in_prefix | in_tail)
-                        selected = host[row + 1, ids[idx].long(), 0].float()
+                        selected = host[0, row * CONTEXT + ids[idx].long(), 0].float()
                         score = (
                             q[idx].cpu().float() @ selected[:, :512].T
                             + rope[idx].cpu().float() @ selected[:, 512:].T
@@ -289,6 +303,7 @@ def test_real_manager_mtp_owner_share_lifecycle(
             # old speculative keys so any future-token leakage is observable.
             rolled_length = L - 128
             inputs.positions[: 2 * Q].sub_(128)
+            inputs.out_cache_loc[: 2 * Q].sub_(128)
             inputs.seq_lens[:2].sub_(128)
             inputs.seq_lens_cpu[:2].sub_(128)
             key_rows = keys.view(batch, CONTEXT, 1, 128)
@@ -311,7 +326,7 @@ def test_real_manager_mtp_owner_share_lifecycle(
                         visible = rolled_length - Q + col + 1
                         assert torch.all((ids[idx] >= 0) & (ids[idx] < visible))
                         assert rolled_length - Q + col in ids[idx].tolist()
-                        selected = host[row + 1, ids[idx].long(), 0].float()
+                        selected = host[0, row * CONTEXT + ids[idx].long(), 0].float()
                         score = (
                             q[idx].cpu().float() @ selected[:, :512].T
                             + rope[idx].cpu().float() @ selected[:, 512:].T
@@ -341,6 +356,55 @@ def test_real_manager_mtp_owner_share_lifecycle(
                     )
                 )
                 assert padding_max == 0
+    finally:
+        torch.npu.synchronize()
+        free_shm(device_id)
+
+
+def test_paged_host_overlap_move_real_npu():
+    if not torch.npu.is_available():
+        pytest.skip("NPU is required")
+    device_id = torch.npu.current_device()
+    manager = SparseKVCacheManager.__new__(SparseKVCacheManager)
+    manager.device = torch.device("npu", device_id)
+    manager.host_kv_is_paged = True
+    manager.head_num, manager.head_dim = 1, 576
+    manager.store_dtype = torch.bfloat16
+    host, _, pointer = create_shm_tensor(
+        shape=(1, 512, 1, 576),
+        dtype=torch.bfloat16,
+        device_id=device_id,
+        name="prefix_shared_overlap_move_test",
+    )
+    manager.host_kv_buffer = [host]
+    manager.dev_ptr_list = [pointer]
+    original = (
+        torch.arange(512, dtype=torch.float32)
+        .remainder(127)
+        .to(torch.bfloat16)[:, None, None]
+        .expand(512, 1, 576)
+        .clone()
+    )
+    host[0].copy_(original)
+    source = torch.tensor([40, 41, 42], device=manager.device)
+    target = torch.tensor([41, 42, 40], device=manager.device)
+    try:
+        manager.move_host_kv(target, source)
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            host[0, [41, 42, 40]], original[[40, 41, 42]], rtol=0, atol=0
+        )
+        host[0].copy_(original)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            manager.move_host_kv(target, source)
+        torch.npu.synchronize()
+        host[0].copy_(original)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            host[0, [41, 42, 40]], original[[40, 41, 42]], rtol=0, atol=0
+        )
     finally:
         torch.npu.synchronize()
         free_shm(device_id)

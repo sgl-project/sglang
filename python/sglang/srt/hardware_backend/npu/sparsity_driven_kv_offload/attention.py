@@ -152,7 +152,7 @@ def _forward_sparse_mtp(backend, q, q_rope, layer, forward_batch, topk_indices):
             unidex_copy_inplace(
                 manager.host_kv_buffer[layer_index],
                 selected,
-                (safe_requests[:, None] * manager.max_context_len + source)
+                manager.host_source_indices(safe_requests[:, None], source)
                 .reshape(-1)
                 .contiguous(),
                 torch.arange(batch * top_k, device=q.device),
