@@ -837,8 +837,6 @@ class TestPromptRewrite(CustomTestCase):
             origin_input_ids=ids,
             origin_input_ids_unpadded=ids,
             full_untruncated_fill_ids=array("q", self.NEW),
-            surr_offset=3,
-            read_offset=9,
             uocr_doc=None,
         )
 
@@ -860,8 +858,6 @@ class TestPromptRewrite(CustomTestCase):
         self.assertEqual(list(req.origin_input_ids), plan.new_ids)
         self.assertIs(req.origin_input_ids_unpadded, req.origin_input_ids)
         self.assertEqual(list(req.full_untruncated_fill_ids), plan.new_ids)
-        # The detokenizer's read offset is derived from the prompt length.
-        self.assertIsNone(req.read_offset)
 
     def test_item_straddling_the_boundary_is_refused(self):
         plan = self._plan()
@@ -1001,17 +997,31 @@ class TestForcedTextIsHidden(CustomTestCase):
 
         req = Req("r0", "", array("q", range(1, prompt_len + 1)), SamplingParams())
         req.output_ids.extend(array("q", range(900, 900 + forced)))
-        r.hide_forced_text(req, forced)
+        r.hide_forced_text(req)
         req.output_ids.extend(array("q", range(800, 800 + generated)))
         return req
 
     def test_the_first_generated_token_still_has_text(self):
         req = self._req(forced=8, generated=2)
-        ids, read_offset = req.init_incremental_detokenize()
-        # What the streamer ships the detokenizer this step.
-        self.assertEqual(list(ids[req.send_decode_id_offset :]), list(ids))
-        # Text starts at the first generated token, not inside the spliced run.
-        self.assertEqual(list(ids[read_offset:]), [800, 801])
+        from sglang.srt.managers.incremental_detokenize import (
+            DetokenizeState,
+            build_detokenize_header,
+        )
+
+        header = build_detokenize_header(req, output_prefix_len=req.send_token_offset)
+        state = DetokenizeState.from_header(header=header, vocab_size=1000)
+        state.append_row(
+            rid=req.rid,
+            output_ids=list(req.output_ids[req.send_token_offset :]),
+            completion_tokens=2,
+            is_beam=False,
+            vocab_size=1000,
+        )
+        read_ids, surr_ids = state.decode_inputs(
+            finished_reason=None, trim_matched_stop=lambda ids, *args: ids
+        )
+        self.assertEqual(surr_ids[-8:], list(range(900, 908)))
+        self.assertEqual(read_ids[len(surr_ids) :], [800, 801])
 
     def test_the_spliced_tokens_stay_out_of_the_token_list(self):
         req = self._req(forced=8, generated=2)

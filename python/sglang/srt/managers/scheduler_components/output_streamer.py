@@ -633,7 +633,9 @@ class _GenerationStreamAccumulator:
 
         if self.output_sink is OutputSink.DETOKENIZER:
             if req.take_detokenize_header_due():
-                self.detokenize_headers.append(build_detokenize_header(req))
+                self.detokenize_headers.append(
+                    build_detokenize_header(req, output_prefix_len=send_token_offset)
+                )
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)

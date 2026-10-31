@@ -605,18 +605,9 @@ def next_page_after(
     return first_page + len(pages.page_starts) - context_pages - lookahead
 
 
-def hide_forced_text(req, n_forced: int) -> None:
-    """Keep the spliced text out of the window's answer.
-
-    The detokenizer subtracts the text before ``read_offset`` from what it
-    decodes, so that prefix must be in the chunk it receives, or the first
-    generated token decodes to no text.
-    """
+def hide_forced_text(req) -> None:
+    """Skip spliced tokens; the first detokenize header carries their context."""
     req.send_token_offset = len(req.output_ids)
-    req.surr_offset = None
-    req.read_offset = None
-    req.init_incremental_detokenize()
-    req.read_offset += n_forced
 
 
 def _rewrite_prompt(req, plan: TailCopyPlan) -> bool:
@@ -672,10 +663,6 @@ def _rewrite_prompt(req, plan: TailCopyPlan) -> bool:
     req.origin_input_ids = ids
     req.origin_input_ids_unpadded = ids if aliased else array("q", plan.new_ids)
     req.full_untruncated_fill_ids = array("q", plan.new_ids)
-    # init_incremental_detokenize keys the read offset off the unpadded prompt,
-    # and it has not run yet for this window (no output tokens).
-    req.surr_offset = None
-    req.read_offset = None
     return True
 
 
@@ -701,8 +688,6 @@ def _restore_prompt(req) -> None:
         return
     _put_back_prompt(req, saved)
     req.full_untruncated_fill_ids = saved.fill_ids
-    req.surr_offset = None
-    req.read_offset = None
 
 
 def _reuse_text_tail(
@@ -1549,7 +1534,7 @@ class DocReuse:
         if req.sampling_params.max_new_tokens is not None:
             req.sampling_params.max_new_tokens += len(forced)
         st.skip_prefill_append = True
-        hide_forced_text(req, len(forced))
+        hide_forced_text(req)
         req.kv.kv_allocated_len += n
         req.kv.kv_committed_len += n
         self._input_overrides[int(row)] = int(plan.forced[-1])
