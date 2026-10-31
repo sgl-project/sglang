@@ -153,6 +153,29 @@ After tuning, configuration files will be generated:
 
 Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_version/` directory to use them in SGLang.
 
+#### AMD Strix Halo / gfx1151 W4A16
+
+For `Qwen3.5-35B-A3B-AWQ-4bit` on Radeon 8060S, use the ROCm Triton path with the single-GPU local tuner:
+
+```bash
+SGLANG_AWQ_MOE_TRITON_ROCM=1 python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
+    --no-ray \
+    --model /models/Qwen3.5-35B-A3B-AWQ-4bit \
+    --tp-size 1 \
+    --dtype int4_w4a16 \
+    --batch-sizes 1 2 4 8 16 32 64 128 \
+    --tune
+```
+
+The packed W4A16 config files are:
+
+```text
+E=256,N=256,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16.json
+E=256,N=256,device_name=Radeon_8060S_Graphics,dtype=int4_w4a16_down.json
+```
+
+The gfx1151 profile was tuned over 72 ROCm configurations and eight batch sizes. The checked-in map improved fused-MoE kernel time by 23.1%–40.9% on the validation Radeon 8060S; retune when the GPU, ROCm, or Triton version changes. The down map currently reuses the tuned map without TMA.
+
 ### Supported Models
 
 - **Mixtral**: mistralai/Mixtral-8x7B-Instruct-v0.1, mixtral-8x22b
@@ -170,7 +193,7 @@ Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/trito
 - `--model`: HuggingFace model name or local path
 - `--tp-size`: Tensor parallelism size (default: 2)
 - `--ep-size`: Expert parallelism size (default: 1, can be combined with TP mode, ensure tp_size is divisible by ep_size)
-- `--dtype`: Data type (`auto`, `fp8_w8a8`, `int8_w8a16`, `int8_w8a8`)
+- `--dtype`: Data type (`auto`, `fp8_w8a8`, `int8_w8a16`, `int8_w8a8`, `int4_w4a16`)
 - `--batch-size`: Specific batch size for tuning (optional)
 - `--tune`: Enable tuning mode
 - `--per-channel-quant`: Enable per-channel quantization
