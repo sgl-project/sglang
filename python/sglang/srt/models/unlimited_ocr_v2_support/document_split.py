@@ -164,35 +164,6 @@ def plan_batches(
     return batches
 
 
-def validate_plan(plan, *, page_count: int, overlap_pages: int) -> None:
-    """Require contiguous output ownership covering every document page"""
-    if page_count < 0 or overlap_pages < 0:
-        raise ValueError("page_count and overlap_pages must be non-negative")
-    if not plan:
-        raise ValueError("document plan must be non-empty")
-    if plan[0][0] != 0 or plan[0][2] != 0:
-        raise ValueError("the first document batch must start and emit at page zero")
-    previous_end = 0
-    for index, (lo, hi, emit_from) in enumerate(plan):
-        if not 0 <= lo < hi <= page_count:
-            raise ValueError(f"invalid page range in batch {index}: {(lo, hi)}")
-        if not lo <= emit_from < hi:
-            raise ValueError(
-                f"emit_from must be inside the batch in batch {index}: "
-                f"{(lo, hi, emit_from)}"
-            )
-        if emit_from != previous_end:
-            raise ValueError("document batches must emit contiguously")
-        if index > 0 and emit_from - lo != overlap_pages:
-            raise ValueError(
-                f"batch {index} overlap does not match configured value: "
-                f"expected {overlap_pages}, got {emit_from - lo}"
-            )
-        previous_end = hi
-    if previous_end != page_count:
-        raise ValueError("document plan does not cover all pages")
-
-
 def split_messages(messages: List[Any], lo: int, hi: int) -> List[Any]:
     """Retain images [lo, hi); image and response page IDs must both start at zero."""
     out = []

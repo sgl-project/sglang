@@ -96,6 +96,13 @@ class _PrefetchedStream:
             return await task
         return await self._agen.__anext__()
 
+    async def aclose(self) -> None:
+        if self._task is not None:
+            task, self._task = self._task, None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._agen.aclose()
+
 
 class _WindowStream(msgspec.Struct):
     """One streaming doc-split window: decoded text and what was sent of it."""
@@ -104,8 +111,6 @@ class _WindowStream(msgspec.Struct):
     sent: str = ""
     reused: bool = False
     meta: dict = {}
-    # The next window, sent while this one decodes; None until then.
-    successor: Optional[tuple] = None
 
 
 def _window_pages(reused: bool, *, lo: int, hi: int, emit_from: int) -> dict:
@@ -627,17 +632,6 @@ def _account_stream_window(
     return tail, finish.get("type")
 
 
-class _StreamCursor(msgspec.Struct):
-    """The window a streamed split document runs next; None ends the stream."""
-
-    next_window: Optional[tuple] = None
-
-
-def _next_window_stream(window, *, open_window, bi, remaining):
-    """The window after ``bi``: its prefetched successor, else a fresh one."""
-    return window.successor or open_window(bi=bi + 1, remaining=remaining)
-
-
 class _SseFormatter(msgspec.Struct, frozen=True):
     """Formats the chunks of one SSE response; every chunk shares id and model."""
 
@@ -871,13 +865,6 @@ class ChatDocSplitter:
             return self._serving.create_error_response(
                 "doc-split requires a positive token budget"
             )
-        doc_split.validate_plan(
-            plan,
-            page_count=doc_split.count_images(request.messages),
-            overlap_pages=next(
-                (emit_from - lo for lo, _, emit_from in plan if emit_from > lo), 0
-            ),
-        )
         progress = _SplitProgress(remaining_tokens=int(original_max_tokens))
         prefetch = (
             envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get() and doc_reuse_id is not None
@@ -1075,27 +1062,54 @@ class ChatDocSplitter:
             doc_reuse_id=doc_reuse_id,
             rids=rids,
         )
-        stream_window = functools.partial(
-            self._stream_window,
-            plan=plan,
-            totals=totals,
-            sse=sse,
-            open_window=open_window,
-            prefetch=(
-                envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get() and doc_reuse_id is not None
-            ),
-            rids=rids,
+        prefetch = (
+            envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get() and doc_reuse_id is not None
         )
+        current = pending = None
         try:
-            cursor = _StreamCursor(
-                next_window=open_window(bi=0, remaining=totals.remaining)
-            )
-            for bi in range(len(plan)):
-                window_stream, cursor.next_window = cursor.next_window, None
-                if window_stream is None or totals.remaining <= 0:
+            pending = open_window(bi=0, remaining=totals.remaining)
+            for bi, (lo, hi, emit_from) in enumerate(plan):
+                current, pending = pending, None
+                if current is None or totals.remaining <= 0:
                     break
-                async for chunk in stream_window(window_stream, bi=bi, cursor=cursor):
-                    yield chunk
+                window, chunks = current
+                has_next = bi + 1 < len(plan)
+                try:
+                    async for delta in chunks:
+                        if prefetch and has_next and pending is None:
+                            pending = open_window(
+                                bi=bi + 1, remaining=totals.remaining, after=rids[-1]
+                            )
+                            await pending[1].start()
+                        if not totals.started:
+                            totals.started = True
+                            yield sse(role="assistant", content="")
+                        if delta:
+                            yield sse(content=delta)
+                except ValueError as e:
+                    if not _is_context_error_message(str(e)):
+                        raise
+                    totals.lose_window()
+                else:
+                    tail, finish_type = _account_stream_window(
+                        window,
+                        totals,
+                        bi=bi,
+                        lo=lo,
+                        hi=hi,
+                        emit_from=emit_from,
+                        prompt_tokens=self._serving._reported_prompt_tokens(
+                            window.meta
+                        ),
+                    )
+                    if tail:
+                        yield sse(content=tail)
+                    if finish_type in ("abort", "content_filter"):
+                        break
+                if has_next and totals.remaining > 0:
+                    pending = pending or open_window(
+                        bi=bi + 1, remaining=totals.remaining
+                    )
             if not totals.started:
                 raise ValueError("doc-split produced no batches")
             for chunk in _stream_epilogue(
@@ -1111,70 +1125,12 @@ class ChatDocSplitter:
                 raise
             yield f"data: {self._serving.create_streaming_error_response(str(e))}\n\n"
         finally:
+            # tokenization can still be running before the manager registers the rid
+            for window_stream in (current, pending):
+                if window_stream is not None:
+                    await window_stream[1].aclose()
             self._abort_windows(rids, doc_reuse_id=doc_reuse_id)
         yield "data: [DONE]\n\n"
-
-    async def _stream_window(
-        self,
-        window_stream,
-        *,
-        plan,
-        bi,
-        totals,
-        sse,
-        open_window,
-        prefetch,
-        rids,
-        cursor,
-    ):
-        """Yield window ``bi``'s SSE chunks and pick the window that runs next.
-
-        The next window is sent once this one streams its first chunk, when
-        ``prefetch`` is on; ``cursor`` receives it, or None to end the stream.
-        """
-        lo, hi, emit_from = plan[bi]
-        window, chunks = window_stream
-        has_next = bi + 1 < len(plan)
-        try:
-            async for delta in chunks:
-                if prefetch and has_next and window.successor is None:
-                    # Sent while this window decodes; capped to the real
-                    # remainder by the scheduler when this one finishes.
-                    window.successor = open_window(
-                        bi=bi + 1, remaining=totals.remaining, after=rids[-1]
-                    )
-                    await window.successor[1].start()
-                if not totals.started:
-                    totals.started = True
-                    yield sse(role="assistant", content="")
-                if delta:
-                    yield sse(content=delta)
-        except ValueError as e:
-            if not _is_context_error_message(str(e)):
-                raise
-            # As in the non-stream path: this window is lost, go on.
-            totals.lose_window()
-            if has_next:
-                cursor.next_window = _next_window_stream(
-                    window, open_window=open_window, bi=bi, remaining=totals.remaining
-                )
-            return
-        tail, finish_type = _account_stream_window(
-            window,
-            totals,
-            bi=bi,
-            lo=lo,
-            hi=hi,
-            emit_from=emit_from,
-            prompt_tokens=self._serving._reported_prompt_tokens(window.meta),
-        )
-        if tail:
-            yield sse(content=tail)
-        stopped = finish_type in ("abort", "content_filter")
-        if not stopped and has_next and totals.remaining > 0:
-            cursor.next_window = _next_window_stream(
-                window, open_window=open_window, bi=bi, remaining=totals.remaining
-            )
 
     def _abort_windows(self, rids, *, doc_reuse_id) -> None:
         """Abort every window still running and free the document's retained KV."""

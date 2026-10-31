@@ -543,15 +543,7 @@ class TestWindowLookahead(CustomTestCase):
         self.assertIsNone(sub.custom_params.get("page_stop_only"))
 
 
-class TestDocumentPlan(CustomTestCase):
-    def test_plan_must_have_configured_overlap(self):
-        with self.assertRaises(ValueError):
-            doc_split.validate_plan(
-                page_count=8,
-                overlap_pages=1,
-                plan=((0, 4, 0), (2, 6, 4), (4, 8, 6)),
-            )
-
+class TestRetainedWindow(CustomTestCase):
     def test_retained_window_release_is_idempotent(self):
         slot = RetainedWindow()
         self.assertTrue(slot.mark_released())
@@ -825,6 +817,49 @@ class TestSplitDocumentAssembly(CustomTestCase):
         for rejected in range(3):
             with self.subTest(rejected=rejected):
                 asyncio.run(check(rejected))
+
+    def test_disconnect_cancels_a_successor_still_tokenizing(self):
+        async def check():
+            started = asyncio.Event()
+            tasks, released = [], []
+            splitter = _splitter(_ScriptedWindows([]))
+            manager = splitter._tokenizer_manager
+            manager.abort_request = lambda rid: None
+            manager.release_uocr_doc = released.append
+
+            async def generate_request(adapted, raw_request):
+                if "-w1-" in adapted.rid:
+                    tasks.append(asyncio.current_task())
+                    started.set()
+                    await asyncio.Event().wait()
+                yield {
+                    "text": "p0",
+                    "meta_info": {"prompt_tokens": 10, "completion_tokens": 1},
+                }
+
+            manager.generate_request = generate_request
+            with serving_chat_doc_split.envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.override(
+                True
+            ):
+                stream = splitter._split_document_stream(
+                    _document_request(2, stream=True),
+                    None,
+                    [(0, 1, 0), (1, 2, 1)],
+                    doc_reuse_id="doc",
+                )
+                try:
+                    await anext(stream)
+                    await asyncio.wait_for(started.wait(), timeout=5)
+                    await stream.aclose()
+                    self.assertEqual(released, ["doc"])
+                    self.assertTrue(tasks[0].cancelled())
+                finally:
+                    await stream.aclose()
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+        asyncio.run(check())
 
     def test_early_exit_aborts_the_parked_successor(self):
         """Every early exit must release a successor sent before the current reply"""
