@@ -1068,6 +1068,9 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Run Quark MXFP4 (W4A4) MoE checkpoints as W4A16 via triton_kernels on
+    # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
+    SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
