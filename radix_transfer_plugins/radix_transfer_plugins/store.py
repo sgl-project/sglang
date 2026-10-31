@@ -25,11 +25,13 @@ Lifecycle:
 
 from __future__ import annotations
 
+import mmap
+import sys
 from typing import Mapping, Optional, Sequence, TypeVar
 
 from radix_transfer_plugins.backend import StorageBackend
 from radix_transfer_plugins.codec import IDENTITY, get_codec
-from radix_transfer_plugins.schema import FieldSpec, Stash, StoreRef
+from radix_transfer_plugins.schema import FieldSpec, RangeRead, Stash, StoreRef
 
 S = TypeVar("S", bound=Stash)
 
@@ -91,6 +93,30 @@ class OutputStore:
             for specs, data in zip(wanted, stored)
         ]
 
+    def read_buffer(self, nbytes: int) -> ReadBuffer:
+        """``nbytes`` of memory to read ranges into, registered until its ``close()``."""
+        return ReadBuffer(backend=self._backend, nbytes=nbytes)
+
+    def read_ranges(self, reads: Sequence[RangeRead], *, into: ReadBuffer) -> None:
+        """Read byte ranges of stored fields into ``into``, without registering memory.
+
+        Only identity-coded fields. Fails before reading when ``into`` is closed or
+        from another store, a field is missing or not identity coded, a range is
+        empty, or a range falls outside its field or ``into``. A read that fails after
+        starting may leave ``into`` partly written; ``into`` stays usable.
+        """
+        if not reads:
+            return
+        if into.closed:
+            raise ValueError("ranges cannot be read into a closed ReadBuffer")
+        if into.backend is not self._backend:
+            raise ValueError("the ReadBuffer was registered by another store")
+        self._check_backend([read.ref for read in reads])
+        for read in reads:
+            (spec,) = _named_specs(read.ref, [read.field])
+            _check_range(read, spec=spec, into=into.view)
+        self._backend.get_ranges(reads, into=into.view)
+
     def delete_many(self, refs: Sequence[StoreRef]) -> None:
         """Delete every field of each ref."""
         self._check_backend(refs)
@@ -133,6 +159,37 @@ class OutputStore:
                 )
 
 
+class ReadBuffer:
+    """Host memory registered with a backend from creation until ``close()``, so that
+    repeated ``read_ranges`` into it register nothing.
+
+    It owns its bytes, so a registration never outlives the memory it pins: ``close()``
+    unregisters before the bytes can be freed. Views of ``view`` stay valid after
+    ``close()``. One read at a time may use it.
+    """
+
+    def __init__(self, *, backend: StorageBackend, nbytes: int) -> None:
+        if nbytes <= 0:
+            raise ValueError(f"a ReadBuffer needs a positive size, not {nbytes}")
+        # Anonymous memory is page aligned and untouched; registering it faults it in,
+        # in parallel from 4 GiB up on Mooncake 0.3.13.
+        memory = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE)
+        if sys.platform == "linux":
+            # Hosts often enable THP on madvise only; huge pages fault in 3x faster
+            # (measured on H200 hosts), and numpy asks for them the same way.
+            memory.madvise(mmap.MADV_HUGEPAGE)
+        self.view = memoryview(memory)
+        backend.register(self.view)
+        self.backend = backend
+        self.nbytes = nbytes
+        self.closed = False
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.backend.unregister(self.view)
+
+
 def _as_bytes(data: memoryview) -> memoryview:
     return data if data.format == "B" and data.ndim == 1 else data.cast("B")
 
@@ -143,3 +200,24 @@ def _named_specs(ref: StoreRef, names: Sequence[str]) -> list[FieldSpec]:
     if missing:
         raise ValueError(f"{ref.key} has no fields {missing}")
     return [specs[name] for name in names]
+
+
+def _check_range(read: RangeRead, *, spec: FieldSpec, into: memoryview) -> None:
+    field = f"{read.ref.key} field {read.field!r}"
+    # Ranges are of the stored bytes, which are the array's bytes only under identity.
+    if spec.codec != IDENTITY:
+        raise ValueError(f"{field} is {spec.codec} coded; ranges need {IDENTITY}")
+    if not (
+        read.src_offset >= 0
+        and read.nbytes > 0
+        and read.src_offset + read.nbytes <= spec.nbytes
+    ):
+        raise ValueError(
+            f"{read.nbytes} bytes at {read.src_offset} are not a range of {field}, "
+            f"which has {spec.nbytes} bytes"
+        )
+    if not (read.dst_offset >= 0 and read.dst_offset + read.nbytes <= into.nbytes):
+        raise ValueError(
+            f"{read.nbytes} bytes of {field} at {read.dst_offset} fall outside the "
+            f"{into.nbytes} bytes they are read into"
+        )

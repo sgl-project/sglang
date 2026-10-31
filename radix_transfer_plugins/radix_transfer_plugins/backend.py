@@ -8,6 +8,8 @@ from typing import ClassVar, Mapping, Optional, Sequence
 
 import msgspec
 
+from radix_transfer_plugins.schema import RangeRead
+
 # Backend name -> "module:class"; a backend's module is imported only when it is used.
 _BACKENDS: dict[str, str] = {
     "mooncake": "radix_transfer_plugins.backends.mooncake:MooncakeBackend",
@@ -41,6 +43,26 @@ class StorageBackend(ABC):
         ``parts`` gives each part's size. Raises ``KeyError`` for a part that is not
         stored, ``ValueError`` for one whose size differs, and ``RuntimeError`` for a
         stored part that could not be read.
+        """
+
+    @abstractmethod
+    def register(self, memory: memoryview) -> None:
+        """Make ``memory`` a destination of ``get_ranges`` until ``unregister``.
+
+        Raises ``RuntimeError`` when the backend cannot register it.
+        """
+
+    @abstractmethod
+    def unregister(self, memory: memoryview) -> None:
+        """Undo ``register``; the caller is releasing ``memory``, so a failure is only logged."""
+
+    @abstractmethod
+    def get_ranges(self, reads: Sequence[RangeRead], *, into: memoryview) -> None:
+        """Read each range of part ``field`` of object ``ref.key`` into ``into``, which
+        lies in memory given to ``register``.
+
+        Raises ``KeyError`` for a part that is not stored and ``RuntimeError`` for a
+        range that could not be read.
         """
 
     @abstractmethod
