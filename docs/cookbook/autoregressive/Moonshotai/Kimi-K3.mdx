@@ -478,3 +478,28 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+
+
+## Restrict the callable tool set
+
+Chat Completions accepts a function subset through `tool_choice`:
+
+```json
+{
+  "tool_choice": {
+    "type": "allowed_tools",
+    "allowed_tools": {
+      "mode": "required",
+      "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+    }
+  }
+}
+```
+
+Declare each referenced function in `tools` or a root/system/developer message's
+`tools` list. The server filters these declarations before prompt encoding,
+constrained decoding and output parsing, then uses `auto` or `required` as the
+normal tool-choice mode. Historical tool calls and results are preserved.
+The selected mode also takes precedence over server chat-template defaults.
+Duplicate or undeclared names, an empty required subset, and a conflicting
+`chat_template_kwargs.tool_choice` are rejected. An empty `auto` subset is valid.
