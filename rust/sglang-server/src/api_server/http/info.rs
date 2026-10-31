@@ -25,7 +25,7 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
-use crate::api_server::handlers::ProfileOutcome;
+use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::ProfileOptions;
 
@@ -387,7 +387,10 @@ struct AbortRequestBody {
 /// `abort_all`, through the core's cancellation registry, as the gRPC `Abort`
 /// does. Python's contract: 200 with an empty body whether or not anything
 /// matched, and an empty rid without `abort_all` is ignored rather than
-/// matching every request, as `TokenizerManager.abort_request` does.
+/// matching every request, as `TokenizerManager.abort_request` does. Each
+/// aborted request ends as Python ends it, on the scheduler's terminal output
+/// with the abort as its finish reason and the partial generation, rather than
+/// on the cancelled error the gRPC `Abort` reports.
 async fn abort_request(
     State(state): State<Arc<AppState>>,
     body: Result<Json<AbortRequestBody>, JsonRejection>,
@@ -399,12 +402,13 @@ async fn abort_request(
         }
     };
     let rid = body.rid.unwrap_or_default();
+    let ending = AbortEnding::AbortFinishReason;
     if body.abort_all {
-        state.core.abort(None);
+        state.core.abort(None, ending);
     } else if rid.is_empty() {
         tracing::warn!("ignoring abort_request with an empty rid and abort_all=false");
     } else {
-        state.core.abort(Some(&rid));
+        state.core.abort(Some(&rid), ending);
     }
     StatusCode::OK.into_response()
 }
@@ -416,6 +420,7 @@ mod tests {
         http::{Request as HttpRequest, header::CONTENT_TYPE},
     };
     use bytes::Bytes;
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -423,8 +428,11 @@ mod tests {
     use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
     use crate::message::ids::Rid;
+    use crate::message::request::Request;
     use crate::message::request::{GenerateRequest, RequestKind};
-    use crate::message::response::ResponseItem;
+    use crate::message::response::{
+        CachedTokensDetails, ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan,
+    };
     use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
     use crate::utils::environ;
 
@@ -1211,8 +1219,8 @@ mod tests {
 
     /// `/abort_request` cancels the live generation submitted under the body's
     /// rid, or every one with `abort_all`, and answers Python's empty 200: the
-    /// runtime is told to abort the request and the client's call ends as
-    /// cancelled. A rid nothing runs under is still a 200 with nothing
+    /// scheduler is told to abort the request, and the client's call ends on
+    /// the scheduler's answer. A rid nothing runs under is still a 200 with nothing
     /// aborted, an empty rid without `abort_all` is ignored, and a malformed
     /// body is a 400.
     #[tokio::test]
@@ -1259,21 +1267,229 @@ mod tests {
             }
             if aborted {
                 assert!(
-                    matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
-                    "{body}: the runtime must be told to abort the request"
+                    matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid),
+                    "{body}: the scheduler must be told to abort the request"
                 );
                 assert!(
-                    matches!(
-                        call.recv().await,
-                        Some(CoreEvent::Failed(CoreError::Cancelled(_)))
-                    ),
-                    "{body}: the client's call ends as cancelled"
+                    futures::FutureExt::now_or_never(call.recv()).is_none(),
+                    "{body}: the call waits for the scheduler's answer"
+                );
+                request
+                    .sink
+                    .try_send(scheduler_abort(&request.rid, "", Vec::new(), 0))
+                    .unwrap();
+                let Some(CoreEvent::Finished(output)) = call.recv().await else {
+                    panic!("{body}: the client's call finishes on the scheduler's abort");
+                };
+                assert_eq!(
+                    output.finish_reason.as_ref().and_then(|r| r.kind_name()),
+                    Some("abort"),
+                    "{body}"
                 );
             } else {
                 assert!(abort_rx.try_recv().is_err(), "{body}: nothing is aborted");
             }
             drop(request);
         }
+    }
+
+    /// The terminal output Python's scheduler sends for a running request an
+    /// `/abort_request` names: the step's tokens, the request's counts, cache
+    /// split and weight-version span, and the plain abort as finish reason.
+    fn scheduler_abort(
+        rid: &Rid,
+        text: &str,
+        token_ids: Vec<i64>,
+        completion_tokens: u64,
+    ) -> ResponseItem {
+        ResponseItem::Done(ChunkEvent {
+            rid: rid.clone(),
+            text: text.into(),
+            token_ids,
+            prompt_tokens: 5,
+            cached_tokens: 2,
+            completion_tokens,
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({
+                    "type": "abort",
+                    "message": "Aborted",
+                    "status_code": null,
+                    "err_type": null
+                }))
+                .unwrap(),
+            ),
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 0,
+                    host: 2,
+                    storage: None,
+                    storage_backend: None,
+                }),
+                weight_versions: vec![WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 17,
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// An `/abort_request` leaves the request's sink in place and asks the
+    /// scheduler to abort it, so each surface ends on the scheduler's terminal
+    /// output as Python's server ends it: a native stream on a final frame
+    /// with all the output, the counts, the cache split and the abort as its
+    /// finish reason, then `[DONE]`; a unary `/generate` aborted before any
+    /// intermediate output with a 200 carrying the partial generation; a
+    /// `/v1/completions` stream on a final chunk whose `finish_reason` is
+    /// `abort`, then `[DONE]`.
+    #[tokio::test]
+    async fn abort_request_ends_requests_on_the_schedulers_abort() {
+        let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
+        let app = routes()
+            .merge(super::super::native_api::routes())
+            .merge(super::super::openai::routes())
+            .with_state(state);
+        let post = |path: &'static str, body: serde_json::Value| {
+            tokio::spawn(
+                app.clone().oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ),
+            )
+        };
+        // Accept the next generation, optionally streaming one frame of it.
+        let start = |frame: bool| {
+            let intake_rx = intake_rx.clone();
+            async move {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected a generation");
+                };
+                assert!(admission.try_accept());
+                if frame {
+                    request
+                        .sink
+                        .try_send(ResponseItem::Frame(ChunkEvent {
+                            rid: request.rid.clone(),
+                            text: "partial".into(),
+                            token_ids: vec![7],
+                            prompt_tokens: 5,
+                            cached_tokens: 2,
+                            completion_tokens: 1,
+                            ..Default::default()
+                        }))
+                        .unwrap();
+                }
+                request
+            }
+        };
+        // Abort through the route, then answer as the scheduler does.
+        let (post, abort_rx) = (&post, &abort_rx);
+        let abort = |body: serde_json::Value, request: Request, terminal: ResponseItem| async move {
+            let response = post("/abort_request", body).await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid)
+            );
+            request.sink.try_send(terminal).unwrap();
+        };
+        let data = |chunk: &[u8]| -> Vec<String> {
+            std::str::from_utf8(chunk)
+                .unwrap()
+                .split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: ").map(str::to_owned))
+                .collect()
+        };
+
+        let response = post(
+            "/generate",
+            serde_json::json!({"text": "hi", "rid": "stream", "stream": true}),
+        );
+        let request = start(true).await;
+        let mut body = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let first = data(&body.next().await.unwrap().unwrap());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first[0]).unwrap()["text"],
+            "partial"
+        );
+        let terminal = scheduler_abort(&request.rid, " end", vec![8], 1);
+        abort(serde_json::json!({"rid": "stream"}), request, terminal).await;
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend(data(&chunk.unwrap()));
+        }
+        let [last, done] = rest.as_slice() else {
+            panic!("expected a final frame and [DONE]: {rest:?}");
+        };
+        let last: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert!(last.get("error").is_none(), "{last}");
+        assert_eq!(last["text"], "partial end");
+        assert_eq!(last["output_ids"], serde_json::json!([7, 8]));
+        let meta = &last["meta_info"];
+        assert_eq!(meta["finish_reason"]["type"], "abort");
+        assert_eq!(meta["finish_reason"]["message"], "Aborted");
+        assert_eq!(meta["prompt_tokens"], 5);
+        assert_eq!(meta["completion_tokens"], 2);
+        assert_eq!(
+            meta["cached_tokens_details"],
+            serde_json::json!({"device": 0, "host": 2})
+        );
+        assert_eq!(meta["weight_versions"][0]["version"], "v1");
+        assert!(meta["e2e_latency"].is_f64());
+        assert_eq!(done, "[DONE]");
+
+        let response = post(
+            "/generate",
+            serde_json::json!({"text": "hi", "rid": "unary"}),
+        );
+        let request = start(false).await;
+        let terminal = scheduler_abort(&request.rid, "seventeen tokens", (1..=17).collect(), 17);
+        abort(serde_json::json!({"rid": "unary"}), request, terminal).await;
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["text"], "seventeen tokens");
+        assert_eq!(body["output_ids"].as_array().unwrap().len(), 17);
+        assert_eq!(body["meta_info"]["completion_tokens"], 17);
+        assert_eq!(body["meta_info"]["finish_reason"]["type"], "abort");
+
+        let response = post(
+            "/v1/completions",
+            serde_json::json!({"model": "m", "prompt": "hi", "stream": true}),
+        );
+        let request = start(true).await;
+        let mut body = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        body.next().await.unwrap().unwrap();
+        let terminal = scheduler_abort(&request.rid, "", Vec::new(), 0);
+        abort(serde_json::json!({"abort_all": true}), request, terminal).await;
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend(data(&chunk.unwrap()));
+        }
+        let [last, done] = rest.as_slice() else {
+            panic!("expected a final chunk and [DONE]: {rest:?}");
+        };
+        let last: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "abort", "{last}");
+        assert_eq!(done, "[DONE]");
     }
 
     /// A forwarded control request reaches the local scheduler under the rid
