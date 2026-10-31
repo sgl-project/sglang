@@ -1476,12 +1476,16 @@ def grouped_topk_gpu(
         topk_weights *= routed_scaling_factor
 
     if num_fused_shared_experts > 0:
-        shared_ids = torch.arange(
-            num_experts,
-            num_experts + num_fused_shared_experts,
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        ).unsqueeze(0).expand(num_token, -1)
+        shared_ids = (
+            torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(num_token, -1)
+        )
         shared_weight_val = fused_shared_expert_weight(
             routed_scaling_factor=routed_scaling_factor,
             fused_in_topk=bool(apply_routed_scaling_factor_on_output),
@@ -1672,12 +1676,16 @@ def biased_topk_impl(
         topk_weights *= routed_scaling_factor
 
     if num_fused_shared_experts > 0:
-        shared_ids = torch.arange(
-            num_experts,
-            num_experts + num_fused_shared_experts,
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        ).unsqueeze(0).expand(num_token, -1)
+        shared_ids = (
+            torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(num_token, -1)
+        )
         shared_weight_val = fused_shared_expert_weight(
             routed_scaling_factor=routed_scaling_factor,
             fused_in_topk=bool(apply_routed_scaling_factor_on_output),
@@ -1887,12 +1895,16 @@ def biased_grouped_topk_impl(
         topk_weights *= routed_scaling_factor
 
     if num_fused_shared_experts > 0:
-        shared_ids = torch.arange(
-            num_experts,
-            num_experts + num_fused_shared_experts,
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        ).unsqueeze(0).expand(num_token, -1)
+        shared_ids = (
+            torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(num_token, -1)
+        )
         shared_weight_val = fused_shared_expert_weight(
             routed_scaling_factor=routed_scaling_factor,
             fused_in_topk=bool(apply_routed_scaling_factor_on_output),
