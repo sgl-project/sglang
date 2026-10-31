@@ -2080,6 +2080,7 @@ class Req(ReqDllmMixin):
                         )
                         break
                     if matched:
+                        matched_span = matched.group(0)
                         finished_len = self._locate_str_stop_finished_len(
                             new_accepted_len, stop_regex=stop_regex_str
                         )
@@ -2091,11 +2092,27 @@ class Req(ReqDllmMixin):
                             stop_regex=stop_regex_str,
                             full_window_matched=False,
                         )
+                        # The span was not in the full tail; re-derive it on
+                        # the accepted prefix that did match.
+                        matched_span = None
+                        if finished_len is not None:
+                            span = re.search(
+                                stop_regex_str,
+                                self.tokenizer.decode(self.output_ids[:finished_len]),
+                            )
+                            matched_span = span.group(0) if span else None
                     else:
                         finished_len = None
+                        matched_span = None
                     if finished_len is not None:
+                        # Record the matched span, not the pattern source:
+                        # the detokenizer trims with a literal find on this
+                        # string, so a non-literal pattern would never be
+                        # found and the output would be returned untrimmed.
+                        # A zero-width span keeps the pattern source (the
+                        # pre-fix behavior) instead of trimming everything.
                         self.finished_reason = FINISHED_MATCHED_REGEX(
-                            matched=stop_regex_str
+                            matched=matched_span or stop_regex_str
                         )
                         self.finished_len = finished_len
                         return True
