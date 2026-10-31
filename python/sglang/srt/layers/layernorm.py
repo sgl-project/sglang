@@ -1239,7 +1239,9 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if _use_aiter and _has_rocm_triton_gemma_rms_norm:
+        # The Triton Gemma kernels need neither aiter nor vLLM. Without both, the
+        # alternative is forward_native (~11 small kernels per call).
+        if _has_rocm_triton_gemma_rms_norm and (_use_aiter or not _has_vllm_rms_norm):
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
