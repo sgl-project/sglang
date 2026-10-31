@@ -43,6 +43,21 @@ _HC_SINKHORN_NUM_WARPS = 4
 
 
 @triton.jit
+def _sinkhorn_div(n, d):
+    """`n / d` with the bits of '/' for normal operands and quotients, minus its scale and fixup.
+
+    '/' runs v_div_scale, v_rcp, two Newton steps, v_div_fmas and v_div_fixup; the scale and
+    fixup only act on zeros, infinities, NaNs, denormals and exponent gaps near 2**96."""
+    y = tl.inline_asm_elementwise(
+        "v_rcp_f32 $0, $1", "=v,v", [d], dtype=tl.float32, is_pure=True, pack=1
+    )
+    y = tl.fma(tl.fma(-d, y, 1.0), y, y)
+    q = n * y
+    q = tl.fma(tl.fma(-d, q, n), y, q)
+    return tl.fma(tl.fma(-d, q, n), y, q)
+
+
+@triton.jit
 def _hc_mix_reduce_sinkhorn_row(
     row,
     part_mix_ptr,
@@ -69,38 +84,36 @@ def _hc_mix_reduce_sinkhorn_row(
     jj = j[:, None]
     kk = j[None, :]
 
+    # issue every load before the first reduction: each reduction's barrier would serialize them
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+    base_pre = tl.load(base_ptr + j)
+    base_post = tl.load(base_ptr + HC + j)
+    base_comb = tl.load(base_ptr + 2 * HC + jj * HC + kk)
     s_idx = tl.arange(0, SLICES_PAD)
     s_ok = s_idx < NUM_SLICES
     off = (s_idx * m + row) * MIX
-    a_pre = tl.sum(
-        tl.load(
-            part_mix_ptr + off[:, None] + j[None, :],
-            mask=s_ok[:, None],
-            other=0.0,
-        ),
-        axis=0,
+    part_pre = tl.load(
+        part_mix_ptr + off[:, None] + j[None, :], mask=s_ok[:, None], other=0.0
     )
-    a_post = tl.sum(
-        tl.load(
-            part_mix_ptr + off[:, None] + HC + j[None, :],
-            mask=s_ok[:, None],
-            other=0.0,
-        ),
-        axis=0,
+    part_post = tl.load(
+        part_mix_ptr + off[:, None] + HC + j[None, :], mask=s_ok[:, None], other=0.0
     )
-    a_comb = tl.sum(
-        tl.load(
-            part_mix_ptr
-            + off[:, None, None]
-            + 2 * HC
-            + jj[None, :, :] * HC
-            + kk[None, :, :],
-            mask=s_ok[:, None, None],
-            other=0.0,
-        ),
-        axis=0,
+    part_comb = tl.load(
+        part_mix_ptr
+        + off[:, None, None]
+        + 2 * HC
+        + jj[None, :, :] * HC
+        + kk[None, :, :],
+        mask=s_ok[:, None, None],
+        other=0.0,
     )
-    sq = tl.sum(tl.load(part_sq_ptr + s_idx * m + row, mask=s_ok, other=0.0), axis=0)
+    part_sq = tl.load(part_sq_ptr + s_idx * m + row, mask=s_ok, other=0.0)
+    a_pre = tl.sum(part_pre, axis=0)
+    a_post = tl.sum(part_post, axis=0)
+    a_comb = tl.sum(part_comb, axis=0)
+    sq = tl.sum(part_sq, axis=0)
     sp = scratch_ptr + row * 32
     tl.store(sp + j, a_pre)
     tl.store(sp + HC + j, a_post)
@@ -111,22 +124,20 @@ def _hc_mix_reduce_sinkhorn_row(
     a_comb = tl.load(sp + 2 * HC + jj * HC + kk)
     rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
 
-    s0 = tl.load(scale_ptr + 0)
-    s1 = tl.load(scale_ptr + 1)
-    s2 = tl.load(scale_ptr + 2)
-
-    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + base_pre) + EPS
     tl.store(pre_ptr + row * HC + j, pre)
-    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + base_post)
     tl.store(post_ptr + row * HC + j, post)
 
-    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
+    comb = a_comb * rsqrt * s2 + base_comb
     comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    # exp may underflow, so the first quotient keeps '/'
     comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
-    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    # later entries stay in [~1e-12, 1] and divisors in [EPS, ~HC], where _sinkhorn_div matches '/'
+    comb = _sinkhorn_div(comb, tl.sum(comb, axis=0)[None, :] + EPS)
     for _ in tl.static_range(ITERS - 1):
-        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
-        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+        comb = _sinkhorn_div(comb, tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = _sinkhorn_div(comb, tl.sum(comb, axis=0)[None, :] + EPS)
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
