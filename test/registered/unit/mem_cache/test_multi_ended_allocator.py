@@ -3395,32 +3395,21 @@ class TestDcpWidening(unittest.TestCase):
         cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
         return cache, walk
 
-    def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
-        """Admission charges the state-slot cost against a budget
-        fed by `available_size()`. Both are bytes/entry_bytes conversions, so
-        both carry `dcp_size`; if only the budget widens, every Mamba state is
-        under-reserved by that factor and a batch is admitted whose later
-        allocations cross the shared byte frontier."""
+    def test_mamba_admission_counts_slots_under_dcp(self):
+        """Admission charges state in slots, not in DCP-widened token
+        equivalents: whatever number of slots it admits, the slot take
+        succeeds, at every DCP width."""
         for page_size in (1, 8):
-            with self._dcp(1):
-                base = self._build_composite(page_size=page_size)
-                base_cost = base.admission_rules().state_slot_cost
-                base_avail = base.available_size()
-                self.assertGreater(base_cost, 0)
-            for dcp_size in (2, 4):
-                with self._dcp(dcp_size):
-                    a = self._build_composite(page_size=page_size)
-                    self.assertEqual(a.available_size(), base_avail * dcp_size)
-                    mamba_bytes = a.mamba_allocator.entry_bytes_per_page
-                    full_entry = a.full_attn_allocator.entry_bytes
-                    cost = a.admission_rules().state_slot_cost
-                    # A widened token is `full_entry / dcp_size` bytes, so the
-                    # reservation covers the slot...
-                    self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
-                    # ...and stays tight (rounds up by less than one token).
-                    self.assertLess((cost - 1) * full_entry, mamba_bytes * dcp_size)
-                    # The un-scaled cost -- the bug -- would not have covered it.
-                    self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
+            for dcp_size in (1, 2, 4):
+                with self.subTest(page_size=page_size, dcp_size=dcp_size):
+                    with self._dcp(dcp_size):
+                        a = self._build_composite(page_size=page_size)
+                        admitted = 0
+                        while a.admits(0, {}, admitted + 1):
+                            admitted += 1
+                        self.assertGreater(admitted, 0)
+                        self.assertIsNotNone(a.alloc_state_slots(admitted))
+                        self.assertFalse(a.admits(0, {}, 1))
 
     def test_mamba_donor_recheck_bound_is_aggregate_and_dcp_widened(self):
         missing_slots = 7
@@ -3438,10 +3427,6 @@ class TestDcpWidening(unittest.TestCase):
                 minimum_missing_bytes = (missing_slots - 1) * mamba_bytes + 1
                 expected = -(-minimum_missing_bytes * dcp_size // full_bytes)
                 self.assertEqual(bound, expected)
-                self.assertLessEqual(
-                    bound,
-                    missing_slots * allocator.admission_rules().state_slot_cost,
-                )
 
     def test_allocation_flush_public_wrapper_is_urgent(self):
         with self._dcp(1):
