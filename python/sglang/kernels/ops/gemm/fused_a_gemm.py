@@ -39,12 +39,14 @@ _IS_CUDA = is_cuda()
 _DEVICE_SM = get_device_sm()
 # The kernel's limit: two 8-token MMA tiles.
 _FP8_MAX_TOKENS = 16
-# (N, K) of the block-FP8 self_attn projections served by the W8A16 kernel (GLM-5.2 TP4 shards, incl. indexer wq_b).
+# (N, K) of the block-FP8 self_attn projections served by the W8A16 kernel (GLM-5.2 TP4 and TP8 shards, incl. indexer wq_b).
 _FP8_SMALL_M_SHAPES = frozenset(
     {
         (2624, 6144),  # fused qkv_a
-        (4096, 2048),  # q_b and indexer wq_b
-        (6144, 4096),  # o_proj
+        (4096, 2048),  # q_b (TP4) and indexer wq_b
+        (6144, 4096),  # o_proj (TP4)
+        (2048, 2048),  # q_b (TP8)
+        (6144, 2048),  # o_proj (TP8)
     }
 )
 
