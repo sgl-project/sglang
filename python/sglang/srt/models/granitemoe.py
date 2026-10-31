@@ -17,6 +17,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -153,6 +154,7 @@ class GraniteMoeMoE(nn.Module):
             # does not register.
             serves_fused_mxfp4=False,
             prefix=f"{prefix}.experts",
+            routing_method_type=RoutingMethodType.RenormalizeNaive,
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
