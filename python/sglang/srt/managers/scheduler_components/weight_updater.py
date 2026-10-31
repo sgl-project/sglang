@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import traceback
 from contextlib import contextmanager
@@ -140,7 +141,7 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in self._select_disk_update_runners(recv_req):
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -183,6 +184,74 @@ class SchedulerWeightUpdaterManager:
         if "draft" in roles and self.draft_worker is not None:
             runners += self.draft_worker.weight_update_runners()
         return runners
+
+    @staticmethod
+    def _runner_owns_checkpoint(runner: Any, model_path: Optional[str]) -> Optional[bool]:
+        """Whether a runner's model was loaded from ``model_path``.
+
+        None means the answer is unknown (the runner has no usable checkpoint
+        path), so the caller must not act on it.
+        """
+        if not isinstance(model_path, str) or not model_path:
+            return None
+        runner_path = getattr(
+            getattr(runner, "model_config", None), "model_path", None
+        )
+        if not isinstance(runner_path, str) or not runner_path:
+            return None
+        return os.path.realpath(runner_path) == os.path.realpath(model_path)
+
+    def _select_disk_update_runners(
+        self, recv_req: UpdateWeightFromDiskReqInput
+    ) -> List[Tuple[str, Any]]:
+        """Pick the runners a from-disk checkpoint belongs to.
+
+        A from-disk update names one checkpoint, but a speculative deployment
+        holds two different models. Handing the target's path to the draft
+        runner loads the target's weights into the draft, which silently
+        breaks speculation, so route the checkpoint to the model that owns it
+        and let the other model keep the weights it has. An explicit selector
+        always wins: it is the caller stating which model it means.
+        """
+        selector = getattr(recv_req, "selector", "all")
+        if _parse_runner_selector(selector) != {"target", "draft"}:
+            return self._select_runners(selector)
+
+        runners = self._select_runners("all")
+        if len(runners) < 2:
+            return runners
+
+        model_path = getattr(recv_req, "model_path", None)
+        owners = {
+            role: self._runner_owns_checkpoint(runner, model_path)
+            for role, runner in runners
+        }
+        if all(owner is None for owner in owners.values()):
+            # No runner's checkpoint path is known, so the checkpoint cannot be
+            # attributed to a model. Keep updating every runner.
+            return runners
+
+        selected = [(role, runner) for role, runner in runners if owners[role]]
+        if not selected:
+            # The checkpoint belongs to none of the runners: it is a new
+            # checkpoint for the target, and the draft must keep its weights.
+            selected = [(role, runner) for role, runner in runners if role == "target"]
+        selected_roles = {role for role, _ in selected}
+        for role, _ in runners:
+            if role in selected_roles:
+                continue
+            owner = next((r for r in selected_roles), "target")
+            logger.warning(
+                "update_weights_from_disk(model_path=%r) is the %s's checkpoint, "
+                "so the %s runner is skipped and keeps its own weights. Pass "
+                "selector=%r to update the %s anyway.",
+                model_path,
+                owner,
+                role,
+                role,
+                role,
+            )
+        return selected
 
     def update_weights_from_distributed(
         self,
