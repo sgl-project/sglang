@@ -58,6 +58,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    PrefetchReqInput,
+    PrefetchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -128,6 +130,7 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("prefetch", PrefetchReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -320,6 +323,46 @@ class TokenizerControlMixin:
             success=all_success,
             corpus_token_counts=corpus_token_counts,
             message=all_message,
+        )
+
+    async def prefetch(
+        self: TokenizerManager,
+        token_ids: List[int],
+        cache_salt: Optional[str] = None,
+    ) -> PrefetchReqOutput:
+        """Warm the available page-aligned prefix in L1, without inference.
+
+        Requires an idle Mooncake external-linker engine. Missing KV is not
+        computed; returned counts are minima across the engine's DP replicas.
+        """
+        if not isinstance(token_ids, list) or not token_ids:
+            raise ValueError("token_ids must be a nonempty list")
+        if len(token_ids) > self.model_config.context_len:
+            raise ValueError("token_ids exceeds the model context length")
+        if any(
+            type(token) is not int or not 0 <= token < self.model_config.vocab_size
+            for token in token_ids
+        ):
+            raise ValueError(
+                "token_ids must contain integer IDs in the model vocabulary"
+            )
+        if cache_salt is not None and not isinstance(cache_salt, str):
+            raise ValueError("cache_salt must be a string")
+        self.auto_create_handle_loop()
+        # Let the serialized communicator consume its reply even if the caller disconnects.
+        results = await asyncio.shield(
+            self.prefetch_communicator(
+                PrefetchReqInput(
+                    token_ids=token_ids, cache_salt=cache_salt, rid=uuid.uuid4().hex
+                )
+            )
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        return PrefetchReqOutput(
+            success=success,
+            message=message,
+            prefetched_tokens=min(result.prefetched_tokens for result in results),
+            cached_tokens=min(result.cached_tokens for result in results),
         )
 
     async def flush_cache(

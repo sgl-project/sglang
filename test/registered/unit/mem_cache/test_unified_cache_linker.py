@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_disagg
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -214,7 +215,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     """Controllable transport for shared Python/Rust TreeCore tests."""
 
     def __init__(self, stored_keys=None):
-        self.layer_done_counter = object()
+        self.layer_done_counter = LayerWiseLoadCounter(1)
         self.pools = dict.fromkeys(PoolName)
         self.stored_keys = defaultdict(set) if stored_keys is None else stored_keys
         self.lookup_calls = []
@@ -284,7 +285,9 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             return -1
         rids = list(self.queued_loads)
         self.started_loads.append(rids)
-        return len(self.started_loads) - 1
+        index = self.layer_done_counter.update_producer()
+        self.layer_done_counter.complete(index, 0)
+        return index
 
     def cancel_queued_load(self, rid):
         return self.queued_loads.pop(rid, None) is not None
@@ -292,6 +295,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         for rid in self.started_loads[counter_index]:
             self.queued_loads.pop(rid, None)
+        self.layer_done_counter.finish(counter_index)
         return self.load_landed
 
     def offload(self, transfers, session_id=None):
@@ -341,6 +345,75 @@ class _TreeCoreBackendTestMixin:
 class TestUnifiedCacheLinkerPythonBackend(
     _TreeCoreBackendTestMixin, UnifiedRadixCacheFixtures, CustomTestCase
 ):
+    def _prefetch(self, cache, tokens, cache_salt=None):
+        req = Req(
+            rid="prefetch",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(max_new_tokens=0),
+            cache_salt=cache_salt,
+        )
+        req.finished_reason = FINISH_LENGTH(0)
+        req.refresh_fill_ids()
+        return cache.linker.prefetch(req)
+
+    def test_explicit_prefetch_publishes_only_the_stored_prefix(self):
+        self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        stored = defaultdict(set)
+        tokens = list(range(1, 10))
+        producer, alloc, pool = build_fixture(self.cfg)
+        writer = _InMemoryUnifiedCacheLinker(stored)
+        producer.init_cache_linker(writer)
+        self._insert(producer, alloc, pool, tokens[:8])
+        writer.complete_next_offload(True)
+        producer.check_hicache_events()
+        consumer, alloc, pool = build_fixture(self.cfg)
+        reader = _InMemoryUnifiedCacheLinker(stored)
+        consumer.init_cache_linker(reader)
+        self._insert(consumer, alloc, pool, tokens[:2])
+        reader.complete_next_offload(True)
+        consumer.check_hicache_events()
+        free_rows = len(pool.free_slots)
+        offloads = len(reader.offload_calls)
+        self.assertEqual(self._prefetch(consumer, tokens), (6, 8))
+        self.assertEqual(len(reader.offload_calls), offloads)
+        self.assertFalse(consumer.linker.pending_offloads)
+        matched = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(matched.device_prefix_len, 8)
+        self.assertEqual(len(pool.free_slots), free_rows)
+        self.assertEqual(self._prefetch(consumer, tokens), (0, 8))
+        self.assertEqual(self._prefetch(consumer, tokens, cache_salt="other"), (0, 0))
+        self.assertEqual(len(reader.started_loads), 1)
+        consumer.sanity_check()
+
+    def test_explicit_prefetch_failed_load_releases_slots_without_publication(self):
+        self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        stored = defaultdict(set)
+        tokens = list(range(1, 9))
+        producer, alloc, pool = build_fixture(self.cfg)
+        writer = _InMemoryUnifiedCacheLinker(stored)
+        producer.init_cache_linker(writer)
+        self._insert(producer, alloc, pool, tokens)
+        writer.complete_next_offload(True)
+        producer.check_hicache_events()
+        consumer, alloc, pool = build_fixture(self.cfg)
+        reader = _InMemoryUnifiedCacheLinker(stored)
+        reader.load_landed = False
+        consumer.init_cache_linker(reader)
+        before = (alloc.available_size(), len(pool.free_slots))
+        with self.assertRaisesRegex(RuntimeError, "load failed"):
+            self._prefetch(consumer, tokens)
+        self.assertEqual((alloc.available_size(), len(pool.free_slots)), before)
+        matched = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(matched.device_prefix_len, 0)
+        self.assertFalse(reader.queued_loads)
+        self.assertFalse(reader.offload_calls)
+        consumer.sanity_check()
+
     def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
         """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
         req.kv.cache_protected_len = req.prefix_len
@@ -771,6 +844,36 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer.init_cache_linker(consumer_linker)
 
         return consumer, consumer_req_pool, consumer_linker
+
+    def test_explicit_prefetch_restores_hybrid_state_and_cleans_up_failures(self):
+        tokens = list(range(1, 7))
+        for failure in ("prepare", "load", None):
+            with self.subTest(failure=failure):
+                cache, pool, linker = self._mamba_linker_consumer(tokens)
+                before = len(pool.free_slots), pool.mamba_allocator.available_size()
+                if failure == "prepare":
+                    with patch.object(pool, "write", side_effect=RuntimeError("OOM")):
+                        with self.assertRaisesRegex(RuntimeError, "prepare prefetch"):
+                            self._prefetch(cache, tokens)
+                elif failure == "load":
+                    linker.load_landed = False
+                    with self.assertRaisesRegex(RuntimeError, "load failed"):
+                        self._prefetch(cache, tokens)
+                else:
+                    self.assertEqual(self._prefetch(cache, tokens), (6, 6))
+                    self.assertEqual(self._prefetch(cache, tokens), (0, 6))
+                self.assertEqual(len(pool.free_slots), before[0])
+                self.assertEqual(
+                    pool.mamba_allocator.available_size(),
+                    before[1] - (failure is None),
+                )
+                matched = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(matched.device_prefix_len, 0 if failure else 6)
+                self.assertFalse(linker.queued_loads)
+                self.assertFalse(linker.offload_calls)
+                cache.sanity_check()
 
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):
         tokens = list(range(1, 7))

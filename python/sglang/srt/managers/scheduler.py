@@ -168,6 +168,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PrefetchReqInput,
+    PrefetchReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -215,6 +217,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     MultimodalInputs,
     MultimodalProcessorOutput,
     NextBatchPlan,
@@ -1853,6 +1856,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (PrefetchReqInput, self.prefetch),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -5672,6 +5676,50 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def prefetch(self, recv_req: PrefetchReqInput) -> PrefetchReqOutput:
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        cache = self.tree_cache
+        if not self.enable_unified_cache_external_linker or not isinstance(
+            cache.linker.cache_linker, MooncakeDirectLinker
+        ):
+            return PrefetchReqOutput(
+                success=False, message="Prefetch requires the Mooncake external linker"
+            )
+        if (
+            get_parallel().pp_size != 1
+            or cache.tree_core.is_eagle
+            or cache.enable_mamba_extra_buffer
+        ):
+            return PrefetchReqOutput(
+                success=False,
+                message="Prefetch does not support PP, Eagle or Mamba extra buffers",
+            )
+        # ponytail: synchronous at idle; add scheduler states for concurrent prefetch.
+        idle = torch.tensor([int(self.is_fully_idle())], dtype=torch.int)
+        cache._all_reduce_attn_groups(idle, torch.distributed.ReduceOp.MIN)
+        if not idle.item():
+            return PrefetchReqOutput(success=False, message="Worker is busy")
+        req = Req(
+            rid=recv_req.rid,
+            origin_input_text="",
+            origin_input_ids=array("q", recv_req.token_ids),
+            sampling_params=SamplingParams(max_new_tokens=0),
+            cache_salt=recv_req.cache_salt,
+        )
+        req.finished_reason = FINISH_LENGTH(0)
+        req.refresh_fill_ids()
+        try:
+            prefetched, cached = cache.linker.prefetch(req)
+        except (RuntimeError, ValueError) as error:
+            return PrefetchReqOutput(success=False, message=str(error))
+        return PrefetchReqOutput(
+            success=True, prefetched_tokens=prefetched, cached_tokens=cached
+        )
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

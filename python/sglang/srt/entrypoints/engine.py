@@ -1518,6 +1518,24 @@ class Engine(EngineScoreMixin, EngineBase):
         self.shutdown()
         return False
 
+    async def async_prefetch(
+        self, token_ids: List[int], cache_salt: Optional[str] = None
+    ):
+        """Restore the available page-aligned Mooncake prefix into L1.
+
+        Requires an idle external-linker engine; incoming requests wait for the
+        synchronous load. PP, Eagle and Mamba extra buffers are unsupported.
+        Missing KV is not computed. Counts are minima across DP replicas;
+        restored pages remain evictable. Use the generation cache_salt.
+
+        Example: ``result = await engine.async_prefetch(full_token_ids)``.
+        Check ``result.success`` before using ``result.cached_tokens``.
+        """
+        return await self.tokenizer_manager.prefetch(token_ids, cache_salt)
+
+    def prefetch(self, token_ids: List[int], cache_salt: Optional[str] = None):
+        return self.loop.run_until_complete(self.async_prefetch(token_ids, cache_salt))
+
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
