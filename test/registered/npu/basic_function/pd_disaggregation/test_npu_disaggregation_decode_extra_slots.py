@@ -1,5 +1,12 @@
-"""Test --disaggregation-decode-extra-slots effect on c128_state_fixed in PD disaggregation.
-Fully reuses the original test script structure (DisaggregationHiCacheBase pattern).
+"""Test --disaggregation-decode-extra-slots on the NPU PD disaggregation pipeline.
+
+Launches a DSV4 prefill + decode pipeline twice:
+
+1. Flag unset: the decode server auto-infers the default extra slots
+   (2x the per-worker batch, see pd_disaggregation_hook).
+2. Flag set to 64: verifies the resolved value on the running decode server,
+   that c128_state_fixed grows by the formula-derived amount, and that real
+   requests still flow through the prefill -> decode pipeline.
 """
 
 import os
@@ -10,6 +17,10 @@ import tempfile
 import time
 import unittest
 
+import requests
+
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V4_FLASH_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -21,17 +32,65 @@ register_npu_ci(est_time=600, suite="full-16-npu-a3", nightly=True)
 # Regex pattern to extract c128_state_fixed value from DSV4 memory pool logs
 C128_PATTERN = re.compile(r"c128_state_fixed\s*[=:]\s*([\d.]+)\s*GB")
 
+# Same process patterns as sglang.cli.killall, so the cleanup also catches
+# servers started via `sglang serve` (this test's launch method).
+_SGLANG_PROCESS_PATTERN = (
+    "sglang::|sglang.launch_server|sglang.bench|sglang.data_parallel"
+    "|sglang.srt|sglang serve"
+)
+
+# Decode server launch constants, also feeding the c128 formula below.
+TP_SIZE = 8
+DP_SIZE = 8
+MAX_RUNNING_REQUESTS = 32
+SPEC_NUM_DRAFT_TOKENS = 3
+EXPLICIT_EXTRA_SLOTS = 64
+
 
 def _cleanup_residual_sglang():
     """Kill any leftover sglang processes before starting a new test round."""
-    print("[CLEANUP] Killing residual sglang.launch_server processes...")
-    os.system("pkill -9 -f 'sglang.launch_server' 2>/dev/null || true")
+    print("[CLEANUP] Killing residual sglang processes...")
+    os.system(f"pkill -9 -f '{_SGLANG_PROCESS_PATTERN}' 2>/dev/null || true")
     time.sleep(5)
+
+
+def _per_worker_max_running_requests() -> int:
+    """Per-worker request cap, as resolved by the pool configurator."""
+    return max(1, MAX_RUNNING_REQUESTS // DP_SIZE)
+
+
+def _auto_inferred_extra_slots() -> int:
+    """Extra slots the decode server infers when the flag is not set.
+
+    Mirrors pd_disaggregation_hook: with --max-running-requests set and a
+    per-worker batch of at most 32, the server reserves 2x the per-worker
+    batch as in-transfer headroom.
+    """
+    per_worker = _per_worker_max_running_requests()
+    return per_worker * 2 if per_worker <= 32 else 0
+
+
+def _expected_c128_state_rows(extra_slots: int) -> int:
+    """c128 state rows the pool configurator reserves for extra_slots.
+
+    Mirrors pool_configurator._get_c128_state_fixed_bytes (offline path):
+
+      num_req_slots = per_worker_max_running_requests + extra_slots + 1
+      state_rows = ceil_div(num_req_slots * ring_size + ring_size + 1, 128) * 128
+      c128_bytes  = state_rows * (2 * attn_head_dim) * dtype_size * num_layers
+
+    The per-row byte cost is model-specific but identical across rounds, so
+    the measured c128 growth ratio must match this row growth ratio.
+    """
+    ring_size = get_compress_state_ring_size(128, SPEC_NUM_DRAFT_TOKENS)
+    num_req_slots = _per_worker_max_running_requests() + extra_slots + 1
+    rows = num_req_slots * ring_size + ring_size + 1
+    return -(-rows // 128) * 128
 
 
 class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
     """Base class for disaggregation extra slots validation tests.
-    Reuses the standard PD disaggregation server lifecycle and providesv
+    Reuses the standard PD disaggregation server lifecycle and provides
     log capture and c128_state_fixed extraction utilities.
     """
 
@@ -41,7 +100,7 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
         cls.model = os.environ.get("MODEL_PATH", DEEPSEEK_V4_FLASH_WEIGHTS_PATH)
         cls.temp_dir = tempfile.mkdtemp()
         cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
-        cls.tp_size = int(os.environ.get("TP", "8"))
+        cls.tp_size = int(os.environ.get("TP", str(TP_SIZE)))
 
     @classmethod
     def tearDownClass(cls):
@@ -135,7 +194,6 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
             "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
             "SGLANG_NPU_PROFILING": "0",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
-            "ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
             "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
         }
 
@@ -198,7 +256,7 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
             "--chunked-prefill-size",
             "-1",
             "--max-running-requests",
-            "32",
+            str(MAX_RUNNING_REQUESTS),
             "--moe-a2a-backend",
             "deepep",
             "--deepep-mode",
@@ -213,11 +271,16 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
             "ascend",
             "--mem-fraction-static",
             "0.85",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             "1",
             "2",
             "3",
             "4",
+            # Prefill owns the first half of the visible devices; decode takes
+            # the second half. The CI runner controls the visible device set,
+            # so no device ids are hardcoded here.
+            "--base-gpu-id",
+            str(cls.tp_size),
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -225,13 +288,11 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
             "--speculative-eagle-topk",
             "1",
             "--speculative-num-draft-tokens",
-            "3",
+            str(SPEC_NUM_DRAFT_TOKENS),
         ]
 
         if extra_slots is not None:
-            decode_args.extend(
-                ["--disaggregation-decode-extra-slots", str(extra_slots)]
-            )
+            decode_args.extend(["--disaggregation-decode-extra-slots", str(extra_slots)])
             print(f"[DECODE] Using --disaggregation-decode-extra-slots={extra_slots}")
 
         decode_args += cls.transfer_backend
@@ -272,7 +333,6 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
             "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
             "SGLANG_NPU_PROFILING": "0",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
-            "ASCEND_RT_VISIBLE_DEVICES": "8,9,10,11,12,13,14,15",
             "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
             "SGLANG_ENABLE_SPEC_V2": "1",
         }
@@ -351,6 +411,12 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
     def _cleanup_round(self):
         """Terminate server processes and release resources between test rounds."""
         print("[CLEANUP] Terminating decode and prefill...")
+        if getattr(self, "process_lb", None):
+            try:
+                kill_process_tree(self.process_lb.pid, wait_timeout=60)
+            except Exception as e:
+                print(f"[CLEANUP] Error killing lb: {e}")
+            self.process_lb = None
         self._kill_gracefully(getattr(self, "process_decode", None))
         self._kill_gracefully(getattr(self, "process_prefill", None))
 
@@ -385,46 +451,129 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
         val = self._extract_c128(self._decode_stdout_name)
         return val
 
+    def _verify_extra_slots_in_use(self, expected_slots):
+        """The running decode server must expose the resolved extra slots."""
+        info = requests.get(self.decode_url + "/server_info", timeout=30).json()
+        self.assertEqual(
+            info.get("disaggregation_decode_extra_slots"),
+            expected_slots,
+            f"decode server resolved disaggregation_decode_extra_slots="
+            f"{info.get('disaggregation_decode_extra_slots')}, "
+            f"expected {expected_slots}",
+        )
+
+    def _verify_serving_through_pd_pipeline(self):
+        """Serve real requests through the pipeline with the extra slots active.
+
+        Each request transits the in-transfer state on the decode side, so a
+        successful completion proves the parameterized request-slot pool
+        actually serves traffic, not just that memory accounting changed.
+        """
+        self.launch_lb()
+        try:
+            for i in range(4):
+                response = requests.post(
+                    f"{self.lb_url}/generate",
+                    json={
+                        "text": "The capital of France is",
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 32,
+                        },
+                    },
+                    timeout=120,
+                )
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"Request {i} failed: {response.status_code} - {response.text}",
+                )
+                data = response.json()
+                self.assertTrue(
+                    isinstance(data["text"], str) and data["text"].strip(),
+                    f"Request {i} returned an empty completion.",
+                )
+                self.assertIn(
+                    data["meta_info"]["finish_reason"]["type"],
+                    ("stop", "length"),
+                    f"Request {i} finished abnormally.",
+                )
+        finally:
+            if self.process_lb:
+                try:
+                    kill_process_tree(self.process_lb.pid, wait_timeout=60)
+                except Exception as e:
+                    print(f"[CLEANUP] Error killing lb: {e}")
+                self.process_lb = None
+
 
 class TestDisaggregationDecodeExtraSlots(DisaggregationExtraSlotsBase):
-    """Testcase: --disaggregation-decode-extra-slots increases c128_state_fixed.
+    """Testcase: --disaggregation-decode-extra-slots sizes the decode c128 state pool.
 
-    [Test Category] Functional
-    [Test Target] PD disaggregation decode extra slots on NPU
-    --disaggregation-decode-extra-slots;
+    [Test Category] Parameter
+    [Test Target] --disaggregation-decode-extra-slots
     """
 
-    def test_c128_increases_with_extra_slots(self):
-        """Verify c128_state_fixed grows when extra slots are configured."""
+    def test_c128_matches_formula_with_extra_slots(self):
+        """Verify c128_state_fixed follows the sizing formula for extra slots."""
 
-        # Round 1: baseline without extra slots
-        c128_without = self._run_round(extra_slots=None)
+        # Round 1: flag not set. The decode server auto-infers the default
+        # extra slots (2x the per-worker batch) instead of using zero.
+        c128_default = self._run_round(extra_slots=None)
         self.assertIsNotNone(
-            c128_without,
-            "Failed to capture c128_state_fixed without "
+            c128_default,
+            "Failed to capture c128_state_fixed with auto-inferred "
             "--disaggregation-decode-extra-slots",
         )
-        print(f"[RESULT] Without extra_slots: c128_state_fixed = {c128_without} GB")
-
-        self._cleanup_round()
-
-        # Round 2: with extra_slots=64
-        c128_with = self._run_round(extra_slots=64)
-        self.assertIsNotNone(
-            c128_with,
-            "Failed to capture c128_state_fixed with "
-            "--disaggregation-decode-extra-slots=64",
-        )
-        print(f"[RESULT] With extra_slots=64: c128_state_fixed = {c128_with} GB")
-
-        self._cleanup_round()
-
-        # Validate that extra slots increase the c128 allocation
         self.assertGreater(
-            c128_with,
-            c128_without,
-            f"c128_state_fixed with extra_slots(64)={c128_with} GB should be "
-            f"greater than without extra_slots={c128_without} GB",
+            c128_default,
+            0,
+            "c128_state_fixed should be positive for the DSV4 decode pool",
+        )
+        print(
+            f"[RESULT] Auto-inferred extra_slots="
+            f"{_auto_inferred_extra_slots()}: c128_state_fixed = {c128_default} GB"
+        )
+
+        self._cleanup_round()
+
+        # Round 2: explicit extra_slots=64
+        c128_explicit = self._run_round(extra_slots=EXPLICIT_EXTRA_SLOTS)
+        self.assertIsNotNone(
+            c128_explicit,
+            "Failed to capture c128_state_fixed with "
+            f"--disaggregation-decode-extra-slots={EXPLICIT_EXTRA_SLOTS}",
+        )
+        print(
+            f"[RESULT] With extra_slots={EXPLICIT_EXTRA_SLOTS}: "
+            f"c128_state_fixed = {c128_explicit} GB"
+        )
+
+        # The parameter is actually in force and usable on the running server.
+        self._verify_extra_slots_in_use(EXPLICIT_EXTRA_SLOTS)
+        self._verify_serving_through_pd_pipeline()
+
+        self._cleanup_round()
+
+        # Formula-derived expectation (see _expected_c128_state_rows): the
+        # per-row byte cost is model-specific but identical across rounds, so
+        # the growth must match the row-growth ratio exactly, up to the
+        # 0.01 GB log rounding.
+        rows_default = _expected_c128_state_rows(_auto_inferred_extra_slots())
+        rows_explicit = _expected_c128_state_rows(EXPLICIT_EXTRA_SLOTS)
+        expected_c128_explicit = c128_default * rows_explicit / rows_default
+        tolerance_gb = max(0.1, 0.05 * expected_c128_explicit)
+        self.assertAlmostEqual(
+            c128_explicit,
+            expected_c128_explicit,
+            delta=tolerance_gb,
+            msg=(
+                f"c128_state_fixed with extra_slots={EXPLICIT_EXTRA_SLOTS} "
+                f"({c128_explicit} GB) should be ~{expected_c128_explicit:.2f} GB, "
+                f"derived from {c128_default} GB x {rows_explicit}/{rows_default} "
+                f"rows (per-worker max_running_requests="
+                f"{_per_worker_max_running_requests()})"
+            ),
         )
         print("[PASS] Test completed successfully!")
 

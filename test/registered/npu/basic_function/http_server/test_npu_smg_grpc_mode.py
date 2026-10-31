@@ -1,10 +1,9 @@
 """Test --smg-grpc-mode parameter on NPU.
-Verifies that the legacy SMG gRPC server starts correctly.
+Verifies that the SMG gRPC server starts correctly and serves requests.
 Logs are printed to screen in real-time (tee) while also captured for assertions.
 """
 
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -15,17 +14,17 @@ import unittest
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
-# Expected log markers for a successful SMG gRPC startup
+# The SMG gRPC servicer listens on server_args.port. The server is launched
+# without --port, so it uses the sglang default port.
+GRPC_PORT = 30000
+
+# Essential readiness markers for a successful SMG gRPC startup
 _GRPC_READY_MARKERS = [
-    "Standard gRPC health service initialized",
-    "gRPC scheduler servicer initialized",
     "gRPC server listening on",
-    "Sending warmup request to gRPC server...",
-    "gRPC warmup request completed successfully",
-    "Health service status set to SERVING",
     "The server is fired up and ready to roll!",
 ]
 
@@ -39,18 +38,17 @@ def _tee_output(pipe, log_file):
         log_file.flush()
 
 
-class TestNpuSmgGrpcMode(unittest.TestCase):
-    """Testcase: --smg-grpc-mode starts the legacy SMG gRPC server on NPU.
+class TestNpuSmgGrpcMode(CustomTestCase):
+    """Testcase: --smg-grpc-mode starts the SMG gRPC server on NPU.
 
-    [Test Category] Functional
-    [Test Target] Legacy SMG gRPC server mode on NPU
-    --smg-grpc-mode;
+    [Test Category] Parameter
+    [Test Target] --smg-grpc-mode
     """
 
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_0_6B_WEIGHTS_PATH
-        cls.grpc_port = 30001  # From log: gRPC server listening on 127.0.0.1:30001
+        cls.grpc_port = GRPC_PORT
 
         command = [
             "sglang",
@@ -152,7 +150,7 @@ class TestNpuSmgGrpcMode(unittest.TestCase):
             "Server process crashed after startup",
         )
 
-        # All readiness markers present
+        # Essential readiness markers present
         for marker in _GRPC_READY_MARKERS:
             self.assertIn(
                 marker,
@@ -160,19 +158,27 @@ class TestNpuSmgGrpcMode(unittest.TestCase):
                 f"Missing expected log marker: {marker}",
             )
 
-    def test_smg_grpc_port_listening(self):
-        """Verify the SMG gRPC port is actually open."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        try:
-            result = sock.connect_ex(("127.0.0.1", self.grpc_port))
-            self.assertEqual(
-                result,
-                0,
-                f"SMG gRPC port {self.grpc_port} is not listening",
+    def test_smg_grpc_health_check(self):
+        """Verify the SMG gRPC server actually serves requests.
+
+        The SglangScheduler HealthCheck RPC runs a one-token generation
+        through the full pipeline (tokenizer -> scheduler -> model), so a
+        healthy response proves the gRPC server works end to end, not just
+        that it printed startup logs.
+        """
+        import grpc
+        from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+
+        with grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}") as channel:
+            stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
+            response = stub.HealthCheck(
+                sglang_scheduler_pb2.HealthCheckRequest(),
+                timeout=60,
             )
-        finally:
-            sock.close()
+        self.assertTrue(
+            response.healthy,
+            f"SMG gRPC HealthCheck failed: {response.message}",
+        )
 
 
 if __name__ == "__main__":
