@@ -23,6 +23,8 @@ class DSV4PagedBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
         "v4",
         "v41",
         "v41_fp4",
+        "v41_new",
+        "v41_fp4_new",
         "uniform_fp8",
         "unified",
         "index_fused",

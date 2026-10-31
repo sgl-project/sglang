@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
+    DeepSeekV4UniformFP8KVPool,
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
 )
@@ -105,6 +106,22 @@ class TestDSV4CompressedPools(CustomTestCase):
                 self.assertEqual(info.layout, layout.value)
                 for actual, native in zip(info.buffers, pool.kv_buffer):
                     self.assertIs(actual, native)
+
+    def test_uniform_fp8_rows_are_labeled_page_aligned(self):
+        """The trtllm pool keeps kv_layout V4 but stores 512-byte uniform FP8 rows;
+        a V4 label would route partial pages through the 576+8 byte V4 copy."""
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _dsv4_region_page_aligned_only,
+        )
+
+        pool = DeepSeekV4UniformFP8KVPool.__new__(DeepSeekV4UniformFP8KVPool)
+        pool.page_size = 64
+        pool.kv_layout = KVLayout.V4
+        pool.kv_buffer = [torch.empty((3, 64 * 512), dtype=torch.uint8)]
+        info = pool.paged_buffer_info()
+        self.assertEqual(info.layout, "uniform_fp8")
+        self.assertEqual(info.page_bytes, 64 * 512)
+        self.assertTrue(_dsv4_region_page_aligned_only(info))
 
     def test_fp4_indexer_page_views_keep_payload_scale_storage_and_reject_mismatch(
         self,

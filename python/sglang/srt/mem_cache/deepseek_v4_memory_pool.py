@@ -400,6 +400,13 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
     def get_bytes_per_token(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        # kv_layout stays V4 for the attention backend, but the rows are
+        # 512-byte uniform FP8 that the V4 token-granular copy cannot split.
+        return DSV4PagedBufferInfo.from_buffers(
+            self.kv_buffer, page_slots=self.page_size, layout="uniform_fp8"
+        )
+
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
         assert bytes_per_token == 512, (
