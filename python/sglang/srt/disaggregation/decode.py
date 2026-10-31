@@ -3086,6 +3086,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         deferred_indices = set()
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
+        device_admission_refused = False
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 if decode_req.req.rid not in rids_to_check:
@@ -3169,9 +3170,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         indices_to_remove.add(i)
                         outcomes[decode_req.req.rid] = True
                         continue
+                    # Like the prealloc and retraction loops, admit in queue order: once
+                    # a request does not fit, later ones wait for the next pass.
+                    if device_admission_refused:
+                        continue
                     if not self.scheduler.disagg_decode_prealloc_queue.allocate_host_staged(
                         decode_req
                     ):
+                        device_admission_refused = True
                         continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
