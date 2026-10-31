@@ -511,6 +511,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.hisparse_coordinator = hisparse_coordinator
+        backend.dsv4_prefill_backend = "auto"
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
