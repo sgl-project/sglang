@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import functools
 from typing import Optional
 
 import torch
@@ -11,9 +12,20 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.utils import is_gfx95_supported
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+
+@functools.cache
+def _launch_config() -> dict:
+    # On gfx95, one program per (chunk, head) covers V = 128: with BV = 64 the two
+    # programs of a head both compute the same q @ k^T. With 16x16 MFMA tiles this
+    # is 0.40 -> 0.23 ms per call on MI355X (16384 tokens, 48 heads, K = V = 128).
+    if is_gfx95_supported():
+        return dict(BV=128, num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
+    return dict(BV=64, num_warps=4, num_stages=2)
 
 
 # @triton.autotune(
@@ -167,10 +179,8 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        **_launch_config(),
     )
     return o
