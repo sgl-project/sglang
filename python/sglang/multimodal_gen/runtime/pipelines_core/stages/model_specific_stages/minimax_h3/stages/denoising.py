@@ -444,12 +444,16 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def __init__(self, transformer, pipeline=None) -> None:
+    def __init__(
+        self, transformer, pipeline=None, stochastic_sampling: bool = False
+    ) -> None:
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
         )
+        # the release's few-step re-noising update (release metadata)
+        self.stochastic_sampling = stochastic_sampling
         self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
 
@@ -823,6 +827,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     collector=collector,
                 )
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
+            renoise_generator = None
+            if self.stochastic_sampling:
+                # The plan carries this output's own seed after output expansion
+                # (42 is latent preparation's default). A device generator keeps
+                # the stream independent of the CPU generators seeded with the
+                # same value for the initial and condition noise.
+                seed = 42 if ctx.plan.seed is None else int(ctx.plan.seed)
+                renoise_generator = torch.Generator(device=device).manual_seed(seed)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -833,6 +845,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ):
 
                 def on_step(_step, _video_rows, _audio_rows):
+                    self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
                         self.step_profile()
@@ -862,6 +875,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                     rollout_ctx=rollout_ctx,
+                    renoise_generator=renoise_generator,
                 )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (

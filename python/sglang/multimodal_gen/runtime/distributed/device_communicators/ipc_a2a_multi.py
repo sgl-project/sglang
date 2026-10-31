@@ -42,8 +42,11 @@ logger = logging.getLogger(__name__)
 _AUTO_PIPELINE_GROUPS = (7, 5, 4, 3, 2)
 # Each group's attention call must fill this many waves of 128-row tiles: below
 # it the call's tail costs more than the overlap saves (cuDNN SDPA on B300 runs
-# Wan 1.3B at Ulysses 4 in three one-head groups 44% slower than sequentially).
-_MIN_GROUP_WAVES = 4
+# Wan 1.3B at Ulysses 4 in three one-head groups, 1.7 waves, 44% slower than
+# sequentially). The groups attend on their own streams, so one call's tail
+# overlaps the next: MiniMax-H3 at Ulysses 4 runs 7 two-head groups (3.5 waves
+# at 1280x704, 3.9 at 1344x768) faster than 2, under FA4 and cuDNN alike.
+_MIN_GROUP_WAVES = 3
 
 
 @functools.lru_cache(maxsize=None)

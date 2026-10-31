@@ -84,7 +84,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _ring_attention_varlen,
+    ulysses_head_group_pipelined_attention,
+)
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -748,6 +751,57 @@ def _minimax_h3_pipelined_dense_attention(
     return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
 
 
+# aiter's varlen kernel gives a head group the same bytes as those heads inside
+# the full call (checked at H3's shapes on MI355X)
+_COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+
+
+def _minimax_h3_collective_pipelined_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor | None:
+    """Dense attention with the collective Ulysses exchange pipelined over head
+    groups, for backends the copy-engine pipeline does not serve.
+
+    Returns None (caller keeps the sequential exchange) unless pipelining is
+    enabled. Auto picks two groups: every further group adds a partial
+    attention wave (MI355X, 14 heads per rank: two groups save 1.5 ms per
+    layer, seven cost 2.8 ms).
+    """
+    groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+    if groups < 0:
+        groups = 2
+    world_size, _ = get_ulysses_ctx()
+    if (
+        groups in (0, 1)
+        or attention._attention_backend_enum
+        not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
+        or q.shape[1] % (world_size * groups)
+        or torch.compiler.is_compiling()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    impl = attention._attention_impl
+
+    def attend(q_group, k_group, v_group):
+        return impl.forward_varlen(
+            q_group,
+            k_group,
+            v_group,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
+
+    return ulysses_head_group_pipelined_attention(q, k, v, attend, groups)
+
+
 def _minimax_h3_qknorm_rope_pipelined_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -835,15 +889,18 @@ def _minimax_h3_attention_core_impl(
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
     if ulysses_active and not ring_active and gate_compress is None:
-        out = _minimax_h3_pipelined_dense_attention(
-            attention,
-            q,
-            k,
-            v,
+        pipeline_kwargs = dict(
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
+        out = _minimax_h3_pipelined_dense_attention(
+            attention, q, k, v, **pipeline_kwargs
+        )
+        if out is None:
+            out = _minimax_h3_collective_pipelined_attention(
+                attention, q, k, v, **pipeline_kwargs
+            )
         if out is not None:
             return out
 

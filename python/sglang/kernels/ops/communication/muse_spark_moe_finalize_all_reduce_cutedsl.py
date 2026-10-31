@@ -30,6 +30,7 @@ is ``sglang.srt.layers.communication.muse_spark_finalize_workspace``.
 """
 
 import functools
+import math
 
 import torch
 
@@ -104,6 +105,84 @@ if HAS_CUTEDSL:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
+    # =================================================================
+    # Push AR building blocks shared by the one-shot and two-shot exchanges
+    # =================================================================
+
+    def _peer_store_atom():
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyR2GOp(),
+            cutlass.Uint32,
+            num_bits_per_copy=AR_COPY_BITS,
+            memory_order=cute.nvgpu.MemoryOrder.RELAXED,
+            memory_scope=cute.nvgpu.MemoryScope.SYS,
+        )
+
+    def _peer_load_atom():
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyG2ROp(),
+            cutlass.Uint32,
+            num_bits_per_copy=AR_COPY_BITS,
+            memory_order=cute.nvgpu.MemoryOrder.RELAXED,
+            memory_scope=cute.nvgpu.MemoryScope.SYS,
+        )
+
+    def _local_store_atom():
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyR2GOp(),
+            cutlass.Uint32,
+            num_bits_per_copy=AR_COPY_BITS,
+            memory_order=cute.nvgpu.MemoryOrder.WEAK,
+            memory_scope=cute.nvgpu.MemoryScope.CTA,
+        )
+
+    @cute.jit
+    def _vec_at(ptr):
+        """The 16-byte vector at ptr as uint32 words; slot and output offsets are vector-aligned."""
+        words = cute.recast_ptr(ptr, dtype=cutlass.Uint32)
+        return cute.make_tensor(
+            words.align(min_align=AR_COPY_BITS // 8), cute.make_layout((AR_VEC_WORDS,))
+        )
+
+    @cute.jit
+    def _epoch_base(epoch, world: cutlass.Constexpr, slot_words):
+        """Word offset of this launch's half of the double-buffered push slots."""
+        return Int32(epoch & 1) * world * slot_words
+
+    @cute.jit
+    def _remap_sentinel(words):
+        """+0 is the not-arrived sentinel: send a +0 word as 0x8000 (-0.0 in the low bf16)."""
+        for v in cutlass.range_constexpr(AR_VEC_WORDS):
+            value = words[v]
+            if value == 0:
+                value = cutlass.Uint32(0x8000)
+            words[v] = value
+
+    @cute.jit
+    def _poll_arrived(load_atom, slots, values):
+        """Spin until every word of every source slot is non-zero.
+        slots: [AR_VEC_WORDS, num_sources] in gmem; values: the same shape in registers."""
+        num_sources = cute.size(slots, mode=[1])
+        # Issue all source probes before any load-dependent readiness test.
+        # Ready slots stay intact until the consumer clears them.
+        ready = False
+        while not ready:
+            for src in cutlass.range_constexpr(num_sources):
+                cute.copy(load_atom, slots[None, src], values[None, src])
+            ready = True
+            for src in cutlass.range_constexpr(num_sources):
+                for a in cutlass.range_constexpr(AR_VEC_WORDS):
+                    ready = ready & (values[a, src] != 0)
+
+    @cute.jit
+    def _sum_ranks(values, result, world: cutlass.Constexpr):
+        """Every rank's bf16 partial -> fp32 sum in rank order -> one bf16 rounding."""
+        partials = cute.recast_tensor(values, cutlass.BFloat16)
+        total = partials[None, 0].load().to(Float32)
+        for src in cutlass.range_constexpr(1, world):
+            total = total + partials[None, src].load().to(Float32)
+        result.store(total.to(cutlass.BFloat16))
+
     @cute.jit
     def push_token(
         acc,
@@ -120,28 +199,18 @@ if HAS_CUTEDSL:
         vec, iters = acc.shape
         assert cutlass.const_expr(vec == AR_VEC_SIZE), "Finalize AR requires vec=8"
         world = len(peers)
-        base = Int32(epoch & 1) * world * slot_words
+        base = _epoch_base(epoch, world, slot_words)
         expert_values = cute.make_rmem_tensor(
             cute.make_layout((vec,)), cutlass.BFloat16
         )
         packed = cute.recast_tensor(expert_values, cutlass.Uint32)
-        store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyR2GOp(),
-            cutlass.Uint32,
-            num_bits_per_copy=AR_COPY_BITS,
-            memory_order=cute.nvgpu.MemoryOrder.RELAXED,
-            memory_scope=cute.nvgpu.MemoryScope.SYS,
-        )
+        store_atom = _peer_store_atom()
         # Publish this token without polling. Its inbox slot remains distinct from
         # every later token assigned to this persistent cluster.
         for p in cutlass.range_constexpr(iters):
             # Round once at the finalize boundary, then view pairs as Lamport words.
             expert_values.store(acc[None, p].load().to(cutlass.BFloat16))
-            for v in cutlass.range_constexpr(AR_VEC_WORDS):
-                value = packed[v]
-                if value == 0:
-                    value = cutlass.Uint32(0x8000)
-                packed[v] = value
+            _remap_sentinel(packed)
             word = (token * hidden + offset + p * threads * cluster * vec) // 2
             if cutlass.const_expr(multicast):
                 _store_multicast(
@@ -154,16 +223,7 @@ if HAS_CUTEDSL:
             else:
                 for dst in cutlass.range_constexpr(world):
                     ptr = peers[dst] + base + rank * slot_words + word
-                    dst_tensor = cute.make_tensor(
-                        cute.make_ptr(
-                            cutlass.Uint32,
-                            ptr.toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=AR_COPY_BITS // 8,
-                        ),
-                        cute.make_layout((AR_VEC_WORDS,)),
-                    )
-                    cute.copy(store_atom, packed, dst_tensor)
+                    cute.copy(store_atom, packed, _vec_at(ptr))
 
     @cute.jit
     def reduce_token(
@@ -179,25 +239,13 @@ if HAS_CUTEDSL:
     ):
         peers, _, _, slot_words, poll_workspace, _ = ar
         world = len(peers)
-        base = Int32(epoch & 1) * world * slot_words
+        base = _epoch_base(epoch, world, slot_words)
         # Interleave AR warps across CTAs.
         vector = (
             tidx // cute.arch.WARP_SIZE * cluster + cta_rank
         ) * cute.arch.WARP_SIZE + tidx % cute.arch.WARP_SIZE
-        load_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyG2ROp(),
-            cutlass.Uint32,
-            num_bits_per_copy=AR_COPY_BITS,
-            memory_order=cute.nvgpu.MemoryOrder.RELAXED,
-            memory_scope=cute.nvgpu.MemoryScope.SYS,
-        )
-        store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyR2GOp(),
-            cutlass.Uint32,
-            num_bits_per_copy=AR_COPY_BITS,
-            memory_order=cute.nvgpu.MemoryOrder.WEAK,
-            memory_scope=cute.nvgpu.MemoryScope.CTA,
-        )
+        load_atom = _peer_load_atom()
+        store_atom = _local_store_atom()
         assert cutlass.const_expr(threads % cute.arch.WARP_SIZE == 0)
         assert cutlass.const_expr(hidden % (threads * cluster * AR_VEC_SIZE) == 0)
         num_iters = hidden // (threads * cluster * AR_VEC_SIZE)
@@ -205,20 +253,15 @@ if HAS_CUTEDSL:
         word = token * (hidden // AR_VEC_SIZE * AR_VEC_WORDS) + vector * AR_VEC_WORDS
         # Per-thread partitions: [word, iteration] and [word, source, iteration].
         output_tensor = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Uint32,
-                (output.iterator + token * hidden + vector * AR_VEC_SIZE).toint(),
-                cute.AddressSpace.gmem,
-                assumed_align=AR_COPY_BITS // 8,
-            ),
+            cute.recast_ptr(
+                output.iterator + token * hidden + vector * AR_VEC_SIZE,
+                dtype=cutlass.Uint32,
+            ).align(min_align=AR_COPY_BITS // 8),
             cute.make_layout((AR_VEC_WORDS, num_iters), stride=(1, vector_stride)),
         )
         poll_ptrs = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Uint32,
-                (poll_workspace + base + word).toint(),
-                cute.AddressSpace.gmem,
-                assumed_align=AR_COPY_BITS // 8,
+            cute.recast_ptr(poll_workspace + base + word, dtype=cutlass.Uint32).align(
+                min_align=AR_COPY_BITS // 8
             ),
             cute.make_layout(
                 (AR_VEC_WORDS, world, num_iters),
@@ -228,39 +271,232 @@ if HAS_CUTEDSL:
         rank_values = cute.make_rmem_tensor(
             cute.make_layout((AR_VEC_WORDS, world)), cutlass.Uint32
         )
-        rank_bf16 = cute.recast_tensor(rank_values, cutlass.BFloat16)
         result = cute.make_rmem_tensor(
             cute.make_layout((AR_VEC_SIZE,)), cutlass.BFloat16
         )
         zero = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32)
         zero.fill(0)
         for vector_iter in cutlass.range_constexpr(num_iters):
-            # Issue all peer probes before any load-dependent readiness test.
-            # Ready slots stay intact until this consumer clears them below.
-            ready = False
-            while not ready:
-                for src in cutlass.range_constexpr(world):
-                    cute.copy(
-                        load_atom,
-                        poll_ptrs[None, src, vector_iter],
-                        rank_values[None, src],
-                    )
-                ready = True
-                for src in cutlass.range_constexpr(world):
-                    for a in cutlass.range_constexpr(AR_VEC_WORDS):
-                        ready = ready & (rank_values[a, src] != 0)
-            # Reinterpret BF16 payloads and accumulate ranks in the original order.
-            total = rank_bf16[None, 0].load().to(Float32)
-            for src in cutlass.range_constexpr(1, world):
-                total = total + rank_bf16[None, src].load().to(Float32)
-            result.store(total.to(cutlass.BFloat16))
+            slots = poll_ptrs[None, None, vector_iter]
+            _poll_arrived(load_atom, slots, rank_values)
+            _sum_ranks(rank_values, result, world)
             cute.copy(
                 store_atom,
                 cute.recast_tensor(result, cutlass.Uint32),
                 output_tensor[None, vector_iter],
             )
             for src in cutlass.range_constexpr(world):
-                cute.copy(store_atom, zero, poll_ptrs[None, src, vector_iter])
+                cute.copy(store_atom, zero, slots[None, src])
+
+    # =================================================================
+    # Two-shot push AR helpers (the 2shot_push protocol of custom_all_reduce.cuh)
+    # =================================================================
+    # Same borrowed push slots, epoch parity and empty word 0 as the one-shot
+    # path. Slot (dst, src) holds two halves: [0, slot_words / 2) takes src's
+    # partial of dst's column slice, [slot_words / 2, slot_words) takes src's
+    # reduced slice src. Two epochs suffice for the same reason as one-shot:
+    # every phase of launch N+1 waits on every peer's launch N+1 data.
+
+    @cute.jit
+    def _worker_token(token_start, token_stride, token_rows: cutlass.Constexpr, k):
+        """Token of the worker's k-th (row, iteration) pair, rows fastest."""
+        return token_start + k % token_rows + k // token_rows * token_stride
+
+    @cute.jit
+    def push_token_two_shot(
+        acc,
+        ar,
+        token,
+        offset,
+        threads: cutlass.Constexpr,
+        hidden: cutlass.Constexpr,
+        cluster: cutlass.Constexpr,
+        epoch,
+    ):
+        """Phase 1: each 8-column vector of this token's partial goes to the
+        owner of its column slice (this rank included)."""
+        peers, _, rank, slot_words, _, _ = ar
+        vec, iters = acc.shape
+        assert cutlass.const_expr(vec == AR_VEC_SIZE), "Finalize AR requires vec=8"
+        world = len(peers)
+        slice_cols = hidden // world
+        slice_words = slice_cols // 2
+        base = _epoch_base(epoch, world, slot_words) + rank * slot_words
+        expert_values = cute.make_rmem_tensor(
+            cute.make_layout((vec,)), cutlass.BFloat16
+        )
+        packed = cute.recast_tensor(expert_values, cutlass.Uint32)
+        store_atom = _peer_store_atom()
+        for p in cutlass.range_constexpr(iters):
+            # Round once at the finalize boundary, then view pairs as Lamport words.
+            expert_values.store(acc[None, p].load().to(cutlass.BFloat16))
+            _remap_sentinel(packed)
+            col = offset + p * threads * cluster * vec
+            owner = col // slice_cols
+            word = base + token * slice_words + (col - owner * slice_cols) // 2
+            for dst in cutlass.range_constexpr(world):
+                if owner == dst:
+                    cute.copy(store_atom, packed, _vec_at(peers[dst] + word))
+
+    @cute.jit
+    def reduce_slice_two_shot(
+        output,
+        ar,
+        token_start,
+        token_stride,
+        token_count,
+        thread: Int32,
+        num_threads: cutlass.Constexpr,
+        hidden: cutlass.Constexpr,
+        epoch,
+        multicast: cutlass.Constexpr = False,
+        token_rows: cutlass.Constexpr = 1,
+        num_tokens: cutlass.Constexpr = 1 << 30,
+    ):
+        """Owner: every source's partial of this rank's slice -> fp32 sum in
+        source order -> one bf16 rounding -> output and every peer's phase-2 half."""
+        peers, _, rank, slot_words, poll_workspace, mc_workspace = ar
+        world = len(peers)
+        slice_cols = hidden // world
+        slice_words = slice_cols // 2
+        slice_vecs = slice_words // AR_VEC_WORDS
+        epoch_base = _epoch_base(epoch, world, slot_words)
+        half = slot_words // 2
+        load_atom = _peer_load_atom()
+        store_atom = _peer_store_atom()
+        local_atom = _local_store_atom()
+        rank_values = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_WORDS, world)), cutlass.Uint32
+        )
+        result = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_SIZE,)), cutlass.BFloat16
+        )
+        result_words = cute.recast_tensor(result, cutlass.Uint32)
+        zero = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32)
+        zero.fill(0)
+        # (token, vector) items of every token this worker owns, over all its threads.
+        for item in range(thread, token_count * slice_vecs, num_threads):
+            token = _worker_token(
+                token_start, token_stride, token_rows, item // slice_vecs
+            )
+            j = item % slice_vecs
+            if token < num_tokens:
+                word = token * slice_words + j * AR_VEC_WORDS
+                # [word, source]: every rank's partial of this vector of my slice.
+                slots = cute.make_tensor(
+                    cute.recast_ptr(
+                        poll_workspace + epoch_base + word, dtype=cutlass.Uint32
+                    ).align(min_align=AR_COPY_BITS // 8),
+                    cute.make_layout(
+                        (AR_VEC_WORDS, world),
+                        stride=(1, cute.assume(slot_words, divby=AR_VEC_WORDS)),
+                    ),
+                )
+                _poll_arrived(load_atom, slots, rank_values)
+                _sum_ranks(rank_values, result, world)
+                # Remap before the local store too, so every rank holds identical bits.
+                _remap_sentinel(result_words)
+                if cutlass.const_expr(multicast):
+                    # One store reaches slot (dst, rank) on every rank, this one included.
+                    _store_multicast(
+                        mc_workspace + epoch_base + rank * slot_words + half + word,
+                        result_words[0],
+                        result_words[1],
+                        result_words[2],
+                        result_words[3],
+                    )
+                else:
+                    for dst in cutlass.range_constexpr(world):
+                        if dst != rank:
+                            cute.copy(
+                                store_atom,
+                                result_words,
+                                _vec_at(
+                                    peers[dst]
+                                    + epoch_base
+                                    + rank * slot_words
+                                    + half
+                                    + word
+                                ),
+                            )
+                cute.copy(
+                    local_atom,
+                    result_words,
+                    _vec_at(
+                        output.iterator
+                        + token * hidden
+                        + rank * slice_cols
+                        + j * AR_VEC_SIZE
+                    ),
+                )
+                for src in cutlass.range_constexpr(world):
+                    cute.copy(local_atom, zero, slots[None, src])
+
+    @cute.jit
+    def gather_slices_two_shot(
+        output,
+        ar,
+        token_start,
+        token_stride,
+        token_count,
+        thread: Int32,
+        num_threads: cutlass.Constexpr,
+        hidden: cutlass.Constexpr,
+        epoch,
+        multicast: cutlass.Constexpr = False,
+        token_rows: cutlass.Constexpr = 1,
+        num_tokens: cutlass.Constexpr = 1 << 30,
+    ):
+        """Every other owner's reduced slice of this token -> output; re-armed."""
+        peers, _, rank, slot_words, poll_workspace, _ = ar
+        world = len(peers)
+        slice_cols = hidden // world
+        slice_words = slice_cols // 2
+        slice_vecs = slice_words // AR_VEC_WORDS
+        epoch_base = _epoch_base(epoch, world, slot_words)
+        half = slot_words // 2
+        load_atom = _peer_load_atom()
+        local_atom = _local_store_atom()
+        values = cute.make_rmem_tensor(
+            cute.make_layout((AR_VEC_WORDS, 1)), cutlass.Uint32
+        )
+        zero = cute.make_rmem_tensor(cute.make_layout((AR_VEC_WORDS,)), cutlass.Uint32)
+        zero.fill(0)
+        # A multicast phase 2 also lands in this rank's own slot (rank, rank): drain and
+        # re-arm it too, since the one-shot path reuses that memory.
+        per_token = (world if multicast else world - 1) * slice_vecs
+        for item in range(thread, token_count * per_token, num_threads):
+            token = _worker_token(
+                token_start, token_stride, token_rows, item // per_token
+            )
+            rest = item % per_token
+            if token < num_tokens:
+                owner = (rank + 1 + rest // slice_vecs) % world
+                j = rest % slice_vecs
+                slot = cute.make_tensor(
+                    cute.recast_ptr(
+                        poll_workspace
+                        + epoch_base
+                        + owner * slot_words
+                        + half
+                        + token * slice_words
+                        + j * AR_VEC_WORDS,
+                        dtype=cutlass.Uint32,
+                    ).align(min_align=AR_COPY_BITS // 8),
+                    cute.make_layout((AR_VEC_WORDS, 1)),
+                )
+                _poll_arrived(load_atom, slot, values)
+                cute.copy(
+                    local_atom,
+                    values[None, 0],
+                    _vec_at(
+                        output.iterator
+                        + token * hidden
+                        + owner * slice_cols
+                        + j * AR_VEC_SIZE
+                    ),
+                )
+                cute.copy(local_atom, zero, slot[None, 0])
 
     _torch_to_cutlass_dtype = {
         torch.float16: cutlass.Float16,
@@ -457,12 +693,18 @@ if HAS_CUTEDSL:
                 tpr //= 2
             raise ValueError("No compatible thread/vector layout")
 
-        def smem_size_in_bytes(self, topk_groups: int) -> int:
+        def smem_size_in_bytes(
+            self, topk_groups: int, rows: int = 1, group_width: int = 1
+        ) -> int:
             """Shared memory for expert sums, transaction barriers, and warp sums."""
-            return (
+            inbox_and_barriers = (
                 topk_groups * self.cluster_size * self.warps_per_row * 16
                 + topk_groups * 8
-                + self.warps_per_row * 4
+            )
+            # warp_sums starts at the next 16-byte boundary.
+            return (
+                math.ceil(inbox_and_barriers / 16) * 16
+                + rows * self.warps_per_row * group_width * 4
             )
 
     # =================================================================
@@ -496,6 +738,7 @@ if HAS_CUTEDSL:
             ar_world_size: int = 0,
             ar_controller_count: int = 0,
             ar_multicast: bool = False,
+            ar_two_shot: bool = False,
         ):
             self.cfg = MOEFinalizeRMSNormConfig(
                 dtype, hidden_dim, hidden_dim_padded, threads_per_row, cluster_size
@@ -504,19 +747,44 @@ if HAS_CUTEDSL:
             self.cluster_size = cluster_size
             self.topk = topk
             self.hidden_dim_padded = hidden_dim_padded
-            self.group_width = 4 if cluster_size > 1 else 1
+            # Two tokens per block (one row of threads each) where the grid would otherwise be
+            # capped at the controller count; not for the multicast one-shot push, which
+            # measured slower.
+            self.rows = (
+                2
+                if ar_world_size > 0
+                and cluster_size == 1
+                and num_tokens > ar_controller_count
+                and (ar_two_shot or not ar_multicast)
+                and 2 * self.cfg.num_threads <= 1024
+                else 1
+            )
+            # Four experts per group keep their loads in flight together under one barrier pair;
+            # eight measured slower. Two-row blocks (1024 threads cap registers) and the standalone
+            # finalize measured best with one.
+            self.group_width = (
+                4 if cluster_size > 1 or (ar_world_size > 0 and self.rows == 1) else 1
+            )
             self.topk_groups = (topk + self.group_width - 1) // self.group_width
             self.use_pdl = use_pdl
             self.eps = float(eps)
             self.weight_first = bool(weight_first)
             self.ar_world_size = ar_world_size
+            # One-shot: push each partial with one multimem store. Two-shot: multicast phase 2.
             self.ar_multicast = ar_multicast
+            self.ar_two_shot = ar_two_shot
             self.num_tokens = num_tokens
+            # One block (a cluster of C CTAs) finalizes `rows` tokens and owns one epoch controller.
+            self.num_workers = math.ceil(num_tokens / self.rows)
             self.is_persistent = (
-                ar_world_size > 0 and num_tokens * cluster_size > ar_controller_count
+                ar_world_size > 0
+                and self.num_workers * cluster_size > ar_controller_count
             )
             if ar_world_size > 0 and self.cfg.vec_size != AR_VEC_SIZE:
                 raise ValueError("Finalize push requires eight BF16 values per lane")
+            # Named per-row barriers count whole warps.
+            if ar_world_size > 0 and self.cfg.num_threads % 32:
+                raise ValueError("Finalize push requires whole warps per row")
 
         @cute.jit
         def __call__(
@@ -571,14 +839,16 @@ if HAS_CUTEDSL:
                 cute.make_layout((num_tokens * topk,), stride=(1,)),
             )
 
-            num_blocks = num_tokens * self.cluster_size
+            num_blocks = self.num_workers * self.cluster_size
             if cutlass.const_expr(self.is_persistent):
                 num_blocks = min(self.ar_controller_count, num_blocks)
             self.kernel(mGemm2, mOut, mW, mExpW, mIdx, ar).launch(
                 grid=[num_blocks, 1, 1],
-                block=[cfg.num_threads, 1, 1],
+                block=[cfg.num_threads * self.rows, 1, 1],
                 cluster=[self.cluster_size, 1, 1],
-                smem=cfg.smem_size_in_bytes(self.topk_groups),
+                smem=cfg.smem_size_in_bytes(
+                    self.topk_groups, self.rows, self.group_width
+                ),
                 stream=stream,
                 use_pdl=self.use_pdl,
             )
@@ -601,10 +871,15 @@ if HAS_CUTEDSL:
             warps_per_row = cfg.warps_per_row
 
             tidx = cute.arch.thread_idx()[0]
+            # Row of this thread (one token per row) and its index inside the row.
+            thread_row = tidx // threads_per_row
+            rtid = tidx % threads_per_row
             lane = tidx % 32
-            warp = tidx // 32
+            warp = rtid // 32
             cta_rank = cute.arch.block_idx()[0] % self.cluster_size
-            token_start = cute.arch.block_idx()[0] // self.cluster_size
+            # The block owns epoch controller `worker`; its rows take consecutive tokens.
+            worker = cute.arch.block_idx()[0] // self.cluster_size
+            token_start = worker * self.rows + thread_row
             smem = utils.SmemAllocator()
             # DSMEM inbox: [expert group, source CTA, source warp, 4 expert sums].
             partials = smem.allocate_tensor(
@@ -618,9 +893,11 @@ if HAS_CUTEDSL:
             bars = smem.allocate_tensor(
                 cutlass.Uint64, cute.make_layout((self.topk_groups,)), byte_alignment=8
             )
-            # C=1 scratch: one sum per warp for the current expert.
+            # Single-CTA (cluster_size == 1) RMSNorm reduction: per-warp sums of squares.
             warp_sums = smem.allocate_tensor(
-                Float32, cute.make_layout((warps_per_row,)), byte_alignment=4
+                Float32,
+                cute.make_layout((self.rows, warps_per_row, self.group_width)),
+                byte_alignment=16,
             )
 
             # ---- Initialize mbarriers when cluster size > 1 ----
@@ -642,13 +919,18 @@ if HAS_CUTEDSL:
             token_iterations = 1
             if cutlass.const_expr(self.is_persistent):
                 token_end = self.num_tokens
-                token_stride = self.ar_controller_count
+                token_stride = self.ar_controller_count * self.rows
                 token_iterations = (
                     token_end - token_start + token_stride - 1
                 ) // token_stride
+            elif cutlass.const_expr(self.rows > 1):
+                # The last block's second row is empty when M is odd.
+                token_iterations = Int32(1)
+                if token_start >= self.num_tokens:
+                    token_iterations = Int32(0)
             # Preserve the host-validated alignment for vectorized copies.
             offset = cute.assume(
-                (cta_rank * threads_per_row + tidx) * cfg.vec_size, divby=cfg.vec_size
+                (cta_rank * threads_per_row + rtid) * cfg.vec_size, divby=cfg.vec_size
             )
             layout = cute.make_layout(
                 (cfg.vec_size, cfg.num_iters),
@@ -670,7 +952,7 @@ if HAS_CUTEDSL:
                 )
                 if cutlass.const_expr(self.use_pdl):
                     cute.arch.griddepcontrol_wait()
-                epoch = controllers[token_start]
+                epoch = controllers[worker]
             for token_iteration in cutlass.range(token_iterations):
                 token_idx = token_start + token_iteration * token_stride
                 # ---- PDL: wait for prior kernel to complete ----
@@ -804,16 +1086,30 @@ if HAS_CUTEDSL:
                                         ]
                             _joint(sum_sq, num_valids)
                         else:
-                            # ---- Single-CTA reduction through warp_sums ----
-                            s = _warp_sum(sum_sq[0], min(threads_per_row, 32))
-                            if lane == 0:
-                                warp_sums[warp] = s
-                            cute.arch.barrier()
-                            s = Float32(0)
-                            if lane < warps_per_row:
-                                s = warp_sums[lane]
-                            sum_sq[0] = _warp_sum(s, min(threads_per_row, 32))
-                            cute.arch.barrier()
+                            # ---- Single-CTA reduction through warp_sums, one sum per expert ----
+                            for e in cutlass.range_constexpr(self.group_width):
+                                s = _warp_sum(sum_sq[e], min(threads_per_row, 32))
+                                if lane == 0:
+                                    warp_sums[thread_row, warp, e] = s
+                            if cutlass.const_expr(self.rows > 1):
+                                cute.arch.barrier(
+                                    barrier_id=1 + thread_row,
+                                    number_of_threads=threads_per_row,
+                                )
+                            else:
+                                cute.arch.barrier()
+                            for e in cutlass.range_constexpr(self.group_width):
+                                s = Float32(0)
+                                if lane < warps_per_row:
+                                    s = warp_sums[thread_row, lane, e]
+                                sum_sq[e] = _warp_sum(s, min(threads_per_row, 32))
+                            if cutlass.const_expr(self.rows > 1):
+                                cute.arch.barrier(
+                                    barrier_id=1 + thread_row,
+                                    number_of_threads=threads_per_row,
+                                )
+                            else:
+                                cute.arch.barrier()
                         # ---- Normalize each expert and accumulate router-weighted output ----
                         for e in cutlass.range_constexpr(self.group_width):
                             if permuted_idxs[e] >= 0:
@@ -831,17 +1127,29 @@ if HAS_CUTEDSL:
                                         )
                 if cutlass.const_expr(self.ar_world_size > 0):
                     # Push finalized values to peer GPUs.
-                    push_token(
-                        acc,
-                        ar,
-                        token_idx,
-                        offset,
-                        threads_per_row,
-                        hidden_dim,
-                        self.cluster_size,
-                        epoch,
-                        self.ar_multicast,
-                    )
+                    if cutlass.const_expr(self.ar_two_shot):
+                        push_token_two_shot(
+                            acc,
+                            ar,
+                            token_idx,
+                            offset,
+                            threads_per_row,
+                            hidden_dim,
+                            self.cluster_size,
+                            epoch,
+                        )
+                    else:
+                        push_token(
+                            acc,
+                            ar,
+                            token_idx,
+                            offset,
+                            threads_per_row,
+                            hidden_dim,
+                            self.cluster_size,
+                            epoch,
+                            self.ar_multicast,
+                        )
                 else:
                     out = cute.make_rmem_tensor(reg_layout, cfg.dtype)
                     out.store(acc.load().to(cfg.dtype))
@@ -860,19 +1168,60 @@ if HAS_CUTEDSL:
                 cute.arch.griddepcontrol_launch_dependents()
             # Reduce received values for each token.
             if cutlass.const_expr(self.ar_world_size > 0):
-                for token_iteration in cutlass.range(token_iterations):
-                    token_idx = token_start + token_iteration * token_stride
-                    reduce_token(
+                if cutlass.const_expr(self.ar_two_shot):
+                    # Every owner reduction of this worker before any gather: gathers
+                    # wait on peers' reductions, which wait only on phase-1 pushes.
+                    # The worker's (token, vector) items are spread over every thread of the block.
+                    worker_first = worker * self.rows
+                    worker_iterations = 1
+                    if cutlass.const_expr(self.is_persistent):
+                        worker_iterations = (
+                            self.num_tokens - worker_first + token_stride - 1
+                        ) // token_stride
+                    block_thread = cta_rank * threads_per_row * self.rows + tidx
+                    block_threads = threads_per_row * self.rows * self.cluster_size
+                    reduce_slice_two_shot(
                         mOut,
                         ar,
-                        token_idx,
-                        tidx,
-                        cta_rank,
-                        threads_per_row,
+                        worker_first,
+                        token_stride,
+                        worker_iterations * self.rows,
+                        block_thread,
+                        block_threads,
                         hidden_dim,
-                        self.cluster_size,
                         epoch,
+                        self.ar_multicast,
+                        self.rows,
+                        self.num_tokens,
                     )
+                    gather_slices_two_shot(
+                        mOut,
+                        ar,
+                        worker_first,
+                        token_stride,
+                        worker_iterations * self.rows,
+                        block_thread,
+                        block_threads,
+                        hidden_dim,
+                        epoch,
+                        self.ar_multicast,
+                        self.rows,
+                        self.num_tokens,
+                    )
+                else:
+                    for token_iteration in cutlass.range(token_iterations):
+                        token_idx = token_start + token_iteration * token_stride
+                        reduce_token(
+                            mOut,
+                            ar,
+                            token_idx,
+                            rtid,
+                            cta_rank,
+                            threads_per_row,
+                            hidden_dim,
+                            self.cluster_size,
+                            epoch,
+                        )
             # Keep shared memory alive until peer DSMEM accesses finish.
             if cutlass.const_expr(self.cluster_size > 1):
                 cute.arch.cluster_arrive_relaxed()
@@ -880,14 +1229,18 @@ if HAS_CUTEDSL:
             if cutlass.const_expr(self.ar_world_size > 0):
                 # One writer per active worker; all CTAs share unused controllers.
                 next_epoch = epoch ^ cutlass.Uint32(1)
+                # Every thread must have read `epoch` before it flips: two rows sync only per row,
+                # and a token with no local expert skips the RMSNorm barriers.
+                cute.arch.barrier()
                 if cta_rank == 0 and tidx == 0:
-                    controllers[token_start] = next_epoch
-                global_thread = cute.arch.block_idx()[0] * threads_per_row + tidx
+                    controllers[worker] = next_epoch
+                block_threads = threads_per_row * self.rows
+                global_thread = cute.arch.block_idx()[0] * block_threads + tidx
                 # Advance unused controllers to match ordinary push AR.
                 for controller in range(
                     cute.arch.grid_dim()[0] // self.cluster_size + global_thread,
                     self.ar_controller_count,
-                    cute.arch.grid_dim()[0] * threads_per_row,
+                    cute.arch.grid_dim()[0] * block_threads,
                 ):
                     controllers[controller] = next_epoch
 
@@ -913,6 +1266,7 @@ if HAS_CUTEDSL:
         ar_world_size: int = 0,
         ar_controller_count: int = 0,
         ar_multicast: bool = False,
+        ar_two_shot: bool = False,
     ):
         if num_tokens <= 0:
             raise ValueError("Finalize requires a positive token count")
@@ -934,6 +1288,7 @@ if HAS_CUTEDSL:
             ar_controller_count,
             num_tokens,
             ar_multicast,
+            ar_two_shot,
         )
         if key not in _compile_cache:
             if ar_controller_count < 0 or (ar_controller_count and not ar_world_size):
@@ -954,6 +1309,7 @@ if HAS_CUTEDSL:
                 ar_world_size=ar_world_size,
                 ar_controller_count=ar_controller_count,
                 ar_multicast=ar_multicast,
+                ar_two_shot=ar_two_shot,
             )
             compiled = cute.compile(
                 kernel_obj,
