@@ -27,9 +27,6 @@ class HiDreamPipelineConfig(PipelineConfig):
     num_inference_steps: Optional[int] = None
     guidance_scale: float = 5.0
     shift: float = 3.0
-    # cap on rows per batched denoise forward (memory safety; a single
-    # request can already peak high on 64GiB NPUs)
-    max_batched_outputs: int = 4
 
     def __post_init__(self):
         from sglang.multimodal_gen.configs.sample.hidream import _is_full_model

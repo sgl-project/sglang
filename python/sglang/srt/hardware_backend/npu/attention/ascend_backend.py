@@ -2839,7 +2839,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
+        if sinks is not None or self.is_hybrid_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
