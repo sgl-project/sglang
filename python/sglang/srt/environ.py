@@ -1101,9 +1101,10 @@ class Envs:
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
-    # GLM-5.3-Flash on CUDA: quantize the checkpoint's BF16 KDA projections to FP8
-    # on load (per-channel weights, per-token activations). Any of o_proj and the
-    # fused input projection qkv_proj, f_a_proj, g_a_proj (together; b_proj rides along).
+    # Experimental; accuracy is not validated across workloads. GLM-5.3-Flash on CUDA:
+    # quantize the checkpoint's BF16 KDA projections to FP8 on load (per-channel weights,
+    # per-token activations). Any of o_proj and the fused input projection qkv_proj,
+    # f_a_proj, g_a_proj (together; b_proj rides along).
     SGLANG_OPT_GLM53_KDA_PTPC_MODULES = EnvTuple(tuple())
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
