@@ -198,6 +198,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FCFS_WARM_PREFILL_RESERVE_TOKENS`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental bound for reserving prefill capacity for a warm FCFS queue head. Unsupported cache and parallelism configurations retain existing scheduling behavior; this does not guarantee admission.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0` (disabled)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bound combined `extend_num_tokens` in consecutive overlapping prefill batches. Encoder SWA replay rows are excluded; this is not a bound on total forward work or GPU memory. Requires the standard non-disaggregated overlap scheduler and attention DP size 1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0` (disabled)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_PREFILL_OVERLAP_MIN_FREE_GB`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Minimum TP group free GPU memory in GB for consecutive prefill overlap. Requires the standard non-disaggregated overlap scheduler and attention DP size 1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0` (disabled)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_SCHEDULER_MAX_RECV_PER_POLL`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set the maximum number of requests per poll, with a negative value indicating no limit</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`-1`</td>

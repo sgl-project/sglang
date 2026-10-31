@@ -478,3 +478,25 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+## Limit consecutive prefill overlap
+
+Two overlapping prefill batches can keep their temporary workspaces live at the
+same time. Optional resource budgets can defer the next batch until the previous
+one finishes:
+
+| Environment variable | Meaning | Default |
+| --- | --- | --- |
+| `SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET` | Maximum combined `extend_num_tokens` of consecutive prefill batches | `0` (disabled) |
+| `SGLANG_PREFILL_OVERLAP_MIN_FREE_GB` | Minimum free GPU memory across the TP group before overlapping consecutive prefill batches | `0` (disabled) |
+
+These limits leave decode overlap unchanged and do not clear allocator caches.
+They require attention DP size 1 and the standard non-disaggregated overlap
+scheduler. Pipeline parallelism, PD role switching, PDMUX, MLX, and disabled
+overlap are rejected at startup when either limit is enabled. These budgets
+complement `--max-prefill-tokens` and can reduce overlap; measure throughput
+and memory on your workload before enabling them. They have not been validated
+for this K3 preset.
+
+The token budget counts `extend_num_tokens`; it does not include additional
+encoder SWA replay rows. It is not a bound on total forward work or GPU memory
+and does not guarantee that a batch will avoid OOM.
