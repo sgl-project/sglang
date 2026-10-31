@@ -75,6 +75,10 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+Sana image LN+modulation fusion is limited to CUDA-graph streams. SANA-Video
+also enables it for default-stream inference, retaining the same per-signature
+bit-exact verification and fallback.
+
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
