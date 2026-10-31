@@ -442,13 +442,6 @@ def create_app(server_args: ServerArgs):
         add_prometheus_middleware(app)
         add_http_request_metrics_middleware(app)
         init_http_request_metrics()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
@@ -488,6 +481,14 @@ def create_app(server_args: ServerArgs):
             api_key=server_args.api_key,
             admin_api_key=server_args.admin_api_key,
         )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None

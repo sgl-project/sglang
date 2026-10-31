@@ -1,8 +1,13 @@
+import socket
+import threading
+import time
 from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+import uvicorn
 from fastapi import APIRouter, FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -108,7 +113,68 @@ def test_nested_routes_preserve_management_auth_level(
             with pytest.raises(WebSocketDisconnect) as exc:
                 with client.websocket_connect("/api/v1/management", headers=headers):
                     pass
+            # TestClient exposes the ASGI close code before acceptance.
             assert exc.value.code == 1008
+
+
+@pytest.mark.parametrize("token", [None, "wrong-secret"])
+def test_websocket_denial_returns_http_403_on_the_wire(token):
+    """A rejected upgrade returns HTTP 403 through a real Uvicorn server."""
+    app = FastAPI()
+    entered = False
+
+    @app.websocket("/stream")
+    async def stream(websocket: WebSocket):
+        nonlocal entered
+        entered = True
+        await websocket.accept()
+        await websocket.close()
+
+    add_api_key_middleware(app, api_key="user-secret", admin_api_key=None)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                loop="asyncio",
+                lifespan="off",
+                log_level="critical",
+                timeout_graceful_shutdown=1,
+            )
+        )
+        thread = threading.Thread(
+            target=server.run, kwargs={"sockets": [listener]}, daemon=True
+        )
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while (
+                not server.started and thread.is_alive() and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            assert server.started, "Uvicorn failed to start"
+            headers = {
+                "Connection": "Upgrade",
+                "Upgrade": "websocket",
+                "Sec-WebSocket-Version": "13",
+                "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+            }
+            if token is not None:
+                headers["Authorization"] = f"Bearer {token}"
+            response = httpx.get(
+                f"http://127.0.0.1:{port}/stream",
+                headers=headers,
+                trust_env=False,
+                timeout=5,
+            )
+            assert response.status_code == 403
+            assert not entered
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "Uvicorn failed to stop"
 
 
 @pytest.mark.parametrize(
@@ -265,3 +331,38 @@ def test_cors_preflight_does_not_require_authentication():
     )
 
     assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://example.com"
+
+
+@pytest.mark.parametrize(
+    "path,token,status",
+    [
+        ("/openapi.json", None, 401),
+        ("/openapi.json", "wrong-secret", 401),
+        ("/openapi.json", "user-secret", 200),
+        ("/forced", "user-secret", 403),
+    ],
+)
+def test_cors_headers_on_authentication_responses(path, token, status):
+    app = create_app(_server_args(api_key="user-secret"))
+
+    @app.get("/forced")
+    @auth_level(AuthLevel.ADMIN_FORCE)
+    async def forced():
+        return {"success": True}
+
+    headers = {"Origin": "https://example.com"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    response = TestClient(app).get(path, headers=headers)
+
+    assert response.status_code == status
+    assert response.headers.get("access-control-allow-origin") in (
+        "*",
+        "https://example.com",
+    )
+    assert response.headers["access-control-allow-credentials"] == "true"
+    if status in (401, 403):
+        assert response.json() == {
+            "error": "Unauthorized" if status == 401 else "Forbidden"
+        }
