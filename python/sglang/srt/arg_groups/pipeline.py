@@ -83,11 +83,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_aux_hidden_state_capture,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_prefill_max_requests,
         validate_response_store,
         validate_sampling_mask_max_tokens,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
+    validate_prefill_max_requests(server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
     # Before any reader of speculative_algorithm: the flag may reset it.
