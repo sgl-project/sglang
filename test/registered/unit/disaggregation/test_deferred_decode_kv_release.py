@@ -530,6 +530,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         hicache_restore_lock=None,
         kv_receiver=receiver,
         metadata_buffer_index=idx,
+        awaiting_publish=False,
     )
 
 
@@ -854,6 +855,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         metadata_buffer_index=idx,
         hicache_restore_status=None,
         host_staged=False,
+        awaiting_publish=False,
     )
 
 
@@ -910,6 +912,26 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(released, [entry])
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [4])
+
+    def test_failure_before_deferred_publish_releases_immediately(self):
+        # A request can join the transfer queue before its destination is sent;
+        # an abort in that window leaves nothing for prefill to drain.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = True
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(mgr, room=10, idx=6, abort_notified=False)
+        entry.awaiting_publish = True
+        q.queue = [entry]
+        # Under prefill_complete, clear() of a failed receiver that decode did not
+        # abort notifies prefill and arms drain tracking no ACK will resolve.
+        entry.kv_receiver.clear = lambda: mgr.register_deferred_abort_room(10)
+
+        released = self._pop(q)
+
+        self.assertEqual(released, [entry])
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [6])
+        self.assertNotIn(10, mgr._deferred_abort_ack_tracker)
 
     def test_backend_optout_keeps_immediate_release_and_sends_no_abort(self):
         mgr = _make_manager()

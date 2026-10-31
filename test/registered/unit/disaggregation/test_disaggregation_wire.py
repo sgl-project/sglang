@@ -1,5 +1,6 @@
 import concurrent.futures
 import ctypes
+import dataclasses
 import os
 import threading
 import unittest
@@ -51,6 +52,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -2133,12 +2137,16 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                         sampling_logprobs_mode=mode,
                     )
                 )
+                fields = dict.fromkeys(
+                    f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                )
+                fields["model_config"] = SimpleNamespace(
+                    self_opened_think_start_ids=None
+                )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
-                    batch_result_processor=SimpleNamespace(
-                        _maybe_update_reasoning_tokens=lambda req, token_id: None
-                    ),
+                    batch_result_processor=SchedulerBatchResultProcessor(**fields),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
@@ -2147,6 +2155,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
                     output_ids=[],
+                    require_reasoning=False,
                     return_logprob=False,
                     return_sampling_mask=True,
                     sampling_logprobs_mode=mode,
@@ -2330,6 +2339,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
         override = get_context().override_server_args(
             speculative_eagle_topk=1,
@@ -2368,6 +2378,52 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
 
                 self.assertEqual(draft_input.dsa_topk_indices.tolist(), expected)
+
+    def test_pd_decode_fused_topk_drops_seed_past_request_length(self):
+        # Whether the batch keeps its seed is decided on the host before the
+        # device remap runs; it must agree with the rows the remap invalidates.
+        req_to_token = torch.tensor(
+            [[0, 0, 0, 0], [700, 801, 902, 990]], dtype=torch.int32
+        )
+        batch = SimpleNamespace(
+            reqs=[
+                self._make_req(torch.tensor([1, 0, -1], dtype=torch.int32)),
+                self._make_req(torch.tensor([0, 3, -1], dtype=torch.int32)),
+            ],
+            device="cpu",
+            enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_share_for_mtp_iteration=True,
+                    index_topk=3,
+                )
+            ),
+            req_pool_indices=torch.tensor([1, 1], dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            seq_lens=torch.tensor([4, 3], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
+        )
+        override = get_context().override_server_args(
+            speculative_eagle_topk=1,
+            speculative_num_steps=5,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="decode",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True),
+        ):
+            draft_input = build_eagle_disagg_draft_input(
+                batch, torch.tensor([11, 12], dtype=torch.int64), None
+            )
+
+        self.assertIsNone(draft_input.dsa_topk_indices)
+        self.assertFalse(draft_input.cuda_graph_compatible)
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
