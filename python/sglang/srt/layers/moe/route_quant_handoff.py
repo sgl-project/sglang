@@ -33,6 +33,8 @@ from typing import Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.moe.trtllm_prepared_fp4 import prepared_routing_sm_supported
+
 
 class _Handoff(msgspec.Struct):
     # staged by the model layer: the activation rows the runner will quantize
@@ -42,6 +44,8 @@ class _Handoff(msgspec.Struct):
     packed: Optional[torch.Tensor] = None
     x_q: Optional[torch.Tensor] = None
     x_s: Optional[torch.Tensor] = None
+    metadata: Optional[list[torch.Tensor]] = None
+    metadata_packed: Optional[torch.Tensor] = None
 
 
 _handoff = _Handoff()
@@ -50,11 +54,15 @@ _handoff = _Handoff()
 def stage(x: torch.Tensor) -> None:
     """Publish the routed activations for the upcoming topk call. Caller pairs
     this with clear() after the experts call (try/finally)."""
+    _handoff.metadata = None
+    _handoff.metadata_packed = None
     _handoff.request_x = x
     _handoff.produced_x = None
 
 
 def clear() -> None:
+    _handoff.metadata = None
+    _handoff.metadata_packed = None
     _handoff.request_x = None
     _handoff.produced_x = None
     _handoff.packed = None
@@ -87,6 +95,13 @@ def try_route_quant_fused(
     ):
         return None
 
+    metadata = None
+    if (
+        x.shape[0] in (1, 8)
+        and prepared_routing_sm_supported()
+        and moe_route_quant_fused.metadata_available()
+    ):
+        metadata = moe_route_quant_fused.allocate_metadata(x.device, x.shape[0])
     weights, ids, packed, x_q, x_s = moe_route_quant_fused.route_quant_fused(
         gating_output,
         correction_bias,
@@ -97,9 +112,12 @@ def try_route_quant_fused(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0
         ),
         apply_scale=apply_routed_scaling_factor_on_output,
+        metadata=metadata,
     )
     _handoff.request_x = None
     _handoff.produced_x = x
+    _handoff.metadata = metadata
+    _handoff.metadata_packed = packed
     _handoff.packed = packed
     _handoff.x_q = x_q
     _handoff.x_s = x_s
@@ -128,3 +146,11 @@ def take(
     _handoff.x_q = None
     _handoff.x_s = None
     return out
+
+
+def take_metadata(packed: torch.Tensor):
+    """Consume metadata only for the exact packed routing tensor that made it."""
+    metadata = _handoff.metadata if _handoff.metadata_packed is packed else None
+    _handoff.metadata = None
+    _handoff.metadata_packed = None
+    return metadata
