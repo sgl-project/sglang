@@ -12,7 +12,7 @@ from contextlib import nullcontext
 from functools import partial
 from itertools import count
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import prometheus_client
 import torch
@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     FpmTiming,
+    TimingSegment,
     _FpmPublisherThread,
     decode,
     wrap_forward_with_fpm,
@@ -163,6 +164,124 @@ class TestDeviceTimerCapture(unittest.TestCase):
                 callback = Mock()
                 timing.when_ready(callback)
                 callback.assert_called_once_with(expected)
+
+    def test_pending_group_supports_span_and_segment_consumers(self):
+        reporter = Mock()
+        timer = DeviceTimer(reporter)
+        intervals = [FakeInterval(2, ready=True), FakeInterval(5, start=4)]
+        timing = FpmTiming()
+        with patch.object(_TimingInterval, "create", side_effect=intervals):
+            with timer.capture(timing):
+                with device_timer_ctx(timer, "extend"):
+                    pass
+                with device_timer_ctx(timer, "decode"):
+                    pass
+        timing.seal()
+        publisher = _CollectingPublisher()
+        metrics = ForwardPassMetrics(worker_id="worker", counter_id=17)
+        timing.publish_when_ready(metrics, publisher)
+        segments = []
+
+        def collect_segments(_span):
+            segments.extend(
+                (segment.elapsed_seconds, segment.metadata["category"])
+                for segment in timing.segments
+            )
+
+        timing.when_ready(collect_segments)
+        self.assertEqual(publisher.metrics, [])
+        self.assertEqual(segments, [])
+
+        intervals[-1].ready = True
+        timer._report()
+        self.assertEqual(len(publisher.metrics), 1)
+        self.assertEqual(publisher.metrics[0].wall_time, 0.009)
+        self.assertEqual(publisher.metrics[0].counter_id, 17)
+        self.assertEqual(segments, [(0.002, "extend"), (0.005, "decode")])
+        self.assertEqual(sum(t for t, _ in segments), 0.007)
+        self.assertEqual(
+            reporter.call_args_list,
+            [
+                call(t=0.002, category="extend"),
+                call(t=0.005, category="decode"),
+            ],
+        )
+        timer._report()
+        self.assertEqual(len(publisher.metrics), 1)
+        self.assertEqual(len(segments), 2)
+
+    def test_segments_are_read_only_snapshots_built_once_ready(self):
+        timer = DeviceTimer()
+        interval = FakeInterval(7)
+        interval.elapsed_time = Mock(wraps=interval.elapsed_time)
+        timing = capture_timing(timer, interval)
+        with self.assertRaises(RuntimeError):
+            _ = timing.segments
+
+        interval.ready = True
+        timer._report()
+        segments = timing.segments
+        self.assertEqual(segments, timing.segments)
+        interval.elapsed_time.assert_called_once_with()
+        (segment,) = segments
+        self.assertEqual(segment.elapsed_seconds, 0.007)
+        self.assertEqual(dict(segment.metadata), {"category": "test"})
+        interval.metadata["category"] = "changed"
+        self.assertEqual(segment.metadata["category"], "test")
+        with self.assertRaises(TypeError):
+            segment.metadata["category"] = "changed"
+        with self.assertRaises(AttributeError):
+            segment.elapsed_seconds = 0.0
+        self.assertFalse(hasattr(segment, "__dict__"))
+        self.assertIsInstance(segment, TimingSegment)
+
+    def test_span_only_consumers_skip_segment_durations(self):
+        timer = DeviceTimer()
+        intervals = [FakeInterval(2, ready=True), FakeInterval(5, True, start=4)]
+        for interval in intervals:
+            interval.elapsed_time = Mock(wraps=interval.elapsed_time)
+        timing = capture_timing(timer, *intervals)
+        timer._report()
+        ready = Mock()
+        timing.when_ready(ready)
+        ready.assert_called_once_with(0.009)
+        for interval in intervals:
+            interval.elapsed_time.assert_not_called()
+
+    def test_completion_before_seal_keeps_all_listeners(self):
+        timer = DeviceTimer()
+        timing = FpmTiming()
+        callbacks = [Mock(), Mock(), Mock()]
+        with patch.object(
+            _TimingInterval, "create", return_value=FakeInterval(7, ready=True)
+        ):
+            with timer.capture(timing):
+                timing.when_ready(callbacks[0])
+                timing.when_ready(callbacks[1])
+                with device_timer_ctx(timer, "decode"):
+                    pass
+        callbacks[0].assert_not_called()
+        callbacks[1].assert_not_called()
+        timing.seal()
+        timing.when_ready(callbacks[2])
+        timing.seal()
+        timer._report()
+        for callback in callbacks:
+            callback.assert_called_once_with(0.007)
+
+    def test_captured_intervals_still_reach_late_aggregate_reporters(self):
+        original, late = Mock(), Mock()
+        timer = DeviceTimer(original)
+        interval = FakeInterval(7)
+        timing = capture_timing(timer, interval)
+        interval.ready = True
+        timer.add_reporter(late)
+        timer._report()
+        for reporter in (original, late):
+            reporter.assert_called_once_with(t=0.007, category="test")
+        ready = Mock()
+        timing.when_ready(ready)
+        ready.assert_called_once_with(0.007)
 
 
 class TestSpecDecodeLengthSnapshot(CustomTestCase):

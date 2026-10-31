@@ -19,14 +19,14 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-Next-80B-A3B-Instruct | Ascend A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-1p-in3k5-out1k5-20ms) |
-| Qwen3-Next-80B-A3B-Instruct | Ascend A3 Series Products | 2 | PD Mixed | 6k+1.5k | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in6k-out1k5-bs16) |
+| Qwen3-Next-80B-A3B-Instruct | A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-1p-in3k5-out1k5-20ms) |
+| Qwen3-Next-80B-A3B-Instruct | A3 Series Products | 2 | PD Mixed | 6k+1.5k | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-Next-80B-A3B-Instruct | Ascend A3 Series Products | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-50ms) |
+| Qwen3-Next-80B-A3B-Instruct | A3 Series Products | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -36,7 +36,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 1
 
@@ -149,7 +149,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 
@@ -264,7 +264,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 
