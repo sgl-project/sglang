@@ -342,7 +342,12 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if query.shape[2] != key.shape[2]:
+        # Grouped-query attention stays on cuDNN on sm_10x (CudnnSDPAImpl passes
+        # enable_gqa). Routing it to FA4 put every Cosmos3 layer (32 query, 8 KV
+        # heads) on FA4: 102.4 vs 87.8 s denoise, Cosmos3-Nano 720p 189f, 1xB200.
+        if query.shape[2] != key.shape[2] and (
+            not self._is_sm100 or query.shape[2] % key.shape[2]
+        ):
             return False
         if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
             return False
