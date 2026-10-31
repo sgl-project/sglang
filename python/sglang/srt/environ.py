@@ -1915,6 +1915,8 @@ class Envs:
     # are read only by _resolve_engram_config.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
