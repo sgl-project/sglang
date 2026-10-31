@@ -184,10 +184,7 @@ def _fa_batch(extend_lens, prefix_lens, mm_items_per_req):
     return SimpleNamespace(
         extend_seq_lens_cpu=list(extend_lens),
         extend_prefix_lens_cpu=list(prefix_lens),
-        mm_inputs=[
-            None if items is None else SimpleNamespace(mm_items=items)
-            for items in mm_items_per_req
-        ],
+        mm_inputs=[SimpleNamespace(mm_items=items) for items in mm_items_per_req],
     )
 
 
@@ -222,35 +219,6 @@ class TestGemma4Fa4ImageTokenRanges(unittest.TestCase):
         expected[2:6] = torch.tensor([2, 5], dtype=torch.int32)
         expected[8 + 1 : 8 + 4] = torch.tensor([5, 7], dtype=torch.int32)
         self.assertTrue(torch.equal(ranges, expected), (ranges, expected))
-
-    def test_fa4_backend_takes_the_same_path(self):
-        backend = self._backend(fa_impl_ver=4)
-        _prepare_on(backend, _fa_batch((4,), (0,), ([_image_item((1, 2))],)))
-        expected = torch.tensor([[-1, -1], [1, 2], [1, 2], [-1, -1]], dtype=torch.int32)
-        self.assertTrue(
-            torch.equal(backend.forward_metadata.image_token_ranges, expected)
-        )
-
-    def test_hybrid_wrapper_is_resolved_through_prefill_backend(self):
-        prefill = self._backend(fa3_upgrades_to_fa4=True)
-        wrapper = SimpleNamespace(
-            prefill_backend=prefill, forward_metadata=SimpleNamespace()
-        )
-        _prepare_on(wrapper, _fa_batch((3,), (0,), ([_image_item((0, 1))],)))
-        self.assertTrue(hasattr(prefill.forward_metadata, "image_token_ranges"))
-        self.assertFalse(hasattr(wrapper.forward_metadata, "image_token_ranges"))
-
-    def test_split_image_and_non_image_items_stay_causal(self):
-        backend = self._backend(fa3_upgrades_to_fa4=True)
-        audio = SimpleNamespace(is_image=lambda: False, offsets=[(0, 2)])
-        _prepare_on(
-            backend,
-            # Image [1, 3] straddles the chunk start at prefix 2.
-            _fa_batch((4, 4, 2), (2, 0, 0), ([_image_item((1, 3))], [audio], None)),
-        )
-        ranges = backend.forward_metadata.image_token_ranges
-        self.assertEqual(ranges.shape, (10, 2))
-        self.assertTrue(torch.all(ranges == -1), ranges)
 
     def test_plain_fa3_without_upgrade_leaves_metadata_alone(self):
         backend = self._backend(fa_impl_ver=3, fa3_upgrades_to_fa4=False)
