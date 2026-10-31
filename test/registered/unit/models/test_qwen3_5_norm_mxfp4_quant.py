@@ -199,6 +199,7 @@ class TestMxfp4Consumers(CustomTestCase):
             gdn = dict(
                 _fused_in_proj_weight=torch.empty(1),
                 _fused_in_proj_mxfp4=True,
+                _fused_in_proj_mxfp4_any_m=False,
                 _fused_fp8_in_proj_sources_valid=lambda: True,
             )
             gdn.update(gdn_overrides)
@@ -215,6 +216,11 @@ class TestMxfp4Consumers(CustomTestCase):
         self.assertFalse(applies(1, _fused_in_proj_weight=None))
         self.assertFalse(applies(1, _fused_in_proj_mxfp4=False))
         self.assertFalse(applies(1, _fused_fp8_in_proj_sources_valid=lambda: False))
+        # With tuned rows for every prefill size, any positive row count.
+        any_m = dict(_fused_in_proj_mxfp4_any_m=True)
+        self.assertTrue(applies(65, **any_m) and applies(16384, **any_m))
+        self.assertTrue(applies(16384, capture=True, **any_m))
+        self.assertFalse(applies(0, **any_m))
 
 
 if __name__ == "__main__":

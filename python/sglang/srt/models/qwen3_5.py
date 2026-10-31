@@ -171,6 +171,12 @@ _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
 # prefills do not JIT extra quant/GEMM variants.
 _ROCM_PACKED_IN_PROJ_MAX_M = 64
 _ROCM_PACKED_MXFP4_IN_PROJ_GRAPH_MAX_M = 256
+# Past those caps the packed MXFP4 GEMM still wins once the input norm has
+# quantized for it (it also replaces in_proj_ba's quant + Triton GEMM and the
+# bf16 norm output), but only on tuned AITER rows for its shape: at prefill
+# sizes AITER's default kernel for it is up to 2.5x slower than a tuned tile.
+# Rows at these getPaddedM buckets cover every batch size above 256.
+_ROCM_PACKED_MXFP4_IN_PROJ_TUNED_M = (512, 1024, 2048, 4096, 8192)
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
@@ -398,6 +404,14 @@ def _mxfp4_asm_input(linear: nn.Module, num_tokens: int) -> bool:
         and not get_forward().sp_active
         and not is_dp_attention_enabled()
     )
+
+
+def _aiter_a4w4_tuned(ms, n: int, k: int) -> bool:
+    """Whether AITER's a4w4 tuned configs have a row for an M x N x K GEMM at
+    every M in ms (looked up as gemm_a4w4 does, incl. its M padding)."""
+    from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+    return all(get_GEMM_config(m, n, k) is not None for m in ms)
 
 
 def _output_gate_mxfp4_quant(
@@ -639,6 +653,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_in_proj_ba_width = 0
         self._fused_in_proj_scale: Optional[torch.Tensor] = None
         self._fused_in_proj_mxfp4 = False
+        self._fused_in_proj_mxfp4_any_m = False
         self._fused_in_proj_sources = None
         self._derived_weight_cache_error = None
         self._fused_input_proj_cpu_enabled = LazyValue(
@@ -1049,6 +1064,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_in_proj_weight = weight
         self._fused_in_proj_scale = scale
         self._fused_in_proj_mxfp4 = True
+        self._fused_in_proj_mxfp4_any_m = _aiter_a4w4_tuned(
+            _ROCM_PACKED_MXFP4_IN_PROJ_TUNED_M, weight.shape[0], 2 * weight.shape[1]
+        )
         self._fused_in_proj_qkvz_width = qkvz_width
         self._fused_in_proj_ba_width = ba_width
         self._fused_in_proj_sources = tuple(
@@ -1109,7 +1127,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             _use_aiter
             and self._fused_in_proj_weight is not None
             and self._fused_in_proj_mxfp4
-            and 0 < num_tokens <= max_m
+            and 0 < num_tokens
+            and (num_tokens <= max_m or self._fused_in_proj_mxfp4_any_m)
             and not torch.compiler.is_compiling()
             and not get_forward().sp_active
             and not is_dp_attention_enabled()
