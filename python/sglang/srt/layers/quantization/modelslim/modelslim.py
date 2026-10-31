@@ -281,6 +281,10 @@ class ModelSlimConfig(QuantizationConfig):
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
+            if prefix_in_quant_config + ".weight" not in self.quant_description:
+                # Fused-layout checkpoints (e.g. MiMo-V2.5 fused_qkv) keep the
+                # fused name in the quant description; fall back to it.
+                prefix_in_quant_config = self._resolve_quant_prefix(prefix)
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
