@@ -1,4 +1,4 @@
-"""AITER unified-verify metadata when the scheduler hands over no host seq_lens."""
+"""AITER verify: unified-verify metadata without host seq_lens, and DCP head padding."""
 
 import unittest
 from types import SimpleNamespace
@@ -125,6 +125,69 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
             backend,
             lambda fb: backend.init_forward_metadata_out_graph(fb, in_capture=False),
         )
+
+
+_CPRR_QUERY = dict(
+    cp_world_size=8, fast_mode=True, intra_batch_mode=False, v_head_dim=512
+)
+
+
+def _cprr_kernel_heads(gathered_heads, q_len):
+    return aiter_backend._asm_cprr_kernel_heads(
+        gathered_heads,
+        lambda heads: aiter_backend._asm_cprr_supports_shape(
+            heads, q_len, **_CPRR_QUERY
+        ),
+    )
+
+
+class _ShapeSupport:
+    """aiter's get_mla_decode_shape_support, answering from a fixed verdict table."""
+
+    def __init__(self, native_shapes, supported=True):
+        self.native_shapes, self.supported, self.calls = native_shapes, supported, []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        shape = (kwargs["num_heads"], kwargs["max_seqlen_qo"])
+        return SimpleNamespace(
+            native=shape in self.native_shapes, supported=self.supported
+        )
+
+
+class TestAiterCprrKernelHeads(CustomTestCase):
+    """The DCP verify pads its gathered heads only where aiter would fold them."""
+
+    def test_aiter_verdict_decides_the_padding(self):
+        # Kimi-K3 at DCP8 gathers 96 heads and verifies 8 tokens a request.
+        for native_shapes, expected in (({(96, 8), (128, 8)}, 96), ({(128, 8)}, 128)):
+            support = _ShapeSupport(native_shapes)
+            with patch.object(aiter_backend, "get_mla_decode_shape_support", support):
+                self.assertEqual(_cprr_kernel_heads(96, 8), expected)
+            # The query describes the call the verify makes: fp8, LSE, round robin.
+            self.assertLessEqual(
+                {
+                    "q_dtype": aiter_backend.fp8_dtype,
+                    "kv_dtype": aiter_backend.fp8_dtype,
+                    "return_lse": True,
+                    "cp_round_robin": True,
+                    **_CPRR_QUERY,
+                }.items(),
+                support.calls[0].items(),
+            )
+
+    def test_table_decides_where_aiter_cannot(self):
+        # An aiter that cannot tell (supported=None) or has no query at all.
+        unknown = _ShapeSupport({(96, 8)}, supported=None)
+        for query in (unknown, None):
+            with patch.object(aiter_backend, "get_mla_decode_shape_support", query):
+                self.assertEqual(_cprr_kernel_heads(96, 6), 96)
+                self.assertEqual(_cprr_kernel_heads(96, 8), 128)
+
+    def test_unsupported_shape_is_not_native(self):
+        unsupported = _ShapeSupport({(96, 8), (128, 8)}, supported=False)
+        with patch.object(aiter_backend, "get_mla_decode_shape_support", unsupported):
+            self.assertEqual(_cprr_kernel_heads(96, 8), 0)
 
 
 if __name__ == "__main__":
