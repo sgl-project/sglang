@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
@@ -274,9 +275,33 @@ def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:
     return context_len
 
 
+def _frontend_cpu_key() -> Optional[Tuple[str, Tuple[int, ...]]]:
+    """This process's ``(hostname, allowed cores)``: listeners with equal keys
+    would partition the same cores, or ``None`` without an affinity API."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        return socket.gethostname(), tuple(sorted(os.sched_getaffinity(0)))
+    except OSError:
+        return None
+
+
+def _frontend_cpu_share(
+    cpu_keys: List[Optional[Tuple[str, Tuple[int, ...]]]], rank: int
+) -> Tuple[int, int]:
+    """``(index, count)`` of ``rank`` among the ranks whose key equals its own,
+    in rank order; ``(0, 1)`` for a rank that contributed no key."""
+    own_key = cpu_keys[rank]
+    if own_key is None:
+        return 0, 1
+    peers = [peer for peer, key in enumerate(cpu_keys) if key == own_key]
+    return peers.index(rank), len(peers)
+
+
 def _partition_cores(
     mm_workers: int = 0,
     server_core_budget: Optional[Callable[[int, int], int]] = None,
+    cpu_share: Tuple[int, int] = (0, 1),
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
@@ -287,6 +312,12 @@ def _partition_cores(
     bind is on), so the partition stays NUMA-local. Returns ``(None, None)``
     (server runs unpinned, confined only by the process affinity) when the
     platform has no affinity API or too few cores to split.
+
+    ``cpu_share`` is ``(index, count)`` from ``_frontend_cpu_share``: under
+    attention DP every DP rank hosts a listener, and ranks launched with one
+    affinity mask would otherwise all pin their frontends onto the same first
+    cores of it. The mask is cut into ``count`` contiguous blocks and only
+    block ``index`` is partitioned.
     """
     if not hasattr(os, "sched_getaffinity"):
         return None, None
@@ -295,6 +326,19 @@ def _partition_cores(
     except OSError as e:
         logger.warning("rust server: cannot read cpu affinity: %s", e)
         return None, None
+
+    index, count = cpu_share
+    if count > 1:
+        block = len(allowed) // count
+        if block >= 4:
+            allowed = allowed[index * block : (index + 1) * block]
+        else:
+            logger.warning(
+                "rust server: %d cores shared by %d listeners; their frontend "
+                "cores overlap",
+                len(allowed),
+                count,
+            )
 
     # Need enough cores to reserve launch cores and still pin the pools.
     if len(allowed) < 4:

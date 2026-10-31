@@ -31,7 +31,12 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
-from sglang.srt.rust_server.config import _build_server_args, _partition_cores
+from sglang.srt.rust_server.config import (
+    _build_server_args,
+    _frontend_cpu_key,
+    _frontend_cpu_share,
+    _partition_cores,
+)
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
@@ -173,12 +178,24 @@ class RustServer:
 
     @classmethod
     def _partition_cores(
-        cls, mm_workers: int = 0
+        cls, mm_workers: int = 0, cpu_share: Tuple[int, int] = (0, 1)
     ) -> tuple[Optional[List[int]], Optional[List[int]]]:
         return _partition_cores(
             mm_workers=mm_workers,
             server_core_budget=cls._server_core_budget,
+            cpu_share=cpu_share,
         )
+
+    @classmethod
+    def gather_frontend_cpu_share(cls, hosts_listener: bool) -> Tuple[int, int]:
+        """Collective: every rank calls once; returns this listener's
+        ``(index, count)`` among the listeners on its node with the same CPU
+        affinity mask, for ``_partition_cores``."""
+        world_group = get_parallel().world_group
+        cpu_keys = world_group.all_gather_object(
+            _frontend_cpu_key() if hosts_listener else None
+        )
+        return _frontend_cpu_share(cpu_keys, rank=world_group.rank_in_group)
 
     @classmethod
     def _port_offset(cls) -> int:
@@ -234,7 +251,9 @@ class RustServer:
         )
 
     @classmethod
-    def launch(cls, scheduler: Scheduler) -> RustServer:
+    def launch(
+        cls, scheduler: Scheduler, frontend_cpu_share: Tuple[int, int] = (0, 1)
+    ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
@@ -257,7 +276,8 @@ class RustServer:
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
                 else 0
-            )
+            ),
+            cpu_share=frontend_cpu_share,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python

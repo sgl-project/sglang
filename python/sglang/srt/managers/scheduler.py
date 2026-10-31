@@ -2479,13 +2479,21 @@ class Scheduler(
             if envs.SGLANG_RUST_SERVER.get()
             else []
         )
+        # Also a collective: attention-DP listeners sharing one CPU mask split it.
+        frontend_cpu_share = (
+            self.get_rust_server_class().gather_frontend_cpu_share(hosts_listener)
+            if envs.SGLANG_RUST_SERVER.get()
+            else (0, 1)
+        )
         if not hosts_listener:
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
             return
 
-        rust_server = self.get_rust_server_class().launch(self)
+        rust_server = self.get_rust_server_class().launch(
+            self, frontend_cpu_share=frontend_cpu_share
+        )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
