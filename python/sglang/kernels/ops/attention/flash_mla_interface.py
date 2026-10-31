@@ -12,10 +12,18 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 
 from typing import Optional, Tuple, Union
 
-import flash_mla
 import torch
-from flash_mla import fused_norm_rope_attn_rope_cast as _mega
-from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+# miles' image keeps the FlashMLA nv_dev build Megatron trains with as `flash_mla`
+# and installs this wheel's package as `sgl_flash_mla`.
+try:
+    import sgl_flash_mla as flash_mla
+    from sgl_flash_mla import fused_norm_rope_attn_rope_cast as _mega
+    from sgl_flash_mla.flash_mla_interface import FlashMLASchedMeta
+except ImportError:
+    import flash_mla
+    from flash_mla import fused_norm_rope_attn_rope_cast as _mega
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
 # why the tensor-metadata API (it predates V4.1) reads such a cache as V3.2.
