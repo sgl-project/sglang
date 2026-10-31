@@ -53,7 +53,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
+    default_tree_mask_mode,
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -334,9 +336,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.seq_lens_cpu is not None:
-            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-        else:
-            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+        elif forward_batch.seq_lens_sum is None and getattr(
+            self.draft_attn_backend, "needs_cpu_seq_lens", True
+        ):
+            forward_batch.seq_lens_sum = int(torch.sum(forward_batch.seq_lens).item())
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
@@ -351,7 +355,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         forward_batch.mark_forward_metadata_ready()
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
+        self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: Optional[int]
     ) -> None:
         from types import SimpleNamespace
 
@@ -477,7 +481,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = (
+            int(batch.seq_lens_cpu.sum()) if batch.seq_lens_cpu is not None else None
+        )
         batch.return_hidden_states = False
 
         forward_batch = ForwardBatch.init_new(
@@ -506,6 +512,22 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 forward_batch
             )
 
+        bs = batch.seq_lens.shape[0]
+        target_attn_backend = self.target_worker.model_runner.attn_backend
+        verify_mask = target_attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, default_tree_mask_mode(), True
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
+
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0
+            else:
+                seq_lens_sum = bs * target_attn_backend.max_context_len
+
         (
             tree_mask,
             position,
@@ -519,10 +541,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            mask_mode,
+            tree_mask_buf,
+            fill_prefix_mask=fill_mask,
         )
 
         return FrozenKVMTPVerifyInput(

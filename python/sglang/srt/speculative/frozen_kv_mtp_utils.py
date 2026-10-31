@@ -123,9 +123,9 @@ def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.repeat_interleave(
             topk, dim=0
         )
-        forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-    else:
-        forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
+        forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+    elif forward_batch.seq_lens_sum is not None:
+        forward_batch.seq_lens_sum *= topk
 
     positions = torch.clamp(forward_batch.seq_lens - 1, min=0).to(torch.int64)
     forward_batch.positions = positions
