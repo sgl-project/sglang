@@ -1116,13 +1116,18 @@ def mhc_pre(
         )
 
     if _use_deep_gemm_hc_prenorm():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        # DeepGEMM reduces split-K internally (issue #43743): `num_splits` is
+        # only a scheduling hint and {n_splits, m, n}-shaped partial outputs
+        # are rejected by current builds. Write the {m, n} / {m} results the
+        # kernel produces without `num_splits` and let the finalization stage
+        # consume a single fully-reduced split.
+        n_splits = 1
 
-        gemm_out_mul = torch.empty(
-            n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
+        gemm_out_mul_2d = torch.empty(
+            num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
         )
-        gemm_out_sqrsum = torch.empty(
-            n_splits, num_tokens, dtype=torch.float32, device=residual.device
+        gemm_out_sqrsum_1d = torch.empty(
+            num_tokens, dtype=torch.float32, device=residual.device
         )
 
         from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
@@ -1130,10 +1135,12 @@ def mhc_pre(
         tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            n_splits,
+            gemm_out_mul_2d,
+            gemm_out_sqrsum_1d,
+            None,
         )
+        gemm_out_mul = gemm_out_mul_2d.unsqueeze(0)
+        gemm_out_sqrsum = gemm_out_sqrsum_1d.unsqueeze(0)
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
     else:
@@ -1694,22 +1701,19 @@ def mhc_fused_post_pre(
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
-    else:
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
-
-    gemm_out_mul = torch.empty(
-        n_splits,
-        num_tokens,
-        hc_mult3,
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    gemm_out_sqrsum = torch.empty(
-        n_splits,
-        num_tokens,
-        dtype=torch.float32,
-        device=residual.device,
-    )
+        gemm_out_mul = torch.empty(
+            n_splits,
+            num_tokens,
+            hc_mult3,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        gemm_out_sqrsum = torch.empty(
+            n_splits,
+            num_tokens,
+            dtype=torch.float32,
+            device=residual.device,
+        )
     residual_cur = torch.empty_like(residual_flat)
 
     if num_tokens <= fma_token_threshold:
@@ -1743,25 +1747,31 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
+        # DeepGEMM's tf32_hc_prenorm_gemm reduces split-K internally: the
+        # `num_splits` argument is only a scheduling hint and the outputs must
+        # be {m, n} / {m} without it (or {1, m, n} with it). Allocating
+        # {n_splits, m, n} partials and passing `num_splits` follows an old
+        # DeepGEMM contract that current builds reject with a shape assertion
+        # (issue #43743), so let the kernel pick its own split count and feed
+        # the finalization stage a single fully-reduced split.
+        n_splits = 1
+        gemm_out_mul_2d = torch.empty(
+            num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
+        )
+        gemm_out_sqrsum_1d = torch.empty(
+            num_tokens, dtype=torch.float32, device=residual.device
+        )
         if _use_deep_gemm_hc_prenorm():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
-                gemm_out_mul,
-                gemm_out_sqrsum,
-                num_splits=n_splits,
+                gemm_out_mul_2d,
+                gemm_out_sqrsum_1d,
             )
         else:
             # Fallback mirrors mhc_pre when DeepGEMM prenorm is disabled.
-            n_splits = 1
-            gemm_out_mul_2d = torch.empty(
-                num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-            )
-            gemm_out_sqrsum_1d = torch.empty(
-                num_tokens, dtype=torch.float32, device=residual.device
-            )
             _mhc_pre_gemm_sqrsum_dispatch()(
                 residual_cur.view(num_tokens, hc_hidden_size),
                 fn,
@@ -1770,8 +1780,8 @@ def mhc_fused_post_pre(
                 hc_mult3,
                 hc_hidden_size,
             )
-            gemm_out_mul = gemm_out_mul_2d.unsqueeze(0)
-            gemm_out_sqrsum = gemm_out_sqrsum_1d.unsqueeze(0)
+        gemm_out_mul = gemm_out_mul_2d.unsqueeze(0)
+        gemm_out_sqrsum = gemm_out_sqrsum_1d.unsqueeze(0)
 
     post_mix_cur = torch.empty(
         num_tokens,
@@ -2701,7 +2711,10 @@ def hc_mix_stats_sinkhorn_deepgemm(
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
+    # DeepGEMM reduces split-K internally (issue #43743): without `num_splits`
+    # it writes {m, mix} / {m} results directly, and the reduce kernel's
+    # (s * m + row) * MIX addressing is layout-compatible with NUM_SLICES == 1.
+    slices = 1
     high, low = weight_parts
     assert high.shape == low.shape == (mix, k)
     dev = x_flat.device
@@ -2711,13 +2724,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     if m == 0:
         return pre, post, comb
 
-    mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
+    mix_hi = torch.empty((m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
-    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+    sq = torch.empty((m,), dtype=torch.float32, device=dev)
+    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, None)
     # sq depends only on x_flat, so the second projection recomputes the same
-    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    # values; overwriting it avoids a throwaway (m,) scratch.
+    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, None)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,
