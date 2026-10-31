@@ -5,6 +5,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallIt
 from sglang.srt.function_call.glm47_moe_detector import (
     Glm47MoeDetector,
     get_argument_type,
+    iter_arg_pair_matches,
 )
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
@@ -23,10 +24,15 @@ class IQuestQ1Detector(Glm47MoeDetector):
         if not name:
             return None
         raw = body[cursor:] if cursor >= 0 else ""
-        pairs = self.func_arg_regex.findall(raw)
-        if self.func_arg_regex.sub("", raw).strip() or any(
-            not key.strip() for key, _ in pairs
-        ):
+        pairs = []
+        leftover = []
+        prev_end = 0
+        for start, end, key, value in iter_arg_pair_matches(raw):
+            pairs.append((key, value))
+            leftover.append(raw[prev_end:start])
+            prev_end = end
+        leftover.append(raw[prev_end:])
+        if "".join(leftover).strip() or any(not key.strip() for key, _ in pairs):
             return None
         arguments = self._parse_argument_pairs(pairs, name, tools)
         for key, value in pairs:
