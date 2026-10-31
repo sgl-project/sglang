@@ -3300,6 +3300,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
 
+            # Aborted before any forward (e.g. PD bootstrap/transfer failure):
+            # no prompt tokens processed, so skip the token metrics.
+            count_tokens = not (
+                finish_reason.get("type") == "abort"
+                and not self._entered_forward(recv_obj, i)
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 request_stats.prompt_tokens,
@@ -3311,7 +3318,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
                 time_per_output_token=time_per_output_token,
+                count_tokens=count_tokens,
             )
+
+    @staticmethod
+    def _entered_forward(recv_obj, i: int) -> bool:
+        # Without scheduler time stats, keep counting as before.
+        time_stats = recv_obj.time_stats
+        if not time_stats or i >= len(time_stats):
+            return True
+        return time_stats[i].forward_entry_time > 0
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         if self.dump_requests_exclude_meta_keys and isinstance(
