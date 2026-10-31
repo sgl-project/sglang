@@ -715,7 +715,6 @@ class MiniMaxM3MoE(nn.Module):
                     hidden_states,
                     self.gate.weight,
                     out_dtype=torch.float32,
-                    max_m=self.tiny_router_gemm_max_tokens,
                 )
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
