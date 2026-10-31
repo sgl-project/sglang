@@ -19,7 +19,7 @@ def _v2_hf_config() -> UnlimitedVLConfig:
     )
 
 
-def _declared_overrides(uocr_doc_split=True, **fields) -> dict:
+def _declared_overrides(**fields) -> dict:
     """What the v2 model override declares for a server launched with ``fields``."""
     declarations = collect_model_override_declarations(
         UNLIMITED_OCR_V2_ARCH,
