@@ -810,6 +810,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 plan=forward_batch.iteration_ids,
             )
         elif forward_mode.is_draft_extend_v2():
+            if spec_info is None or spec_info.num_tokens_per_req <= 0:
+                raise RuntimeError(
+                    "FlashInfer draft extend requires speculative metadata with "
+                    "num_tokens_per_req > 0."
+                )
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -927,10 +932,9 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         """Prepare FlashInfer metadata for an FP4 dequant workspace.
 
-        Some FP4 recipes store packed KV but expose an FP8 workspace to
-        FlashInfer prefill. This builds the workspace page table, exact paged
-        lengths, and CPU request ids needed to populate that workspace before
-        the prefill kernel runs.
+        The FP8 workspace uses physical KV slots, including shared prefix
+        pages. The normal index updater builds its page table and exact
+        lengths; only request IDs are mirrored for workspace population.
         """
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
@@ -941,61 +945,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ):
             return
 
-        # Ragged prefill handles current-chunk K/V with raw tensors, so the
-        # paged side only contains cached prefix lengths. Non-ragged prefill
-        # uses the dequant workspace for prefix + current chunk, so it needs
-        # full sequence lengths. These CPU length containers may arrive as
-        # Python lists or CPU tensors depending on the metadata builder.
-        paged_seq_lens_cpu = (
-            forward_batch.extend_prefix_lens_cpu
-            if use_ragged
-            else forward_batch.seq_lens_cpu
-        )
-        raw_paged_seq_lens = (
-            paged_seq_lens_cpu
-            if isinstance(paged_seq_lens_cpu, list)
-            else paged_seq_lens_cpu.tolist()
-        )
-        paged_seq_lens = [
-            int(seq_len.item()) if isinstance(seq_len, torch.Tensor) else int(seq_len)
-            for seq_len in raw_paged_seq_lens
-        ]
-        if sum(paged_seq_lens) <= 0:
-            self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
-                "cpu", non_blocking=True
-            )
-            return
-
-        # dq_buffer layout is page-aligned: each request occupies
-        # ceil(seq_len/page_size)*page_size slots, starting after a page_size
-        # dummy prefix. dq_page_table maps only actual token positions and skips
-        # padding gaps; dq_paged_kernel_lens stores real lengths so FlashInfer
-        # causal offsets use seq_len - q_len, not page_align(seq_len) - q_len.
-        seq_lens_with_scratch = paged_seq_lens + [256]
-        starts = []
-        next_start = self.page_size
-        for seq_len in seq_lens_with_scratch:
-            starts.append(next_start)
-            padded_len = (
-                (seq_len + self.page_size - 1) // self.page_size
-            ) * self.page_size
-            next_start += padded_len
-
-        device = forward_batch.req_pool_indices.device
-        indices = [
-            torch.arange(start, start + seq_len, device=device, dtype=torch.int32)
-            for start, seq_len in zip(starts, seq_lens_with_scratch)
-            if seq_len > 0
-        ]
-        self.dq_page_table = torch.cat(indices) if indices else None
-        self.dq_paged_kernel_lens = torch.tensor(
-            paged_seq_lens,
-            dtype=torch.int32,
-            device=device,
-        )
-        self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
-            "cpu", non_blocking=True
-        )
+        self.cpu_req_pool_indices = forward_batch.req_pool_indices.to("cpu")
 
     def _kv_write_scales(self, layer: RadixAttention):
         if self.kv_cache_quant_method.needs_global_scale():
@@ -1040,6 +990,43 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
+                False,
+                False,
+                swa_out_cache_loc=swa_out_cache_loc,
+            )
+        elif (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self.prefill_uses_dequant_workspace
+        ):
+            spec_info = forward_batch.spec_info
+            if spec_info is None or spec_info.num_tokens_per_req <= 0:
+                raise RuntimeError(
+                    "FlashInfer draft extend requires speculative metadata with "
+                    "num_tokens_per_req > 0."
+                )
+            prefix_lens = forward_batch.extend_prefix_lens
+            if prefix_lens is None:
+                prefix_lens = forward_batch.seq_lens - spec_info.num_tokens_per_req
+
+            # Draft extend uses the same physical-slot page table as target
+            # verification. It intentionally ignores dq_page_table and the CPU
+            # mirrors owned by prompt/chunk prefill; those may remain bound to a
+            # capture-stable full-prefill graph.
+            self.indices_updater_prefill.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=False,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=spec_info,
+                fixed_split_size=self.prefill_split_tile_size,
+                plan=forward_batch.kv_loc_plan,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
                 False,
                 False,
                 swa_out_cache_loc=swa_out_cache_loc,
@@ -1415,18 +1402,59 @@ class FlashInferAttnBackend(AttentionBackend):
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
         if self.prefill_uses_dequant_workspace:
-            kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
-                layer,
-                self.req_to_token_pool.req_to_token,
-                self.cpu_req_pool_indices,
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-                self.page_size,
-                prepare_workspace=self.dq_page_table is not None,
-                use_ragged=self.forward_metadata.use_ragged,
-                k_cur=k,
-                v_cur=v,
-            )
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                phase = (
+                    "target verification"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "draft extend"
+                )
+                if k is None or v is None:
+                    raise RuntimeError(f"NVFP4 {phase} requires current K/V tensors.")
+                spec_info = forward_batch.spec_info
+                if spec_info is None or spec_info.num_tokens_per_req <= 0:
+                    raise RuntimeError(
+                        f"NVFP4 {phase} requires speculative metadata with "
+                        "num_tokens_per_req > 0."
+                    )
+                cache_loc = KVWriteLoc.for_layer(
+                    forward_batch,
+                    layer,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
+                ).loc
+                if cache_loc is None:
+                    raise RuntimeError(f"NVFP4 {phase} requires KV write locations.")
+                prefix_len_delta = (
+                    spec_info.num_tokens_per_req
+                    if forward_batch.forward_mode.is_draft_extend_v2()
+                    else 0
+                )
+                kv_cache = pool.get_flashinfer_speculative_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    k,
+                    v,
+                    cache_loc,
+                    spec_info.num_tokens_per_req,
+                    prefix_len_delta,
+                )
+            else:
+                kv_cache = pool.get_flashinfer_dequant_workspace_kv_buffer(
+                    layer,
+                    self.req_to_token_pool.req_to_token,
+                    self.cpu_req_pool_indices,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    self.page_size,
+                    prepare_workspace=self.cpu_req_pool_indices is not None,
+                    use_ragged=self.forward_metadata.use_ragged,
+                    k_cur=k,
+                    v_cur=v,
+                )
         else:
             kv_cache = self.kv_layers.read(layer.layer_id).kv()
 
@@ -1457,9 +1485,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 sm_scale=layer.scaling,
                 window_left=paged_window_left,
                 logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+                # Workspace dequantization already applies global scales.
+                # Plain FP8 still needs them; use host floats for Graph capture.
+                k_scale=(
+                    1.0 if self.prefill_uses_dequant_workspace else layer.k_scale_float
+                ),
+                v_scale=(
+                    1.0 if self.prefill_uses_dequant_workspace else layer.v_scale_float
+                ),
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -1519,9 +1552,17 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     window_left=paged_window_left,
                     logits_soft_cap=logits_soft_cap,
-                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                    k_scale=layer.k_scale_float,
-                    v_scale=layer.v_scale_float,
+                    # The workspace contains fully dequantized prefix KV.
+                    k_scale=(
+                        1.0
+                        if self.prefill_uses_dequant_workspace
+                        else layer.k_scale_float
+                    ),
+                    v_scale=(
+                        1.0
+                        if self.prefill_uses_dequant_workspace
+                        else layer.v_scale_float
+                    ),
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
@@ -1592,9 +1633,14 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_cache,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            # Workspace values already include global scales. Keep host floats
+            # for plain FP8 so CUDA Graph capture does not copy from the device.
+            k_scale=(
+                1.0 if self.decode_uses_dequant_workspace else layer.k_scale_float
+            ),
+            v_scale=(
+                1.0 if self.decode_uses_dequant_workspace else layer.v_scale_float
+            ),
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
