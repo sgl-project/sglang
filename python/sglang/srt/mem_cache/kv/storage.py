@@ -779,6 +779,12 @@ class KVStorage:
             token_writes_unknown=token_writes_unknown,
         )
 
+    def retire_forward(self, forward_done: torch.cuda.Event) -> None:
+        """The scheduler processed the result of the forward recorded with
+        ``forward_done``: it and every forward recorded before it retire. Page
+        moves decide from retirement, the same point on every rank."""
+        self._allocator.retire_forward(forward_done)
+
     def host_load_alloc(
         self, sub_pool: str
     ) -> Optional[Tuple[Callable[[int], Any], Callable[[Any], Any]]]:

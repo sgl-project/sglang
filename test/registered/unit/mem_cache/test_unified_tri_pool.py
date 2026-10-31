@@ -1688,13 +1688,17 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
         alloc.free(v[:4])
         order = self._trace(flt)
         flt.make_room(side="low", min_bytes=flt.entry_bytes_per_page)
-        self.assertIn("settle", order, "make_room never settled the forward")
+        # No copy, no wait: a settle with nothing to order would hold later
+        # schedule-stream work behind the forward for nothing.
         if "move" in order:
+            self.assertIn("settle", order, "make_room never settled the forward")
             self.assertLess(
                 order.index("settle"),
                 order.index("move"),
                 f"a copy was issued before the settle: {order}",
             )
+        else:
+            self.assertEqual(order, [])
 
     def test_compact_holes_settles_before_the_first_move(self):
         _pool, alloc, _kv = self._tri()
@@ -1711,10 +1715,13 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
     def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
         """The settle before a float move must be a stream wait: a host sync
         there would land on the alloc-shortfall path every time the float moves."""
-        src = inspect.getsource(Band._settle_inflight_forward)
+        settle = inspect.getsource(Band._settle_inflight_forward)
+        self.assertIn("_wait_on_stream", settle)
+        src = inspect.getsource(Band._wait_on_stream)
         self.assertIn("wait_event", src)
-        self.assertNotIn(".item()", src)
-        self.assertNotIn("synchronize()", src)
+        for src in (settle, src):
+            self.assertNotIn(".item()", src)
+            self.assertNotIn("synchronize()", src)
 
 
 class TestFloatHoleCreditIsPerSide(_PoolTestCase):
