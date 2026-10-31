@@ -39,7 +39,7 @@ from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
@@ -191,7 +191,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
 
             exported = []
             for bs in (4, 2, 1):
-                fake_self._set_profile_trace_tag(bs, None, None, None)
+                fake_self._set_profile_trace_tag(bs, None, None)
                 self._flush(on_trace_ready, exported)
 
             self.assertEqual(
@@ -215,7 +215,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             exported = []
             for bs in (2, 1):
                 for attention_variant in ("dense", "sparse"):
-                    fake_self._set_profile_trace_tag(bs, None, None, attention_variant)
+                    fake_self._set_profile_trace_tag(bs, None, attention_variant)
                     self._flush(on_trace_ready, exported)
 
             self.assertEqual(
@@ -236,7 +236,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             )
             exported = []
             for i in range(6):
-                fake_self._set_profile_trace_tag(2, None, None, f"v{i}")
+                fake_self._set_profile_trace_tag(2, None, f"v{i}")
                 self._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 6)
 
@@ -255,7 +255,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 capture_bs=[8], rank=3, tmp=tmp
             )
             runner = type(fake_self).__name__
-            fake_self._set_profile_trace_tag(8, None, None, None)
+            fake_self._set_profile_trace_tag(8, None, None)
             prof = mock.Mock()
             on_trace_ready(prof)
             prof.export_chrome_trace.assert_called_once_with(
@@ -270,18 +270,18 @@ class TestProfileTraceTag(CustomTestCase):
 
     def test_bs_only_when_no_variants(self):
         fake_self = _make_fake_self([1])
-        fake_self._set_profile_trace_tag(16, None, None, None)
+        fake_self._set_profile_trace_tag(16, None, None)
         self.assertEqual(fake_self._profile_trace_tag, "bs_16")
 
-    def test_appends_attention_lora_and_stream(self):
+    def test_appends_attention_and_lora(self):
         fake_self = _make_fake_self([1])
-        fake_self._set_profile_trace_tag(8, 1, "nolora", "sparse")
-        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora_stream_1")
+        fake_self._set_profile_trace_tag(8, "nolora", "sparse")
+        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora")
 
     def test_noop_without_scheduled_profiler(self):
         fake_self = _make_fake_self([1])
         fake_self._profiler = None
-        fake_self._set_profile_trace_tag(8, None, None, "sparse")
+        fake_self._set_profile_trace_tag(8, None, "sparse")
         self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
 
 
@@ -317,7 +317,7 @@ class TestProfileRunnerName(CustomTestCase):
                     )
                 )
                 for bs in (2, 1):
-                    fake_self._set_profile_trace_tag(bs, None, None, None)
+                    fake_self._set_profile_trace_tag(bs, None, None)
                     TestOnTraceReadyNaming._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 4)
             self.assertEqual(len(set(exported)), len(exported))
@@ -370,6 +370,73 @@ class TestOriginalTraceExport(CustomTestCase):
                 )
 
 
+class TestAttentionVariantSizes(CustomTestCase):
+    """Variants captured only at some batch sizes, such as a megakernel's where its
+    step runs, are captured and replayed by label there and once elsewhere."""
+
+    def test_each_label_is_captured_and_replayed_only_at_its_batch_sizes(self):
+        import contextlib
+
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+        )
+
+        variants = SimpleNamespace(
+            capture_labels=("short", "long"),
+            select=lambda fb: (
+                "long" if fb.attention_kv_len_lower_bound >= 8 else "short"
+            ),
+        )
+        both = [("short", "short"), ("long", "long")]
+        for sizes, captures, replays in (
+            # the megakernel runs bs 1 only: one graph at bs 4 and 2, both labels at 1
+            (
+                frozenset({1}),
+                {4: [(None, None)], 2: [(None, None)], 1: both},
+                {1: "long", 2: None},
+            ),
+            # unrestricted (the DSA and candidate variants): every label everywhere
+            (None, {4: both, 2: both, 1: both}, {1: "long", 2: "long"}),
+        ):
+            with self.subTest(sizes=sizes):
+                runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+                runner.capture_bs, runner.compile_bs = [1, 2, 4], []
+                runner.captured_req_width, runner.record_nolora_graph = 7, False
+                runner.model_runner = SimpleNamespace(
+                    model=None, device="cpu", gpu_id=0
+                )
+                runner.attention_graph_variants = variants
+                runner.attention_variant_sizes = sizes
+                captured = {}
+
+                def capture_one_shape(bs, forward, lora, label):
+                    # the label a capture runs under, and what the model reads
+                    seen = (label, get_capture_attention_variant())
+                    captured.setdefault(bs, []).append(seen)
+
+                runner.capture_one_shape = capture_one_shape
+                with (
+                    mock.patch.object(
+                        mod,
+                        "get_parallel",
+                        return_value=SimpleNamespace(tp_rank=1, tp_group=None),
+                    ),
+                    mock.patch.object(mod, "get_available_gpu_memory", return_value=0),
+                    mock.patch.object(
+                        mod.torch_compile_decoration,
+                        "patch_model",
+                        side_effect=lambda *a, **k: contextlib.nullcontext(),
+                    ),
+                ):
+                    runner._capture_one_stream()
+                self.assertEqual(captured, captures)
+                self.assertIsNone(get_capture_attention_variant())
+                long_batch = SimpleNamespace(attention_kv_len_lower_bound=8)
+                for bs, label in replays.items():
+                    replayed = runner._resolve_attention_variant(long_batch, bs)
+                    self.assertEqual(replayed, label, bs)
+
+
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):
     """Every graph variant of a token tier must replay the staged live layout."""
 
@@ -405,6 +472,99 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
                     layout.qo_indptr_device, expected.qo_indptr_device
                 )
                 torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+
+
+class TestPrePlannedReplayRestage(CustomTestCase):
+    """A pre-planned replay may skip copying input_ids and positions again only when
+    the full load copied the same tensors, unwritten since, on the same stream."""
+
+    def _runner(self, stream):
+        import torch
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.dllm_uses_input_embeds = False
+        runner.dllm_input_preparation = None
+        runner.ragged_verify_mode = False
+        runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+        runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            pp_proxy_tensors=None,
+        )
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+            is_draft_worker=False,
+        )
+        runner.device_module = SimpleNamespace(current_stream=lambda: stream[0])
+        runner._capture_graph_size = lambda **_: 2
+        runner._set_dp_real_num_tokens = lambda _: None
+        runner._resolve_lora_variant = lambda _: None
+        runner._resolve_attention_variant = lambda *_: None
+        runner._make_graph_key = lambda *key: key
+        # SGLANG_Q35MF_MKH_N3B on
+        runner._restage_skip, runner._staged_inputs = True, None
+        return runner
+
+    def test_replay_copies_unless_the_full_load_staged_the_same_inputs(self):
+        import torch
+
+        changes = {
+            "nothing": lambda fb, stream: None,
+            "input_ids written": lambda fb, stream: fb.input_ids.add_(1),
+            "input_ids replaced": lambda fb, stream: setattr(
+                fb, "input_ids", fb.input_ids + 1
+            ),
+            "positions written": lambda fb, stream: fb.positions.add_(1),
+            "positions replaced": lambda fb, stream: setattr(
+                fb, "positions", fb.positions + 1
+            ),
+            "another stream": lambda fb, stream: stream.__setitem__(0, "plan"),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                stream = ["forward"]
+                runner = self._runner(stream)
+                fb = SimpleNamespace(
+                    needs_forward_metadata_init=lambda: False,
+                    input_ids=torch.tensor([5, 6, 7, 8]),
+                    positions=torch.tensor([20, 21, 22, 23]),
+                    input_embeds=None,
+                )
+                # what the full load_batch leaves behind
+                runner._staged_inputs = runner._staged_signature(fb)
+                change(fb, stream)
+                for load in range(2):
+                    runner.buffers.input_ids.fill_(-1)
+                    runner.buffers.positions.fill_(-1)
+                    runner.load_batch(fb)
+                    skipped = name == "nothing" and load == 0
+                    for buf, src in (
+                        (runner.buffers.input_ids, fb.input_ids),
+                        (runner.buffers.positions, fb.positions),
+                    ):
+                        want = [-1] * 4 if skipped else src.tolist()
+                        self.assertEqual(buf.tolist(), want, (name, load))
+
+    def test_inference_tensors_are_always_copied(self):
+        """SGLANG_ENABLE_TORCH_INFERENCE_MODE: inference tensors keep no version, so
+        a write since the full load cannot be ruled out."""
+        import torch
+
+        runner = self._runner(["forward"])
+        with torch.inference_mode():
+            fb = SimpleNamespace(
+                needs_forward_metadata_init=lambda: False,
+                input_ids=torch.tensor([5, 6, 7, 8]),
+                positions=torch.tensor([20, 21, 22, 23]),
+                input_embeds=None,
+            )
+            runner._staged_inputs = runner._staged_signature(fb)
+            runner.buffers.input_ids.fill_(-1)
+            runner.buffers.positions.fill_(-1)
+            runner.load_batch(fb)
+        self.assertEqual(runner.buffers.input_ids.tolist(), [5, 6, 7, 8])
+        self.assertEqual(runner.buffers.positions.tolist(), [20, 21, 22, 23])
 
 
 class TestSkipPrefilledInputs(CustomTestCase):
@@ -486,7 +646,6 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         runner._metadata_glue = glue
         runner._skip_glued_replay_view = skip
         runner.enable_two_batch_overlap = False
-        runner.enable_pdmux = False
         runner.model_runner = SimpleNamespace(lora_manager=None)
         runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
         eager = []

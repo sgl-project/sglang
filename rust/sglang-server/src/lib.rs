@@ -18,21 +18,22 @@ mod tokenizer_manager;
 mod utils;
 
 pub use api_server::http::generate_hook::{
-    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook,
+    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
+    GenerateTerminal,
 };
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::MmData;
+pub use message::request::{GenerateRequest, MmData};
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
-pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor};
+pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
 pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
 pub use sglang_mm::pipeline::{Tensor, TensorData};
 
@@ -159,6 +160,15 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 /// or routes ([`Server::start_with_extensions`]). It wraps every route but the
 /// PD bootstrap registry's, inside the access log.
 pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
+
+/// When a `/generate` request's timing starts, as a request extension: an
+/// [`HttpLayer`] that does part of the request's work before `/generate` runs,
+/// work Python's TokenizerManager does after its timer starts, inserts this
+/// when it starts that work, so `e2e_latency` and the time to first token
+/// cover it as Python's do. Without it the timing starts once `/generate` has
+/// normalized the body.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestStart(pub std::time::Instant);
 
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.

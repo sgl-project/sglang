@@ -5,11 +5,12 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    compute_uniform_extend_lengths,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _DEVICE = torch.device("cpu")
 _GRID = [8, 16, 24, 32, 64]
@@ -30,6 +31,26 @@ class TestRaggedTargetVerifyGeometry(CustomTestCase):
         self.assertEqual(geometry.cu_seqlens_q.tolist(), [0, 8, 9, 12])
         self.assertEqual(geometry.cu_seqlens_k.tolist(), [0, 18, 39, 72])
         self.assertEqual(geometry.max_seq_len_q, 8)
+
+
+class TestUniformExtendLengths(CustomTestCase):
+    def test_without_host_seq_lens(self):
+        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+        lengths = compute_uniform_extend_lengths(
+            seq_lens=seq_lens, seq_lens_cpu=None, extend_len=5
+        )
+        self.assertEqual(lengths.seq_lens_extended.tolist(), [15, 25, 35])
+        self.assertIsNone(lengths.seq_lens_cpu_extended)
+        self.assertEqual(lengths.extend_seq_lens_cpu, [5, 5, 5])
+        self.assertEqual(lengths.num_tokens, 15)
+
+    def test_with_host_seq_lens(self):
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        lengths = compute_uniform_extend_lengths(
+            seq_lens=seq_lens, seq_lens_cpu=[10, 20], extend_len=5
+        )
+        self.assertEqual(lengths.seq_lens_cpu_extended, [15, 25])
+        self.assertEqual(lengths.num_tokens, 10)
 
 
 class TestPaddedRaggedVerifyGeometry(CustomTestCase):

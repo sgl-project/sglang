@@ -39,9 +39,11 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    bind_thread_to_device,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    run_on_device,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
@@ -53,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
@@ -74,6 +77,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_memory,
     get_observability,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -337,7 +341,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
-                    transfer_thread_pool_size // transfer_queue_size
+                    transfer_thread_pool_size // transfer_queue_size,
+                    initializer=bind_thread_to_device,
+                    initargs=(self.kv_args.gpu_id,),
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -353,9 +359,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # Track the thread so teardown() can join it: otherwise every
                 # P->D->P flip that re-enters PREFILL leaks threads
                 # (each parked forever in FastQueue.get()).
+                # transfer_worker makes device calls (wait_event.synchronize());
+                # a thread without a current device would run them on device 0
+                # and open a second context on another rank's GPU.
                 t = threading.Thread(
-                    target=self.transfer_worker,
+                    target=run_on_device,
                     args=(
+                        self.kv_args.gpu_id,
+                        self.transfer_worker,
                         queue,
                         executor,
                         (
@@ -1879,8 +1890,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Prefill CP all-gathers before writing the pool, so every CP rank holds
         # the full state regardless of whether the pool is hybrid. We assume no
         # structure about the state rows, so we don't split them across CP ranks
-        # -- just let rank 0 send the whole thing (unless layer split already
-        # shards it per rank).
+        # -- just let rank 0 send the whole thing. Layer-split and page-sharded
+        # DSA pools are exceptions: every owner must send its distinct state.
         if self._should_skip_cp_replicated_state_transfer():
             skip_state = True
 
@@ -1922,6 +1933,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
         )
+
+    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
+        """Pair target/draft indexer pages before narrowing to this owner."""
+        if len(src_indices) != len(dst_indices):
+            raise RuntimeError(
+                "Sharded DSA state page count mismatch: "
+                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+            )
+        local_indices, positions = filter_kv_indices_for_shard_rank(
+            kv_indices=np.asarray(src_indices, dtype=np.int32),
+            index_slice=slice(0, len(src_indices)),
+            shard_rank=self.kv_shard_rank,
+            shard_size=self.kv_shard_size,
+        )
+        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     def maybe_send_extra(
         self,
@@ -2113,6 +2139,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                if st == StateType.DSA and get_parallel().enable_kv_cache_sharding:
+                    src_indices, dst_indices_local = self._prepare_sharded_dsa_indices(
+                        src_indices, dst_indices_local
+                    )
+                    if len(src_indices) == 0:
+                        continue
                 if (
                     st == StateType.DSV4_REQUEST_STATE
                     and len(src_indices) == 0
@@ -3302,6 +3334,27 @@ class MooncakeKVSender(CommonKVSender):
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
         )
+
+    def _record_transfer_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+    ):
+        metric_state_indices = state_indices
+        if metric_state_indices and get_parallel().enable_kv_cache_sharding:
+            # The queued state remains logical and is filtered by the worker.
+            # Account only for this sender's pages, including all target/draft
+            # indexer buffers represented by the DSA component's item lengths.
+            metric_state_indices = list(state_indices)
+            for i, (st, indices) in enumerate(
+                zip(self.kv_mgr.kv_args.state_types, state_indices)
+            ):
+                if st == StateType.DSA and indices is not None:
+                    pages = np.asarray(indices, dtype=np.int32)
+                    metric_state_indices[i] = pages[
+                        pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
+                    ]
+        super()._record_transfer_indices(kv_indices, metric_state_indices)
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
