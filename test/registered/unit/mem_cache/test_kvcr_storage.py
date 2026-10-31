@@ -12,6 +12,7 @@ from contextlib import ExitStack, nullcontext
 from enum import Enum
 from pathlib import Path
 from queue import Queue
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -223,6 +224,36 @@ class _StrictPeerTransport(_CopyTransport):
                 # Remove its local copy only after the final claim releases.
                 self.storage.pop(key, None)
             released.append((handle, key is not None))
+        return released
+
+
+class _GatedFetchTransport(_StrictPeerTransport):
+    """Delay one dependency completion while the real adapter waits unlocked."""
+
+    def __init__(self, layouts):
+        super().__init__(layouts, {})
+        self.submitted, self.resume = Event(), Event()
+        self.delayed = None
+        self.fail_release_handle = None
+
+    def fetch(self, *args, **kwargs):
+        handle = super().fetch(*args, **kwargs)
+        if not self.submitted.is_set():
+            self.delayed = (handle, self.completed.pop(handle))
+            self.submitted.set()
+        return handle
+
+    def poll_completed(self):
+        if self.resume.is_set() and self.delayed is not None:
+            handle, result = self.delayed
+            self.completed[handle] = result
+            self.delayed = None
+        return super().poll_completed()
+
+    def release(self, handles):
+        released = super().release(handles)
+        if self.fail_release_handle in handles:
+            raise RuntimeError("late claim release failed")
         return released
 
 
@@ -1213,6 +1244,95 @@ class TestKVCRStorage(CustomTestCase):
             submit(4)
         self.assertFalse(transport.claims)
         self.assertFalse(reader._lookup_claims)
+
+    def _check_revoked_confirmation(self, partial, survivor_scope, release_error=False):
+        backend = KVCRStore(self.config, _HostPool())
+        backend.register_mem_host_pool_v2(_HostPool(sizes=(9, 3)), PoolName.MAMBA)
+        backend._namespace = storage_namespace(self.config, backend._layouts)
+        transport = backend._runner = _GatedFetchTransport(backend._layouts)
+        keys = self.keys[:2]
+        stored_keys = keys[:1] if partial else keys
+        self.assertEqual(
+            backend.batch_set_v2(
+                [
+                    PoolTransfer(
+                        PoolName.MAMBA,
+                        keys=stored_keys,
+                        host_indices=torch.arange(2 * len(stored_keys)),
+                    )
+                ]
+            )[PoolName.MAMBA],
+            [True] * len(stored_keys),
+        )
+        transfers = [
+            PoolTransfer(
+                PoolName.MAMBA, keys=keys, hit_policy=PoolHitPolicy.TRAILING_PAGES
+            )
+        ]
+        outcomes, errors = [], []
+
+        def confirm():
+            try:
+                outcomes.append(backend.confirm_lookup(keys, transfers, 2, None, "old"))
+            except Exception as error:
+                errors.append(error)
+
+        worker = Thread(target=confirm, daemon=True)
+        worker.start()
+        survivor_claims = {}
+        try:
+            self.assertTrue(transport.submitted.wait(timeout=5))
+            with backend._lock:
+                self.assertEqual(len(transport.claims), len(stored_keys))
+                self.assertEqual(backend._lookup_claims, {"old": {}})
+                backend.release_lookup("old")
+                if release_error:
+                    transport.fail_release_handle = next(iter(transport.claims))
+                if survivor_scope is not None:
+                    self.assertTrue(
+                        backend.confirm_lookup(
+                            keys[:1],
+                            [
+                                PoolTransfer(
+                                    PoolName.MAMBA,
+                                    keys=keys[:1],
+                                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                                )
+                            ],
+                            1,
+                            None,
+                            survivor_scope,
+                        )
+                    )
+                    survivor_claims = dict(backend._lookup_claims[survivor_scope])
+        finally:
+            transport.resume.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        if release_error:
+            self.assertEqual(outcomes, [])
+            self.assertEqual(len(errors), 1)
+            self.assertRegex(str(errors[0]), "late claim release failed")
+        else:
+            self.assertEqual(errors, [])
+            self.assertEqual(outcomes, [False])
+        self.assertEqual(set(transport.claims), set(survivor_claims.values()))
+        self.assertEqual(
+            backend._lookup_claims,
+            {} if survivor_scope is None else {survivor_scope: survivor_claims},
+        )
+        backend.release_all_lookup_claims()
+        self.assertFalse(transport.claims)
+        self.assertFalse(backend._lookup_claims)
+
+    def test_cancelled_confirmation_releases_complete_and_partial_results(self):
+        for partial in (False, True):
+            for survivor_scope in (None, "old", "sibling"):
+                with self.subTest(partial=partial, survivor_scope=survivor_scope):
+                    self._check_revoked_confirmation(partial, survivor_scope)
+
+    def test_late_release_error_preserves_replacement_confirmation(self):
+        self._check_revoked_confirmation(False, "old", release_error=True)
 
     def test_invalid_startup_budget_is_rejected_before_registration(self):
         """An invalid optional deadline must not reach native registration."""
