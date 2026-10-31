@@ -743,7 +743,7 @@ def dispatch_w8a8_block_fp8_linear(
         linear = _dispatch_explicit_backend(backend)
     else:
         # Auto mode: Select based purely on hardware/backend availability
-        linear = _dispatch_auto_backend()
+        linear = _dispatch_auto_backend(act_scale_ue8m0=act_scale_ue8m0)
     # Preserve the unwrapped callable when no activation policy needs binding.
     if act_scale_ue8m0 and linear is deepgemm_w8a8_block_fp8_linear_with_fallback:
         return partial(linear, act_scale_ue8m0=True)
@@ -1167,7 +1167,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
-def _dispatch_auto_backend() -> Callable:
+def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
@@ -1186,7 +1186,13 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif is_npu_arch35():
+    elif is_npu_arch35() and (
+        # UE8M0 checkpoints are served in the MXFP8 layout losslessly; plain
+        # block-FP8 ones (fp32 scales) only join them when load-time
+        # requantization is explicitly enabled (lossy, see
+        # process_npu_arch35_mxfp8_linear_weights), else Triton emulates.
+        act_scale_ue8m0 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+    ):
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             npu_w8a8_mxfp8_linear,
         )
@@ -1453,6 +1459,25 @@ def _deepgemm_block_fp8_supported(
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
 
 
+def _deepgemm_packed_input_valid(input, weight, input_scale, weight_scale) -> bool:
+    """Validate the group-128, column-major TMA layout for packed activations."""
+    if input.ndim != 2 or weight.ndim != 2:
+        return False
+    m, k = input.shape
+    packed_groups = ceil_div(k // 128, 4)
+    padded_m = ceil_align(m, 4)
+    return (
+        input.is_cuda
+        and input.is_contiguous()
+        and k == weight.shape[1]
+        and input.device == weight.device == input_scale.device == weight_scale.device
+        and input_scale.shape == (m, packed_groups)
+        and input_scale.stride() == (1, padded_m)
+        and input.data_ptr() % 16 == 0
+        and input_scale.data_ptr() % 16 == 0
+    )
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1463,18 +1488,36 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if input_scale is not None:
-        # Block32 pre-quantized input reaches Triton below on UE8M0 DeepGEMM.
-        assert (
-            list(block_size) == [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-        )
-        assert input.dtype == torch.float8_e4m3fn
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
-
-    # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    if not _deepgemm_block_fp8_supported(
+    deepgemm_supported = weight.ndim == 2 and _deepgemm_block_fp8_supported(
         weight.shape, block_size, output_dtype
-    ) or _ue8m0_deepgemm_skips_block32(block_size, weight_scale, input_scale):
+    )
+    if input_scale is not None:
+        if input_scale.dtype == torch.int32:
+            # Packed activation scales cannot go through the Triton fallback.
+            if not (
+                deepgemm_supported
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and list(block_size) == [128, 128]
+                and _deepgemm_packed_input_valid(
+                    input, weight, input_scale, weight_scale
+                )
+            ):
+                raise ValueError(
+                    "Pre-quantized DeepGEMM block-FP8 input requires supported "
+                    "[128, 128] weights and TMA-aligned, column-major packed UE8M0 scales"
+                )
+        else:
+            # Block32 pre-quantized input uses the Triton fallback.
+            assert (
+                list(block_size) == [32, 32]
+                or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
+        assert input.dtype == torch.float8_e4m3fn
+    # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
+    if not deepgemm_supported or _ue8m0_deepgemm_skips_block32(
+        block_size, weight_scale, input_scale
+    ):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
@@ -1495,8 +1538,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         )
 
     if input_scale is not None:
-        # Pre-quantized activations retain their per-token group size and
-        # fp32 scales. DeepGEMM aligns scale storage for TMA when needed.
+        # Pre-quantized activations retain their group size and scale format.
+        # DeepGEMM aligns fp32 scale storage for TMA when needed.
         input_2d = input.view(-1, input.shape[-1])
         output = w8a8_block_fp8_matmul_deepgemm(
             input_2d,

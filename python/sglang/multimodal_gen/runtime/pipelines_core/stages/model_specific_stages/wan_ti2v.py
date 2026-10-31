@@ -155,7 +155,8 @@ def expand_wan_ti2v_timestep(
 
     local_seq_len = _get_wan_ti2v_local_seq_len(batch, seq_len, patch_size)
 
-    if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
+    # every rank expands its own mask shard so all ranks see the same rounded t
+    if reserved_frames_mask is not None:
         temp_ts = (reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded).flatten()
         temp_ts = torch.cat(
             [

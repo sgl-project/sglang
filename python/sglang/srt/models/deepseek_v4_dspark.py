@@ -13,9 +13,11 @@ from torch import nn
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -468,6 +470,17 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        self._tp_shard = MarkovW2ShardGeometry(
+            tp_size=tp_size,
+            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
+            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
+            num_embeddings_per_partition=per_partition,
+            num_embeddings_padded=num_padded,
+        )
+        # A rank holding the whole unpadded vocab has nothing to gather, so the
+        # draft step adds the bias, keeps the logits and selects in one pass.
+        if per_partition == self.vocab_size:
+            return
         vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
@@ -477,15 +490,10 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         if shard_group.rank == 0:
             cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
-        self._tp_shard = MarkovW2ShardGeometry(
-            tp_size=tp_size,
-            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
-            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
-            num_embeddings_per_partition=per_partition,
-            num_embeddings_padded=num_padded,
-        )
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=vocab_gather
+            start=self._tp_shard.org_vocab_start,
+            width=self._tp_shard.org_vocab_end - self._tp_shard.org_vocab_start,
+            gather=vocab_gather,
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -678,10 +686,12 @@ DSparkV4Stage = DSparkV4CudaStage if _is_cuda else DSparkV4PlatformStage
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu
+    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
@@ -692,7 +702,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if _is_npu:
+        if cls.uses_own_vocab_modules:
             return (
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
@@ -851,9 +861,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        kvs = self.project_commit_kv(main_hidden=main_hidden, pool=pool)
+        self.store_commit_kv(kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool)
+
+    def project_commit_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> List[torch.Tensor]:
+        """The context rows' per-stage KV, before norm / rope / store; reads no KV
+        location, so it can run before the accept decides what is committed."""
         main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
+        return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
@@ -863,6 +880,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def store_commit_kv(
+        self,
+        *,
+        kvs: List[torch.Tensor],
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+    ) -> None:
+        swa_loc = swa_loc.to(torch.int32)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla
@@ -905,8 +932,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     ) -> LogitsProcessorOutput:
         if not _is_cuda:
             return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
+        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
         try:
-            return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
+            with mega_gate_forward_scope(forward_batch):
+                return self._forward_impl(
+                    input_ids, positions, forward_batch, input_embeds
+                )
         finally:
             residual_batch.clear(forward_batch)
 
@@ -933,7 +965,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            x = mhc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
+            # The kernel widens each element to fp32 as it loads it.
+            x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
@@ -1005,7 +1038,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for name, loaded_weight in weights:
             mapped = (
                 self._remap_dspark_weight_name_npu(name)
-                if _is_npu
+                if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:
