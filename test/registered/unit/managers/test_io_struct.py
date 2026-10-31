@@ -617,7 +617,12 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
 
     def test_parallel_sampling_still_rejects_misaligned_hashes(self):
-        for hashes in ({"mm_hashes": ["a"]}, {"mm_content_hashes": [None]}):
+        for hashes in (
+            {"mm_hashes": ["a"]},
+            {"mm_content_hashes": [None]},
+            {"mm_hashes": []},
+            {"mm_content_hashes": []},
+        ):
             with self.subTest(hashes=hashes):
                 req = GenerateReqInput(
                     input_ids=[1, 2],
@@ -639,12 +644,29 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                     sampling_params={"n": 2},
                 )
                 req.normalize_batch_and_arguments()
-                self.assertEqual(req.image_data, [None, None])
+                self.assertEqual(req.image_data, [media, media])
                 self.assertEqual(req.mm_content_hashes, [None, None])
                 for index in range(2):
-                    self.assertIsNone(req[index].image_data)
-                    self.assertIsNone(req[index].video_data)
-                    self.assertIsNone(req[index].audio_data)
+                    self.assertEqual(req[index].image_data, media)
+                    self.assertEqual(req[index].video_data, media)
+                    self.assertEqual(req[index].audio_data, media)
+        req = GenerateReqInput(
+            text="hello",
+            image_data=[],
+            mm_hashes=[],
+            mm_content_hashes=[],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        for index in range(2):
+            self.assertEqual(req[index].image_data, [])
+            self.assertEqual(req[index].mm_hashes, [])
+            self.assertEqual(req[index].mm_content_hashes, [])
+        req = GenerateReqInput(text=["first", "second"], video_data=[], audio_data=[])
+        req.normalize_batch_and_arguments()
+        for index in range(2):
+            self.assertIsNone(req[index].video_data)
+            self.assertIsNone(req[index].audio_data)
         for params in ({"n": 1}, {"n": 2, "beam_width": 2}):
             with self.subTest(params=params):
                 req = GenerateReqInput(

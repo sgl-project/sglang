@@ -60,7 +60,7 @@ def has_valid_data(data) -> bool:
 
 def batch_single_media_input(value):
     """Keep one request's flat media list together when promoting it to a batch."""
-    if isinstance(value, list) and value and not isinstance(value[0], list):
+    if isinstance(value, list) and (not value or not isinstance(value[0], list)):
         return [value]
     return value
 
