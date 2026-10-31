@@ -40,8 +40,8 @@ _PLUGIN = """
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 
 class ExternalLinker(UnifiedCacheLinker):
-    def __init__(self, server_args, params, *, components, extra_config, forward_stream):
-        self.args = (server_args, params, components, extra_config)
+    def __init__(self, server_args, params, *, cache, extra_config, forward_stream):
+        self.args = (server_args, params, cache, extra_config)
         self.layer_done_counter = object()
         self.forward_stream = forward_stream
         self.pools = {}
@@ -212,13 +212,14 @@ class TestExternalLinkerFactory(unittest.TestCase):
         importlib.invalidate_caches()
 
     def _create(self, *, forward_stream=None, **config):
+        cache = Mock(components={"full"})
         with get_context().override_server_args(
             enable_unified_cache_external_linker=True,
             unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config={**_CONFIG, **config},
         ):
             return _create_startup_linker(
-                "args", "params", components={"full"}, forward_stream=forward_stream
+                "args", "params", cache=cache, forward_stream=forward_stream
             )
 
     def test_passes_forward_stream_to_plugin(self):
@@ -227,7 +228,8 @@ class TestExternalLinkerFactory(unittest.TestCase):
 
     def test_loads_unregistered_module_and_copies_extra_config(self):
         linker = self._create()
-        self.assertEqual(linker.args[:3], ("args", "params", {"full"}))
+        self.assertEqual(linker.args[:2], ("args", "params"))
+        self.assertEqual(linker.args[2].components, {"full"})
         self.assertEqual(linker.args[3], _CONFIG["linker_extra_config"])
         linker.args[3]["nested"]["directory"] = "changed"
         self.assertEqual(
@@ -256,6 +258,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
 
     def test_builtin_selection_and_private_config(self):
         stream = object()
+        cache = Mock(components={"full"})
         for backend, target in (
             (
                 "mooncake",
@@ -277,12 +280,15 @@ class TestExternalLinkerFactory(unittest.TestCase):
                     patch(target) as constructor,
                 ):
                     result = _create_startup_linker(
-                        "args", "params", components={"full"}, forward_stream=stream
+                        "args",
+                        "params",
+                        forward_stream=stream,
+                        cache=cache,
                     )
                     constructor.assert_called_once_with(
                         "args",
                         "params",
-                        components={"full"},
+                        cache=cache,
                         extra_config=config or {},
                         forward_stream=stream,
                     )
@@ -295,6 +301,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
                         self.assertEqual(config["backend_option"]["value"], 1)
 
     def test_explicit_config_does_not_read_launch_defaults(self):
+        cache = Mock(components={"full"})
         with get_context().override_server_args(
             unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config=_CONFIG,
@@ -312,7 +319,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
                         "params",
                         backend="mooncake",
                         config=config,
-                        components={"full"},
+                        cache=cache,
                     )
                     self.assertEqual(constructor.call_args.kwargs["extra_config"], {})
 
@@ -324,7 +331,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "must be a JSON object"),
         ):
-            _create_startup_linker("args", "params", components={"full"})
+            _create_startup_linker("args", "params", cache=Mock(components={"full"}))
 
 
 class TestBuiltinLinkerConfig(unittest.TestCase):
@@ -345,6 +352,7 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
             token_to_kv_pool_allocator=Mock(),
             page_size=1,
         )
+        cache = Mock(components={"full"})
         legacy = {"master_server_address": "legacy:50051"}
         for backend, module_path in (
             ("mooncake", "mooncake_store.mooncake_direct_linker"),
@@ -375,7 +383,7 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                     ) as storage_config,
                     self.assertRaisesRegex(RuntimeError, "storage boundary"),
                 ):
-                    _create_startup_linker("args", params, components={"full"})
+                    _create_startup_linker("args", params, cache=cache)
                 passed = storage_config.call_args.kwargs["extra_config"]
                 expected = legacy if config is None else config
                 self.assertEqual(
