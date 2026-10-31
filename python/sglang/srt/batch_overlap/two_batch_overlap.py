@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     PplxDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.moriep import mori_tbo_child_dispatch_cap
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -475,6 +476,15 @@ class TboDPAttentionPreparer:
                     extend_seq_lens=local_batch.extend_lens,
                     token_num_per_seq=token_num_per_seq,
                 )
+                child_cap = mori_tbo_child_dispatch_cap()
+                if (
+                    child_cap is not None
+                    and num_tokens - self.local_tbo_split_num_tokens > child_cap
+                ):
+                    # Micro-batch B dispatches through an op sized for child_cap
+                    # rows per rank; the gathered min keeps every rank unsplit.
+                    local_can_run_tbo = False
+                    self.local_tbo_split_num_tokens = 0
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
