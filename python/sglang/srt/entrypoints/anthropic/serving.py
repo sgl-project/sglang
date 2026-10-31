@@ -782,11 +782,13 @@ class AnthropicServing:
             logger.warning(
                 "Non-streaming request rejected: %s %s", e.status_code, e.detail
             )
-            return self._error_response(
+            response = self._error_response(
                 status_code=e.status_code,
                 error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
                 message=_scrub_error_message(str(e.detail), e.status_code),
             )
+            response.headers.update(e.headers or {})
+            return response
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -838,6 +840,14 @@ class AnthropicServing:
                 error_type="invalid_request_error",
                 message=str(e),
             )
+        except HTTPException as e:
+            response = self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=_scrub_error_message(str(e.detail), e.status_code),
+            )
+            response.headers.update(e.headers or {})
+            return response
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(

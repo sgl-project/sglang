@@ -17,6 +17,7 @@ import json
 import unittest
 import uuid
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -39,6 +40,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
@@ -6188,6 +6190,96 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                         self._request(chat_template_kwargs=kwargs)
                     )
                 )
+
+
+class TestStreamingAbortStatus(CustomTestCase):
+    def _chunks(self, status):
+        finish = {"type": "abort", "message": "Aborted by scheduler"}
+        if status is not None:
+            finish["status_code"] = status
+
+        async def generate(*args):
+            yield {
+                "text": "",
+                "index": 0,
+                "meta_info": {
+                    "id": "abort-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": finish,
+                },
+            }
+
+        async def no_content(**kwargs):
+            if False:
+                yield
+
+        chat = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(generate_request=generate),
+            chat_encoding_spec=None,
+            reasoning_parser=None,
+            _should_return_input_ids=lambda request: False,
+            _should_return_output_ids=lambda request: False,
+            _generate_stream_content=no_content,
+        )
+        chat._reported_prompt_tokens = (
+            OpenAIServingChat._reported_prompt_tokens.__get__(chat)
+        )
+        chat.create_streaming_error_response = (
+            OpenAIServingBase.create_streaming_error_response.__get__(chat)
+        )
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in OpenAIServingChat._generate_chat_stream(
+                    chat, object(), request, None
+                )
+            ]
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+            return_value=SimpleNamespace(stream_response_default_include_usage=False),
+        ):
+            return asyncio.run(collect())
+
+    def test_integer_and_enum_error_aborts_keep_legacy_error_body(self):
+        for status, expected_type in (
+            (HTTPStatus.BAD_REQUEST, "BAD_REQUEST"),
+            (400, "BAD_REQUEST"),
+            (HTTPStatus.INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR"),
+            (500, "INTERNAL_SERVER_ERROR"),
+            (499, "499"),
+            (599, "599"),
+        ):
+            with self.subTest(status=status, status_type=type(status).__name__):
+                chunks = self._chunks(status)
+                self.assertEqual(len(chunks), 2)
+                error = json.loads(chunks[0][len("data: ") :])["error"]
+                self.assertEqual(error["code"], int(status))
+                self.assertEqual(error["type"], expected_type)
+                self.assertEqual(error["message"], "Aborted by scheduler")
+                self.assertEqual(error["object"], "error")
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_graceful_and_non_error_aborts_remain_normal_finishes(self):
+        for status in (None, 200, "500"):
+            with self.subTest(status=status):
+                chunks = self._chunks(status)
+                data = [json.loads(chunk[len("data: ") :]) for chunk in chunks[:-1]]
+                self.assertFalse(any("error" in item for item in data))
+                self.assertTrue(
+                    any(
+                        choice.get("finish_reason") == "abort"
+                        for item in data
+                        for choice in item.get("choices", [])
+                    )
+                )
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
 
 if __name__ == "__main__":

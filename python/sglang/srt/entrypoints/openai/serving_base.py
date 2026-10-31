@@ -117,9 +117,11 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
         except HTTPException as e:
-            return self.create_error_response(
+            response = self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
+            response.headers.update(e.headers or {})
+            return response
         except ValueError as e:
             return self.create_error_response(
                 message=str(e),
