@@ -3004,6 +3004,11 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+    elif _is_cpu and topk_config.sqrtsoftplus_log1p and custom_routing_function is None:
+        fold_scale_after_routing = True
+        topk_weights, topk_ids = torch.ops.sgl_kernel.dsv41_sqrtsoftplus_topk_cpu(
+            router_logits, correction_bias, top_k_for_gate, renormalize
+        )
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(

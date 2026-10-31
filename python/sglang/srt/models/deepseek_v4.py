@@ -168,6 +168,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
+    _is_cpu,
     _is_cuda,
     _is_hip,
     _is_npu,
@@ -208,6 +209,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     log_info_on_rank0,
     make_pp_layers,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -511,10 +513,22 @@ def _apply_wo_a_bf16_matmul(
     fast_path: bool = False,
     fp8_grid: bool = False,
     emit_fp8: bool = False,
+    cpu_packed: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
+    if cpu_packed:
+        groups = o.transpose(0, 1).contiguous()
+        return torch.stack(
+            [
+                torch.ops.sgl_kernel.weight_packed_linear(
+                    activation, weight, None, True
+                )
+                for activation, weight in zip(groups, wo_a)
+            ],
+            dim=1,
+        )
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
     hip_fast_path = fast_path and _is_hip and _is_gfx95_supported
@@ -1383,19 +1397,25 @@ class MQALayer(MqaAttentionBase):
             prefix,
             compress_ratio=compress_ratio_override,
         )
+        if _is_cpu:
+            alt_streams = None
 
         active_rope_scaling = None
         if self.compress_ratio:
             active_rope_scaling = dict(self.rope_scaling or {})
             active_rope_scaling["rope_type"] = "deepseek_yarn"
-        self.rotary_emb = get_rope_wrapper(
-            head_size=self.rope_head_dim,
-            rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=self.rope_base,
-            rope_scaling=active_rope_scaling,
-            is_neox_style=False,
-            device=get_device().device,
+        self.rotary_emb = (
+            None
+            if _is_cpu
+            else get_rope_wrapper(
+                head_size=self.rope_head_dim,
+                rotary_dim=self.rope_head_dim,
+                max_position=config.max_position_embeddings,
+                base=self.rope_base,
+                rope_scaling=active_rope_scaling,
+                is_neox_style=False,
+                device=get_device().device,
+            )
         )
 
         if _is_npu:
@@ -3046,6 +3066,7 @@ class MQALayer(MqaAttentionBase):
                             fp8_grid=_is_hip and _hip.wo_a_emits_fp8_grid(self),
                             emit_fp8=_is_hip
                             and _hip.wo_b_emits_mxfp8(self, o.shape[0]),
+                            cpu_packed=use_intel_amx_backend(self.wo_a),
                         )
                 else:
                     o = _apply_gguf_grouped_wo_a(
@@ -3118,6 +3139,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         boundary_mhc_fusions: bool = True,
     ) -> None:
         super().__init__()
+        if _is_cpu:
+            alt_streams = None
+            hc_stats_stream = None
+            moe_routed_quant_stream = None
         self.hc_stats_stream = hc_stats_stream
         self.config = config
         self.hidden_size = config.hidden_size
@@ -3783,6 +3808,7 @@ class DeepseekV4Model(nn.Module):
                 )
             )
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+            or not _is_cpu
         )
         device_module = torch.get_device_module()
         num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
@@ -5186,7 +5212,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or _is_xpu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if (
+            _is_npu
+            or _is_xpu
+            or _is_cpu
+            or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
@@ -5577,6 +5608,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         )
                                     continue
                                 param = params_dict[name]
+                                if (
+                                    _is_cpu
+                                    and name.endswith(".attn_sink")
+                                    and loaded_weight.numel() < param.numel()
+                                ):
+                                    loaded_weight = F.pad(
+                                        loaded_weight,
+                                        (0, param.numel() - loaded_weight.numel()),
+                                    )
 
                                 weight_loader = auto_weight_loader(param)
                                 maybe_executor_submit(

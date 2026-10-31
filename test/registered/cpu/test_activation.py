@@ -3,7 +3,9 @@ import sys
 import pytest
 import sgl_kernel  # noqa: F401
 import torch
+import torch.nn.functional as F
 
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import GeluAndMul, SiluAndMul, precision
@@ -42,6 +44,16 @@ def test_activation(m, n, dtype):
         GeluAndMul(x, approximate="tanh"),
         torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x),
     )
+
+
+def test_dsv41_clipped_silu_is_not_gpt_oss_swiglu():
+    """Negative gates stay unclipped; up has no GPT-OSS +1 bias."""
+    x = torch.tensor([[-20, 20, 2, -2, 20, -20, 3, -4]], dtype=torch.bfloat16)
+    output = torch.empty(1, 4, dtype=torch.bfloat16)
+    silu_and_mul_clamp(x, output, 10.0)
+    gate, up = x.float().chunk(2, -1)
+    expected = (F.silu(gate.clamp(max=10)) * up.clamp(-10, 10)).bfloat16()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("gate_3d", [False, True])

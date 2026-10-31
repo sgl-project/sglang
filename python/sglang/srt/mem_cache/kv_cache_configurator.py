@@ -466,7 +466,11 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
-        if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
+        if (
+            current_platform.is_cpu()
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and not is_deepseek_v4(self.model_config.hf_config)
+        ):
             if self.use_mla_backend:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
             if not cpu_has_amx_support():
@@ -1906,7 +1910,14 @@ class KVCacheConfigurator:
             pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
         else:
-            pool_cls = DeepSeekV4TokenToKVPool
+            if self.device == "cpu":
+                from sglang.srt.mem_cache.deepseek_v4_cpu_memory_pool import (
+                    DeepSeekV4CPUTokenToKVPool,
+                )
+
+                pool_cls = DeepSeekV4CPUTokenToKVPool
+            else:
+                pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout

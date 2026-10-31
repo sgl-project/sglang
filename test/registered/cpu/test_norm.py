@@ -5,6 +5,7 @@ import pytest
 import sgl_kernel  # noqa: F401
 import torch
 
+from sglang.kernels.ops.layernorm.mhc import hc_split_sinkhorn, mhc_combine
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import make_non_contiguous, precision
 
@@ -632,6 +633,49 @@ class TestFusedQKNorm:
         atol = rtol = precision[dtype]
         torch.testing.assert_close(q, ref_q, atol=atol, rtol=rtol)
         torch.testing.assert_close(k, ref_k, atol=atol, rtol=rtol)
+
+
+class TestDeepseekV4MHC:
+    def test_cpu_load_skips_gpu_mhc_prewarm(self):
+        """CPU loading must not enter GPU-only JIT prewarm."""
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model._mhc_prewarmed_at_load = False
+        model._prewarm_mhc_kernels()
+        assert model._mhc_prewarmed_at_load
+
+    def test_mhc_orientation_and_float_accumulation(self):
+        """Post-mix consumes input streams by columns, not by rows."""
+        generator = torch.Generator().manual_seed(7)
+        mixes = torch.randn(3, 1, 24, generator=generator)
+        pre, post, comb = hc_split_sinkhorn(
+            mixes, torch.tensor([0.3, 0.7, 0.9]), torch.zeros(24)
+        )
+        torch.testing.assert_close(pre, (mixes[..., :4] * 0.3).sigmoid() + 1e-6)
+        torch.testing.assert_close(post, (mixes[..., 4:8] * 0.7).sigmoid() * 2)
+        expected_comb = (mixes[..., 8:].view(3, 1, 4, 4) * 0.9).softmax(-1) + 1e-6
+        expected_comb = expected_comb / (expected_comb.sum(-2, keepdim=True) + 1e-6)
+        for _ in range(19):
+            expected_comb = expected_comb / (expected_comb.sum(-1, keepdim=True) + 1e-6)
+            expected_comb = expected_comb / (expected_comb.sum(-2, keepdim=True) + 1e-6)
+        torch.testing.assert_close(comb, expected_comb)
+        torch.testing.assert_close(comb.sum(-2), torch.ones(3, 1, 4), atol=2e-6, rtol=0)
+        torch.testing.assert_close(comb.sum(-1), torch.ones(3, 1, 4), atol=2e-6, rtol=0)
+        residual = torch.randn(3, 4, 128, generator=generator).bfloat16()
+        x = mhc_combine(residual.flatten(1), pre[:, 0], 4, torch.bfloat16)
+        torch.testing.assert_close(
+            x, (residual.float() * pre[:, 0, :, None]).sum(1).bfloat16()
+        )
+        actual = torch.ops.sgl_kernel.dsv4_hc_post_cpu(
+            x, residual, post[:, 0].contiguous(), comb[:, 0].contiguous()
+        )
+        expected = (
+            torch.bmm(comb[:, 0].transpose(1, 2), residual.float())
+            + post[:, 0, :, None] * x.float()[:, None]
+        ).bfloat16()
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":
