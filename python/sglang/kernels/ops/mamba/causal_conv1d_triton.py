@@ -704,6 +704,13 @@ QWEN38_GDN_QKV_DIM = (
     2 * QWEN38_GDN_NUM_QK_HEADS * QWEN38_GDN_HEAD_DIM
     + QWEN38_GDN_NUM_V_HEADS * QWEN38_GDN_HEAD_DIM
 )
+# From this many tokens the prologue runs one warp per 16 tokens x 256
+# channels, so each lane moves 4 BF16 (8 bytes) per token instead of one.
+# Smaller batches keep the Conv1D tile, which spreads them over more
+# programs. The per-element math is the same (bit-identical outputs).
+# MI355X, per layer: 16384 tokens 0.53 -> 0.36 ms, 4096 tokens 0.15 -> 0.13 ms.
+QWEN38_GDN_PROLOGUE_WIDE_MIN_TOKENS = 2048
+QWEN38_GDN_PROLOGUE_WIDE_BLOCK_M = 16
 
 
 def can_use_qwen38_gdn_prefill_prologue(
@@ -877,6 +884,10 @@ def qwen38_gdn_prefill_prologue(
     num_cache_lines = conv_states.shape[0]
     state_len = weight.shape[1] - 1
     np2_statelen = triton.next_power_of_2(state_len)
+    if num_tokens >= QWEN38_GDN_PROLOGUE_WIDE_MIN_TOKENS:
+        block_m, num_warps = QWEN38_GDN_PROLOGUE_WIDE_BLOCK_M, 1
+    else:
+        block_m, num_warps = CAUSAL_CONV1D_FWD_BLOCK_M, 4
 
     def grid(meta):
         return (
@@ -931,7 +942,7 @@ def qwen38_gdn_prefill_prologue(
         IS_CONTINUOUS_BATCHING=True,
         USE_PAD_SLOT=True,
         NP2_STATELEN=np2_statelen,
-        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=256,
         FUSE_QWEN38_GDN_PREP=True,
         NUM_QK_HEADS=QWEN38_GDN_NUM_QK_HEADS,
@@ -939,7 +950,7 @@ def qwen38_gdn_prefill_prologue(
         HEAD_DIM=QWEN38_GDN_HEAD_DIM,
         SOFTPLUS_BETA=1.0,
         SOFTPLUS_THRESHOLD=20.0,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     return q, k, v, g, beta

@@ -12,6 +12,8 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     QWEN38_GDN_HEAD_DIM,
     QWEN38_GDN_NUM_QK_HEADS,
     QWEN38_GDN_NUM_V_HEADS,
+    QWEN38_GDN_PROLOGUE_WIDE_BLOCK_M,
+    QWEN38_GDN_PROLOGUE_WIDE_MIN_TOKENS,
     QWEN38_GDN_QKV_DIM,
     can_use_qwen38_gdn_prefill_prologue,
     causal_conv1d_fn,
@@ -328,6 +330,27 @@ class TestQwen38GDNPrefillPrologue(unittest.TestCase):
             has_initial_state=True,
             projection_stride=False,
         )
+
+    def test_wide_launch_tiles_exact(self):
+        """Batches at and above the wide-launch size, with sequences that end
+        inside a token tile or are shorter than one."""
+        tile = QWEN38_GDN_PROLOGUE_WIDE_BLOCK_M
+        wide = QWEN38_GDN_PROLOGUE_WIDE_MIN_TOKENS
+        for lengths in (
+            [wide],
+            [wide + tile - 1],
+            [wide - tile - 3, tile + 1, 2],
+            [16384 + 52],
+        ):
+            for has_initial_state in (False, True):
+                with self.subTest(
+                    lengths=lengths,
+                    has_initial_state=has_initial_state,
+                ):
+                    self._assert_prologue_exact(
+                        lengths,
+                        has_initial_state=has_initial_state,
+                    )
 
     def test_signed_zero_and_softplus_threshold_exact(self):
         inputs = _make_inputs([8], has_initial_state=False)
