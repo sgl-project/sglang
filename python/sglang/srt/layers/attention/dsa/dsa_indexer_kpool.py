@@ -2228,7 +2228,7 @@ class IndexerKPool(MultiPlatformOp):
         query token only sees pools up to its causal position.
         """
         import torch_npu
-        from sgl_kernel_npu.operators.attention import (
+        from sgl_kernel_npu.operators.indexer import (
             build_pooled_page_table,
         )
 

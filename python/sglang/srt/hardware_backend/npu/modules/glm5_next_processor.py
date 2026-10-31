@@ -9,7 +9,7 @@ that layout transformation.
 from functools import wraps
 
 import torch
-from sgl_kernel_npu.operators.mm import flatten_patches
+from sgl_kernel_npu.operators.multimodal import flatten_patches
 
 from sglang.srt.hardware_backend.npu.modules.glm_vl_utils import (
     _patch_processor_method,
