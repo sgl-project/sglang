@@ -2548,7 +2548,10 @@ class Cosmos3DecodingStage(PipelineStage):
         if save_file_path is None:
             return None
         return EncodeWhileDecoding(
-            save_file_path, batch, finish_frames=self._postprocess_tensor
+            save_file_path,
+            batch,
+            # Keep the VAE's returned frames intact if encoding needs to fall back.
+            finish_frames=lambda frames: frames.mul(0.5).add_(0.5).clamp_(0, 1).float(),
         )
 
     @staticmethod

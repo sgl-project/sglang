@@ -14,9 +14,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import supports_nvenc
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -104,8 +106,7 @@ class EncodeWhileDecoding:
 
         height, width = int(frames.shape[-2]), int(frames.shape[-1])
         os.makedirs(os.path.dirname(self.save_file_path) or ".", exist_ok=True)
-        return CudaVideoEncoder.open(
-            self.save_file_path,
+        kwargs = dict(
             device=frames.device,
             height=height,
             width=width,
@@ -115,6 +116,31 @@ class EncodeWhileDecoding:
             audio_sample_rate=self._audio_sample_rate,
             output_compression=self._batch.output_compression,
             x264_preset=self._batch.x264_preset,
+        )
+        if envs.SGLANG_USE_NVENC.get() and supports_nvenc(frames.device):
+            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+                NvencVideoEncoder,
+            )
+
+            try:
+                encoder = NvencVideoEncoder.open(
+                    self.save_file_path,
+                    **kwargs,
+                    # These queued frames are FP32 until the worker converts them.
+                    max_queued_frames=max(
+                        1, _STREAMED_VIDEO_QUEUE_BYTES // (12 * height * width)
+                    ),
+                )
+                if encoder is not None:
+                    return encoder
+            except Exception:
+                logger.warning_once(
+                    "Cannot start streamed NVENC; using CPU encode overlap instead."
+                )
+                logger.debug("Streamed NVENC startup failure", exc_info=True)
+        return CudaVideoEncoder.open(
+            self.save_file_path,
+            **kwargs,
             max_queued_frames=_STREAMED_VIDEO_QUEUE_BYTES // (3 * height * width),
         )
 

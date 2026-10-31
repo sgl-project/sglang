@@ -1186,7 +1186,7 @@ class _RecordingStream:
         raise AssertionError("the decode must not fail")
 
 
-class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
+class TestCosmos3EncodeWhileDecoding(CustomTestCase):
     """The plain video decode feeds the MP4 encoder the frames it would save."""
 
     @staticmethod
@@ -1248,6 +1248,43 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
             torch.equal(torch.cat(streams[0].frames, dim=2), reference.output)
         )
 
+    def test_failed_streamed_encode_keeps_decoded_frames_unchanged(self):
+        """A failed encoder must not cause the fallback to normalize frames twice."""
+
+        class SharedFrameVAE(_FrameVAE):
+            def decode(self, z, on_frames=None):
+                out = torch.tanh(3 * z[:, :3])
+                if on_frames is not None:
+                    on_frames(out)
+                return out
+
+        reference_stage = self._stage()
+        reference_stage.vae = SharedFrameVAE()
+        with mock.patch(
+            f"{_COSMOS3_STAGES}.streamed_video_output_path", return_value=None
+        ):
+            reference = reference_stage.forward(self._batch(), types.SimpleNamespace())
+
+        stage = self._stage()
+        stage.vae = SharedFrameVAE()
+        encoder = mock.Mock()
+        encoder.close.side_effect = OSError("encoder could not finish")
+        with (
+            mock.patch(
+                f"{_COSMOS3_STAGES}.streamed_video_output_path",
+                return_value="/tmp/cosmos3.mp4",
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.entrypoints.utils.CudaVideoEncoder.open",
+                return_value=encoder,
+            ),
+        ):
+            actual = stage.forward(self._batch(), types.SimpleNamespace())
+
+        encoder.write.assert_called_once()
+        self.assertIsNone(actual.output_file_paths)
+        torch.testing.assert_close(actual.output, reference.output)
+
     def test_outputs_that_need_the_frames_are_not_streamed(self):
         stage = self._stage()
         cases = {
@@ -1275,6 +1312,51 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
                             self._batch(**batch_fields), types.SimpleNamespace()
                         )
                     )
+
+    def test_nvenc_and_cpu_encoders_use_the_streamed_decode(self):
+        """Select NVENC when possible, while preserving CPU overlap as fallback."""
+        stage = self._stage()
+        batch = self._batch(
+            save_output=True,
+            return_file_paths_only=True,
+            return_raw_frames=False,
+            enable_frame_interpolation=False,
+            enable_upscaling=False,
+            output_file_path=lambda *_args: "/tmp/cosmos3.mp4",
+            fps=24,
+            num_frames=5,
+            output_compression=None,
+            x264_preset=None,
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=Cosmos3Config(), enable_torch_compile=False
+        )
+        gate = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding"
+        )
+        with (
+            envs.SGLANG_USE_NVENC.override(True),
+            mock.patch(f"{gate}.supports_nvenc", return_value=True) as supported,
+            mock.patch(
+                "sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder."
+                "NvencVideoEncoder.open"
+            ) as nvenc_open,
+            mock.patch(
+                "sglang.multimodal_gen.runtime.entrypoints.utils.CudaVideoEncoder.open"
+            ) as cpu_open,
+        ):
+            frames = torch.zeros(3, 1, 6, 8)
+            stream = stage._encode_while_decoding(batch, server_args)
+            self.assertIsNotNone(stream)
+            self.assertIs(stream._open(frames), nvenc_open.return_value)
+            nvenc_open.assert_called_once()
+            self.assertGreater(nvenc_open.call_args.kwargs["max_queued_frames"], 0)
+            cpu_open.assert_not_called()
+
+            supported.return_value = False
+            stream = stage._encode_while_decoding(batch, server_args)
+            self.assertIs(stream._open(frames), cpu_open.return_value)
+            cpu_open.assert_called_once()
 
 
 class TestCosmos3DecodeFastPath(unittest.TestCase):
