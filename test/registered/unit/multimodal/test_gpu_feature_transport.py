@@ -327,6 +327,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
+        manager.mm_processor = MagicMock()
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock(
@@ -364,6 +365,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
+        manager.mm_processor = MagicMock()
         manager.encoder_dispatch_ready = {}
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock()
