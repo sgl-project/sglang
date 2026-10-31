@@ -1038,30 +1038,12 @@ class Band:
                 return None
             return self.take_physical(num_pages * self.page_size)
 
-    def take_planned_physical_pages(self, take) -> Optional[torch.Tensor]:
-        """Apply a no-relief take only while its source geometry still holds."""
-        from sglang.srt.mem_cache.kv.alloc.pricing import snapshot_band
-
-        current = snapshot_band(self)
-        if (
-            current.low_byte != take.low_byte
-            or current.high_byte != take.high_byte
-            or current.holes != take.holes
-            or current.live != take.live
-        ):
-            return None
-        if take.fresh is not None:
-            start, end = take.fresh
-            if (
-                start * self.entry_bytes_per_page
-                < self._chain_high_frontier_below_bytes()
-                or end * self.entry_bytes_per_page
-                > self._chain_low_frontier_above_bytes()
-            ):
-                return None
+    def take_planned_pages(self, take) -> Optional[torch.Tensor]:
+        """Take a plan's pages for this band (a `PlanTake` of the current
+        snapshot): holes first, then the planned extension."""
         if self.grow_direction == "float":
-            return self.take_physical_pages(take.pages, placement=take.fresh)
-        return self.take_physical_pages(take.pages)
+            return self.take_physical_pages(take.count(), placement=take.pages)
+        return self.take_physical_pages(take.count())
 
     def _sorted_free_phys_pages(self) -> torch.Tensor:
         """`_free_phys_pages` in ascending order. Sorts on the device, and only
