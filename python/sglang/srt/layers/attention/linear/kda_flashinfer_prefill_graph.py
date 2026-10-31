@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.kda_input_pack import contiguous_kda_inputs
+
 
 class FlashInferKDAPrefillGraph:
     def __init__(self, *, wrapper_cls, num_tokens, max_seqs, track, device):
@@ -68,12 +70,13 @@ class FlashInferKDAPrefillGraph:
                 checkpoint_state_indices=self.checkpoint_indices,
                 checkpoint_every_n_tokens=64,
             )
+        q, k, v, g, beta = contiguous_kda_inputs(q, k, v, g, beta)
         return wrapper.run(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
-            g=g.contiguous(),
-            beta=beta.contiguous(),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
             A_log=layer.A_log.reshape(-1).float().contiguous(),
             dt_bias=layer.dt_bias.reshape(-1).float().contiguous(),
             initial_state=ssm_states,
