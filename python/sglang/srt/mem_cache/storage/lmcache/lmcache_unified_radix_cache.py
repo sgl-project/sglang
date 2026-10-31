@@ -847,6 +847,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.prefix_published = True
 
     def _submit_store(self, req: Req, token_ids: list[int]) -> None:
+        # The connector records its producer-ready event on the current stream.
+        # Include both model KV writes and caller-side index preparation before
+        # allowing an asynchronous transfer to read the cache.
+        self._forward_stream.wait_stream(
+            torch.cuda.current_stream(self._forward_stream.device)
+        )
+        with torch.cuda.stream(self._forward_stream):
+            self._submit_store_on_forward_stream(req, token_ids)
+
+    def _submit_store_on_forward_stream(self, req: Req, token_ids: list[int]) -> None:
         key = RadixKey(
             token_ids,
             req.extra_key,
