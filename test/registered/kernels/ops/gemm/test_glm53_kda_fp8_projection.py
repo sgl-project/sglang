@@ -85,6 +85,9 @@ def make_layer(n, k, seed=0):
     method = glm5_next._KdaFp8Config(is_checkpoint_fp8_serialized=False)
     method = method.get_quant_method(None, "")
     layer = torch.nn.Module()
+    layer.quant_method = (
+        method  # as LinearBase sets it; the model loader finds layers by it
+    )
     with torch.device("cuda"):
         method.create_weights(layer, k, [n], k, n, torch.bfloat16)
     weight = random_weight(n, k, seed)
@@ -444,9 +447,15 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         error = _unsupported_derived_weight_cache_error(layer)
         self.assertIsNotNone(error)
         self.assertIn("SGLANG_OPT_GLM53_KDA_PTPC_MODULES", error)
-        exporter = SimpleNamespace(get_model=lambda: layer)
+        exporter = WeightExporter(
+            tp_rank=0,
+            tp_size=1,
+            gpu_id=0,
+            get_model_path=lambda: "",
+            get_model=lambda: layer,
+        )
         with self.assertRaisesRegex(RuntimeError, "SGLANG_OPT_GLM53_KDA_PTPC_MODULES"):
-            WeightExporter._check_weight_export_supported(exporter)
+            exporter._check_weight_export_supported()
 
     def test_bf16_weight_memory_is_released_after_quantization(self):
         # TP8's padding copies the BF16 weight;
