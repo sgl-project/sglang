@@ -1327,6 +1327,10 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer._report()
         if not ENABLE_METRICS_DEVICE_TIMER:
             return
+        # A device without timing events contributes no GPU time, and 0/cpu_time
+        # would publish a permanently idle occupancy instead of no sample at all.
+        if not self.forward_pass_device_timer.timing_supported:
+            return
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
             # Window start: keep the last published value instead of NaN-ing

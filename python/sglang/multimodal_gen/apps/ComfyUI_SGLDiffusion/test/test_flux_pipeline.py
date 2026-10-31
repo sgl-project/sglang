@@ -12,10 +12,12 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.test.passthrough import (
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def test_comfyui_flux_pipeline_direct() -> None:
     """Test FluxPipeline with custom inputs."""
+    device = current_platform.device_type
     model_path = os.environ.get(
         "SGLANG_TEST_FLUX_MODEL_PATH",
         "black-forest-labs/FLUX.1-dev",  # Supports both safetensors file and diffusers format
@@ -43,7 +45,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
         batch_size,
         hidden_states_seq_len,
         hidden_states_dim,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
 
@@ -51,18 +53,18 @@ def test_comfyui_flux_pipeline_direct() -> None:
         batch_size,
         encoder_seq_len,
         encoder_dim,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
 
     pooled_projections = torch.ones(
         batch_size,
         pooled_dim,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
 
-    timesteps = torch.tensor([1000], dtype=torch.long, device="cuda")
+    timesteps = torch.tensor([1000], dtype=torch.long, device=device)
 
     sampling_params = SamplingParams.from_user_sampling_params_args(
         generator.server_args.model_path,
@@ -98,14 +100,14 @@ def test_comfyui_flux_pipeline_direct() -> None:
             batch_size,
             77,
             clip_dim,
-            device="cuda",
+            device=device,
             dtype=torch.bfloat16,
         )
         negative_encoder_hidden_states = torch.ones(
             batch_size,
             encoder_seq_len,
             encoder_dim,
-            device="cuda",
+            device=device,
             dtype=torch.bfloat16,
         )
         req.negative_prompt_embeds = [
@@ -133,17 +135,17 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
     if req.seed is not None:
         generator_device = req.generator_device
-        device_str = "cuda" if generator_device == "cuda" else "cpu"
+        device_str = device if generator_device == device else "cpu"
         req.generator = [
             torch.Generator(device_str).manual_seed(req.seed + i)
             for i in range(req.num_outputs_per_prompt)
         ]
     else:
         req.generator = [
-            torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
+            torch.Generator(device) for _ in range(req.num_outputs_per_prompt)
         ]
 
-    latents = check_passthrough_output(generator, req)
+    latents = check_passthrough_output(generator, req, device=device)
     print(f"latents.shape: {latents.shape}")
 
 
