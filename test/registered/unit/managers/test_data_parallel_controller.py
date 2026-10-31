@@ -157,6 +157,14 @@ class TestLocalKvEventSources(CustomTestCase):
             "block_size": block_size,
         }
 
+    @staticmethod
+    def _hint(rank):
+        return {
+            "dp_rank": rank,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": f"tcp://127.0.0.1:{19500 + rank}",
+        }
+
     def test_scheduler_reports_logical_block_size_or_no_source(self):
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.scheduler_components.kv_events_publisher import (
@@ -193,6 +201,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller.env_lock = threading.Lock()
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
+        controller.local_kv_hint_sources = []
         controller.run_scheduler_process_func = MagicMock()
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
@@ -204,10 +213,16 @@ class TestLocalKvEventSources(CustomTestCase):
                         "max_total_num_tokens": 64,
                         "max_req_input_len": 32,
                         "kv_event_sources": sources,
+                        **({"kv_hint_sources": hints} if hints else {}),
                     }
                 )
             )
-            for sources in ([self._source(2)], [], [self._source(3)], [])
+            for sources, hints in (
+                ([self._source(2)], [self._hint(2)]),
+                ([], []),
+                ([self._source(3)], [self._hint(3)]),
+                ([], []),
+            )
         ]
         with (
             get_context().override_server_args(
@@ -237,6 +252,9 @@ class TestLocalKvEventSources(CustomTestCase):
             )
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
+        )
+        self.assertEqual(
+            controller.local_kv_hint_sources, [self._hint(2), self._hint(3)]
         )
 
 
