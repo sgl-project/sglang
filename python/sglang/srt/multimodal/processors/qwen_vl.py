@@ -810,6 +810,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         entry_time = time.perf_counter()
         base_output = await self.legacy_load_mm_data(
             prompt=input_text,
+            input_ids=input_text if isinstance(input_text, list) else None,
             image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
