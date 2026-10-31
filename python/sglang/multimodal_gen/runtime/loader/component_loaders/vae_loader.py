@@ -9,6 +9,9 @@ from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
+    MiniMaxH3VideoVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -222,7 +225,13 @@ def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
     state = vae.state_dict()
     for name, tensor in mapped.items():
         param = state.get(name)
-        if param is None or param.shape != tensor.shape or tensor.dtype != dtype:
+        if (
+            param is None
+            or param.shape != tensor.shape
+            or tensor.dtype != dtype
+            # The mapping is host memory; it never replaces a device weight.
+            or param.device.type != "cpu"
+        ):
             return False
     vae.load_state_dict(mapped, strict=False, assign=True)
     return True
@@ -283,6 +292,16 @@ def _rehome_cast_weights_to_file(
         return prepare(dtype), False
 
 
+def _holds_host_weights(vae) -> bool:
+    # The store re-homes host copies; a resident component has none, and
+    # adopting one would assign host mappings into a device module.
+    parameters = getattr(vae, "parameters", None)
+    if parameters is None:
+        return True
+    devices = {tensor.device.type for tensor in parameters()}
+    return not devices or devices == {"cpu"}
+
+
 def _hold_decoder_weights_in_decode_dtype(
     vae,
     server_args: ServerArgs,
@@ -300,6 +319,11 @@ def _hold_decoder_weights_in_decode_dtype(
     video decoder drops from 9.7 to ~4.9 GiB, which is the difference between
     restreaming a third of it per tile and holding all 36 blocks on a 12 GiB
     card for the decode.
+
+    The file-backed store (``_rehome_cast_weights_to_file``) is a host-memory
+    measure: it is written and adopted only by a component that starts on the
+    host. A resident start keeps the cast on its device and leaves any store
+    from an earlier host start for the next one.
     """
     component_type = component_type or _normalize_component_type(component_name)
     if component_type not in ("vae", "video_vae"):
@@ -314,19 +338,30 @@ def _hold_decoder_weights_in_decode_dtype(
         return
     if not autocast_enabled(dtype, server_args.disable_autocast):
         return
-    if component_model_path and not envs.SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE:
+    on_host = _holds_host_weights(vae)
+    if (
+        on_host
+        and component_model_path
+        and not envs.SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE
+    ):
         held, file_backed = _rehome_cast_weights_to_file(
             vae, dtype, component_model_path, component_name, prepare
         )
     else:
         held, file_backed = prepare(dtype), False
     if held:
+        if file_backed:
+            placement = "file-backed"
+        elif on_host:
+            placement = "anonymous host memory"
+        else:
+            placement = "device memory"
         logger.info(
             "VAE: %s holds %d decoder weights in %s from load (%s)",
             component_name,
             held,
             dtype,
-            "file-backed" if file_backed else "anonymous host memory",
+            placement,
         )
 
 
@@ -538,6 +573,37 @@ class VAELoader(WeightOverrideComponentLoader):
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
 
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        # Only the MiniMax-H3 video decoder has an online quantizer; every
+        # other VAE keeps the fail-closed base behavior.
+        quantization = server_args.component_quantizations.get(component_name)
+        if (
+            quantization == "fp8"
+            and self.structural_component_type(component_name) in ("vae", "video_vae")
+            and isinstance(
+                server_args.pipeline_config.vae_config, MiniMaxH3VideoVAEConfig
+            )
+        ):
+            return quantization
+        return super().resolve_component_quantization_override(
+            server_args, component_name
+        )
+
+    def _quantize_decoder_if_requested(
+        self, vae, server_args: ServerArgs, component_name: str
+    ) -> None:
+        if (
+            self.resolve_component_quantization_override(server_args, component_name)
+            is None
+        ):
+            return
+        swapped = vae.quantize_decoder_fp8()
+        logger.info(
+            "VAE: %s holds %d decoder linears in online FP8", component_name, swapped
+        )
+
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
@@ -718,6 +784,7 @@ class VAELoader(WeightOverrideComponentLoader):
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
             _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
+            self._quantize_decoder_if_requested(vae, server_args, component_name)
             return current_platform.optimize_vae(vae)
 
         loaded = {}
@@ -785,5 +852,6 @@ class VAELoader(WeightOverrideComponentLoader):
             component_weights_path,
             component_type=component_type,
         )
+        self._quantize_decoder_if_requested(vae, server_args, component_name)
         vae = current_platform.optimize_vae(vae)
         return vae

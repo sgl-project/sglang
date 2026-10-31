@@ -1,3 +1,4 @@
+import os
 import pathlib
 import unittest
 from tempfile import TemporaryDirectory
@@ -13,6 +14,9 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
@@ -66,6 +70,7 @@ class _FakeServerArgs:
         self.component_quantizations = {}
         self.component_precisions = {}
         self.component_direct_gpu_weight_loading = {}
+        self.disable_autocast = False
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
@@ -442,6 +447,157 @@ class TestDirectGPUVAEState(unittest.TestCase):
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_only_the_h3_video_vae_admits_the_fp8_quantization_override(self):
+        loader = vae_loader.VAELoader()
+        h3_args = _FakeServerArgs(MiniMaxH3PipelineConfig())
+        h3_args.component_quantizations = {"video_vae": "fp8"}
+        self.assertEqual(
+            loader.resolve_component_quantization_override(h3_args, "video_vae"),
+            "fp8",
+        )
+
+        h3_args.component_quantizations = {"video_vae": "int8"}
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "quantization override"
+        ):
+            loader.resolve_component_quantization_override(h3_args, "video_vae")
+
+        qwen_args = _FakeServerArgs(QwenImagePipelineConfig())
+        qwen_args.component_quantizations = {"vae": "fp8"}
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "quantization override"
+        ):
+            loader.resolve_component_quantization_override(qwen_args, "vae")
+
+    def test_fp8_override_quantizes_the_h3_decoder_before_optimize_vae(self):
+        class _H3LikeVAE(nn.Module):
+            def __init__(self, *_args, **_kwargs):
+                super().__init__()
+                self.proj = nn.Linear(2, 2, bias=False)
+                self.calls = []
+
+            def quantize_decoder_fp8(self):
+                self.calls.append("fp8")
+                return 144
+
+        def optimize(vae):
+            vae.calls.append("optimize")
+            return vae
+
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(MiniMaxH3PipelineConfig())
+        server_args.component_quantizations = {"video_vae": "fp8"}
+        latent_stats = {
+            "latents_mean": [0.0] * 24,
+            "latents_std": [1.0] * 24,
+        }
+        with (
+            TemporaryDirectory() as root,
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={"_class_name": "TestVAE", **latent_stats},
+            ),
+            patch.object(
+                vae_loader.ModelRegistry,
+                "resolve_model_cls",
+                return_value=(_H3LikeVAE, None),
+            ),
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            patch.object(
+                vae_loader.current_platform, "optimize_vae", side_effect=optimize
+            ),
+        ):
+            source = pathlib.Path(root) / "source"
+            source.mkdir()
+            safetensors_save_file(
+                {"proj.weight": torch.eye(2)}, source / "model.safetensors"
+            )
+            loaded = loader.load_customized(root, server_args, "video_vae")
+
+        self.assertEqual(loaded.calls, ["fp8", "optimize"])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_a_host_start_store_does_not_pull_the_fp8_decoder_to_the_host(self):
+        """The auto performance mode starts the video VAE on the host and
+        writes its decode-dtype store; the next, resident start with the FP8
+        decoder must keep its device weights for the installer."""
+
+        class _H3LikeVAE(nn.Module):
+            def __init__(self, *_args, **_kwargs):
+                super().__init__()
+                self.proj = nn.Linear(2, 2, bias=False)
+
+            def prepare_decoder_autocast_weights(self, dtype):
+                converted = int(self.proj.weight.dtype != dtype)
+                self.proj.to(dtype=dtype)
+                return converted
+
+            def quantize_decoder_fp8(self):
+                # The installer's precondition: resident, prepared fp16 weights.
+                weight = self.proj.weight
+                if not (weight.is_cuda and weight.dtype == torch.float16):
+                    raise ValueError(
+                        "Online FP8 requires resident, prepared FP16 decoder weights"
+                    )
+                return 1
+
+        loader = vae_loader.VAELoader()
+        latent_stats = {
+            "latents_mean": [0.0] * 24,
+            "latents_std": [1.0] * 24,
+        }
+        with (
+            TemporaryDirectory() as root,
+            TemporaryDirectory() as cache_root,
+            patch.dict(os.environ, {"SGLANG_DIFFUSION_CACHE_ROOT": cache_root}),
+            # The loader pops _class_name, so each start needs a fresh config.
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                side_effect=lambda *_args, **_kwargs: {
+                    "_class_name": "TestVAE",
+                    **latent_stats,
+                },
+            ),
+            patch.object(
+                vae_loader.ModelRegistry,
+                "resolve_model_cls",
+                return_value=(_H3LikeVAE, None),
+            ),
+            patch.object(
+                vae_loader.current_platform, "optimize_vae", side_effect=lambda vae: vae
+            ),
+        ):
+            source = pathlib.Path(root) / "source"
+            source.mkdir()
+            safetensors_save_file(
+                {"proj.weight": torch.eye(2)}, source / "model.safetensors"
+            )
+            store_dir = pathlib.Path(cache_root) / "decode_dtype_store"
+
+            host_args = _FakeServerArgs(MiniMaxH3PipelineConfig())
+            with patch.object(
+                loader, "target_device", return_value=torch.device("cpu")
+            ):
+                host = loader.load_customized(root, host_args, "video_vae")
+            self.assertEqual(host.proj.weight.dtype, torch.float16)
+            self.assertEqual(host.proj.weight.device.type, "cpu")
+            stores = sorted(store_dir.iterdir())
+            self.assertEqual(len(stores), 1)
+            stored = stores[0].read_bytes()
+
+            fp8_args = _FakeServerArgs(MiniMaxH3PipelineConfig())
+            fp8_args.component_quantizations = {"video_vae": "fp8"}
+            with patch.object(
+                loader, "target_device", return_value=torch.device("cuda")
+            ):
+                resident = loader.load_customized(root, fp8_args, "video_vae")
+            self.assertTrue(resident.proj.weight.is_cuda)
+            self.assertEqual(resident.proj.weight.dtype, torch.float16)
+            self.assertEqual(sorted(store_dir.iterdir()), stores)
+            self.assertEqual(stores[0].read_bytes(), stored)
+
     def test_exact_precision_is_admitted_for_every_vae_component(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())

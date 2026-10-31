@@ -105,6 +105,7 @@ def _server_args(**overrides) -> SimpleNamespace:
         enable_torch_compile=False,
         enable_breakable_cuda_graph=False,
         quantization=None,
+        component_quantizations={},
     )
     args.update(overrides)
     ns = SimpleNamespace(**args)
