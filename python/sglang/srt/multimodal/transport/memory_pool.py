@@ -1,12 +1,4 @@
-"""Shared stream-ordered lifecycle for GPU and NPU multimodal feature pools.
-
-Both accelerators stamp ready/ack words inside the pool allocation and order
-them on device streams with memory value operations: CUDA through the driver's
-32-bit ``cuStreamWriteValue32``/``cuStreamWaitValue32``, NPU through the
-CANN runtime's 64-bit ``aclrtValueWrite``/``aclrtValueWait``
-(``acl.rt.value_write``/``acl.rt.value_wait``), which is why NPU control words
-are twice as wide and 8-byte aligned.
-"""
+"""Shared stream-ordered lifecycle for GPU and NPU multimodal feature pools."""
 
 import logging
 import threading
