@@ -1,26 +1,30 @@
-"""Regression tests for the unified-memory PD pin source.
+"""Regression tests for unified-memory PD transfer ordering.
 
-The source decides when lazy compaction may relocate physical pages. A page is
-exposed to the peer from the moment its address is published until the transfer
-concludes, and for part of that lifetime the request sits in NEITHER end's
-queue. Both cases below are exactly those windows: an earlier version of the
-predicates looked only at `disagg_prefill_inflight_queue` /
-`disagg_decode_transfer_queue` (plus `scheduler.chunked_req`) and reported idle
-here, letting compaction move pages under in-flight RDMA -- silent KV
-corruption with no crash.
+A PD transfer addresses device pages by physical id from the moment the ids are
+published (decode) or translated for a send (prefill) until its engine is done,
+and for part of that lifetime the request sits in NEITHER end's queue. An
+earlier pin keyed off the queues missed those windows and let compaction move
+pages under in-flight RDMA; a later fix pinned every band while any transfer was
+in flight, and another kept each addressed page in place. Pages a transfer
+reads or writes now move like any page unfinished work touches: a copy of a
+page it writes waits its completion flag, a page it reads that a move vacates is
+reused only after it, and nothing the transfer does changes pricing.
 """
 
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import List, Optional, Set
+from typing import Set
 from unittest import mock
 
+import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    disagg_transfers_in_flight,
+    end_network_transfer,
+    record_network_transfer,
 )
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
@@ -30,120 +34,188 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
+    chain_snapshot,
     setup_allocator_context,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _FakeTransferQueue:
-    def __init__(self):
-        self.queue: List[object] = []
-
-
-class _FakePreallocQueue:
-    """Mirrors the real queue's published-destination bookkeeping."""
-
-    def __init__(self):
-        self._num_published_destinations = 0
-
-    @property
-    def has_published_destinations(self) -> bool:
-        return self._num_published_destinations > 0
-
-    def note_destinations_published(self) -> None:
-        self._num_published_destinations += 1
-
-    def note_destinations_queued(self, count: int) -> None:
-        self._num_published_destinations = max(
-            0, self._num_published_destinations - count
+def _tri_pool():
+    setup_allocator_context()
+    bundle = build_unified_bundle(
+        UnifiedGeometry(
+            chain="tri",
+            full_layer_ids=(0,),
+            swa_layer_ids=(1,),
+            state_layer_ids=(2,),
+            lazy=True,
+            device="cpu",
         )
+    )
+    allocator = bundle.token_to_kv_pool_allocator
+    return allocator, allocator.storage
 
 
-class _FakeScheduler:
-    def __init__(self, mode: DisaggregationMode):
-        self.disaggregation_mode = mode
-        self.chunked_req: Optional[object] = None
-        self.disagg_prefill_inflight_queue: List[object] = []
-        self.disagg_prefill_pending_chunk_rids: Set[str] = set()
-        self.disagg_decode_transfer_queue = _FakeTransferQueue()
-        self.disagg_decode_prealloc_queue = _FakePreallocQueue()
-        self.decode_offload_manager = None
+def _physical_pages(band, ids) -> list:
+    pages = band.ids.virtual_to_physical[ids // band.page_size] * band.page_size
+    return (pages // band.pool_page_size).tolist()
 
 
-class TestDecodeMoveGate(CustomTestCase):
-    def test_closed_while_destination_published_but_not_queued(self):
-        """`pop_preallocated` publishes request A's destination addresses via
-        `send_metadata`, then keeps allocating for request B in the same loop;
-        the batch only reaches the transfer queue after the loop returns. B's
-        allocation can urgently flush the peer sub-allocator, so the source must
-        stay busy across that window even though the transfer queue is empty.
-        """
-        scheduler = _FakeScheduler(DisaggregationMode.DECODE)
-        busy = disagg_transfers_in_flight(scheduler)
-        self.assertFalse(busy(), "idle decode node should allow compaction")
+class _Manager(CommonKVManager):
+    """The status path of a connection, without its sockets."""
 
-        # A's destination is now visible to prefill; transfer queue still empty.
-        scheduler.disagg_decode_prealloc_queue.note_destinations_published()
-        self.assertFalse(scheduler.disagg_decode_transfer_queue.queue)
-        self.assertTrue(busy())
-
-        # Handing the batch to the transfer queue transfers responsibility.
-        scheduler.disagg_decode_transfer_queue.queue.append(object())
-        scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
-        self.assertTrue(busy(), "transfer queue still holds it")
-
-        scheduler.disagg_decode_transfer_queue.queue.clear()
-        self.assertFalse(busy())
+    def __init__(self):
+        self.request_status = {}
+        self.deferred_bootstrap = None
+        self._deferred_ack_targets = {}
+        self._deferred_ack_poisoned_rooms = set()
+        self._staging_outstanding = {}
 
 
-class TestPrefillMoveGate(CustomTestCase):
-    def test_closed_after_final_chunk_clears_chunked_req(self):
-        """Scheduling the final chunk clears `scheduler.chunked_req`, but the
-        request only reaches `disagg_prefill_inflight_queue` later in the result
-        path. Earlier middle chunks may still be draining in that window, so the
-        source must not key off `chunked_req` alone.
-        """
-        scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
-        busy = disagg_transfers_in_flight(scheduler)
-        self.assertFalse(busy(), "idle prefill node should allow compaction")
+def _record(allocator, req, pages, *, writes, manager=None, failed_delay=None):
+    record_network_transfer(
+        allocator,
+        req,
+        kv_manager=_Manager() if manager is None else manager,
+        writes=writes,
+        page_indices=np.array(pages, dtype=np.int32),
+        page_size=allocator.page_size,
+        failed_delay=failed_delay,
+    )
 
-        # A middle chunk went out for rid "r0".
-        scheduler.chunked_req = object()
-        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
-        self.assertTrue(busy())
 
-        # Final chunk scheduled: chunked_req cleared, not yet inflight-queued.
-        scheduler.chunked_req = None
-        self.assertFalse(scheduler.disagg_prefill_inflight_queue)
-        self.assertTrue(busy())
+class TestNetworkTransfers(CustomTestCase):
+    def test_transfers_never_change_pricing_or_block_a_band(self):
+        """A rank prices its pool from counts and geometry only, whatever its
+        transfers are doing: rank 0 prices another stage from the same."""
+        allocator, storage = _tri_pool()
+        owner, state = allocator.full_attn_allocator, allocator.mamba_allocator
+        ids = owner.alloc(8 * allocator.page_size)
+        owner.free(ids[: 2 * allocator.page_size])
+        slots = state.alloc(2)
+        before = chain_snapshot(allocator)
+        req = SimpleNamespace(rid="r0", bootstrap_room=1)
+        _record(allocator, req, _physical_pages(owner, ids[-1:]), writes=True)
+        record_network_transfer(
+            allocator,
+            req,
+            kv_manager=_Manager(),
+            writes=True,
+            page_indices=np.array([], dtype=np.int32),
+            page_size=allocator.page_size,
+            state_types=[StateType.MAMBA],
+            state_indices=[[np.array(_physical_pages(state, slots[:1]))]],
+        )
+        self.assertEqual(chain_snapshot(allocator), before)
+        self.assertFalse(any(m.moves_blocked() for m in allocator.members))
+        self.assertFalse(any(m.fixed_pages() for m in allocator.members))
+        end_network_transfer(allocator, req)
+        self.assertEqual(chain_snapshot(allocator), before)
 
-        # Last chunk sent: the request is on the inflight queue, which covers it.
-        scheduler.disagg_prefill_inflight_queue.append(object())
-        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
-        self.assertTrue(busy())
+    def test_a_read_page_moves_and_its_old_row_waits_for_the_transfer(self):
+        """A send's row moves like a page a forward reads; the row it vacates
+        is not handed out until the send is released."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        ids = owner.alloc(8 * page)
+        # The page nearest the frontier is the first a compaction moves.
+        top = _physical_pages(owner, ids[:1])
+        req = SimpleNamespace(rid="r0", bootstrap_room=1)
+        _record(allocator, req, top, writes=False)
+        owner.free(ids[2 * page : 6 * page])  # interior holes
+        self.assertGreater(owner.flush_opportunistic(), 0)
+        self.assertNotEqual(_physical_pages(owner, ids[:1]), top, "it moved")
+        self.assertIn(top[0], owner._pending_reuse_pages_cpu)
+        self.assertNotIn(top[0], owner._free_pages_snapshot())
+        end_network_transfer(allocator, req)
+        owner.flush_opportunistic()
+        self.assertNotIn(top[0], owner._pending_reuse_pages_cpu)
 
-        scheduler.disagg_prefill_inflight_queue.clear()
-        self.assertFalse(busy())
+    def test_only_a_needed_move_takes_a_written_page(self):
+        """An opportunistic flush leaves a page a receive still writes; a
+        flush an allocation needs moves it, ordered after the receive."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        ids = owner.alloc(8 * page)
+        # The page nearest the frontier is the first a compaction moves.
+        top = _physical_pages(owner, ids[:1])
+        req = SimpleNamespace(rid="r0", bootstrap_room=1)
+        _record(allocator, req, top, writes=True)
+        owner.free(ids[2 * page : 6 * page])  # interior holes
+        self.assertEqual(owner.flush_opportunistic(), 0)
+        self.assertEqual(_physical_pages(owner, ids[:1]), top)
+        self.assertGreater(owner.flush_for_allocation(), 0)
+        self.assertNotEqual(_physical_pages(owner, ids[:1]), top)
 
-    def test_reopens_when_middle_sent_request_is_retired_without_final_chunk(self):
-        """A request aborted after a middle chunk never reaches a `last_chunk`
-        send, so its rid is only dropped by the abort/release cleanup. Without
-        that discard the source stays busy for the process lifetime and lazy
-        compaction never packs the free list again -- a liveness leak that ends
-        in allocation failure despite reclaimable space.
-        """
-        scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
-        busy = disagg_transfers_in_flight(scheduler)
+    def test_releasing_the_row_ends_the_transfer(self):
+        """A request aborted mid-transfer never commits; its row release is
+        main's release point, where the transfer ends and its flag publishes."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        ids = owner.alloc(4)
+        req = SimpleNamespace(rid="r0", bootstrap_room=1)
+        manager = _Manager()
+        _record(
+            allocator,
+            req,
+            _physical_pages(owner, ids[:1]),
+            writes=True,
+            manager=manager,
+        )
+        flag, release = storage._network_transfers[req.rid]
+        self.assertFalse(flag.query())
+        with mock.patch.object(storage.requests, "free"):
+            storage.release_row(req)
+        self.assertTrue(flag.query())
+        self.assertTrue(release.released)
+        self.assertFalse(storage._network_transfers)
 
-        scheduler.chunked_req = object()
-        scheduler.disagg_prefill_pending_chunk_rids.add("r0")
-        self.assertTrue(busy())
-
-        # Aborted mid-chunking: chunked_req dropped, no final send, never queued.
-        scheduler.chunked_req = None
-        scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
-        self.assertFalse(busy(), "abort cleanup must let compaction resume")
+    def test_the_status_path_publishes_the_flag(self):
+        """The flag is published by the thread applying the transfer's status,
+        never only by the scheduler loop, which may itself wait on it."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        ids = owner.alloc(4)
+        for status, delay in ((KVPoll.Success, 30.0), (KVPoll.Failed, None)):
+            with self.subTest(status=status):
+                manager = _Manager()
+                req = SimpleNamespace(rid=f"r{status}", bootstrap_room=status)
+                manager.update_status(req.bootstrap_room, KVPoll.Bootstrapping)
+                _record(
+                    allocator,
+                    req,
+                    _physical_pages(owner, ids[:1]),
+                    writes=True,
+                    manager=manager,
+                    failed_delay=delay,
+                )
+                flag, _ = storage._network_transfers[req.rid]
+                self.assertFalse(flag.query())
+                manager.update_status(req.bootstrap_room, status)
+                self.assertTrue(flag.query())
+        # A failed receive publishes only after the engine's deadline.
+        manager = _Manager()
+        req = SimpleNamespace(rid="late", bootstrap_room=7)
+        manager.update_status(7, KVPoll.Bootstrapping)
+        with mock.patch("threading.Timer") as timer:
+            _record(
+                allocator,
+                req,
+                _physical_pages(owner, ids[:1]),
+                writes=True,
+                manager=manager,
+                failed_delay=30.0,
+            )
+            flag, _ = storage._network_transfers[req.rid]
+            manager.update_status(7, KVPoll.Failed)
+            self.assertFalse(flag.query())
+            delay, publish = timer.call_args.args
+            self.assertEqual(delay, 30.0)
+            publish()
+        self.assertTrue(flag.query())
 
 
 class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
@@ -264,68 +336,35 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 )
                 self.assertTrue(all(m.moves_blocked() for m in alloc.members))
 
-    def test_role_switch_keeps_current_pd_pins_and_independent_hicache_pins(self):
-        """Role changes must release old queues without losing protection for
-        new PD transfers or an independent HiCache transfer."""
+    def test_transfers_block_nothing_and_an_independent_pin_source_still_does(self):
+        """Network transfers order moves without blocking a band, so a role
+        switch has nothing to drop or leak; an independent pin source still
+        keeps every band it names in place on its own."""
         for chain in self._CHAINS:
             with self.subTest(chain=chain):
                 alloc = self._chain(chain)
-                scheduler = _FakeScheduler(DisaggregationMode.DECODE)
                 storage = alloc.storage
-                storage.add_pin_source(
-                    storage.sub_pool_names(), disagg_transfers_in_flight(scheduler)
-                )
-                hicache = SimpleNamespace(busy=False)
-                storage.add_pin_source(storage.sub_pool_names(), lambda: hicache.busy)
+                other = SimpleNamespace(busy=False)
+                storage.add_pin_source(storage.sub_pool_names(), lambda: other.busy)
+                owner = alloc.full_attn_allocator
 
                 def capacity_keys():
                     return tuple(m._schedulable_capacity_key() for m in alloc.members)
 
-                idle_keys = capacity_keys()
-
-                def check_pins(blocked):
-                    self.assertEqual(
-                        [m.moves_blocked() for m in alloc.members],
-                        [blocked] * len(alloc.members),
-                    )
-                    if blocked:
-                        self.assertNotEqual(capacity_keys(), idle_keys)
-                    else:
-                        self.assertEqual(capacity_keys(), idle_keys)
-
-                scheduler.disagg_decode_prealloc_queue.note_destinations_published()
-                check_pins(True)
-                scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
-                check_pins(False)
-
-                # Role teardown removes the decode queues; the pool survives.
-                scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-                scheduler.disagg_decode_transfer_queue = None
-                scheduler.disagg_decode_prealloc_queue = None
-                check_pins(False)
-                scheduler.disagg_prefill_pending_chunk_rids.add("prefill")
-                check_pins(True)
-                scheduler.disagg_prefill_pending_chunk_rids.clear()
-                hicache.busy = True
-                check_pins(True)
-                hicache.busy = False
-                check_pins(False)
-
-                scheduler.disaggregation_mode = DisaggregationMode.DECODE
-                scheduler.disagg_prefill_inflight_queue = None
-                scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
-                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
-                check_pins(False)
-                scheduler.disagg_decode_transfer_queue.queue.append(object())
-                check_pins(True)
-                scheduler.disagg_decode_transfer_queue.queue.clear()
-                offload = SimpleNamespace(busy=True)
-                scheduler.decode_offload_manager = SimpleNamespace(
-                    has_inflight_device_transfer=lambda: offload.busy
-                )
-                check_pins(True)
-                offload.busy = False
-                check_pins(False)
+                ids = owner.alloc(alloc.page_size)
+                keys = capacity_keys()
+                pages = owner.ids.virtual_to_physical[ids[:1] // owner.page_size]
+                req = SimpleNamespace(rid="r0", bootstrap_room=1)
+                _record(alloc, req, pages.tolist(), writes=True)
+                self.assertFalse(any(m.moves_blocked() for m in alloc.members))
+                self.assertEqual(capacity_keys(), keys)
+                end_network_transfer(alloc, req)
+                self.assertEqual(capacity_keys(), keys)
+                other.busy = True
+                self.assertTrue(all(m.moves_blocked() for m in alloc.members))
+                self.assertNotEqual(capacity_keys(), keys)
+                other.busy = False
+                self.assertFalse(any(m.moves_blocked() for m in alloc.members))
 
     def test_every_ordering_event_reaches_every_member(self):
         """Every member that can relocate pages must hear each event its moves

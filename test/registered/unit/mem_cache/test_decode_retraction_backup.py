@@ -368,7 +368,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
             transfer_backend=TransferBackend.FAKE,
             is_mla_backend=False,
             enable_staging=False,
-            transfer_queue=SimpleNamespace(queue=[], enable_staging=False),
+            transfer_queue=SimpleNamespace(
+                queue=[], enable_staging=False, enable_deferred_kv_release=False
+            ),
             queue=[],
             pending_reqs=[],
             retracted_queue=[],

@@ -158,48 +158,67 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
-def disagg_transfers_in_flight(scheduler):
-    """A PD node's pin source over the unified memory pool.
+def end_network_transfer(token_to_kv_pool_allocator, req) -> None:
+    """The request's transfers ended: the rows they addressed may be reused."""
+    storage = token_to_kv_pool_allocator.storage
+    if storage is not None:
+        storage.end_network_transfer(req)
 
-    Returns a predicate that is True while a transfer may be in flight, so
-    compaction never relocates a page the RDMA engine is reading or writing.
-    Safe to read this state from here: every mover runs on the scheduler thread.
 
-    A page is exposed from the moment its address reaches the peer until the
-    transfer concludes, and for part of that lifetime the request is in NEITHER
-    end's queue -- so queue emptiness alone is not enough:
+def record_network_transfer(
+    token_to_kv_pool_allocator,
+    req,
+    *,
+    kv_manager,
+    writes: bool,
+    page_indices,
+    page_size: int,
+    state_types: Sequence = (),
+    state_indices: Optional[Sequence] = None,
+    failed_delay: Optional[float] = None,
+) -> None:
+    """Record the device rows a transfer addresses by physical id, read by a
+    send or with ``writes`` written by a receive: its KV pages
+    (``page_indices``, in pages of ``page_size`` tokens; a host array or a
+    device tensor the schedule stream produced) and the rows of each state
+    entry in ``state_indices``, aligned with ``state_types``. The rows may
+    still move; a move is ordered after the transfer's completion flag, which
+    ``kv_manager``'s status path publishes (after ``failed_delay`` seconds for
+    a failed transfer)."""
+    from sglang.srt.disaggregation.common.conn import CommonKVManager
+    from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
 
-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
-      chunks may still be draining, and the request only reaches the inflight
-      queue later, in the result path.
-    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
-      allocating for the next, whose allocation can urgently flush the peer
-      sub-allocator; the batch reaches the transfer queue only after the loop.
-    """
-
-    # The scheduler and pool outlive the queues rebuilt by a PD role switch.
-    def busy() -> bool:
-        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            return bool(
-                scheduler.disagg_prefill_inflight_queue
-                or scheduler.disagg_prefill_pending_chunk_rids
-            )
-        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_offload_manager = scheduler.decode_offload_manager
-            return bool(
-                scheduler.disagg_decode_transfer_queue.queue
-                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
-                or (
-                    decode_offload_manager is not None
-                    and decode_offload_manager.has_inflight_device_transfer()
+    storage = token_to_kv_pool_allocator.storage
+    if storage is None:
+        return
+    flag = storage.record_network_transfer(
+        req, storage.owner, page_indices, unit_tokens=page_size, writes=writes
+    )
+    if state_indices is not None:
+        sub_pools = {
+            _wire_state_type(entry.state_type): entry.sub_pool
+            for entry in storage.wire_entries()
+            if entry.part in (KV_PART, STATE_PART)
+        }
+        for state_type, ids in zip(state_types, state_indices):
+            sub_pool = sub_pools.get(_wire_state_type(state_type))
+            if sub_pool is None or ids is None:
+                continue
+            for part in ids if isinstance(ids, list) else [ids]:
+                storage.record_network_transfer(
+                    req,
+                    sub_pool,
+                    part,
+                    unit_tokens=storage.unit_tokens(sub_pool),
+                    writes=writes,
                 )
-            )
-        raise ValueError(
-            "disagg_transfers_in_flight: scheduler is not a PD node "
-            f"(mode={scheduler.disaggregation_mode})"
+    if isinstance(kv_manager, CommonKVManager):
+        kv_manager.publish_on_conclusion(
+            req.bootstrap_room, flag, failed_delay=failed_delay
         )
-
-    return busy
+    else:
+        # An engine without a status path (a fake one) touches nothing later.
+        flag.publish()
 
 
 #########################

@@ -43,6 +43,7 @@ from typing import (
     TypeVar,
 )
 
+import numpy as np
 import torch
 from torch.profiler import record_function
 
@@ -451,12 +452,14 @@ class Band:
         # them, by any band of the chain, waits the event first.
         self._fences: List[Tuple[int, int, object]] = []
         # Transfers that may still read or write this band's pages, oldest first:
-        # (signal, controller ids, writes, logical release or None). A copy waits
-        # the writers of its sources; a source a reader still reads is released
-        # with that reader. Entries without a logical release are dropped once
-        # their signal has completed: they only decide waits, never a layout.
+        # (signal, ids, writes, logical release or None, unit tokens or None).
+        # Ids are controller ids translated when read, or, with unit tokens,
+        # physical units fixed when the engine was handed them. A copy waits the
+        # writers of its sources; a source a reader still reads is released with
+        # that reader. Entries without a logical release are dropped once their
+        # signal has completed: they only decide waits, never a layout.
         self._transfers: List[
-            Tuple[object, torch.Tensor, bool, Optional[TransferRelease]]
+            Tuple[object, object, bool, Optional[TransferRelease], Optional[int]]
         ] = []
         # Recorded forwards in launch order. A forward retires when the scheduler
         # processes its result, or when an urgent relief waits for it. Move and
@@ -1680,19 +1683,22 @@ class Band:
     def record_transfer(
         self,
         signal,
-        ids: Optional[torch.Tensor],
+        ids,
         *,
         writes: bool,
         release: Optional[TransferRelease] = None,
+        unit_tokens: Optional[int] = None,
     ) -> None:
         """Record a transfer that reads, or with ``writes`` writes, the pages
         this band's controller ids ``ids`` name: until ``signal`` completes, or
-        with ``release`` until it is released. A copy of a page it writes waits
+        with ``release`` until it is released. With ``unit_tokens``, ``ids`` are
+        physical units of that many tokens, the rows an engine outside every
+        stream addresses whatever moves later. A copy of a page it writes waits
         ``signal``; a page it reads that a move vacates is reused only after it."""
-        if ids is None or ids.numel() == 0:
+        if ids is None or len(ids) == 0:
             return
         self._prune_transfers()
-        self._transfers.append((signal, ids, writes, release))
+        self._transfers.append((signal, ids, writes, release, unit_tokens))
 
     def _prune_transfers(self) -> None:
         self._transfers = [
@@ -1715,17 +1721,42 @@ class Band:
             return []
         with record_function("Band._transfer_page_sets"):
             return [
-                (signal, self._physical_pages_of(ids, widened=False), writes, release)
-                for signal, ids, writes, release in self._transfers
+                (
+                    signal,
+                    (
+                        self._physical_pages_of(ids, widened=False)
+                        if unit_tokens is None
+                        else self._pages_of_units(ids, unit_tokens)
+                    ),
+                    writes,
+                    release,
+                )
+                for signal, ids, writes, release, unit_tokens in self._transfers
             ]
+
+    def _pages_of_units(self, units, unit_tokens: int) -> Set[int]:
+        """The physical PAGE ids physical ``units`` of ``unit_tokens`` tokens
+        cover. Reads a device tensor on the host (a stream sync)."""
+        if isinstance(units, torch.Tensor):
+            units = units.tolist()
+        rows = self.pool_page_size
+        return {
+            page
+            for unit in np.asarray(units).reshape(-1).tolist()
+            for page in range(
+                unit * unit_tokens // rows, ((unit + 1) * unit_tokens - 1) // rows + 1
+            )
+        }
 
     @staticmethod
     def _readers_of(srcs: Sequence[int], transfer_sets) -> tuple:
         """The release keys of the transfers that still read any of ``srcs``:
-        a source they read is reused only after them."""
+        a source they read is reused only after them. A transfer with a logical
+        release keys on both: the release decides when reuse is due, alike on
+        every rank, and the signal is what the GPU waits before reusing."""
         src_set = set(srcs)
         return tuple(
-            signal if release is None else release
+            signal if release is None else (signal, release)
             for signal, pages, writes, release in transfer_sets
             if not writes and not src_set.isdisjoint(pages)
         )
@@ -2024,6 +2055,9 @@ class Band:
         self._prune_inflight_forwards()
         # Read the transfers' pages on the host before any stream wait below.
         transfer_sets = self._transfer_page_sets()
+        transfer_written = set().union(
+            *(pages for _, pages, writes, _ in transfer_sets if writes)
+        )
         if any(written is None for _, written in self._inflight_forwards):
             # A running forward whose writes are unknown may write any survivor.
             if not urgent:
@@ -2113,6 +2147,10 @@ class Band:
                     break  # packed: the rest stays where it is
                 if src in fixed:
                     break  # non-urgent: a fixed page stops the walk
+                if not urgent and src in transfer_written:
+                    # A transfer still writes it: only a move an allocation
+                    # needs waits for that, not an opportunistic one.
+                    break
 
                 # Case A: write race.
                 if write_set is None:

@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
+    record_network_transfer,
     setup_state_kv_args,
     wire_sub_pool,
 )
@@ -1570,6 +1571,7 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         state_indices: Optional[List] = None
+        state_types = ()
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1770,6 +1772,19 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            # The engine reads these rows by physical id until it is done.
+            record_network_transfer(
+                self.token_to_kv_pool_allocator,
+                req,
+                kv_manager=sender.kv_mgr,
+                writes=False,
+                page_indices=(
+                    page_indices_dev if indices_event is not None else page_indices
+                ),
+                page_size=page_size,
+                state_types=state_types if segment_is_last else (),
+                state_indices=send_state_indices,
+            )
             if indices_event is not None:
                 sender.send(
                     page_indices,

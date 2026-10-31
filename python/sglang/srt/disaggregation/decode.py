@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -76,6 +77,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    record_network_transfer,
     setup_state_kv_args,
     wire_sub_pool,
 )
@@ -1892,6 +1894,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         assert decode_req.metadata_buffer_index is not None
         page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
+        if metadata_kwargs.get("destination") != KVTransferDestination.HOST:
+            # The peer writes these pages by physical id from now on; a failed
+            # transfer is done with them where main releases them.
+            transfer_queue = self.transfer_queue
+            record_network_transfer(
+                self.token_to_kv_pool_allocator,
+                decode_req.req,
+                kv_manager=self.kv_manager,
+                writes=True,
+                page_indices=page_indices,
+                page_size=page_size,
+                state_types=self.kv_manager.kv_args.state_types,
+                state_indices=state_indices,
+                failed_delay=(
+                    transfer_queue.deferred_kv_release_timeout
+                    if transfer_queue.enable_deferred_kv_release
+                    else None
+                ),
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -3018,6 +3039,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     ):
                         continue
                 self._commit_transfer_to_req(decode_req)
+                # The peer wrote its last byte.
+                end_network_transfer(
+                    self.tree_cache.token_to_kv_pool_allocator, decode_req.req
+                )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):

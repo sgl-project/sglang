@@ -522,11 +522,12 @@ class TestForwardWriteSets(CustomTestCase):
             (allocator.full_attn_allocator, owner_ids),
             (allocator.mamba_allocator, state_slots),
         ):
-            ((signal, recorded, writes, release),) = band._transfers
+            ((signal, recorded, writes, release, unit_tokens),) = band._transfers
             self.assertIs(signal, done)
             self.assertIs(recorded, ids)
             self.assertTrue(writes)
             self.assertIsNone(release)
+            self.assertIsNone(unit_tokens)  # controller ids, translated when read
         done.fired = True
         allocator.full_attn_allocator._prune_transfers()
         self.assertEqual(allocator.full_attn_allocator._transfers, [])
