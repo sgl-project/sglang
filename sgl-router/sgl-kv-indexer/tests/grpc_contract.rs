@@ -332,6 +332,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
             block_sizes: Vec::new(),
             parent_block_hash: None,
         }],
+        ..Default::default()
     };
     let err = c
         .apply_external_kv_batch(unmapped_action_type)
@@ -608,4 +609,75 @@ async fn router_client_publishes_its_deadline_on_the_wire() {
         value > 0,
         "a budget of zero would shed every query: {raw:?}"
     );
+}
+
+#[tokio::test]
+async fn shared_dram_pool_composes_with_each_members_hbm() {
+    use sgl_kv_indexer::pb::WorkerCacheSpec;
+    use test_kv::{component_report, dram};
+    let mut client = start().await;
+    let spec = WorkerCacheSpec {
+        version: 1,
+        components: 7,
+        swa_window_tokens: 32,
+        full_tier_mask: 6,
+        swa_tier_mask: 6,
+        mamba_tier_mask: 6,
+    };
+    let member = |id: &str, pool: &str| ApplyExternalKvBatchRequest {
+        worker_id: id.into(),
+        worker_address: format!("http://{id}:30000"),
+        cache_spec: Some(spec),
+        dram_pool_id: pool.into(),
+        ..Default::default()
+    };
+    // Members can arrive first; worker and pool ids have separate namespaces.
+    for id in ["tp4", "dp4-0"] {
+        client
+            .apply_external_kv_batch(member(id, "tp4"))
+            .await
+            .unwrap();
+    }
+    let pool = ApplyExternalKvBatchRequest {
+        dram_pool_id: "tp4".into(),
+        ..Default::default()
+    };
+    let (worker, private) = (member("tp4", "tp4"), member("tp4", ""));
+    let report = |tier, mask| component_report(tier, &[30, 10, 20], &[mask; 3], &[16; 3]);
+    let clear = |tier| action(ExternalKvActionType::ActionClearAllAtTier, tier, &[]);
+    // One DRAM report serves both members, each owner's clear leaves the other's
+    // placements intact, and a member ignores its own DRAM while in the pool.
+    for (owner, action, expected) in [
+        (&pool, report(dram(), 7), vec!["dp4-0", "tp4"]),
+        (&worker, report(hbm(), 7), vec!["dp4-0", "tp4"]),
+        (&pool, clear(dram()), vec!["tp4"]),
+        (&worker, clear(hbm()), vec![]),
+        (&private, report(dram(), 7), vec!["tp4"]),
+        (&worker, clear(hbm()), vec![]),
+    ] {
+        let mut request = owner.clone();
+        request.actions = vec![action];
+        client.apply_external_kv_batch(request).await.unwrap();
+        let matches = client
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![30, 10, 20],
+                max_blocks: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .matches;
+        assert!(matches.iter().all(|m| m.matched_prefix_blocks == 3));
+        let mut ids: Vec<_> = matches.iter().map(|m| m.worker_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+    // A pool owner may only report DRAM.
+    let mut hbm_report = pool.clone();
+    hbm_report.actions = vec![report(hbm(), 7)];
+    let error = client
+        .apply_external_kv_batch(hbm_report)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
 }
