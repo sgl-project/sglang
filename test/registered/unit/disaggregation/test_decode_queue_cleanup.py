@@ -134,6 +134,7 @@ class TestHeldDestinationPublication(CustomTestCase):
             req=FakeReq(),
             kv_receiver=receiver,
             pending_metadata=(event, ("pages", 3, None), {}),
+            pending_receive=None,
             is_rebootstrap=False,
         )
         queue.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
@@ -330,6 +331,26 @@ def _local_reduce(flags, group, op):
     return flags
 
 
+class _MovingStorage:
+    """The storage surface an inline publish uses: the page-move count and
+    network-transfer recording."""
+
+    def __init__(self, epochs=(0,)):
+        self._epochs = iter(epochs)
+        self._epoch = 0
+        self.recorded = []
+
+    def move_epoch(self):
+        self._epoch = next(self._epochs, self._epoch)
+        return self._epoch
+
+    def wire_entries(self):
+        return ()
+
+    def record_network_transfer(self, req, *, pages, page_size, states, writes, peer):
+        self.recorded.append([int(page) for page in pages])
+
+
 class TestDeferredDestinationPublish(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -372,6 +393,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1,
             state=None,
+            storage=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
         )
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
@@ -479,6 +501,72 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(kwargs, {"decode_prefix_len": 0})
         self.assertEqual(decode_req.metadata_buffer_index, 0)
         self.assertTrue(queue.has_published_destinations)
+
+    def _inline_queue(self, decode_req, storage):
+        queue = self._deferring_queue([decode_req])
+        queue._defer_publish = False
+        ready = MagicMock()
+        ready.query.return_value = True
+        queue.scheduler.enable_overlap = True
+        queue.scheduler.device_module = SimpleNamespace(Event=lambda: ready)
+        queue.scheduler.disagg_decode_prealloc_queue = queue
+        queue.token_to_kv_pool_allocator.storage = storage
+        transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
+        transfer.gloo_group = object()
+        transfer.scheduler = queue.scheduler
+        return queue, transfer
+
+    def test_inline_publish_records_its_rows_at_the_send(self):
+        """BUG REGRESSION. The inline publish recorded its rows as the peer's
+        at allocation but sent their ids a loop later. A page move that could
+        not avoid them waited on the host for a receive the peer could not
+        start, and the scheduler, which sends the ids, never got there. The rows
+        are recorded only when the send goes; a page move in between makes the
+        send read their ids again."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        storage = _MovingStorage(epochs=(0, 1))
+        queue, transfer = self._inline_queue(decode_req, storage)
+
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(storage.recorded, [])
+        self.assertIsNotNone(decode_req.pending_receive)
+        receiver.send_metadata.assert_not_called()
+
+        # A page move rebinds the rows before the send.
+        queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer = (
+            lambda indices: indices + 100
+        )
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            transfer.publish_pending_metadata()
+
+        page_indices = receiver.send_metadata.call_args.args[0]
+        self.assertEqual(page_indices.tolist(), [108, 109, 110, 111, 112])
+        self.assertEqual(storage.recorded, [[108, 109, 110, 111, 112]])
+        self.assertIsNone(decode_req.pending_receive)
+
+    def test_inline_publish_of_a_failed_receive_records_nothing(self):
+        """A receive that fails before its ids are sent leaves nothing a page
+        move could wait for."""
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        storage = _MovingStorage()
+        queue, transfer = self._inline_queue(decode_req, storage)
+
+        queue.pop_preallocated()
+        receiver._poll = KVPoll.Failed
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            transfer.publish_pending_metadata()
+
+        receiver.send_metadata.assert_not_called()
+        self.assertEqual(storage.recorded, [])
 
     def test_recompute_waits_for_held_metadata_to_be_sent(self):
         receiver = _PollingReceiver()

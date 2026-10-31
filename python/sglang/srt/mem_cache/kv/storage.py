@@ -902,6 +902,12 @@ class KVStorage:
         by the ``peer`` it was recorded with, alike on every rank."""
         self._allocator.set_network_waiter(waiter)
 
+    def move_epoch(self) -> int:
+        """How many page-move batches the pool has issued. Physical ids read
+        before a move stay valid while this is unchanged; a destination held
+        for a later send reads its ids again when it changed."""
+        return sum(band.moves for band in self._allocator.bands)
+
     def end_network_transfer(self, req: Req) -> None:
         """The request's network transfers ended, or its row is released (the
         release point of a failed transfer): every rank reaches this alike."""
@@ -921,15 +927,6 @@ class KVStorage:
         if sub_pool == roles.state:
             return self._allocator.mamba_allocator
         return self._allocator.window_allocators[sub_pool]
-
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Keep the named sub-pools' device rows where they are whenever
-        ``busy()`` holds: a DMA engine (a PD transfer, a HiCache copy) reads
-        or writes the addresses it was handed. Register each initiator once,
-        over the queues that live across iterations; tree locks are not pins."""
-        self._allocator.add_pin_source(sub_pools, busy)
 
     def record_forward(
         self,

@@ -413,6 +413,8 @@ class DecodeRequest:
     # Overlap without the deferred publish: (ready event, send_metadata args,
     # kwargs) until the forward in flight at allocation time is done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
+    # The receive rows of that held send, while no peer has their ids.
+    pending_receive: Optional[_PendingReceive] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -430,6 +432,17 @@ class _PendingPublish(msgspec.Struct, frozen=True):
     prefix_len: int
     total_prefix_len: int
     fill_len: int
+
+
+class _PendingReceive(msgspec.Struct, frozen=True):
+    """Receive rows whose destination waits to be sent. No peer touches them
+    yet, so they are not recorded as a transfer's and a move of them waits for
+    nothing; a move since (`move_epoch`) makes the send read the ids again
+    (``refresh``: the KV indices and state payloads)."""
+
+    move_epoch: int
+    page_size: int
+    refresh: Callable[[], Tuple[Any, Optional[List]]]
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -2048,14 +2061,64 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         metadata_kwargs = {"decode_prefix_len": total_prefix_len}
         if device_page_indices is not None:
             metadata_kwargs["device_kv_indices"] = device_page_indices
+
+        def refresh():
+            # The same rows' physical ids and state payloads, read again
+            # after a page move.
+            fresh_kv_indices = (
+                kv_indices
+                if self.scheduler.enable_hisparse
+                else self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    raw_kv_indices
+                )
+            )
+            return fresh_kv_indices, [
+                payloads[st]() if st in payloads else None for st in state_types
+            ]
+
         self._send_kv_metadata(
             decode_req,
             kv_indices,
             kv_transfer_page_size,
             state_indices,
             metadata_buffer_preassigned=metadata_buffer_preassigned,
+            refresh=refresh,
             **metadata_kwargs,
         )
+
+    def _record_receive(
+        self, decode_req, page_indices, page_size, state_indices
+    ) -> None:
+        """The peer writes these rows by physical id from now on; a failed
+        transfer is done with them at its deferred release."""
+        record_network_transfer(
+            self.token_to_kv_pool_allocator,
+            decode_req.req,
+            peer=decode_req,
+            writes=True,
+            page_indices=page_indices,
+            page_size=page_size,
+            state_types=self.kv_manager.kv_args.state_types,
+            state_indices=state_indices,
+        )
+
+    def held_receive_args(self, decode_req, args: tuple) -> tuple:
+        """The send_metadata args of a held send, once it may go: the rows'
+        ids read again if a page moved since they were held, and the rows
+        recorded as the peer's from now on."""
+        receive = decode_req.pending_receive
+        if receive is None:
+            return args
+        decode_req.pending_receive = None
+        page_indices, metadata_index, state_indices = args
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        if storage.move_epoch() != receive.move_epoch:
+            kv_indices, state_indices = receive.refresh()
+            page_indices = self._transfer_page_indices(
+                decode_req, kv_indices, receive.page_size
+            )
+        self._record_receive(decode_req, page_indices, receive.page_size, state_indices)
+        return page_indices, metadata_index, state_indices
 
     def _send_kv_metadata(
         self,
@@ -2064,27 +2127,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         page_size,
         state_indices=None,
         metadata_buffer_preassigned: bool = False,
+        refresh: Optional[Callable[[], Tuple[Any, Optional[List]]]] = None,
         **metadata_kwargs,
     ) -> None:
+        """Send ``decode_req``'s destination, or under overlap without the
+        deferred publish hold it until the forward in flight is done. A held
+        send's rows are not recorded as the peer's until it is sent: the peer
+        cannot touch them before it has their ids, so a move of them meanwhile
+        waits for nothing, and the send reads their ids again (``refresh``)."""
         if not metadata_buffer_preassigned:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
         assert decode_req.metadata_buffer_index is not None
         page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
-        if metadata_kwargs.get("destination") != KVTransferDestination.HOST:
-            # The peer writes these pages by physical id from now on; a failed
-            # transfer is done with them at its deferred release.
-            record_network_transfer(
-                self.token_to_kv_pool_allocator,
-                decode_req.req,
-                peer=decode_req,
-                writes=True,
-                page_indices=page_indices,
+        to_device = metadata_kwargs.get("destination") != KVTransferDestination.HOST
+        held = self.scheduler.enable_overlap and not self._defer_publish and to_device
+        if held and refresh is not None:
+            decode_req.pending_receive = _PendingReceive(
+                move_epoch=kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                ).move_epoch(),
                 page_size=page_size,
-                state_types=self.kv_manager.kv_args.state_types,
-                state_indices=state_indices,
+                refresh=refresh,
             )
+        elif to_device:
+            self._record_receive(decode_req, page_indices, page_size, state_indices)
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2097,11 +2165,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.bootstrap_room, decode_req
             )
         args = (page_indices, decode_req.metadata_buffer_index, state_indices)
-        if (
-            self.scheduler.enable_overlap
-            and not self._defer_publish
-            and metadata_kwargs.get("destination") != KVTransferDestination.HOST
-        ):
+        if held:
             # A request that finished last step can still have its forward in
             # flight, writing pages this request was just given. Prefill's RDMA
             # into them follows no stream, so send once that forward is done.
@@ -3234,6 +3298,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if publish:
                 _, args, kwargs = decode_req.pending_metadata
                 decode_req.pending_metadata = None
+                if decode_req.pending_receive is not None:
+                    args = (
+                        self.scheduler.disagg_decode_prealloc_queue.held_receive_args(
+                            decode_req, args
+                        )
+                    )
                 decode_req.kv_receiver.send_metadata(*args, **kwargs)
                 if (
                     decode_req.is_rebootstrap

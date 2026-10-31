@@ -19,6 +19,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_swa_cache,
+    hold_band,
+    release_band,
     setup_allocator_context,
 )
 
@@ -390,12 +392,14 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         before = snapshot()
         for gate in (False, True):
             for member in allocator._flush_targets():
-                member.pin_sources = (lambda: not gate,)
+                release_band(member)
+                if not gate:
+                    hold_band(member)
             for _ in range(20):
                 allocator.reclaim_plan(4, 4)
             self.assertEqual(snapshot(), before)
         for member in allocator._flush_targets():
-            member.pin_sources = ()
+            release_band(member)
         self.assertTrue(evict_from_tree_cache(cache, 4))
         self.assertIsNotNone(allocator.alloc(4))
         self.assertEqual(cache.full_evictable_size(), 94)

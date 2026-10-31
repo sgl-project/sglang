@@ -355,20 +355,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     # -- capacity views (the interim policy of the chain's shape) --
 
     def _snapshot_key_now(self) -> int:
-        """The chain's capacity epoch and, per band, its compaction mode and
-        whether a pin source is busy: neither is a capacity field. A band's
-        blocked bit is its load pin, a capacity field, or a busy pin source;
-        sources are callables, so the epoch alone misses a flip."""
+        """The chain's capacity epoch and, per band, its compaction mode, which
+        is not a capacity field."""
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
-            pinned = band.pinned_by_source()
-            bits = (bits << 2) | (2 if band.lazy_compaction else 0) | pinned
-        return (epoch << (2 * len(self.bands))) | bits
+            bits = (bits << 1) | bool(band.lazy_compaction)
+        return (epoch << len(self.bands)) | bits
 
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
-        the epoch moves or a pin source's answer changes."""
+        the epoch moves."""
         key = self._snapshot_key_now()
         if key != self._snapshot_key:
             self._snapshot_memo = snapshot_chain(
@@ -507,13 +504,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if state is not None and state_slots > len(state.free_virtual_ids):
             return False
-        demands = {n: d for n, d in demands.items() if d > 0}
-        if feasible(self.pricing_snapshot(), demands):
-            return True
-        # The planner holds a pinned float's whole span; its freed boundary
-        # pages serve once absorbed, as the take's shortfall path absorbs them.
-        return self._pinned_float_holes_absorbed() and feasible(
-            self.pricing_snapshot(), demands
+        return feasible(
+            self.pricing_snapshot(), {n: d for n, d in demands.items() if d > 0}
         )
 
     def admission_windows(self, tree_cache) -> Tuple[Tuple[str, int, int, int], ...]:
@@ -612,15 +604,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             )
             if state_slots > free_slots:
                 return False
-        demands = {n: d for n, d in demands.items() if d > 0}
-
-        def fits() -> bool:
-            snapshot = reclaimed_snapshot(
-                self.pricing_snapshot(), reclaim, empty_pool=empty_pool
-            )
-            return feasible(snapshot, demands)
-
-        return fits() or (self._pinned_float_holes_absorbed() and fits())
+        snapshot = reclaimed_snapshot(
+            self.pricing_snapshot(), reclaim, empty_pool=empty_pool
+        )
+        return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
 
     def _window_demand(
         self, full_tokens, swa_tokens, auxiliary_swa_tokens=None
@@ -1067,21 +1054,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- ordering with transfers and forwards --
 
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Keep the named sub-pools' pages in place whenever ``busy()`` holds:
-        a DMA initiator whose queues outlive an iteration, registered once. A
-        transfer that reaches every sub-pool names every one: a band it leaves
-        out would relocate its own pages under the same in-flight copy."""
-        assert self.lazy_compaction, (
-            "Pin sources (PD disaggregation, HiCache) with the unified memory "
-            "pool require lazy compaction (eager free-path compaction moves "
-            "pages under in-flight transfers)."
-        )
-        for name in sub_pools:
-            self.bands[self._band_positions[name]].add_pin_source(busy)
-
     def fix_pages(self, sub_pool: str, key: Hashable, pages: Sequence[int]) -> None:
         """Keep these physical pages of ``sub_pool`` where they are, under
         ``key``, until `unfix_pages`: a transfer that holds their physical ids,
@@ -1264,17 +1236,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 counts[name] = owner_pages
         return counts
 
-    def _pinned_float_holes_absorbed(self) -> bool:
-        """Hand the freed pages at a pinned float's boundaries back to its
-        neighbours. It moves no live page, so it is safe while the float's
-        moves are blocked; it reads the float's holes on the host, so it runs
-        only on a shortfall. True when some span shrank."""
-        shrunk = False
-        for band in self.bands:
-            if isinstance(band, FloatBand) and band.moves_blocked():
-                shrunk = band._absorb_span_boundary_holes() > 0 or shrunk
-        return shrunk
-
     def _plan_and_take(
         self, demands: Dict[str, int], *, bind_at_frontier: bool = False
     ) -> Optional[Dict[str, Optional[torch.Tensor]]]:
@@ -1287,8 +1248,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if not demands:
             return {}
         plan = first_plan(self.pricing_snapshot(), demands)
-        if plan is None and self._pinned_float_holes_absorbed():
-            plan = first_plan(self.pricing_snapshot(), demands)
         if plan is None:
             return None
         return self.realize(plan, bind_at_frontier=bind_at_frontier)
@@ -1331,8 +1290,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         later and in any order, such as a host load's."""
         demands = {name: n for name, n in demands.items() if n > 0}
         plan = first_plan(self.pricing_snapshot(), demands)
-        if plan is None and self._pinned_float_holes_absorbed():
-            plan = first_plan(self.pricing_snapshot(), demands)
         if plan is None:
             return False
         self._lay_out(plan)
@@ -1384,19 +1341,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def scoped_physical_takes(
         self, full_tokens, swa_tokens, *, auxiliary_swa_tokens=None, state_slots=0
     ):
-        """Consume a pre-realized reservation across independently issued H2D
-        takes. Every chain shape realizes the reservation's layout here, before
-        the takes pin their bands."""
+        """Consume a pre-realized reservation across independently issued H2D takes."""
+        if len(self._windows) <= 1:
+            yield
+            return
         if any(band._physical_take_scope is not None for band in self.members):
             raise RuntimeError("physical reservation scopes cannot be nested")
         scope = _ScopedPhysicalTakes(
             self,
-            self.page_demands(
-                full_tokens,
-                swa_tokens,
-                auxiliary_swa_tokens=auxiliary_swa_tokens,
-                state_slots=state_slots,
-            ).items(),
+            self._policy._demands(
+                self, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+            ),
         )
         for band in self.members:
             band._physical_take_scope = scope

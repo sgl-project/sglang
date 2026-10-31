@@ -15,7 +15,10 @@ from test_unified_chain_realize import _allocator, _live_pages
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import setup_allocator_context
+from sglang.test.unified_allocator_fixtures import (
+    hold_band,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-small")
@@ -54,9 +57,9 @@ class TestAdmissionIsATake(CustomTestCase):
             if not any(ids is c for c in cached):
                 protected.update(ids.cpu().tolist())
         for band in allocator.bands:
-            # Pins require lazy compaction.
+            # A band held where it stands, as before holds needed lazy bands.
             if lazy and rng.random() < 0.15:
-                band.pin_sources = (lambda: True,)
+                hold_band(band)
             elif rng.random() < 0.3 and band is not state:
                 p2v = band.ids.physical_to_virtual.cpu().tolist()
                 live = [p for p in _live_pages(band) if p2v[p] in protected]

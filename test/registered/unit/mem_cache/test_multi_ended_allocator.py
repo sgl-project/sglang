@@ -26,6 +26,8 @@ from sglang.test.tree_slots import index_slots, tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
     chain_snapshot,
+    hold_band,
+    release_band,
     stand_in_views,
     token_ends,
 )
@@ -676,7 +678,6 @@ class TestWindowChainAllocator(unittest.TestCase):
         allocator.lazy_compaction = True
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.lazy_compaction = True
-            sub_pool.pin_sources = (lambda: True,)
         live = allocator.alloc(16)
         self.assertIsNotNone(live)
         allocator.free(live[4:8])
@@ -687,7 +688,9 @@ class TestWindowChainAllocator(unittest.TestCase):
                 allocator.full_attn_allocator,
                 allocator.swa_attn_allocator,
             ):
-                sub_pool.pin_sources = (lambda: not compacted,)
+                release_band(sub_pool)
+                if not compacted:
+                    hold_band(sub_pool)
             for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
                 max_full = min(12, full_evictable) // page_size
                 max_swa = min(8, swa_evictable) // page_size
@@ -1265,10 +1268,16 @@ class TestJointLRUEviction(unittest.TestCase):
 
     @staticmethod
     def _block_compaction(allocator):
+        # A fixed page forbids the moves compaction needs.
         allocator.lazy_compaction = True
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.lazy_compaction = True
-            sub_pool.pin_sources = (lambda: True,)
+            sub_pool.fix_pages("blocked", [sub_pool.min_page_index])
+
+    @staticmethod
+    def _unblock_compaction(allocator):
+        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+            sub_pool.unfix_pages("blocked")
 
     @staticmethod
     def _record_victims(cache):
@@ -1378,8 +1387,7 @@ class TestJointLRUEviction(unittest.TestCase):
 
         # Reopened, the joint walk picks the victims of the same tree whose
         # match ran with the gate open.
-        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-            sub_pool.pin_sources = ()
+        self._unblock_compaction(allocator)
         victims = self._record_victims(cache)
         cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
         open_cache, _ = self._tree()
@@ -3436,14 +3444,14 @@ class TestFloatBand(CustomTestCase):
                 len(fla._inverse_history),
             )
 
-        fla.pin_sources = (lambda: True,)
+        hold_band(fla)
         before = snapshot()
         self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
         self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
         self.assertEqual(snapshot(), before)
         self._check_float_state(fla, kv)
 
-        fla.pin_sources = ()
+        release_band(fla)
         self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
         self._check_float_state(fla, kv)
 
