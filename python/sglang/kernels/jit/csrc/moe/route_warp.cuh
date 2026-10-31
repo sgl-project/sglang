@@ -93,35 +93,37 @@ SGL_DEVICE float key_to_float(uint32_t k) {
   return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
 }
 
+inline constexpr float kLog2e = 1.4426950408889634f;
+inline constexpr float kLn2 = 0.6931471805599453f;
+
 // 1 + e >= 1: rcp.approx equals div.full, except a result below 2^-126 flushes to 0.
 SGL_DEVICE float sigmoid(float x) {
-  return ptx::rcp_approx_ftz(1.0f + ptx::ex2_approx_ftz(x * -1.4426950408889634f));
+  return ptx::rcp_approx_ftz(1.0f + ptx::ex2_approx_ftz(x * -kLog2e));
 }
 
 SGL_DEVICE float softmax_exp(float x, float mx) {
-  return ptx::ex2_approx_ftz((x - mx) * 1.4426950408889634f);
+  return ptx::ex2_approx_ftz((x - mx) * kLog2e);
 }
 
 // sqrt(max(x, 0) + log1p(exp(-|x|))), branch-free: exp(-|x|) = 2^n * 2^f with a
 // degree-7 polynomial for 2^f, log1p(z) = 2 atanh(z / (2 + z)) as an odd series.
 SGL_DEVICE float sqrtsoftplus(float x) {
-  constexpr float kL2eHi = 1.4426950408889634f;
-  constexpr float kL2eLo = 1.925963033500011e-08f;  // log2(e) - kL2eHi
+  constexpr float kL2eLo = 1.925963033500011e-08f;  // log2(e) - kLog2e
   // Bounds n for the int conversion; exponents below -126 become 0 below.
   const auto nx = fmaxf(-fabsf(x), -100.0f);
-  const auto t_hi = nx * kL2eHi;
-  const auto t_lo = fmaf(nx, kL2eHi, -t_hi) + nx * kL2eLo;
+  const auto t_hi = nx * kLog2e;
+  const auto t_lo = fmaf(nx, kLog2e, -t_hi) + nx * kL2eLo;
   const auto n = rintf(t_hi);
   const auto f = (t_hi - n) + t_lo;
   // 2^f = e^(f ln2), Taylor to degree 7 (error < 5e-9 for |f| <= 1/2).
   auto e = 1.0f / 5040.0f;
-  e = fmaf(e, f * 0.6931471805599453f, 1.0f / 720.0f);
-  e = fmaf(e, f * 0.6931471805599453f, 1.0f / 120.0f);
-  e = fmaf(e, f * 0.6931471805599453f, 1.0f / 24.0f);
-  e = fmaf(e, f * 0.6931471805599453f, 1.0f / 6.0f);
-  e = fmaf(e, f * 0.6931471805599453f, 0.5f);
-  e = fmaf(e, f * 0.6931471805599453f, 1.0f);
-  e = fmaf(e, f * 0.6931471805599453f, 1.0f);
+  e = fmaf(e, f * kLn2, 1.0f / 720.0f);
+  e = fmaf(e, f * kLn2, 1.0f / 120.0f);
+  e = fmaf(e, f * kLn2, 1.0f / 24.0f);
+  e = fmaf(e, f * kLn2, 1.0f / 6.0f);
+  e = fmaf(e, f * kLn2, 0.5f);
+  e = fmaf(e, f * kLn2, 1.0f);
+  e = fmaf(e, f * kLn2, 1.0f);
   // 2^n with n < -126 flushed to 0 (a select here compiles to a branch).
   const auto z = e * __int_as_float(max(static_cast<int32_t>(n) + 127, 0) << 23);
   // s = z / (2 + z): rcp.approx and one Newton step, ~0.5 ulp.
