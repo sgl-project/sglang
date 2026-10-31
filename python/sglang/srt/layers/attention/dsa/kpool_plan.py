@@ -587,7 +587,7 @@ def init_pooled_paged_mqa_metadata(
 ) -> DSAMetadata:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
-        or not is_cuda()
+        or not (is_cuda() or (is_hip() and forward_mode.is_target_verify()))
         or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return metadata
@@ -633,7 +633,7 @@ def update_pooled_paged_mqa_metadata(
 ) -> None:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
-        or not is_cuda()
+        or not (is_cuda() or (is_hip() and forward_mode.is_target_verify()))
         or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return
