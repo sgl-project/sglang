@@ -9,6 +9,9 @@ import triton.language as tl
 from sglang.kernels.ops.speculative.dspark.dispatch import (
     inputs_on_cuda,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.dspark_components.dspark_planner import (
@@ -41,6 +44,14 @@ class ScheduleVerifyLensTopk:
         budget: int,
         cfg: DSparkScheduleConfig,
     ) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.operators.sample import (
+                schedule_verify_lens_topk_triton as npu_schedule_verify_lens_topk,
+            )
+
+            return npu_schedule_verify_lens_topk(
+                confidence=confidence, budget=budget, cfg=cfg
+            )
         return schedule_verify_lens_topk_triton(
             confidence=confidence, budget=budget, cfg=cfg
         )
