@@ -70,6 +70,11 @@ message SamplingParams {
   optional string regex = 15 [deprecated = true];
   optional int64 seed = 16;
   optional GuidedDecoding guided_decoding = 17;
+  // Preserve Python's three states for max_new_tokens over proto3:
+  // unset uses the server default (128), max_new_tokens sets an explicit cap,
+  // and this flag requests the HTTP `max_new_tokens: null` behavior (no cap).
+  // Must not be true when max_new_tokens is set.
+  optional bool no_max_new_tokens_limit = 18;
 }
 
 message GuidedDecoding {

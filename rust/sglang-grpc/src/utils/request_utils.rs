@@ -45,7 +45,15 @@ fn sampling_params_to_map(
             if let Some(v) = p.repetition_penalty {
                 map.insert("repetition_penalty".into(), serde_json::json!(v));
             }
-            if let Some(v) = p.max_new_tokens {
+            if p.no_max_new_tokens_limit.unwrap_or(false) {
+                if p.max_new_tokens.is_some() {
+                    return Err(
+                        "max_new_tokens and no_max_new_tokens_limit=true are mutually exclusive"
+                            .into(),
+                    );
+                }
+                map.insert("max_new_tokens".into(), serde_json::Value::Null);
+            } else if let Some(v) = p.max_new_tokens {
                 map.insert("max_new_tokens".into(), serde_json::json!(v));
             }
             if let Some(v) = p.min_new_tokens {
@@ -713,6 +721,64 @@ mod tests {
         for key in ["image_data", "video_data", "audio_data"] {
             assert!(!mapped.contains_key(key));
         }
+    }
+
+    fn mapped_max_new_tokens(params: proto::SamplingParams) -> [Option<serde_json::Value>; 2] {
+        let text_request = proto::TextGenerateRequest {
+            sampling_params: Some(params.clone()),
+            ..Default::default()
+        };
+        let token_request = proto::GenerateRequest {
+            sampling_params: Some(params),
+            ..Default::default()
+        };
+
+        [
+            build_text_generate_dict("request-1", &text_request).unwrap(),
+            build_generate_dict("request-2", &token_request).unwrap(),
+        ]
+        .map(|mapped| mapped["sampling_params"].get("max_new_tokens").cloned())
+    }
+
+    #[test]
+    fn max_new_tokens_preserves_default_explicit_and_unlimited_states() {
+        // Unset matches Python's omitted-field behavior: use the default 128.
+        assert_eq!(mapped_max_new_tokens(Default::default()), [None, None]);
+
+        // An explicit integer remains an explicit cap.
+        assert_eq!(
+            mapped_max_new_tokens(proto::SamplingParams {
+                max_new_tokens: Some(64),
+                ..Default::default()
+            }),
+            [Some(serde_json::json!(64)), Some(serde_json::json!(64))]
+        );
+
+        // The additive flag expresses HTTP's explicit-null (no-limit) state.
+        assert_eq!(
+            mapped_max_new_tokens(proto::SamplingParams {
+                no_max_new_tokens_limit: Some(true),
+                ..Default::default()
+            }),
+            [Some(serde_json::Value::Null), Some(serde_json::Value::Null),]
+        );
+    }
+
+    #[test]
+    fn max_new_tokens_rejects_cap_with_no_limit_flag() {
+        let request = proto::GenerateRequest {
+            sampling_params: Some(proto::SamplingParams {
+                max_new_tokens: Some(64),
+                no_max_new_tokens_limit: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_generate_dict("request", &request).unwrap_err(),
+            "max_new_tokens and no_max_new_tokens_limit=true are mutually exclusive"
+        );
     }
 
     #[test]
