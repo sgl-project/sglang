@@ -13,7 +13,9 @@ class TrinityDetector(Qwen25Detector):
     Detector for Trinity models using Qwen-style function call format.
 
     This detector extends Qwen25Detector to handle tool calls that may appear
-    inside <think> sections by stripping the think tags before parsing.
+    inside <think> sections. Think tags are stripped from the normal text only;
+    tool-call arguments are kept verbatim, since they may legitimately contain
+    the literal strings "<think>" or "</think>".
 
     Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
     """
@@ -22,15 +24,15 @@ class TrinityDetector(Qwen25Detector):
         """Remove <think> and </think> tags, keeping the content inside."""
         return text.replace("<think>", "").replace("</think>", "")
 
-    def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a tool call."""
-        return super().has_tool_call(self._strip_think_tags(text))
-
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
         """
-        return super().detect_and_parse(self._strip_think_tags(text), tools)
+        result = super().detect_and_parse(text, tools)
+        result.normal_text = self._strip_think_tags(result.normal_text)
+        if self.has_tool_call(text):
+            result.normal_text = result.normal_text.strip()
+        return result
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -38,6 +40,7 @@ class TrinityDetector(Qwen25Detector):
         """
         Streaming incremental parsing for tool calls.
         """
-        return super().parse_streaming_increment(
-            self._strip_think_tags(new_text), tools
-        )
+        result = super().parse_streaming_increment(new_text, tools)
+        if result.normal_text:
+            result.normal_text = self._strip_think_tags(result.normal_text)
+        return result
