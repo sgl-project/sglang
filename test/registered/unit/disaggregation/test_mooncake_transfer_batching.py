@@ -193,6 +193,91 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                         self.assertEqual(manager.maybe_send_extra(**kwargs), 0)
                         np.testing.assert_array_equal(dst, [1, -1, -1])
 
+    @staticmethod
+    def _copy_bytes(session, sources, destinations, lengths):
+        for src, dst, length in zip(sources, destinations, lengths, strict=True):
+            ctypes.memmove(dst, src, length)
+        return 0
+
+    def _pp_stage_manager(self, state, src_layers, src_layer_ids):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[state],
+            state_data_ptrs=[[layer.ctypes.data for layer in src_layers]],
+            state_item_lens=[[src_layers[0].itemsize] * len(src_layers)],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[src_layer_ids],
+        )
+        manager.engine = SimpleNamespace(batch_transfer_sync=self._copy_bytes)
+        manager.pp_size = 2
+        manager.attn_tp_size = 1
+        manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        return manager
+
+    def test_pp_stage_pairs_compact_entries_with_decode_by_layer_id(self):
+        """A PP stage's compact entries land in the decode entries of the same layers."""
+        # Decode (PP1) registers layers 0..3; this prefill stage owns layers 2..3.
+        cases = {
+            StateType.MINIMAX_INDEX_K: ([2, 3], [0, 1, 2, 3]),
+            # Dense KV registers K entries, then V entries.
+            StateType.MINIMAX_DENSE_KV: ([2, 3, 2, 3], [0, 1, 2, 3, 0, 1, 2, 3]),
+        }
+        for state, (src_ids, dst_ids) in cases.items():
+            with self.subTest(state=state):
+                src_layers = [
+                    np.full(4, 10 * (i + 1), dtype=np.int32)
+                    for i in range(len(src_ids))
+                ]
+                dst_layers = [np.full(4, -1, dtype=np.int32) for _ in dst_ids]
+                manager = self._pp_stage_manager(state, src_layers, src_ids)
+                peer = SimpleNamespace(
+                    dst_state_data_ptrs=[[layer.ctypes.data for layer in dst_layers]],
+                    dst_state_item_lens=[[dst_layers[0].itemsize] * len(dst_ids)],
+                    dst_state_dim_per_tensor=[[]],
+                    dst_state_layer_ids=[dst_ids],
+                    dst_attn_tp_size=1,
+                )
+                ret = manager.maybe_send_extra(
+                    req=SimpleNamespace(
+                        mooncake_session_id="cpu", dst_state_indices=[[0, 3]]
+                    ),
+                    prefill_state_indices=[[1, 2]],
+                    executor=None,
+                    target_rank_registration_info=peer,
+                )
+                self.assertEqual(ret, 0)
+                expected = [np.full(4, -1, dtype=np.int32) for _ in dst_ids]
+                pending = list(range(len(dst_ids)))
+                for i, layer_id in enumerate(src_ids):
+                    j = next(j for j in pending if dst_ids[j] == layer_id)
+                    pending.remove(j)
+                    expected[j][[0, 3]] = 10 * (i + 1)
+                for got, want in zip(dst_layers, expected):
+                    np.testing.assert_array_equal(got, want)
+
+    def test_pp_stage_rejects_decode_peer_without_layer_ids(self):
+        src_layers = [np.zeros(2, dtype=np.int32) for _ in range(2)]
+        dst_layers = [np.full(2, -1, dtype=np.int32) for _ in range(4)]
+        manager = self._pp_stage_manager(StateType.MINIMAX_INDEX_K, src_layers, [2, 3])
+        peer = SimpleNamespace(
+            dst_state_data_ptrs=[[layer.ctypes.data for layer in dst_layers]],
+            dst_state_item_lens=[[4] * 4],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[]],
+            dst_attn_tp_size=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
+            manager.maybe_send_extra(
+                req=SimpleNamespace(mooncake_session_id="cpu", dst_state_indices=[[0]]),
+                prefill_state_indices=[[1]],
+                executor=None,
+                target_rank_registration_info=peer,
+            )
+        for layer in dst_layers:
+            np.testing.assert_array_equal(layer, [-1, -1])
+
 
 class TestDcpDraftHeadTransfer(unittest.TestCase):
     def test_transfers_draft_heads_to_logical_destination_rows(self):
