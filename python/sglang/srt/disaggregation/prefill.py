@@ -45,12 +45,14 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
+    ABORT_REASON_REQUEST,
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    TransferOutcome,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -64,6 +66,8 @@ from sglang.srt.disaggregation.utils import (
     kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
+    poll_transfer_outcomes_attn_cp_tp_group,
+    poll_transfer_outcomes_prefill_pp,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -1210,9 +1214,12 @@ class SchedulerDisaggregationPrefillMixin:
         done_reqs = []
 
         parallel = get_parallel()
+        senders = [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue]
         if parallel.pp_size > 1:
-            polls = poll_and_all_reduce_prefill_pp(
-                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            # PP0 decides from every stage's status; each stage applies the
+            # decision so all stages release the same requests the same way.
+            polls, outcomes = poll_transfer_outcomes_prefill_pp(
+                senders,
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
                 self.pp_group,
@@ -1221,16 +1228,24 @@ class SchedulerDisaggregationPrefillMixin:
                 self.pp_poll_sync_work_list_inflight,
                 P2PTag.DISAGG_INFLIGHT_PP_SYNC,
             )
+            if parallel.pp_rank > 0:
+                for sender, poll in zip(senders, polls):
+                    if poll in (KVPoll.Success, KVPoll.Failed):
+                        # Only for the sender's conclusion side effects
+                        # (trace end, transfer latency); PP0 made the decision.
+                        sender.poll()
         else:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
-                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+            polls, outcomes = poll_transfer_outcomes_attn_cp_tp_group(
+                senders,
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll, outcome in zip(
+            self.disagg_prefill_inflight_queue, polls, outcomes
+        ):
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -1276,7 +1291,9 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                self.handle_inflight_transfer_failure(req)
+                self.handle_inflight_transfer_failure(
+                    req, aborted_by_request=outcome == TransferOutcome.ABORT
+                )
                 done_reqs.append(req)
             else:
                 raise RuntimeError(
@@ -1322,21 +1339,29 @@ class SchedulerDisaggregationPrefillMixin:
         return done_reqs
 
     def handle_inflight_transfer_failure(
-        self: Scheduler, req: Req
+        self: Scheduler, req: Req, aborted_by_request: bool = False
     ) -> Optional[Exception]:
-        """Conclude an inflight request whose KV transfer failed."""
+        """Conclude an inflight request whose KV transfer failed.
+
+        aborted_by_request is the classification agreed across ranks. This
+        rank's own exception is only logged: a rank that succeeded locally has
+        no failure reason and would otherwise report a 500 for a requested abort.
+        """
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
         exc: Optional[Exception] = None
+        is_aborted_by_request = (
+            isinstance(req.finished_reason, FINISH_ABORT) or aborted_by_request
+        )
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
+        # Mute propagated exceptions and requested aborts to avoid noisy logging
+        if getattr(exc, "is_from_another_rank", False) or is_aborted_by_request:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
@@ -1347,10 +1372,13 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
-            prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-            )
-        if self.metrics_reporter.enable_metrics:
+            if is_aborted_by_request:
+                prepare_abort(req, ABORT_REASON_REQUEST)
+            else:
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+        if self.metrics_reporter.enable_metrics and not is_aborted_by_request:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
