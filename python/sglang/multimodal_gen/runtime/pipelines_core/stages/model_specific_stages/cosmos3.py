@@ -1266,6 +1266,7 @@ class Cosmos3DenoisingStage(PipelineStage):
       that share a CFG context, so each context shards independently.
     """
 
+    supports_denoising_step_profiling = True
     parallelism_type = StageParallelismType.REPLICATED
 
     def __init__(
