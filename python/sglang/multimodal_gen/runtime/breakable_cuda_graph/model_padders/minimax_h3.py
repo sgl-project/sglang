@@ -49,12 +49,16 @@ def _replace_psp(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
 ) -> dict[str, Any]:
-    out = dict(psp) if isinstance(psp, dict) else {}
-    # Host tuples are request-local constants. Keeping them would key a graph
-    # by the original prompt length and freeze attention bounds at capture.
-    out.pop("cu_seqlens_q_host", None)
-    out.update(cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q)
-    return out
+    if isinstance(psp, dict):
+        return {
+            **psp,
+            "cu_seqlens_q": cu_seqlens_q,
+            "max_seqlen_q": max_seqlen_q,
+        }
+    return {
+        "cu_seqlens_q": cu_seqlens_q,
+        "max_seqlen_q": max_seqlen_q,
+    }
 
 
 def _aligned(value: int) -> int:

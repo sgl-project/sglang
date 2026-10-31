@@ -47,6 +47,9 @@ def check_pika_adapter_accuracy(variant: str) -> None:
     }
     loader.lora_adapters = defaultdict(dict)
     loader.loaded_adapter_paths = {}
+    loader.loaded_adapter_files = {}
+    loader.loaded_adapter_configs = {}
+    loader.loaded_adapter_fingerprints = {}
     loader.loaded_adapter_alphas = {}
     loader.load_lora_adapter(path, variant, rank=0, lora_alpha=128)
     mapped = loader.lora_adapters[variant]

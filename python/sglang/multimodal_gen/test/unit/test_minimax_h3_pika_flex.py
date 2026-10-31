@@ -185,6 +185,9 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
 
     def server_args(explicit: bool, mode: str) -> SimpleNamespace:
         return SimpleNamespace(
+            model_variant="fl2va",
+            lora_alpha=None,
+            lora_scale=1.0,
             lora_merge_mode=mode,
             is_arg_explicitly_set=lambda name: explicit and name == "lora_merge_mode",
         )
@@ -518,7 +521,7 @@ def test_variant_keeps_base_case_insensitive_contract(monkeypatch, variant):
 def test_prequeue_retains_public_task_and_admits_internal_partition(
     monkeypatch, task, index
 ):
-    """Plan canonicalization must not change the task returned in API metadata."""
+    """Plan canonicalization must preserve the public sampling task."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
         MiniMaxH3PartitionAdmissionStage,
     )

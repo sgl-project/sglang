@@ -829,6 +829,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
             renoise_generator = None
             if self.stochastic_sampling:
+                # The plan carries this output's own seed after output expansion
+                # (42 is latent preparation's default). A device generator keeps
+                # the stream independent of the CPU generators seeded with the
+                # same value for the initial and condition noise.
                 seed = 42 if ctx.plan.seed is None else int(ctx.plan.seed)
                 renoise_generator = torch.Generator(device=device).manual_seed(seed)
             with (

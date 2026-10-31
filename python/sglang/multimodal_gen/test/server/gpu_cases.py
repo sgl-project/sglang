@@ -815,14 +815,7 @@ PIKA_H3_FLEX_B200_CASES = [
                 "off",
             ],
         ),
-        replace(
-            PIKA_H3_FLEX_T2VA_sampling_params,
-            extras={
-                **PIKA_H3_FLEX_T2VA_sampling_params.extras,
-                "task": "t2va",
-                "conditions": [],
-            },
-        ),
+        PIKA_H3_FLEX_T2VA_sampling_params,
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,

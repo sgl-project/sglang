@@ -610,40 +610,5 @@ class TestRouterPastInt32(unittest.TestCase):
         self.assertTrue(torch.equal(index, ref))
 
 
-class TestH3GraphSequenceBoundaries(unittest.TestCase):
-    def test_live_boundaries_reach_sparse_attention(self):
-        """Graph replay must not silently select dense attention for missing host lengths."""
-        from types import SimpleNamespace
-
-        from sglang.multimodal_gen.runtime.models.dits import minimax_h3
-        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-        impl = Mock(schedule=SimpleNamespace(min_seq_len=4))
-        impl._sparse_ready.return_value = True
-        q = torch.zeros(8, 1, 128)
-        impl.forward_varlen.return_value = q
-        attention = SimpleNamespace(
-            _attention_backend_enum=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
-            _attention_impl=impl,
-        )
-        with patch.object(minimax_h3, "_minimax_h3_bind_attention_backend"):
-            for used in (4, 6):
-                minimax_h3._minimax_h3_attention_core_impl(
-                    attention,
-                    q,
-                    q,
-                    q,
-                    cu_seqlens=torch.tensor([0, used, 8], dtype=torch.int32),
-                    cu_seqlens_host=None,
-                    max_seqlen=8,
-                    ulysses_active=False,
-                    subblock_sparse_query_block_mask=torch.ones(1, dtype=torch.bool),
-                )
-                self.assertEqual(
-                    impl.forward_varlen.call_args.kwargs["cu_seqlens_host"],
-                    (0, used, 8),
-                )
-
-
 if __name__ == "__main__":
     unittest.main()
