@@ -282,6 +282,61 @@ def _validate_schema_depth_recursive(schema: Any, ctx: TraversalContext) -> None
                 _validate_schema_depth_recursive(child, ctx.enter())
 
 
+def _estimate_fixed_regex_states(pattern: str) -> int | None:
+    """Count linear states for fixed repetitions of character atoms, if known."""
+    try:
+        parsed = sre_parse.parse(pattern)
+    except Exception:
+        # Leave unsupported syntax to the backend compiler.
+        return None
+
+    # Without a start anchor, a suffix such as a[ab]{100}$ can require
+    # exponential states to remember all candidate match positions.
+    if (
+        not parsed
+        or parsed.state.flags & sre_parse.SRE_FLAG_MULTILINE
+        or parsed[0]
+        not in (
+            (sre_parse.AT, sre_parse.AT_BEGINNING),
+            (sre_parse.AT, sre_parse.AT_BEGINNING_STRING),
+        )
+    ):
+        return None
+
+    def fixed_width(subpattern):
+        width = 0
+        for op, arg in subpattern:
+            if op in (
+                sre_parse.LITERAL,
+                sre_parse.NOT_LITERAL,
+                sre_parse.IN,
+                sre_parse.ANY,
+                sre_parse.CATEGORY,
+            ):
+                width += 1
+            elif op == sre_parse.AT:
+                continue
+            elif op == sre_parse.SUBPATTERN:
+                child_width = fixed_width(arg[3])
+                if child_width is None:
+                    return None
+                width += child_width
+            elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                min_rep, max_rep, child = arg
+                if min_rep != max_rep or max_rep == sre_parse.MAXREPEAT:
+                    return None
+                child_width = fixed_width(child)
+                if child_width is None:
+                    return None
+                width += max_rep * child_width
+            else:
+                return None
+        return width
+
+    width = fixed_width(parsed)
+    return None if width is None else width + 1
+
+
 def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
     """
     Estimate the number of DFA states that would be generated from a JSON schema.
@@ -331,7 +386,12 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
         # Pattern: \(...[+*?{].*[+*?}]\) or similar nesting indicators
         nested_quantifier_pattern = r"\([^)]*[\+\*\?\{][^)]*\)[\+\*\?\{]"
         has_nested_quantifiers = bool(re.search(nested_quantifier_pattern, pattern))
-        if has_unbounded and has_bounded and has_nested_quantifiers:
+        linear_states = _estimate_fixed_regex_states(pattern)
+        if linear_states is not None:
+            # Fixed repetitions of character atoms grow linearly, including
+            # hashes and UUIDs. Do not apply the explosion-risk multiplier.
+            pattern_complexity = linear_states
+        elif has_unbounded and has_bounded and has_nested_quantifiers:
             # Nested quantifiers (e.g., (a{100})+ ) can cause exponential blowup
             # Multiply by the product of bounded quantifiers
             bounded_product = 1

@@ -1,7 +1,11 @@
 """Unit tests for backend-specific JSON Schema prevalidation."""
 
+import json
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from llguidance import LLTokenizer
+from xgrammar import GrammarCompiler, TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.json_schema_validation import (
@@ -14,9 +18,17 @@ from sglang.srt.constrained.json_schema_validation import (
     validate_schema_bounds,
     validate_xgrammar_json_schema,
 )
-from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
-from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+from sglang.srt.constrained.llguidance_backend import GuidanceBackend, GuidanceGrammar
+from sglang.srt.constrained.outlines_backend import (
+    OutlinesGrammar,
+    OutlinesGrammarBackend,
+)
+from sglang.srt.constrained.xgrammar_backend import (
+    XGrammarGrammar,
+    XGrammarGrammarBackend,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -214,6 +226,67 @@ class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
 
         self.assertIsInstance(result, InvalidGrammarObject)
         backend._compile_regex.assert_not_called()
+
+
+class TestBoundedLinearPatterns(CustomTestCase):
+    patterns = (
+        "^[0-9a-f]{32}$",  # MD5
+        "^[0-9a-f]{40}$",  # SHA-1
+        "^[0-9a-f]{64}$",  # SHA-256
+        "^[0-9a-f]{128}$",  # SHA-512
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "^(?:[0-9a-f]{8}){8}$",
+        "^[*+?()|]{64}$",  # Metacharacters inside a class are character atoms.
+    )
+
+    def _assert_dispatch_accepts(self, backend, grammar_type):
+        for pattern in self.patterns:
+            with self.subTest(pattern=pattern):
+                schema = json.dumps({"type": "string", "pattern": pattern})
+                self.assertIsInstance(backend.dispatch_json(schema), grammar_type)
+
+    def test_xgrammar_dispatch_accepts_fixed_patterns(self):
+        backend = object.__new__(XGrammarGrammarBackend)
+        info = TokenizerInfo([chr(i) for i in range(129)], stop_token_ids=[128])
+        backend.grammar_compiler = GrammarCompiler(tokenizer_info=info)
+        backend.any_whitespace = True
+        backend.max_whitespace_cnt = None
+        backend.override_stop_tokens = None
+        backend.vocab_size = 129
+        self._assert_dispatch_accepts(backend, XGrammarGrammar)
+
+    def test_outlines_dispatch_accepts_fixed_patterns(self):
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend.whitespace_pattern = None
+        backend.outlines_tokenizer = MagicMock()
+        # Keep schema conversion and FSM budget checks real; only the external
+        # token guide needs a model tokenizer.
+        with patch("sglang.srt.constrained.outlines_backend.RegexGuide"):
+            self._assert_dispatch_accepts(backend, OutlinesGrammar)
+
+    def test_llguidance_dispatch_accepts_fixed_patterns(self):
+        backend = object.__new__(GuidanceBackend)
+        backend.llguidance_tokenizer = LLTokenizer("byte")
+        backend.any_whitespace = True
+        backend.whitespace_pattern = None
+        self._assert_dispatch_accepts(backend, GuidanceGrammar)
+
+    def test_linear_patterns_still_obey_state_budget(self):
+        validate_schema_bounds({"type": "string", "pattern": "^[ab]{64}$"})
+        for pattern in ("^[ab]{10001}$", "^(?:[ab]{100}){101}$"):
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(JSONSchemaStateExplosion):
+                    validate_schema_bounds({"type": "string", "pattern": pattern})
+
+    def test_ambiguous_patterns_keep_explosion_checks(self):
+        for pattern in (
+            "[ab]*a[ab]{100}",
+            "[ab]{100}a[ab]{100}$",
+            "^[ab]{0,100}a[ab]{100}$",
+        ):
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(JSONSchemaStateExplosion):
+                    validate_schema_bounds({"type": "string", "pattern": pattern})
 
 
 class TestSchemaBoundsValidation(unittest.TestCase):
