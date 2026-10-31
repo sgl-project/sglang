@@ -72,9 +72,9 @@ def rpd_to_chrome_trace(
         raise Exception("Trace file is empty.")
 
     print("Timestamps:")
-    print(f"\t    first: \t{min_time/1000} us")
-    print(f"\t     last: \t{max_time/1000} us")
-    print(f"\t duration: \t{(max_time-min_time) / 1000000000} seconds")
+    print(f"\t    first: \t{min_time / 1000} us")
+    print(f"\t     last: \t{max_time / 1000} us")
+    print(f"\t duration: \t{(max_time - min_time) / 1000000000} seconds")
 
     start_time = min_time / 1000
     end_time = max_time / 1000
@@ -114,7 +114,7 @@ def rpd_to_chrome_trace(
         )
 
     print("\nFilter: %s" % (rangeStringApi))
-    print(f"Output duration: {(end_time-start_time)/1000000} seconds")
+    print(f"Output duration: {(end_time - start_time) / 1000000} seconds")
 
     # Output Ops
 
@@ -368,11 +368,11 @@ def rpd_to_chrome_trace(
             if row[0] == "0":  # Frame start
                 if key not in stacks:
                     stacks[key] = []
-                stack = stacks[key].append((row[1], row[4]))
+                stacks[key].append((row[1], row[4]))
                 # print(f"0: new api frame: pid_tid={key} -> stack={stacks}")
 
             elif row[0] == "1":  # Frame end
-                completed = stacks[key].pop()
+                stacks[key].pop()
                 # print(f"1: end api frame: pid_tid={key} -> stack={stacks}")
 
             elif row[0] == "2":  # API + Op
@@ -400,8 +400,6 @@ def rpd_to_chrome_trace(
                                 or abs(gpuFrame.start - row[8]) < 200
                             )
                         ):
-                            # if gpuFrame.id == frame[0] and gpuFrame.name == frame[1]:    # Another op under the same frame -> union them
-                            # if False:   # Turn off frame joining
                             if row[7] < gpuFrame.start:
                                 gpuFrame.start = row[7]
                             if row[8] > gpuFrame.end:

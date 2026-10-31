@@ -90,14 +90,19 @@ def decide_request_auth(
       it must be rejected (403) even if api_key is provided.
 
     NOTE :
-    - Health/metrics endpoints are always allowed (even when api_key/admin_api_key is set),
-      to support k8s/liveness/readiness and Prometheus scraping without embedding secrets.
+    - Health/readiness/metrics endpoints are always allowed (even when
+      api_key/admin_api_key is set), to support k8s probes and Prometheus
+      scraping without embedding secrets.
     - We match them by prefix to cover common variants like /health_generate.
     """
     if method == "OPTIONS":
         return AuthDecision(allowed=True)
 
-    if path.startswith("/health") or path.startswith("/metrics"):
+    if (
+        path.startswith("/health")
+        or path.startswith("/ready")
+        or path.startswith("/metrics")
+    ):
         return AuthDecision(allowed=True)
 
     def _check_bearer_token(

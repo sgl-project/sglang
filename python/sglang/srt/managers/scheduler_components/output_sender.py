@@ -2,7 +2,7 @@ from typing import Optional, Union
 
 import zmq
 
-from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq
+from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq, sock_send
 
 
 class SenderWrapper:
@@ -12,17 +12,18 @@ class SenderWrapper:
     def send_output(
         self,
         output: Union[BaseReq, BaseBatchReq],
-        recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
+        recv_obj: Optional[object] = None,
     ):
         if self.socket is None:
             return
 
+        http_worker_ipc = getattr(recv_obj, "http_worker_ipc", None)
         if (
-            isinstance(recv_obj, BaseReq)
-            and recv_obj.http_worker_ipc is not None
+            isinstance(output, BaseReq)
+            and http_worker_ipc is not None
             and output.http_worker_ipc is None
         ):
-            # handle communicator reqs for multi-http worker case
-            output.http_worker_ipc = recv_obj.http_worker_ipc
+            # Scheduler Req is not a BaseReq but carries the same return route.
+            output.http_worker_ipc = http_worker_ipc
 
-        self.socket.send_pyobj(output)
+        sock_send(self.socket, output)

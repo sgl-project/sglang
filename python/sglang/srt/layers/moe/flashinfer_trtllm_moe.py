@@ -5,15 +5,19 @@ import torch
 from sglang.srt.utils.custom_op import register_custom_op
 
 
-def _fake_fp8_block_scale_moe(
+def _fake_fp8_block_scale_moe_out(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
+    output: torch.Tensor,
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -29,22 +33,27 @@ def _fake_fp8_block_scale_moe(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
-) -> torch.Tensor:
-    return torch.empty(
-        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
-    )
+) -> None:
+    return None
 
 
-@register_custom_op(fake_impl=_fake_fp8_block_scale_moe)
-def trtllm_fp8_block_scale_moe_wrapper(
+@register_custom_op(
+    fake_impl=_fake_fp8_block_scale_moe_out,
+    mutates_args=["output"],
+)
+def trtllm_fp8_block_scale_moe_out_wrapper(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
+    output: torch.Tensor,
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -60,7 +69,7 @@ def trtllm_fp8_block_scale_moe_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
-) -> torch.Tensor:
+) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
     except ImportError as e:
@@ -68,6 +77,7 @@ def trtllm_fp8_block_scale_moe_wrapper(
             "Can't import trtllm_fp8_block_scale_moe from flashinfer. "
             "Please check flashinfer version."
         ) from e
+
     kwargs = {
         "routing_logits": routing_logits,
         "routing_bias": routing_bias,
@@ -75,8 +85,12 @@ def trtllm_fp8_block_scale_moe_wrapper(
         "hidden_states_scale": hidden_states_scale,
         "gemm1_weights": gemm1_weights,
         "gemm1_weights_scale": gemm1_weights_scale,
+        "gemm1_alpha": gemm1_alpha,
+        "gemm1_beta": gemm1_beta,
+        "gemm1_clamp_limit": gemm1_clamp_limit,
         "gemm2_weights": gemm2_weights,
         "gemm2_weights_scale": gemm2_weights_scale,
+        "output": output,
         "num_experts": num_experts,
         "top_k": top_k,
         "n_group": n_group,
@@ -101,16 +115,20 @@ def trtllm_fp8_block_scale_moe_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
-    return trtllm_fp8_block_scale_moe(**kwargs)
+    trtllm_fp8_block_scale_moe(**kwargs)
 
 
-def _fake_fp8_block_scale_routed_moe(
+def _fake_fp8_block_scale_routed_moe_out(
     topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
@@ -121,6 +139,7 @@ def _fake_fp8_block_scale_routed_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
+    output: torch.Tensor,
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
@@ -128,20 +147,25 @@ def _fake_fp8_block_scale_routed_moe(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
-) -> torch.Tensor:
-    return torch.empty(
-        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
-    )
+) -> None:
+    return None
 
 
-@register_custom_op(fake_impl=_fake_fp8_block_scale_routed_moe)
-def trtllm_fp8_block_scale_routed_moe_wrapper(
+@register_custom_op(
+    fake_impl=_fake_fp8_block_scale_routed_moe_out,
+    mutates_args=["output"],
+)
+def trtllm_fp8_block_scale_routed_moe_out_wrapper(
     topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
@@ -152,6 +176,7 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
+    output: torch.Tensor,
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
@@ -159,7 +184,7 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Optional[int] = None,
     activation_type: Optional[int] = None,
-) -> torch.Tensor:
+) -> None:
     try:
         from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
     except ImportError as e:
@@ -167,15 +192,20 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
             "Can't import trtllm_fp8_block_scale_routed_moe from flashinfer. "
             "Please check flashinfer version."
         ) from e
+
     kwargs = {
-        "topk_ids": topk_ids,
+        "topk_ids": topk_ids if topk_weights is None else (topk_ids, topk_weights),
         "routing_bias": routing_bias,
         "hidden_states": hidden_states,
         "hidden_states_scale": hidden_states_scale,
         "gemm1_weights": gemm1_weights,
         "gemm1_weights_scale": gemm1_weights_scale,
+        "gemm1_alpha": gemm1_alpha,
+        "gemm1_beta": gemm1_beta,
+        "gemm1_clamp_limit": gemm1_clamp_limit,
         "gemm2_weights": gemm2_weights,
         "gemm2_weights_scale": gemm2_weights_scale,
+        "output": output,
         "num_experts": num_experts,
         "top_k": top_k,
         "n_group": n_group,
@@ -200,7 +230,7 @@ def trtllm_fp8_block_scale_routed_moe_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
-    return trtllm_fp8_block_scale_routed_moe(**kwargs)
+    trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 
 def _fake_fp8_per_tensor_scale_moe(
@@ -293,3 +323,63 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
         kwargs["activation_type"] = ActivationType(activation_type)
 
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)
+
+
+@register_custom_op(mutates_args=["output"])
+def trtllm_fp8_per_tensor_scale_routed_moe_out_wrapper(
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    output1_scales_scalar: torch.Tensor,
+    output1_scales_gate_scalar: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    output2_scales_scalar: torch.Tensor,
+    output: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
+) -> None:
+    try:
+        from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_routed_moe
+    except ImportError as e:
+        raise ImportError(
+            "FlashInfer TRT-LLM per-tensor FP8 with materialized routing requires "
+            "trtllm_fp8_per_tensor_scale_routed_moe; use the pinned CUDA FlashInfer build."
+        ) from e
+
+    kwargs = dict(
+        topk_ids=topk_ids if topk_weights is None else (topk_ids, topk_weights),
+        routing_bias=None,
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        output1_scales_scalar=output1_scales_scalar,
+        output1_scales_gate_scalar=output1_scales_gate_scalar,
+        gemm2_weights=gemm2_weights,
+        output2_scales_scalar=output2_scales_scalar,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        use_routing_scales_on_input=False,
+        routing_method_type=routing_method_type,
+        output=output,
+        enable_pdl=enable_pdl,
+        tune_max_num_tokens=tune_max_num_tokens,
+    )
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
+    trtllm_fp8_per_tensor_scale_routed_moe(**kwargs)

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import time
+from array import array
+from dataclasses import InitVar, dataclass, field
+from enum import Enum, auto
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
+    Dict,
     List,
     Optional,
 )
@@ -12,20 +18,44 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    beam_completion_tokens,
+    pack_beam_search_output,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    CachedTokensDetails,
+    DetokenizeReleaseReq,
+    RequestOutputStats,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.runtime_context import (
+    get_observability,
+    get_parallel,
+    get_serving,
+    get_spec,
+)
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_decoding_metrics import (
+    populate_spec_info,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
+
+if TYPE_CHECKING:
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+    from sglang.srt.rust_server.server import RustServer
+
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +63,61 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
+class OutputSink(Enum):
+    DETOKENIZER = auto()  # Python detokenizer: header once, then deltas
+    TOKENIZER = auto()  # --skip-tokenizer-init: per-row route, no decoding
+    RUST = auto()  # Rust frontend decodes with its own request state
+
+
+def _scheduler_decode_latency(time_stats: SchedulerReqTimeStats) -> Optional[float]:
+    """A finished non-streaming request's decode latency as Python's
+    TokenizerManager measures it: from the scheduler's prefill-finished stamp
+    (`_get_scheduler_first_token_time`, which has the stamp only when metrics
+    are on) to now, its terminal output (`get_decode_latency`). None where it
+    falls back to its own first-output time, which the Rust frontend
+    measures the same way."""
+    stamp = time_stats.prefill_finished_time
+    now = time.perf_counter()
+    if time_stats.enable_metrics and 0.0 < stamp <= now:
+        return now - stamp
+    return None
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
+    has_additional_customized_info: ClassVar[bool] = False
+
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
-    ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
+    skip_tokenizer_init: InitVar[bool]
     enable_hicache_storage: Callable[[], bool]
+    # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
+    # Rust egress ring via `rust_server.push_generation` instead of the zmq
+    # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
+    rust_server: Optional[RustServer] = None
+    # Set when the scheduler first defers a response; see deferred_output.
+    defer_outputs: bool = False
     _test_stream_output_count: int = 0
+    output_sink: OutputSink = field(init=False)
+    enable_metrics: bool = field(init=False)
+
+    def __post_init__(self, skip_tokenizer_init: bool) -> None:
+        if self.rust_server is not None:
+            self.output_sink = OutputSink.RUST
+        elif skip_tokenizer_init:
+            self.output_sink = OutputSink.TOKENIZER
+        else:
+            self.output_sink = OutputSink.DETOKENIZER
+        if self.has_additional_customized_info and self.output_sink is OutputSink.RUST:
+            raise ValueError(
+                "a streamer's additional customized_info needs TokenizerManager "
+                "hooks (update_request_meta_info) the Rust frontend does not run"
+            )
+        self.enable_metrics = get_observability().enable_metrics
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -53,9 +127,24 @@ class SchedulerOutputStreamer:
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
                 storage_backend_type = type(storage_backend).__name__
+        elif self.server_args.enable_lmcache:
+            storage_backend_type = "LMCache"
         return storage_backend_type
 
-    def get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def _rust_frames_split_cached_tokens(self) -> bool:
+        """Whether Rust egress frames carry each request's cached tokens by
+        tier, from which the frontend reports what
+        ``get_cached_tokens_details`` would. Only a cache with a host or
+        storage tier, or a PD decode server (which takes the split from
+        prefill), serves hits from anywhere but the device; otherwise the
+        frontend reports every cached token on device."""
+        return self.rust_server is not None and (
+            self.server_args.enable_hierarchical_cache
+            or self.server_args.enable_lmcache
+            or self.disaggregation_mode == DisaggregationMode.DECODE
+        )
+
+    def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -88,6 +177,55 @@ class SchedulerOutputStreamer:
 
         return None
 
+    def build_request_stats(self, req: Req) -> RequestOutputStats:
+        image_tokens, audio_tokens, video_tokens = req.get_mm_token_counts()
+        return RequestOutputStats(
+            prompt_tokens=len(req.origin_input_ids),
+            cached_tokens=req.cached_tokens,
+            cached_tokens_details=self.get_cached_tokens_details(req),
+            retraction_count=req.retraction_count,
+            image_tokens=image_tokens,
+            audio_tokens=audio_tokens,
+            video_tokens=video_tokens,
+            # Embedding outputs carry no time stats.
+            time_stats=(
+                req.time_stats.to_output_time_stats()
+                if self.enable_metrics and self.is_generation
+                else None
+            ),
+        )
+
+    def release_detokenize_state(self, req: Req) -> None:
+        if req.detokenize_header_sent:
+            self.send_to_detokenizer.send_output(DetokenizeReleaseReq(rid=req.rid))
+
+    def get_request_stats(self, req: Req, completion_tokens: int) -> Dict[str, Any]:
+        """A finished request's ``meta_info`` keys that Python's
+        TokenizerManager derives from scheduler state, built with the helpers
+        it uses, for the Rust frontend to report as they are: the retraction
+        count, the scheduler's timings when metrics are on, and the
+        speculative-decoding stats. TokenizerManager also reports the first
+        two on intermediate frames; the frontend reports them only on the
+        terminal one."""
+        stats: Dict[str, Any] = {"num_retractions": req.retraction_count}
+        if get_observability().enable_metrics:
+            output_time_stats = req.time_stats.to_output_time_stats()
+            if output_time_stats is not None:
+                stats.update(output_time_stats.to_meta_info())
+        if not self.spec_algorithm.is_none():
+            populate_spec_info(
+                stats,
+                num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                completion_tokens=completion_tokens,
+                verify_ct=req.spec_verify_ct,
+                num_correct_drafts=req.spec_num_correct_drafts,
+                num_cap_tokens=req.spec_num_cap_tokens,
+                num_block_accept_tokens=req.spec_num_block_accept_tokens,
+                correct_drafts_histogram=req.spec_correct_drafts_histogram,
+                cap_lens_histogram=req.spec_cap_lens_histogram,
+            )
+        return stats
+
     def stream_output(
         self,
         reqs: List[Req],
@@ -95,6 +233,9 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.defer_outputs:
+            # The scheduler releases held requests after their work completes.
+            reqs = [req for req in reqs if not req.defer_output]
         if self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
@@ -130,17 +271,32 @@ class SchedulerOutputStreamer:
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
+        return_sampling_mask = any(
+            req.return_sampling_mask for req in reqs if req is not skip_req
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
+            return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            default_stream_interval=self.server_args.stream_interval,
+            default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
-            get_cached_tokens_details=self.get_cached_tokens_details,
+            build_request_stats=self.build_request_stats,
+            is_request_level_customized_info_key=(
+                self.is_request_level_customized_info_key
+            ),
+            output_sink=self.output_sink,
+            current_weight_version=get_serving().weight_version,
+            cached_tokens_split=(
+                [] if self._rust_frames_split_cached_tokens() else None
+            ),
+            get_request_stats=(
+                self.get_request_stats if self.rust_server is not None else None
+            ),
         )
         for req in reqs:
             if req is skip_req:
@@ -153,20 +309,68 @@ class SchedulerOutputStreamer:
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 
+        if (
+            self.has_additional_customized_info
+            and self.should_build_additional_customized_info()
+        ):
+            additional_customized_info = self.build_additional_customized_info(
+                acc.output_reqs
+            )
+            for key, values in additional_customized_info.items():
+                if key in acc.customized_info:
+                    raise ValueError(f"duplicate customized_info key: {key}")
+                if len(values) != len(acc.output_reqs):
+                    raise ValueError(
+                        f"customized_info key {key!r} returned {len(values)} values "
+                        f"for {len(acc.output_reqs)} requests"
+                    )
+                acc.customized_info[key] = values
+
         # Send to detokenizer
         payload = acc.to_payload(
-            dp_rank=self.ps.dp_rank,
+            dp_rank=get_parallel().dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
         )
         if payload is not None:
-            self.send_to_detokenizer.send_output(payload)
+            if self.output_sink is OutputSink.RUST:
+                self.rust_server.push_generation(
+                    payload,
+                    acc.decode_latencies,
+                    acc.cached_tokens_split,
+                    (
+                        self._get_storage_backend_type()
+                        if acc.cached_tokens_split and self.enable_hicache_storage()
+                        else None
+                    ),
+                    acc.rust_request_stats,
+                )
+            else:
+                self.send_to_detokenizer.send_output(payload)
+
+    def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
+        """Return fields aligned with the emitted requests in ``reqs``.
+
+        Subclasses must set ``has_additional_customized_info`` to opt in. Each
+        returned value must have one entry per request. A matching
+        ``HostAuxiliaryOutput.consume`` call has already observed the tokens
+        committed in this scheduler step, so implementations can read buffered
+        per-request state here.
+        """
+        return {}
+
+    def should_build_additional_customized_info(self) -> bool:
+        """Return whether this invocation needs subclass-provided output fields."""
+        return True
+
+    def is_request_level_customized_info_key(self, key: str) -> bool:
+        """Whether a customized-info value is emitted once rather than token-sliced."""
+        return False
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
             req.finished()
-            and self.ps.attn_tp_rank == 0
-            and self.server_args.enable_request_time_stats_logging
+            and get_parallel().attn_tp_rank == 0
+            and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
 
@@ -176,11 +380,9 @@ class SchedulerOutputStreamer:
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
-        prompt_tokens = []
-        cached_tokens = []
-        cached_tokens_details = []  # Detailed breakdown by cache source
-        time_stats = []
-        retraction_counts = []
+        request_stats = []
+        tensor_embeddings = []
+        has_tensor_embeddings = False
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -188,49 +390,55 @@ class SchedulerOutputStreamer:
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
-                embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
-                cached_tokens.append(req.cached_tokens)
-
-                # Collect detailed cache breakdown if available
-                cached_tokens_details.append(self.get_cached_tokens_details(req))
-                time_stats.append(req.time_stats)
-                retraction_counts.append(req.retraction_count)
+                if isinstance(req.embedding, torch.Tensor):
+                    embeddings.append([])
+                    tensor_embeddings.append(req.embedding)
+                    has_tensor_embeddings = True
+                else:
+                    embeddings.append(req.embedding)
+                    tensor_embeddings.append(None)
+                request_stats.append(self.build_request_stats(req))
 
                 phs = req.pooled_hidden_state
                 phs_list.append(phs)
                 if phs is not None:
                     has_phs = True
 
-        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
-        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
-        # *every* entry is non-None (homogeneous batch); mixed batches
-        # (some requests want PHS, others don't) keep the raw list so
-        # positional indexing on the receiver side stays correct.
+        # Optimize pooled hidden states (PHS) for IPC serialization.
+        # Two formats, disambiguated on the receiver side by length:
+        #   Stacked:     [stacked_tensor(N, ...)] — len 1, N > 1 requests
+        #   Non-stacked: [tensor_0, tensor_1, ...] — len == N
+        # Stacking reduces N pickle/__reduce_ex__ calls to 1.
+        # Only possible when all entries are non-None and same shape.
+        # See paired receiver logic in tokenizer_manager.py.
         stacked_phs = None
         if has_phs:
             all_have_phs = all(t is not None for t in phs_list)
             if all_have_phs:
-                if all(t.shape == phs_list[0].shape for t in phs_list):
-                    stacked_phs = torch.stack(phs_list)
+                if len(phs_list) > 1 and all(
+                    t.shape == phs_list[0].shape for t in phs_list
+                ):
+                    # Stacked: single tensor, wrapped in a list.
+                    stacked_phs = [torch.stack(phs_list)]
                 else:
+                    # Non-stacked: 1 request, mixed shapes, or mixed None.
                     stacked_phs = phs_list
             else:
+                # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=time_stats,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
-                prompt_tokens=prompt_tokens,
-                cached_tokens=cached_tokens,
-                cached_tokens_details=cached_tokens_details,
+                request_stats=request_stats,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
-                retraction_counts=retraction_counts,
+                tensor_embeddings=(
+                    tensor_embeddings if has_tensor_embeddings else None
+                ),
                 pooled_hidden_states=stacked_phs,
             )
         )
@@ -242,55 +450,91 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
+    return_sampling_mask: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    get_cached_tokens_details: Callable[[Req], Optional[dict]]
-
+    build_request_stats: Callable[[Req], RequestOutputStats]
+    is_request_level_customized_info_key: Callable[[str], bool]
+    current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
+    output_reqs: list[Req] = field(default_factory=list)
+    # By row, the http_worker_ipc the row carries, else None; see BatchTokenIDOutput.
     http_worker_ipcs: list = field(default_factory=list)
+    has_http_worker_ipc: bool = False
     finished_reasons: list = field(default_factory=list)
-    decoded_texts: list = field(default_factory=list)
-    decode_ids_list: list = field(default_factory=list)
-    read_offsets: list = field(default_factory=list)
-    output_ids: list = field(default_factory=list)
-    skip_special_tokens: list = field(default_factory=list)
-    spaces_between_special_tokens: list = field(default_factory=list)
-    no_stop_trim: list = field(default_factory=list)
-    prompt_tokens: list = field(default_factory=list)
+    # See BatchTokenIDOutput.output_ids_flat.
+    output_ids_flat: array = field(default_factory=lambda: array("q"))
+    output_ids_offsets: list = field(default_factory=lambda: [0])
+    # OutputSink.DETOKENIZER only.
+    detokenize_headers: list = field(default_factory=list)
+    has_detokenize_header: bool = False
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
-    cached_tokens: list = field(default_factory=list)
-    cached_tokens_details: list = field(
-        default_factory=list
-    )  # Detailed breakdown by cache source
-    image_tokens: list = field(default_factory=list)
-    audio_tokens: list = field(default_factory=list)
-    video_tokens: list = field(default_factory=list)
+    request_stats: list = field(default_factory=list)
+    has_request_stats: bool = False
+    # OutputSink.RUST only; see BatchTokenIDOutput.prompt_tokens.
+    prompt_tokens: Optional[list] = None
+    cached_tokens: Optional[list] = None
+    image_tokens: Optional[list] = None
+    audio_tokens: Optional[list] = None
+    video_tokens: Optional[list] = None
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_block_accept_tokens: list = field(default_factory=list)
+    spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
-    retraction_counts: list = field(default_factory=list)
+    spec_cap_lens_histogram: list = field(default_factory=list)
+    weight_versions: list = field(default_factory=list)
+    prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
-    time_stats: list = field(default_factory=list)
+    beam_search_output: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
     output_token_logprobs_idx: Optional[list] = None
     input_top_logprobs_val: Optional[list] = None
     input_top_logprobs_idx: Optional[list] = None
+    # Per-request flat prompt top logprob arrays (return_flat_raw_top_logprobs);
+    # None entries for requests on the nested format.
+    input_top_logprobs_val_flat: Optional[list] = None
+    input_top_logprobs_idx_flat: Optional[list] = None
+    input_top_logprobs_flat_null_prefix: Optional[list] = None
+    has_input_top_logprobs_flat: bool = False
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_sampling_mask: Optional[list[Optional[SamplingMaskChunk]]] = None
+    output_sink: OutputSink
+    # OutputSink.RUST only: by row, the decode latency of a finished
+    # non-streaming request, whose first token the Rust frontend does not see.
+    decode_latencies: dict = field(default_factory=dict)
+    # Rust server mode, when a hit can come from a host or storage tier (see
+    # `SchedulerOutputStreamer._rust_frames_split_cached_tokens`): by row, the
+    # request's cached tokens per tier, as (device, host, storage). None
+    # otherwise.
+    cached_tokens_split: Optional[list] = None
+    # Rust server mode: builds a finished request's `request_stats` from it and
+    # its completion tokens (`SchedulerOutputStreamer.get_request_stats`).
+    # None otherwise.
+    get_request_stats: Optional[Callable[[Req, int], Dict[str, Any]]] = None
+    # By row, the finished requests' `request_stats`.
+    rust_request_stats: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.output_sink is OutputSink.RUST:
+            self.prompt_tokens = []
+            self.cached_tokens = []
+            self.image_tokens = []
+            self.audio_tokens = []
+            self.video_tokens = []
         if self.return_hidden_states:
             self.output_hidden_states = []
         if self.return_routed_experts:
@@ -305,14 +549,25 @@ class _GenerationStreamAccumulator:
             self.output_token_logprobs_idx = []
             self.input_top_logprobs_val = []
             self.input_top_logprobs_idx = []
+            self.input_top_logprobs_val_flat = []
+            self.input_top_logprobs_idx_flat = []
+            self.input_top_logprobs_flat_null_prefix = []
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.input_token_ids_logprobs_val = []
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+        if self.return_sampling_mask:
+            self.output_token_sampling_mask = []
+
+    def _beam_admits(self, *, req: Req) -> bool:
+        # Only the leader is ever streamed, and only at group finish.
+        return req.is_beam_leader and req.finished()
 
     def accept(self, *, req: Req) -> None:
+        if req.beam_group is not None and not self._beam_admits(req=req):
+            return
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -325,11 +580,16 @@ class _GenerationStreamAccumulator:
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
 
-                # origin stream_interval logic
+                # Send every step at the default interval of 1. Otherwise send
+                # the first token at once, then whenever at least
+                # stream_interval tokens are unsent: a step can append several
+                # tokens (speculative decoding, dLLM), so it can pass a multiple
+                # of the interval without landing on it.
+                num_unsent = len(req.output_ids) - req.send_token_offset
                 should_output = (
-                    len(req.output_ids) % stream_interval == 1
-                    if stream_interval > 1
-                    else len(req.output_ids) % stream_interval == 0
+                    stream_interval == 1
+                    or num_unsent >= stream_interval
+                    or (req.send_token_offset == 0 and num_unsent > 0)
                 )
 
                 if should_output:
@@ -346,59 +606,103 @@ class _GenerationStreamAccumulator:
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
-        self.http_worker_ipcs.append(req.http_worker_ipc)
+        self.output_reqs.append(req)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
-        self.decoded_texts.append(req.decoded_text)
-        decode_ids, read_offset = req.init_incremental_detokenize()
-
-        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-
-        req.send_decode_id_offset = len(decode_ids)
-        self.read_offsets.append(read_offset)
-        self.output_ids.append(output_ids_[send_token_offset:])
+        self.output_ids_flat.extend(output_ids_[send_token_offset:])
+        self.output_ids_offsets.append(len(self.output_ids_flat))
         req.send_token_offset = len(output_ids_)
-        self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
-        self.spaces_between_special_tokens.append(
-            req.sampling_params.spaces_between_special_tokens
+        # A verified token block can extend past the stop position. Report
+        # reasoning usage only within the same prefix as completion usage.
+        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
+        # Index-aligned with the batch items so mixed batches resolve per-item
+        # on the tokenizer side; None for non-beam items and aborted groups.
+        beam_output = (
+            pack_beam_search_output(req) if req.beam_group is not None else None
         )
-        self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-        self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
-        self.completion_tokens.append(len(output_ids_))
-        self.cached_tokens.append(req.cached_tokens)
+        self.beam_search_output.append(beam_output)
 
-        # Collect detailed cache breakdown if available
-        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        if self.output_sink is OutputSink.DETOKENIZER:
+            if req.take_detokenize_header_due():
+                self.detokenize_headers.append(build_detokenize_header(req))
+                self.has_detokenize_header = True
+            else:
+                self.detokenize_headers.append(None)
+            # A finished row carries its http_worker_ipc, so it reaches its
+            # tokenizer worker even with no stored state.
+            ipc = req.http_worker_ipc if req.finished() else None
+            self.http_worker_ipcs.append(ipc)
+            self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
+        elif self.output_sink is OutputSink.TOKENIZER:
+            self.http_worker_ipcs.append(req.http_worker_ipc)
 
-        # Multimodal prompt token counts. In disagg decode mode the prefill node
-        # already computed these and transferred them via the metadata buffer
-        # (req.mm_*), so prefer the pre-stored values; otherwise compute them
-        # from the request's multimodal items.
-        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
-            image_t = req.mm_image_tokens
-            audio_t = req.mm_audio_tokens
-            video_t = req.mm_video_tokens
-        elif req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        if self.output_sink is OutputSink.RUST:
+            # Per-step header columns of `push_generation`.
+            self.prompt_tokens.append(len(req.origin_input_ids))
+            self.cached_tokens.append(req.cached_tokens)
+            image_t, audio_t, video_t = req.get_mm_token_counts()
+            self.image_tokens.append(image_t)
+            self.audio_tokens.append(audio_t)
+            self.video_tokens.append(video_t)
+            if self.cached_tokens_split is not None:
+                self.cached_tokens_split.append(
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    )
+                )
         else:
-            image_t = audio_t = video_t = 0
-        self.image_tokens.append(image_t)
-        self.audio_tokens.append(audio_t)
-        self.video_tokens.append(video_t)
+            # Read by the DetokenizerManager (continuity check) and TokenizerManager
+            # (meta_info, per-request metrics), never by `push_generation`.
+            self.completion_tokens.append(
+                beam_completion_tokens(beam_output)
+                if beam_output is not None
+                else len(output_ids_)
+            )
 
-        self.retraction_counts.append(req.retraction_count)
+            if req.take_request_stats_due():
+                self.request_stats.append(self.build_request_stats(req))
+                self.has_request_stats = True
+            else:
+                self.request_stats.append(None)
 
-        self.time_stats.append(req.time_stats)
+        if req.finished():
+            self.weight_versions.append(
+                compute_weight_version_spans(
+                    req.weight_version_events,
+                    current_version=self.current_weight_version,
+                    num_output_tokens=len(output_ids_),
+                )
+            )
+            if self.output_sink is OutputSink.RUST and not req.stream:
+                latency = _scheduler_decode_latency(req.time_stats)
+                if latency is not None:
+                    self.decode_latencies[len(self.rids) - 1] = latency
+            self.prefill_weight_versions.append(req.prefill_weight_versions)
+            if self.get_request_stats is not None:
+                self.rust_request_stats[len(self.rids) - 1] = self.get_request_stats(
+                    req,
+                    (
+                        beam_completion_tokens(beam_output)
+                        if beam_output is not None
+                        else len(output_ids_)
+                    ),
+                )
+        else:
+            self.weight_versions.append(None)
+            self.prefill_weight_versions.append(None)
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
+            self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
+            self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 
         if self.return_logprob:
             if (
@@ -417,6 +721,17 @@ class _GenerationStreamAccumulator:
                 )
                 self.input_top_logprobs_val.append(req.logprob.input_top_logprobs_val)
                 self.input_top_logprobs_idx.append(req.logprob.input_top_logprobs_idx)
+                self.input_top_logprobs_val_flat.append(
+                    req.logprob.input_top_logprobs_val_flat
+                )
+                self.input_top_logprobs_idx_flat.append(
+                    req.logprob.input_top_logprobs_idx_flat
+                )
+                self.input_top_logprobs_flat_null_prefix.append(
+                    req.logprob.input_top_logprobs_flat_null_prefix
+                )
+                if req.logprob.input_top_logprobs_val_flat is not None:
+                    self.has_input_top_logprobs_flat = True
                 self.input_token_ids_logprobs_val.append(
                     req.logprob.input_token_ids_logprobs_val
                 )
@@ -429,11 +744,16 @@ class _GenerationStreamAccumulator:
                 self.input_token_logprobs_idx.append([])
                 self.input_top_logprobs_val.append([])
                 self.input_top_logprobs_idx.append([])
+                self.input_top_logprobs_val_flat.append(None)
+                self.input_top_logprobs_idx_flat.append(None)
+                self.input_top_logprobs_flat_null_prefix.append(None)
                 self.input_token_ids_logprobs_val.append([])
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
-                logprob_end = max(len(output_ids_), 1)
+                logprob_end = (
+                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
@@ -473,13 +793,27 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
+        if self.return_sampling_mask:
+            if req.return_sampling_mask:
+                self.output_token_sampling_mask.append(req.sampling_mask_rows.take())
+            else:
+                self.output_token_sampling_mask.append(None)
+
         if self.return_hidden_states:
             if req.return_hidden_states:
-                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
-                hs = req.hidden_states
-                if req.finished_len is not None:
-                    hs = hs[: req.finished_len]
-                self.output_hidden_states.append(hs)
+                if req.return_hidden_states == "last":
+                    # Collection keeps this list bounded to the final valid
+                    # accepted token, including speculative verify overshoot.
+                    self.output_hidden_states.append(
+                        req.hidden_states[-1] if req.hidden_states else None
+                    )
+                else:
+                    # Mirror output_ids_through_stop: spec verify steps can
+                    # overshoot finished_len.
+                    hs = req.hidden_states
+                    if req.finished_len is not None:
+                        hs = hs[: req.finished_len]
+                    self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
         if self.return_routed_experts:
@@ -491,38 +825,70 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
+        offsets = self.output_ids_offsets
+        current_output_len = offsets[-1] - offsets[-2]
         if req.customized_info is not None:
-            for k, v in req.customized_info.items():
-                if k not in self.customized_info:
-                    self.customized_info[k] = []
-                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+            for key, req_values in req.customized_info.items():
+                is_request_level = self.is_request_level_customized_info_key(key)
+                if is_request_level:
+                    if req.stream:
+                        if send_token_offset != 0:
+                            continue
+                    elif not req.finished():
+                        continue
+                if key not in self.customized_info:
+                    self.customized_info[key] = [
+                        [] if is_request_level else [None] * (end - start)
+                        for start, end in zip(offsets[:-2], offsets[1:-1])
+                    ]
+                if req_values is None:
+                    values = [] if is_request_level else [None] * current_output_len
+                elif is_request_level:
+                    values = req_values
+                else:
+                    values = req_values[send_token_offset : len(output_ids_)]
+                self.customized_info[key].append(values)
+
+        for key, per_request_values in self.customized_info.items():
+            if len(per_request_values) < len(self.rids):
+                per_request_values.append(
+                    []
+                    if self.is_request_level_customized_info_key(key)
+                    else [None] * current_output_len
+                )
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
-        if not (has_reqs or is_idle_batch):
+        if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
-            http_worker_ipcs=self.http_worker_ipcs,
+            # The tokenizer-side router reads the list on every TOKENIZER batch,
+            # idle ones included.
+            http_worker_ipcs=(
+                self.http_worker_ipcs
+                if self.output_sink is OutputSink.TOKENIZER or self.has_http_worker_ipc
+                else None
+            ),
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
-            time_stats=self.time_stats,
+            spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             finished_reasons=self.finished_reasons,
-            decoded_texts=self.decoded_texts,
-            decode_ids=self.decode_ids_list,
-            read_offsets=self.read_offsets,
-            output_ids=self.output_ids,
-            skip_special_tokens=self.skip_special_tokens,
-            spaces_between_special_tokens=self.spaces_between_special_tokens,
-            no_stop_trim=self.no_stop_trim,
-            prompt_tokens=self.prompt_tokens,
+            output_ids_flat=self.output_ids_flat,
+            output_ids_offsets=self.output_ids_offsets,
+            detokenize_headers=(
+                self.detokenize_headers if self.has_detokenize_header else None
+            ),
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
+            request_stats=self.request_stats if self.has_request_stats else None,
+            prompt_tokens=self.prompt_tokens,
             cached_tokens=self.cached_tokens,
-            cached_tokens_details=self.cached_tokens_details,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,
@@ -532,6 +898,23 @@ class _GenerationStreamAccumulator:
             output_token_logprobs_idx=self.output_token_logprobs_idx,
             input_top_logprobs_val=self.input_top_logprobs_val,
             input_top_logprobs_idx=self.input_top_logprobs_idx,
+            # None on the common path so the wire payload is unchanged when no
+            # request in the batch uses the flat format.
+            input_top_logprobs_val_flat=(
+                self.input_top_logprobs_val_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_idx_flat=(
+                self.input_top_logprobs_idx_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_flat_null_prefix=(
+                self.input_top_logprobs_flat_null_prefix
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
             output_top_logprobs_val=self.output_top_logprobs_val,
             output_top_logprobs_idx=self.output_top_logprobs_idx,
             input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
@@ -539,12 +922,36 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
+            output_token_sampling_mask=self.output_token_sampling_mask,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
-            customized_info=self.customized_info,
+            # The Rust egress encodes the per-token lists itself.
+            customized_info=(
+                (
+                    self.customized_info
+                    if self.output_sink is OutputSink.RUST
+                    else wrap_as_pickle(self.customized_info)
+                )
+                if self.customized_info
+                else None
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=self.retraction_counts,
+            # All-None means no beam item in this batch; drop the list so
+            # non-beam traffic pays no carrier cost.
+            beam_search_output=(
+                self.beam_search_output
+                if any(x is not None for x in self.beam_search_output)
+                else None
+            ),
+            weight_versions=(
+                self.weight_versions if any(self.weight_versions) else None
+            ),
+            prefill_weight_versions=(
+                self.prefill_weight_versions
+                if any(self.prefill_weight_versions)
+                else None
+            ),
             dp_ranks=dp_ranks,
         )

@@ -2,23 +2,22 @@ from typing import Union
 
 import torch
 
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import set_weight_attrs
 
 
-class Mixer2RMSNormGated(MultiPlatformOp):
+class Mixer2RMSNormGated(BaseFusedOp):
     def __init__(
         self,
         full_hidden_size: int,
@@ -44,13 +43,20 @@ class Mixer2RMSNormGated(MultiPlatformOp):
         if self.use_rms_norm:
             # Register norm weight only if we're actually applying RMSNorm
             self.weight = torch.nn.Parameter(torch.ones(self.per_rank_hidden_size))
-            set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(
+                self.weight,
+                {
+                    "weight_loader": sharded_weight_loader(
+                        0, parallel_group="attn_tp" if self.use_attn_tp_group else "tp"
+                    )
+                },
+            )
         else:
             # Avoid checkpoint mismatch by skipping unused parameter
             self.register_parameter("weight", None)
-        assert (
-            self.full_hidden_size % self.tp_size == 0
-        ), "Tensor parallel world size must divide hidden size."
+        assert self.full_hidden_size % self.tp_size == 0, (
+            "Tensor parallel world size must divide hidden size."
+        )
 
     def forward_native(
         self,
@@ -92,7 +98,7 @@ class Mixer2RMSNormGated(MultiPlatformOp):
                 # To handle the general case, redundantly apply the variance
                 if self.use_attn_tp_group:
                     parts = [torch.empty_like(x) for _ in range(self.tp_size)]
-                    get_attention_tp_group().all_gather(x, output_tensor_list=parts)
+                    get_parallel().attn_tp_group.all_gather(x, output_tensor_list=parts)
                     x = torch.cat(parts, dim=-1)
                 else:
                     x = tensor_model_parallel_all_gather(x, -1)

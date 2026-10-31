@@ -2,7 +2,7 @@ import json as json_lib
 import logging
 import math
 import os
-import re
+from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -24,8 +24,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -33,7 +33,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 
 
 class Llama4VisionMLP(nn.Module):
-
     def __init__(
         self,
         input_size: int,
@@ -115,7 +114,6 @@ def pixel_shuffle(input_tensor, shuffle_ratio):
 
 
 class Llama4VisionPixelShuffleMLP(nn.Module):
-
     def __init__(
         self,
         config,
@@ -126,7 +124,9 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         super().__init__()
         self.pixel_shuffle_ratio = config.pixel_shuffle_ratio
         self.mlp = Llama4VisionMLP(
-            input_size=config.intermediate_size,
+            input_size=getattr(
+                config, "original_intermediate_size", config.intermediate_size
+            ),
             intermediate_size=config.projector_input_dim,
             output_size=config.projector_output_dim,
             bias=config.multi_modal_projector_bias,
@@ -153,7 +153,6 @@ def apply_position_embedding(q, k, freqs_ci, shape):
 
 
 class Llama4VisionEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -163,8 +162,17 @@ class Llama4VisionEncoderLayer(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
+        self.num_attention_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
         self.intermediate_size = config.intermediate_size
+        num_dummy_heads = 0
+        if hasattr(config, "original_num_attention_heads"):
+            num_dummy_heads = (
+                config.num_attention_heads - config.original_num_attention_heads
+            )
 
         self.self_attn = VisionAttention(
             self.hidden_size,
@@ -175,6 +183,7 @@ class Llama4VisionEncoderLayer(nn.Module):
             quant_config=None,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            num_dummy_heads=num_dummy_heads,
             qkv_bias=True,
             customized_position_embedding_applier=apply_position_embedding,
         )
@@ -214,7 +223,6 @@ class Llama4VisionEncoderLayer(nn.Module):
 
 
 class Llama4VisionEncoder(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -260,7 +268,6 @@ class Llama4VisionEncoder(nn.Module):
 
 
 class Llama4UnfoldConvolution(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -273,9 +280,16 @@ class Llama4UnfoldConvolution(nn.Module):
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         self.unfold = torch.nn.Unfold(kernel_size=kernel_size, stride=config.patch_size)
+        output_size = (
+            config.hidden_size
+            // config.original_num_attention_heads
+            * config.num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.hidden_size
+        )
         params = {
             "input_size": config.num_channels * kernel_size[0] * kernel_size[1],
-            "output_size": config.hidden_size,
+            "output_size": output_size,
             "bias": False,
             "quant_config": quant_config,
             "prefix": f"{prefix}.linear",
@@ -303,7 +317,12 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         img_idx[-1, -1] = -2  # ID_CLS_TOKEN
         frequencies_x = img_idx % idx  # get the coordinates of the 2d matrix along x
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
-        freq_dim = config.hidden_size // config.num_attention_heads // 2
+        num_attention_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
+        freq_dim = config.hidden_size // num_attention_heads // 2
         rope_freq = 1.0 / (
             config.rope_parameters["rope_theta"]
             ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
@@ -326,7 +345,6 @@ class Llama4VisionRotaryEmbedding(nn.Module):
 
 
 class Llama4VisionModel(nn.Module):
-
     def __init__(
         self,
         config: Llama4VisionConfig,
@@ -378,6 +396,14 @@ class Llama4VisionModel(nn.Module):
     ) -> torch.Tensor:
         # Patch embedding
         hidden_state = self.patch_embedding(pixel_values)
+        # If padded in patch embedding linear part, only retrieve valid slice
+        if (
+            hasattr(self.config, "original_num_attention_heads")
+            and self.config.num_attention_heads
+            > self.config.original_num_attention_heads
+        ):
+            hidden_state = hidden_state[:, :, : self.config.hidden_size]
+
         num_tiles, num_patches, hidden_dim = hidden_state.shape
 
         # Add cls token
@@ -420,11 +446,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    # Pattern to match language model layers only (skip vision_model and multi_modal_projector)
-    lora_pattern = re.compile(
-        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def __init__(
         self,
         config: Llama4Config,
@@ -444,9 +465,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                 "Please not that this warning might be inaccurate if the weights haven't been fully downloaded"
             )
 
-        self.has_vision = (
-            self.has_vision_weights and get_global_server_args().enable_multimodal
-        )
+        self.has_vision = self.has_vision_weights and get_mm().enable_multimodal
 
         if self.has_vision:
             # TODO: make this more general
@@ -483,7 +502,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(
             config.text_config if hasattr(config, "text_config") else config
         )
-        self.padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def _has_vision_weights(self, config) -> bool:
         """Check if the model has vision components by examining the checkpoint."""
@@ -535,8 +553,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         except (OSError, json_lib.JSONDecodeError, KeyError):
             return False
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return self.padding_pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(
         self,
@@ -560,7 +578,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def should_apply_lora(self, module_name: str) -> bool:
         """Skip vision model and multi_modal_projector for LoRA."""
-        return bool(self.lora_pattern.match(module_name))
+        return module_name.startswith("language_model.model.layers.")
 
     def forward(
         self,

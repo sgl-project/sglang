@@ -28,15 +28,18 @@ import signal
 import sys
 import threading
 import zlib
+from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
+import msgspec
 import psutil
 import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -44,17 +47,29 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ConfigureLoggingReq,
     ContinueGenerationReqInput,
     FreezeGCReq,
-    PauseContinueBroadcast,
+    PauseContinueBroadcastReq,
     PauseGenerationReqInput,
-    TokenizerWorkerRegistration,
+    TokenizerWorkerRegistrationReq,
+    async_sock_recv,
+    async_sock_send,
+    flatten_output_ids,
+    row_output_ids,
+    sock_recv,
+    sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.trace import process_tracing_init
+from sglang.srt.runtime_context import get_disagg, get_observability
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -68,6 +83,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+_cached_output_fields = lru_cache(maxsize=None)(msgspec.structs.fields)
 
 
 class SocketMapping:
@@ -97,7 +114,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        self._mapping[ipc_name].send_pyobj(output)
+        sock_send(self._mapping[ipc_name], output)
 
 
 def _extract_field_by_index(
@@ -118,17 +135,47 @@ def _extract_field_by_index(
     if field is None:
         return None
 
+    should_wrap_result = field_name == "customized_info"
+    if should_wrap_result:
+        field = unwrap_from_pickle(field)
+        if field is None:
+            return None
+
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            new_field[k] = v[index] if len(v) > index else None
+            if len(v) > index:
+                new_field[k] = [v[index]] if should_wrap_result else v[index]
+            else:
+                new_field[k] = [None] if should_wrap_result else None
+        if should_wrap_result:
+            return wrap_as_pickle(new_field) if new_field else None
         return new_field
 
     if check_length:
         if len(field) <= index:
             return None
 
-    return [field[index]]
+    new_field = [field[index]]
+    return wrap_as_pickle(new_field) if should_wrap_result else new_field
+
+
+def _extract_output_ids_by_indices(
+    output: Union[BatchTokenIDOutput, BatchStrOutput], indices: List[int]
+) -> Dict[str, Any]:
+    """The flat output ids columns of the rows at indices, in that order."""
+    flat, offsets = flatten_output_ids(row_output_ids(output, i) for i in indices)
+    return {"output_ids_flat": flat, "output_ids_offsets": offsets}
+
+
+def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int):
+    states = output.pooled_hidden_states
+    if states is None:
+        return None
+    # Stacked layout: one tensor holding a row per request.
+    if len(states) == 1 and len(output.rids) > 1:
+        return [states[0][i]]
+    return [states[i]]
 
 
 def _handle_output_by_index(output, i):
@@ -143,29 +190,21 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),
-            time_stats=_extract_field_by_index(output, "time_stats", i),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
+            ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
-            decode_ids=_extract_field_by_index(output, "decode_ids", i),
-            read_offsets=_extract_field_by_index(output, "read_offsets", i),
-            output_ids=_extract_field_by_index(output, "output_ids", i),
-            skip_special_tokens=_extract_field_by_index(
-                output, "skip_special_tokens", i
-            ),
-            spaces_between_special_tokens=_extract_field_by_index(
-                output, "spaces_between_special_tokens", i
-            ),
-            no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            **_extract_output_ids_by_indices(output, [i]),
+            detokenize_headers=_extract_field_by_index(output, "detokenize_headers", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cached_tokens_details=_extract_field_by_index(
-                output, "cached_tokens_details", i
-            ),
-            image_tokens=_extract_field_by_index(output, "image_tokens", i),
-            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
-            video_tokens=_extract_field_by_index(output, "video_tokens", i),
+            request_stats=_extract_field_by_index(output, "request_stats", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -183,6 +222,15 @@ def _handle_output_by_index(output, i):
             ),
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
+            ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
             ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
@@ -205,6 +253,9 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -214,9 +265,15 @@ def _handle_output_by_index(output, i):
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
-            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            prefill_weight_versions=_extract_field_by_index(
+                output, "prefill_weight_versions", i
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -230,10 +287,13 @@ def _handle_output_by_index(output, i):
             rids=[output.rids[i]],
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             embeddings=_extract_field_by_index(output, "embeddings", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
+            tensor_embeddings=_extract_field_by_index(
+                output, "tensor_embeddings", i, check_length=False
+            ),
+            request_stats=_extract_field_by_index(output, "request_stats", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
@@ -245,20 +305,21 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),
-            time_stats=_extract_field_by_index(output, "time_stats", i),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
+            ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
-            output_ids=_extract_field_by_index(output, "output_ids", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+            **_extract_output_ids_by_indices(output, [i]),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cached_tokens_details=_extract_field_by_index(
-                output, "cached_tokens_details", i
-            ),
-            image_tokens=_extract_field_by_index(output, "image_tokens", i),
-            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
-            video_tokens=_extract_field_by_index(output, "video_tokens", i),
+            request_stats=_extract_field_by_index(output, "request_stats", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -276,6 +337,15 @@ def _handle_output_by_index(output, i):
             ),
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
+            ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
             ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
@@ -298,6 +368,9 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -313,7 +386,13 @@ def _handle_output_by_index(output, i):
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            prefill_weight_versions=_extract_field_by_index(
+                output, "prefill_weight_versions", i
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -321,6 +400,156 @@ def _handle_output_by_index(output, i):
     else:
         new_output = output
     return new_output
+
+
+class _CannotSplitBatch(Exception):
+    pass
+
+
+def _extract_field_by_indices(
+    output: Any, field_name: str, indices: List[int], check_length: bool = True
+) -> Any:
+    field = object.__getattribute__(output, field_name)
+    if field is None:
+        return None
+
+    should_wrap_result = field_name == "customized_info"
+    if should_wrap_result:
+        field = unwrap_from_pickle(field)
+        if field is None:
+            return None
+
+    max_index = max(indices)
+    if isinstance(field, dict):
+        new_field = {}
+        for key, values in field.items():
+            if len(values) <= max_index:
+                raise _CannotSplitBatch(
+                    f"{field_name}[{key!r}] cannot provide index {max_index}"
+                )
+            selected = [values[index] for index in indices]
+            new_field[key] = selected
+        if should_wrap_result:
+            return wrap_as_pickle(new_field) if new_field else None
+        return new_field
+
+    # Same as _extract_field_by_index: a field too short for every index (e.g.
+    # spec_* lists stay empty when speculative decoding is off) becomes None.
+    if check_length and len(field) <= min(indices):
+        return None
+    if len(field) <= max_index:
+        raise _CannotSplitBatch(f"{field_name} cannot provide index {max_index}")
+
+    selected = [field[index] for index in indices]
+    return wrap_as_pickle(selected) if should_wrap_result else selected
+
+
+# Per-request fields that may be shorter than rids; the rest must match rids or
+# be empty.
+_UNCHECKED_LENGTH_FIELDS = frozenset(
+    {
+        "input_token_logprobs_val",
+        "input_token_logprobs_idx",
+        "output_token_logprobs_val",
+        "output_token_logprobs_idx",
+        "input_top_logprobs_val",
+        "input_top_logprobs_idx",
+        "input_top_logprobs_val_flat",
+        "input_top_logprobs_idx_flat",
+        "input_top_logprobs_flat_null_prefix",
+        "output_top_logprobs_val",
+        "output_top_logprobs_idx",
+        "input_token_ids_logprobs_val",
+        "input_token_ids_logprobs_idx",
+        "output_token_ids_logprobs_val",
+        "output_token_ids_logprobs_idx",
+        "output_token_entropy_val",
+        "output_token_sampling_mask",
+        "output_hidden_states",
+        "routed_experts",
+        "indexer_topk",
+        "token_steps",
+        "customized_info",
+        "dp_ranks",
+    }
+)
+_NOT_SPLIT_FIELDS = frozenset(
+    {
+        "rids",
+        "http_worker_ipcs",
+        "placeholder_tokens_idx",
+        "placeholder_tokens_val",
+        "output_ids_flat",
+        "output_ids_offsets",
+    }
+)
+
+
+def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
+    if len(indices) == 1:
+        return _handle_output_by_index(output, indices[0])
+    if not isinstance(output, (BatchTokenIDOutput, BatchStrOutput)):
+        raise _CannotSplitBatch(f"Cannot split {type(output)}")
+
+    split_fields = {
+        field.name: _extract_field_by_indices(
+            output,
+            field.name,
+            indices,
+            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+        )
+        for field in _cached_output_fields(type(output))
+        if field.name not in _NOT_SPLIT_FIELDS
+    }
+    return type(output)(
+        rids=[output.rids[index] for index in indices],
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        **_extract_output_ids_by_indices(output, indices),
+        **split_fields,
+    )
+
+
+def _split_batch_by_key(
+    output: Any, keys: List[Any]
+) -> Optional[List[Tuple[Any, Any]]]:
+    indices_by_key: Dict[Any, List[int]] = {}
+    for index, key in enumerate(keys):
+        indices_by_key.setdefault(key, []).append(index)
+
+    # Build every sub-batch before any send, so a fallback never duplicates one.
+    try:
+        grouped = [
+            (key, _handle_output_by_indices(output, indices), indices)
+            for key, indices in indices_by_key.items()
+        ]
+    except _CannotSplitBatch:
+        return None
+
+    ipcs = output.http_worker_ipcs
+    for _, sub_output, indices in grouped:
+        sub_output.http_worker_ipcs = (
+            None if ipcs is None else [ipcs[index] for index in indices]
+        )
+    return [(key, sub_output) for key, sub_output, _ in grouped]
+
+
+def _send_output_to_tokenizer_workers(
+    output: Any, ipcs: List[Optional[str]], socket_mapping: SocketMapping
+) -> None:
+    grouped = (
+        _split_batch_by_key(output, ipcs)
+        if envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.get()
+        else None
+    )
+    if grouped is None:
+        for index, ipc_name in enumerate(ipcs):
+            single_output = _handle_output_by_index(output, index)
+            socket_mapping.send_output(ipc_name, single_output, is_tokenizer=True)
+        return
+
+    for ipc_name, grouped_output in grouped:
+        socket_mapping.send_output(ipc_name, grouped_output, is_tokenizer=True)
 
 
 class MultiHttpWorkerDetokenizerMixin:
@@ -333,29 +562,29 @@ class MultiHttpWorkerDetokenizerMixin:
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
+        # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
+        # paused while waiting for input and fed once per processed message.
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is None:
-                continue
-
-            # Fan out the output back to the originating tokenizer worker(s).
-            # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-            # forward either batched or single requests, so handle both shapes.
-            if isinstance(recv_obj, BaseBatchReq):
-                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                    new_output = _handle_output_by_index(output, i)
-                    self.socket_mapping.send_output(
-                        ipc_name, new_output, is_tokenizer=True
+            if output is not None:
+                # Fan out the output back to the originating tokenizer worker(s).
+                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+                # forward either batched or single requests, so handle both shapes.
+                if isinstance(recv_obj, BaseBatchReq):
+                    _send_output_to_tokenizer_workers(
+                        output, output.http_worker_ipcs, self.socket_mapping
                     )
-            elif isinstance(recv_obj, BaseReq):
-                self.socket_mapping.send_output(
-                    recv_obj.http_worker_ipc, output, is_tokenizer=True
-                )
-            else:
-                raise ValueError(
-                    f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                )
+                elif isinstance(recv_obj, BaseReq):
+                    self.socket_mapping.send_output(
+                        recv_obj.http_worker_ipc, output, is_tokenizer=True
+                    )
+                else:
+                    raise ValueError(
+                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                    )
+            self.soft_watchdog.feed()
 
 
 class MultiTokenizerRouter:
@@ -371,7 +600,15 @@ class MultiTokenizerRouter:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        # Requests are unpickled here; TraceReqContext needs an OTel provider.
+        if get_observability().enable_trace:
+            process_tracing_init(
+                get_observability().otlp_traces_endpoint,
+                get_observability().otlp_service_name,
+                trace_modules=get_observability().trace_modules,
+            )
         self.server_args = server_args
+        self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -398,18 +635,21 @@ class MultiTokenizerRouter:
         # read SHM only. Drain it event-driven via the socket's fd instead of
         # polling on a timer.
         self.load_snapshot_reader = None
-        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+        if zmq_reader_owner("MultiTokenizerRouter"):
             self.load_snapshot_reader = create_load_snapshot_reader(
-                server_args, port_args, caller="MultiTokenizerRouter"
+                port_args, caller="MultiTokenizerRouter"
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
+
+    def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
+        self.startup_time = startup_time
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -431,9 +671,9 @@ class MultiTokenizerRouter:
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
+            recv_obj = await async_sock_recv(self.receive_from_worker)
 
-            if isinstance(recv_obj, TokenizerWorkerRegistration):
+            if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
                     self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
                     logger.info(
@@ -447,7 +687,7 @@ class MultiTokenizerRouter:
             ):
                 # Broadcast to ALL workers so every worker's is_pause is set
                 is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcast(is_pause=is_pause)
+                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
                 # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
@@ -456,15 +696,15 @@ class MultiTokenizerRouter:
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
                 ):
-                    await self.send_to_scheduler.send_pyobj(recv_obj)
+                    await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
@@ -483,9 +723,10 @@ class MultiTokenizerRouter:
 class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
-    Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
-    ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
-    always land on the same detokenizer and ``decode_status`` stays consistent.
+    Each request is pinned to a worker by hashing its ``rid`` with ``zlib.crc32``
+    (deterministic across runs), so all outputs of a rid land on the same
+    detokenizer and ``detokenize_state_table`` stays consistent. The route cannot
+    be the key: only some outputs of a request carry its ``http_worker_ipc``.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -503,22 +744,39 @@ class MultiDetokenizerRouter:
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
+    def _send_batch(self, recv_obj: BaseBatchReq) -> None:
+        targets = [self._pick(rid) for rid in recv_obj.rids]
+
+        grouped = _split_batch_by_key(recv_obj, targets)
+        if grouped is None:
+            ipcs = recv_obj.http_worker_ipcs
+            for index, target in enumerate(targets):
+                one = _handle_output_by_index(recv_obj, index)
+                if one is recv_obj:
+                    raise TypeError(f"Cannot split {type(recv_obj)}")
+                one.http_worker_ipcs = None if ipcs is None else [ipcs[index]]
+                self._send(target, one)
+            return
+
+        for target, output in grouped:
+            self._send(target, output)
+
     def event_loop(self):
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
 
-            # FreezeGCReq must freeze every detokenizer process.
-            if isinstance(recv_obj, FreezeGCReq):
+            # Control messages must reach every detokenizer process.
+            if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Single request: route like the batch items of the same rid.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None
-                ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                assert recv_obj.rid is not None, (
+                    f"Single req {type(recv_obj).__name__} has no rid"
+                )
+                self._send(self._pick(recv_obj.rid), recv_obj)
                 continue
 
             # Batch request.
@@ -529,20 +787,7 @@ class MultiDetokenizerRouter:
                         self._send(ipc, recv_obj)
                     continue
 
-                ipcs = recv_obj.http_worker_ipcs
-                assert (
-                    ipcs is not None
-                    and len(ipcs) == len(recv_obj.rids)
-                    and all(x is not None for x in ipcs)
-                ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
-
-                # Split per-item and route each by its own ipc.
-                for i, ipc_key in enumerate(ipcs):
-                    one = _handle_output_by_index(recv_obj, i)
-                    if one is recv_obj:
-                        raise TypeError(f"Cannot split {type(recv_obj)}")
-                    one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(ipc_key), one)
+                self._send_batch(recv_obj)
                 continue
 
             raise ValueError(
@@ -554,6 +799,8 @@ def run_multi_detokenizer_router_process(
     ipc_name_list: List[str],
     server_args: ServerArgs,
     port_args: PortArgs,
+    *,
+    enable_metrics: bool,
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
@@ -562,6 +809,8 @@ def run_multi_detokenizer_router_process(
 
     router = None
     try:
+        if enable_metrics:
+            start_cpu_monitor_thread("detokenizer_router")
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
@@ -581,36 +830,36 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
-        # prevent init prefill bootstrapserver again
-        disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
-        super().__init__(server_args, port_args)
+        import torch
+
+        torch.set_num_threads(1)
+        super().__init__(
+            server_args,
+            port_args,
+            start_pd_bootstrap_service=False,
+        )
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-        # For PD disaggregtion
-        self.server_args.disaggregation_mode = disaggregation_mode
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
+        # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting
-        reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
-        self.send_to_scheduler.send_pyobj(reg)
+        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        self._dispatch_to_scheduler(reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
 
-        # Register PauseContinueBroadcast in the result dispatcher so
+        # Register PauseContinueBroadcastReq in the result dispatcher so
         # handle_loop routes it to _handle_pause_continue_broadcast
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcast, self._handle_pause_continue_broadcast)]
+            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -618,7 +867,7 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -633,15 +882,15 @@ class TokenizerWorker(TokenizerManager):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 
-    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
+    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""
         loop = asyncio.get_event_loop()
         loop.create_task(self._apply_pause_continue_broadcast(obj))
 
-    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
+    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Apply pause/continue state under the condition lock."""
         async with self.is_pause_cond:
             if obj.is_pause:
@@ -655,14 +904,18 @@ class TokenizerWorker(TokenizerManager):
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
 
-    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
 
-        if isinstance(req, BaseReq):
-            req.http_worker_ipc = self.tokenizer_ipc_name
-        elif isinstance(req, BaseBatchReq):
-            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
-        else:
-            raise ValueError(f"Unknown req type: {type(req)}")
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerWorker
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
+            f"subclass, got {worker_class!r}"
+        )
+
+    return worker_class
 
 
 async def print_exception_wrapper(func):
@@ -684,9 +937,7 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """
-    Get the main process ID.
-    """
+    """Get the main process ID."""
     return multiprocessing.current_process()._parent_pid
 
 
@@ -722,7 +973,9 @@ def read_from_shared_memory(name: str) -> Any:
 
 
 def write_data_for_multi_tokenizer(
-    port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
+    port_args: PortArgs,
+    server_args: ServerArgs,
+    scheduler_info: Dict,
 ):
     """Write args information to share memory for multi-tokenizer"""
     # get main process ID
@@ -734,14 +987,3 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-class SenderWrapper:
-    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
-        self.port_args = port_args
-        self.send_to_scheduler = send_to_scheduler
-
-    def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)

@@ -6,12 +6,13 @@ LoRA deltas are injected via hooks.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import DispatchMoeRunnerCore, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -23,25 +24,21 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
-
-    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation import silu_and_mul
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+        moe_sum_reduce_triton,
+    )
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
     )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        moe_sum_reduce_triton,
-    )
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 
-_MARLIN_WORKSPACE: Optional[torch.Tensor] = None
-
-
-class MarlinLoraRunnerCore:
+class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
     """
     MoE runner using Marlin kernels for base projections, with hooks for LoRA.
 
@@ -57,6 +54,10 @@ class MarlinLoraRunnerCore:
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
+    @property
+    def runner_backend(self) -> MoeRunnerBackend:
+        return MoeRunnerBackend.MARLIN
+
     def run_from_dispatch(
         self,
         dispatch_output: StandardDispatchOutput,
@@ -64,21 +65,19 @@ class MarlinLoraRunnerCore:
         runner_config: MoeRunnerConfig,
         hooks=None,
     ) -> StandardCombineInput:
-        global _MARLIN_WORKSPACE
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         assert hooks is not None, "hooks must be provided for MarlinLoraRunnerCore"
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
-        assert (
-            torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-        ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
-        inplace = runner_config.inplace
+        assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
+            "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
+        )
         routed_scaling_factor = runner_config.routed_scaling_factor
 
         M, K = hidden_states.shape
@@ -91,21 +90,36 @@ class MarlinLoraRunnerCore:
             if M * topk / E / block_size_m < 0.9:
                 break
 
+        # Under EP the dispatcher already localized topk_ids (-1 = non-local); align
+        # over the global expert count like fused_marlin_moe, not the local E.
+        align_num_experts = (
+            quant_info.global_num_experts if quant_info.expert_map is not None else E
+        )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, E
+            topk_ids,
+            block_size_m,
+            align_num_experts,
+            return_inactive_prefix_count=quant_info.expert_map is None,
         )
 
-        if (
-            _MARLIN_WORKSPACE is None
-            or _MARLIN_WORKSPACE.device != hidden_states.device
-        ):
-            _MARLIN_WORKSPACE = marlin_make_workspace(
-                hidden_states.device, max_blocks_per_sm=4
-            )
-        workspace = _MARLIN_WORKSPACE
+        # Per-call workspace like fused_experts_none_to_marlin: a shared buffer aliases
+        # inter-block locks across in-flight kernels/graphs and deadlocks capture.
+        workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
 
-        scalar_type1 = get_scalar_type(num_bits, quant_info.w13_qzeros is not None)
-        scalar_type2 = get_scalar_type(num_bits, quant_info.w2_qzeros is not None)
+        # Pass scales + global scale so fp4-marlin weights (the ModelOpt NVFP4
+        # W4A16 fallback) resolve to float4_e2m1f instead of uint4b8.
+        scalar_type1 = get_scalar_type(
+            num_bits,
+            quant_info.w13_qzeros is not None,
+            quant_info.w13_scales,
+            quant_info.w13_global_scale,
+        )
+        scalar_type2 = get_scalar_type(
+            num_bits,
+            quant_info.w2_qzeros is not None,
+            quant_info.w2_scales,
+            quant_info.w2_global_scale,
+        )
 
         # Stage 1: Gate/Up (Marlin)
         intermediate_cache1 = torch.empty(
@@ -115,9 +129,9 @@ class MarlinLoraRunnerCore:
             hidden_states,
             intermediate_cache1,
             quant_info.w13_qweight,
-            None,
+            quant_info.w13_bias,
             quant_info.w13_scales,
-            None,
+            quant_info.w13_global_scale,
             quant_info.w13_qzeros,
             quant_info.w13_g_idx,
             quant_info.w13_g_idx_sort_indices,
@@ -130,6 +144,8 @@ class MarlinLoraRunnerCore:
             top_k=topk,
             mul_topk_weights=False,
             is_ep=quant_info.expert_map is not None,
+            expert_ids_are_sorted=quant_info.expert_map is None,
+            has_inactive_prefix_count=quant_info.expert_map is None,
             b_q_type=scalar_type1,
             size_m=M,
             size_n=2 * N,
@@ -157,16 +173,14 @@ class MarlinLoraRunnerCore:
         intermediate_cache3 = torch.empty(
             (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        if quant_info.expert_map is not None:
-            intermediate_cache3.zero_()
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
             intermediate_cache2,
             intermediate_cache3,
             quant_info.w2_qweight,
-            None,
+            quant_info.w2_bias,
             quant_info.w2_scales,
-            None,
+            quant_info.w2_global_scale,
             quant_info.w2_qzeros,
             quant_info.w2_g_idx,
             quant_info.w2_g_idx_sort_indices,
@@ -178,7 +192,10 @@ class MarlinLoraRunnerCore:
             moe_block_size=block_size_m,
             top_k=1,
             mul_topk_weights=True,
+            zero_inactive_output=True,
             is_ep=quant_info.expert_map is not None,
+            expert_ids_are_sorted=quant_info.expert_map is None,
+            has_inactive_prefix_count=quant_info.expert_map is None,
             b_q_type=scalar_type2,
             size_m=M * topk,
             size_n=K,
@@ -196,8 +213,9 @@ class MarlinLoraRunnerCore:
                 intermediate_cache2, intermediate_cache3, topk_weights, topk_ids
             )
 
-        # Stage 4: Reduction
-        output = hidden_states if inplace else torch.empty_like(hidden_states)
+        # Stage 4: Reduction. Never alias hidden_states even under inplace: the sink
+        # forward still reads it (stock fused_experts_none_to_marlin does the same).
+        output = torch.empty_like(hidden_states)
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
         # NOTE: fusion opportunity here

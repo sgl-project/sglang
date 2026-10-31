@@ -86,6 +86,22 @@ def _mark_dynamic_on_value(val, dims):
         # else: ignore (None or non-tensor)
 
 
+_MROPE_TOKEN_AXIS_ARGUMENTS = frozenset(
+    {"positions", "position_ids", "mrope_positions"}
+)
+
+
+def _runtime_dynamic_dim_for_argument(name: str) -> int:
+    """Return the runtime-sized tensor dimension for a compiled argument.
+
+    Most compiler-facing tensors are batch/token-major and vary on dim 0.
+    mRoPE positions instead have shape ``[rope_axis, token]``; their runtime
+    token length is therefore the final dimension. ``maybe_mark_dynamic``
+    accepts ``-1`` for that final dimension irrespective of tensor rank.
+    """
+    return -1 if name in _MROPE_TOKEN_AXIS_ARGUMENTS else 0
+
+
 def _infer_dynamic_arg_dims_from_annotations(forward_fn):
     sig = inspect.signature(forward_fn)
     dyn = {}
@@ -96,7 +112,7 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             ann is torch.Tensor
             or getattr(getattr(ann, "__args__", [None])[0], "__name__", "") == "Tensor"
         ):
-            dyn[name] = 0
+            dyn[name] = _runtime_dynamic_dim_for_argument(name)
         elif getattr(ann, "__name__", "") in ("IntermediateTensors",) or any(
             getattr(a, "__name__", "") == "IntermediateTensors"
             for a in getattr(ann, "__args__", [])
@@ -104,10 +120,31 @@ def _infer_dynamic_arg_dims_from_annotations(forward_fn):
             dyn[name] = 0
         elif ann == "torch.Tensor" or ann == "Optional[torch.Tensor]":
             # For future import annotations (e.g. from __future__ import annotations), the annotation is a string
-            dyn[name] = 0
+            dyn[name] = _runtime_dynamic_dim_for_argument(name)
     if not dyn:
         raise ValueError("No dynamic dims inferred; pass dynamic_arg_dims explicitly.")
     return dyn
+
+
+def _mark_dynamic_forward_batch(forward_batch) -> None:
+    """Mark runtime-sized ForwardBatch tensors before the first PCG trace.
+
+    ``ForwardBatch`` is deliberately not annotated as a Tensor, so the
+    annotation-based argument inference above cannot see its tensor fields.
+    PCG nevertheless reads sequence- and token-sized metadata from it in
+    attention layers. Leaving those dimensions static gives Dynamo a guard on
+    the dummy capture shape and silently creates a new backend for a real VLM
+    request. All direct tensor fields are batch-major except mRoPE positions,
+    whose token axis is the final dimension.
+    """
+    if forward_batch is None:
+        return
+
+    for name, value in vars(forward_batch).items():
+        if not isinstance(value, torch.Tensor) or value.ndim == 0:
+            continue
+        dims = _runtime_dynamic_dim_for_argument(name)
+        _mark_dynamic_on_value(value, dims)
 
 
 def install_torch_compiled(
@@ -129,9 +166,8 @@ def install_torch_compiled(
     if backend_factory is None:
         from sglang.srt.compilation.backend import SGLangBackend
 
-        backend_factory = lambda gm, ex: SGLangBackend(compile_config, graph_pool)(
-            gm, ex
-        )
+        def backend_factory(gm, ex):
+            return SGLangBackend(compile_config, graph_pool)(gm, ex)
 
     compiled_codes: list[type(original_code)] = []
     state = {"compiled": False, "compiled_callable": None}
@@ -172,13 +208,16 @@ def install_torch_compiled(
                 val = ba.arguments[name]
                 if val is not None:
                     _mark_dynamic_on_value(val, dims)
+        _mark_dynamic_forward_batch(ba.arguments.get("forward_batch"))
 
         # Avoid cross-instance cache reuse
         torch._dynamo.eval_frame.remove_from_cache(unbound_fwd.__code__)
 
         bound = types.MethodType(unbound_fwd, self)
         compiled_callable = torch.compile(
-            bound, fullgraph=fullgraph, backend=backend_factory
+            bound,
+            fullgraph=fullgraph,
+            backend=backend_factory,
         )
 
         # Trigger Dynamo so bytecode hook can capture

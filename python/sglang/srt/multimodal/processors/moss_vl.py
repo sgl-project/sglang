@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse
 
 import pybase64
-import requests
 import torch
 
 from sglang.srt.managers.schedule_batch import (
@@ -16,15 +15,12 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
-    SGL_USE_CUDA_IPC,
-)
-from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.common import download_remote_media
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -238,7 +234,15 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             device=device,
         )
 
-        if len(flat_eff_h) == 0 or len(image_token_indices) == 0:
+        frame_count = len(flat_eff_h)
+        image_token_count = len(image_token_indices)
+        if frame_count != image_token_count:
+            raise ValueError(
+                "Moss-VL vision metadata must map one-to-one to image tokens: "
+                f"found {frame_count} frame(s) and {image_token_count} token(s)"
+            )
+
+        if frame_count == 0:
             rope_deltas = (
                 position_ids.max(dim=0).values.max(dim=-1).values
                 + 1
@@ -246,18 +250,11 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return vision_pos_ids, position_ids, rope_deltas
 
-        num_matches = min(len(flat_eff_h), len(image_token_indices))
-        flat_eff_h = torch.tensor(
-            flat_eff_h[:num_matches], device=device, dtype=torch.long
-        )
-        flat_eff_w = torch.tensor(
-            flat_eff_w[:num_matches], device=device, dtype=torch.long
-        )
-        flat_vis_starts = torch.tensor(
-            flat_vis_starts[:num_matches], device=device, dtype=torch.long
-        )
+        flat_eff_h = torch.tensor(flat_eff_h, device=device, dtype=torch.long)
+        flat_eff_w = torch.tensor(flat_eff_w, device=device, dtype=torch.long)
+        flat_vis_starts = torch.tensor(flat_vis_starts, device=device, dtype=torch.long)
 
-        target_indices = image_token_indices[:num_matches]
+        target_indices = image_token_indices
         batch_rows = target_indices[:, 0]
         text_cols = target_indices[:, 1]
 
@@ -416,9 +413,16 @@ class MossVLImageProcessor(SGLangBaseProcessor):
     def _write_video_bytes_to_tempfile(
         self, video_bytes: bytes, suffix: str = ".mp4"
     ) -> str:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(video_bytes)
-            return f.name
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                temp_path = f.name
+                f.write(video_bytes)
+            return temp_path
+        except BaseException:
+            if temp_path is not None:
+                self._remove_temp_video_paths([temp_path])
+            raise
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
         if value.startswith("file://"):
@@ -429,14 +433,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
         if value.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(value, stream=True, timeout=timeout)
-            response.raise_for_status()
+            content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                return f.name, f.name
+            temp_path = self._write_video_bytes_to_tempfile(content, suffix=suffix)
+            return temp_path, temp_path
 
         if value.startswith("data:"):
             header, encoded = value.split(",", 1)
@@ -489,14 +489,45 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             for v in video_data
         ]
-        results = await asyncio.gather(*futures)
+        gather_task = asyncio.gather(*futures, return_exceptions=True)
+        cancelled_error = None
+        try:
+            results = await asyncio.shield(gather_task)
+        except asyncio.CancelledError as error:
+            cancelled_error = error
+            results = await gather_task
 
         normalized_inputs: List[Union[str, Dict]] = []
         temp_paths: List[str] = []
-        for normalized_input, created_paths in results:
+        errors = []
+        for result in results:
+            if isinstance(result, BaseException):
+                errors.append(result)
+                continue
+            normalized_input, created_paths = result
             normalized_inputs.append(normalized_input)
             temp_paths.extend(created_paths)
+
+        if cancelled_error is not None or errors:
+            self._remove_temp_video_paths(temp_paths)
+            if cancelled_error is not None:
+                raise cancelled_error
+            first_error = errors[0]
+            if len(errors) > 1:
+                first_error.add_note(
+                    f"{len(errors) - 1} additional video input(s) failed"
+                )
+            raise first_error
+
         return normalized_inputs, temp_paths
+
+    @staticmethod
+    def _remove_temp_video_paths(temp_paths: List[str]) -> None:
+        for temp_path in temp_paths:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
     async def process_mm_data_async(
         self,
@@ -506,9 +537,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        normalized_video_data, temp_video_paths = (
-            await self._normalize_video_inputs_async(request_obj.video_data)
-        )
+        (
+            normalized_video_data,
+            temp_video_paths,
+        ) = await self._normalize_video_inputs_async(request_obj.video_data)
 
         try:
             base_output = await self.load_mm_data(
@@ -551,44 +583,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             if mm_items and vision_token_info:
                 mm_items[0].set("vision_token_info", vision_token_info[0])
 
-            if SGL_USE_CUDA_IPC:
-                for item in mm_items:
-                    if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                                item.feature
-                            )
-                        )
-                        if isinstance(available_slice, torch.Tensor):
-                            available_slice.copy_(
-                                item.feature.reshape(-1).view(torch.int8),
-                                non_blocking=True,
-                            )
-                            item.feature = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.feature,
-                                sync_buffer_meta=sync_flag,
-                            )
-                    elif (
-                        isinstance(item.precomputed_embeddings, torch.Tensor)
-                        and item.precomputed_embeddings.is_cuda
-                    ):
-                        sync_flag, available_slice = (
-                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                                item.precomputed_embeddings
-                            )
-                        )
-                        if isinstance(available_slice, torch.Tensor):
-                            flattened = item.precomputed_embeddings.reshape(-1)
-                            available_slice.copy_(
-                                flattened.view(torch.int8),
-                                non_blocking=True,
-                            )
-                            item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                                data=available_slice,
-                                info_data=item.precomputed_embeddings,
-                                sync_buffer_meta=sync_flag,
-                            )
+            mm_items = self._prepare_mm_items_for_transport(mm_items)
 
             return MultimodalProcessorOutput(
                 input_ids=input_ids.tolist(),
@@ -605,8 +600,4 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                 visible_frame_counts=visible_frame_counts,
             )
         finally:
-            for temp_path in temp_video_paths:
-                try:
-                    os.unlink(temp_path)
-                except FileNotFoundError:
-                    pass
+            self._remove_temp_video_paths(temp_video_paths)

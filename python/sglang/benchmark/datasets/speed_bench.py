@@ -1,4 +1,4 @@
-"""SPEED-Bench (nvidia/SPEED-Bench) dataset for SGLang bench_serving.
+"""SPEED-Bench (nvidia/SPEED-Bench) dataset for the SGLang serving benchmark.
 
 Reads the pre-downloaded throughput_1k JSONL produced by prepare_speed_bench.sh
 (or equivalent), optionally filtering by category (low_entropy / mixed /
@@ -74,6 +74,7 @@ class SpeedBenchDataset(BaseDataset):
                     [{"role": "user", "content": prompt_text}],
                     add_generation_prompt=True,
                     tokenize=True,
+                    return_dict=False,
                 )
                 prompt = tokenizer.decode(prompt_ids)
             except Exception:

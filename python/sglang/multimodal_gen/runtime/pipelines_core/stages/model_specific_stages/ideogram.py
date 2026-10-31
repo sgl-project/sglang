@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
     DenoisingStepState,
+    DualTransformerExecutionMode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -36,13 +37,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 SEQUENCE_PADDING_INDICATOR = -1
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
 IMAGE_POSITION_OFFSET = 65536
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,7 @@ class Ideogram4Scheduler:
 
 
 class Ideogram4TextEncodingStage(TextEncodingStage):
+    deduplicated_output_fields = ("prompt_embeds", "prompt_embeds_mask")
     deduplicated_extra_tensor_tree_output_keys = ("ideogram4",)
 
     def __init__(self, text_encoder, tokenizer) -> None:
@@ -264,45 +269,33 @@ class Ideogram4DenoisingStage(DenoisingStage):
     def __init__(self, transformer, unconditional_transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,
+            transformer_2=unconditional_transformer,
             scheduler=Ideogram4Scheduler(),
             pipeline=pipeline,
         )
-        self.unconditional_transformer = unconditional_transformer
-        self._maybe_enable_torch_compile(self.unconditional_transformer)
+        self.unconditional_transformer = self.transformer_2
 
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
         if module is self.unconditional_transformer:
             return "unconditional_transformer"
         return super()._component_name_for_stage_module(module, default_name)
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        stage_name = self._component_stage_name(stage_name)
-        return [
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="transformer",
-                phase="transformer",
-                preferred_ready_after_request=True,
-                memory_intensive=True,
-            ),
-            ComponentUse(
-                stage_name=stage_name,
-                component_name="unconditional_transformer",
-                phase="unconditional_transformer",
-                memory_intensive=True,
-            ),
-        ]
+    def _cache_dit_dual_model_name(self) -> str:
+        return "ideogram4"
 
-    def _maybe_enable_cache_dit_and_torch_compile(
-        self, num_inference_steps: int | tuple[int, int], batch: Req
-    ) -> None:
-        self._maybe_enable_cache_dit(num_inference_steps, batch)
-        for transformer in filter(
-            None, [self.transformer, self.unconditional_transformer]
-        ):
-            self._maybe_enable_torch_compile(transformer)
+    def _dual_transformer_execution_mode(
+        self,
+    ) -> DualTransformerExecutionMode | None:
+        if self.unconditional_transformer is None:
+            return None
+        return DualTransformerExecutionMode.PAIRED_PER_STEP
+
+    def _cache_dit_secondary_uses_primary_config(self) -> bool:
+        return True
+
+    def _maybe_enable_cache_dit(self, *args, **kwargs) -> None:
+        super()._maybe_enable_cache_dit(*args, **kwargs)
+        self.unconditional_transformer = self.transformer_2
 
     def _manage_unconditional_transformer_use_site(self, batch: Req) -> None:
         manager = self._component_residency_manager
@@ -323,6 +316,25 @@ class Ideogram4DenoisingStage(DenoisingStage):
         if self._component_residency_manager is None:
             return
         super()._manage_dit_use_site(current_model, current_phase, batch)
+
+    def _run_ideogram_transformer(
+        self,
+        current_model: torch.nn.Module,
+        call_kwargs: dict,
+        llm_cond_cache: dict,
+        branch: str,
+    ) -> torch.Tensor:
+        runner = self._maybe_get_bcg_runner(current_model)
+        if runner is not None:
+            # the BCG prompt padder pads the raw LLM features with the sequence
+            return self._bcg_run(runner, call_kwargs, current_model)
+        # project the request-constant LLM conditioning once per branch, then reuse it
+        llm_features = call_kwargs.pop("llm_features")
+        if branch not in llm_cond_cache:
+            llm_cond_cache[branch] = current_model.project_llm_features(
+                llm_features, call_kwargs["indicator"]
+            )
+        return current_model(llm_cond=llm_cond_cache[branch], **call_kwargs)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         batch.did_sp_shard_latents = False
@@ -349,6 +361,37 @@ class Ideogram4DenoisingStage(DenoisingStage):
         preset_cfg = IDEOGRAM4_PRESETS[preset]
         num_steps = int(preset_cfg["num_steps"])
         device = get_local_torch_device()
+
+        skip_unconditional = bool(preset_cfg.get("skip_unconditional", False))
+        lora_scale = float(preset_cfg.get("lora_scale", 0.0))
+        requires_lora = bool(preset_cfg.get("requires_lora", False))
+
+        if skip_unconditional and any(
+            float(guidance) != 1.0 for guidance in preset_cfg["guidance_schedule"]
+        ):
+            raise ValueError("skip_unconditional requires guidance_schedule to be 1.0")
+
+        if (
+            lora_scale == 0.0
+            and getattr(server_args, "lora_path", None) is not None
+            and getattr(server_args, "lora_merge_mode", "auto") != "dynamic"
+        ):
+            raise ValueError(
+                f"Ideogram 4 preset {preset} disables LoRA, but request-local LoRA "
+                "switching requires --lora-merge-mode dynamic when --lora-path is set."
+            )
+
+        pipeline = self.pipeline() if self.pipeline else None
+        if requires_lora and (
+            pipeline is None or not pipeline.is_lora_effective("transformer")
+        ):
+            raise ValueError(
+                f"Ideogram 4 preset {preset} requires an active LoRA on transformer. "
+                "Please start the server with --lora-path and --lora-merge-mode dynamic."
+            )
+
+        batch.runtime_lora_scale = lora_scale
+
         schedule = get_schedule_for_resolution(
             (batch.height, batch.width),
             known_mean=float(preset_cfg["mu"]),
@@ -404,6 +447,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 "ideogram4_schedule_deltas": schedule_deltas,
                 "ideogram4_guidance_schedule": guidance_schedule,
                 "ideogram4_text_z_padding": text_z_padding,
+                "ideogram4_skip_unconditional": skip_unconditional,
                 "ideogram4_attn_mask": attn_mask,
                 "ideogram4_attn_mask_meta": build_varlen_mask_meta(attn_mask),
                 "ideogram4_neg_position_ids": neg_position_ids,
@@ -412,6 +456,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 "ideogram4_neg_attn_mask": neg_attn_mask,
                 "ideogram4_neg_attn_mask_meta": build_varlen_mask_meta(neg_attn_mask),
                 "ideogram4_neg_llm_features": neg_llm_features,
+                "ideogram4_llm_cond": {},
             }
         )
         return ctx
@@ -427,9 +472,11 @@ class Ideogram4DenoisingStage(DenoisingStage):
         z = ctx.latents.to(dtype=torch.float32)
         llm_features = batch.prompt_embeds[0]
         max_text_tokens = data["max_text_tokens"]
+        num_image_tokens = data["num_image_tokens"]
         schedule_values = ctx.extra["ideogram4_schedule_values"]
         schedule_deltas = ctx.extra["ideogram4_schedule_deltas"]
         guidance_schedule = ctx.extra["ideogram4_guidance_schedule"]
+        skip_unconditional = ctx.extra.get("ideogram4_skip_unconditional", False)
         i = step.t_int
 
         t_val = schedule_values[i + 1]
@@ -443,39 +490,53 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 attn_metadata=step.attn_metadata,
                 forward_batch=batch,
             ):
-                pos_out = step.current_model(
-                    llm_features=llm_features,
-                    x=pos_z,
-                    t=t,
-                    position_ids=data["position_ids"],
-                    segment_ids=data["segment_ids"],
-                    indicator=data["indicator"],
-                    attn_mask=ctx.extra["ideogram4_attn_mask"],
-                    attn_mask_meta=ctx.extra["ideogram4_attn_mask_meta"],
+                pos_out = self._run_ideogram_transformer(
+                    step.current_model,
+                    dict(
+                        llm_features=llm_features,
+                        x=pos_z,
+                        t=t,
+                        position_ids=data["position_ids"],
+                        segment_ids=data["segment_ids"],
+                        indicator=data["indicator"],
+                        attn_mask=ctx.extra["ideogram4_attn_mask"],
+                        attn_mask_meta=ctx.extra["ideogram4_attn_mask_meta"],
+                    ),
+                    ctx.extra["ideogram4_llm_cond"],
+                    "positive",
                 )
-                pos_v = pos_out[:, max_text_tokens:]
+                pos_v = pos_out[:, max_text_tokens : max_text_tokens + num_image_tokens]
 
-            self._manage_unconditional_transformer_use_site(batch)
-            with set_forward_context(
-                current_timestep=i,
-                attn_metadata=step.attn_metadata,
-                forward_batch=batch,
-            ):
-                neg_v = self.unconditional_transformer(
-                    llm_features=ctx.extra["ideogram4_neg_llm_features"],
-                    x=z,
-                    t=t,
-                    position_ids=ctx.extra["ideogram4_neg_position_ids"],
-                    segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
-                    indicator=ctx.extra["ideogram4_neg_indicator"],
-                    attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
-                    attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
-                )
+            neg_v = None
+            if not skip_unconditional and self.unconditional_transformer is not None:
+                self._manage_unconditional_transformer_use_site(batch)
+                with set_forward_context(
+                    current_timestep=i,
+                    attn_metadata=step.attn_metadata,
+                    forward_batch=batch,
+                ):
+                    neg_v = self._run_ideogram_transformer(
+                        self.unconditional_transformer,
+                        dict(
+                            llm_features=ctx.extra["ideogram4_neg_llm_features"],
+                            x=z,
+                            t=t,
+                            position_ids=ctx.extra["ideogram4_neg_position_ids"],
+                            segment_ids=ctx.extra["ideogram4_neg_segment_ids"],
+                            indicator=ctx.extra["ideogram4_neg_indicator"],
+                            attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
+                            attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
+                        ),
+                        ctx.extra["ideogram4_llm_cond"],
+                        "negative",
+                    )
 
         with maybe_nvtx_range("scheduler_step", use_nvtx):
-            velocity = (
-                guidance_schedule[i] * pos_v + (1.0 - guidance_schedule[i]) * neg_v
-            )
+            velocity = pos_v
+            if neg_v is not None:
+                velocity = (
+                    guidance_schedule[i] * pos_v + (1.0 - guidance_schedule[i]) * neg_v
+                )
             ctx.latents = z + velocity * schedule_deltas[i]
 
 
@@ -489,6 +550,8 @@ class Ideogram4DecodingStage(PipelineStage):
     def __init__(self, vae) -> None:
         super().__init__()
         self.vae = vae
+        # (dtype, device) -> latent scale/shift, uploaded once
+        self.latent_stats = {}
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -510,8 +573,13 @@ class Ideogram4DecodingStage(PipelineStage):
         latents = batch.latents.to(get_local_torch_device())
         cfg = server_args.pipeline_config
         patch = cfg.patch_size
-        shift = torch.tensor(LATENT_SHIFT, device=latents.device, dtype=latents.dtype)
-        scale = torch.tensor(LATENT_SCALE, device=latents.device, dtype=latents.dtype)
+        stats_key = (latents.dtype, latents.device)
+        if stats_key not in self.latent_stats:
+            self.latent_stats[stats_key] = tuple(
+                torch.tensor(values, device=latents.device, dtype=latents.dtype)
+                for values in (LATENT_SCALE, LATENT_SHIFT)
+            )
+        scale, shift = self.latent_stats[stats_key]
         z = latents * scale.to(latents.dtype) + shift.to(latents.dtype)
         batch_size = z.shape[0]
         grid_h = data["grid_h"]

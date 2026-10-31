@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Optional
 
 from transformers import (
+    AutoImageProcessor,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import cached_file
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import logger
@@ -47,7 +49,80 @@ from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
+    _install_tokenizer_warnings_filter,
+    get_tokenizer,
 )
+
+_IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
+
+
+def resolve_image_processor_backend(mm_config) -> str:
+    """Resolve the new backend option while honoring the legacy disable flag.
+
+    Takes the `mm` config bag (`get_mm()`): both leaves are resolved config, and
+    every caller is past publish. `getattr` with a default keeps it working for a
+    stand-in that carries only one of the two.
+    """
+    if getattr(mm_config, "disable_fast_image_processor", False):
+        return "pil"
+    return getattr(mm_config, "image_processor_backend", "auto")
+
+
+def _normalize_image_processor_backend(
+    image_processor_backend: Optional[str], use_fast: Optional[bool]
+) -> str:
+    backend = image_processor_backend or "auto"
+    if backend not in _IMAGE_PROCESSOR_BACKENDS:
+        raise ValueError(
+            f"Unsupported image processor backend: {backend}. "
+            f"Expected one of {sorted(_IMAGE_PROCESSOR_BACKENDS)}."
+        )
+
+    if use_fast is not None:
+        legacy_backend = "torchvision" if use_fast else "pil"
+        if backend not in {"auto", legacy_backend}:
+            raise ValueError(
+                f"use_fast={use_fast} conflicts with "
+                f"image_processor_backend={backend!r}."
+            )
+        backend = legacy_backend
+    return backend
+
+
+def _apply_image_processor_backend(
+    processor,
+    tokenizer_name,
+    args,
+    trust_remote_code,
+    revision,
+    backend,
+    kwargs,
+):
+    """Apply an explicit backend only to the image sub-processor.
+
+    ProcessorMixin forwards generic kwargs to every sub-processor. Passing
+    ``backend`` through AutoProcessor therefore also reaches tokenizers and
+    video processors, where it has different semantics or may be read-only.
+    """
+    if backend == "auto" or not hasattr(processor, "image_processor"):
+        return processor
+
+    image_processor = processor.image_processor
+    if getattr(image_processor, "backend", None) == backend:
+        return processor
+
+    image_processor_kwargs = dict(kwargs)
+    image_processor_kwargs.pop("backend", None)
+    image_processor_kwargs.pop("use_fast", None)
+    processor.image_processor = AutoImageProcessor.from_pretrained(
+        tokenizer_name,
+        *args,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        backend=backend,
+        **image_processor_kwargs,
+    )
+    return processor
 
 
 def _build_processor_manually(
@@ -135,13 +210,46 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _get_minimax_m31_processor(model_path, config, revision):
+    from transformers import MiniMaxM3VLProcessor
+
+    from sglang.srt.multimodal.processors.minimax_m31_media import (
+        MiniMaxM31ImageProcessor,
+        MiniMaxM31VideoProcessor,
+    )
+
+    filename = cached_file(model_path, "preprocessor_config.json", revision=revision)
+    with open(filename) as f:
+        raw = json.load(f)
+    compression = raw.get("img_token_compression_config", {})
+    common = {
+        "patch_size": raw.get("patch_size", 14),
+        "merge_size": compression.get("spatial_merge_size", 2),
+        "temporal_patch_size": compression.get("temporal_patch_size", 2),
+        "image_mean": raw.get("image_mean", [0.48145466, 0.4578275, 0.40821073]),
+        "image_std": raw.get("image_std", [0.26862954, 0.26130258, 0.27577711]),
+    }
+    size = raw.get("size", [672, 672])
+    max_size = (
+        size if isinstance(size, (list, tuple)) else (size["height"], size["width"])
+    )
+    tokenizer = get_tokenizer(model_path, trust_remote_code=False, revision=revision)
+    return MiniMaxM3VLProcessor(
+        image_processor=MiniMaxM31ImageProcessor(max_size=max_size, **common),
+        video_processor=MiniMaxM31VideoProcessor(max_size=max_size, **common),
+        tokenizer=tokenizer,
+        chat_template=getattr(tokenizer, "chat_template", None),
+    )
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
-    use_fast: Optional[bool] = True,
+    use_fast: Optional[bool] = None,
+    image_processor_backend: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
     model_name: Optional[str] = None,
     **kwargs,
@@ -152,7 +260,12 @@ def get_processor(
         _ensure_fastokens_patched()
 
     revision = kwargs.pop("revision", tokenizer_revision)
+    image_processor_backend = _normalize_image_processor_backend(
+        image_processor_backend, use_fast
+    )
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
+    if model_name is not None:
+        model_name = resolve_runai_obj_uri(model_name)
 
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(
@@ -174,6 +287,10 @@ def get_processor(
             revision=revision,
             **kwargs,
         )
+    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        return get_tokenizer(
+            tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
+        )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
         config.model_type = "deepseek-ocr"
@@ -181,14 +298,28 @@ def get_processor(
         if is_ocr2:
             _override_v_head_dim_if_zero(config)
 
+    # Checkpoints with language_model_only=True are text-only despite their
+    # multimodal-family config; route to tokenizer instead of the mm processor.
+    if getattr(config, "language_model_only", False):
+        return AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
-    if config.model_type not in {"llava", "clip"}:
-        kwargs["use_fast"] = use_fast
+    if config.model_type == "minimax_m3_vl":
+        trust_remote_code = False
+
     try:
-        if "InternVL3_5" in tokenizer_name:
+        if config.model_type == "minimax_m3_vl":
+            processor = _get_minimax_m31_processor(tokenizer_name, config, revision)
+        elif "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
                 tokenizer_name,
                 *args,
@@ -216,20 +347,7 @@ def get_processor(
 
     except ValueError as e:
         error_message = str(e)
-        if "does not have a slow version" in error_message:
-            logger.info(
-                "Processor %s does not have a slow version. Automatically use fast version",
-                tokenizer_name,
-            )
-            kwargs["use_fast"] = True
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
-        elif "Unrecognized feature extractor" in error_message:
+        if "Unrecognized feature extractor" in error_message:
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
                 "constructing processor manually",
@@ -247,10 +365,9 @@ def get_processor(
         ):
             logger.info(
                 "AutoProcessor for %s rejected standard kwargs, "
-                "retrying without trust_remote_code/use_fast",
+                "retrying without trust_remote_code",
                 tokenizer_name,
             )
-            kwargs.pop("use_fast", None)
             kwargs.pop("_from_auto", None)
             processor = AutoProcessor.from_pretrained(
                 tokenizer_name,
@@ -260,6 +377,16 @@ def get_processor(
             )
         else:
             raise
+
+    processor = _apply_image_processor_backend(
+        processor,
+        tokenizer_name,
+        args,
+        trust_remote_code,
+        revision,
+        image_processor_backend,
+        kwargs,
+    )
     if (
         isinstance(processor, PreTrainedTokenizerBase)
         and getattr(config, "model_type", None) == "pixtral"
@@ -271,8 +398,6 @@ def get_processor(
     # AutoProcessor may internally create a TokenizersBackend tokenizer
     # (same issue as get_tokenizer). Replace it with a properly loaded one.
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
-        from .tokenizer import get_tokenizer
-
         logger.warning(
             "Processor tokenizer for %s is TokenizersBackend, "
             "reloading via get_tokenizer",
@@ -289,6 +414,8 @@ def get_processor(
             processor = tokenizer
         else:
             processor.tokenizer = tokenizer
+
+    _install_tokenizer_warnings_filter(tokenizer)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(

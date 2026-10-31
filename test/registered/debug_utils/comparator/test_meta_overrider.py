@@ -16,8 +16,7 @@ from sglang.srt.debug_utils.comparator.meta_overrider import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=1, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
 
 
 # ───────────────────── Unit: MetaOverrideRule ─────────────────────
@@ -195,11 +194,13 @@ class TestFromArgsAndConfig:
     def test_cli_before_yaml(self, tmp_path: Path) -> None:
         """CLI rules are ordered before YAML rules (CLI wins on conflict)."""
         yaml_path = tmp_path / "override.yaml"
-        yaml_path.write_text(textwrap.dedent("""\
+        yaml_path.write_text(
+            textwrap.dedent("""\
             overrides:
               - match: "hidden"
                 dims: "FROM_YAML"
-        """))
+        """)
+        )
 
         overrider = MetaOverrider.from_args_and_config(
             override_dims=["hidden:FROM_CLI"],
@@ -257,14 +258,16 @@ class TestLoadYamlRules:
     def test_valid_yaml(self, tmp_path: Path) -> None:
         """Valid YAML with override rules loads correctly."""
         yaml_path = tmp_path / "override.yaml"
-        yaml_path.write_text(textwrap.dedent("""\
+        yaml_path.write_text(
+            textwrap.dedent("""\
             overrides:
               - match: "hidden"
                 dims: "b s h d"
               - match: "logits"
                 dims: "b s v[tp]"
                 side: baseline
-        """))
+        """)
+        )
         rules = _load_yaml_rules(yaml_path)
         assert len(rules) == 2
         assert rules[0].dims == "b s h d"

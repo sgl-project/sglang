@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -138,6 +140,7 @@ class AnthropicCustomTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    strict: bool = False
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
@@ -250,6 +253,7 @@ class AnthropicToolChoice(BaseModel):
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: bool = False
 
 
 class AnthropicThinkingParam(BaseModel):
@@ -284,13 +288,13 @@ class AnthropicThinkingParam(BaseModel):
         if self.type == "enabled":
             if self.budget_tokens is None:
                 raise ValueError(
-                    "thinking.budget_tokens is required when "
-                    "thinking.type is 'enabled'"
+                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
                 )
             if self.budget_tokens < 1024:
                 raise ValueError(
-                    "thinking.budget_tokens must be >= 1024 "
-                    "(got {})".format(self.budget_tokens)
+                    "thinking.budget_tokens must be >= 1024 (got {})".format(
+                        self.budget_tokens
+                    )
                 )
         elif self.type == "disabled":
             if self.budget_tokens is not None:
@@ -300,8 +304,7 @@ class AnthropicThinkingParam(BaseModel):
                 )
             if self.display is not None:
                 raise ValueError(
-                    "thinking.display is not allowed when "
-                    "thinking.type is 'disabled'"
+                    "thinking.display is not allowed when thinking.type is 'disabled'"
                 )
         elif self.type == "adaptive":
             if self.budget_tokens is not None:
@@ -326,6 +329,11 @@ class AnthropicTaskBudget(BaseModel):
     remaining: Optional[int] = Field(default=None, ge=0)
 
 
+class AnthropicJSONOutputFormat(BaseModel):
+    type: Literal["json_schema"]
+    schema_: dict[str, Any] = Field(alias="schema")
+
+
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
@@ -334,8 +342,9 @@ class AnthropicOutputConfig(BaseModel):
     ``task_budget`` is propagated as a custom-param hint.
     """
 
-    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
+    effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
+    format: Optional[AnthropicJSONOutputFormat] = None
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -347,7 +356,7 @@ class AnthropicCountTokensRequest(BaseModel):
     thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
-    # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
+    # Claude 4.7 / SDK-compatibility fields; betas is accepted but ignored.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 
@@ -358,7 +367,7 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicMessagesRequest(PDRoutingFields):
     """Anthropic Messages API request."""
 
     model: str
@@ -374,68 +383,11 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    cache_salt: Optional[str] = None
     # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def move_mid_conversation_system_messages(cls, values: dict) -> dict:
-        """Fold mid-conversation ``role: "system"`` turns into the top-level
-        ``system`` field — some clients (e.g. Claude Code) emit them there."""
-        messages = values.get("messages", [])
-        if not messages:
-            return values
-
-        clean_messages = []
-        extracted_system_texts = []
-
-        for msg in messages:
-            # ``mode="before"`` sees raw dicts (HTTP path) but also already-
-            # constructed ``AnthropicMessage`` objects (programmatic path, e.g.
-            # ``handle_count_tokens``), so normalize to a dict first.
-            if isinstance(msg, BaseModel):
-                msg = msg.model_dump()
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    extracted_system_texts.append(content.strip())
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "").strip()
-                            if text:
-                                extracted_system_texts.append(text)
-            else:
-                clean_messages.append(msg)
-
-        if extracted_system_texts:
-            existing_system = values.get("system")
-            combined_system = []
-
-            if existing_system:
-                if isinstance(existing_system, str):
-                    if existing_system.strip():
-                        combined_system.append(existing_system.strip())
-                elif isinstance(existing_system, list):
-                    for block in existing_system:
-                        if isinstance(block, BaseModel):
-                            block = block.model_dump()
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "").strip()
-                            if text:
-                                combined_system.append(text)
-
-            combined_system.extend(extracted_system_texts)
-
-            # Join into a string — ``system`` is ``str | list[AnthropicContentBlock]``,
-            # so a ``list[str]`` would fail validation.
-            if combined_system:
-                values["system"] = "\n".join(combined_system)
-
-        values["messages"] = clean_messages
-        return values
 
     @field_validator("model")
     @classmethod

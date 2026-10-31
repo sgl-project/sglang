@@ -1,10 +1,12 @@
 import unittest
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -17,26 +19,37 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=211, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=355, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestMultiTokenizer(CustomTestCase, MMLUMixin):
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    """One server covering both worker pools: multi-tokenizer and
+    multi-detokenizer (the flags are orthogonal), with DP attention, so the
+    worker pools also see idle DP ranks."""
+
+    mmlu_score_threshold = 0.72
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
+                "--trust-remote-code",
+                "--tp",
+                2,
+                "--attn-dp-size",
+                2,
                 "--tokenizer-worker-num",
                 8,
+                "--detokenizer-worker-num",
+                4,
                 "--mem-fraction-static",
                 0.7,
             ],
@@ -73,7 +86,41 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             # relax for mi300x
             self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
-            self.assertLess(res["median_itl_ms"], 10)
+            self.assertLess(res["median_itl_ms"], 11)
+
+    def test_batch_input_ids_routing(self):
+        # Regression guard for sgl-project/sglang#29878 (introduced by #29214).
+        #
+        # A batch of pre-tokenized `input_ids` (no text / multimodal) is the one
+        # case that takes the batch-tokenization path (_send_batch_request ->
+        # BatchTokenizedGenerateReqInput). In multi-tokenizer mode this batch
+        # must stamp each sub-request's `http_worker_ipc` so the scheduler can
+        # route every reply back to its owning tokenizer worker. If it is missing,
+        # the requests hang forever.
+        #
+        # The existing ttft test only sends *text*, so it never exercises this
+        # path — this case does, and uses a short timeout so a routing hang
+        # fails fast instead of stalling until the server launch timeout.
+        batch_input_ids = [
+            [1, 2, 3, 4, 5],
+            [10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24],
+            [30, 31, 32, 33, 34],
+        ]
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": batch_input_ids,
+                "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        results = response.json()
+        # Every batched request must get its reply routed back — not hang.
+        self.assertEqual(len(results), len(batch_input_ids))
+        for result in results:
+            self.assertIn("text", result)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import triton.testing as tt
 
 from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
+from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 
 
 def extend_attention_fwd_torch(

@@ -16,8 +16,10 @@ import logging
 import time
 import uuid
 from array import array
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Dict, Optional
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -56,12 +58,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT()
+            self.req.request_finish(FINISH_ABORT())
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT()
+            self.req.request_finish(FINISH_ABORT())
 
     def __str__(self):
         return self._str_helper(self.req.rid)
@@ -156,7 +158,7 @@ class Session:
             or carry_fill is input_ids_unpadded
         ):
             # Unexpected type or aliased with an origin array (extending it
-            # below would double-append): let _refresh_fill_ids rebuild.
+            # below would double-append): let refresh_fill_ids rebuild.
             carry_fill = None
         else:
             del carry_fill[self.committed_fill_len :]
@@ -206,9 +208,10 @@ class Session:
         tokenizer,
         vocab_size: int,
         eos_token_ids=None,
+        disagg_mode: Optional[DisaggregationMode] = None,
+        req_factory: Callable[..., Req] = Req,
     ):
         assert req.session_params is not None
-        self.last_active_time = time.monotonic()
         session_params = req.session_params
 
         last_req_node = None
@@ -289,7 +292,13 @@ class Session:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
 
-        new_req = Req(
+        if not abort and len(input_ids) == 0:
+            abort = True
+            abort_message = (
+                "A session request must contain input tokens after restoring history."
+            )
+
+        new_req = req_factory(
             rid=req.rid,
             origin_input_text=None,
             origin_input_ids=input_ids,
@@ -302,20 +311,32 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            return_sampling_mask=req.return_sampling_mask,
+            sampling_logprobs_mode=req.sampling_logprobs_mode,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,
             routed_experts_start_len=req.routed_experts_start_len,
+            bootstrap_host=req.bootstrap_host,
+            bootstrap_port=req.bootstrap_port,
+            bootstrap_room=req.bootstrap_room,
+            disagg_mode=disagg_mode,
+            routed_dp_rank=req.routed_dp_rank,
+            disagg_prefill_dp_rank=req.disagg_prefill_dp_rank,
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
+            # An offset can truncate inherited media.
+            if not abort and not session_params.offset:
+                new_req.inherit_mm_token_counts(last_req)
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
@@ -323,9 +344,11 @@ class Session:
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
+            self.last_active_time = time.monotonic()
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
         else:
+            self.last_active_time = time.monotonic()
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 
@@ -365,10 +388,10 @@ class SessionController:
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
+            return OpenSessionReqOutput(session_id=session_id, success=False)
         elif session_id is None:
             logger.warning("session id is None, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
+            return OpenSessionReqOutput(session_id=session_id, success=False)
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len,
@@ -379,7 +402,7 @@ class SessionController:
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"
             )
-            return OpenSessionReqOutput(session_id, True)
+            return OpenSessionReqOutput(session_id=session_id, success=True)
 
     def close(self, recv_req: CloseSessionReqInput):
         session_id = recv_req.session_id
@@ -405,7 +428,7 @@ class SessionController:
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
-            # reference so cache_finished_req takes the streaming path,
+            # reference so release_kv_cache takes the streaming path,
             # and we schedule release_session for after it completes.
             session.close_on_finish = True
             logger.info(
@@ -430,6 +453,7 @@ class SessionController:
                 mm.release_features()
             node.req.multimodal_inputs = None
 
+        self.tree_cache.release_radix_session(session_id)
         self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
         log_info_on_rank0(

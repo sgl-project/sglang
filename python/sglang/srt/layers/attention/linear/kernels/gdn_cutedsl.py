@@ -4,7 +4,7 @@ Decode path uses the existing ``cutedsl_fused_sigmoid_gating_delta_rule_update``
 (works on SM90+).
 
 Prefill (extend) path uses the ported vLLM SM100 chunkwise kernel
-(``chunk_gated_delta_rule_cutedsl``). Requires SM100+ and ``head_k_dim == 128``.
+(``chunk_gated_delta_rule_cutedsl``). Requires SM10x and ``head_k_dim == 128``.
 """
 
 import logging
@@ -12,7 +12,9 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
+from sglang.kernels.ops.attention.cutedsl_gdn import (
+    cutedsl_fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -20,12 +22,15 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 logger = logging.getLogger(__name__)
 
 
-def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell) where the ported kernel is valid."""
+def _is_sm10x() -> bool:
+    """True iff running on SM10x, the only arch with the tcgen05/TMEM the kernel uses.
+
+    SM120 (desktop Blackwell) lacks tcgen05 despite its larger capability number.
+    """
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major == 10
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -33,15 +38,15 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
     Decode: ``cutedsl_fused_sigmoid_gating_delta_rule_update`` (SM90+).
     Extend (prefill): chunkwise ``chunk_gated_delta_rule_cutedsl``
-    (SM100+ only, ``head_k_dim`` must be 128). On SM90 the prefill path is
+    (SM10x only, ``head_k_dim`` must be 128). Elsewhere the prefill path is
     unsupported; callers should query :attr:`supports_prefill` and fall back
     to another backend (e.g. Triton).
     """
 
     def __init__(self):
-        # The Blackwell extend kernel uses tcgen05/TMA-bulk-swizzle features
-        # that don't exist on SM90. The decode kernel does work on SM90+.
-        self.supports_prefill = _is_blackwell()
+        # The extend kernel uses tcgen05/TMA-bulk-swizzle features that exist
+        # only on SM10x. The decode kernel does work on SM90+.
+        self.supports_prefill = _is_sm10x()
 
         # Heavy CuteDSL imports are deferred to extend() so SM90 boxes can
         # still construct the kernel just for decode.
@@ -59,14 +64,14 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
                 else -1
             )
             raise RuntimeError(
-                f"CuTe DSL GDN prefill requires SM100+ (Blackwell); got SM{major}."
+                f"CuTe DSL GDN prefill requires SM10x (tcgen05); got SM{major}."
             )
         if head_k_dim != 128:
             raise RuntimeError(
                 f"CuTe DSL GDN prefill requires head_k_dim=128, got {head_k_dim}."
             )
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-        from sglang.srt.layers.attention.linear.kernels.gdn_blackwell import (
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.linear.gdn_blackwell import (
             chunk_gated_delta_rule_cutedsl,
             prepare_metadata_cutedsl,
         )
@@ -137,38 +142,35 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
         cu_seqlens = query_start_loc.to(torch.int32)
 
-        # Pool gather: remap padding (-1) to the last (sentinel) slot.
+        # Pool state I/O is fused into the h kernel's TMA load/store: pass the
+        # pool + per-seq slots and the kernel reads h0/writes ht in place at
+        # those rows (no gather/scatter kernels, no [N, Hv, V, K] intermediates).
+        # Remap padding (-1) to the last (sentinel) slot.
         ssm_cache_indices = torch.where(
             cache_indices >= 0,
             cache_indices,
             ssm_states.shape[0] - 1,
-        ).to(torch.long)
-        initial_state = ssm_states[ssm_cache_indices].contiguous()
+        ).to(torch.int32)
 
         chunk_indices, chunk_offsets = self._prepare_meta_fn(
             cu_seqlens, total_seq_len, chunk_size=64
         )
 
-        output, final_state = self._extend_fn(
+        output, _ = self._extend_fn(
             q=q_norm,
             k=k_norm,
             v=v_in,
             g=g_in,
             beta=beta_in,
-            initial_state=initial_state,
+            initial_state=ssm_states,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
-        )
-
-        ssm_states.index_copy_(
-            0,
-            ssm_cache_indices,
-            final_state.to(ssm_states.dtype),
+            initial_state_indices=ssm_cache_indices,
         )
 
         # Match Triton extend interface: (output, last_recurrent_state, h).
-        # We've already written state back, so no need to return it.
+        # The kernel already wrote state back into the pool in place.
         return output, None, None
 
     def target_verify(self, *args, **kwargs):

@@ -19,7 +19,7 @@ _is_npu = current_platform.is_npu()
 _is_xpu = current_platform.is_xpu()
 
 if _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import silu_and_mul
 elif _is_hip or _is_xpu:
     from sgl_kernel import silu_and_mul
 
@@ -40,9 +40,6 @@ class SiluAndMul(CustomOp):
         x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
         return: (num_tokens, d) or (batch_size, seq_len, d)
     """
-
-    def __init__(self) -> None:
-        super().__init__()
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -111,10 +108,6 @@ class GeluAndMul(CustomOp):
 
 @CustomOp.register("gelu_new")
 class NewGELU(CustomOp):
-
-    def __init__(self):
-        super().__init__()
-
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
@@ -130,9 +123,6 @@ class NewGELU(CustomOp):
 @CustomOp.register("quick_gelu")
 class QuickGELU(CustomOp):
     # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
-    def __init__(self):
-        super().__init__()
-
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
@@ -161,18 +151,3 @@ def get_act_fn(act_fn_name: str) -> nn.Module:
         raise ValueError(f"Activation function {act_fn_name!r} is not supported.")
 
     return _ACTIVATION_REGISTRY[act_fn_name]()
-
-
-_ACTIVATION_AND_MUL_REGISTRY = {
-    "gelu": GeluAndMul,
-    "silu": SiluAndMul,
-}
-
-
-def get_act_and_mul_fn(act_fn_name: str) -> nn.Module:
-    """Get an activation-and-mul (i.e. SiluAndMul) function by name."""
-    act_fn_name = act_fn_name.lower()
-    if act_fn_name not in _ACTIVATION_AND_MUL_REGISTRY:
-        raise ValueError(f"Activation function {act_fn_name!r} is not supported.")
-
-    return _ACTIVATION_AND_MUL_REGISTRY[act_fn_name]()

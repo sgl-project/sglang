@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_backends
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -29,9 +29,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-
-from ..mock_server_args import make_mock_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -183,17 +182,25 @@ class TinyKDAModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
+        self.quantization = None
         self.is_hybrid_swa = False
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
         self.hf_config = SimpleNamespace(architectures=["TinyKDAForCausalLM"])
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class MockKDAModelRunner(ModelRunner):
@@ -216,7 +223,14 @@ class MockKDAModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
@@ -226,7 +240,7 @@ class MockKDAModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -248,9 +262,7 @@ class MockKDAModelRunner(ModelRunner):
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
             linear_attn_prefill_backend=None,
-            mamba_cache_chunk_size=64,
             max_running_requests=None,
-            model_path=None,
             revision=None,
             speculative_algorithm=None,
             speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
@@ -258,7 +270,11 @@ class MockKDAModelRunner(ModelRunner):
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
+            # Pin the lazy mamba_cache_chunk_size property cache: production
+            # derives it from hf_config + page_size, which needs a real model.
+            _mamba_cache_chunk_size=64,
         )
+        self.server_args = self._server_args_override.install()
         # KDA uses the KimiLinear cache layout (conv_kernel-1, conv_dim) and a
         # temporal state of (num_heads, head_dim, head_dim). The KDA backend's
         # forward_extend splits conv by [q_dim, k_dim, v_dim] along the conv_dim
@@ -301,15 +317,21 @@ class MockKDAModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
-        self.attn_cp_size = 1
+        self.req_to_token_pool.state.bind_routes(self.token_to_kv_pool.layer_router)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
+        self.is_draft_worker = False
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
         self.is_hybrid_swa = False
         self.sliding_window_size = None
         self.use_mla_backend = False
-        self.is_draft_worker = False
         self._kernel_warmed_up = True
 
     @property
@@ -536,6 +558,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
@@ -594,7 +618,9 @@ def build_kda_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    initialize_linear_attn_config(runner.server_args)
+    # Standing in for `attn_backend_wrapper`, which is what stamps this on a
+    # runner before building the backend that reads it.
+    runner.linear_attn_backends = resolve_linear_attn_backends()
     linear_backend = KDAAttnBackend(runner)
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedKDAAttention(
@@ -639,9 +665,6 @@ def build_kda_attention_fixture(
         device=device,
     )
     # KDA gate input is per-head-channel ([T, HV*K] raw); beta is per-head ([T, HV]).
-    # For extend, the production model unflattens gate to [1, T, HV, K] and
-    # sigmoid-then-unsqueezes beta to [1, T, HV] before calling the attn layer.
-    # For decode, both stay flat and beta is sigmoid'd inside the fused kernel.
     a_raw = torch.randn(
         case.num_input_tokens,
         case.num_v_heads * head_k_dim,
@@ -653,10 +676,9 @@ def build_kda_attention_fixture(
     )
     if case.forward_mode.is_decode():
         a = a_raw
-        b = b_raw.unsqueeze(0)
     else:
         a = a_raw.unflatten(-1, (case.num_v_heads, head_k_dim)).unsqueeze(0)
-        b = b_raw.float().sigmoid().unsqueeze(0).to(dtype)
+    b = b_raw.unsqueeze(0)
 
     fixture = KDAAttentionFixture(
         case=case,
@@ -719,11 +741,11 @@ def _copy_kda_parameters(
 
 
 def _ssm_states(fixture: KDAAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).temporal
 
 
 def _conv_states(fixture: KDAAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).conv[0]
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).conv[0]
 
 
 def _clone_kda_cache(fixture: KDAAttentionFixture):
@@ -866,14 +888,6 @@ def make_kda_case_with_prefix_lens(
 
 
 def kda_fixture_inputs(fixture: KDAAttentionFixture) -> dict[str, torch.Tensor]:
-    # `a, b` are the per-forward-mode shaped tensors the actual module
-    # consumes (see `build_kda_attention_fixture`: for DECODE
-    # `a = a_raw [T, HV*K]` and `b = b_raw.unsqueeze(0) [1, T, HV]`; for
-    # non-DECODE `a = a_raw.unflatten(-1, (HV, K)).unsqueeze(0)` and
-    # `b = b_raw.sigmoid().unsqueeze(0)`). The verify reference
-    # (`expected_kda_verify_output_from_inputs` →
-    # `_pure_torch_kda_gating`) expects raw `[T, HV*K]` / `[T, HV]`
-    # instead, so we expose both shapes through the inputs dict.
     return {
         "mixed_qkv": fixture.mixed_qkv,
         "a": fixture.a,
@@ -905,10 +919,9 @@ def make_kda_random_inputs(
     )
     if case.forward_mode.is_decode():
         a = a_raw
-        b = b_raw.unsqueeze(0)
     else:
         a = a_raw.unflatten(-1, (case.num_v_heads, head_k_dim)).unsqueeze(0)
-        b = b_raw.float().sigmoid().unsqueeze(0).to(dtype)
+    b = b_raw.unsqueeze(0)
     return {
         "mixed_qkv": torch.randn(
             case.num_input_tokens,

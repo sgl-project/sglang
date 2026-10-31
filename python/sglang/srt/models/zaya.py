@@ -31,9 +31,13 @@ for the full design notes):
   averaging across MoE layers) and MOD (mixture-of-depths skip expert).
 - Per-layer :class:`ResidualScaling` keeps the residual stream in fp32 with
   affine scale/bias both on the residual and on the post-mixer hidden states.
-- Per-request CCA state (``conv_state`` + ``prev_hs``) is managed by
-  SGLang's centralized ``MambaPool`` inside ``HybridReqToTokenPool``,
-  accessed via ``get_req_to_token_pool().mamba2_layer_cache()``.
+- Per-request CCA state (``conv_state`` + ``prev_hs``) lives in SGLang's
+  centralized ``MambaPool`` inside ``HybridReqToTokenPool``. The per-request
+  state plumbing (slot indices, prefix mask, cuda-graph buffers) is owned by
+  ``ShortConvAttnBackend`` and reached via
+  ``get_attn_backend().conv_state_metadata()``, so the model holds no pool
+  access; CCA runs its own conv (:func:`cca_extend` / :func:`cca_decode`)
+  against the returned handle.
 """
 
 from __future__ import annotations
@@ -41,26 +45,32 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import adds_replicated_output_to_partial
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -70,20 +80,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import add_prefix, make_pp_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
-
-
-# Attribute names used to memoize the per-request MambaPool slot indices on the
-# ForwardBatch. The req -> slot mapping is identical for every CCA layer in a
-# step, so caching it here makes the lookup (and its GPU->CPU sync) run once per
-# forward step instead of once per attention layer.
-_MAMBA_INDICES_ATTR = "_zaya_mamba_indices"
-_MAMBA_INDICES_CPU_ATTR = "_zaya_mamba_indices_cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +127,77 @@ class ResidualScaling(nn.Module):
         return residual, hidden_states
 
 
+class _ResidualMergeRead:
+    """How a ZAYA1 stage reads its input: its ResidualScaling, when the config
+    has one, on the incoming contribution and the fp32 residual, their fp32
+    sum as the new residual, and the input norm of that sum in the model
+    dtype. The producer's update must be a plain add."""
+
+    bind = None
+
+    is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
+    reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
+
+    def __init__(self, res_scale: Optional[ResidualScaling]):
+        self.res_scale = res_scale
+
+    def _merge(self, residual, hidden_states):
+        if self.res_scale is not None:
+            residual, hidden_states = self.res_scale(residual, hidden_states)
+        if residual is None:
+            return hidden_states.float()
+        return residual.float() + hidden_states.float()
+
+    def init_residual(self, hidden_states):
+        return self._merge(None, hidden_states)
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        if quant_format or post_residual_addition is not None:
+            raise NotImplementedError(
+                f"a ZAYA1 read with {quant_format=} or a post-residual addition"
+            )
+        hidden_states = _apply_norm_with_fp32_residual(
+            norm, residual, norm.weight.dtype
+        )
+        return hidden_states, residual
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if not update.is_plain_add:
+            raise NotImplementedError("a ZAYA1 read after a non-plain update")
+        return self.read(
+            self._merge(residual, hidden_states),
+            norm,
+            quant_format,
+            post_residual_addition,
+        )
+
+
+class _MergedNorm:
+    """The final norm, in the norm calling convention, read through the same
+    merge as the layers."""
+
+    def __init__(self, read: _ResidualMergeRead, norm: nn.Module):
+        self.read = read
+        self.norm = norm
+
+    def __call__(self, hidden_states, residual=None):
+        if residual is None:
+            residual = self.read.init_residual(hidden_states)
+            return self.read.read(residual, self.norm)[0]
+        return self.read.update_and_read(PLAIN_ADD, hidden_states, residual, self.norm)
+
+
 def _apply_norm_with_fp32_residual(
     norm: nn.Module,
     residual: torch.Tensor,
@@ -139,6 +212,187 @@ def _apply_norm_with_fp32_residual(
     call, ×120 norms per step).
     """
     return norm(residual.to(target_dtype))
+
+
+# ---------------------------------------------------------------------------
+# CCA conv-state kernels (v1 torch)
+#
+# ZAYA1-specific conv step: the CCA conv is a causal two-stage conv over
+# ``qk = [W_q hs || W_k hs]`` plus a one-token ``prev_hs`` lag for val_proj2.
+# The per-request conv state lives in the centralized MambaPool; the backend
+# (ShortConvAttnBackend) hands out the slot indices + prefix flags and CCA runs
+# these functions against them. ``conv_qk`` is the module's two-stage conv;
+# both functions mutate ``conv_state`` / ``prev_hs_state`` in place and return
+# ``(qk_out, v2_input)`` -- the conv output ``[T, in_out_ch]`` and the (shifted)
+# ``val_proj2`` input ``[T, hidden_size]``.
+# ---------------------------------------------------------------------------
+
+
+def cca_extend(
+    qk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    conv_qk: nn.Module,
+    conv_state: torch.Tensor,
+    prev_hs_state: torch.Tensor,
+    slot_ids: List[int],
+    has_prefix: List[bool],
+    extend_seq_lens_cpu: List[int],
+    total_padding: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prefill / extend conv-state step (v1, pure torch).
+
+    Walks each request in the batch, applies ``conv_qk`` with the request's own
+    initial state (zeros on a fresh first chunk, the cached ``conv_state`` slot
+    otherwise), writes the updated ``conv_state`` / ``prev_hs_state`` back, and
+    returns the concatenated ``(qk_out, v2_input)`` in the original token layout.
+
+    ``slot_ids`` is the host mirror of the per-request MambaPool slot indices and
+    ``has_prefix[i]`` is ``True`` when request ``i`` resumes a cached prefix.
+
+    The Triton swap (:func:`cca_conv1d_fn`) removes this per-request loop.
+    """
+    dtype = hidden_states.dtype
+    if total_padding is None:
+        total_padding = conv_state.shape[-1]
+    in_out_ch = qk.shape[-1]
+    hidden_size = hidden_states.shape[-1]
+
+    qk_out = torch.empty_like(qk)
+    v2_input = torch.empty_like(hidden_states)
+
+    # Fresh-prefill fast path: when no request has a cached prefix the per-request
+    # convs can be coalesced into a single packed convolution. Each request's
+    # segment is laid out as ``[total_padding zeros, S_i tokens]``.
+    all_fresh = bool(extend_seq_lens_cpu) and not any(has_prefix)
+
+    if all_fresh:
+        seq_lens = [int(s) for s in extend_seq_lens_cpu]
+        pad = total_padding
+        offsets_in = [0]
+        for s in seq_lens:
+            offsets_in.append(offsets_in[-1] + s + pad)
+        packed = qk.new_zeros((1, in_out_ch, offsets_in[-1]))
+        start = 0
+        for i, s in enumerate(seq_lens):
+            end = start + s
+            packed[0, :, offsets_in[i] + pad : offsets_in[i + 1]] = qk[
+                start:end
+            ].transpose(0, 1)
+            start = end
+
+        packed_out = conv_qk(packed)  # [1, C, offsets_in[-1] - pad]
+
+        start = 0
+        for i, s in enumerate(seq_lens):
+            end = start + s
+            a_i = offsets_in[i]
+            qk_out[start:end] = packed_out[0, :, a_i : a_i + s].transpose(0, 1)
+            new_state = packed[0, :, a_i + s : a_i + s + pad]
+            conv_state[slot_ids[i]] = new_state.to(conv_state.dtype)
+
+            hs_cur = hidden_states[start:end]
+            first = hidden_states.new_zeros((1, hidden_size))
+            v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+            prev_hs_state[slot_ids[i]] = (
+                hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+            )
+            start = end
+    else:
+        start = 0
+        for i, seq_len in enumerate(extend_seq_lens_cpu):
+            end = start + int(seq_len)
+            slot = slot_ids[i]
+            prefix = bool(has_prefix[i])
+
+            qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
+            if prefix:
+                left_pad = conv_state[slot].unsqueeze(0).to(dtype)
+            else:
+                left_pad = qk_cur.new_zeros((1, in_out_ch, total_padding))
+            padded = torch.cat([left_pad, qk_cur], dim=-1)
+
+            out = conv_qk(padded)  # [1, C, S_cur]
+            qk_out[start:end] = out.squeeze(0).transpose(0, 1)
+
+            new_state = padded[..., -total_padding:]
+            conv_state[slot] = new_state.squeeze(0).to(conv_state.dtype)
+
+            hs_cur = hidden_states[start:end]
+            if prefix:
+                first = prev_hs_state[slot].squeeze(-1).to(dtype).unsqueeze(0)
+            else:
+                first = hidden_states.new_zeros((1, hidden_size))
+            v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+
+            prev_hs_state[slot] = hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+            start = end
+
+    return qk_out, v2_input
+
+
+def cca_decode(
+    qk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    conv_qk: nn.Module,
+    conv_state: torch.Tensor,
+    prev_hs_state: torch.Tensor,
+    mamba_indices: torch.Tensor,
+    total_padding: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Single-token decode conv-state step (v1, pure torch).
+
+    Gathers each request's cached ``conv_state`` / ``prev_hs_state`` via
+    ``index_select``, runs ``conv_qk`` on the ``[T, C, total_padding + 1]``
+    window, and scatters the updated state back with ``index_copy_``. All ops are
+    on-device (``mamba_indices`` is a device ``long`` tensor), so this stays
+    CUDA-graph capturable. Returns ``(qk_out, prev_hs)`` where ``prev_hs`` is the
+    previous hidden state feeding ``val_proj2``.
+
+    The Triton swap is :func:`cca_conv1d_update`.
+    """
+    dtype = hidden_states.dtype
+    if total_padding is None:
+        total_padding = conv_state.shape[-1]
+
+    left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
+    cur = qk.unsqueeze(-1)  # [T, C, 1]
+    padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding + 1]
+    out = conv_qk(padded)  # [T, C, 1]
+    qk_out = out.squeeze(-1)  # [T, C]
+
+    new_state = padded[..., -total_padding:]
+    conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
+
+    # Read the previous hidden state (val_proj2 input) BEFORE overwriting the
+    # slot with the current token.
+    prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
+    prev_hs_state.index_copy_(
+        0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
+    )
+    return qk_out, prev_hs
+
+
+# Fused kernel seam (TODO) -- perf swap for the v1 torch paths above. These
+# mirror the ``causal_conv1d_fn`` / ``causal_conv1d_update`` contract but for
+# CCA's two-stage *grouped* conv (conv_qk[0] depthwise + conv_qk[1] grouped
+# per-head), which the stock depthwise ``causal_conv1d`` cannot express. Once
+# implemented they replace the per-request loop in ``cca_extend`` and the
+# separate gather/conv/scatter launches in ``cca_decode`` with a single
+# index-driven kernel. Same ``(qk_out, v2_input)`` return contract.
+
+
+def cca_conv1d_fn(*args, **kwargs):
+    raise NotImplementedError(
+        "Fused CCA prefill conv-with-state kernel not implemented yet; "
+        "the model uses cca_extend (v1 torch) in the meantime."
+    )
+
+
+def cca_conv1d_update(*args, **kwargs):
+    raise NotImplementedError(
+        "Fused CCA decode conv-with-state kernel not implemented yet; "
+        "the model uses cca_decode (v1 torch) in the meantime."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +439,7 @@ class CCA(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.config = config
@@ -199,19 +452,14 @@ class CCA(nn.Module):
         self.padding1 = self.cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
 
-        if tp_rank is None:
-            tp_rank = get_parallel().tp_rank
-        if tp_size is None:
-            tp_size = get_parallel().tp_size
-        self.tp_rank = int(tp_rank)
-        self.tp_size = int(tp_size)
+        self.tp_rank, self.tp_size = resolve_linear_parallel_group(parallel_group)
 
         # Full (global) head counts retained for weight loading and shape asserts.
         self.num_q_heads_full = int(cca_num_q_heads)
         self.num_k_heads_full = int(cca_num_k_heads)
-        assert (
-            self.num_q_heads_full % self.num_k_heads_full == 0
-        ), "num_q_heads must be a multiple of num_k_heads"
+        assert self.num_q_heads_full % self.num_k_heads_full == 0, (
+            "num_q_heads must be a multiple of num_k_heads"
+        )
         self.gqa_groups = self.num_q_heads_full // self.num_k_heads_full
 
         # Head-parallel TP requires both head counts to be divisible by tp_size.
@@ -259,8 +507,7 @@ class CCA(nn.Module):
                 gather_output=False,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_q", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
             self.linear_k = ColumnParallelLinear(
                 self.hidden_size,
@@ -269,8 +516,7 @@ class CCA(nn.Module):
                 gather_output=False,
                 quant_config=quant_config,
                 prefix=add_prefix("linear_k", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
         else:
             self.linear_q = ReplicatedLinear(
@@ -381,16 +627,16 @@ class CCA(nn.Module):
                 [loaded_weight[q_start:q_end], loaded_weight[k_start:k_end]],
                 dim=0,
             )
-            assert (
-                sliced.shape == param.data.shape
-            ), f"conv shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            assert sliced.shape == param.data.shape, (
+                f"conv shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            )
             param.data.copy_(sliced)
 
         def temp_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             sliced = loaded_weight[k_temp_start:k_temp_end]
-            assert (
-                sliced.shape == param.data.shape
-            ), f"temp shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            assert sliced.shape == param.data.shape, (
+                f"temp shard shape mismatch: {sliced.shape} vs {param.data.shape}"
+            )
             param.data.copy_(sliced)
 
         set_weight_attrs(self.conv_qk[0].weight, {"weight_loader": conv_row_loader})
@@ -400,58 +646,6 @@ class CCA(nn.Module):
         set_weight_attrs(self.temp, {"weight_loader": temp_loader})
 
     # ----- helpers ---------------------------------------------------------
-
-    @staticmethod
-    def _get_mamba_indices(forward_batch: ForwardBatch) -> torch.Tensor:
-        """Per-request MambaPool slot indices as an int64 device tensor.
-
-        The req -> slot mapping depends only on ``forward_batch.req_pool_indices``,
-        which is constant for every CCA layer within one forward step. Computing
-        it inside each of the ~60 attention layers would issue one redundant
-        gather per layer, so it is computed once and memoized on the ForwardBatch
-        (whose lifetime is exactly one forward step). The lookup is pure on-device
-        work, so this stays compatible with CUDA graph capture on the decode path.
-        """
-        cached = getattr(forward_batch, _MAMBA_INDICES_ATTR, None)
-        if cached is None:
-            cached = (
-                get_req_to_token_pool()
-                .get_mamba_indices(forward_batch.req_pool_indices)
-                .to(torch.long)
-            )
-            setattr(forward_batch, _MAMBA_INDICES_ATTR, cached)
-        return cached
-
-    @staticmethod
-    def _get_mamba_indices_cpu(
-        forward_batch: ForwardBatch, mamba_indices: torch.Tensor
-    ) -> list[int]:
-        """Host mirror of :meth:`_get_mamba_indices`, memoized per forward step.
-
-        Only the extend/prefill path needs the indices on the host to drive its
-        per-request Python loop; the decode path indexes the pool entirely
-        on-device. Memoizing turns the previous one-``.tolist()``-sync-per-layer
-        behavior into a single GPU->CPU sync per forward step. This helper is
-        never reached on the decode path that CUDA graphs capture.
-        """
-        cached = getattr(forward_batch, _MAMBA_INDICES_CPU_ATTR, None)
-        if cached is None:
-            cached = mamba_indices.tolist()
-            setattr(forward_batch, _MAMBA_INDICES_CPU_ATTR, cached)
-        return cached
-
-    def _get_pool_state(self, forward_batch: ForwardBatch):
-        """Retrieve per-request CCA state from the centralized MambaPool.
-
-        ``conv_state`` / ``prev_hs_state`` are layer-local pool views, but the
-        ``mamba_indices`` req -> slot mapping is shared across layers and so is
-        memoized on the ForwardBatch (see :meth:`_get_mamba_indices`).
-        """
-        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_id)
-        conv_state = layer_cache.conv[0]
-        prev_hs_state = layer_cache.conv[1]
-        mamba_indices = self._get_mamba_indices(forward_batch)
-        return conv_state, prev_hs_state, mamba_indices
 
     def _normalize_qk(
         self, query: torch.Tensor, key: torch.Tensor
@@ -583,201 +777,22 @@ class CCA(nn.Module):
         value = self._slice_v_per_rank(value_full)
         return query, key, value
 
-    def _forward_extend(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prefill / extend path.
-
-        Walks every request in the batch, applies the conv with each request's
-        own initial state (zero on first chunk, cached otherwise), writes the
-        updated state and ``prev_hs`` back into the centralized MambaPool, and
-        returns the concatenated q/k/v in the original token layout.
-        """
-        dtype = hidden_states.dtype
-        T = hidden_states.shape[0]
-
-        q_raw, _ = self.linear_q(hidden_states)  # [T, latent_q]
-        k_raw, _ = self.linear_k(hidden_states)
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, in_out_ch]
-
-        query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
-        key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
-
-        qk_out = torch.empty_like(qk)
-        v2_input = torch.empty_like(hidden_states)
-
-        conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
-        # Host view of the slot indices to drive the per-request loop below.
-        # Memoized on the ForwardBatch, so the GPU->CPU sync runs once per forward
-        # step rather than once per attention layer (~60 syncs/step otherwise).
-        mamba_idx_cpu = self._get_mamba_indices_cpu(forward_batch, mamba_indices)
-
-        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-
-        # Fresh-prefill fast path: when no request has a cached prefix the
-        # per-request convs (one launch each, ×60 attention layers ×B requests)
-        # can be coalesced into a single packed convolution. The conv chain is
-        # two ``kernel_size=2`` convs (effective receptive field = 3), so each
-        # request's S valid outputs are produced from the packed positions
-        # ``[a_i, a_i + S_i - 1]`` where the input segment for request i is
-        # ``[pad, pad, x_0, ..., x_{S-1}]`` of length ``S_i + total_padding``.
-        all_fresh = bool(extend_seq_lens_cpu) and not any(
-            int(p) > 0 for p in extend_prefix_lens_cpu
-        )
-
-        if all_fresh:
-            seq_lens = [int(s) for s in extend_seq_lens_cpu]
-            pad = self.total_padding
-            # Build packed buffer: per request -> [pad zeros, S_i tokens].
-            offsets_in = [0]
-            for s in seq_lens:
-                offsets_in.append(offsets_in[-1] + s + pad)
-            packed = qk.new_zeros((1, self.in_out_ch, offsets_in[-1]))
-            start = 0
-            for i, s in enumerate(seq_lens):
-                end = start + s
-                packed[0, :, offsets_in[i] + pad : offsets_in[i + 1]] = qk[
-                    start:end
-                ].transpose(0, 1)
-                start = end
-
-            packed_out = self._conv_qk_run(packed)  # [1, C, offsets_in[-1] - pad]
-
-            start = 0
-            for i, s in enumerate(seq_lens):
-                end = start + s
-                a_i = offsets_in[i]
-                qk_out[start:end] = packed_out[0, :, a_i : a_i + s].transpose(0, 1)
-                new_state = packed[0, :, a_i + s : a_i + s + pad]
-                conv_state[mamba_idx_cpu[i]] = new_state.to(conv_state.dtype)
-
-                hs_cur = hidden_states[start:end]
-                first = hidden_states.new_zeros((1, self.hidden_size))
-                v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
-                prev_hs_state[mamba_idx_cpu[i]] = (
-                    hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
-                )
-                start = end
-        else:
-            start = 0
-            for i, seq_len in enumerate(extend_seq_lens_cpu):
-                end = start + int(seq_len)
-                mamba_idx = mamba_idx_cpu[i]
-                has_prefix = int(extend_prefix_lens_cpu[i]) > 0
-
-                qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
-                if has_prefix:
-                    left_pad = conv_state[mamba_idx].unsqueeze(0).to(dtype)
-                else:
-                    left_pad = qk_cur.new_zeros((1, self.in_out_ch, self.total_padding))
-                padded = torch.cat([left_pad, qk_cur], dim=-1)
-
-                out = self._conv_qk_run(padded)  # [1, C, S_cur]
-                qk_out[start:end] = out.squeeze(0).transpose(0, 1)
-
-                new_state = padded[..., -self.total_padding :]
-                conv_state[mamba_idx] = new_state.squeeze(0).to(conv_state.dtype)
-
-                hs_cur = hidden_states[start:end]
-                if has_prefix:
-                    first = prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
-                else:
-                    first = hidden_states.new_zeros((1, self.hidden_size))
-                shifted = torch.cat([first, hs_cur[:-1]], dim=0)
-                v2_input[start:end] = shifted
-
-                prev_hs_state[mamba_idx] = (
-                    hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
-                )
-
-                start = end
-
-        query_conv = qk_out[:, : self.latent_q_dim].view(
-            T, self.num_q_heads, self.head_dim
-        )
-        key_conv = qk_out[:, self.latent_q_dim :].view(
-            T, self.num_k_heads, self.head_dim
-        )
-
-        query, key = self._add_grouped_qk_means(
-            query_conv, key_conv, query_pre, key_base
-        )
-        query, key = self._normalize_qk(query, key)
-
-        v1, _ = self.val_proj1(hidden_states)
-        v2, _ = self.val_proj2(v2_input)
-        value_full = torch.cat([v1, v2], dim=-1).view(
-            T, self.num_k_heads_full, self.head_dim
-        )
-        value = self._slice_v_per_rank(value_full)
-        return query, key, value
-
-    def _forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single-token decode path for a whole batch.
-
-        Reads each request's cached conv state and ``prev_hs`` from the
-        centralized MambaPool via ``index_select``, runs the conv on the
-        small ``[T, C, total_padding+1]`` window, and writes back via
-        ``index_copy_``.
-        """
-        T = hidden_states.shape[0]
-        dtype = hidden_states.dtype
-
-        conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
-
-        q_raw, _ = self.linear_q(hidden_states)
-        k_raw, _ = self.linear_k(hidden_states)
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, C]
-
-        query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
-        key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
-
-        left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
-        cur = qk.unsqueeze(-1)  # [T, C, 1]
-        padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding+1]
-        out = self._conv_qk_run(padded)  # [T, C, 1]
-        qk_out = out.squeeze(-1)  # [T, C]
-
-        new_state = padded[..., -self.total_padding :]
-        conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
-
-        query_conv = qk_out[:, : self.latent_q_dim].view(
-            T, self.num_q_heads, self.head_dim
-        )
-        key_conv = qk_out[:, self.latent_q_dim :].view(
-            T, self.num_k_heads, self.head_dim
-        )
-
-        query, key = self._add_grouped_qk_means(
-            query_conv, key_conv, query_pre, key_base
-        )
-        query, key = self._normalize_qk(query, key)
-
-        prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
-        v1, _ = self.val_proj1(hidden_states)
-        v2, _ = self.val_proj2(prev_hs)
-        value_full = torch.cat([v1, v2], dim=-1).view(
-            T, self.num_k_heads_full, self.head_dim
-        )
-        value = self._slice_v_per_rank(value_full)
-        prev_hs_state.index_copy_(
-            0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
-        )
-        return query, key, value
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project ``hidden_states`` into ``(q, k, v)`` honoring per-request state.
+
+        The per-request conv-state plumbing (slot gather/scatter, prefix mask,
+        cuda-graph buffers) is owned by :class:`ShortConvAttnBackend
+        <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>`,
+        reached via ``get_attn_backend().conv_state_metadata``; CCA runs its own
+        two-stage grouped conv (:func:`cca_extend` / :func:`cca_decode`) against
+        that handle, so this module holds no pool access. Those functions return
+        the conv output ``qk_out`` and the ``val_proj2`` input ``v2_input`` (the
+        shifted / previous hidden state), updating the ``conv_state`` /
+        ``prev_hs`` pool slots in place.
 
         ``q`` / ``k`` are returned in fp32 (the normalize step keeps fp32 for
         stability); ``v`` is returned in the input dtype since the caller
@@ -798,10 +813,63 @@ class CCA(nn.Module):
                 zero.view(0, self.num_k_heads, self.head_dim),
             )
 
+        T = hidden_states.shape[0]
+        q_raw, _ = self.linear_q(hidden_states)  # [T, latent_q]
+        k_raw, _ = self.linear_k(hidden_states)
+        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, in_out_ch]
+
+        query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
+        key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
+
+        # The backend hands out the per-request conv-state handle (slot indices,
+        # prefix mask, cuda-graph buffers); CCA runs its own two-stage grouped
+        # conv against it and gets back the conv output + val_proj2 input, with
+        # the conv_state / prev_hs pool slots updated in place.
+        meta = get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
+        conv_state = meta.layer_cache.conv[0]
+        prev_hs_state = meta.layer_cache.conv[1]
         if forward_batch.forward_mode.is_decode_or_idle():
-            return self._forward_decode(hidden_states, forward_batch)
-        # EXTEND / MIXED / DLLM_EXTEND all share the prefill loop.
-        return self._forward_extend(hidden_states, forward_batch)
+            qk_out, v2_input = cca_decode(
+                qk,
+                hidden_states,
+                self.conv_qk,
+                conv_state,
+                prev_hs_state,
+                meta.cache_indices,
+                self.total_padding,
+            )
+        else:
+            qk_out, v2_input = cca_extend(
+                qk,
+                hidden_states,
+                self.conv_qk,
+                conv_state,
+                prev_hs_state,
+                meta.slot_ids_cpu,
+                meta.has_prefix_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.total_padding,
+            )
+
+        query_conv = qk_out[:, : self.latent_q_dim].view(
+            T, self.num_q_heads, self.head_dim
+        )
+        key_conv = qk_out[:, self.latent_q_dim :].view(
+            T, self.num_k_heads, self.head_dim
+        )
+
+        query, key = self._add_grouped_qk_means(
+            query_conv, key_conv, query_pre, key_base
+        )
+        query, key = self._normalize_qk(query, key)
+
+        v1, _ = self.val_proj1(hidden_states)
+        v2, _ = self.val_proj2(v2_input)
+        value_full = torch.cat([v1, v2], dim=-1).view(
+            T, self.num_k_heads_full, self.head_dim
+        )
+        value = self._slice_v_per_rank(value_full)
+        return query, key, value
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +899,6 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_parallel().tp_rank
         self.tp_size = get_parallel().tp_size
         # The head split, the ``o_proj`` RowParallel all-reduce, and the
         # RadixAttention KV cache are all organized on the *global* TP group,
@@ -845,7 +912,7 @@ class ZayaAttention(nn.Module):
         assert attn_tp_size == self.tp_size, (
             f"ZAYA1 head-parallel attention requires the attention TP group "
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
-            "DP attention (enable_dp_attention) is not supported for ZAYA1."
+            "attention DP is not supported for ZAYA1."
         )
         assert self.num_q_heads_full % self.tp_size == 0, (
             f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
@@ -875,22 +942,18 @@ class ZayaAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("qkv", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
-        # RowParallel o_proj: per-rank input is the rank's q heads, full
-        # output is replicated via the end-of-forward all-reduce.
+        # RowParallel o_proj: per-rank input is the rank's q heads; the next
+        # stage's input completes the sum.
         self.o_proj = RowParallelLinear(
             self.q_dim_full,
             self.hidden_size,
             bias=bool(getattr(config, "attention_bias", False)),
             input_is_parallel=True,
-            reduce_results=True,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
         rope_theta = float(getattr(config, "rope_theta", 1_000_000.0))
@@ -1091,37 +1154,36 @@ def mod_premask_experts(
     indices: torch.Tensor,
     num_moe_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask the (per-rank, pre-all-reduce) expert output for the MOD skip path.
+    """Mask the (per-rank, partial) expert output for the MOD skip path.
 
     Returns ``(mod_mask, masked_experts)`` where ``mod_mask`` is ``1`` for
     tokens routed to a real expert and ``0`` for tokens routed to the skip
     slot (``indices == num_moe_experts``), and
     ``masked_experts = mod_mask * experts_out``.
 
-    The masking is applied *before* the cross-rank all-reduce so the single
-    reduction yields ``mask · sum_r(partial_r) = mask · experts_out_full``
-    without the replicated ``mod_out`` term being summed ``tp_size`` times.
-    Pairs with :func:`mod_blend`, which adds the skip-path term back after the
-    reduce. Kept as a free function so the MOD math is unit-testable without a
-    live ``torch.distributed`` group.
+    The mask is replicated, so the TP sum of the masked partials is
+    ``mask · experts_out_full``. Pairs with :func:`mod_blend`, which adds the
+    skip-path term. Kept as a free function so the MOD math is unit-testable
+    without a live ``torch.distributed`` group.
     """
     mod_mask = (indices != num_moe_experts).to(experts_out.dtype)
     return mod_mask, mod_mask * experts_out
 
 
 def mod_blend(
-    masked_experts_reduced: torch.Tensor,
+    masked_experts: torch.Tensor,
     mod_mask: torch.Tensor,
     mod_out: torch.Tensor,
 ) -> torch.Tensor:
-    """Combine the already-all-reduced masked expert output with the skip path.
+    """Add the skip path, weighted by ``(1 - mod_mask)``, to the masked expert
+    output.
 
     ``mod_out`` (the skip-expert residual, ``hidden_states * prob``) is
-    replicated on every rank, so it is folded in here -- after the reduce of
-    ``masked_experts`` -- weighted by ``(1 - mod_mask)``. See
-    :func:`mod_premask_experts`.
+    replicated on every rank. While ``masked_experts`` is still a partial TP
+    sum, only one rank may add it (:func:`adds_replicated_output_to_partial`),
+    so that the sum counts it once. See :func:`mod_premask_experts`.
     """
-    return masked_experts_reduced + (1.0 - mod_mask) * mod_out
+    return masked_experts + (1.0 - mod_mask) * mod_out
 
 
 class ZayaBlock(nn.Module):
@@ -1148,9 +1210,9 @@ class ZayaBlock(nn.Module):
                 f"number of experts {self.num_moe_experts}"
             )
 
-        assert (
-            config.activation_func == "swiglu"
-        ), "ZayaBlock only supports SwiGLU activation"
+        assert config.activation_func == "swiglu", (
+            "ZayaBlock only supports SwiGLU activation"
+        )
         assert config.gated_linear_unit, "ZayaBlock requires gated_linear_unit=True"
 
         self.router = ZayaRouter(
@@ -1208,25 +1270,21 @@ class ZayaBlock(nn.Module):
 
             experts_out = self.experts(hidden_states, topk_out)
             # ``mod_out`` is computed identically on every TP rank (both
-            # ``hidden_states`` and ``probs`` are replicated). Fold the skip
-            # mask into the per-rank partial experts output *before*
-            # all-reduce so the single reduction yields:
+            # ``hidden_states`` and ``probs`` are replicated). The output is a
+            # partial TP sum that the stage boundary completes, so only one
+            # rank adds the skip path:
             #   sum_r(mask · partial_r) + (1 - mask) · mod_out
             # = mask · experts_out_full + (1 - mask) · mod_out
-            # without double-counting ``mod_out`` by tp_size. The two steps are
-            # ``mod_premask_experts`` / ``mod_blend`` so the math is testable
-            # without a live distributed group.
+            # The two steps are ``mod_premask_experts`` / ``mod_blend`` so the
+            # math is testable without a live distributed group.
             mod_out = hidden_states * probs
-            mod_mask, masked_experts = mod_premask_experts(
+            mod_mask, hidden_out = mod_premask_experts(
                 experts_out, indices, self.num_moe_experts
             )
-            if self.tp_size > 1:
-                masked_experts = tensor_model_parallel_all_reduce(masked_experts)
-            hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
+            if adds_replicated_output_to_partial():
+                hidden_out = mod_blend(hidden_out, mod_mask, mod_out)
         else:
             hidden_out = self.experts(hidden_states, topk_out)
-            if self.tp_size > 1:
-                hidden_out = tensor_model_parallel_all_reduce(hidden_out)
 
         return hidden_out, router_hs_next
 
@@ -1261,6 +1319,15 @@ class ZayaDecoderATTLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
+        (attn,) = self.stage_facts(res_scale=self.res_scale)
+        (self.attn_boundary,) = append_stages((attn, self.input_norm))
+        self.entry_boundary = self.attn_boundary
+
+    @staticmethod
+    def stage_facts(*, res_scale: Optional[ResidualScaling] = None):
+        """The one stage an attention layer declares: its attention, read
+        through ``res_scale``."""
+        return (declare_attn(read=_ResidualMergeRead(res_scale)),)
 
     @staticmethod
     def _build_norm(config: ZayaConfig) -> nn.Module:
@@ -1273,27 +1340,14 @@ class ZayaDecoderATTLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        target_dtype = (
-            self.input_norm.weight.dtype
-            if isinstance(self.input_norm, RMSNorm)
-            else hidden_states.dtype
-        )
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        if residual is not None:
-            residual = residual.float() + hidden_states.float()
-        else:
-            residual = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.input_norm, residual, target_dtype
-        )
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(hidden_states, positions, forward_batch)
-        return hidden_states, residual, prev_router_hidden_states
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states, prev_router_hidden_states
 
 
 class ZayaDecoderMLPLayer(nn.Module):
@@ -1321,38 +1375,49 @@ class ZayaDecoderMLPLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
+        (ffn,) = self.stage_facts(res_scale=self.res_scale)
+        (self.ffn_boundary,) = append_stages((ffn, self.input_norm))
+        self.entry_boundary = self.ffn_boundary
+
+    @staticmethod
+    def stage_facts(*, res_scale: Optional[ResidualScaling] = None):
+        """The one stage an MoE layer declares: its MoE, read through
+        ``res_scale``."""
+        return (
+            declare_ffn(
+                sparse=True,
+                next_layer_sparse=True,
+                read=_ResidualMergeRead(res_scale),
+            ),
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        target_dtype = (
-            self.input_norm.weight.dtype
-            if isinstance(self.input_norm, RMSNorm)
-            else hidden_states.dtype
-        )
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        if residual is not None:
-            residual = residual.float() + hidden_states.float()
-        else:
-            residual = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.input_norm, residual, target_dtype
-        )
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states, prev_router_hidden_states = self.zaya_block(
             hidden_states, prev_router_hidden_states
         )
-        return hidden_states, residual, prev_router_hidden_states
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+        return hidden_states, prev_router_hidden_states
 
 
 # ---------------------------------------------------------------------------
 # Top-level model
 # ---------------------------------------------------------------------------
+
+
+def _layer_class(layer_id: int):
+    # Even layer ids are attention, odd layer ids are MoE. This matches the HF
+    # checkpoint keys: ``model.layers.<2k>.self_attn.*`` (CCA) versus
+    # ``model.layers.<2k+1>.zaya_block.*`` (MoE).
+    if layer_id % 2 == 0:
+        return ZayaDecoderATTLayer
+    return ZayaDecoderMLPLayer
 
 
 def _build_layer(
@@ -1361,22 +1426,19 @@ def _build_layer(
     quant_config: Optional[QuantizationConfig],
     prefix: str,
 ) -> nn.Module:
-    # Even layer ids are attention, odd layer ids are MoE. This matches the HF
-    # checkpoint keys: ``model.layers.<2k>.self_attn.*`` (CCA) versus
-    # ``model.layers.<2k+1>.zaya_block.*`` (MoE).
-    if layer_id % 2 == 0:
-        return ZayaDecoderATTLayer(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-    return ZayaDecoderMLPLayer(
+    return _layer_class(layer_id)(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
         prefix=prefix,
     )
+
+
+def stage_facts(layer_id: int):
+    """The one stage the layer at ``layer_id`` declares, from its kind alone:
+    the model's shared declaration function, which its layers declare with
+    too (see make_layers)."""
+    return _layer_class(layer_id).stage_facts()
 
 
 class ZayaModel(nn.Module):
@@ -1390,7 +1452,7 @@ class ZayaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1402,7 +1464,7 @@ class ZayaModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: _build_layer(
                 layer_id=idx,
@@ -1410,9 +1472,8 @@ class ZayaModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=stage_facts,
         )
 
         if self.pp_group.is_last_rank:
@@ -1421,6 +1482,9 @@ class ZayaModel(nn.Module):
                 self.res_scale = ResidualScaling(config, config.num_hidden_layers)
             else:
                 self.res_scale = None
+            self._final_merged_norm = _MergedNorm(
+                _ResidualMergeRead(self.res_scale), self.final_norm
+            )
         else:
             self.final_norm = PPMissingLayer()
             self.res_scale = None
@@ -1438,46 +1502,27 @@ class ZayaModel(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].entry_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         prev_router_hidden_states: Optional[torch.Tensor] = None
         for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual, prev_router_hidden_states = layer(
+            hidden_states, prev_router_hidden_states = self.layers[i](
                 hidden_states=hidden_states,
-                residual=residual,
                 positions=positions,
                 forward_batch=forward_batch,
                 prev_router_hidden_states=prev_router_hidden_states,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        target_dtype = (
-            self.final_norm.weight.dtype
-            if isinstance(self.final_norm, RMSNorm)
-            else hidden_states.dtype
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        return residual_batch.final_norm(
+            hidden_states, forward_batch, self._final_merged_norm
         )
-        if residual is not None:
-            merged = hidden_states.float() + residual.float()
-        else:
-            merged = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.final_norm, merged, target_dtype
-        )
-        return hidden_states
 
 
 class ZayaForCausalLM(nn.Module):
@@ -1490,7 +1535,7 @@ class ZayaForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = ZayaModel(
             config=config,

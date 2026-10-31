@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -19,6 +20,61 @@ class _Progress:
 
     def update(self):
         self.count += 1
+
+
+def test_causal_transformer_prepares_dit_before_forward(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages import causal_denoising
+
+    stage = CausalDMDDenoisingStage.__new__(CausalDMDDenoisingStage)
+    stage._component_residency_manager = object()
+    calls = []
+
+    def manage_dit(self, model, phase, batch):
+        del self
+        calls.append(("prepare", model, phase, batch))
+
+    def transformer(latents, *args, **kwargs):
+        del args, kwargs
+        calls.append(("forward",))
+        return latents
+
+    stage._manage_dit_use_site = MethodType(manage_dit, stage)
+    stage.transformer = transformer
+    monkeypatch.setattr(
+        causal_denoising,
+        "precision_autocast_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        causal_denoising,
+        "set_forward_context",
+        lambda **kwargs: nullcontext(),
+    )
+
+    batch = SimpleNamespace()
+    latents = torch.zeros(1)
+    result = stage._forward_causal_transformer(
+        batch,
+        latent_model_input=latents,
+        prompt_embeds=None,
+        timestep=torch.zeros(1),
+        kv_cache=[],
+        crossattn_cache=[],
+        current_start_tokens=0,
+        start_frame=0,
+        image_kwargs={},
+        pos_cond_kwargs={},
+        current_timestep=0,
+        attn_metadata=None,
+        target_dtype=torch.float16,
+        autocast_enabled=False,
+    )
+
+    assert result is latents
+    assert calls == [
+        ("prepare", transformer, "transformer", batch),
+        ("forward",),
+    ]
 
 
 def test_causal_dmd_chunk_loop_uses_model_input_builder():
@@ -397,6 +453,24 @@ def test_causal_kv_cache_allocation_sets_shapes_and_optional_int_indices():
     assert cache[0].sink_tokens == 13
     assert cache[0].attention_window_size == 3
     assert cache[0].allow_growth is False
+
+
+def test_causal_kv_cache_can_direct_current_attention():
+    cache = CausalSelfAttentionKVCache(
+        k=torch.zeros(1, 3, 1, 1),
+        v=torch.zeros(1, 3, 1, 1),
+        global_end_index=torch.zeros(1, dtype=torch.long),
+        local_end_index=torch.zeros(1, dtype=torch.long),
+        cache_size=3,
+        sink_tokens=0,
+        attention_window_size=3,
+    )
+
+    assert cache.can_direct_current_attention(3)
+    assert not cache.can_direct_current_attention(2)
+
+    cache.sink_tokens = 1
+    assert not cache.can_direct_current_attention(3)
 
 
 def test_causal_kv_cache_update_handles_append_roll_and_recompute():

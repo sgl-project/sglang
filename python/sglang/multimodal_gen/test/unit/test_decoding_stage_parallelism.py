@@ -2,16 +2,55 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+import torch.nn as nn
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    _to_unit_range,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
     LTX2RefinementStage,
 )
 
 
+class FakeVAE(nn.Module):
+    def decode(self, latents):
+        return latents
+
+
 class TestDecodingStageParallelism(unittest.TestCase):
+    def test_component_use_honors_decode_precision_override(self):
+        stage = DecodingStage(FakeVAE())
+        server_args = SimpleNamespace(
+            component_precisions={},
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="bf16",
+            ),
+        )
+
+        [component_use] = stage.component_uses(server_args)
+
+        self.assertEqual(component_use.target_dtype, torch.bfloat16)
+
+    def test_component_use_honors_exact_component_precision(self):
+        stage = DecodingStage(FakeVAE())
+        server_args = SimpleNamespace(
+            component_precisions={"vae": "fp16"},
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp32",
+                vae_decode_precision="bf16",
+            ),
+        )
+
+        [component_use] = stage.component_uses(server_args)
+
+        self.assertEqual(component_use.target_dtype, torch.float16)
+
     def test_cfg_parallel_uses_replicated_decode_when_decode_group_has_multiple_ranks(
         self,
     ):
@@ -35,6 +74,30 @@ class TestDecodingStageParallelism(unittest.TestCase):
             self.assertEqual(
                 stage.parallelism_type,
                 StageParallelismType.REPLICATED,
+            )
+
+    def test_torch_compile_decode_cache_is_replaced_for_new_vae_instance(self):
+        vae = FakeVAE()
+        stage = DecodingStage(vae)
+        server_args = SimpleNamespace(enable_torch_compile=True)
+
+        with patch(
+            "torch.compile",
+            side_effect=lambda fn, **_: fn,
+        ) as compile_fn:
+            compiled_vae_decode = stage._get_vae_decode_fn(vae, server_args)
+            self.assertIs(
+                stage._get_vae_decode_fn(vae, server_args), compiled_vae_decode
+            )
+            self.assertEqual(compile_fn.call_count, 1)
+
+            new_vae = FakeVAE()
+            new_compiled_vae_decode = stage._get_vae_decode_fn(new_vae, server_args)
+            self.assertIsNot(new_compiled_vae_decode, compiled_vae_decode)
+            self.assertEqual(compile_fn.call_count, 2)
+            self.assertEqual(stage._compiled_vae_decode.target_id, id(new_vae))
+            self.assertIs(
+                stage._compiled_vae_decode.compiled_module, new_compiled_vae_decode
             )
 
     def test_cfg_parallel_keeps_main_rank_decode_without_parallel_decode(self):
@@ -137,6 +200,30 @@ class TestDecodingStageParallelism(unittest.TestCase):
                 stage.parallelism_type,
                 StageParallelismType.MAIN_RANK_ONLY,
             )
+
+
+class TestToUnitRange(unittest.TestCase):
+    def test_in_place_matches_out_of_place(self):
+        image = torch.tensor([-1.5, -1.0, 0.0, 1.0, 1.5])
+        expected = (image / 2 + 0.5).clamp(0, 1)
+
+        result = _to_unit_range(image.clone(), in_place=True)
+
+        torch.testing.assert_close(result, expected)
+
+    def test_in_place_mutates_the_input_tensor(self):
+        image = torch.tensor([-1.0, 0.0, 1.0])
+        result = _to_unit_range(image, in_place=True)
+
+        self.assertIs(result, image)
+        torch.testing.assert_close(image, torch.tensor([0.0, 0.5, 1.0]))
+
+    def test_default_does_not_mutate_the_input_tensor(self):
+        image = torch.tensor([-1.0, 0.0, 1.0])
+        result = _to_unit_range(image)
+
+        self.assertIsNot(result, image)
+        torch.testing.assert_close(image, torch.tensor([-1.0, 0.0, 1.0]))
 
 
 if __name__ == "__main__":

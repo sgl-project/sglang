@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 
 import torch
 import torch.library
 
-from sglang.kernel_api_logging import debug_torch_op
+from sglang.kernels.kernel_api_logging import _KERNEL_API_LOG_LEVEL, debug_torch_op
 
 F = TypeVar("F", bound=Callable)
 
@@ -103,15 +104,15 @@ def register_custom_op(
     """
     extra_kwarg_keys = set(extra_kwargs.keys())
     expected_kwarg_keys = set({"out_shape", "fake_impl"})
-    assert (
-        expected_kwarg_keys >= extra_kwarg_keys
-    ), f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    assert expected_kwarg_keys >= extra_kwarg_keys, (
+        f"Unexpected extra kwargs: {extra_kwarg_keys - expected_kwarg_keys}"
+    )
 
     has_out_shape = "out_shape" in extra_kwargs
     has_fake_impl = "fake_impl" in extra_kwargs
-    assert not (
-        has_out_shape and has_fake_impl
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (has_out_shape and has_fake_impl), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
     # Assume inplace if neither out_shape nor fake_impl is provided
     if not (has_out_shape or has_fake_impl):
         extra_kwargs["out_shape"] = None
@@ -128,6 +129,45 @@ def register_custom_op(
     if fn is not None:
         return decorator(fn)
     return decorator
+
+
+_PLAIN_TENSORS = (torch.Tensor, torch.nn.Parameter)
+# Bound once: these run on every eager call of every op.
+_is_compiling = torch.compiler.is_compiling
+_dispatch_modes = torch._C._len_torch_dispatch_stack
+_function_modes = torch._C._is_torch_function_mode_enabled
+_profiling = torch._C._autograd._profiler_enabled
+_grad_enabled = torch.is_grad_enabled
+
+
+def _call_directly_in_eager(op_func: Callable, op: Callable) -> Callable:
+    """Call ``op_func`` itself in plain eager execution, skipping the dispatcher.
+
+    The op is registered for one device key with no autograd formula, so for plain
+    CUDA tensors under no_grad the dispatcher only re-enters ``op_func``, at several
+    microseconds a call. Everything else keeps the registered op: tracing, dispatch
+    and function modes, the profiler (which records the op), autograd, tensor
+    subclasses, and tensors on other devices (which the op rejects or fakes).
+    """
+
+    @functools.wraps(op_func)
+    def call(*args, **kwargs):
+        if (
+            _is_compiling()
+            or _dispatch_modes()
+            or _function_modes()
+            or _profiling()
+            or _grad_enabled()
+        ):
+            return op(*args, **kwargs)
+        for a in (*args, *kwargs.values()):
+            if isinstance(a, torch.Tensor) and (
+                type(a) not in _PLAIN_TENSORS or not a.is_cuda
+            ):
+                return op(*args, **kwargs)
+        return op_func(*args, **kwargs)
+
+    return call
 
 
 class CustomOpWrapper:
@@ -150,7 +190,8 @@ class CustomOpWrapper:
     @property
     def real_impl(self) -> Callable:
         if self._impl is None:
-            if not hasattr(torch.ops.sglang, self.op_name):
+            registered_here = not hasattr(torch.ops.sglang, self.op_name)
+            if registered_here:
                 from sglang.srt.utils.common import direct_register_custom_op
 
                 # NOTE(dark): if torch compile fail here, mark the decorator as eager
@@ -161,7 +202,14 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = debug_torch_op(self.op_func, self.op_name)
+            op = debug_torch_op(self.op_func, self.op_name)
+            # Logging wraps the registered op, and a name registered elsewhere first
+            # runs that registration's function; both stay on the dispatcher.
+            self._impl = (
+                _call_directly_in_eager(self.op_func, op)
+                if registered_here and not _KERNEL_API_LOG_LEVEL
+                else op
+            )
             assert self._impl is not None
         return self._impl
 
@@ -261,9 +309,9 @@ def register_custom_op_from_extern(
     name = op_name or fn.__name__
     computed_args = computed_args or {}
 
-    assert not (
-        out_shape is not None and fake_impl is not None
-    ), "Only one of `out_shape` or `fake_impl` should be provided."
+    assert not (out_shape is not None and fake_impl is not None), (
+        "Only one of `out_shape` or `fake_impl` should be provided."
+    )
 
     # If computed_args specified, create a wrapper with a reduced signature
     # that computes the excluded args inside the op body.

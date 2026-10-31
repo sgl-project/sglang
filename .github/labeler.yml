@@ -9,12 +9,14 @@ model-gateway:
 # Kernel specific
 sgl-kernel:
   - changed-files:
-    - any-glob-to-any-file: 'sgl-kernel/**/*'
+    - any-glob-to-any-file: 'python/sglang/kernels/aot/**/*'
 
 # JIT kernel specific
 jit-kernel:
   - changed-files:
-    - any-glob-to-any-file: 'python/sglang/jit_kernel/**/*'
+    - any-glob-to-any-file:
+      - 'python/sglang/kernels/!(*.md)'
+      - 'python/sglang/kernels/!(aot)/**/*'
 
 # Documentation
 documentation:
@@ -24,7 +26,7 @@ documentation:
       - '**/*.mdx'
       - 'docs/**/*'
       - 'README*'
-      - 'docs_new/**/*'
+      - 'docs/**/*'
 
 # Dependencies
 dependencies:
@@ -90,7 +92,6 @@ blackwell:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*nvfp4*'
-      - 'sgl-kernel/csrc/attention/cutlass_sm100_mla/**/*'
       - 'python/sglang/srt/layers/attention/trtllm_mla_backend.py'
       - 'python/sglang/srt/layers/attention/trtllm_mha_backend.py'
 
@@ -100,11 +101,61 @@ deepseek:
     - any-glob-to-any-file:
       - '**/*deepseek*'
 
-# HiCache
+memory-pool:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/mem_cache/pool/**/*'
+      - 'python/sglang/srt/mem_cache/allocator/**/*'
+      - 'python/sglang/srt/mem_cache/layout/**/*'
+      - 'python/sglang/srt/mem_cache/**/*memory_pool*'
+      - 'test/registered/mem_cache/**/*'
+
+unified-radix-cache:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/mem_cache/unified_cache/**/*'
+      - 'python/sglang/srt/mem_cache/**/*radix*'
+      - 'python/sglang/srt/mem_cache/evict_policy.py'
+      - 'python/sglang/srt/mem_cache/base_prefix_cache.py'
+      - 'test/registered/radix_cache/**/*'
+
 hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
+      - '**/HiCache/**/*'
+      - 'benchmark/hicache/**/*'
+      - 'test/registered/hicache/**/*'
+      - 'python/sglang/srt/managers/cache_controller.py'
+      - 'python/sglang/srt/mem_cache/pool_host/**/*'
+      - 'python/sglang/srt/mem_cache/hybrid_cache/**/*'
+      - 'python/sglang/srt/mem_cache/storage/**/*'
+      - 'python/sglang/srt/mem_cache/buffer_mode/**/*'
+      - 'python/sglang/srt/mem_cache/**/*host*'
+      - 'python/sglang/srt/mem_cache/**/*storage*'
+      - 'python/sglang/srt/mem_cache/l2_transfer.py'
+
+# A *mooncake* filename glob also matches benchmark/datasets/mooncake.py.
+mooncake:
+  - changed-files:
+    - any-glob-to-any-file:
+      # PD KV transfer.
+      - 'python/sglang/srt/disaggregation/mooncake/**/*'
+      - 'python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py'
+      - 'python/sglang/srt/observability/mooncake_trace.py'
+      - 'test/registered/unit/disaggregation/**/*mooncake*'
+      - 'test/manual/kv_transfer/**/*mooncake*'
+      # HiCache store.
+      - 'python/sglang/srt/mem_cache/storage/mooncake_store/**/*'
+      - 'python/sglang/test/mooncake_utils.py'
+      - 'test/registered/unit/mem_cache/**/*mooncake*'
+      - 'test/registered/hicache/**/*mooncake*'
+      # MoE EP. elastic_ep.py also implements nixl.
+      - 'python/sglang/srt/layers/moe/token_dispatcher/mooncake.py'
+      - 'python/sglang/srt/elastic_ep/expert_backup_client.py'
+      - 'python/sglang/srt/elastic_ep/expert_backup_manager.py'
+      - 'test/registered/ep/**/*mooncake*'
+      - 'test/manual/ep/**/*mooncake*'
 
 # Deterministic
 deterministic:
@@ -122,3 +173,18 @@ mthreads:
     - any-glob-to-any-file:
       - '**/*mthreads*'
       - '**/*musa*'
+      - '**/musa/**'
+
+# Apple Silicon specific
+apple-silicon:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*metal*'
+      - '**/*mlx*'
+      - '**/mlx/**'
+      - '**/*mps*'
+
+rust-processor:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'rust/sglang-processor/**/*'

@@ -1,36 +1,25 @@
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
 
 
-def _draft_runner_of(worker):
-    """Draft model_runner accessor across worker shapes.
-
-    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
-    model_runner as `draft_runner`; fall back to `model_runner` for workers
-    that run the draft model directly.
-    """
-    return (
-        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
-    )
-
-
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
-    custom_mask: torch.Tensor
+    # Keep this dataclass argument required despite SpecInput's None default;
+    # otherwise the required positions field would follow a defaulted field.
+    custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
@@ -42,10 +31,14 @@ class EagleVerifyInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
-    grammar: BaseGrammarObject = None
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+    prepared_out_cache_loc: Optional[torch.Tensor] = None
+    prepared_mrope_positions: Optional[torch.Tensor] = None
+    # The iteration's plan when the draft planned the verify window
+    # (`prepared_out_cache_loc`); verify and draft extend take it.
+    iteration_ids: Optional[IterationIds] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -54,6 +47,7 @@ class EagleVerifyInput(SpecInput):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+        self.num_tokens_for_logprob_per_req = self.draft_token_num
 
     @property
     def max_tree_depth(self) -> int:
@@ -68,23 +62,22 @@ class EagleVerifyInput(SpecInput):
         irregular tree (no fixed per-level branching)."""
         return self.topk
 
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.draft_token_num, self.draft_token_num
-
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(
+        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
+    ):
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -97,13 +90,20 @@ class EagleVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        runner_ids: RunnerIds,
+        plan: IterationIds,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the `RunnerIds` packs the read ids straight into
+        ``kv_indices``. Under a ``window`` read, the mask carries the window."""
         device = req_pool_indices.device
-        batch_size = len(req_pool_indices)
+        batch_size = req_pool_indices.numel()
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
@@ -118,19 +118,21 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
+        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        runner_ids.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kind=kind,
+            kv_start_idx=None if window is None else window.start,
+            # The runner_ids tiles the gather over token blocks, sized from
+            # the length sum (an upper bound on the longest live row) while
+            # it is still a host int.
+            num_token_blocks=None,
+            kv_lens_sum=paged_kernel_lens_sum,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -151,11 +153,22 @@ class EagleVerifyInput(SpecInput):
                 dim=0,
             )
 
+        if window is not None:
+            return (
+                kv_indices,
+                cum_kv_seq_len,
+                qo_indptr,
+                window.tree_mask(
+                    self.custom_mask,
+                    width=self.draft_token_num,
+                    read_lens_sum=paged_kernel_lens_sum,
+                ),
+            )
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+class EagleDraftInput(SpecInput):
     # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
     # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
     # `bonus_tokens` unconditionally.
@@ -163,14 +176,18 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, vocab) - single-step draft proposal q from draft-extend;
-    # only set under rejection sampling.
+    # Draft proposal q from draft-extend, only set under rejection sampling:
+    # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
     draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
     hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+
+    # Survives across draft steps: spec_info is shared by reference across the
+    # per-step forwards (each runs on a copied ForwardBatch, dropping writebacks).
+    dsa_topk_indices: Optional[torch.Tensor] = None
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
     # chain); the worker copies it here post-extend for next iter's draft.
@@ -179,34 +196,32 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
+    # The window-clipped counterpart of the pair above, for the draft's
+    # sliding-window layers; None on a pool with no window side.
+    window_kv_indptr: torch.Tensor = None
+    window_kv_indices: torch.Tensor = None
 
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
+
+    # False when this input is missing model-required state for graph replay.
+    # DP attention synchronizes the bit across ranks before the worker runs.
+    cuda_graph_compatible: bool = True
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """Decode-phase `hidden_states` width: draft self-chain output
-        (draft model writes its own last hidden back via `capture_for_decode`
-        and the draft loop). Returns None when the draft architecture doesn't
-        consume the field (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return _draft_runner_of(worker).model_config.dtype
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.draft_probs is not None:
+            self.draft_probs = pad_tensor_to_size(self.draft_probs, batch_size)
 
     @classmethod
     def create_idle_input(
@@ -229,48 +244,49 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
-                if get_global_server_args().speculative_use_rejection_sampling
+                if get_spec().speculative_use_rejection_sampling
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
 
-        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
-        if has_been_filtered:
-            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-            if len(new_indices) != len(self.topk_p):
-                if strict_check:
-                    raise ValueError(error_msg)
-                else:
-                    logger.warning(error_msg)
-
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            if self.draft_probs is not None:
-                self.draft_probs = self.draft_probs[: len(new_indices)]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
-        else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
-            if self.draft_probs is not None:
-                self.draft_probs = self.draft_probs[new_indices]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[new_indices]
-            self.bonus_tokens = self.bonus_tokens[new_indices]
+        self.topk_p = self.topk_p[new_indices]
+        self.topk_index = self.topk_index[new_indices]
+        if self.draft_probs is not None:
+            self.draft_probs = self.draft_probs[new_indices]
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states[new_indices]
+        self.bonus_tokens = self.bonus_tokens[new_indices]
+        if self.dsa_topk_indices is not None:
+            self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            self_was_empty = len(self.future_indices) == 0
+            spec_info_is_empty = len(spec_info.future_indices) == 0
+            if self_was_empty:
+                self.cuda_graph_compatible = spec_info.cuda_graph_compatible
+                self.future_dsa_topk_indices_available = (
+                    spec_info.future_dsa_topk_indices_available
+                )
+            elif not spec_info_is_empty:
+                self.cuda_graph_compatible = (
+                    self.cuda_graph_compatible and spec_info.cuda_graph_compatible
+                )
+                self.future_dsa_topk_indices_available = (
+                    self.future_dsa_topk_indices_available
+                    and spec_info.future_dsa_topk_indices_available
+                )
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
@@ -280,14 +296,19 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
         # for STANDALONE all non-idle inputs also have None hidden_states.
         if len(self.topk_index) == 0:
+            self.cuda_graph_compatible = spec_info.cuda_graph_compatible
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
+            self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
             return
+        self.cuda_graph_compatible = (
+            self.cuda_graph_compatible and spec_info.cuda_graph_compatible
+        )
         if self.hidden_states is not None and spec_info.hidden_states is not None:
             self.hidden_states = torch.cat(
                 [self.hidden_states, spec_info.hidden_states], axis=0
@@ -297,6 +318,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
+            self.dsa_topk_indices = torch.cat(
+                [self.dsa_topk_indices, spec_info.dsa_topk_indices]
+            )
+        else:
+            self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:
             self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
@@ -320,6 +347,7 @@ class EagleDraftExtendInput(SpecInput):
     # Both kept for cuda-graph buffer indexing.
     num_correct_drafts: torch.Tensor = None
     num_accept_tokens: torch.Tensor = None
+    num_front_tokens: int = 0
     # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
 
@@ -342,6 +370,15 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
 
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_select: Optional[torch.Tensor] = None
+
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]). When set, the logits
+    # processor runs lm_head and LAST hidden capture only on these rows; FULL
+    # hidden capture remains unpruned.
+    select_index: Optional[torch.Tensor] = None
+
     # None for draft-extend's idle batch; attention backends fall back to
     # rebuilding plain metadata from seq_lens when this is None.
     kv_indptr: torch.Tensor = None
@@ -349,41 +386,18 @@ class EagleDraftExtendInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
-        widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
-        None when the draft architecture doesn't consume the field
-        (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        target_cfg = worker.target_worker.model_runner.model_config
-        if not (
-            worker.speculative_algorithm.is_eagle3()
-            and worker.eagle_use_aux_hidden_state
-        ):
-            return target_cfg.spec_hidden_size
-
-        hf_config = target_cfg.hf_config
-
-        # `num_aux` resolution: explicit attr > eagle_config layer_ids > default 3.
-        num_aux = getattr(hf_config, "num_aux_hidden_states", None)
-        if num_aux is None:
-            eagle_config = getattr(hf_config, "eagle_config", None) or {}
-            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-            num_aux = len(layer_ids) if layer_ids else 3
-
-        target_hidden = getattr(hf_config, "target_hidden_size", target_cfg.hidden_size)
-        return target_hidden * num_aux
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return worker.target_worker.model_runner.model_config.dtype
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.num_correct_drafts is not None:
+            self.num_correct_drafts = pad_tensor_to_size(
+                self.num_correct_drafts, batch_size
+            )
+            self.num_accept_tokens = pad_tensor_to_size(
+                self.num_accept_tokens, batch_size
+            )
 
     @classmethod
     def create_idle_input(
@@ -411,11 +425,19 @@ class EagleDraftExtendInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: Optional[int],
-        req_to_token: torch.Tensor,
+        runner_ids: RunnerIds,
+        plan: IterationIds,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
+        """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
+        draft-extend window; a ``window`` read starts each row at its window's
+        first token, else at column 0. The queries are consecutive positions,
+        so the kernel's causal window masks them exactly."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
@@ -429,6 +451,10 @@ class EagleDraftExtendInput(SpecInput):
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Captured while the length sum is still a host int (None -> the
+        # `RunnerIds` sizes from its table width).
+        host_kv_lens_sum = paged_kernel_lens_sum
+
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
@@ -436,13 +462,15 @@ class EagleDraftExtendInput(SpecInput):
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        runner_ids.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kv_start_idx=None if window is None else window.start,
+            kind=kind,
+            num_token_blocks=None,
+            kv_lens_sum=host_kv_lens_sum,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
