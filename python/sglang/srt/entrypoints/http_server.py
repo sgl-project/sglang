@@ -3159,12 +3159,30 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
+        from sglang.srt.rust_server.server import drain_notify_name
+        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+        drain = None
+        # Without a local listener (the DP controller starts the schedulers),
+        # SIGTERM keeps its previous effect. Installed before the sidecar
+        # block, so SIGTERM stops the sidecar first and then reaches the drain.
+        if scheduler_init_result.rust_listener_procs:
+            drain = RustServerSigtermDrain(
+                scheduler_init_result.scheduler_procs,
+                scheduler_init_result.rust_listener_procs,
+                subprocess_watchdog,
+                drain_notify_name(port_args.instance_id),
+            )
+            drain.install()
         # Every listener is bound before its scheduler reports ready, so the
         # sidecar can connect at once.
         with rust_server_sidecar(node_hosts_rust_server()):
             if launch_callback is not None:
                 launch_callback()
-            scheduler_init_result.block_until_scheduler_exits()
+            if drain is not None:
+                drain.wait()
+            else:
+                scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(
             server_args,
