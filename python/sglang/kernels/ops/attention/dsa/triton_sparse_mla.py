@@ -323,10 +323,10 @@ def _sparse_mla_fwd_split_dim_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
+    STRIDE_QN_T,
+    STRIDE_QN_H,
+    STRIDE_QR_T,
+    STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -598,16 +598,23 @@ def _sparse_mla_fused_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
+    STRIDE_QN_T,
+    STRIDE_QN_H,
+    STRIDE_QR_T,
+    STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     USE_TOPK_LENGTH: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     USE_I64_PAGE: tl.constexpr = True,
     PIPE_STAGES: tl.constexpr = 3,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
+    # Set only when 0 <= topk_length <= topk and every index past it is -1,
+    # as transform_index_page_table_dcp writes the DCP-localized table: the
+    # tile count skips the clamp and the index load masks on the constexpr
+    # topk, leaving the -1 tail to slot >= 0.
+    TOPK_TAIL_INVALID: tl.constexpr = False,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0)
@@ -661,12 +668,14 @@ def _sparse_mla_fused_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
 
-    valid_topk = topk
-    if USE_TOPK_LENGTH:
-        valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
-
     k_offs = tl.arange(0, BLOCK_K)
-    num_tiles = tl.cdiv(valid_topk, BLOCK_K)
+    valid_topk = topk
+    if TOPK_TAIL_INVALID:
+        num_tiles = tl.cdiv(tl.load(topk_length_ptr + t), BLOCK_K)
+    else:
+        if USE_TOPK_LENGTH:
+            valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
+        num_tiles = tl.cdiv(valid_topk, BLOCK_K)
 
     for j in tl.range(0, num_tiles, num_stages=PIPE_STAGES):
         k_start = j * BLOCK_K
@@ -749,6 +758,12 @@ def _sparse_mla_fused_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.where(l_i[:, None] > 0.0, acc3 * inv_denom[:, None], 0.0)
 
+    if STORE_LSE:
+        # Finite floor: the DCP merge weights an empty rank by exp2(lse - max),
+        # so an all-masked row must not come back as -inf.
+        lse = tl.where(l_i > 0.0, tl.log2(denom) + m_i, -1073741824.0)
+        tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
+
     o_base = out_ptr + t * H * D_V
     tl.store(
         o_base + h_offs[:, None] * D_V + g[None, :],
@@ -791,14 +806,16 @@ def _sparse_mla_split_k_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    STRIDE_QN_T: tl.constexpr,
-    STRIDE_QN_H: tl.constexpr,
-    STRIDE_QR_T: tl.constexpr,
-    STRIDE_QR_H: tl.constexpr,
+    STRIDE_QN_T,
+    STRIDE_QN_H,
+    STRIDE_QR_T,
+    STRIDE_QR_H,
     USE_FP8_DOT: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    topk_length_ptr=None,
+    USE_TOPK_LENGTH: tl.constexpr = False,
 ):
     """Split-K partial kernel. grid=(seq, head_blocks, kv_splits)."""
     t = tl.program_id(0)
@@ -842,12 +859,21 @@ def _sparse_mla_split_k_kernel(
         other=0.0,
     ).to(input_type)
 
-    tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
-    if pid_k * tiles_per_segment * BLOCK_K >= topk:
-        return
-    num_tiles = tl.cdiv(topk, BLOCK_K)
-    tile_start = pid_k * tiles_per_segment
-    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+    if USE_TOPK_LENGTH:
+        # The reduce reads all KV_SPLITS partials, so a split left with no tiles
+        # must fall through and store an empty one rather than return early.
+        valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
+        num_tiles = tl.cdiv(valid_topk, BLOCK_K)
+        tiles_per_segment = tl.cdiv(num_tiles, KV_SPLITS)
+        tile_start = pid_k * tiles_per_segment
+        tile_end = tl.minimum(tile_start + tiles_per_segment, num_tiles)
+    else:
+        tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
+        if pid_k * tiles_per_segment * BLOCK_K >= topk:
+            return
+        num_tiles = tl.cdiv(topk, BLOCK_K)
+        tile_start = pid_k * tiles_per_segment
+        tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
@@ -983,6 +1009,8 @@ def _sparse_mla_reduce_kernel(
     ACTIVE_SPLITS_POW2: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    lse_out_ptr=None,
+    STORE_LSE: tl.constexpr = False,
 ):
     """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
     t = tl.program_id(0)
@@ -1028,6 +1056,12 @@ def _sparse_mla_reduce_kernel(
         out.to(tl.bfloat16),
         mask=d_mask,
     )
+    if STORE_LSE:
+        if dc == 0:
+            tl.store(
+                lse_out_ptr + t * H + h,
+                lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30)),
+            )
 
 
 def _triton_sparse_mla_fwd_splitk(

@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -224,7 +224,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
                 worker.target_worker = SimpleNamespace(
                     model_runner=SimpleNamespace(
-                        attn_backend=attn_backend, kv_index_translator=None
+                        attn_backend=attn_backend, runner_ids=None
                     )
                 )
                 draft_input = SimpleNamespace(
@@ -266,7 +266,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            runner_ids=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -301,7 +303,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            runner_ids=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2

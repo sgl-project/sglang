@@ -54,6 +54,15 @@ from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+    init_progress_reporter,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    init_request_cancel,
+    poll_cancellations,
+)
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -162,8 +171,19 @@ class Scheduler(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
             )
+            if server_args.progress_endpoint is not None:
+                init_progress_reporter(
+                    context=self.context, endpoint=server_args.progress_endpoint
+                )
         else:
             self.receiver = None
+        if server_args.cancel_endpoint is not None:
+            # every rank takes part in each stop decision; only the driver
+            # receives the cancelled request ids
+            init_request_cancel(
+                endpoint=server_args.cancel_endpoint,
+                context=self.context if self.receiver is not None else None,
+            )
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
         Exec_worker = CPUWorker if current_platform.is_cpu() else GPUWorker
@@ -333,7 +353,47 @@ class Scheduler(
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if (
+            allow_dynamic_batching
+            and len(reqs) > 1
+            and any(req.cancellable for req in reqs)
+        ):
+            # filter before merging; a running mixed batch cannot stop just one member
+            errors = [GPUWorker._cancel_error(req) for req in reqs]
+            if any(error is not None for error in errors):
+                live = [req for req, error in zip(reqs, errors) if error is None]
+                outputs = (
+                    self._handle_generation(
+                        live, allow_dynamic_batching=allow_dynamic_batching
+                    )
+                    if live
+                    else []
+                )
+                streaming = isinstance(outputs, _SequentiallyReturnedOutputs)
+                if streaming:
+                    outputs = outputs.outputs
+                elif not isinstance(outputs, list):
+                    outputs = [outputs]
+                live_outputs = iter(outputs)
+                restored = (
+                    OutputBatch(error=str(error), cancelled=True)
+                    if error is not None
+                    else next(live_outputs)
+                    for error in errors
+                )
+                return (
+                    _SequentiallyReturnedOutputs(restored)
+                    if streaming
+                    else list(restored)
+                )
         if self._async_output_save:
+            # continuous forward/save overlap must occasionally leave GC enabled
+            if request_gc.needs_collection_window() or any(
+                req.is_warmup or req.extra.get("server_internal_prewarm")
+                for req in reqs
+            ):
+                while self._inflight_finalizes:
+                    self._inflight_finalizes.popleft().result()
             # Reserve capacity before any forward allocates another output.
             # The single finalize worker completes futures in FIFO order.
             while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
@@ -346,6 +406,11 @@ class Scheduler(
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
+        progress_reporter = get_progress_reporter()
+        if progress_reporter is not None:
+            for req in reqs:
+                if req.report_progress and not req.is_warmup:
+                    progress_reporter.start(request_ids=req.client_request_ids())
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -379,6 +444,11 @@ class Scheduler(
             batch_size = len(reqs)
             try:
                 output_batch = self.worker.execute_forward([merged_req])
+                if output_batch.cancelled:
+                    # the worker logged the cancel
+                    return self._build_dynamic_batch_error_outputs(
+                        reqs=reqs, error_msg=output_batch.error, cancelled=True
+                    )
                 if output_batch.error:
                     logger.error(
                         "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
@@ -428,6 +498,11 @@ class Scheduler(
 
         try:
             output_batch = self.worker.execute_forward(reqs)
+            if output_batch.cancelled:
+                # the worker logged the cancel
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs, error_msg=output_batch.error, cancelled=True
+                )
             if output_batch.error:
                 logger.error(
                     "Native grouped execution returned error. Returning per-request errors: %s",
@@ -812,8 +887,9 @@ class Scheduler(
         self,
         reqs: List[Req],
         error_msg: str,
+        cancelled: bool = False,
     ) -> List[OutputBatch]:
-        return [OutputBatch(error=error_msg) for _ in reqs]
+        return [OutputBatch(error=error_msg, cancelled=cancelled) for _ in reqs]
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
         req = get_first_generation_req(processed_req)
@@ -821,6 +897,7 @@ class Scheduler(
             is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
         )
 
+    @request_gc.defer()
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -839,7 +916,7 @@ class Scheduler(
                         output_batch, "Scheduler.return_result.spill_arrays"
                     ):
                         output_batch.output = spill_large_arrays_to_file_refs(
-                            output_batch.output
+                            output_batch.output, identity
                         )
 
                 with self._record_return_stage(
@@ -917,6 +994,7 @@ class Scheduler(
         )
         self._inflight_finalizes.append(future)
 
+    @request_gc.defer()
     def _finalize_and_reply(
         self,
         *,
@@ -1074,6 +1152,19 @@ class Scheduler(
                         req.output_file_path(req.num_outputs_per_prompt, output_idx)
                     )
             merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
+        merged_req.merged_request_ids = [
+            req.request_id
+            for req in reqs
+            if req.report_progress and req.request_id is not None
+        ]
+        merged_req.report_progress = bool(merged_req.merged_request_ids)
+        # The batch stops only when each member is cancelled, so the ids must
+        # name each member. video_api sets report_progress with cancellable,
+        # so each cancellable member is in merged_request_ids; the length check
+        # keeps that true if another caller sets cancellable alone.
+        merged_req.cancellable = all(req.cancellable for req in reqs) and len(
+            merged_req.merged_request_ids
+        ) == len(reqs)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req
@@ -1356,6 +1447,7 @@ class Scheduler(
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
+            poll_cancellations()
             recv_reqs: list[tuple[bytes, Any]] = []
             received: list[list[bytes]] = []
             with self._socket_lock:

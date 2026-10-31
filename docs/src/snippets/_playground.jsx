@@ -564,6 +564,7 @@ export const Playground = ({ config }) => {
           cpOn: cpEnabledIn(flags),
           cpStrategy: bakedCpStrategy(flags) || "interleave",
           effTp: h.parseIntFlagAny(flags, h.TP_HEADS),
+          hicacheOn: h.hasFlag(flags, "--enable-hierarchical-cache"),
         });
         // The runtime derives the prefill-CP size as attn_cp_size = tp/dp
         // (a mismatched --attn-cp-size is overridden), so with DP-Attention
@@ -1577,10 +1578,10 @@ export const Playground = ({ config }) => {
           && (value.backend === null || value.backend === derived.backend)
           && h.hasFlag(flags, "--enable-unified-cache-external-linker")
           && !h.hasFlag(flags, "--enable-hierarchical-cache")) return { flags, env };
-        const linkerConfig = h.findFlagArg(flags, "--hicache-storage-backend-extra-config");
+        const linkerConfig = h.findFlagArg(flags, "--unified-cache-external-linker-config");
         const optimisticPrefill = h.findFlagArg(flags, "--optimistic-prefill-attempts");
         const ownedHeads = [
-          ...(inherited ? ["--hicache-storage-backend-extra-config"] : []),
+          ...(inherited ? ["--unified-cache-external-linker-config"] : []),
           ...(ownsOptimisticPrefill ? ["--optimistic-prefill-attempts"] : []),
           "--enable-unified-cache-external-linker",
           "--unified-cache-external-linker-backend",
@@ -1617,7 +1618,7 @@ export const Playground = ({ config }) => {
           ...((roleOverride && roleOverride.flags) || []),
           ...(ownsOptimisticPrefill && optimisticPrefill ? [`--optimistic-prefill-attempts ${optimisticPrefill}`] : []),
           ...(inherited && backend === "mori" && linkerConfig
-            ? [`--hicache-storage-backend-extra-config ${linkerConfig}`] : []),
+            ? [`--unified-cache-external-linker-config ${linkerConfig}`] : []),
         ]);
         const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
         if (inherited && backend === "mori" && standalone) extraEnv.push(standalone);

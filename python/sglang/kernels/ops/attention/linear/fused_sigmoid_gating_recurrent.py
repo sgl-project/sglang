@@ -17,6 +17,7 @@ _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_sm90 = is_sm90_supported()
 _is_sm103 = is_cuda() and get_device_sm() == 103
+_is_sm107 = is_cuda() and get_device_sm() == 107
 
 
 def _select_recurrent_launch_config(
@@ -62,6 +63,12 @@ def _select_recurrent_launch_config(
         and (n, h, hv, k, v, cache_steps) == (1, 8, 8, 128, 128, 8)
     ):
         # GLM TP8 DFlash verification: 256 CTAs instead of 32.
+        return 4, 1
+    if _is_sm107 and is_kda and target_verify:
+        # KDA spec verify on SM107: the default BV=32 single-warp launch gives
+        # heads x 4 CTAs (48 at Kimi-K3 TP8) on a 212-SM part. Each V column
+        # updates independently, so BV=4 spreads the serial per-token chain
+        # over 8x the CTAs with identical output (6.99 vs 13.66 us isolated).
         return 4, 1
     return min(triton.next_power_of_2(v), 32), 1
 
@@ -465,7 +472,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and V == 128 and BV == 4:
+        elif IS_KDA and (V == 128 and BV == 4):
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",

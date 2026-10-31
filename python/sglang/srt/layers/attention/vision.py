@@ -5,7 +5,7 @@ import functools
 import math
 import warnings
 from functools import lru_cache, partial
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -147,6 +147,11 @@ class VisionAttentionMetadata:
     seq_lens: torch.Tensor
     max_seqlen: int
 
+    # Cumulative sequence ends for Ascend FIA; excludes the leading zero.
+    # Read-only by convention; prepared once per vision forward on the CPU
+    # so per-block NPU->CPU copies of the same metadata can be skipped.
+    actual_seq_lengths_cpu: Optional[list[int]] = None
+
     # flashinfer_cudnn specific (optional)
     packed_indptrs: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
@@ -158,6 +163,7 @@ def prepare_vision_attention_metadata(
     device: torch.device,
     *,
     max_seqlen: Optional[int] = None,
+    actual_seq_lengths_cpu: Optional[list[int]] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -172,6 +178,7 @@ def prepare_vision_attention_metadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
+        actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         packed_indptrs=packed_indptrs,
         sequence_lengths=sequence_lengths,
         flashinfer_max_seqlen=flashinfer_max_seqlen,
@@ -375,6 +382,54 @@ class VisionSdpaAttention(nn.Module):
 
         return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
 
+    def _maskless_seq_lens(
+        self, s: int, bsz: int, cu_seqlens: Optional[torch.Tensor]
+    ) -> Optional[List[int]]:
+        """Per-sequence lengths when the patch mask would be all-True or block-diagonal,
+        so one unmasked SDPA per sequence is equivalent; None when the mask is needed.
+        """
+        if (
+            cu_seqlens is None
+            or bsz != 1
+            or self.softmax_in_single_precision
+            or self.num_kv_heads != self.num_heads
+        ):
+            return None
+        cu = cu_seqlens.tolist()
+        if cu[0] != 0 or cu[-1] != s or (len(cu) > 2 and not self.flatten_batch):
+            return None
+        seq_lens = [end - start for start, end in zip(cu[:-1], cu[1:]) if end > start]
+        return seq_lens or None
+
+    def _sdpa_per_sequence(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_lens: List[int]
+    ) -> torch.Tensor:
+        # [s, h, head_size] --> [1, h, s, head_size]
+        q, k, v = (
+            x.reshape(-1, self.num_heads, self.head_size).transpose(0, 1)[None]
+            for x in (q, k, v)
+        )
+        output = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    qi,
+                    ki,
+                    vi,
+                    dropout_p=self.dropout,
+                    is_causal=False,
+                    scale=self.scale,
+                )
+                for qi, ki, vi in zip(
+                    q.split(seq_lens, dim=2),
+                    k.split(seq_lens, dim=2),
+                    v.split(seq_lens, dim=2),
+                )
+            ],
+            dim=2,
+        )
+        # [1, h, s, head_size] --> [s, h, head_size]
+        return output[0].transpose(0, 1).reshape(-1, self.num_heads, self.head_size)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -397,6 +452,12 @@ class VisionSdpaAttention(nn.Module):
         assert q.dim() == 3, q.shape
 
         s = q.shape[0] // bsz
+
+        # A mask, even an all-True one, keeps SDPA off its flash kernels.
+        if attention_mask is None:
+            seq_lens = self._maskless_seq_lens(s=s, bsz=bsz, cu_seqlens=cu_seqlens)
+            if seq_lens is not None:
+                return self._sdpa_per_sequence(q=q, k=k, v=v, seq_lens=seq_lens)
 
         # [b, 1, s, s]
         if attention_mask is None:
@@ -868,9 +929,14 @@ class VisionAscendAttention(nn.Module):
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
-            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = cu[1:].to(torch.int32)
+            if forward_metadata.actual_seq_lengths_cpu is not None:
+                # Prepared once per vision forward on the CPU; reuse it in
+                # every block instead of copying cu_seqlens back per block.
+                seq_len_arg = forward_metadata.actual_seq_lengths_cpu
+            else:
+                cu = forward_metadata.cu_seqlens.to("cpu")
+                seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -886,7 +952,8 @@ class VisionAscendAttention(nn.Module):
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        seq_len_arg = seq_len_arg.tolist()
+        if isinstance(seq_len_arg, torch.Tensor):
+            seq_len_arg = seq_len_arg.tolist()
 
         total_tokens = int(seq_len_arg[-1])
 

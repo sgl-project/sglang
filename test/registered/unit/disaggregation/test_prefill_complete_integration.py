@@ -33,7 +33,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAllocationConfiguration(CustomTestCase):
@@ -50,7 +50,6 @@ class TestAllocationConfiguration(CustomTestCase):
                 "disaggregation_mode": "decode",
                 "disaggregation_decode_host_receive_threshold": 0.5,
             },
-            {"enable_pdmux": True},
             {"enable_pd_role_switch": True},
             {"language_only": True},
             {

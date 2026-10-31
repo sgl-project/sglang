@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     run_score_benchmark_multi,
 )
 
-register_cuda_ci(est_time=215, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=183, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=210, suite="extra-a-test-1-gpu-large-amd")
 
 

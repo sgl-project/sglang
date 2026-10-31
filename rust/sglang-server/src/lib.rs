@@ -17,18 +17,23 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::http::generate_hook::{
+    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
+    GenerateTerminal,
+};
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::MmData;
+pub use message::request::{GenerateRequest, MmData};
+pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
-pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor};
+pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
 pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
 pub use sglang_mm::pipeline::{Tensor, TensorData};
 
@@ -152,9 +157,18 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 }
 
 /// Wraps the HTTP app before it serves: an embedding package's own middleware
-/// or routes ([`Server::start_with_http_layer`]). It wraps every route but the
+/// or routes ([`Server::start_with_extensions`]). It wraps every route but the
 /// PD bootstrap registry's, inside the access log.
 pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
+
+/// When a `/generate` request's timing starts, as a request extension: an
+/// [`HttpLayer`] that does part of the request's work before `/generate` runs,
+/// work Python's TokenizerManager does after its timer starts, inserts this
+/// when it starts that work, so `e2e_latency` and the time to first token
+/// cover it as Python's do. Without it the timing starts once `/generate` has
+/// normalized the body.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestStart(pub std::time::Instant);
 
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
@@ -188,13 +202,14 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
     ) -> PyResult<Self> {
-        Self::start_with_http_layer(
+        Self::start_with_extensions(
             server_args,
             port_offset,
             to_scheduler_cap,
             from_scheduler_cap,
             stage_channel_cap,
             cores,
+            None,
             None,
         )
     }
@@ -288,10 +303,12 @@ impl Server {
 }
 
 impl Server {
-    /// [`Server::start`], with `http_layer` wrapping the HTTP app (see
-    /// [`HttpLayer`]).
+    /// [`Server::start`] with a model package's extensions, the boot of the
+    /// package's own server class: `http_layer` wraps the HTTP app (see
+    /// [`HttpLayer`]), and `generate_hook` adds the package's keys to native
+    /// `/generate` frames (see [`GenerateHook`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn start_with_http_layer(
+    pub fn start_with_extensions(
         server_args: ServerArgs,
         port_offset: Option<u16>,
         to_scheduler_cap: usize,
@@ -299,6 +316,7 @@ impl Server {
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
         http_layer: Option<HttpLayer>,
+        generate_hook: Option<Arc<dyn GenerateHook>>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -325,6 +343,7 @@ impl Server {
                 metrics_listener: port_offset.unwrap_or(0) == 0,
             },
             server_args: std::sync::Arc::new(server_args),
+            generate_hook,
         };
         let rt =
             runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;

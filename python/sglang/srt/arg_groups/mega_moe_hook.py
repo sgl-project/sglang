@@ -68,9 +68,10 @@ def mega_moe_needs_token_budget(
     model_arch: str, hf_quant_config: dict, quantization: str | None
 ) -> bool:
     # NVFP4 experts are repacked into the mega layout at load: no fallback.
-    nvfp4_experts = quantization == "modelopt_fp4" or "FP4" in str(
-        hf_quant_config.get("quant_algo", "")
-    )
+    nvfp4_experts = quantization in (
+        "modelopt_fp4",
+        "minimax_m3_nvfp4",
+    ) or "FP4" in str(hf_quant_config.get("quant_algo", ""))
     return model_arch in MEGA_MOE_NO_FALLBACK_ARCHS or nvfp4_experts
 
 
@@ -204,12 +205,12 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         ) // token_partition_size
     elif attn_dp_enabled_of(cfg):
         token_partition_size = cfg.attn_dp_size
-        token_partition_name = "attn_dp_size"
+        token_partition_name = "attn_dp_size (already applied)"
         token_alignment = max(
             cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+        local_chunked_prefill_size = cfg.chunked_prefill_size
     else:
         # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1
