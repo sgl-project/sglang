@@ -53,9 +53,7 @@ from sglang.srt.runtime_context import (
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
-from sglang.srt.utils import Withable, get_device, get_int_env_var, is_npu
-
-_is_npu = is_npu()
+from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -148,12 +146,6 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.eplb_statistics import (
-                    NpuExpertDistributionRecorder,
-                )
-
-                return NpuExpertDistributionRecorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -233,7 +225,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_debug_name = Withable()
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: self._create_gatherer(expert_location_metadata, rank)
+            k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -243,9 +235,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
-
-    def _create_gatherer(self, expert_location_metadata, rank):
-        return _SinglePassGatherer.init_new(expert_location_metadata, rank)
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -421,7 +410,7 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if get_exec().moe.deepep_mode == "normal":
+            if get_platform().is_npu or get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
