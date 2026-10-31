@@ -269,7 +269,7 @@ _BF16_WARP_SPLITK_TUNED_TACTICS = {
     (32, 1024, 4096): (16, 16, 256, 10, 2),
 }
 
-# GLM-5 TP4 decode on SM107 (VR200), merged into the table above on SM107 only;
+# GLM-5 TP4 decode on SM107 (Vera Rubin NVL72), added to the active table on SM107 only;
 # FlashInfer's default tactics, each faster than TGV/cuBLAS/fused_a per call with PDL.
 _BF16_SM107_WARP_SPLITK_TUNED_TACTICS = {
     # o_proj.
@@ -298,11 +298,13 @@ _BF16_SM107_FUSED_A_SPLITK_KEYS = frozenset(
     {(1, 2624, 6144), (4, 2624, 6144), (5, 2624, 6144)}
 )
 _use_sm107_splitk_tactics = False
+# The warp split-K table in use; rebound by initialize_bf16_gemm_config.
+_active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
 
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     key = (m, n, k)
-    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
+    return key in _BF16_SPLITK_TUNED_TACTICS or key in _active_warp_splitk_tactics
 
 
 def prefer_bf16_splitk_over_fused_a(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -320,7 +322,7 @@ def precompile_splitk_tactics(
     if not _enable_bf16_splitk_gemm:
         return False
     if keys is None:
-        keys = {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}
+        keys = {**_BF16_SPLITK_TUNED_TACTICS, **_active_warp_splitk_tactics}
     device = torch.cuda.current_device()
     for m, n, k in keys:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
@@ -352,6 +354,7 @@ def initialize_bf16_gemm_config() -> None:
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
+    global _active_warp_splitk_tactics
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -396,6 +399,7 @@ def initialize_bf16_gemm_config() -> None:
 
     _enable_bf16_splitk_gemm = False
     _use_sm107_splitk_tactics = False
+    _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
     if should_enable_bf16_splitk_gemm(backend):
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
@@ -420,9 +424,10 @@ def initialize_bf16_gemm_config() -> None:
         _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
         if get_platform().device_sm == 107:
-            _BF16_WARP_SPLITK_TUNED_TACTICS.update(
-                _BF16_SM107_WARP_SPLITK_TUNED_TACTICS
-            )
+            _active_warp_splitk_tactics = {
+                **_BF16_WARP_SPLITK_TUNED_TACTICS,
+                **_BF16_SM107_WARP_SPLITK_TUNED_TACTICS,
+            }
             _use_sm107_splitk_tactics = True
 
     _BF16_GEMM_BACKEND = backend
@@ -441,7 +446,7 @@ def _bf16_splitk_gemm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
+    warp_tactic = _active_warp_splitk_tactics.get((m, n, k))
     if warp_tactic is not None:
         _run_warp_splitk_dense(
             x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias

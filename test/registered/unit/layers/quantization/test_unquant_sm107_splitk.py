@@ -1,4 +1,4 @@
-"""SM107 (VR200) routes the GLM-5 TP4 decode BF16 GEMMs to FlashInfer warp
+"""SM107 (Vera Rubin NVL72) routes the GLM-5 TP4 decode BF16 GEMMs to FlashInfer warp
 split-K with PDL; every other GPU keeps its existing route."""
 
 import sys
@@ -43,6 +43,7 @@ _DISPATCH_GLOBALS = (
     "_run_warp_splitk_dense",
     "_enable_bf16_splitk_gemm",
     "_use_sm107_splitk_tactics",
+    "_active_warp_splitk_tactics",
 )
 
 
@@ -106,10 +107,12 @@ class TestSm107SplitKDispatch(CustomTestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch.dict(sys.modules, _fake_kernel_modules(self.routes)))
-        # initialize_bf16_gemm_config rebinds these and grows the warp table.
-        for name in _DISPATCH_GLOBALS:
-            stack.enter_context(patch.object(unquant, name, getattr(unquant, name)))
-        stack.enter_context(patch.dict(unquant._BF16_WARP_SPLITK_TUNED_TACTICS))
+        # initialize_bf16_gemm_config rebinds these.
+        stack.enter_context(
+            patch.multiple(
+                unquant, **{name: vars(unquant)[name] for name in _DISPATCH_GLOBALS}
+            )
+        )
         stack.enter_context(
             get_context().override_server_args(bf16_gemm_backend="cutedsl")
         )
@@ -148,6 +151,16 @@ class TestSm107SplitKDispatch(CustomTestCase):
                 for key in _GLM_KEYS:
                     self.assertEqual(self._route(key), ("cublas", False))
                 self.assertEqual(self._route(_MUSE_SPARK_KEY), ("warp_splitk", True))
+
+    def test_reinitializing_off_sm107_drops_the_glm_keys(self):
+        """The SM107 keys live in the active table only; the shared tables
+        are never modified, so a later non-SM107 init routes them as before."""
+        base_table = dict(unquant._BF16_WARP_SPLITK_TUNED_TACTICS)
+        self._initialize(device_sm=107)
+        self.assertEqual(self._route(_GLM_KEYS[0]), ("warp_splitk", True))
+        self._initialize(device_sm=100)
+        self.assertEqual(self._route(_GLM_KEYS[0]), ("cublas", False))
+        self.assertEqual(unquant._BF16_WARP_SPLITK_TUNED_TACTICS, base_table)
 
     def test_fused_qkv_a_leaves_fused_a_only_for_a_split_k_route(self):
         """Leaving the fused_a JIT for anything but warp split-K (cuBLAS
