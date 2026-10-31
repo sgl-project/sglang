@@ -14,6 +14,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+    MXFP_SCHEMES,
+    get_mxfp_capability,
+    require_mxfp_operators,
+    validate_mxfp_configuration,
+    validate_mxfp_loaded_weights,
+)
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
@@ -129,6 +136,9 @@ class ModelSlimConfig(QuantizationConfig):
 
         quant_type = self.quant_description.get(mapped_name, "")
         prefix = mapped_name.removesuffix(".weight")
+        if quant_type in MXFP_SCHEMES:
+            cap = get_mxfp_capability("diffusion", "dense", quant_type, "modelslim")
+            validate_mxfp_configuration(cap, prefix=prefix)
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
             return ModelSlimW8A8Int8(quant_config=self.quant_description, prefix=prefix)
         elif quant_type == "W4A4_DYNAMIC":
@@ -138,17 +148,21 @@ class ModelSlimConfig(QuantizationConfig):
                 ModelSlimMXFP8Scheme,
             )
 
-            return ModelSlimMXFP8Scheme()
+            scheme = ModelSlimMXFP8Scheme()
+            scheme.mxfp_capability = cap
+            return scheme
         elif quant_type in ("W4A4_MXFP4", "W4A4_MXFP4_DUALSCALE"):
             from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
                 ModelSlimMXFP4Scheme,
             )
 
-            return ModelSlimMXFP4Scheme(
+            scheme = ModelSlimMXFP4Scheme(
                 quant_config=self.quant_description,
                 prefix=prefix,
                 quant_type=quant_type,
             )
+            scheme.mxfp_capability = cap
+            return scheme
         raise NotImplementedError(
             f"No modelslim compatible scheme was found for layer '{layer_name}'. "
             f"quant_description['{layer_name}.weight'] = '{quant_type}'"
@@ -206,6 +220,12 @@ class ModelSlimLinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        cap = getattr(layer.scheme, "mxfp_capability", None)
+        if cap is not None:
+            validate_mxfp_loaded_weights(
+                cap, layer.weight, getattr(layer, "weight_scale", None)
+            )
+            require_mxfp_operators(cap)
         layer.scheme.process_weights_after_loading(layer)
 
     def create_weights(
@@ -224,6 +244,9 @@ class ModelSlimLinearMethod(LinearMethodBase):
         details
         """
         weight_loader = extra_weight_attrs.get("weight_loader")
+        cap = getattr(layer.scheme, "mxfp_capability", None)
+        if cap is not None:
+            validate_mxfp_configuration(cap, input_size=input_size_per_partition)
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,
