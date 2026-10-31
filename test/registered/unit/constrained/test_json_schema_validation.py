@@ -621,6 +621,12 @@ class TestBoundedFSMConstruction(CustomTestCase):
         ):
             build_fsm_with_budget("a" * 501, max_states=16)
 
+    def test_huge_bounded_repeat_stops_at_state_budget(self):
+        with self.assertRaisesRegex(
+            JSONSchemaStateExplosion, "before determinization completed"
+        ):
+            build_fsm_with_budget(r"a{1000000000}", max_states=16)
+
 
 class TestFSMBudgetValidation(unittest.TestCase):
     """Tests for FSM compilation with budget enforcement (Tier 2)."""
