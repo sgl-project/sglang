@@ -819,7 +819,8 @@ class _MultiWindowPolicy(_WindowPolicy):
         require_token_slack=False,
     ):
         from sglang.srt.mem_cache.kv.alloc.pricing import (
-            no_relief_plan,
+            NO_MOVE,
+            plan,
             reclaimed_snapshot,
         )
 
@@ -857,11 +858,14 @@ class _MultiWindowPolicy(_WindowPolicy):
         ):
             return False
         return (
-            no_relief_plan(
+            plan(
                 snapshot,
-                self._demands(
-                    c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+                dict(
+                    self._demands(
+                        c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+                    )
                 ),
+                NO_MOVE,
             )
             is not None
         )
@@ -874,8 +878,8 @@ class _MultiWindowPolicy(_WindowPolicy):
                 for b in (c.full_attn_allocator, *c._windows)
             ),
         )
-        # The no-relief plan is monotone in each band's demand and is also
-        # consumed by allocation, so this is the largest feasible equal demand.
+        # The in-place plan is monotone in each band's demand, so this is the
+        # largest equal demand that fits without moving a page.
         low, high = 0, pages
         while low < high:
             mid = (low + high + 1) // 2
