@@ -652,12 +652,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
         pad_values = []
-        if hasattr(forward_batch, "mm_inputs") and forward_batch.mm_inputs is not None:
+        if forward_batch.mm_inputs is not None:
             for mm_input in forward_batch.mm_inputs:
                 if mm_input is None:
                     continue
                 for item in mm_input.mm_items:
-                    pad_values.append(item.pad_value)
+                    pad_values.extend(item.padding_values())
         placeholder_tensor = torch.as_tensor(
             pad_values,
             device=input_ids.device,
@@ -708,7 +708,14 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        self._set_visual_token_mask(input_ids, forward_batch)
+        # Skip on decode/text-only batches: per-step mask allocs exhaust XPU memory.
+        if not forward_batch.forward_mode.is_decode() and (
+            forward_batch.contains_image_inputs()
+            or forward_batch.contains_video_inputs()
+        ):
+            self._set_visual_token_mask(input_ids, forward_batch)
+        else:
+            self.visual_token_mask = None
 
         assert input_ids.numel() == positions.shape[-1], (
             f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"

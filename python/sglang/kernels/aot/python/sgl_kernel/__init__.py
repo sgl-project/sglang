@@ -32,9 +32,7 @@ else:
         concat_mla_absorb_q,
         concat_mla_k,
         copy_to_gpu_no_ce,
-        dsv4_fused_k_norm_rope_flashmla,
         dsv4_fused_q_indexer_rope_hadamard_quant,
-        dsv4_fused_q_norm_rope,
         fused_add_rmsnorm,
         gelu_and_mul,
         gelu_tanh_and_mul,
@@ -79,6 +77,7 @@ else:
     )
     from sgl_kernel.memory import weak_ref_tensor
     from sgl_kernel.moe import (
+        apply_gguf_moe_weights,
         apply_shuffle_mul_sum,
         fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
@@ -147,6 +146,7 @@ else:
         )
 
     _DEBUG_EXPORT_NAMES = [
+        "apply_gguf_moe_weights",
         "apply_shuffle_mul_sum",
         "apply_token_bitmask_inplace_cuda",
         "build_tree_kernel_efficient",
@@ -155,9 +155,7 @@ else:
         "concat_mla_absorb_q",
         "concat_mla_k",
         "copy_to_gpu_no_ce",
-        "dsv4_fused_k_norm_rope_flashmla",
         "dsv4_fused_q_indexer_rope_hadamard_quant",
-        "dsv4_fused_q_norm_rope",
         "es_fp8_blockwise_scaled_grouped_mm",
         "es_sm100_mxfp8_blockscaled_grouped_mm",
         "es_sm100_mxfp8_blockscaled_grouped_quant",
@@ -214,13 +212,3 @@ else:
 
     del _name
     del _DEBUG_EXPORT_NAMES
-
-    def create_greenctx_stream_by_value(*args, **kwargs):
-        from sgl_kernel.spatial import create_greenctx_stream_by_value as _impl
-
-        return _impl(*args, **kwargs)
-
-    def get_sm_available(*args, **kwargs):
-        from sgl_kernel.spatial import get_sm_available as _impl
-
-        return _impl(*args, **kwargs)

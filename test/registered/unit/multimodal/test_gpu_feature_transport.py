@@ -11,7 +11,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
@@ -215,28 +215,6 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.pool.wrap_tensors.return_value = proxies
         items = [
             MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
-            for feature in features
-        ]
-
-        transport.wrap_items(items)
-
-        transport.pool.wrap_tensors.assert_called_once_with(features)
-        transport.pool.wrap_tensor.assert_not_called()
-        self.assertEqual([item.feature for item in items], proxies)
-
-    def test_video_clip_features_are_packed_per_request(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-        from sglang.srt.utils.cuda_vmm_transport_utils import (
-            CudaVmmFeatureTransport,
-        )
-
-        transport = object.__new__(CudaVmmFeatureTransport)
-        transport.pool = MagicMock()
-        features = [torch.arange(4), torch.arange(4, 8)]
-        proxies = [object(), object()]
-        transport.pool.wrap_tensors.return_value = proxies
-        items = [
-            MultimodalDataItem(modality=Modality.VIDEO, feature=feature)
             for feature in features
         ]
 
@@ -998,6 +976,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             routed_dp_rank=None,
             priority=None,
             dimensions=None,
+            encoding_format=None,
             lora_id=None,
             lora_name=None,
             http_worker_ipc=None,

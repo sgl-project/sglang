@@ -42,7 +42,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
 )
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
-register_cpu_ci(est_time=33, suite="base-a-test-cpu")
+register_cpu_ci(est_time=55, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -103,6 +103,7 @@ def _receiver() -> SchedulerRequestReceiver:
         max_recv_per_poll=-1,
         stream_output=lambda *args, **kwargs: None,
         get_last_batch=lambda: None,
+        rust_server_mode=False,
     )
 
 
