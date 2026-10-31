@@ -36,10 +36,15 @@ DEVICE = "cuda"
 PAGE_SIZE = 1 if is_hip() else 16
 NUM_LAYERS = 2
 MHA_ELEMENT_DIMS = [128, 512]
-MLA_ELEMENT_DIMS = [576]
+MLA_ELEMENT_DIMS = [288, 576]
 # Include counts around and above the staging capacity so both the single-pass
 # and the multi-chunk staged relayout branches are exercised.
 PAGE_COUNTS = [1, 64, 65, 129]
+
+
+@pytest.fixture(autouse=True)
+def _use_register_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SGLANG_HICACHE_TMA_TRANSFER", "0")
 
 
 def _token_indices_for_pages(
@@ -162,6 +167,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     )
     # page_first + kernel staged write-back JIT path must be enabled.
     assert host_pool.can_use_write_back_jit
+    assert host_pool.can_use_jit
 
     for layer_id in range(NUM_LAYERS):
         _fill_with_offset(device_pool.k_buffer[layer_id], layer_id)
@@ -195,8 +201,6 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         )
 
     # Load path (prefix-cache hit): exercises the hicache.cuh load matchers.
-    if not host_pool.can_use_jit:
-        return
     for layer_id in range(NUM_LAYERS):
         device_pool.k_buffer[layer_id].zero_()
         device_pool.v_buffer[layer_id].zero_()
@@ -247,6 +251,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
         element_size=element_dim * host_pool.dtype.itemsize,
     )
     assert host_pool.can_use_write_back_jit
+    assert host_pool.can_use_jit
 
     for layer_id in range(NUM_LAYERS):
         _fill_with_offset(device_pool.kv_buffer[layer_id], layer_id)
@@ -270,8 +275,6 @@ def _run_mla(element_dim: int, page_count: int) -> None:
             device_pages,
         )
 
-    if not host_pool.can_use_jit:
-        return
     for layer_id in range(NUM_LAYERS):
         device_pool.kv_buffer[layer_id].zero_()
 
