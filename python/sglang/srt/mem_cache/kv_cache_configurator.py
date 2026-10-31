@@ -2726,7 +2726,11 @@ class KVCacheConfigurator:
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
-                        token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        token_allocator_cls = (
+                            current_platform.get_token_allocator_cls()
+                            or TokenToKVPoolAllocator
+                        )
+                        token_to_kv_pool_allocator = token_allocator_cls(
                             sizes.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
