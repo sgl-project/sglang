@@ -645,10 +645,10 @@ class Envs:
     # The engine defaults NCCL cuMem on for eligible single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
