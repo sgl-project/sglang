@@ -27,11 +27,13 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    get_cp_strategy,
     get_cp_strategy_kind,
 )
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
+    cp_shard_position_ids,
     cp_split_before_forward,
     prepare_cp_forward,
 )
@@ -86,6 +88,8 @@ class PrefillCPBCGInput:
     positions: torch.Tensor
     bucket_local_tokens: Dict[int, int] = field(default_factory=dict)
     live_local_tokens: int = 0
+    # Eager CP-local rows of the live batch; PP stage boundaries use this layout.
+    stage_local_tokens: int = 0
 
     @classmethod
     def create(cls, runner: PrefillCudaGraphRunner) -> PrefillCPBCGInput:
@@ -188,6 +192,12 @@ class PrefillCPBCGInput:
         # built for a different request layout. Always rebuild before sharding.
         forward_batch.attn_cp_metadata = None
         prepare_cp_forward(forward_batch)
+        metadata = forward_batch.attn_cp_metadata
+        stage_local_tokens = None
+        if hasattr(metadata, "per_rank_actual_token"):
+            stage_local_tokens = int(
+                metadata.per_rank_actual_token[get_cp_strategy().cp_rank]
+            )
 
         captured_local_tokens = None
         if not capture:
@@ -215,17 +225,28 @@ class PrefillCPBCGInput:
                 metadata.max_rank_len = [captured_local_tokens] * cp_size
 
         raw_tokens = int(forward_batch.extend_num_tokens)
-        global_input_ids = forward_batch.input_ids[:raw_tokens]
         global_positions = forward_batch.positions[:raw_tokens]
-        global_input_embeds = runner.model_runner.model.get_input_embeddings()(
-            global_input_ids
+        # Later PP stages read activations from the proxy buffers, not embeddings.
+        # A draft runs inside the last PP stage and embeds its own tokens.
+        pp_proxy_buffers = (
+            None
+            if runner.model_runner.is_draft_worker
+            else runner.buffers.pp_proxy_tensors
         )
-        local_input_embeds, local_positions = cp_split_before_forward(
-            global_input_embeds,
-            global_positions,
-            forward_batch,
-        )
-        live_local_tokens = int(local_input_embeds.shape[0])
+        if pp_proxy_buffers is not None:
+            local_input_embeds = None
+            local_positions = cp_shard_position_ids(global_positions, forward_batch)
+            live_local_tokens = int(local_positions.shape[-1])
+        else:
+            global_input_embeds = runner.model_runner.model.get_input_embeddings()(
+                forward_batch.input_ids[:raw_tokens]
+            )
+            local_input_embeds, local_positions = cp_split_before_forward(
+                global_input_embeds,
+                global_positions,
+                forward_batch,
+            )
+            live_local_tokens = int(local_input_embeds.shape[0])
 
         if capture:
             captured_local_tokens = live_local_tokens
@@ -245,15 +266,24 @@ class PrefillCPBCGInput:
                 f"fixed input buffer has capacity {self.input_embeds.shape[0]}"
             )
 
-        input_embeds = self.input_embeds[:captured_local_tokens]
         positions = self.positions[:captured_local_tokens]
-        input_embeds.zero_()
         positions.zero_()
-        input_embeds[:live_local_tokens].copy_(local_input_embeds)
         positions[:live_local_tokens].copy_(local_positions)
-        forward_batch.input_embeds = input_embeds
         forward_batch.positions = positions
+        if local_input_embeds is not None:
+            input_embeds = self.input_embeds[:captured_local_tokens]
+            input_embeds.zero_()
+            input_embeds[:live_local_tokens].copy_(local_input_embeds)
+            forward_batch.input_embeds = input_embeds
         self.live_local_tokens = live_local_tokens
+        self.stage_local_tokens = (
+            live_local_tokens if stage_local_tokens is None else stage_local_tokens
+        )
+        if pp_proxy_buffers is not None:
+            # The upstream stage sends only its eager CP-local rows. Rows up to
+            # the captured capacity still run through the graph, so clear them.
+            for buffer in pp_proxy_buffers.values():
+                buffer[self.stage_local_tokens : captured_local_tokens].zero_()
 
 
 def execute_prefill_cp_bcg(
@@ -294,6 +324,10 @@ def execute_prefill_cp_bcg(
             hidden_states = local_output
 
         if not model.pp_group.is_last_rank:
+            # Hand the next stage the eager CP-local rows so it can replay or
+            # run eagerly independently of this stage's choice.
+            if isinstance(hidden_states, PPProxyTensors):
+                hidden_states = hidden_states[: cp_input.stage_local_tokens]
             return (
                 (hidden_states, aux_hidden_states)
                 if capture_aux_hidden_states

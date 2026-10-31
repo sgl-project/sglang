@@ -901,6 +901,7 @@ def build_prefill_registry(
     register_input_embeds: Optional[bool] = None,
     share_pool: bool = True,
     source: Optional[Any] = None,
+    zero_pp_proxy_padding: bool = True,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable / full (prefill) cuda-graph runners.
@@ -1041,6 +1042,7 @@ def build_prefill_registry(
 
     # PP stage inputs live outside ForwardBatch; adopt runner-owned buffers for
     # stable addresses and clear padding because prefill executes every bucket row.
+    # CP graphs run on CP-local rows, so their prepare step clears the padding.
     if source is not None:
         pp = getattr(source, "pp_proxy_tensors", None)
         if pp is not None:
@@ -1065,7 +1067,11 @@ def build_prefill_registry(
                         ),
                         dtype=_backing.dtype,
                         axis="tokens",
-                        padding_policy=PaddingPolicy.ZERO,
+                        padding_policy=(
+                            PaddingPolicy.ZERO
+                            if zero_pp_proxy_padding
+                            else PaddingPolicy.KEEP_PAD
+                        ),
                         source_fn=_pp_source(_key),
                     ),
                     bind=_backing,

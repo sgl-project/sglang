@@ -1,7 +1,7 @@
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -15,6 +15,7 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
+from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
 from sglang.srt.layers.cp.bcg.zigzag_bcg import ZigzagCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
@@ -34,6 +35,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -290,6 +292,120 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             runner.load_batch(forward_batch)
 
         self.assertEqual(runner.buffer_registry.padded_num_tokens, 2304)
+
+    def test_pp_cp_bcg_support_is_zigzag_only(self):
+        bcg_pkg = "sglang.srt.layers.cp.bcg"
+        for pp_size, strategy, backend, expected in (
+            (1, "zigzag", "trtllm_mha", True),
+            (2, "zigzag", "trtllm_mha", True),
+            (1, "interleave", "dsa", True),
+            (2, "interleave", "dsa", False),
+            (2, "zigzag", "fa3", False),
+        ):
+            cfg = SimpleNamespace(
+                enable_prefill_cp=True, pp_size=pp_size, tp_size=2, cp_strategy=strategy
+            )
+            with (
+                self.subTest(pp_size=pp_size, strategy=strategy, backend=backend),
+                patch(f"{bcg_pkg}.resolving_view", return_value=cfg),
+                patch(
+                    f"{bcg_pkg}.resolved_view",
+                    return_value=SimpleNamespace(attn_cp_size=2),
+                ),
+                patch(
+                    f"{bcg_pkg}.attention_backends_of", return_value=(backend, backend)
+                ),
+                patch.object(InterleaveCPBCGInput, "supports", return_value=True),
+            ):
+                self.assertEqual(supports_prefill_cp_bcg(object()), expected)
+
+    def _prepare_later_pp_stage(self, *, extend_seq_lens, proxy_rows):
+        """Run CP prepare on a non-first PP stage with zigzag cp_size=2."""
+        num_tokens = sum(extend_seq_lens)
+        hidden_size = 2
+        proxy = {"hidden_states": torch.full((proxy_rows, hidden_size), 7.0)}
+        runner = SimpleNamespace(
+            buffers=SimpleNamespace(pp_proxy_tensors=proxy),
+            model_runner=SimpleNamespace(
+                is_draft_worker=False,
+                model=SimpleNamespace(
+                    get_input_embeddings=Mock(side_effect=AssertionError("embedded"))
+                ),
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(num_tokens),
+            positions=torch.arange(num_tokens),
+            forward_mode=_ExtendMode(),
+            seq_lens_cpu=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens,
+            extend_num_tokens=num_tokens,
+            attn_cp_metadata=None,
+            global_num_tokens_cpu=None,
+            out_cache_loc=None,
+            input_embeds=None,
+        )
+        return runner, forward_batch, proxy
+
+    def test_later_pp_stage_prepare_keeps_proxy_rows_and_skips_embedding(self):
+        init_cp_strategy(enable_prefill_cp=True, cp_size=2, cp_strategy="zigzag")
+        cp_input = ZigzagCPBCGInput(
+            input_embeds=torch.zeros(16, 2), positions=torch.zeros(16, dtype=torch.long)
+        )
+        with get_parallel().override(
+            attn_cp_rank=0, attn_cp_size=2, enable_cp_tp_group_sharing=False
+        ):
+            # Capture a 16-token bucket: 8 CP-local rows on each rank.
+            runner, batch, proxy = self._prepare_later_pp_stage(
+                extend_seq_lens=[16], proxy_rows=16
+            )
+            cp_input.prepare(runner, batch, static_num_tokens=16, capture=True)
+            self.assertEqual(cp_input.bucket_local_tokens, {16: 8})
+            self.assertIsNone(batch.input_embeds)
+
+            # Replay 8 live tokens in that bucket: the upstream stage sent the
+            # eager CP-local rows (4 on rank 0); the remaining captured rows
+            # must not carry stale activations into the graph.
+            runner, batch, proxy = self._prepare_later_pp_stage(
+                extend_seq_lens=[8], proxy_rows=16
+            )
+            cp_input.prepare(runner, batch, static_num_tokens=16, capture=False)
+
+        # The graph runs the captured rows; the PP boundary keeps eager rows.
+        self.assertEqual(cp_input.live_local_tokens, 8)
+        self.assertEqual(cp_input.stage_local_tokens, 4)
+        self.assertIsNone(batch.input_embeds)
+        hidden = proxy["hidden_states"]
+        torch.testing.assert_close(hidden[:4], torch.full((4, 2), 7.0))
+        torch.testing.assert_close(hidden[4:8], torch.zeros(4, 2))
+        # Rows past the captured CP-local capacity are never read.
+        torch.testing.assert_close(hidden[8:], torch.full((8, 2), 7.0))
+        # Zigzag rank 0 owns the first and last of four 2-token chunks.
+        torch.testing.assert_close(batch.positions[:4], torch.tensor([0, 1, 6, 7]))
+
+    def test_non_last_pp_stage_returns_eager_cp_local_proxy_rows(self):
+        from sglang.srt.layers.cp.bcg.bcg import execute_prefill_cp_bcg
+
+        replayed = PPProxyTensors({"hidden_states": torch.arange(16.0).view(8, 2)})
+        runner = SimpleNamespace(
+            prefill_cp_bcg_input=SimpleNamespace(
+                live_local_tokens=6, stage_local_tokens=4
+            ),
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(pp_group=SimpleNamespace(is_last_rank=False))
+            ),
+            backend=SimpleNamespace(replay=lambda *_args, **_kwargs: replayed),
+            _prefill_forward_context=lambda *_args, **_kwargs: nullcontext(),
+        )
+
+        output = execute_prefill_cp_bcg(
+            runner, None, None, static_num_tokens=16, raw_num_tokens=8
+        )
+
+        self.assertIsInstance(output, PPProxyTensors)
+        torch.testing.assert_close(
+            output["hidden_states"], replayed["hidden_states"][:4]
+        )
 
 
 class TestCPZigzagStrategy(CustomTestCase):
