@@ -29,7 +29,10 @@ from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
     extract_extra_tensors,
     restore_extra_tensors,
 )
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.roles import (
+    RoleType,
+    needs_image_encoder,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
 )
@@ -417,6 +420,7 @@ class SchedulerDisaggMixin:
         from sglang.multimodal_gen.runtime.disaggregation.metrics import DisaggMetrics
 
         self._disagg_role = server_args.disagg_role
+        self._disagg_encode_only = server_args.disagg_encode_only
         self._disagg_sampling_params_cls = SamplingParams
         self._disagg_metrics = None
         self._pool_work_pull = None
@@ -572,6 +576,7 @@ class SchedulerDisaggMixin:
             pool_size=self._transfer_manager.pool_size,
             work_endpoint=_advertised_pool_work_endpoint(sa),
             preallocated_slots=preallocated_slot_info,
+            encode_only=sa.disagg_encode_only,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
         logger.info(
@@ -1503,6 +1508,12 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
+        if self._disagg_returns_encoded(result):
+            self._disagg_send_encoded(result, request_id)
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_complete(request_id)
+            return
+
         # Stage denoiser output for decoder transfer (async staging)
         tensor_fields, scalar_fields = extract_transfer_fields(result)
 
@@ -1709,6 +1720,13 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
+        if self._disagg_returns_encoded(req_result):
+            if self._pool_result_push is not None:
+                self._disagg_send_encoded(req_result, request_id)
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_complete(request_id)
+            return
+
         # Pack and send encoder output (rank 0 only sends)
         tensor_fields, scalar_fields = extract_transfer_fields(req_result)
 
@@ -1730,6 +1748,35 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_complete(request_id)
 
         logger.debug("Pool ENCODER: processed %s", request_id)
+
+    def _disagg_returns_encoded(self: Scheduler, req: Req) -> bool:
+        return self._disagg_encode_only and not (
+            self._disagg_role == RoleType.PROMPT_ENCODER
+            and needs_image_encoder(req.image_path, req.encode_target)
+        )
+
+    def _disagg_send_encoded(self: Scheduler, req: Req, request_id: str) -> None:
+        """Return what a denoiser would receive: the Req tensors and the extras."""
+        if req.encode_target and "encode_target" not in req.extra:
+            send_tensors(
+                self._pool_result_push,
+                {},
+                {
+                    "request_id": request_id,
+                    "_disagg_error": f"{self.worker.pipeline.pipeline_name} "
+                    "does not encode training targets",
+                },
+            )
+            return
+        tensor_fields, scalar_fields = extract_transfer_fields(req)
+        # Request scalars (prompt, sizes, inlined images) are the client's own input.
+        scalar_fields = {
+            key: value
+            for key, value in scalar_fields.items()
+            if key.startswith("_extra_")
+        }
+        scalar_fields["request_id"] = request_id
+        send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 
     def _disagg_encoder_transfer_stage(
         self: Scheduler, request_id: str, tensor_fields: dict, scalar_fields: dict

@@ -506,7 +506,9 @@ def launch_disagg_server(server_args: ServerArgs):
         and server_args.encoder_urls is None
         and server_args.decoder_urls is None
     )
-    required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
+    required_urls = []
+    if not server_args.disagg_encode_only:
+        required_urls.append(("--denoiser-urls", server_args.denoiser_urls))
     split_encoding = bool(
         server_args.prompt_encoder_urls or server_args.image_encoder_urls
     )
@@ -515,7 +517,8 @@ def launch_disagg_server(server_args: ServerArgs):
             "Use either --encoder-urls or split --prompt-encoder-urls/--image-encoder-urls"
         )
     if not glm_distributed_mode_enabled:
-        required_urls.append(("--decoder-urls", server_args.decoder_urls))
+        if not server_args.disagg_encode_only:
+            required_urls.append(("--decoder-urls", server_args.decoder_urls))
         if split_encoding:
             required_urls.extend(
                 [
@@ -579,6 +582,7 @@ def launch_disagg_server(server_args: ServerArgs):
         image_encoder_work_endpoints=parse_url_string(server_args.image_encoder_urls),
         prompt_encoder_result_endpoint=f"tcp://{host}:{base_port + 4}",
         image_encoder_result_endpoint=f"tcp://{host}:{base_port + 5}",
+        encode_only=server_args.disagg_encode_only,
         **denoiser_options,
     )
     diffusion_server.start()

@@ -4257,3 +4257,24 @@ def test_resident_layer_help_describes_the_actual_scope():
     assert "still benefits" not in per_component_help
     assert "once per request" in per_component_help
     assert "has no effect" in per_component_help
+
+
+def test_disagg_encode_only_applies_to_the_head_and_encoder_roles():
+    from types import SimpleNamespace
+
+    import pytest
+
+    for role in (
+        RoleType.SERVER,
+        RoleType.ENCODER,
+        RoleType.PROMPT_ENCODER,
+        RoleType.IMAGE_ENCODER,
+    ):
+        ServerArgs._validate_disagg_encode_only(
+            SimpleNamespace(disagg_encode_only=True, disagg_role=role)
+        )
+    for role in (RoleType.DENOISER, RoleType.DECODER, RoleType.MONOLITHIC):
+        with pytest.raises(ValueError, match="--disagg-encode-only"):
+            ServerArgs._validate_disagg_encode_only(
+                SimpleNamespace(disagg_encode_only=True, disagg_role=role)
+            )
