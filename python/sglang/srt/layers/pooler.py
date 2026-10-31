@@ -66,11 +66,16 @@ def pool_hidden_states(
     elif pooling_type == PoolingType.MEAN:
         prompt_lens = forward_batch.extend_seq_lens
         end_indices = torch.cumsum(prompt_lens, dim=0) - 1
-        cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
+        # fp32: a fp16/bf16 batch-wide cumsum swamps short requests after long ones.
+        cumulative_hidden_states = torch.cumsum(
+            hidden_states, dim=0, dtype=torch.float32
+        )
         sums = cumulative_hidden_states[end_indices]
         preceding_sums = torch.zeros_like(sums)
         preceding_sums[1:] = cumulative_hidden_states[end_indices[:-1]]
-        return (sums - preceding_sums) / prompt_lens.unsqueeze(-1)
+        return ((sums - preceding_sums) / prompt_lens.unsqueeze(-1)).to(
+            hidden_states.dtype
+        )
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 
