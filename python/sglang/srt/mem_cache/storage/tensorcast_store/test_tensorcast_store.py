@@ -247,7 +247,7 @@ def _make_pool(
     pool.layer_num = layer_num
     pool.head_num = head_num
     pool.dtype = dtype
-    pool.mtp_draft_device_pools = ()
+    pool.target_layer_num = layer_num
     pool.dcp_size = 1
     pool.dcp_rank = 0
     pool.allocator = allocator or HostTensorAllocator()
@@ -332,7 +332,7 @@ def test_fragment_registration_dispatch_is_exact_and_specific() -> None:
     [
         ({"layout": "layer_first"}, {}, "supports only"),
         ({"layout": "page_head"}, {}, "supports only"),
-        ({"mtp_draft_device_pools": (object(),)}, {}, "MTP"),
+        ({"target_layer_num": 0}, {}, "MTP"),
         ({"dcp_size": 2}, {}, "DCP"),
         ({}, {"attn_cp_size": 2}, "context parallel"),
         ({}, {"tp_lcm_size": 2}, "TP-LCM"),
@@ -1121,6 +1121,9 @@ def test_controller_tensorcast_factory_and_host_pool_group_use_v1_anchor(
 
         def register_mem_pool_host(self, pool: HostKVCache) -> None:
             self.registered.append(pool)
+
+        def on_host_pools_registered(self) -> None:
+            pass
 
     backend = FakeStorageBackend()
 

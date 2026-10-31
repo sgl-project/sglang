@@ -1,4 +1,4 @@
-"""Unit tests for bad-input classification in ``BaseMultimodalProcessor._load_single_item``.
+"""Unit tests for bad-input classification in ``BaseMultimodalProcessor`` media loading.
 
 Media the client supplied but that cannot be fetched or decoded must raise
 ``ValueError``; anything else must stay a ``RuntimeError``.
@@ -8,17 +8,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import asyncio
 import base64
 import binascii
 import io
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import requests
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
 from sglang.test.test_utils import CustomTestCase
 
@@ -77,6 +82,15 @@ class TestBadInputIsClientError(CustomTestCase):
                     _StubProcessor._load_single_item(media, Modality.IMAGE)
                 self.assertIsInstance(ctx.exception.__cause__.__cause__, OSError)
 
+    def test_decompression_bomb_image(self):
+        # 15000 x 15000 is above twice Image.MAX_IMAGE_PIXELS, so Pillow refuses it
+        # in Image.open, before decoding; a 1-bit PNG of that size is about 27 KB.
+        buf = io.BytesIO()
+        Image.new("1", (15000, 15000)).save(buf, format="PNG")
+        with self.assertRaisesRegex(ValueError, "decompression bomb") as ctx:
+            _StubProcessor._load_single_item(buf.getvalue(), Modality.IMAGE)
+        self.assertIsInstance(ctx.exception.__cause__, Image.DecompressionBombError)
+
     def test_undecodable_audio_bytes(self):
         # soundfile raises LibsndfileError, a RuntimeError -- not a ValueError.
         self._assert_client_error(b"definitely not audio", Modality.AUDIO)
@@ -122,9 +136,33 @@ class TestClientMediaExceptions(CustomTestCase):
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
             binascii.Error,  # invalid base64
+            Image.DecompressionBombError,
         ):
             with self.subTest(exc_type=exc_type.__name__):
                 self.assertTrue(issubclass(exc_type, CLIENT_MEDIA_EXCEPTIONS))
+
+
+class _LoaderStub(_StubProcessor):
+    async def process_mm_data_async(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class TestPlaceholderMismatchIsClientError(CustomTestCase):
+    def test_more_placeholders_than_images(self):
+        """A prompt with more image placeholders than images must be a 400, not a 500."""
+        processor = object.__new__(_LoaderStub)
+        tokens = MultimodalSpecialTokens(image_token="<img>").build(None)
+        with ThreadPoolExecutor(max_workers=1) as processor.io_executor:
+            with self.assertRaisesRegex(
+                ValueError, "2 image placeholders but 1 image inputs"
+            ):
+                asyncio.run(
+                    processor.legacy_load_mm_data(
+                        prompt="a <img> b <img> c",
+                        multimodal_tokens=tokens,
+                        image_data=[Image.new("RGB", (8, 8))],
+                    )
+                )
 
 
 if __name__ == "__main__":

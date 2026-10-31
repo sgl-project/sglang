@@ -22,11 +22,13 @@ struct StoreKVIndexParams {
   uint32_t total_jobs;       // batch_size * heads_per_token
 };
 
-template <int64_t kHeadBytes, bool kUsePDL>
+// kHeadBytes is the cache head size; with kCastFp8 the input head is bf16 (2x).
+template <int64_t kHeadBytes, bool kCastFp8, bool kUsePDL>
 struct StoreTrait {
   static_assert(kHeadBytes % 16 == 0, "head bytes must be a multiple of 16 (128-bit vector)");
-  using vec_t = device::AlignedVector<uint32_t, 4>;         // 16 bytes / thread
-  static constexpr uint32_t kWorkerSize = kHeadBytes / 16;  // threads per head
+  using vec_t = device::AlignedVector<uint32_t, 4>;  // 16 bytes / thread
+  static constexpr int64_t kInHeadBytes = kCastFp8 ? 2 * kHeadBytes : kHeadBytes;
+  static constexpr uint32_t kWorkerSize = kInHeadBytes / 16;  // threads per head
 
   template <typename T>
   SGL_DEVICE static void forward(const StoreKVIndexParams& params) {
@@ -60,12 +62,27 @@ struct StoreTrait {
     const auto input_ptr = static_cast<const char*>(params.input_ptrs[which]);
     const auto cache_stride = params.cache_stride_bytes[which];
     const auto input_stride = params.input_stride_bytes[which];
-    const auto src = pointer::offset(input_ptr, token_id * input_stride, head_id * kHeadBytes);
+    const auto src = pointer::offset(input_ptr, token_id * input_stride, head_id * kInHeadBytes);
     const auto dst = pointer::offset(cache_ptr, loc * cache_stride, head_id * kHeadBytes);
     PDLWaitPrimary<kUsePDL>();
     vec_t chunk;
     chunk.load(src, lane);
-    chunk.store(dst, lane);
+    if constexpr (kCastFp8) {
+#ifdef USE_ROCM
+      static_assert(!kCastFp8, "the bf16 -> fp8 cast store is CUDA-only");
+#else
+      uint2 packed;
+      auto* out = reinterpret_cast<__nv_fp8x2_storage_t*>(&packed);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        out[i] = __nv_cvt_bfloat16raw2_to_fp8x2(
+            *reinterpret_cast<const __nv_bfloat162_raw*>(&chunk[i]), __NV_SATFINITE, __NV_E4M3);
+      }
+      reinterpret_cast<uint2*>(dst)[lane] = packed;
+#endif
+    } else {
+      chunk.store(dst, lane);
+    }
     PDLTriggerSecondary<kUsePDL>();
   }
 };
@@ -78,7 +95,7 @@ __global__ void store_kv_index_kernel(const __grid_constant__ StoreKVIndexParams
 // idx_v / idx_v_cache may be dummies (== idx_k / idx_k_cache) when the layer
 // has no index value; the caller signals "no V" via heads_per_token == 2*hkv+1
 // so the index-V branch is never taken.
-template <int64_t kHeadBytes, bool kUsePDL>
+template <int64_t kHeadBytes, bool kCastFp8, bool kUsePDL>
 void store_kv_index(
     tvm::ffi::TensorView k,
     tvm::ffi::TensorView v,
@@ -96,9 +113,10 @@ void store_kv_index(
   auto Mrow = SymbolicSize{"main_row"};  // num_kv_heads * head_dim
   auto Drow = SymbolicSize{"idx_row"};   // head_dim
   auto dtype = SymbolicDType{};
+  auto cache_dtype = SymbolicDType{};
   auto indice_dtype = SymbolicDType{};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   // All cache/source tensors share the same store dtype (fast-path precondition).
   TensorMatcher({B, Mrow})  //
@@ -109,7 +127,7 @@ void store_kv_index(
       .verify(v);
   TensorMatcher({-1, Mrow})  //
       .with_strides({-1, 1})
-      .with_dtype(dtype)
+      .with_dtype(cache_dtype)
       .with_device(device)
       .verify(k_cache)
       .verify(v_cache);
@@ -121,7 +139,7 @@ void store_kv_index(
       .verify(idx_v);
   TensorMatcher({-1, Drow})  //
       .with_strides({-1, 1})
-      .with_dtype(dtype)
+      .with_dtype(cache_dtype)
       .with_device(device)
       .verify(idx_k_cache)
       .verify(idx_v_cache);
@@ -131,7 +149,13 @@ void store_kv_index(
       .verify(indices);
 
   const int64_t dsize = dtype_bytes(dtype.unwrap());
-  RuntimeCheck(kHeadBytes == Drow.unwrap() * dsize);
+  const int64_t csize = dtype_bytes(cache_dtype.unwrap());
+  if constexpr (kCastFp8) {
+    RuntimeCheck(dtype.is_type<bf16_t>() && cache_dtype.is_type<fp8_e4m3_t>());
+  } else {
+    RuntimeCheck(dtype.unwrap() == cache_dtype.unwrap());
+  }
+  RuntimeCheck(kHeadBytes == Drow.unwrap() * csize);
   RuntimeCheck(Mrow.unwrap() == num_kv_heads * Drow.unwrap());
 
   const auto params = StoreKVIndexParams{
@@ -147,10 +171,10 @@ void store_kv_index(
           },
       .cache_stride_bytes =
           {
-              k_cache.stride(0) * dsize,
-              v_cache.stride(0) * dsize,
-              idx_k_cache.stride(0) * dsize,
-              idx_v_cache.stride(0) * dsize,
+              k_cache.stride(0) * csize,
+              v_cache.stride(0) * csize,
+              idx_k_cache.stride(0) * csize,
+              idx_v_cache.stride(0) * csize,
           },
       .num_k_heads = static_cast<uint32_t>(num_kv_heads),
       .num_total_heads = static_cast<uint32_t>(heads_per_token),
@@ -158,7 +182,7 @@ void store_kv_index(
   };
   if (params.total_jobs == 0) return;
 
-  using Trait = StoreTrait<kHeadBytes, kUsePDL>;
+  using Trait = StoreTrait<kHeadBytes, kCastFp8, kUsePDL>;
   constexpr uint32_t kBlockSize = 256u;
   const uint32_t num_blocks = div_ceil(params.total_jobs * Trait::kWorkerSize, kBlockSize);
   const auto kernel = indice_dtype.is_type<int32_t>()  //

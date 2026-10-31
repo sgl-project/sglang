@@ -25,7 +25,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (  # noqa: E402
+from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (  # noqa: E402
     commit_kda_replayssm_spec,
     commit_kda_replayssm_spec_all_layers,
 )

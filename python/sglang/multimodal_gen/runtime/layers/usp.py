@@ -52,6 +52,11 @@ def uncached_a2a_staging():
         _UNCACHED_STAGING -= 1
 
 
+# Accelerators whose device module exposes is_current_stream_capturing() and can
+# run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
+_A2A_DEVICE_TYPES = ("cuda", "xpu")
+
+
 def drop_a2a_staging_buffers() -> None:
     """Release the cached all-to-all staging buffers on this rank.
 
@@ -61,8 +66,9 @@ def drop_a2a_staging_buffers() -> None:
     """
     if not _A2A_STAGING_BUFFERS:
         return
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        device_module.synchronize()
     _A2A_STAGING_BUFFERS.clear()
 
 
@@ -75,23 +81,23 @@ def _a2a_staging_buffer(
     next collective with the same role overwrites it. Keep one grow-only
     backing allocation per (role, dtype, device), then return an exact-shape
     view into that allocation. This removes per-block allocator churn without
-    retaining one CUDA tensor for every request shape seen by the worker.
-    Bypassed under autograd and CUDA graph capture: a buffer first allocated
-    while capturing would live in the graph's private memory pool and must
-    not be shared with eager replays.
+    retaining one device tensor for every request shape seen by the worker.
+    Bypassed under autograd and graph capture: a buffer first allocated while
+    capturing would live in the graph's private memory pool and must not be
+    shared with eager replays.
     """
     if (
         _UNCACHED_STAGING
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
-        or device.type != "cuda"
-        or torch.cuda.is_current_stream_capturing()
+        or device.type not in _A2A_DEVICE_TYPES
+        or torch.get_device_module(device).is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
 
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.get_device_module(device).current_device()
     key = (role, dtype, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
@@ -417,7 +423,7 @@ def _usp_input_all_to_all_packed_qkv(
     h_local = h_global // world_size
 
     if (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
@@ -453,6 +459,72 @@ def _usp_input_all_to_all_packed_qkv(
     return q, k, v
 
 
+def ulysses_head_group_pipelined_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attend,
+    groups: int,
+) -> torch.Tensor:
+    """Ulysses attention with the collective exchange pipelined over head groups.
+
+    q/k/v are matching ``[rows, heads, head_size]`` row shards and
+    ``attend(q, k, v)`` attends one head group over the gathered rows; it must
+    treat heads independently, so the result is the sequential exchange's
+    bytes. Every input exchange is queued up front on the collective stream
+    and group g's output exchange runs while group g + 1 attends.
+    """
+    group = get_sp_group().ulysses_group
+    world_size = get_ulysses_parallel_world_size()
+    rows, heads, head_size = q.shape
+    group_heads = heads // (world_size * groups)
+    # pack block w * groups + g holds rank w's heads of group g
+    packed = pack_qkv_destination_major(
+        q,
+        k,
+        v,
+        world_size * groups,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size * groups, rows, group_heads, 3 * head_size),
+            q.dtype,
+            q.device,
+        ),
+    ).view(world_size, groups, rows, group_heads, 3 * head_size)
+    received = _a2a_staging_buffer(
+        "usp_packed_qkv_recv",
+        (groups, world_size, rows, group_heads, 3 * head_size),
+        q.dtype,
+        q.device,
+    )
+    exchanges = [
+        dist.all_to_all(
+            list(received[g].unbind(0)),
+            list(packed[:, g].unbind(0)),
+            group=group,
+            async_op=True,
+        )
+        for g in range(groups)
+    ]
+    out = _a2a_staging_buffer(
+        "usp_output",
+        (groups, world_size, rows, group_heads, head_size),
+        q.dtype,
+        q.device,
+    )
+    for g in range(groups):
+        exchanges[g].wait()
+        group_qkv = received[g].view(world_size * rows, group_heads, 3 * head_size)
+        group_out = attend(*group_qkv.split(head_size, dim=-1))
+        exchanges.append(
+            dist.all_to_all_single(out[g], group_out, group=group, async_op=True)
+        )
+    for exchange in exchanges[groups:]:
+        exchange.wait()
+    # [group, rank, row, head, dim] -> [row, rank, group, head, dim]
+    return out.permute(2, 1, 0, 3, 4).reshape(rows, heads, head_size)
+
+
 def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
     """True when ``x.view(b * s_local, h, d)`` costs no copy.
 
@@ -469,7 +541,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype
