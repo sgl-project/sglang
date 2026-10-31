@@ -761,12 +761,12 @@ pub struct MmSpec {
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_processor::dynamo_multimodal::registry::ProcessorSpec,
+    pub pipeline: sglang_processor::MmPipelineSpec,
 }
 
 #[pyo3::pymethods]
 impl MmSpec {
-    /// `pipeline` is `RustMmSpec.rust_json()`: Dynamo's `ProcessorSpec`, tagged by `family`.
+    /// `pipeline` is `RustMmSpec.rust_json()`, tagged by `family`.
     #[new]
     #[pyo3(signature = (*, feature_shm, pipeline))]
     fn py_new(feature_shm: bool, pipeline: &str) -> pyo3::PyResult<Self> {
