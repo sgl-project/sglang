@@ -40,7 +40,6 @@ from sglang.srt.models.unlimited_ocr_v2_support import (
 )
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
 from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
-from sglang.srt.models.unlimited_ocr_v2_support.document_plan import DocumentPlanState
 from sglang.srt.runtime_context import get_mm, get_serving
 
 if TYPE_CHECKING:
@@ -298,19 +297,6 @@ def _window_limit(*, remaining_tokens, context_capacity) -> tuple[int, str]:
     if context_capacity < remaining_tokens:
         return max_tokens, "context_capacity"
     return max_tokens, "tied"
-
-
-def _begin_window(doc_kv_state, *, lo, hi, emit_from):
-    """Advance ``doc_kv_state`` to the window the plan runs next."""
-    batch_layout = doc_kv_state.begin_batch()
-    layout = (
-        batch_layout.input_start,
-        batch_layout.input_end,
-        batch_layout.emit_start,
-    )
-    if layout != (lo, hi, emit_from):
-        raise RuntimeError("document KV state diverged from the document split plan")
-    return batch_layout
 
 
 def _usage_error(usage, *, bi, max_tokens) -> Optional[str]:
@@ -580,54 +566,6 @@ class _SplitProgress(msgspec.Struct):
         self.texts.append(owned)
         self.batches.append(batch)
         self.terminal = batch["finish"] in ("abort", "content_filter")
-
-
-def _fold_rejected_window(response, *, progress, doc_kv_state, row) -> Optional[object]:
-    """The response that ends the document, or None for a window that did not fit.
-
-    A window rejected for its context length is recorded as ``row`` and the
-    document goes on without it.
-    """
-    if not _is_doc_split_context_error(response):
-        return response
-    doc_kv_state.abort_batch()
-    progress.batches.append(row)
-    return None
-
-
-def _fold_window_answer(
-    response,
-    *,
-    progress,
-    doc_kv_state,
-    batch_layout,
-    bi,
-    lo,
-    hi,
-    emit_from,
-    max_tokens,
-    context_capacity,
-    limit_source,
-) -> None:
-    """Record a finished window's owned text and settle its document KV state."""
-    owned, batch = _window_batch(
-        response.choices[0],
-        response.usage,
-        bi=bi,
-        lo=lo,
-        hi=hi,
-        emit_from=emit_from,
-        max_tokens=max_tokens,
-        context_capacity=context_capacity,
-        limit_source=limit_source,
-        remaining_before=progress.remaining_tokens,
-        remaining_after=progress.remaining_tokens - response.usage.completion_tokens,
-    )
-    if batch["incomplete"]:
-        doc_kv_state.abort_batch()
-    else:
-        doc_kv_state.complete_batch(batch_layout.new_pages)
-    progress.add_window(response, owned=owned, batch=batch)
 
 
 class _StreamTotals(msgspec.Struct):
@@ -917,7 +855,7 @@ class ChatDocSplitter:
         )
 
     async def _handle_split_document(self, request, raw_request, plan, *, doc_reuse_id):
-        """Transcribe an over-long document as page windows, concatenated."""
+        """Run page windows in order; cancel an unconsumed successor on every exit"""
         error = self._serving._validate_request(
             request, validate_max_output_tokens=False
         )
@@ -928,153 +866,112 @@ class ChatDocSplitter:
             return self._serving.create_error_response(
                 "doc-split requires a positive token budget"
             )
-        overlap_pages = next(
-            (emit_from - lo for lo, _, emit_from in plan if emit_from > lo), 0
-        )
-        doc_kv_state = DocumentPlanState.from_plan(
+        doc_split.validate_plan(
+            plan,
             page_count=doc_split.count_images(request.messages),
-            overlap_pages=overlap_pages,
-            plan=plan,
+            overlap_pages=next(
+                (emit_from - lo for lo, _, emit_from in plan if emit_from > lo), 0
+            ),
         )
-        # Window i+1 is sent while window i decodes; the scheduler parks it and
-        # encodes its pages early.
+        progress = _SplitProgress(remaining_tokens=int(original_max_tokens))
         prefetch = (
             envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get() and doc_reuse_id is not None
         )
-        # The prefetched window still in flight; cancelled if the loop exits early.
-        open_prefetch: list = []
+        pending = None
         try:
-            return await self._run_split_windows(
-                request,
-                raw_request,
-                plan,
-                doc_reuse_id=doc_reuse_id,
-                prefetch=prefetch,
-                original_max_tokens=original_max_tokens,
-                doc_kv_state=doc_kv_state,
-                open_prefetch=open_prefetch,
+            for bi, (lo, hi, emit_from) in enumerate(plan):
+                if progress.remaining_tokens <= 0 or progress.terminal:
+                    break
+                context_capacity = self._window_capacity(request, plan, bi)
+                if context_capacity <= 0:
+                    return self._serving.create_error_response(
+                        f"doc-split batch {bi} has no completion capacity"
+                    )
+                max_tokens, limit_source = _window_limit(
+                    remaining_tokens=progress.remaining_tokens,
+                    context_capacity=context_capacity,
+                )
+                # 1. consume the prefetched window or submit the current one
+                if pending is not None:
+                    (task, sub_rid), pending = pending, None
+                else:
+                    sub = _window_request(
+                        request,
+                        hf_config=self._hf_config,
+                        plan=plan,
+                        bi=bi,
+                        max_tokens=max_tokens,
+                        doc_reuse_id=doc_reuse_id,
+                    )
+                    sub.rid = (
+                        f"{doc_reuse_id or 'uocr-doc'}-w{bi}-{uuid.uuid4().hex[:8]}"
+                    )
+                    sub_rid = sub.rid
+                    task = asyncio.ensure_future(self._handle_window(sub, raw_request))
+                # 2. send the successor before awaiting this window's response
+                if prefetch and bi + 1 < len(plan):
+                    pending = self._prefetch_window(
+                        request,
+                        raw_request,
+                        plan=plan,
+                        bi=bi + 1,
+                        remaining=progress.remaining_tokens,
+                        doc_reuse_id=doc_reuse_id,
+                        after=sub_rid,
+                    )
+                response = await task
+                if not isinstance(response, ChatCompletionResponse):
+                    # a rejected window cannot release its parked successor
+                    if pending is not None:
+                        self._cancel_prefetch(pending)
+                        pending = None
+                    if not _is_doc_split_context_error(response):
+                        return response
+                    progress.batches.append(
+                        _context_error_batch(
+                            bi=bi,
+                            max_tokens=max_tokens,
+                            context_capacity=context_capacity,
+                            remaining_tokens=progress.remaining_tokens,
+                            context_pages=emit_from - lo,
+                        )
+                    )
+                    continue
+                # 3. settle usage and owned pages before advancing the budget
+                usage_error = _usage_error(response.usage, bi=bi, max_tokens=max_tokens)
+                if usage_error is not None:
+                    return self._serving.create_error_response(usage_error)
+                owned, batch = _window_batch(
+                    response.choices[0],
+                    response.usage,
+                    bi=bi,
+                    lo=lo,
+                    hi=hi,
+                    emit_from=emit_from,
+                    max_tokens=max_tokens,
+                    context_capacity=context_capacity,
+                    limit_source=limit_source,
+                    remaining_before=progress.remaining_tokens,
+                    remaining_after=progress.remaining_tokens
+                    - response.usage.completion_tokens,
+                )
+                progress.add_window(response, owned=owned, batch=batch)
+            if progress.last_response is None:
+                return self._serving.create_error_response(
+                    "doc-split produced no batches"
+                )
+            return _assemble_split_response(
+                progress.last_response,
+                request=request,
+                plan=plan,
+                texts=progress.texts,
+                batches=progress.batches,
+                original_max_tokens=int(original_max_tokens),
+                remaining_tokens=progress.remaining_tokens,
             )
         finally:
-            for item in open_prefetch:
-                self._cancel_prefetch(item)
-
-    async def _run_split_windows(
-        self,
-        request,
-        raw_request,
-        plan,
-        *,
-        doc_reuse_id,
-        prefetch,
-        original_max_tokens,
-        doc_kv_state,
-        open_prefetch,
-    ):
-        """Run the windows of a split document in order and assemble the answer."""
-        progress = _SplitProgress(remaining_tokens=int(original_max_tokens))
-        pending = None
-        for bi in range(len(plan)):
-            if progress.remaining_tokens <= 0 or progress.terminal:
-                break
-            early_response, pending = await self._run_window(
-                request,
-                raw_request,
-                plan,
-                bi,
-                progress=progress,
-                pending=pending,
-                doc_reuse_id=doc_reuse_id,
-                prefetch=prefetch,
-                doc_kv_state=doc_kv_state,
-                open_prefetch=open_prefetch,
-            )
-            if early_response is not None:
-                return early_response
-        if progress.last_response is None:
-            return self._serving.create_error_response("doc-split produced no batches")
-        return _assemble_split_response(
-            progress.last_response,
-            request=request,
-            plan=plan,
-            texts=progress.texts,
-            batches=progress.batches,
-            original_max_tokens=int(original_max_tokens),
-            remaining_tokens=progress.remaining_tokens,
-        )
-
-    async def _run_window(
-        self,
-        request,
-        raw_request,
-        plan,
-        bi,
-        *,
-        progress,
-        pending,
-        doc_reuse_id,
-        prefetch,
-        doc_kv_state,
-        open_prefetch,
-    ):
-        """Run window ``bi`` and fold its answer into ``progress``.
-
-        Returns the response that ends the document early (else None) and the
-        next window when it was prefetched.
-        """
-        lo, hi, emit_from = plan[bi]
-        batch_layout = _begin_window(doc_kv_state, lo=lo, hi=hi, emit_from=emit_from)
-        context_capacity = self._window_capacity(request, plan, bi)
-        if context_capacity <= 0:
-            error = f"doc-split batch {bi} has no completion capacity"
-            return self._serving.create_error_response(error), pending
-        max_tokens, limit_source = _window_limit(
-            remaining_tokens=progress.remaining_tokens,
-            context_capacity=context_capacity,
-        )
-        task, pending = self._start_window(
-            request,
-            raw_request,
-            plan=plan,
-            bi=bi,
-            pending=pending,
-            max_tokens=max_tokens,
-            remaining_tokens=progress.remaining_tokens,
-            doc_reuse_id=doc_reuse_id,
-            prefetch=prefetch,
-            open_prefetch=open_prefetch,
-        )
-        resp = await task
-        if not isinstance(resp, ChatCompletionResponse):
-            # The prefetched successor waits for a window that never ran.
-            self._drop_prefetch(pending, open_prefetch=open_prefetch)
-            row = _context_error_batch(
-                bi=bi,
-                max_tokens=max_tokens,
-                context_capacity=context_capacity,
-                remaining_tokens=progress.remaining_tokens,
-                context_pages=emit_from - lo,
-            )
-            early_response = _fold_rejected_window(
-                resp, progress=progress, doc_kv_state=doc_kv_state, row=row
-            )
-            return early_response, None
-        usage_error = _usage_error(resp.usage, bi=bi, max_tokens=max_tokens)
-        if usage_error is not None:
-            return self._serving.create_error_response(usage_error), pending
-        _fold_window_answer(
-            resp,
-            progress=progress,
-            doc_kv_state=doc_kv_state,
-            batch_layout=batch_layout,
-            bi=bi,
-            lo=lo,
-            hi=hi,
-            emit_from=emit_from,
-            max_tokens=max_tokens,
-            context_capacity=context_capacity,
-            limit_source=limit_source,
-        )
-        return None, pending
+            if pending is not None:
+                self._cancel_prefetch(pending)
 
     def _window_capacity(self, request, plan, bi) -> int:
         return _estimate_window_capacity(
@@ -1084,59 +981,6 @@ class ChatDocSplitter:
             context_length=int(self._tokenizer_manager.max_req_input_len),
             image_mode=_doc_image_mode(request),
         )
-
-    def _drop_prefetch(self, pending, *, open_prefetch) -> None:
-        if pending is not None:
-            self._cancel_prefetch(pending)
-            open_prefetch.clear()
-
-    def _start_window(
-        self,
-        request,
-        raw_request,
-        *,
-        plan,
-        bi,
-        pending,
-        max_tokens,
-        remaining_tokens,
-        doc_reuse_id,
-        prefetch,
-        open_prefetch,
-    ):
-        """Window ``bi``'s handler task, and the prefetched next window or None.
-
-        ``pending`` is window ``bi`` when it was prefetched while its predecessor
-        decoded; the scheduler then caps its budget by what that window used.
-        """
-        if pending is not None:
-            task, sub_rid = pending
-            open_prefetch.clear()
-        else:
-            sub = _window_request(
-                request,
-                hf_config=self._hf_config,
-                plan=plan,
-                bi=bi,
-                max_tokens=max_tokens,
-                doc_reuse_id=doc_reuse_id,
-            )
-            sub.rid = f"{doc_reuse_id or 'uocr-doc'}-w{bi}-{uuid.uuid4().hex[:8]}"
-            sub_rid = sub.rid
-            task = asyncio.ensure_future(self._handle_window(sub, raw_request))
-        if not (prefetch and bi + 1 < len(plan)):
-            return task, None
-        next_window = self._prefetch_window(
-            request,
-            raw_request,
-            plan=plan,
-            bi=bi + 1,
-            remaining=remaining_tokens,
-            doc_reuse_id=doc_reuse_id,
-            after=sub_rid,
-        )
-        open_prefetch.append(next_window)
-        return task, next_window
 
     def _prefetch_window(
         self, request, raw_request, *, plan, bi, remaining, doc_reuse_id, after

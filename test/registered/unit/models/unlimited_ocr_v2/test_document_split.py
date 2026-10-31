@@ -19,7 +19,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.models.unlimited_ocr_v2_support import chat as serving_chat_doc_split
 from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
-from sglang.srt.models.unlimited_ocr_v2_support.document_plan import DocumentPlanState
 from sglang.srt.models.unlimited_ocr_v2_support.retained_window import (
     RetainedWindow,
 )
@@ -544,10 +543,10 @@ class TestWindowLookahead(CustomTestCase):
         self.assertIsNone(sub.custom_params.get("page_stop_only"))
 
 
-class TestDocumentPlanState(CustomTestCase):
+class TestDocumentPlan(CustomTestCase):
     def test_plan_must_have_configured_overlap(self):
         with self.assertRaises(ValueError):
-            DocumentPlanState.from_plan(
+            doc_split.validate_plan(
                 page_count=8,
                 overlap_pages=1,
                 plan=((0, 4, 0), (2, 6, 4), (4, 8, 6)),
@@ -835,7 +834,9 @@ class TestSplitDocumentAssembly(CustomTestCase):
                     await asyncio.gather(task, return_exceptions=True)
             self.assertEqual(len(successor_tasks), 1)
             rid, successor = successor_tasks[0]
-            await asyncio.gather(successor, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(successor, return_exceptions=True), timeout=5
+            )
             self.assertTrue(successor.cancelled())
             self.assertEqual(aborted, [rid])
             if mode == "cancel":
