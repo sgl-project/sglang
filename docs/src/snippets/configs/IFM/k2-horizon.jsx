@@ -11,7 +11,8 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200"],
+  supportedHardware: ["h200", "arc_b"],
+  hardware: [{ id: "arc_b", label: "BMG", vram: "", vendor: "intel" }],
   runModes: ["python"],
 
   variants: [
@@ -208,6 +209,19 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
+    {
+      match: { hw: "arc_b", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device xpu",
+        "--attention-backend intel_xpu",
+        "--dtype bfloat16",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "h200", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,

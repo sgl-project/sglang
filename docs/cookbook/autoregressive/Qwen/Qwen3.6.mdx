@@ -98,7 +98,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities, including Ascend NPU (Atlas 800I A3) scenarios.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities, including Intel Arc Pro B-Series GPUs (codename: BMG (Battlemage)) and Ascend NPU (Atlas 800I A3) scenarios.
 
 
 <Qwen36Deployment />
@@ -134,6 +134,7 @@ environment.
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
 - **Ascend NPU (Atlas 800I A3):** Each card has 2 dies, so `--tp-size` is twice the card count (1 card → `--tp-size 2`). Add `--attention-backend ascend --device npu` and `--mamba-ssm-dtype bfloat16`, run speculative decoding with the built-in MTP weights via `--speculative-algorithm NEXTN`. See [Deploying on Ascend NPUs](#ascend-npu-deployment) below.
 - Hardware requirements for the GPU recipes:
+  - **Intel Arc Pro B-Series GPUs (BMG)**: Both BF16 variants use TP=4 and `--mem-fraction-static 0.8`.
     - **35B-A3B BF16**: ~70GB for weights. TP=1 fits on all supported hardware.
     - **35B-A3B FP8**: ~35GB for weights. TP=1 fits on all supported hardware.
     - **35B-A3B NVFP4**: ~23GB for weights. TP=1 fits on B200/B300 and RTX Spark.
