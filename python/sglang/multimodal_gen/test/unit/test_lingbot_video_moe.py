@@ -7,6 +7,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.diffusion.sites.gated_residual_site import (
+    LINGBOT_VIDEO_GATED_RESIDUAL,
+)
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEArchConfig,
 )
@@ -29,6 +32,8 @@ from sglang.multimodal_gen.runtime.models.dits import (
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
+    LingBotVideoBlock,
+    LingBotVideoRMSNorm,
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
     make_joint_position_ids,
@@ -205,6 +210,36 @@ def test_attention_single_sample_matches_direct_attention(monkeypatch):
 
     qkv = x.unflatten(2, (num_heads, head_dim))
     expected = _sdpa(qkv, qkv, qkv).flatten(2)
+    torch.testing.assert_close(out, expected)
+
+
+class _LinearAttn(torch.nn.Linear):
+    to_q = property(lambda self: self)
+
+    def forward(self, x, *args, **kwargs):
+        return super().forward(x)
+
+
+def test_block_per_sample_modulation_matches_per_token():
+    batch, seq_len, hidden = 2, 5, 16
+    torch.manual_seed(0)
+    block = object.__new__(LingBotVideoBlock)
+    torch.nn.Module.__init__(block)
+    block.scale_shift_table = torch.nn.Parameter(torch.randn(1, 6 * hidden))
+    for name in ("norm1", "norm_post_attn", "norm2", "norm_post_ffn"):
+        setattr(block, name, LingBotVideoRMSNorm(hidden))
+    block.attn = _LinearAttn(hidden, hidden)
+    block.ffn = torch.nn.Linear(hidden, hidden)
+    x = torch.randn(batch, seq_len, hidden)
+    temb6 = torch.randn(batch, 6 * hidden)
+
+    out = block(x, temb6, None)
+    # The enabled gated site expands modulation to per-token (B, S, 6D) views;
+    # on CPU the fused kernels decline, so this is the per-token reference.
+    setattr(block, LINGBOT_VIDEO_GATED_RESIDUAL.enabled_attr, True)
+    expected = block(x, temb6, None)
+
+    assert out.shape == x.shape
     torch.testing.assert_close(out, expected)
 
 
