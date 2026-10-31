@@ -141,6 +141,10 @@ class BaseCudaGraphRunner(BaseRunner):
     buffers: ForwardInputBuffers
     backend: BaseCudaGraphBackend
 
+    def __init__(self, model_runner: ModelRunner) -> None:
+        super().__init__(model_runner)
+        self.compile_bs: Sequence[int] = ()
+
     def cuda_graph_output_rows(self, output: Any) -> Optional[int]:
         """Rows of graph output that must be preserved for post-replay work.
 

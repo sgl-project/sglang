@@ -54,7 +54,7 @@ class _FakeGraphCtx:
         return False
 
 
-def _make_backend(runner):
+def _make_backend(runner, *, breakable=False):
     """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
     touch CUDA), wiring just the attributes ``capture_one`` reads."""
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
@@ -71,6 +71,16 @@ def _make_backend(runner):
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
     backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
+    if breakable:
+        fields = backend.__dict__
+        backend = bcg.BreakableCudaGraphBackend.__new__(bcg.BreakableCudaGraphBackend)
+        backend.__dict__.update(fields)
+        backend._shared_output_buffer = None
+        backend._hicache_graph_events = None
+        backend._debug_eager = False
+        backend._capture_inputs = {}
+        runner.cuda_graph_output_capacity_rows = lambda output: None
+        runner.cuda_graph_output_rows = lambda output: None
     return backend
 
 
@@ -84,6 +94,7 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
         num_tokens_per_bs=num_tokens_per_bs,
         capture_forward_mode=SimpleNamespace(name=mode_name),
         enable_profile_cuda_graph=enable_profile,
+        compile_bs=(),
     )
     if profiler is not _UNSET:
         runner._profiler = profiler
@@ -114,33 +125,47 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertIs(backend._outputs[shape_key], sentinel_out)
 
     def test_compiled_shape_finishes_deferred_tuning_before_capture(self):
-        runner = _make_runner(enable_profile=False, profiler=None)
-        runner.compile_bs = [4]
-        backend = _make_backend(runner)
-        calls = 0
+        """Both capture backends must finish deferred tuning outside the graph."""
+        for breakable in (False, True):
+            with self.subTest(breakable=breakable):
+                runner = _make_runner(enable_profile=False, profiler=None)
+                runner.compile_bs = [4]
+                backend = _make_backend(runner, breakable=breakable)
+                calls = 0
 
-        def forward():
-            nonlocal calls
-            calls += 1
-            # The first call compiles; the second tunes and synchronizes.
-            if calls == 2:
-                runner.device_module.synchronize()
-            return torch.ones(4, 2)
+                def forward():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        runner.device_module.synchronize()
+                    return torch.ones(4, 2)
 
-        @contextlib.contextmanager
-        def capture(**kwargs):
-            self.assertEqual(calls, 2)
-            with mock.patch.object(
-                runner.device_module,
-                "synchronize",
-                side_effect=AssertionError("autotuning during capture"),
-            ):
-                yield
+                @contextlib.contextmanager
+                def capture(**kwargs):
+                    self.assertEqual(calls, 2)
+                    with mock.patch.object(
+                        runner.device_module,
+                        "synchronize",
+                        side_effect=AssertionError("autotuning during capture"),
+                    ):
+                        yield
 
-        runner.device_module.graph.side_effect = capture
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
-            backend.capture_one(ShapeKey(size=4), forward)
-        self.assertEqual(calls, 3)
+                runner.device_module.graph.side_effect = capture
+                with (
+                    mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+                    mock.patch.object(bcg, "BreakableCUDAGraph", return_value="GRAPH"),
+                    mock.patch.object(
+                        bcg, "BreakableCUDAGraphCapture", side_effect=capture
+                    ),
+                    mock.patch.object(
+                        bcg.BreakableCudaGraphBackend,
+                        "deduped_cuda_graph",
+                        new_callable=mock.PropertyMock,
+                        return_value=False,
+                    ),
+                ):
+                    backend.capture_one(ShapeKey(size=4), forward)
+                self.assertEqual(calls, 3)
 
     def test_prefill_shapes_share_one_output_storage(self):
         runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
@@ -286,19 +311,7 @@ class TestPrecarveWarmup(CustomTestCase):
         for breakable in (False, True):
             with self.subTest(breakable=breakable):
                 runner = _make_runner(enable_profile=False, profiler=None)
-                backend = _make_backend(runner)
-                if breakable:
-                    fields = backend.__dict__
-                    backend = bcg.BreakableCudaGraphBackend.__new__(
-                        bcg.BreakableCudaGraphBackend
-                    )
-                    backend.__dict__.update(fields)
-                    backend._shared_output_buffer = None
-                    backend._hicache_graph_events = None
-                    backend._debug_eager = False
-                    backend._capture_inputs = {}
-                    runner.cuda_graph_output_capacity_rows = lambda output: None
-                    runner.cuda_graph_output_rows = lambda output: None
+                backend = _make_backend(runner, breakable=breakable)
                 backend._precarve = GraphPoolPrecarve()
                 persistent = 0
 

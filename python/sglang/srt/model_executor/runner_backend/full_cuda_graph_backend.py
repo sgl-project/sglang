@@ -165,7 +165,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             2
             if profiler is not None
             or envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
-            or shape_key.size in getattr(runner, "compile_bs", ())
+            or shape_key.size in runner.compile_bs
             else 1
         )
         for _ in range(warmups):
