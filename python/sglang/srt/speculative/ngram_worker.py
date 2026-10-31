@@ -15,6 +15,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    refresh_shared_read_done_event,
+)
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import (
     get_device,
@@ -520,6 +523,12 @@ class NGRAMWorker(BaseSpecWorker):
                     predict,
                     accept_index=accept_index,
                 )
+
+            # Post-verify kernels (e.g., move_accept_tokens_to_target_kvcache)
+            # read req_to_token after the target verify CUDA graph replay.
+            # Refresh shared_read_done_event so the overlap scheduler WAR
+            # barrier waits for those reads before releasing/overwriting slots.
+            refresh_shared_read_done_event(self.model_runner)
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
