@@ -10,12 +10,13 @@ from sglang.kernels.ops.gemm.hc_seam import (
     hc_gated_combine,
     hc_seam,
 )
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
-    torch.version.hip is None, reason="the HC seam is enabled on ROCm only"
+    not is_gfx95_supported(), reason="the HC seam runs on gfx950 only"
 )
 
 EPS = 1e-6

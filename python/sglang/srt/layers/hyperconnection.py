@@ -15,7 +15,7 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,8 @@ def _hc_gate_stream(device: int) -> torch.cuda.Stream:
 
 
 # Fused HC seam (sglang/kernels/ops/gemm/hc_seam.py) for batches of
-# MIN_ROWS..MAX_ROWS rows; off by default.
-_HC_SEAM = is_hip() and envs.SGLANG_ENABLE_QWEN4_HC_SEAM.get()
+# MIN_ROWS..MAX_ROWS rows; off by default, gfx950 only (where it is validated).
+_HC_SEAM = is_hip() and envs.SGLANG_ENABLE_QWEN4_HC_SEAM.get() and is_gfx95_supported()
 _HC_SEAM_MIN_ROWS = envs.SGLANG_QWEN4_HC_SEAM_MIN_ROWS.get()
 _HC_SEAM_MAX_ROWS = envs.SGLANG_QWEN4_HC_SEAM_MAX_ROWS.get()
 if _HC_SEAM:
