@@ -116,6 +116,7 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.relaunched_in_flight = False
         self.multimodal_inputs = None
         self._session_mm_items = []
 
@@ -285,6 +286,95 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
         if component == ComponentType.SWA
         else [list(range(32, 64))]
     )
+
+
+def _speculative_turn(committed, finished_len, overshoot, holds_mamba):
+    """A streaming turn after a speculative verify: origin 26 tokens, the
+    accepted run committed ``committed`` and emitted ``overshoot`` tokens past
+    the visible ``finished_len``; the verify reserved KV up to 44."""
+    tree_cache = _single_row_cache()
+    req = _FakeReq("session-a", req_pool_idx=0, committed=committed, allocated=44)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(finished_len + overshoot))
+    req.finished_len = finished_len
+    req.lock = object()
+    if holds_mamba:
+        req.kv.mamba_pool_idx = torch.tensor([3])
+    finished = []
+    req.session.finish_req = finished.append
+    tree_cache.maybe_hand_to_session(req)
+    req.finished_reason = FINISH_LENGTH(length=finished_len)
+    return tree_cache, req, finished
+
+
+@pytest.mark.parametrize("holds_mamba", [False, True])
+def test_turn_ending_on_a_bonus_token_keeps_only_computed_kv(holds_mamba):
+    """No forward computed the last (bonus) token, so the slot keeps the req
+    clock (37), not origin + finished_len (38); the next turn prefills it."""
+    tree_cache, req, finished = _speculative_turn(37, 12, 0, holds_mamba)
+    record = req.kv
+
+    assert tree_cache.session.try_cache_finished_req(req)
+
+    slot = tree_cache.session.slots["session-a"]
+    assert slot.kv is record
+    assert slot.kv.kv_committed_len == 37
+    assert slot.kv.kv_allocated_len == 37
+    assert [t.tolist() for t in tree_cache.token_to_kv_pool_allocator.freed] == [
+        list(range(37, 44))
+    ]
+    assert finished == [req]
+
+
+def test_recurrent_state_at_the_visible_output_is_kept():
+    """One token of overshoot: the state absorbed exactly the visible output."""
+    tree_cache, req, _ = _speculative_turn(38, 12, 1, holds_mamba=True)
+
+    assert tree_cache.session.try_cache_finished_req(req)
+
+    assert tree_cache.session.slots["session-a"].kv.kv_committed_len == 38
+    assert len(req.output_ids) == 12
+
+
+def test_recurrent_state_past_the_visible_output_releases_the_record():
+    """The state absorbed a token past the visible output and cannot be
+    rewound: the slot hands the record and its tree lock back for release,
+    while the turn stays in the session history."""
+    tree_cache, req, finished = _speculative_turn(40, 12, 3, holds_mamba=True)
+    record, lock = req.kv, tree_cache.session.slots["session-a"].lock
+    assert lock is not None
+
+    assert not tree_cache.session.try_cache_finished_req(req)
+
+    assert "session-a" not in tree_cache.session.slots
+    assert req.kv is record and record.kv_committed_len == 40
+    assert req.lock is lock
+    assert len(req.output_ids) == 12
+    assert finished == [req]
+    assert tree_cache.token_to_kv_pool_allocator.freed == []
+
+
+@pytest.mark.parametrize("holds_mamba", [False, True])
+def test_turn_relaunched_in_flight_releases_recurrent_state(holds_mamba):
+    """A launched batch already reruns the finished turn and will advance its
+    recurrent state, so a recurrent record is released; KV alone is kept."""
+    tree_cache, req, finished = _speculative_turn(38, 12, 0, holds_mamba)
+    req.relaunched_in_flight = True
+
+    kept = tree_cache.session.try_cache_finished_req(req)
+
+    assert kept is not holds_mamba
+    assert ("session-a" in tree_cache.session.slots) is not holds_mamba
+    assert finished == [req]
+
+
+def test_kv_only_overshoot_is_still_trimmed_and_kept():
+    """Without recurrent state the overshoot KV is trimmed as before."""
+    tree_cache, req, _ = _speculative_turn(40, 12, 3, holds_mamba=False)
+
+    assert tree_cache.session.try_cache_finished_req(req)
+
+    assert tree_cache.session.slots["session-a"].kv.kv_committed_len == 38
 
 
 if __name__ == "__main__":

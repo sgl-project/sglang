@@ -2097,9 +2097,15 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
+        # A streaming session keeps a finished turn's recurrent state, which a
+        # rerun of the turn would advance past the kept tokens.
+        mark_relaunches = get_serving().enable_streaming_session and self.is_hybrid_ssm
+
+        def pop_and_process(planned_batch: Optional[ScheduleBatch] = None):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if mark_relaunches:
+                self._mark_relaunched_in_flight(tmp_batch, planned_batch)
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
@@ -2127,7 +2133,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                pop_and_process(batch)
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -2165,6 +2171,17 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _mark_relaunched_in_flight(
+        self, batch: ScheduleBatch, planned_batch: Optional[ScheduleBatch]
+    ) -> None:
+        """Mark the requests of ``batch`` that a launched or planned batch runs
+        again before ``batch``'s result is processed."""
+        rerun = {req for queued, _ in self.result_queue for req in queued.reqs}
+        if planned_batch is not None:
+            rerun.update(planned_batch.reqs)
+        for req in batch.reqs:
+            req.relaunched_in_flight = req in rerun
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]

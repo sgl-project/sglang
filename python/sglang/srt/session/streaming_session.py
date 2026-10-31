@@ -177,14 +177,25 @@ class StreamingSession:
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
-        target = len(req.origin_input_ids) + finished_len
-        self._trim_overshoot(req, finished_len)
+        if req.kv.holds_mamba and (
+            req.kv.kv_committed_len > len(req.origin_input_ids) + finished_len
+            or req.relaunched_in_flight
+        ):
+            # Recurrent state cannot be rewound, and it went past the visible
+            # output (an accepted run) or will (a launched rerun of the turn).
+            # Release the record like an aborted turn's, but keep the turn: the
+            # next one re-prefills from the cache.
+            del self.slots[req.session.session_id]
+            req.lock, slot.lock = slot.lock, None
+            req.output_ids = req.output_ids[:finished_len]
+            req.session.finish_req(req)
+            return False
+        target = self._trim_overshoot(req, finished_len)
 
         req.detach_kv()
         req.swa_branching_seqlen = None
         slot.publishes_prompt = False
-        # Use the finished length, not the req clock (it lags an in-flight verify
-        # by ~1 under overlap); clamp so committed <= allocated.
+        # Clamp so committed <= allocated.
         slot.kv.commit_finished(target)
 
         # Update req_nodes to this successfully finished request.
@@ -279,10 +290,15 @@ class StreamingSession:
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
         kv.truncate(prefix_len)
 
-    def _trim_overshoot(self, req: Req, finished_len: int) -> None:
+    def _trim_overshoot(self, req: Req, finished_len: int) -> int:
         """Spec v2 can commit past max_new_tokens; the next turn's input is
-        output_ids[:finished_len], so release the KV past it."""
-        target = len(req.origin_input_ids) + finished_len
+        output_ids[:finished_len], so release the KV past it. Returns the
+        retained length."""
+        # Keep only what a forward computed: a verify computes no KV or
+        # recurrent state for its bonus token, which the req clock excludes, so
+        # a turn ending on one keeps one token less and the next turn prefills
+        # it. A decode commits at allocation, so this changes nothing there.
+        target = min(len(req.origin_input_ids) + finished_len, req.kv.kv_committed_len)
         if self.cache.page_size > 1 and req.kv.max_evicted_seqlen > target:
             # Same hazard as the match-path rewind: the cursor must stay
             # page-aligned; the partial page is re-prefilled next turn.
@@ -290,6 +306,7 @@ class StreamingSession:
         self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.truncate(target)
         req.output_ids = req.output_ids[:finished_len]
+        return target
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free [ceil_align(target), end): paged free returns whole pages, so
