@@ -2075,7 +2075,9 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 only (see _forward_prepare); V4.1 keeps Q un-normed.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
             )
@@ -2433,7 +2435,12 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 normalizes each query head (weightless rmsnorm) before RoPE;
+            # V4.1 (q_head_norm False) does not -- its only q norm is the q_lora
+            # one above, matching the reference model's prepare_query. The
+            # ds41-dev port has this line commented out for that reason.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -2635,6 +2642,10 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            # DeepSeek-V4.1 runs the compressor + indexer as one ordered call
+            # (see LowRatioCompressAscendBackendMixin.forward_low_ratio_sources),
+            # which the NPU multi-stream split does not model.
+            and not self.is_dsv41
         )
 
         low_ratio_multi_stream = (
@@ -4583,12 +4594,18 @@ class DeepseekV4Model(nn.Module):
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import mhc_combine
+            if _is_npu:
+                # TODO check if npu can use cuda triton kernel
+                # mhc_combine's Triton kernel is CUDA-only; the premix collapse
+                # is a plain weighted sum, so the NPU path runs it directly.
+                hidden_states = mhc.combine_premix(hidden_states, last_pre)
+            else:
+                from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            # The kernel widens each element to fp32 as it loads it.
-            hidden_states = mhc_combine(
-                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
-            )
+                # The kernel widens each element to fp32 as it loads it.
+                hidden_states = mhc_combine(
+                    pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
+                )
         else:
             hidden_states = self.hc_head(
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base

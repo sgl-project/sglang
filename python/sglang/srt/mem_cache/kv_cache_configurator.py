@@ -2624,7 +2624,14 @@ class KVCacheConfigurator:
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
-                    if is_dsv4_model:
+                    # DeepSeek-V4.1 (compress_ratios 1/2) is excluded: its
+                    # compressed slots are the pure function full_loc // ratio and
+                    # the compressed pools are sized/paged to match, so it needs
+                    # neither a c128 sidecar allocator nor the DSV4OutCacheLoc
+                    # bundle the generic SWA allocator never produces.
+                    ratios = getattr(self.model_config, "compress_ratios", None) or ()
+                    has_low_ratio = any(ratio in (1, 2) for ratio in ratios)
+                    if is_dsv4_model and not has_low_ratio:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,
                         )

@@ -93,6 +93,99 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         )
 
 
+# DeepSeek-V4.1 low-ratio row formats, written by
+# ``torch.ops.custom.kv_compress_epilog_v2``. Unlike the V4 layout (which keeps
+# the RoPE tail in bf16: 448 fp8 nope + 64*2 bf16 rope + 7 scales = 584), the
+# V4.1 operator quantizes *all* ``head_dim`` values, so there is no bf16 tail.
+# Layout (see ops/ascendc/docs/custom-npu_kv_compress_epilog_v2.md):
+#   dataCol   = head_dim            (mxfp8)  |  head_dim // 2 (packed mxfp4)
+#   G         = ceil(head_dim / quant_group_size), scales are G * bf16
+#   row bytes = ceil((dataCol + 2G) / 32) * 32
+#
+# The format follows the *role* of the pool, not the layer's compress ratio --
+# the ds41 attention op takes the two sides as separate arguments with fixed
+# encodings (experimental/attention/mixed_quant_sparse_flash_mla_dsl/README.md
+# L184-L192, "ori 每连续 32 个元素共享一个 BF16 scale ... cmp 每连续 16 个元素"):
+#   window / ori_kv    -> mxfp8_bf16 group 32 : 512 + 16*2 = 544  (float8_e4m3fn)
+#   compressed / cmp_kv -> mxfp4_bf16 group 16 : 256 + 32*2 = 320  (uint8, packed fp4)
+# cann-recipes-infer agrees: ``common_modules.get_kv_cache_dim(head_dim, *)``
+# gives 544 for the window cache and 320 for the compressed one, for every ratio,
+# and ``Compressor.update_compress_cache`` always quantizes with mxfp4 g16.
+_DSV41_LOW_RATIOS: tuple = (1, 2)
+_DSV41_ORI_KV_QUANT: tuple = ("mxfp8_bf16", 32)
+_DSV41_CMP_KV_QUANT: tuple = ("mxfp4_bf16", 16)
+_DSV41_ROW_ALIGNMENT = 32
+
+
+def dsv41_quant(compressed: bool) -> tuple:
+    """``(quant_mode, quant_group_size)`` of a V4.1 pool row."""
+    return _DSV41_CMP_KV_QUANT if compressed else _DSV41_ORI_KV_QUANT
+
+
+def dsv41_row_layout(head_dim: int, *, compressed: bool):
+    """Row width in bytes and store dtype of a V4.1 KV pool.
+
+    ``compressed`` selects the side of the attention: False is the window /
+    ``ori_kv`` row (FP8 E4M3 group 32), True the compressed / ``cmp_kv`` row
+    (FP4 E2M1 group 16). It is a property of the pool, not of the layer's
+    compress ratio -- a ratio-1 aggregate is still read as ``cmp_kv``.
+    """
+    assert head_dim > 0, head_dim
+    _, group = dsv41_quant(compressed)
+    scale_bytes = 2 * math.ceil(head_dim / group)
+    data_bytes = head_dim // 2 if compressed else head_dim
+    row_bytes = (
+        math.ceil((data_bytes + scale_bytes) / _DSV41_ROW_ALIGNMENT)
+        * _DSV41_ROW_ALIGNMENT
+    )
+    # Compack two fp4_e2m1 as uint8
+    dtype = torch.uint8 if compressed else torch.float8_e4m3fn
+    return row_bytes, dtype
+
+
+class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
+    """NPU DeepSeek-V4.1 KV pool.
+
+    Rows are fully quantized by ``kv_compress_epilog_v2`` (all ``head_dim``
+    values, no bf16 RoPE tail), so the row width and store dtype come from
+    :func:`dsv41_row_layout` instead of
+    :attr:`NPUDeepSeekV4SingleKVPool.a5_packed_kv_dim` (the V4 584-byte row).
+
+    ``is_compressed`` picks the side: the model-wide window/main pool
+    (``False``, FP8 E4M3 group 32, 544 B, ``page_size == global_page_size``) or
+    one ratio's compressed pool (``True``, FP4 E2M1 group 16, 320 B, whose
+    physical page holds ``page_size // ratio`` rows so its page id lines up with
+    the full page id). The ratio-1 compressed pool keeps the global page size
+    like the window pool but must still take the compressed row format.
+    """
+
+    def __init__(self, *args, is_compressed: bool, kernel_page_size: int, **kwargs):
+        # Set before super().__init__ — it calls _create_buffers() ->
+        # create_buffer(), which reads self.is_compressed below.
+        self.is_compressed = is_compressed
+        super().__init__(*args, kernel_page_size=kernel_page_size, **kwargs)
+
+    @property
+    def dsv41_row_bytes(self) -> int:
+        return self.kv_cache_total_dim
+
+    def create_buffer(self, *, num_pages: int):
+        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        kv_dim, kv_dtype = dsv41_row_layout(head_dim, compressed=self.is_compressed)
+        self.kv_cache_total_dim = kv_dim
+        # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
+        self.bytes_per_page_padded = self.kernel_page_size * kv_dim * kv_dtype.itemsize
+        npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
+        return torch.zeros(
+            npu_num_pages,
+            self.kernel_page_size,
+            1,
+            kv_dim,
+            dtype=kv_dtype,
+            device=self.device,
+        )
+
+
 class NPUCompressStatePool(CompressStatePool):
     """Thin Atlas adapter over the shared GPU-style ring state pool.
 
@@ -193,17 +286,19 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         super()._create_buffer()
         kp = self._kernel_page_size
         npu_num_pages = (self.size + kp + 1) // kp
-        if is_npu_arch35():
-            index_k_dtype, index_scale_dtype = torch.float8_e4m3fn, torch.float32
-        else:
-            index_k_dtype, index_scale_dtype = torch.int8, torch.float16
+        (
+            k_dim,
+            scale_dim,
+            index_k_dtype,
+            index_scale_dtype,
+        ) = self._npu_index_row_dims()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.index_k_buffer = [
                 torch.zeros(
                     npu_num_pages,
                     kp,
                     1,
-                    self.index_head_dim,
+                    k_dim,
                     dtype=index_k_dtype,
                     device=self.device,
                 )
@@ -214,12 +309,24 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                     npu_num_pages,
                     kp,
                     1,
-                    1,
+                    scale_dim,
                     dtype=index_scale_dtype,
                     device=self.device,
                 )
                 for _ in range(self.layer_num)
             ]
+
+    def _npu_index_row_dims(self) -> Tuple[int, int, torch.dtype, torch.dtype]:
+        """Last-dim sizes and dtypes of the NPU index K / scale PA_ND buffers.
+
+        The c4 (fp8) pool stores ``index_head_dim`` fp8 values plus a single
+        fp32 scale per token. The V4.1 low-ratio pools override this to store
+        packed fp4 with one uint8 scale per 32 values (see
+        :class:`DSV41NPUIndexerPool`).
+        """
+        if is_npu_arch35():
+            return self.index_head_dim, 1, torch.float8_e4m3fn, torch.float32
+        return self.index_head_dim, 1, torch.int8, torch.float16
 
     @property
     def has_npu_storage(self) -> bool:
@@ -253,6 +360,43 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 loc_long,
                 index_k_scale.to(index_scale_cache.dtype).view(-1, 1, 1),
             )
+
+
+# ``indexer_prologue_k`` rounds to packed fp4 with one e4m3 scale per 32 values.
+_DSV41_INDEX_SCALE_GROUP = 32
+
+
+class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
+    """NPU DeepSeek-V4.1 low-ratio indexer K pool (packed fp4).
+
+    ``indexer_prologue_k`` consumes two separate PA_ND buffers
+    (ops-transformer/experimental/attention/indexer_prologue_k_dsl/README.md)::
+
+        k_cache        uint8 [pages, page_size // ratio, 1, index_head_dim // 2]
+        k_scale_cache  uint8 [pages, page_size // ratio, 1, index_head_dim // 32]
+
+    i.e. 64 + 4 = 68 bytes per token at ``index_head_dim == 128``, matching the
+    base ``get_dsv4_indexer_bytes_per_token(..., use_fp4_indexer=True)``. The
+    inherited fp8-shaped buffers are replaced through
+    :meth:`_npu_index_row_dims`.
+
+    K is written by the operator itself (its ``cache_index`` is an INT64 loc
+    whose ``-1`` entries are skipped), so the inherited torch scatter
+    :meth:`set_index_k_scale` is not on this path.
+    """
+
+    def __init__(self, *args, kernel_page_size: int, **kwargs):
+        super().__init__(*args, kernel_page_size=kernel_page_size, **kwargs)
+
+    def _npu_index_row_dims(self) -> Tuple[int, int, torch.dtype, torch.dtype]:
+        head_dim = self.index_head_dim
+        assert head_dim > 0 and head_dim % _DSV41_INDEX_SCALE_GROUP == 0, head_dim
+        return (
+            head_dim // 2,
+            head_dim // _DSV41_INDEX_SCALE_GROUP,
+            torch.uint8,
+            torch.uint8,
+        )
 
 
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
@@ -291,6 +435,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
         kv_layout: KVLayout = KVLayout.V4,
+        compressed: bool = False,
     ) -> NPUDeepSeekV4SingleKVPool:
         # NPU does not use the HiSparse c4 device pool; fail loud if someone
         # enables it so the silent layout mismatch surfaces at init.
@@ -298,18 +443,51 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "enable_hisparse is not supported on the NPU DSV4 KV pool "
             f"(got c4 pool class {cls.__name__})."
         )
-        # The V4.1 fp8 / fp4 page layouts are CUDA FlashMLA formats.
+        # The V4.1 fp8 / fp4 page layouts are CUDA FlashMLA formats. NPU keeps
+        # KVLayout.V4 for both generations (select_dsv4_kv_layout returns V4
+        # when there is no SM100 GPU) and distinguishes them by the compression
+        # ratios instead of the layout value.
         assert kv_layout is KVLayout.V4, f"NPU pools do not support {kv_layout}"
         # Full/SWA use the global page size, C4 uses its native compressed page,
-        # and C128 has an independent physical page size.
-        is_c4_pool = page_size * 4 == global_page_size
-        is_c128_pool = page_size * 128 == global_page_size
-        if is_c4_pool:
+        # and C128 has an independent physical page size. The V4.1 low ratios
+        # follow the shared ``page = page_size // ratio`` rule, so a V4.1
+        # model's window/main pool and its ratio-1 compressed pool both arrive
+        # with page_size == global_page_size -- the window pool is told apart by
+        # ``compressed`` (False) rather than by its page geometry, because its
+        # row format is FP8 while every compressed pool is FP4.
+        ratio = global_page_size // page_size if page_size else 0
+        is_v41 = any(r in _DSV41_LOW_RATIOS for r in self.compression_ratios)
+        is_dsv41_pool = None
+        if is_v41:
+            if compressed:
+                # Every compressed pool of a V4.1 model is fp4. A ratio-4/128
+                # pool (should a checkpoint carry one) keeps the packed fp8 V4
+                # row, so the flag only applies to the low ratios.
+                if ratio in _DSV41_LOW_RATIOS:
+                    is_dsv41_pool = True
+            elif ratio == 1:
+                is_dsv41_pool = False
+        if is_dsv41_pool is not None:
             kernel_page_size = page_size
-        elif is_c128_pool:
+        elif page_size * 4 == global_page_size:
+            kernel_page_size = page_size
+        elif page_size * 128 == global_page_size:
             kernel_page_size = self.c128_page_size
         else:
             kernel_page_size = global_page_size
+        if is_dsv41_pool is not None:
+            return DSV41NPUSingleKVPool(
+                size,
+                page_size,
+                dtype,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                layer_num,
+                device,
+                enable_memory_saver,
+                is_compressed=is_dsv41_pool,
+                kernel_page_size=kernel_page_size,
+            )
         return NPUDeepSeekV4SingleKVPool(
             size,
             page_size,
@@ -360,6 +538,33 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             swa_page_size=self.swa_page_size,
         )
 
+    def _make_pair_state_pool(self, enable_memory_saver: bool) -> CompressStatePool:
+        """Ratio-2 pending-pair state exposed as a physical
+        ``[block_num, ring_size, 2*D]`` bank.
+
+        The community factory allocates the same ring buffer but leaves the flat
+        ``page_size=1`` default, on which :attr:`CompressStatePool.state_cache_3d`
+        raises — and that view is exactly the ``state_cache`` the fused
+        ``ds41.compressor`` gets on A5 (cache_mode=2 CYCLE addresses one request
+        bank per ``state_block_table`` row). Only the second-axis page size is
+        turned on here; sizing, ring ownership and the PD transfer indices stay
+        in :class:`CompressStatePool`, so the ratio-2 ABI is unchanged.
+        """
+        ring_size = self.get_ring_size(2)
+        return CompressStatePool(
+            size=self.num_req_slots * ring_size,
+            ring_size=ring_size,
+            overlap=False,
+            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+            dtype=torch.float32,
+            device=self.device,
+            enable_memory_saver=enable_memory_saver,
+            ratio=2,
+            request_scoped=True,
+            online=False,
+            state_cache_page_size=ring_size,
+        )
+
     def _make_indexer_pool(
         self,
         size: int,
@@ -369,8 +574,39 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        force_fp4: bool = False,
         global_page_size: Optional[int] = None,
+        index_k_page8: bool = False,
     ) -> NPUDeepSeekV4IndexerPool:
+        assert not index_k_page8, (
+            "index_k_page8 is a CUDA/AITER fp4 layout; the NPU pool expresses "
+            "the same packing through indexer_prologue_k's combined_block_size."
+        )
+        is_v41 = any(ratio in _DSV41_LOW_RATIOS for ratio in self.compression_ratios)
+        if force_fp4:
+            assert is_v41, (
+                "force_fp4 indexer pools on NPU are the DeepSeek-V4.1 low-ratio "
+                f"pools, but compression_ratios={list(self.compression_ratios)}"
+            )
+            # Ratios 1 and 2 share the same packed-fp4 row shape and are told
+            # apart only by `size` (see _init_compressed_pools), so the pool
+            # needs no ratio-derived state.
+            pool = DSV41NPUIndexerPool(
+                size,
+                page_size,
+                dtype,
+                index_head_dim,
+                layer_num,
+                device,
+                enable_memory_saver,
+                kernel_page_size=page_size,
+                use_fp4_indexer=True,
+                global_page_size=global_page_size,
+            )
+            # Same fp4 reference-rounding marker the base sets for `force_fp4`
+            # pools; index_k_page8 is CUDA/AITER-only and stays False here.
+            pool.index_k_rne = True
+            return pool
         # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(
             size,
@@ -385,21 +621,59 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """Main PD buffers addressed by the full KV page id."""
-        if self.c4_kv_pool is None:
-            # A draft pool whose layers are all uncompressed has no c4 buffers.
-            return [], [], []
-        indexer_pool = self._indexer_pool(4)
-        buffers = (
-            self.c4_kv_pool.kv_buffer
-            + indexer_pool.index_k_buffer
-            + indexer_pool.index_scale_buffer
-        )
-        return (
-            [buf.data_ptr() for buf in buffers],
-            [buf.nbytes for buf in buffers],
-            [buf[0].nbytes for buf in buffers],
-        )
+        """Main PD buffers addressed by the full KV page id.
+
+        One item is the whole content of one full page: a C4 / low-ratio
+        compressed pool pages at ``page_size // ratio`` rows, i.e. exactly the
+        rows one full page holds, which is why the two share a page id.  The
+        index pools page at ``DSV41_INDEX_PAGE_SIZE`` instead, so one item is
+        the run of index pages tiling a full page (see R10).
+        """
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+
+        if self.c4_kv_pool is not None:
+            indexer_pool = self._indexer_pool(4)
+            for buf in (
+                self.c4_kv_pool.kv_buffer
+                + indexer_pool.index_k_buffer
+                + indexer_pool.index_scale_buffer
+            ):
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes)
+
+        # DeepSeek-V4.1 has no C4 pool: its main component is the per-ratio
+        # compressed KV followed by that ratio's index K and index scale. Both
+        # PD peers walk ``_DSV41_LOW_RATIOS`` against the same compression
+        # config, so their entries pair up positionally. A pool without such
+        # layers -- a V4 pool, or a draft whose layers are all uncompressed --
+        # contributes nothing here.
+        for ratio in _DSV41_LOW_RATIOS:
+            kv_pool = self.kv_pools.get(ratio)
+            if kv_pool is None:
+                continue
+            for buf in kv_pool.kv_buffer:
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes)
+            indexer_pool = self._indexer_pool(ratio)
+            slots_per_full_page = self.page_size // ratio
+            assert slots_per_full_page % indexer_pool.page_size == 0, (
+                f"ratio-{ratio} index pages of {indexer_pool.page_size} slots do "
+                f"not tile a full page of {slots_per_full_page} slots"
+            )
+            index_pages_per_full_page = slots_per_full_page // indexer_pool.page_size
+            for buf in (
+                *indexer_pool.index_k_buffer,
+                *indexer_pool.index_scale_buffer,
+            ):
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes * index_pages_per_full_page)
+
+        return data_ptrs, data_lens, item_lens
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
@@ -458,6 +732,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_c128_kv_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        if self.c128_kv_pool is None:
+            # DeepSeek-V4.1 has no ratio-128 compression.
+            return [], [], []
         buffers = self.c128_kv_pool.kv_buffer
         return (
             [buf.data_ptr() for buf in buffers],
@@ -515,6 +792,27 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             kv = kv.flatten(0, 1)[loc]
         return kv
 
+    def get_index_k(self, layer_id: int) -> torch.Tensor:
+        """The layer's indexer-K payload buffer (PA_ND, packed fp4/fp8).
+
+        ``DSV41NPUIndexerPool`` keeps K and its scales in two separate buffers
+        per ratio, so they are reached through the layer's *ratio* index pool
+        rather than through the token-to-KV pool itself.
+        """
+        self.wait_layer_transfer(layer_id)
+        item = self.layer_mapping[layer_id]
+        return self._indexer_pool(item.compress_ratio).get_index_k(
+            item.compress_layer_id
+        )
+
+    def get_index_scale(self, layer_id: int) -> torch.Tensor:
+        """The layer's indexer-K scale buffer (one uint8 E8M0 per 32 values)."""
+        self.wait_layer_transfer(layer_id)
+        item = self.layer_mapping[layer_id]
+        return self._indexer_pool(item.compress_ratio).get_index_scale(
+            item.compress_layer_id
+        )
+
     def get_compress_buffer(
         self,
         layer_id: int,
@@ -556,7 +854,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         index_put.
         """
         # Index by PP-stage-local layer_id (see get_swa_buffer).
-        buf = self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+        pool = self.swa_kv_pool
+        buf = pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+        if isinstance(pool, DSV41NPUSingleKVPool):
+            # A V4.1 window row is FP8 E4M3 group 32 (544 B), not the V4 584-byte
+            # A5 row: the ds41 attention op reads ori_kv with all head_dim values
+            # quantized and 16 BF16 scales per 512 (DSL README L184-L189).
+            self._write_dsv41_packed_kv(buf=buf, loc=loc, cache=cache, compressed=False)
+            return
         if is_npu_arch35():
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
@@ -597,6 +902,54 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             quant_mode=2,
             round_scale_flag=True,
             layout=1,
+        )
+
+    def _write_dsv41_packed_kv(
+        self,
+        *,
+        buf: torch.Tensor,
+        loc: torch.Tensor,
+        cache: torch.Tensor,
+        compressed: bool,
+    ) -> None:
+        """Quantize ``cache`` (bf16, last dim ``qk_nope + qk_rope``) into a V4.1
+        pool row at flat token positions ``loc``.
+
+        ``kv_compress_epilog_v2`` quantizes *every* head_dim value (there is no
+        bf16 RoPE tail, unlike the V4 ``_write_a5_packed_kv``), so RoPE must
+        already have been applied by the caller. ``compressed`` selects the side,
+        matching :func:`dsv41_row_layout` and the ds41 attention op's two
+        arguments: window/``ori_kv`` = ``mxfp8_bf16`` group 32 (544 B),
+        compressed/``cmp_kv`` = ``mxfp4_bf16`` group 16 (320 B).
+
+        Reference calls: cann-recipes-infer
+        ``models/deepseek_v4_1/models/modeling_deepseek.py::update_win_kv``
+        (window) and ``modules/compressor.py::update_compress_cache``.
+        """
+        cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if cache.shape[-1] != cache_dim:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 KV cache expects input last dim {cache_dim}, "
+                f"got shape={tuple(cache.shape)}."
+            )
+        cache_2d = cache.reshape(-1, cache_dim).to(torch.bfloat16).contiguous()
+        slot_mapping = loc.reshape(-1).contiguous()
+        if cache_2d.shape[0] != slot_mapping.shape[0]:
+            raise RuntimeError(
+                "DeepSeek-V4.1 KV cache write expects one slot per token, got "
+                f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
+            )
+        if cache_2d.shape[0] == 0:
+            return
+        quant_mode, quant_group_size = dsv41_quant(compressed)
+        torch.ops.custom.kv_compress_epilog_v2(
+            buf.view(-1, buf.shape[-1]),
+            cache_2d,
+            slot_mapping,
+            quant_group_size=quant_group_size,
+            quant_mode=quant_mode,
+            round_scale=True,
+            x_scale=1.0,
         )
 
     def set_swa_key_buffer_radix_fused_norm_rope(
@@ -645,9 +998,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         kv_scale: Optional[torch.Tensor],
         from_indexer: bool,
     ) -> None:
-        # Routes to c4_indexer (from_indexer) / c4_kv (ratio 4) / c128_kv (ratio
-        # 128). NPU bypasses CUDA fused_store_cache with direct bf16 writes.
-        ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        # Routes to the indexer pool (from_indexer) or to the compressed KV pool
+        # of this layer's ratio (4 / 128, plus 1 / 2 for DeepSeek-V4.1). NPU
+        # bypasses CUDA fused_store_cache with direct writes into the PA_ND rows.
+        item = self.layer_mapping[layer_id]
+        ratio = item.compress_ratio
+        compress_layer_id = item.compress_layer_id
         device_type = kv.device.type
         if from_indexer:
             indexer_pool = self._indexer_pool(ratio)
@@ -662,11 +1018,22 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 return
             indexer_pool.set_index_k_scale_buffer(compress_layer_id, loc, kv, kv_scale)
             return
-        compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
+        compress_pool = item.compress_kv_pool
+        assert compress_pool is not None, "Missing compressed KV pool"
         if device_type == "npu":
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
+            if isinstance(compress_pool, DSV41NPUSingleKVPool):
+                # DeepSeek-V4.1 compressed KV: a bf16 latent goes in and a
+                # fully-quantized row comes out, so no separate scale tensor.
+                assert kv_scale is None, (
+                    "the DeepSeek-V4.1 compressed KV is quantized by "
+                    "kv_compress_epilog_v2 from a bf16 latent, not from a "
+                    "separate scale tensor"
+                )
+                self._write_dsv41_packed_kv(buf=buf, loc=loc, cache=kv, compressed=True)
+                return
             if is_npu_arch35():
                 self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
