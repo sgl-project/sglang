@@ -232,9 +232,7 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
-        use_quant_indexer = (
-            pool.dsa_kv_cache_store_fp8 and pool.num_indexer_layers > 0
-        )
+        use_quant_indexer = pool.dsa_kv_cache_store_fp8 and pool.num_indexer_layers > 0
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
@@ -313,8 +311,12 @@ class DSANPUIndexerMixin:
                 past_key_states,
                 weights.contiguous(),
                 query_scale.contiguous(),
-                actual_seq_lengths_q.to(device=k.device, dtype=torch.int32).contiguous(),
-                actual_seq_lengths_kv.to(device=k.device, dtype=torch.int32).contiguous(),
+                actual_seq_lengths_q.to(
+                    device=k.device, dtype=torch.int32
+                ).contiguous(),
+                actual_seq_lengths_kv.to(
+                    device=k.device, dtype=torch.int32
+                ).contiguous(),
                 block_table.to(dtype=torch.int32).contiguous(),
                 self.index_topk,
                 3,
@@ -340,7 +342,6 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
-
 
             topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),

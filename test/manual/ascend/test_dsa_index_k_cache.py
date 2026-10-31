@@ -44,9 +44,7 @@ class TestPackedIndexCache(unittest.TestCase):
         # Repeat with new values to verify overwrite as well as first insertion.
         for _ in range(2):
             x = torch.randn((loc.numel(), 128), dtype=torch.bfloat16).npu()
-            key, scale = torch_npu.npu_dynamic_quant(
-                x, dst_type=torch.float8_e4m3fn
-            )
+            key, scale = torch_npu.npu_dynamic_quant(x, dst_type=torch.float8_e4m3fn)
             scale = scale.to(torch.float32).reshape(-1)
             key_bytes = key.view(torch.uint8).cpu()
             scale_bytes = scale.cpu().view(torch.uint8).reshape(-1, 4)
