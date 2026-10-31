@@ -153,6 +153,26 @@ class RunnerIds:
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
+            plan = None if alloc.storage is None else alloc.storage.plan
+            drafts = (
+                set()
+                if plan is None or plan.fused_draft is None
+                else set(plan.fused_draft.new_bands)
+            )
+            windows = (
+                set()
+                if not is_unified_target or plan is None
+                else {s.name for s in plan.windows()} - drafts
+            )
+            if len(windows) > 1:
+                # Attention backends bind one window's write and read ids per
+                # runner; layers of another window would take that window's.
+                raise NotImplementedError(
+                    f"this runner's layers attend through window sub-pools "
+                    f"{sorted(windows)}; attention backends read one window per "
+                    "runner, so layers with windows of different lengths are "
+                    "not supported yet"
+                )
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
