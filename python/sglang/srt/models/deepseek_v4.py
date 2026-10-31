@@ -1992,6 +1992,10 @@ class MQALayer(MqaAttentionBase):
         q = self._compute_q_b(q_for_wqb, positions, q_out)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
+            # TP-row-sharded index scoring all-gathers on stream_sources. Until
+            # its join below, neither the main nor KV stream may issue an
+            # attention-TP collective: all ranks must keep the same communicator
+            # ordering, even though the indexer overlaps local Q/KV work.
             with torch.cuda.stream(stream_sources):
                 attn_backend.forward_low_ratio_sources(
                     layer=self,

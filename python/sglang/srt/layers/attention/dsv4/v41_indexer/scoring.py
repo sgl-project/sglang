@@ -75,6 +75,27 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     def num_rows(self) -> int:
         return self.q_fp4.shape[0]
 
+    def narrow(self, rows: slice) -> DeepGEMMPrefillData:
+        """A contiguous query-row view, retaining the global flattened-K layout
+        and score width. Projection stays replicated so its GEMM shape is unchanged."""
+        start, stop, step = rows.indices(self.num_rows)
+        if step != 1:
+            raise ValueError("prefill index data requires contiguous query rows")
+        request_offsets = itertools.accumulate(self.rows_per_request, initial=0)
+        local_counts = [
+            max(0, min(offset + count, stop) - max(offset, start))
+            for offset, count in zip(request_offsets, self.rows_per_request)
+        ]
+        return msgspec.structs.replace(
+            self,
+            request_starts=self.request_starts[rows],
+            rows_per_request=local_counts,
+            compress_lens=self.compress_lens[rows],
+            q_fp4=self.q_fp4[rows],
+            q_sf=self.q_sf[rows],
+            weights=self.weights[rows],
+        )
+
     def empty_selection(self, topk: int) -> torch.Tensor:
         return self.request_starts.new_full(
             (self.num_rows, topk), -1, dtype=torch.int32
@@ -270,17 +291,14 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
 def score_tiles(
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
-    *,
-    rows: Optional[slice] = None,
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
-    """Tiles of ``rows`` (all by default); a tile slice is relative to ``rows``."""
-    rows = slice(0, data.num_rows) if rows is None else rows
+    """Score tiles whose row slices are relative to this data's query-row view."""
     yield from flat_index_logits_tiles(
-        q=(data.q_fp4[rows], data.q_sf[rows]),
+        q=(data.q_fp4, data.q_sf),
         kv=kv,
-        weights=data.weights[rows],
-        starts=data.request_starts[rows],
-        lengths=data.compress_lens[rows],
+        weights=data.weights,
+        starts=data.request_starts,
+        lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
         budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
     )
@@ -317,15 +335,13 @@ def dense_prefill_topk(
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
     out: torch.Tensor,
-    rows: Optional[slice] = None,
 ) -> None:
-    """Request-local compressed positions of ``rows`` (all by default) into
+    """Request-local compressed positions of the data's query rows into
     ``out``, one ``out`` row per scored row, ``-1`` padded, unordered."""
-    rows = slice(0, data.num_rows) if rows is None else rows
-    lens = data.compress_lens[rows]
+    lens = data.compress_lens
     # Score columns are request-relative, so a zero offset emits request-local positions.
     zero_offsets = torch.zeros_like(lens)
-    for tile, logits in score_tiles(data, kv, rows=rows):
+    for tile, logits in score_tiles(data, kv):
         topk_ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])
         # Free this tile's logits before the generator scores the next one.
         del logits
@@ -342,7 +358,7 @@ def sharded_dense_prefill_topk(
     into ``out`` for every row."""
     num_rows = data.num_rows
     local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)
-    dense_prefill_topk(data, kv, out=local, rows=shard.local_rows(num_rows))
+    dense_prefill_topk(data.narrow(shard.local_rows(num_rows)), kv, out=local)
     out.copy_(shard.gather(local, num_rows))
 
 

@@ -37,10 +37,10 @@ class RowShard(msgspec.Struct, frozen=True, kw_only=True):
     """This rank's share of a prefill chunk's query rows across a group whose
     ranks all hold the same rows.
 
-    The indexer is replicated, so every rank of the attention-TP group would
-    score every row identically. Each rank scores a contiguous share instead and
-    the selections are all-gathered. A dense score depends only on its own query
-    row, so the gathered selection is bitwise the replicated one."""
+    Each rank scores a contiguous share instead of scoring every row, then
+    all-gathers the selections. Rows are mathematically independent, but bf16
+    logits can vary with the kernel's row count and change picks near the
+    selection floor; alignment alone does not imply bitwise parity."""
 
     group: GroupCoordinator
     rank: int

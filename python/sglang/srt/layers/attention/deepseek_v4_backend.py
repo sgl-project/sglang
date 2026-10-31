@@ -35,6 +35,9 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     fp8_dtype,
     gather_dequant_requant_fp8_paged_dsv4,
 )
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_row_alignment,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -3929,7 +3932,14 @@ class DeepseekV4AttnBackend(
                 self.full_topk_indexer.topk_decode(inputs)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
-                layer, x, q_lora, req, pos, forward_batch, rows_per_request
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                forward_batch,
+                rows_per_request,
+                allow_row_shard=rows_per_request is None,
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
@@ -3990,14 +4000,16 @@ class DeepseekV4AttnBackend(
         pos,
         forward_batch,
         rows_per_request,
+        *,
+        allow_row_shard: bool = False,
     ) -> PrefillInputs:
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
-        # Prefill CP hands each rank its own interleaved subset of rows; every
-        # other path holds the batch's rows on every attention-TP rank.
+        # Only the eager caller opts in. Graph breaks also have replicated rows,
+        # but must not introduce these collectives into the prefill graph path.
         row_shard = (
             self._indexer_row_shard(layer, num_rows=x.shape[0])
-            if rows_per_request is None
+            if allow_row_shard
             else None
         )
         if rows_per_request is not None:
@@ -4054,6 +4066,7 @@ class DeepseekV4AttnBackend(
         if (
             not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
             or parallel.attn_tp_size == 1
+            or parallel.attn_cp_size != 1
             or num_rows < _INDEXER_TP_SHARD_MIN_ROWS
         ):
             return None
@@ -4061,7 +4074,7 @@ class DeepseekV4AttnBackend(
             group=parallel.attn_tp_group,
             rank=parallel.attn_tp_rank,
             world=parallel.attn_tp_size,
-            row_align=128 // layer.indexer.n_heads,
+            row_align=flat_index_logits_row_alignment(layer.indexer.n_heads),
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
@@ -4112,6 +4125,7 @@ class DeepseekV4AttnBackend(
             pos[:real],
             forward_batch,
             None,
+            allow_row_shard=False,
         )
         if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)

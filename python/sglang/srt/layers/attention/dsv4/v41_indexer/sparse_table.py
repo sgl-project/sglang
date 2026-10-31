@@ -505,18 +505,17 @@ def select_prefill_rows(
     *,
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
-    rows: slice,
     nblocks: torch.Tensor,
     out_positions: torch.Tensor,
     out_blocks: torch.Tensor,
 ) -> None:
     """The source's own top-k (request-local compressed positions) and its top
-    blocks for ``rows``, from one pass over their dense scores; one row of each
-    output per scored row, ``nblocks`` already sliced to ``rows``."""
-    lens_all = data.compress_lens[rows]
+    blocks from one pass over this query-row view's dense scores; one row of
+    each output per scored row, with ``nblocks`` matching the view."""
+    lens_all = data.compress_lens
     zero_offsets = torch.zeros_like(lens_all)
     # the block keys read the score rows through 32-byte vectors
-    for tile, logits in score_tiles(data, kv, rows=rows):
+    for tile, logits in score_tiles(data, kv):
         lens = lens_all[tile]
         topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
         # keys past a row's block count stay unset; the top-k reads a row
@@ -560,7 +559,6 @@ def publish_prefill_table(
         select_prefill_rows(
             data=data,
             kv=kv,
-            rows=slice(0, rows),
             nblocks=nblocks,
             out_positions=out_positions,
             out_blocks=blocks,
@@ -571,9 +569,8 @@ def publish_prefill_table(
         local_positions = out_positions.new_full((per, out_positions.shape[1]), -1)
         local_blocks = torch.empty(per, topk_blocks, dtype=torch.int32, device=device)
         select_prefill_rows(
-            data=data,
+            data=data.narrow(local),
             kv=kv,
-            rows=local,
             nblocks=nblocks[local],
             out_positions=local_positions,
             out_blocks=local_blocks,
