@@ -531,6 +531,10 @@ class MoeTransport(MoeRowTransport):
     def prepare_output(self, hidden_states):
         self.input = None
         if isinstance(hidden_states, MoEOutput):
+            if self.rows.group is None:
+                # a2a backends (e.g., flashinfer_megamoe) with ep=True:
+                # transport rows declare no sum group, so complete the merge now
+                return hidden_states.get_merged()
             completion = MoeFinalize(hidden_states)
             # Without a declared group, only an a2a combine that already summed
             # the experts finalizes locally; a fallback that did not still owes it.
