@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import dp_capacity_for
 from sglang.srt.model_executor.forward_batch_info import (
     NgramEmbeddingInfo,
     enable_num_token_non_padded,
@@ -209,6 +210,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 encoder_lens = None
 
             if require_mlp_tp_gather:
+                # Pool ceiling, not live width: captured graphs replay this storage.
+                num_dp_ranks = dp_capacity_for(num_dp_ranks)
                 global_num_tokens_gpu = torch.zeros((num_dp_ranks,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
                     (num_dp_ranks,), dtype=torch.int32
