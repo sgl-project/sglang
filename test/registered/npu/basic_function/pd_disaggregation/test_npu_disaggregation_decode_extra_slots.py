@@ -292,7 +292,9 @@ class DisaggregationExtraSlotsBase(PDDisaggregationServerBase):
         ]
 
         if extra_slots is not None:
-            decode_args.extend(["--disaggregation-decode-extra-slots", str(extra_slots)])
+            decode_args.extend(
+                ["--disaggregation-decode-extra-slots", str(extra_slots)]
+            )
             print(f"[DECODE] Using --disaggregation-decode-extra-slots={extra_slots}")
 
         decode_args += cls.transfer_backend
