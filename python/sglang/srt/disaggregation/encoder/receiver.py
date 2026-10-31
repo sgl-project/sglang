@@ -2519,7 +2519,7 @@ class MMReceiverBase(ABC):
         req = Req(
             recv_req.rid,
             recv_req.input_text,
-            recv_req.input_ids,
+            recv_req.input_ids if recv_req.input_ids is not None else array("q"),
             recv_req.sampling_params,
             return_logprob=recv_req.return_logprob,
             top_logprobs_num=recv_req.top_logprobs_num,
