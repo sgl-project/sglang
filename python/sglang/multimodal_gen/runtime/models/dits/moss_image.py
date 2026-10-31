@@ -278,9 +278,7 @@ class _Block(nn.Module):
             if model_parallel_is_initialized() and get_sp_world_size() > 1
             else LocalAttention
         )
-        # No default backend: the platform's is FA on Hopper and dynamic cuDNN
-        # SDPA on sm_10x, where pinning FA cost 8% end to end (4.76 vs 4.37 s,
-        # 1024x1024 50 steps, 1xB200).
+        # No pinned default: sm_10x then gets the platform's dynamic cuDNN SDPA.
         self.attention = attention_cls(
             num_heads=heads,
             head_size=dim // heads,
