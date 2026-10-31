@@ -56,20 +56,37 @@ UINT8 = "uint8"
 
 
 @lru_cache(maxsize=8)
-def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
+def _pick_inner_iter(
+    seq: int,
+    ni: int,
+    cu: int,
+    block_per_cu: int,
+    any_divisor: bool = False,
+    head_blocks: int = 1,
+) -> int:
     """
-    Pick the largest valid inner_iter (power-of-two divisor of ni) that keeps
-    enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
-    under-utilization while minimizing the number of partial groups.
+    Pick the largest valid inner_iter (a divisor of ni) that keeps enough work
+    per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
+    under-utilization while minimizing the number of partial groups. Only ni,
+    ni // 2, ni // 4, ... are tried; with any_divisor, a larger divisor is taken
+    when its seq * head_blocks * ni / inner_iter blocks fill the waves they need.
     """
 
     max_it = int(seq * ni / (cu * block_per_cu))
     it = ni
     while it >= 2:
         if it <= max_it and ni % it == 0:
-            return it
+            break
         it //= 2
-    return 1
+    if any_divisor:
+        # Two blocks of the FP8 partial kernel run on each SM; fewer, or a mostly
+        # empty last wave, was slower on H200 with 8 to 64 heads.
+        slots = 2 * cu
+        for larger in range(min(ni, max_it), it, -1):
+            blocks = seq * head_blocks * (ni // larger)
+            if ni % larger == 0 and blocks >= 0.8 * slots * -(-blocks // slots):
+                return larger
+    return it
 
 
 @tilelang.jit(
@@ -1204,7 +1221,16 @@ def tilelang_sparse_fwd(
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            # Any divisor is measured on CUDA only; ROCm keeps trying ni, ni // 2, ...
+            inner_iter = _pick_inner_iter(
+                q.shape[0],
+                ni,
+                cu,
+                block_per_cu,
+                any_divisor=not _is_hip,
+                # sparse_mla_fwd_decode_partial_fp8 runs 16 heads per block.
+                head_blocks=(num_heads + 15) // 16,
+            )
             kernel_partial = sparse_mla_fwd_decode_partial_fp8(
                 num_heads,
                 d_v,
