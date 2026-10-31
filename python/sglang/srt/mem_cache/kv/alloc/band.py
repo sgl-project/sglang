@@ -72,6 +72,17 @@ _STATS_INSTANCES: weakref.WeakSet[Band] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
 
 
+def _page_runs(pages: Sequence[int]) -> List[Tuple[int, int]]:
+    """``pages`` as ascending half-open runs ``[first, end)``."""
+    runs: List[Tuple[int, int]] = []
+    for page in sorted(pages):
+        if runs and runs[-1][1] == page:
+            runs[-1] = (runs[-1][0], page + 1)
+        else:
+            runs.append((page, page + 1))
+    return runs
+
+
 def _emit_all_final_stats(reason: str) -> None:
     for inst in list(_STATS_INSTANCES):
         try:
@@ -426,6 +437,10 @@ class Band:
         self._inflight_forwards: List[
             Tuple[torch.cuda.Event, Optional[torch.Tensor]]
         ] = []
+        # Byte ranges a move vacated outside this band's free list while a
+        # forward could still read them, with that forward's event: a write into
+        # them, by any band of the chain, waits the event first.
+        self._fences: List[Tuple[int, int, torch.cuda.Event]] = []
         # Recorded forwards in launch order. A forward retires when the scheduler
         # processes its result, or when an urgent relief waits for it. Move and
         # reuse decisions read retirement, never whether an event has fired, so
@@ -547,6 +562,7 @@ class Band:
         self._pending_reuse_pages_cpu.clear()
         self.live_page_count = 0
         self._inflight_forwards.clear()
+        self._fences.clear()
         self._latest_forward_done_event = None
         self._retired_seq = self._forward_seq
         self._event_seq.clear()
@@ -988,6 +1004,7 @@ class Band:
             end_exclusive = start + num_pages
             if end_exclusive > self.num_pages:
                 return None
+            self._wait_fences(start, end_exclusive)
             phys_pages = torch.arange(
                 start, end_exclusive, dtype=torch.int64, device=self.device
             )
@@ -998,6 +1015,7 @@ class Band:
             start = end - num_pages + 1
             if start < self.min_page_index:
                 return None
+            self._wait_fences(start, end + 1)
             phys_pages = torch.arange(
                 start, end + 1, dtype=torch.int64, device=self.device
             )
@@ -1018,6 +1036,7 @@ class Band:
             )
             if new_wm > chain_low_pages:
                 return False
+            self._wait_fences(self.watermark_physical, new_wm)
             self.watermark_physical = new_wm
         else:
             new_wm = self.watermark_physical - num_pages
@@ -1030,6 +1049,7 @@ class Band:
             )
             if new_wm + 1 < chain_high_pages:
                 return False
+            self._wait_fences(new_wm + 1, self.watermark_physical + 1)
             self.watermark_physical = new_wm
         return True
 
@@ -1152,11 +1172,13 @@ class Band:
                         new_wm = start_wm + N
                         if new_wm > self.num_pages:
                             return None
+                        self._wait_fences(start_wm, new_wm)
                         self.watermark_physical = new_wm
                     else:
                         new_wm = start_wm - N
                         if new_wm < self.min_page_index - 1:
                             return None
+                        self._wait_fences(new_wm + 1, start_wm + 1)
                         self.watermark_physical = new_wm
 
                 # Lowest physical id of the new range (both directions yield
@@ -1535,11 +1557,9 @@ class Band:
         launches the next microbatch before the previous one ends. Pass
         `written_virtual=None` when the forward writes nothing here, and
         ``writes_unknown`` when its write ids cannot be read before it ends:
-        nothing then moves until it retires. No-op in eager mode.
+        nothing then moves until it retires.
         """
         with record_function("Band.set_inflight_forward"):
-            if not self.lazy_compaction:
-                return
             self._register_forward(forward_done)
             self._prune_inflight_forwards()
             if writes_unknown:
@@ -1555,32 +1575,97 @@ class Band:
             if not self._retired(inflight[0])
         ]
 
-    def _materialize_inflight_write_set(self) -> Optional[Set[int]]:
-        """The physical PAGE ids the unfinished forwards write, or `None` if
-        none is unfinished. Pays a bs-sized D2H sync per forward, once per call
-        and only when a survivor needs classifying. `_flush` has settled any
-        forward whose writes are unknown.
+    def _inflight_write_sets(self) -> List[Tuple[torch.cuda.Event, Optional[Set[int]]]]:
+        """Each unretired forward with the physical PAGE ids it writes in this
+        band (None when unknown), oldest first. Pays a bs-sized D2H sync per
+        forward; call it before any stream wait, or the read parks the host.
         """
         self._prune_inflight_forwards()
-        written = [w for _, w in self._inflight_forwards if w is not None]
-        if not written:
-            return None
-        with record_function("Band._materialize_inflight_write_set"):
-            # `oclv` is a WIDENED virtual id under DCP; collapse it. A widened page
-            # covers the same page, so the non-owned ids fold in harmlessly.
+        if not self._inflight_forwards:
+            return []
+        with record_function("Band._inflight_write_sets"):
+            # Written ids are WIDENED virtual ids under DCP; collapse them. A
+            # widened page covers the same page, so non-owned ids fold in.
             dcp_size = get_parallel().attn_dcp_size if self.shards_under_dcp else 1
-            pages: Set[int] = set()
+            out: List[Tuple[torch.cuda.Event, Optional[Set[int]]]] = []
             # One forward at a time, not concatenated: a kernel's first launch
             # loads its module, which waits for the running forwards.
-            for oclv in written:
+            for event, oclv in self._inflight_forwards:
+                if oclv is None:
+                    out.append((event, None))
+                    continue
                 if dcp_size > 1:
                     oclv = oclv // dcp_size
                 # Negative ids (an empty tracking slot) translate to the sink.
                 phys_tokens = self.ids.translate(oclv)
                 if self.pool_page_size > 1:
                     phys_tokens = (phys_tokens // self.pool_page_size).unique()
-                pages.update(phys_tokens.tolist())  # .tolist() syncs schedule_stream
-            return pages
+                out.append((event, set(phys_tokens.tolist())))  # syncs the stream
+            return out
+
+    def _materialize_inflight_write_set(self) -> Optional[Set[int]]:
+        """The physical PAGE ids the unfinished forwards write, or `None` if
+        none writes a known page. `_flush` has settled any forward whose writes
+        are unknown.
+        """
+        pages: Set[int] = set()
+        for _, written in self._inflight_write_sets():
+            if written is not None:
+                pages |= written
+        return pages or None
+
+    def _wait_writers(
+        self,
+        srcs: Sequence[int],
+        write_sets: List[Tuple[torch.cuda.Event, Optional[Set[int]]]],
+    ) -> None:
+        """Order a copy of ``srcs`` after the newest unfinished forward that
+        writes one of them (or whose writes are unknown), and after nothing when
+        none does: reading a page a forward only reads is safe."""
+        src_set = set(srcs)
+        writer = None
+        for event, written in write_sets:
+            if written is None or not src_set.isdisjoint(written):
+                writer = event
+        if writer is not None:
+            self._wait_on_stream(writer)
+            self._retire_through(writer)
+
+    def _fence_vacated(self, pages: Sequence[int]) -> None:
+        """``pages`` left this band while the newest recorded forward could still
+        read them; a later write into them waits that forward (`_wait_fences`)."""
+        event = self._latest_forward_done_event
+        if event is None or not pages:
+            return
+        epp = self.entry_bytes_per_page
+        for first, end in _page_runs(pages):
+            self._fences.append((first * epp, end * epp, event))
+
+    def _wait_fences(self, first: int, end: int) -> None:
+        """Before anything writes this band's pages ``[first, end)``: wait each
+        fence of the chain they meet. A waited fence is dropped, as later work
+        on the stream is ordered after it; so is one whose event has fired, as
+        bookkeeping only."""
+        if end <= first:
+            return
+        lo, hi = first * self.entry_bytes_per_page, end * self.entry_bytes_per_page
+        for band in self._chain_bands():
+            if not band._fences:
+                continue
+            kept = []
+            for fence in band._fences:
+                f_lo, f_hi, event = fence
+                if event.query():
+                    continue
+                if f_lo < hi and lo < f_hi:
+                    self._wait_on_stream(event)
+                    continue
+                kept.append(fence)
+            band._fences = kept
+
+    def _wait_fences_on(self, pages: Sequence[int]) -> None:
+        for first, end in _page_runs(pages):
+            self._wait_fences(first, end)
 
     def _maybe_emit_stats(self) -> None:
         """Env-gated periodic stats emit (at most once per interval) at `_flush` end.
@@ -1778,11 +1863,12 @@ class Band:
     def _flush(self, *, urgent: bool) -> int:
         """One batched compaction pass; returns the number of survivor moves.
 
-        Two hazards per survivor, both keyed on the single `forward_done` event:
-        a WRITE race (the forward overwrites KV[src], so a compaction read would
-        corrupt KV[dst]) stops a non-urgent walk at that src and is settled up
-        front when urgent; a READ race (the forward READS KV[src]) gates src
-        REUSE, so such srcs route to `_pending_reuse`.
+        Two hazards per survivor: a WRITE race (an unfinished forward overwrites
+        KV[src], so a compaction read would corrupt KV[dst]) stops a non-urgent
+        walk at that src, and an urgent one waits that forward before copying
+        it; a READ race (a forward READS KV[src]) gates src REUSE, so such srcs
+        route to `_pending_reuse`, or, when an urgent pass retreats the frontier
+        past them, to a fence that later writes into them wait.
 
         `_topmost_survivor` excludes all p2v=-1 pages, so a negative virtual id in
         the batched mapping lookup is a corrupt-state bug and raises.
@@ -1801,6 +1887,8 @@ class Band:
                 self._drain_pending_reuse(urgent=False)
                 return 0
             self._settle_inflight_forward()
+        # Urgent: read the write sets on the host before any stream wait below.
+        write_sets = self._inflight_write_sets() if urgent else None
         self._wait_hicache_transfers()
         self._stats_n_flush_calls += 1
         with record_function("Band._flush"):
@@ -1818,17 +1906,16 @@ class Band:
 
             latest_event = self._latest_forward_done_event
 
-            # Single-pass FULL-PACK (urgent only): `_latest_forward_done_event` is
-            # recorded after the WHOLE forward, so waiting it once settles BOTH
-            # hazards and the walk then runs race-free (empty write_set).
+            # Single-pass FULL-PACK (urgent only): every interior hole is filled
+            # and the frontier retreats past the vacated survivors, which are
+            # fenced rather than waited for (a forward may still read them).
             single_pass_absorb = urgent and len(holes_cpu) > 0
-            if single_pass_absorb:
-                self._settle_inflight_forward()
-                latest_event = None  # reads/writes settled -> srcs are fired
 
             # write_set: None = not yet materialized (do it inline on the first
             # survivor needing the check); set() = no write race; else materialized.
-            write_set: Optional[Set[int]] = set() if single_pass_absorb else None
+            write_set: Optional[Set[int]] = None
+            if write_sets is not None:
+                write_set = set().union(*(w for _, w in write_sets if w is not None))
 
             srcs: List[int] = []
             dsts: List[int] = []
@@ -1868,21 +1955,29 @@ class Band:
                     write_set = materialized if materialized is not None else set()
                 if write_set and src in write_set:
                     if urgent:
-                        # Commit accumulated moves, then wait the forward so the
-                        # rest of the walk is race-free.
+                        # Commit accumulated moves, then wait the newest forward
+                        # that writes this src; forwards after it may still write.
                         self._commit_move_batch(
-                            srcs, dsts, latest_event, released_fired
+                            srcs,
+                            dsts,
+                            latest_event,
+                            released_fired,
+                            fence=single_pass_absorb,
                         )
                         n_moves += len(srcs)
                         srcs.clear()
                         dsts.clear()
-                        if self._inflight_forwards:
-                            newest = self._inflight_forwards[-1][0]
-                            self._wait_on_stream(newest)
-                            self._retire_through(newest)
-                            self._inflight_forwards.clear()
-                        write_set = set()  # forward drained -> no race
-                        latest_event = None
+                        self._wait_writers([src], write_sets)
+                        write_sets = [
+                            (event, written)
+                            for event, written in write_sets
+                            if not self._retired(event)
+                        ]
+                        write_set = set().union(
+                            *(w for _, w in write_sets if w is not None)
+                        )
+                        if self._retired(latest_event):
+                            latest_event = None
                         # DO NOT reset cursor/j_cursor: rewinding would re-pick
                         # the just-committed srcs (now p2v=-1, not in holes_cpu)
                         # and trip the p2v=-1 assertion.
@@ -1917,7 +2012,9 @@ class Band:
                 if move_cap is not None and len(srcs) >= move_cap:
                     break
 
-            self._commit_move_batch(srcs, dsts, latest_event, released_fired)
+            self._commit_move_batch(
+                srcs, dsts, latest_event, released_fired, fence=single_pass_absorb
+            )
             n_moves += len(srcs)
 
             if single_pass_absorb:
@@ -1963,11 +2060,15 @@ class Band:
         dsts: List[int],
         latest_event: Optional[torch.cuda.Event],
         released_fired: List[Tuple[torch.Tensor, List[int]]],
+        *,
+        fence: bool = False,
     ) -> None:
         """Issue the page copies (`_move_pages`) plus ONE bulk v2p/p2v remap for
-        the accumulated `(src, dst)` pairs. Srcs whose readers retired accumulate
-        in `released_fired` (merged by `_flush` after its dst-slice); the others
-        route to `_pending_reuse` for read-race gating.
+        the accumulated `(src, dst)` pairs. With ``fence`` the srcs leave the
+        band (the frontier retreats past them) and are fenced; otherwise srcs
+        whose readers retired accumulate in `released_fired` (merged by `_flush`
+        after its dst-slice) and the others route to `_pending_reuse` for
+        read-race gating.
         """
         if not srcs:
             return
@@ -1991,7 +2092,9 @@ class Band:
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
             # Src disposition. `src_pages_t` is reused as the `_pending_reuse` GPU
             # tensor (no second H2D at drain).
-            if self._retired(latest_event):
+            if fence:
+                self._fence_vacated(srcs)
+            elif self._retired(latest_event):
                 if latest_event is not None:
                     # A retired forward can still run its tail; reuse after it.
                     self._wait_on_stream(latest_event)
@@ -2371,6 +2474,7 @@ class FloatBand(Band):
                     self.high_wm_page = end
                 else:
                     return None
+                self._wait_fences(start, end)
                 fresh = torch.arange(start, end, dtype=torch.int64, device=self.device)
             elif self._is_frontier_transparent():
                 # Reposition-on-alloc-from-empty: collapse to the midpoint so
@@ -2380,6 +2484,7 @@ class FloatBand(Band):
                 start = lo + (hi - lo - need_more) // 2
                 self.low_wm_page = start
                 self.high_wm_page = start + need_more
+                self._wait_fences(start, start + need_more)
                 fresh = torch.arange(
                     start, start + need_more, dtype=torch.int64, device=self.device
                 )
@@ -2399,6 +2504,7 @@ class FloatBand(Band):
                         break
                 else:
                     return None  # neither side fits; state untouched
+                self._wait_fences(start, start + need_more)
                 fresh = torch.arange(
                     start, start + need_more, dtype=torch.int64, device=self.device
                 )
@@ -2556,10 +2662,11 @@ class FloatBand(Band):
         gap). Returns the bytes now open on ``side``; a result < ``min_bytes``
         means the ask is impossible now or movement is gated, and state is then
         unchanged.
-        Scheduler-phase only; stream safety is owned HERE, not by the caller --
-        the in-flight forward is settled right before the first copy, after the
-        plan is read and built on the host. Moves at most min(L_live, G) pages:
-        every live page when the ask exceeds them.
+        Scheduler-phase only; stream safety is owned HERE, not by the caller:
+        the copy waits only a forward that writes a moved page, after the plan
+        and the write sets are read on the host, and the vacated pages are
+        fenced. Moves at most min(L_live, G) pages: every live page when the ask
+        exceeds them.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
         epp = self.entry_bytes_per_page
@@ -2627,12 +2734,14 @@ class FloatBand(Band):
                 dsts += list(range(self.high_wm_page, self.high_wm_page + n_fresh))
 
         if srcs:
+            write_sets = self._inflight_write_sets()
             src_t, dst_t = self._to_device(srcs), self._to_device(dsts)
-            # Order the copies after the in-flight forward, or they carry pre-write
-            # bytes; one wait covers read AND write (the event is post-forward).
-            self._settle_inflight_forward()
+            self._wait_writers(srcs, write_sets)
+            self._wait_fences_on([p for p in dsts if p not in holes])
             self._move_pages_and_rebind(src_t, dst_t)
             self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
+            # The sources end outside the new span: the edge retreats past them.
+            self._fence_vacated(srcs)
 
         # Reconstruct the span from final live positions: everything between
         # the extremes is span; non-live pages inside are holes.
@@ -2666,11 +2775,14 @@ class FloatBand(Band):
         # Not live, so never a source: one batched, disjoint move.
         dsts = [p for p in range(first, end) if p not in inside][: len(srcs)]
         if srcs:
+            write_sets = self._inflight_write_sets()
             src_t, dst_t = self._to_device(srcs), self._to_device(dsts)
-            # Settle right before the first copy -- see `make_room`.
-            self._settle_inflight_forward()
+            self._wait_writers(srcs, write_sets)
+            self._wait_fences_on([p for p in dsts if p not in holes])
             self._move_pages_and_rebind(src_t, dst_t)
             self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
+            # Every source lies outside the block, so outside the new span.
+            self._fence_vacated(srcs)
         kept = inside | set(dsts)
         self.low_wm_page, self.high_wm_page = first, end
         new_holes = [p for p in range(first, end) if p not in kept]
@@ -2688,13 +2800,17 @@ class FloatBand(Band):
         if pairs:
             src_set = {s for s, _ in pairs}
             dst_set = {d for _, d in pairs}
+            live_set = set(live_sorted)
             if src_set.isdisjoint(dst_set):
+                write_sets = self._inflight_write_sets()
                 src_t = self._to_device([s for s, _ in pairs])
                 dst_t = self._to_device([d for _, d in pairs])
-                # Settle right before the first copy -- see `make_room`.
-                self._settle_inflight_forward()
+                self._wait_writers(src_set, write_sets)
+                self._wait_fences_on([d for d in dst_set if d not in live_set])
                 self._move_pages_and_rebind(src_t, dst_t)
                 self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
+                # Disjoint: every source lies outside the final block.
+                self._fence_vacated(sorted(src_set))
             else:
                 # Interior packing can move pages in both directions. For an
                 # order-preserving mapping, leftward moves are safe in ascending
@@ -2707,7 +2823,10 @@ class FloatBand(Band):
                 # a shift can span the whole pool.
                 src_all = self._to_device([s for s, _ in ordered])
                 dst_all = self._to_device([d for _, d in ordered])
+                # Some destinations are sources vacated earlier in this pass, which
+                # a forward may still read: wait every recorded forward.
                 self._settle_inflight_forward()
+                self._wait_fences_on([d for d in dst_set if d not in live_set])
                 for i in range(len(ordered)):
                     s_t, d_t = src_all[i : i + 1], dst_all[i : i + 1]
                     self._move_pages_and_rebind(s_t, d_t)
