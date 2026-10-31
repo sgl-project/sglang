@@ -92,6 +92,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.storage_engine = None
         cache.pp_rank = 1
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c

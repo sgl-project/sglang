@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.storage_agreement import QUERY_DONE
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
@@ -562,9 +563,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertIsNotNone(swa_release_q)
 
         # Consume one queued event per iteration to stop in the window between the
-        # SWA pool ack and the whole-request ack.
+        # SWA pool ack and the whole-request ack. The hit verdict reaches the
+        # queue through the scheduler's agreement step, so run it each pass.
         deadline = time.time() + 10.0
         while time.time() < deadline:
+            cons.storage_engine.tick(cc.prefetch_hit_queue.put)
             cons._drain_storage_control_queues_impl(
                 n_storage_hit=min(1, cc.prefetch_hit_queue.qsize()),
                 n_ack_prefetch=min(1, cc.ack_prefetch_queue.qsize()),
@@ -2171,15 +2174,14 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
-        # Wait for the hit verdict WITHOUT draining it (the drain is the
-        # scheduler-thread IO commit under test).
+        # Wait for the worker's local hit verdict WITHOUT agreeing or draining
+        # it (the drain is the scheduler-thread IO commit under test).
+        operation = cons.ongoing_prefetch[req_id].operation
         deadline = time.time() + 10.0
-        while (
-            cons.cache_controller.prefetch_hit_queue.qsize() == 0
-            and time.time() < deadline
-        ):
+        while operation.query_status()[0] != QUERY_DONE and time.time() < deadline:
             time.sleep(0.01)
-        self.assertGreater(cons.cache_controller.prefetch_hit_queue.qsize(), 0)
+        self.assertEqual(operation.query_status()[0], QUERY_DONE)
+        self.assertEqual(cons.cache_controller.prefetch_hit_queue.qsize(), 0)
 
         self._insert(cons, cons_alloc, cons_rtp, seq)
         cons.drain_storage_control_queues()

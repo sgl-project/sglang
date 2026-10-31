@@ -222,6 +222,9 @@ class StorageAttachment:
 
         try:
             self._release_pending_storage_ops()
+            if cache.storage_engine is not None:
+                # Queries still awaiting agreement belong to the detached backend.
+                cache.storage_engine.reset()
             cache.drain_storage_control_queues_local()
         except Exception:
             logger.exception("Failed post-detach cleanup of storage bookkeeping.")

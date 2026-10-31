@@ -68,6 +68,7 @@ def _staged_fixture(full_match=2):
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None
     cache.ongoing_prefetch = {}
+    cache.storage_engine = None
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
     cache.components = {}

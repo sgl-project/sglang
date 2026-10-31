@@ -49,6 +49,7 @@ def _hicache_tp_rank(rank: int, extra_pools: int) -> UnifiedRadixCache:
     )
     cache.pp_rank, cache.pp_size, cache.pp_group = 0, 1, None
     cache.host_memory_mode = "cache"
+    cache.storage_engine = None
     cache.attn_cp_group = cache.attn_tp_group = None
     cache.tp_group, cache.tp_world_size = torch.distributed.group.WORLD, 2
     cache.cache_controller = SimpleNamespace(
@@ -89,14 +90,15 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
             _sleep_on_idle(False),
             _shm_names(),
         ):
-            # A row holds 6 ready counts, one more per extra host pool, and the folded
-            # digest's 2 words: 8, 9 and 10 values here. The shm table holds 8.
+            # A row holds 6 ready counts, one more per extra host pool, the storage
+            # agreement FIFO's 2 words and the folded digest's 2 words: 10, 11 and
+            # 12 values here. The shm table holds 10.
             for extra_pools in (0, 1, 2):
                 cache = _hicache_tp_rank(rank, extra_pools)
                 want = list(range(6 + extra_pools))
                 names = tuple(cache.cache_controller.extra_host_mem_release_queues)
                 got = cache._sync_hicache_ready_counts()
-                assert got == (want[0], want[1], tuple(want[2:]), names), (
+                assert got == (want[0], want[1], tuple(want[2:]) + (0, 0), names), (
                     extra_pools,
                     got,
                 )
