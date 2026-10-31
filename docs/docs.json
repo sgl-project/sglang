@@ -10,6 +10,10 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/diffusion/LingBot-Video/LingBot-Video",
+      "destination": "/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
+    },
+    {
       "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
       "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
     },
