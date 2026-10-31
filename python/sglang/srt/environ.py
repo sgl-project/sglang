@@ -1956,6 +1956,8 @@ class Envs:
     # load each row's queries once. Scores are bitwise identical to the per-row kernel.
     SGLANG_OPT_DSV41_FAST_DECODE_INDEXER = EnvBool(True)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Select current Mega kernels for DSv4.1 prefill over BF16 workspaces.
+    SGLANG_OPT_DSV41_CURRENT_MEGA_PREFILL = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
