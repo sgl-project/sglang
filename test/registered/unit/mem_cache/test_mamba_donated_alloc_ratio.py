@@ -5,13 +5,14 @@ at the first checkpoint, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
 1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
-the donated alloc asserts; ratio 3 (pool = 3N) has headroom. Once decode's
+the optional donation is skipped; ratio 3 (pool = 3N) has headroom. Once decode's
 skip_mamba leaves the matched prefix evictable, even ratio 2 recovers via
 eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
 
 import unittest
 from types import MethodType, SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 import torch
 
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     IncLockRefResult,
+    InsertParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
@@ -28,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -109,7 +112,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     return component, cache, owned
 
 
-class TestMambaRatioEnvGate(unittest.TestCase):
+class TestMambaRatioEnvGate(CustomTestCase):
     """SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK gates the pool ratio: off restores the
     original base 3 (overlap 5, lazy 4, no_buffer 3), on drops the base to 2
     (overlap 4, lazy 3) while no_buffer stays 3. Guards the flag wiring so the
@@ -286,7 +289,7 @@ class _RecordingComp:
         pass
 
 
-class TestDecSwaLockSkip(unittest.TestCase):
+class TestDecSwaLockSkip(CustomTestCase):
     """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
     locks. On a node whose acquire skipped Mamba (decode hold), the release
     must skip it too, else it drops a mamba lock it never took -- another
@@ -338,20 +341,67 @@ class TestDecSwaLockSkip(unittest.TestCase):
         self.assertEqual(full.released, [])
 
 
-class TestMambaDonatedAllocRatio(unittest.TestCase):
+class TestMambaDonatedAllocRatio(CustomTestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
+        self.assertIsNone(component._try_alloc_mamba_slot())
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
         self.assertEqual(
-            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+            cache.alloc_evict_params,
+            [EvictParams(num_tokens=0, mamba_num=1)] * 2,
         )
+
+    def test_unfinished_checkpoint_skips_donation_when_all_states_locked(self):
+        for extra_buffer, quantized in ((True, False), (True, True), (False, False)):
+            with self.subTest(extra_buffer=extra_buffer, quantized=quantized):
+                component, cache, owned = _build_peak(
+                    pool_size=2 * N, lock_prefixes=True
+                )
+                cache.enable_mamba_extra_buffer = extra_buffer
+                req = SimpleNamespace(
+                    kv=SimpleNamespace(
+                        mamba_last_track_seqlen=8, mamba_pool_idx=owned[0]
+                    ),
+                    lock=None,
+                )
+                params = InsertParams()
+
+                with (
+                    patch.object(
+                        MambaComponent,
+                        "quantizes_checkpoints",
+                        new_callable=PropertyMock,
+                        return_value=quantized,
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.unified_cache.components.mamba.get_exec",
+                        return_value=SimpleNamespace(
+                            mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+                        ),
+                    ),
+                ):
+                    self.assertEqual(
+                        component.prepare_for_caching_req(
+                            req, params, 8, is_finished=False
+                        ),
+                        0,
+                    )
+
+                self.assertIsNone(params.mamba_value)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, 8)
+                self.assertTrue(torch.equal(req.kv.mamba_pool_idx, owned[0]))
+                self.assertEqual(len(cache.prefix_nodes), N)
+                self.assertEqual(cache.allocator.free_ids, [])
+                self.assertEqual(
+                    cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+                )
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
         component, cache, _ = _build_peak(pool_size=3 * N, lock_prefixes=True)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(cache.component_protected_size_[ComponentType.MAMBA], N)
 
@@ -359,7 +409,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         # pool = 2N but the matched prefixes are evictable (skip_mamba on decode):
         # eviction reclaims a victim, so even ratio 2 serves the donated alloc.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=False)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
         self.assertEqual(
@@ -367,7 +417,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         )
 
 
-class TestPPMambaPoolSizing(unittest.TestCase):
+class TestPPMambaPoolSizing(CustomTestCase):
     """A PP rank only allocates mamba state for its own [start_layer, end_layer)
     slice, so charging it for the whole model's layers starves the pool. Sizing
     uses the largest per-stage share, which also keeps every rank on the same
@@ -483,7 +533,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         )
 
 
-class TestExtraMambaCacheSizing(unittest.TestCase):
+class TestExtraMambaCacheSizing(CustomTestCase):
     @staticmethod
     def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
         from sglang.srt import runtime_context as rc
