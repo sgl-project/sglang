@@ -34,6 +34,10 @@ def _qsa_fused_kv_prepare(
     IB: tl.constexpr,
     CHAIN: tl.constexpr,
     PAGE: tl.constexpr,
+    HK,
+    HV,
+    RW,
+    HOST: tl.constexpr,
 ):
     tiles = tl.cdiv(S, B) + 2
     pid = tl.program_id(0)
@@ -78,6 +82,13 @@ def _qsa_fused_kv_prepare(
         valid = (pos >= 0) & (pos < length) & (c < T)
         valid = valid & row_active
         slot = tl.load(MAP + req.to(tl.int64) * MAP_STRIDE + pos, valid, 0).to(tl.int64)
+        if HOST:
+            # Address translation: a slot inside the resident window lives at
+            # the same row on device; everything else is read from the pinned
+            # host tier through zero-copy.  ``slot`` itself stays logical.
+            dslot = tl.where((slot > 0) & (slot < RW), slot, -1)
+        else:
+            dslot = slot
         if EXPAND and CHAIN and W > 1:
             group_row = row // W * W
             first_pos = length - 1 - row % W
@@ -93,13 +104,40 @@ def _qsa_fused_kv_prepare(
                 matches = valid & (candidate_slot != 0) & (slot == candidate_slot)
                 input_row = tl.where(matches, candidate_row, input_row)
                 fresh = fresh | matches
-        oldoff = slot[:, None] * H * D + head * D + d[None, :]
-        nkoff = input_row.to(tl.int64)[:, None] * NK_STRIDE + head * D + d[None, :]
-        nvoff = input_row.to(tl.int64)[:, None] * NV_STRIDE + head * D + d[None, :]
-        kp = tl.where(fresh[:, None], NK + nkoff, K + oldoff)
-        vp = tl.where(fresh[:, None], NV + nvoff, V + oldoff)
-        k = tl.load(kp, valid[:, None], 0.0)
-        v = tl.load(vp, valid[:, None], 0.0)
+        if HOST:
+            koff = slot[:, None] * H * D + head * D + d[None, :]
+            nkoff = input_row.to(tl.int64)[:, None] * NK_STRIDE + head * D + d[None, :]
+            nvoff = input_row.to(tl.int64)[:, None] * NV_STRIDE + head * D + d[None, :]
+            dev = (dslot > 0)[:, None] & valid[:, None]
+            host = (dslot <= 0)[:, None] & valid[:, None]
+            k_dev = tl.load(
+                K + dslot[:, None] * H * D + head * D + d[None, :], dev, 0.0
+            )
+            v_dev = tl.load(
+                V + dslot[:, None] * H * D + head * D + d[None, :], dev, 0.0
+            )
+            k_host = tl.load(HK + koff, host, 0.0)
+            v_host = tl.load(HV + koff, host, 0.0)
+            k_new = tl.load(NK + nkoff, valid[:, None], 0.0)
+            v_new = tl.load(NV + nvoff, valid[:, None], 0.0)
+            k = tl.where(
+                fresh[:, None],
+                k_new,
+                tl.where((dslot > 0)[:, None], k_dev, k_host),
+            )
+            v = tl.where(
+                fresh[:, None],
+                v_new,
+                tl.where((dslot > 0)[:, None], v_dev, v_host),
+            )
+        else:
+            oldoff = slot[:, None] * H * D + head * D + d[None, :]
+            nkoff = input_row.to(tl.int64)[:, None] * NK_STRIDE + head * D + d[None, :]
+            nvoff = input_row.to(tl.int64)[:, None] * NV_STRIDE + head * D + d[None, :]
+            kp = tl.where(fresh[:, None], NK + nkoff, K + oldoff)
+            vp = tl.where(fresh[:, None], NV + nvoff, V + oldoff)
+            k = tl.load(kp, valid[:, None], 0.0)
+            v = tl.load(vp, valid[:, None], 0.0)
         outoff = (row.to(tl.int64) * S + c[:, None]) * H * D + head * D + d[None, :]
         tl.store(OK + outoff, k, (c < S)[:, None])
         tl.store(OV + outoff, v, (c < S)[:, None])
@@ -111,8 +149,17 @@ def _qsa_fused_kv_prepare(
         v = tl.load(NV + row.to(tl.int64) * NV_STRIDE + head * D + d).to(
             V.dtype.element_ty
         )
-        tl.store(K + slot * H * D + head * D + d, k, slot != 0)
-        tl.store(V + slot * H * D + head * D + d, v, slot != 0)
+        if HOST:
+            # Write-through: the host tier always receives the token, and the
+            # device tier only when the slot is resident.
+            dslot = tl.where((slot > 0) & (slot < RW), slot, -1)
+            tl.store(HK + slot * H * D + head * D + d, k, slot != 0)
+            tl.store(HV + slot * H * D + head * D + d, v, slot != 0)
+            tl.store(K + dslot * H * D + head * D + d, k, dslot > 0)
+            tl.store(V + dslot * H * D + head * D + d, v, dslot > 0)
+        else:
+            tl.store(K + slot * H * D + head * D + d, k, slot != 0)
+            tl.store(V + slot * H * D + head * D + d, v, slot != 0)
     elif head == 0:
         if EXPAND:
             n = tl.minimum((tl.load(LENGTH + row) // RATIO), IB) * RATIO
@@ -146,6 +193,9 @@ def fused_kv_prepare(
     query_positions=None,
     chain_positions=False,
     visible_page_size=0,
+    host_k=None,
+    host_v=None,
+    resident_tokens=0,
 ):
     """With block indices (compress_ratio > 1) and ``visible_page_size`` set, a
     row's packed K/V is written only up to its valid count rounded up to that
@@ -189,5 +239,9 @@ def fused_kv_prepare(
         input_topk,
         chain_positions,
         visible_page_size if compress_ratio > 1 else 0,
+        host_k if host_k is not None else k_cache,
+        host_v if host_v is not None else v_cache,
+        resident_tokens,
+        host_k is not None,
         num_warps=4,
     )
