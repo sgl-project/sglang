@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import hashlib
+import importlib
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -86,13 +87,30 @@ def get_eviction_strategy(
     return factory(**config) if config else factory()
 
 
+# (enabled, module, function): the module is imported only when enabled, since
+# importing a transfer backend package requires its optional library.
+_CUSTOM_MEM_POOL_PROVIDERS: List[Tuple[Callable[[], bool], str, str]] = [
+    (
+        lambda: envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None,
+        "sglang.srt.disaggregation.mooncake.utils",
+        "init_mooncake_custom_mem_pool",
+    ),
+    (
+        lambda: envs.SGLANG_MORI_BACKEND.get().strip().lower() == "fabric",
+        "sglang.srt.disaggregation.mori.custom_mem_pool",
+        "init_mori_custom_mem_pool",
+    ),
+]
+
+
 def maybe_init_custom_mem_pool(
     device: str,
 ) -> Tuple[bool, Optional[Any], Optional[str]]:
     """
     Initialize custom memory pool based on environment variable.
 
-    This function can be modified to support more features that require a custom memory pool.
+    Each provider decides from its own configuration whether it applies; the
+    first one that does owns the pool.
 
     Args:
         device: The device to allocate memory on
@@ -100,19 +118,13 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
-
-    if enable_custom_mem_pool:
-        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
-        from sglang.srt.disaggregation.mooncake.utils import (
-            init_mooncake_custom_mem_pool,
-        )
-
-        return init_mooncake_custom_mem_pool(device)
-    else:
-        return False, None, None
+    for enabled, module, function in _CUSTOM_MEM_POOL_PROVIDERS:
+        if not enabled():
+            continue
+        result = getattr(importlib.import_module(module), function)(device)
+        if result[0]:
+            return result
+    return False, None, None
 
 
 def get_hash_str(
