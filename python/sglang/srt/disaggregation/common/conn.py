@@ -1030,16 +1030,13 @@ class CommonKVManager(BaseKVManager):
         )
 
     def _send_abort_ack(self, room: int, target: AckTarget) -> None:
-        """Best-effort ack that this rank's transfer for an aborted room drained."""
-        try:
-            na = NetworkAddress(target.ip, target.port)
-            self._send_multipart_locked(
-                na.to_tcp(),
-                AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
-                is_ipv6=na.is_ipv6,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+        """Send this rank's drained ACK; the caller retains failed targets."""
+        na = NetworkAddress(target.ip, target.port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            AbortAck(room, self._prefill_unique_rank(), target.generation).to_zmq(),
+            is_ipv6=na.is_ipv6,
+        )
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
         """Send the deferred ack once an aborted room's chunks have drained
@@ -1057,8 +1054,19 @@ class CommonKVManager(BaseKVManager):
     ) -> None:
         # With prefill TP < decode TP several decode ranks share one room and
         # each sends its own ABORT; fan the ACK out to every one of them.
-        for target in (targets or {}).values():
-            self._send_abort_ack(room, target)
+        for target in tuple((targets or {}).values()):
+            try:
+                self._send_abort_ack(room, target)
+            except Exception as error:
+                # The drain verdict is still valid. Retain a failed delivery
+                # for a later drain check, without replacing a newer generation
+                # registered while the socket send was in progress.
+                if room not in self._deferred_ack_poisoned_rooms:
+                    pending = self._deferred_ack_targets.setdefault(room, {})
+                    pending.setdefault((target.ip, target.port), target)
+                logger.debug(
+                    "Failed to send drained ABORT_ACK for room %s: %s", room, error
+                )
 
     def register_deferred_ack_target(self, room: int, target: AckTarget) -> None:
         """Hold this generation's ACK until the room's transfer drains.
