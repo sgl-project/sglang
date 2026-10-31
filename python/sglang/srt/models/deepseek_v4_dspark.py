@@ -28,6 +28,9 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import (
+    remap_dspark_weight_name_npu,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1037,11 +1040,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         for name, loaded_weight in weights:
             mapped = (
-                self._remap_dspark_weight_name_npu(name)
+                remap_dspark_weight_name_npu(name)
                 if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:
+                continue
+            if _is_npu and mapped in ("embed_tokens.weight", "lm_head.weight"):
+                if not self.uses_own_vocab_modules:
+                    continue
+                stage_idx = int(name.split(".", 2)[1])
+                vocab_stage = (
+                    0 if mapped == "embed_tokens.weight" else self.num_stages - 1
+                )
+                if stage_idx != vocab_stage:
+                    continue
+            if mapped.startswith("confidence_head.") and self.confidence_head is None:
                 continue
             if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
                 mapped = mapped.replace(
@@ -1156,64 +1170,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
-        return f"stages.{stage_id}.{mapped_rest}"
-
-    def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
-        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-            return None
-        if "rotary_emb.inv_freq" in name:
-            return None
-
-        if not name.startswith("mtp."):
-            return None
-        parts = name.split(".", 2)
-        if len(parts) < 3:
-            return None
-        stage_id, rest = parts[1], parts[2]
-        if not stage_id.isdigit():
-            return None
-        stage_idx = int(stage_id)
-        if rest in ("embed.weight", "embed_tokens.weight"):
-            return (
-                "embed_tokens.weight"
-                if self.uses_own_vocab_modules and stage_idx == 0
-                else None
-            )
-        if rest in ("head.weight", "lm_head.weight"):
-            return (
-                "lm_head.weight"
-                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
-                else None
-            )
-        if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-            return None
-
-        if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.') :]}"
-
-        if rest.startswith("confidence_head."):
-            if self.confidence_head is None:
-                return None
-            return f"confidence_head.{rest[len('confidence_head.') :]}"
-
-        mapped_rest = rest
-        if mapped_rest.startswith("attn."):
-            mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-        elif mapped_rest.startswith("ffn."):
-            mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
-        elif mapped_rest.startswith("attn_norm."):
-            mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
-        elif mapped_rest.startswith("ffn_norm."):
-            mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
-                "ffn_norm."
-            )
-        mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
-        mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
-        mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-        mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        if mapped_rest.endswith(".scale"):
-            mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"
 
 

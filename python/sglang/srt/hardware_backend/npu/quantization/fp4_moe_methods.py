@@ -11,7 +11,11 @@ import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
-    prepare_w4a8_mxfp_weight,
+)
+from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    build_ascend_quant_info,
+    create_ascend_moe_runner,
+    process_npu_fp4_expert_weights,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
@@ -120,7 +124,6 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
-        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.utils import (
             MoeRunnerBackend,
             get_moe_runner_backend,
@@ -134,10 +137,12 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
                 f"NPU W4A8 MXFP4 requires the Ascend MoE runner, got {backend.value}"
             )
 
-        layer.w13_kernel = self.w13_kernel
-        layer.w2_kernel = self.w2_kernel
-        moe_runner_config.layer = layer
-        self.runner = MoeRunner(backend, moe_runner_config)
+        self.runner = create_ascend_moe_runner(
+            layer,
+            moe_runner_config,
+            w13_kernel=self.w13_kernel,
+            w2_kernel=self.w2_kernel,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
@@ -156,18 +161,13 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
-        layer.w13_weight.data, w13_scale = prepare_w4a8_mxfp_weight(
-            layer.w13_weight.data.view(torch.uint8),
-            layer.w13_weight_scale_inv.data,
-            npu_format=nz_format,
+        process_npu_fp4_expert_weights(layer, npu_format=nz_format)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            layer.w13_weight_scale_inv.data, requires_grad=False
         )
-        layer.w2_weight.data, w2_scale = prepare_w4a8_mxfp_weight(
-            layer.w2_weight.data.view(torch.uint8),
-            layer.w2_weight_scale_inv.data,
-            npu_format=nz_format,
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            layer.w2_weight_scale_inv.data, requires_grad=False
         )
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
@@ -175,15 +175,8 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
             )
 
     def apply(self, layer: torch.nn.Module, dispatch_output: "DispatchOutput"):
-        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
         if self.runner is None:
             raise RuntimeError("The NPU FP4 MoE runner has not been initialized")
 
-        quant_info = AscendQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_weight_scale=layer.w13_weight_scale_inv,
-            w2_weight_scale=layer.w2_weight_scale_inv,
-        )
+        quant_info = build_ascend_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
