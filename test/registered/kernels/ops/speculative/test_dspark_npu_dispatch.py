@@ -102,7 +102,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         logits[2, 10] = float("inf")
         expected_top1 = logits.cpu().argmax(-1)
         with mock.patch.object(sample, "row_argmax", wraps=sample.row_argmax) as kernel:
-            actual = _row_argmax(logits)
+            actual = _row_argmax(logits, fused=True)
         kernel.assert_called_once_with(logits)
         self.assertTrue(torch.equal(actual.cpu(), expected_top1))
         predict = expected_top1.reshape(rows, block)
