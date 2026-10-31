@@ -79,8 +79,13 @@ Agentic workloads, such as coding agents and other multi-turn, tool-using assist
 
 import { AgentX } from "/src/snippets/_agentx.jsx";
 import { agentx } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next.jsx";
+import { b300Cells } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next-b300.jsx";
 
-<AgentX data={agentx} />
+The B300 HiCache configurations reserve 298 GB of host memory for the combined target/draft KV and Mamba pool, in addition to pinned PLE embeddings and process overhead. Provision sufficient free host RAM and container shared memory before starting them. GPU KV configurations also offload PLE embeddings to host memory.
+
+For the B300 NVIDIA configurations at concurrency 12 and above, `--mamba-track-interval 262144` reduces intermediate state checkpoints. The concurrency-80 configuration also uses `--strip-thinking-cache` and `--mamba-max-states-per-path 2`. These settings target replay traffic that does not resend model output; reassess prefix reuse for conversational clients that do.
+
+<AgentX data={{ ...agentx, cells: [...agentx.cells, ...b300Cells] }} />
 
 ### MI355X deployment measured with SemiAnalysis InferenceX
 

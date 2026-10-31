@@ -19,14 +19,14 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-32B | Ascend A3 Series Products | 8 | PD Mixed | 18k+4k | 6ms | BF16 | [Optimal Configuration](#qwen3-32b-bf16-8p-in18k-out4k-6ms) |
+| Qwen3-32B | A3 Series Products | 8 | PD Mixed | 18k+4k | 6ms | BF16 | [Optimal Configuration](#qwen3-32b-bf16-8p-in18k-out4k-6ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-32B | Ascend A3 Series Products | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) |
-| Qwen3-32B | Ascend A2 Series Products | 2 | PD Mixed | 3.5k+1.5k | 55ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) |
+| Qwen3-32B | A3 Series Products | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) |
+| Qwen3-32B | A2 Series Products | 2 | PD Mixed | 3.5k+1.5k | 55ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) |
 
 ## Optimal Configuration
 
@@ -36,7 +36,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: Qwen3-32B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 8
 
@@ -133,7 +133,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-32B
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 2
 
@@ -232,7 +232,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3-32B
 
-**Hardware**: Ascend A2 Series Products
+**Hardware**: A2 Series Products
 
 **Cards**: 2
 
