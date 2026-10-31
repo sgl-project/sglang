@@ -319,13 +319,19 @@ class FlashAttentionBackend(AttentionBackend):
         self.fa3_upgrades_to_fa4 = (
             self.fa_impl_ver == 3 and not self.use_mla and model_head_dim > 256
         )
+        device_capability = get_device_capability()
+        if self.fa3_upgrades_to_fa4 and device_capability[0] < 9:
+            raise ValueError(
+                f"The fa3 backend runs head_dim {model_head_dim} layers on FA4, "
+                "which requires SM90 or newer for paged KV cache. "
+                "Use --attention-backend triton on SM8x."
+            )
         if self.fa3_upgrades_to_fa4 and self.kv_cache_dtype != torch.bfloat16:
             raise ValueError(
                 f"FA4 has no {self.kv_cache_dtype_str} KV cache path on SM90, and "
                 f"the fa3 backend runs head_dim {model_head_dim} layers on FA4. "
                 "Use a BF16 KV cache."
             )
-        device_capability = get_device_capability()
         self._init_flash_attention_functions(device_capability)
 
         # Store head info for precomputing FA3 scheduler metadata
