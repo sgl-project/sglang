@@ -24,6 +24,8 @@ The per-device workspace is reused by every seam; seams on one stream run in ord
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -346,6 +348,8 @@ def hc_gated_combine(
     y: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     """R' = bf16(R + gate[c] * y) with a precomputed fp32 gate [M, HC]."""
+    rows = residual.shape[0]
+    assert y.shape == (rows, HS) and gate.shape == (rows, HC)
     out = torch.empty_like(residual)
     total = residual.numel()
     _hc_combine_apply_kernel[(triton.cdiv(total, KC_BLOCK),)](
@@ -355,13 +359,13 @@ def hc_gated_combine(
 
 
 def hc_seam(
-    y,
+    y: Optional[torch.Tensor],
     residual: torch.Tensor,
-    gate_prev,
+    gate_prev: Optional[torch.Tensor],
     norm_w: torch.Tensor,
     w_down: torch.Tensor,
     w_up: torch.Tensor,
-    w_inject_next,
+    w_inject_next: Optional[torch.Tensor],
     eps: float,
 ):
     """Combine (when ``y`` is given) + norm + low-rank gated mix (+ the next combine's gate).
@@ -372,6 +376,8 @@ def hc_seam(
     rows = residual.shape[0]
     if rows > MAX_ROWS:
         raise ValueError(f"hc_seam: {rows} rows, the workspace holds 1..{MAX_ROWS}")
+    if y is not None:
+        assert y.shape == (rows, HS) and gate_prev.shape == (rows, HC)
     bm = max(16, triton.next_power_of_2(rows)) if rows <= _ROW_TILE else _ROW_TILE
     row_tiles = triton.cdiv(rows, bm)
     device = residual.device

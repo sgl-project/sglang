@@ -296,7 +296,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional[DualGemmQuantMode] = None,
+    quant_mode: Optional["DualGemmQuantMode"] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -528,6 +528,7 @@ for _fn in ("hc_seam", "hc_gated_combine"):
             capabilities=frozenset({CapabilityRequirement.HIP}),
         )
     )
+del _fn
 register_kernel(
     KernelSpec(
         op="gemm.w8a8_block_fp8_matmul_triton",
