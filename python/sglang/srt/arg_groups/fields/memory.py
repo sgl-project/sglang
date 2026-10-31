@@ -256,7 +256,7 @@ class Memory(msgspec.Struct):
     enable_hi_engram: A[
         Optional[str],
         Arg(
-            help="Enable HiCache Engram storage in local or remote mode. Remote is not yet supported.",
+            help="Enable HiCache Engram storage: local CPU tables or node-sharded DeepEP RDMA.",
             choices=["local", "remote"],
         ),
     ] = None

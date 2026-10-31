@@ -21,8 +21,15 @@ class HiCacheVocabParallelEmbedding(VocabParallelEmbedding):
 
     def __init__(self, *args, **kwargs):
         config = get_memory()
-        rows = create_storage(config.enable_hi_engram, config.hi_engram_config)
-        with torch.device("cpu"):
+        bounds = kwargs.pop("engram_head_bounds", None)
+        namespace = kwargs.pop("engram_namespace", None)
+        rows = create_storage(
+            config.enable_hi_engram,
+            config.hi_engram_config,
+            head_bounds=bounds,
+            namespace=namespace,
+        )
+        with torch.device("meta" if config.enable_hi_engram == "remote" else "cpu"):
             super().__init__(*args, **kwargs)
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise ValueError("HiCache Engram requires an uncompressed row tensor")
@@ -31,6 +38,26 @@ class HiCacheVocabParallelEmbedding(VocabParallelEmbedding):
         self.quant_method = None
         self._rows = rows
         self._rows_initialized = False
+        if config.enable_hi_engram == "remote":
+            old_weight = self.weight
+            self.weight = torch.nn.Parameter(
+                torch.empty(
+                    (rows.row_end - rows.row_start, self.embedding_dim),
+                    dtype=old_weight.dtype,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+            self.weight.__dict__.update(old_weight.__dict__)
+            self.storage_row_start, self.storage_row_end = rows.row_start, rows.row_end
+
+    def weight_loader(self, param, loaded_weight):
+        if self._rows.remote is not None:
+            param.data.copy_(
+                loaded_weight[self.storage_row_start : self.storage_row_end]
+            )
+            return
+        return super().weight_loader(param, loaded_weight)
 
     def _embed_local_shard(self, input_):
         if not self._rows_initialized:
@@ -38,6 +65,20 @@ class HiCacheVocabParallelEmbedding(VocabParallelEmbedding):
             # Storage owns the rows now; keep only the parameter's dtype/metadata.
             self.weight.data = self.weight.new_empty(0)
             self._rows_initialized = True
+        if self._rows.remote is not None:
+            # Keep computational TP ownership exactly as before. Only the
+            # physical owner of each selected row is resolved by EngramStore.
+            mask = (input_ < self.shard_indices.org_vocab_start_index) | (
+                input_ >= self.shard_indices.org_vocab_end_index
+            )
+            ids = input_.masked_fill(mask, -1)
+            with use_symmetric_memory(
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+            ):
+                out = self._rows.lookup(ids).view(self.weight.dtype)
+                return (
+                    out.to(self.output_dtype) if self.output_dtype is not None else out
+                )
         if self.tp_size > 1:
             ids, mask = get_masked_input_and_mask(
                 input_,

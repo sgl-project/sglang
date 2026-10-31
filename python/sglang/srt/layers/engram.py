@@ -64,7 +64,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_memory, get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -1011,7 +1011,40 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        if (
+        self._hi_rows = None
+        if get_memory().enable_hi_engram is not None:
+            from sglang.srt.mem_cache.engram import create_storage
+
+            self._hi_rows = create_storage(
+                get_memory().enable_hi_engram,
+                get_memory().hi_engram_config,
+                head_bounds=column_bounds,
+                namespace=f"deepseek/engram/layer{layer_id}",
+            )
+            self._storage_row_start = (
+                self._hi_rows.row_start
+                if self._hi_rows.remote is not None
+                else self.row_start
+            )
+            storage_rows = (
+                self._hi_rows.row_end - self._storage_row_start
+                if self._hi_rows.remote is not None
+                else self.rows
+            )
+            self.weight = nn.Parameter(
+                torch.empty(storage_rows, dim, dtype=torch.float8_e4m3fn, device="cpu"),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                torch.empty(
+                    storage_rows,
+                    dim // FP8_BLOCK_SIZE,
+                    dtype=torch.float8_e8m0fnu,
+                    device="cpu",
+                ),
+                requires_grad=False,
+            )
+        elif (
             envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
             and self.tp_size > 1
             and is_cuda()
@@ -1079,6 +1112,10 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self._hi_rows is not None:
+            start = self._storage_row_start
+            param.data.copy_(loaded_weight[start : start + param.shape[0]])
+            return
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
             param.data[rows].copy_(loaded_weight[rows])
@@ -1090,6 +1127,10 @@ class EngramEmbedding(nn.Module):
     def finish_load(self, label: str):
         """Collective in the shared layout and with peer shards: every rank calls
         it after loading."""
+        if self._hi_rows is not None:
+            from sglang.srt.mem_cache.engram.deepseek import publish
+
+            publish(self, FP8_BLOCK_SIZE)
         if self.peer is not None:
             self.peer.connect(self.row_start, label)
         if self.host_table is not None:
@@ -1191,6 +1232,10 @@ class EngramEmbedding(nn.Module):
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
+        if self._hi_rows is not None:
+            from sglang.srt.mem_cache.engram.deepseek import lookup
+
+            return lookup(self, indices, FP8_BLOCK_SIZE)
         if self.rows == 0:
             return self.new_rows(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):
