@@ -56,7 +56,6 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
-from sglang.srt.runtime_context import max_speculative_num_draft_tokens
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -84,7 +83,6 @@ class UnlimitedOCRV2Metadata:
 
     __slots__ = (
         "is_decode",
-        "is_verify",
         "num_tokens",
         "num_reqs",
         "block_table",
@@ -302,7 +300,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         cs.st_marker[row] = marker
         cs.st_pp[row] = prompt_pages
         cs.cnt[row] = torch.tensor(counts, dtype=cs.cnt.dtype, device=cs.cnt.device)
-        cs.sp_pos0[row] = -1
 
     @torch.no_grad()
     def unpin_coord_rows(self, first_blocks: Optional[torch.Tensor]) -> None:
@@ -320,7 +317,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         cs.stamp.masked_fill_(pinned, 0)
 
     def _init_decode_buffer_slots(self) -> None:
-        """Declare the eager scratch and decode/verify graph buffer slots."""
+        """declare eager scratch and decode graph buffer slots"""
         self._idx_buf: Optional[torch.Tensor] = None
         self._bias_buf: Optional[torch.Tensor] = None
         self._eager_idx_buf: Optional[torch.Tensor] = None
@@ -343,13 +340,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self._img_allow_buf: Optional[torch.Tensor] = None
         self._kbar_plan_buf: Optional[tuple] = None
         self._win_bufs: Optional[tuple] = None
-        # Verify graphs use fixed buffers sized for speculative-token geometry.
-        self._vctx_buf: Optional[torch.Tensor] = None
-        self._vseq_buf: Optional[torch.Tensor] = None
-        self._vculen_buf: Optional[torch.Tensor] = None
-        self._kbar_all_plan_buf: Optional[tuple] = None
-        self._row2req_buf: Optional[torch.Tensor] = None
-        self._prefill_score_buf: Optional[torch.Tensor] = None
         # Fixed-address cos/sin per branch, allocated by init_cuda_graph_state.
         self._cos_sin_buf: dict = {}
 
@@ -396,13 +386,10 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             device=self.req_to_token.device,
         )
         max_reqs = int(self.req_to_token.shape[0]) + 8
-        # Snapshot capacity must cover an entire speculative verify step.
-        self.max_spec_slots = max(1, int(max_speculative_num_draft_tokens() or 1))
         self.coord_state = PageCoordState(
             sparse_cfg,
             max_reqs=max_reqs,
             max_pages=page_capacity(self.max_context_len),
-            max_spec_slots=self.max_spec_slots,
         )
         self.image_bucket_constraint = bool(
             sparse_cfg.get("image_bucket_constraint", False)
@@ -662,8 +649,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             self._refresh_prefill_state(md)
             return
         if not md.is_decode or md.query_allow is None:
-            if md.is_verify:
-                self._refresh_verify_state(md)
             return
         if not any(r.image_only for r in self.routers):
             return
@@ -679,32 +664,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         self._build_image_allow_decode(md)
         if _ENT_WINDOW:
             self._build_scan_window(md)
-
-    def _refresh_verify_state(self, md) -> None:
-        """Build the VERIFY step's router inputs eagerly, out of graph.
-
-        An over-capacity eager verify builds fresh plans instead of replacing the
-        fixed-address buffers captured by a graph.
-        """
-        plan_out = self._kbar_all_plan_buf if md.use_decode_twin else None
-        row2req_out = self._row2req_buf if md.use_decode_twin else None
-        md.kbar_plan = kbar_all_plan(
-            block_table=md.block_table,
-            seq_lens=md.seq_lens,
-            context_lens=md.context_lens,
-            block_size=self.block_size,
-            max_block=md.max_block,
-            max_query_len=md.max_query_len,
-            device=self.device,
-            out=plan_out,
-        )
-        md.row2req = prefill_row2req(
-            cu_seqlens_q=md.cu_seqlens_q,
-            device=self.device,
-            out=row2req_out,
-        )
-        if self.image_bucket_constraint and md.query_allow is not None:
-            self._build_image_allow_prefill(md)
 
     def _refresh_prefill_state(self, md) -> None:
         """Build plain-prefill router inputs in graph-stable storage."""
@@ -866,35 +825,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         view.copy_(src[:n])
         return view
 
-    # Verify graph kernels read these geometry tensors by stable address.
-    def _verify_ctx(self, md, verify_len: int) -> torch.Tensor:
-        buf = self._vctx_buf
-        n = md.num_reqs
-        if buf is None or buf.shape[0] < n:
-            return md.seq_lens.clone()
-        view = buf[:n]
-        view.copy_(md.seq_lens)
-        return view
-
-    def _verify_seq(self, md, verify_len: int) -> torch.Tensor:
-        buf = self._vseq_buf
-        n = md.num_reqs
-        if buf is None or buf.shape[0] < n:
-            return md.seq_lens + verify_len
-        view = buf[:n]
-        torch.add(md.seq_lens, verify_len, out=view)
-        return view
-
-    def _verify_cu_seqlens(self, md, verify_len: int) -> torch.Tensor:
-        buf = self._vculen_buf
-        n = md.num_reqs + 1
-        if buf is None or buf.shape[0] < n:
-            return torch.arange(n, device=self.device, dtype=torch.int32) * verify_len
-        view = buf[:n]
-        torch.arange(n, device=self.device, dtype=torch.int32, out=view)
-        view.mul_(verify_len)
-        return view
-
     def _build_metadata(self, forward_batch, *, graph_path: bool, in_capture: bool):
         # Document KV reuse queues copies and state rebuilds for this point so
         # they run on the forward stream before any kernel reads that state.
@@ -906,8 +836,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         md = self._new_step_metadata(forward_batch, graph_path=graph_path)
         # An in-graph refresh reads the graph-owned decode inputs directly.
         refresh_in_graph = self._refresh_recorded_in_graph(md)
-        verify_len = self._bind_kv_geometry(md, forward_batch, refresh_in_graph)
-        self._bind_query_geometry(md, forward_batch, refresh_in_graph, verify_len)
+        self._bind_kv_geometry(md, forward_batch, refresh_in_graph)
+        self._bind_query_geometry(md, forward_batch, refresh_in_graph)
         self._bind_page_geometry(md, forward_batch, refresh_in_graph)
         if not refresh_in_graph:
             self._shift_page_coords(md, forward_batch)
@@ -928,10 +858,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         """Classify the step and pick the graph-owned buffer set it may use."""
         md = UnlimitedOCRV2Metadata()
         md.is_decode = forward_batch.forward_mode.is_decode_or_idle()
-        # A speculative verify step is 1 + k GENERATED tokens per request, run
-        # through the prefill attend (query len > 1) but numbered like decode
-        # tokens: seq_lens is the COMMITTED length and the drafts sit past it.
-        md.is_verify = forward_batch.forward_mode.is_target_verify()
         md.num_tokens = int(forward_batch.input_ids.shape[0])
         # The full prefill graph's replay view pads input_ids to the captured
         # bucket; only the real tokens own KV slots.
@@ -940,16 +866,13 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 md.num_tokens, int(forward_batch.out_cache_loc.shape[0])
             )
         md.num_reqs = int(forward_batch.seq_lens.shape[0])
-        md.use_decode_twin = (
-            graph_path and self._cg_ready and (md.is_decode or md.is_verify)
-        )
+        md.use_decode_twin = graph_path and self._cg_ready and md.is_decode
         # Plain-prefill CUDA graph eligibility; such a step runs the FULL prefill
         # graph, so its kernels must read only the fixed-address `_p_*` twins.
         md.use_prefill_twin = bool(
             graph_path
             and self._pcg_ready
             and not md.is_decode
-            and not md.is_verify
             and md.num_tokens <= self._pcg_max_tokens
             and md.num_reqs <= self._pcg_max_reqs
         )
@@ -970,8 +893,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
 
     def _bind_kv_geometry(
         self, md: UnlimitedOCRV2Metadata, forward_batch, refresh_in_graph: bool
-    ) -> Optional[int]:
-        """Set lengths, block-table width and block table; return the verify length."""
+    ) -> None:
+        """bind lengths, block-table width and block table for the step"""
         seq_lens_src_buf = (
             self._p_seq_lens_buf if md.use_prefill_twin else self._seq_lens_buf
         )
@@ -987,14 +910,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             md.max_seq_len = self.max_context_len
         else:
             md.max_seq_len = int(seq_lens_cpu.max().item())
-        verify_len = None
-        if md.is_verify:
-            verify_len = max(1, md.num_tokens // max(1, md.num_reqs))
-            md.max_seq_len += verify_len
-            # Verify geometry must use buffers owned by the captured graph.
-            md.context_lens = self._verify_ctx(md, verify_len)
-            md.seq_lens = self._verify_seq(md, verify_len)
-            md.cu_seqlens_q = self._verify_cu_seqlens(md, verify_len)
         if _uses_static_width(
             use_decode_twin=md.use_decode_twin,
             use_prefill_twin=md.use_prefill_twin,
@@ -1012,14 +927,12 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             )
         else:
             md.block_table = self._block_table(forward_batch, md.max_block)
-        return verify_len
 
     def _bind_query_geometry(
         self,
         md: UnlimitedOCRV2Metadata,
         forward_batch,
         refresh_in_graph: bool,
-        verify_len: Optional[int],
     ) -> None:
         """Set query lengths, context lengths and cu_seqlens for the step kind."""
         if md.is_decode:
@@ -1037,9 +950,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                     view.clamp_(min=0)
                     md.context_lens = view
             md.cu_seqlens_q = None
-        elif md.is_verify:
-            md.decode_query_len = 0
-            md.max_query_len = verify_len
         else:
             md.decode_query_len = 0
             md.max_query_len = int(max(forward_batch.extend_seq_lens_cpu))
@@ -1067,12 +977,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
     ) -> None:
         """Set query pages, page2d coordinates and the candidate-page mask."""
         num_slots = self._index_pages() * self.block_size
-        # The fused path cannot rewind or snapshot speculative carry state.
         fused = (
-            md.is_decode
-            and md.decode_query_len == 1
-            and self.image_bucket_constraint
-            and self.max_spec_slots == 1
+            md.is_decode and md.decode_query_len == 1 and self.image_bucket_constraint
         )
         if fused:
             # Fuse page IDs and coordinates separately from the candidate mask;
@@ -1150,11 +1056,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         page.add_(torch.where(page > 0, per_tok, torch.zeros_like(per_tok)))
 
     def _layout(self, md: UnlimitedOCRV2Metadata, forward_batch) -> BatchLayout:
-        """Build page-state geometry for prefill, verify, or decode.
-
-        Verify uses response-page numbering despite its ragged layout.
-        Fixed-shape mapping avoids host synchronization.
-        """
+        """build fixed-shape prefill/decode page geometry without host synchronization"""
         device = self.device
         tok = torch.arange(md.num_tokens, device=device, dtype=torch.int64)
         gen_start = None
@@ -1171,9 +1073,8 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             req_of_token = torch.searchsorted(
                 q_start[1:].contiguous(), tok, right=True
             ).clamp_(max=md.num_reqs - 1)
-            if not md.is_verify:
-                rows = forward_batch.req_pool_indices[: md.num_reqs].long()
-                gen_start = self._gen_start_row[rows]
+            rows = forward_batch.req_pool_indices[: md.num_reqs].long()
+            gen_start = self._gen_start_row[rows]
         return BatchLayout(
             num_tokens=md.num_tokens,
             num_reqs=md.num_reqs,
@@ -1181,7 +1082,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             start_pos=start_pos,
             block_table=md.block_table,
             req_of_token=req_of_token,
-            num_decode_tokens=(md.num_tokens if (md.is_decode or md.is_verify) else 0),
+            num_decode_tokens=md.num_tokens if md.is_decode else 0,
             gen_start=gen_start,
         )
 
@@ -1420,14 +1321,10 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
     def _route_prefill(
         self, md, *, router, k_bar, kv, idx_q, head_cls, idx_buf, bias_buf
     ):
-        """Refresh summaries and route prefill / verify queries; return width."""
+        """refresh summaries and route prefill queries; return width"""
         if md.kbar_plan is None:
-            # VERIFY uses the verify-geometry `out=` twins, a plain-prefill
-            # FULL graph the prefill twins; eager/over-bucket prefill allocates.
-            if md.is_verify:
-                twins = self._kbar_all_plan_buf
-                row2req_out = self._row2req_buf
-            elif md.use_prefill_twin:
+            # full prefill graphs own their routing storage; eager prefill allocates
+            if md.use_prefill_twin:
                 twins = self._p_kbar_all_plan_buf
                 row2req_out = self._p_row2req_buf
             else:
@@ -1485,8 +1382,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
 
     def _prefill_score_scratch(self, md) -> Optional[torch.Tensor]:
         """Graph-owned prefill router score scratch, or None to allocate."""
-        if md.is_verify and md.use_decode_twin and self._prefill_score_buf is not None:
-            return self._prefill_score_buf
         if md.use_prefill_twin and self._p_score_buf is not None:
             return self._p_score_buf
         return None
@@ -1665,10 +1560,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             torch.zeros((self.cg_max_tokens,), dtype=torch.int32, device=dev),
             torch.zeros((self.cg_max_tokens,), dtype=torch.int8, device=dev),
         )
-        # Verify-step twins (spec decoding): max_num_tokens = max_bs * draft_tokens,
-        # so only these request-axis and plan tensors are unique to the branch.
-        if self.max_spec_slots > 1:
-            self._alloc_verify_graph_buffers(w, dev)
         # page2d cos/sin, one pair per branch (main head_dim, index
         # sparse_index_dim); `_refresh_cos_sin` refills them eagerly before replay.
         self._cos_sin_buf = self._alloc_cos_sin_pairs(self.cg_max_tokens, dev)
@@ -1685,28 +1576,6 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             self.max_context_len,
             self.block_size,
             SCAN_TILE if _ENT_WINDOW else 0,
-        )
-
-    def _alloc_verify_graph_buffers(self, w: int, dev) -> None:
-        """Allocate the fixed request-axis and plan buffers of verify graphs."""
-        verify_width = min(w, -(-self.max_spec_slots // self.block_size) + 1)
-        plan_len = self.cg_max_bs * verify_width
-        self._vctx_buf = torch.zeros((self.cg_max_bs,), dtype=torch.int32, device=dev)
-        self._vseq_buf = torch.zeros((self.cg_max_bs,), dtype=torch.int32, device=dev)
-        self._vculen_buf = torch.zeros(
-            (self.cg_max_bs + 1,), dtype=torch.int32, device=dev
-        )
-        self._kbar_all_plan_buf = (
-            torch.zeros((plan_len,), dtype=torch.int64, device=dev),
-            torch.zeros((plan_len,), dtype=torch.int32, device=dev),
-        )
-        self._row2req_buf = torch.zeros(
-            (self.cg_max_tokens,), dtype=torch.int32, device=dev
-        )
-        # route_prefill_triton's per-chunk score scratch, [q_chunk, W]; the
-        # eager path allocates it fresh, the replayed graph must not.
-        self._prefill_score_buf = torch.empty(
-            (self.q_chunk, w), dtype=torch.float32, device=dev
         )
 
     def _alloc_cos_sin_pairs(self, rows: int, dev) -> dict:

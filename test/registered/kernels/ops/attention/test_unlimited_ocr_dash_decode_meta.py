@@ -235,7 +235,6 @@ def _decode_backend(prompts, page_state, coord_state, bt, *, graph: bool):
     b.local_blocks = 1
     b.buf_width = 4
     b.num_layers = 0
-    b.max_spec_slots = 1
     b.image_bucket_constraint = True
     b.max_context_len = WIDTH * BS
     b.max_block_static = WIDTH

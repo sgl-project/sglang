@@ -133,19 +133,29 @@ class TestPromptPlanning(CustomTestCase):
 
 
 class TestStateReplay(CustomTestCase):
-    def test_coords_match_streaming_state(self):
+    def test_coords_are_independent_of_prefill_chunk_boundaries(self):
+        """single-token prompt chunks and decode must use the same page counters"""
         ids = prompt([(0, 2), (1, 3)]) + [PAGE, 40, 41, PAGE, 42]
         gen = len(prompt([(0, 2), (1, 3)]))
-        state = PageCoordState(CFG, max_reqs=2, max_pages=16)
-        _, page = state.step(torch.tensor(ids[:gen]), layout(0, gen, False))
-        pages = page.tolist()
-        for pos in range(gen, len(ids)):
-            _, page = state.step(torch.tensor([ids[pos]]), layout(pos, 1, True))
-            pages += page.tolist()
         replay, (mc, pp, cnt) = r.replay_coords(ids, gen, PAGE, IMG, 16)
-        self.assertEqual(replay, pages)
-        self.assertEqual((mc, pp), (int(state.st_marker[0]), int(state.st_pp[0])))
-        self.assertEqual(cnt, state.cnt[0].tolist())
+        for chunk in (1, 2, 3, gen):
+            with self.subTest(chunk=chunk):
+                state = PageCoordState(CFG, max_reqs=2, max_pages=16)
+                pages = []
+                for start in range(0, gen, chunk):
+                    end = min(start + chunk, gen)
+                    _, page = state.step(
+                        torch.tensor(ids[start:end]), layout(start, end - start, False)
+                    )
+                    pages += page.tolist()
+                for pos in range(gen, len(ids)):
+                    _, page = state.step(torch.tensor([ids[pos]]), layout(pos, 1, True))
+                    pages += page.tolist()
+                self.assertEqual(replay, pages)
+                self.assertEqual(
+                    (mc, pp), (int(state.st_marker[0]), int(state.st_pp[0]))
+                )
+                self.assertEqual(cnt, state.cnt[0].tolist())
 
     def test_default_page_capacity_keeps_long_documents_distinct(self):
         """Pages past the coordinate capacity are clamped onto one page; a

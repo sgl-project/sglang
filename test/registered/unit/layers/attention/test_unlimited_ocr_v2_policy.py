@@ -263,7 +263,6 @@ class TestUnlimitedOCRV2FusedDecodePaths(CustomTestCase):
         backend.max_block_static = 8
         backend.max_context_len = 256
         backend.block_size = 32
-        backend.max_spec_slots = 1
         backend.image_bucket_constraint = True
         backend._cos_sin_cache = {}
         backend.forward_metadata = None
@@ -271,7 +270,6 @@ class TestUnlimitedOCRV2FusedDecodePaths(CustomTestCase):
             forward_mode=SimpleNamespace(
                 is_idle=lambda: False,
                 is_decode_or_idle=lambda: True,
-                is_target_verify=lambda: False,
             ),
             input_ids=torch.arange(4),
             seq_lens=torch.tensor([8, 7, 6, 1], dtype=torch.int64),
