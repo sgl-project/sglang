@@ -28,6 +28,16 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>false</code></td>
     </tr>
     <tr>
+      <td><code>SGLANG_NPU_USE_FLASH_MLA</code></td>
+      <td>Enables FlashMLA for target-model MLA attention during DSPARK verification, such as Kimi-K3. Applies to eager execution and graph replay. Does not enable FlashMLA on draft workers or ordinary non-speculative decode.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>ASCEND_USE_PAGED_MTP</code></td>
+      <td>Enables <code>paged_mtp_attention_decode</code> for draft-model MHA attention in DSPARK, such as the Kimi-K3 DSpark draft model. Applies to eager execution and graph replay. Does not change target-model attention or ordinary non-speculative decode.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_USE_MULTI_STREAM</code></td>
       <td>Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek DSA Indexer.</td>
       <td><code>false</code></td>
@@ -44,6 +54,24 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
   </tbody>
 </table>
+
+### Kimi-K3 speculative attention
+
+Use these switches to optimize DSPARK target verification and draft attention on Ascend NPUs.
+Install a version of `sgl-kernel-npu` that provides `sgl_kernel_npu.attention.flash_mla` and
+`sgl_kernel_npu.attention.paged_mtp_attention` for your NPU. Set the variables in the server
+environment on every rank before launching with `--speculative-algorithm DSPARK`:
+
+```bash
+export SGLANG_NPU_USE_FLASH_MLA=1
+export ASCEND_USE_PAGED_MTP=1
+```
+
+You can enable either kernel independently. To also avoid CPU sequence-length mirror and host
+attention-parameter updates in these speculative paths, enable both kernels and set
+`SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0`. Its default is `1`; the two kernel switches
+alone do not disable CPU mirrors. Setting either kernel switch to `0` keeps the existing
+attention path for that worker.
 
 ## Used in DeepEP Ascend
 

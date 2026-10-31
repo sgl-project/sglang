@@ -56,6 +56,7 @@ def _kvc():
         server_args=types.SimpleNamespace(enable_hisparse=False),
         mambaish_config=None,
         is_draft_worker=False,
+        use_combined_kv_buffer=False,
         kv_cache_dtype=torch.bfloat16,
         device="cpu",
     )
