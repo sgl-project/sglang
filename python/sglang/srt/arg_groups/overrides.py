@@ -979,7 +979,6 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
             and view.tp_size in SUPPORTED_TP_SIZES
             and view.attn_cp_size == 1
             and not view.encoder_only
-            and not view.enable_pdmux
         ):
             return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.

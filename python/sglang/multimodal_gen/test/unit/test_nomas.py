@@ -710,6 +710,54 @@ def test_event_plan_and_budget():
         check_cache_budget(config, 10080, free_bytes=9 * 2**30)
 
 
+def test_free_bytes_counts_freed_memory_held_by_the_allocator(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        _free_bytes,
+    )
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (10, 100))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 50)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 20)
+    assert _free_bytes(torch.device("cuda", 0)) == 40
+
+
+@pytest.mark.parametrize(
+    "frames, flush, ok", [(13, False, True), (17, False, False), (4, True, True)]
+)
+def test_sequence_parallel_indivisible_segment_rejected_by_input_validation(
+    monkeypatch, frames, flush, ok
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas import (
+        stages,
+    )
+    from sglang.multimodal_gen.runtime.realtime.nomas import NOMAS_FLUSH_CONDITION
+
+    monkeypatch.setattr(
+        stages.RealtimeInputValidationStage, "forward", lambda self, batch, args: batch
+    )
+    # 352x640 is 220 tokens per latent frame: 4 latents split over 8 ranks, 5 do not.
+    monkeypatch.setattr(stages, "get_ulysses_ctx", lambda: (8, 0))
+    batch = SimpleNamespace(
+        height=352,
+        width=640,
+        num_frames=frames,
+        prompt="road",
+        segments=None,
+        continuation_prompts=None,
+        prompt_format="plain",
+        condition_inputs={NOMAS_FLUSH_CONDITION: flush},
+        session=None,
+        extra={},
+    )
+    args = SimpleNamespace(pipeline_config=NomasPipelineConfig())
+    stage = object.__new__(stages.NomasInputValidationStage)
+    if ok:
+        stage.forward(batch, args)
+    else:
+        with pytest.raises(ValueError, match="sequence-parallel"):
+            stage.forward(batch, args)
+
+
 def test_action_windows_and_camera_gate_follow_upstream():
     """Malformed action timing must degrade to full attention, not reject the
     request, and a camera-on segment must not carry a gate mask."""
