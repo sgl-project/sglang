@@ -55,6 +55,32 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_kv_layers
 from sglang.srt.runtime_context import get_device, get_parallel
 
+# int32 elements per 16 bytes: attention kernels may specialize on alignment.
+_SEGMENT_ALIGN = 4
+
+
+def _lists_to_device(
+    lists: dict[str, list[int]], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Upload int32 host lists as 16-byte-aligned views of one device buffer.
+
+    A pageable ``torch.tensor(..., device=cuda)`` is a synchronous copy that
+    waits for queued work on the stream; one pinned non-blocking copy is ordered
+    on the current stream without blocking the host.
+    """
+    flat: list[int] = []
+    starts: list[int] = []
+    for values in lists.values():
+        starts.append(len(flat))
+        flat.extend(values)
+        flat.extend([0] * (-len(flat) % _SEGMENT_ALIGN))
+    host = torch.tensor(flat, dtype=torch.int32, pin_memory=device.type == "cuda")
+    buffer = host.to(device, non_blocking=True)
+    return {
+        name: buffer[start : start + len(values)]
+        for (name, values), start in zip(lists.items(), starts)
+    }
+
 
 @dataclass
 class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
@@ -236,6 +262,20 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         assert sorted(cp_reverse_index) == list(range(bs * cp_segment_num))
         assert sum(per_rank_actual_token) == total_seq_lens
 
+        device_lists = {
+            "kv_len_prev_tensor": kv_len_prev_list,
+            "kv_len_next_tensor": kv_len_next_list,
+            "cu_seqlens_kv_prev_tensor": cu_kv_prev,
+            "cu_seqlens_kv_next_tensor": cu_kv_next,
+            "actual_seq_q_prev_tensor": actual_seq_q_prev_list,
+            "actual_seq_q_next_tensor": actual_seq_q_next_list,
+            "cu_seqlens_q_prev_tensor": cu_prev,
+            "cu_seqlens_q_next_tensor": cu_next,
+            "actual_seq_q_combined_tensor": actual_seq_q_combined_list,
+            "kv_len_combined_tensor": kv_len_combined_list,
+            "cu_seqlens_q_combined_tensor": cu_q_combined,
+            "cu_seqlens_kv_combined_tensor": cu_kv_combined,
+        }
         return ZigzagContextParallelMetadata(
             split_list=split_list,
             zigzag_index=zigzag_index,
@@ -243,42 +283,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             reverse_split_len=reverse_split_len,
             per_rank_actual_token=per_rank_actual_token,
             max_rank_len=max_rank_len,
-            kv_len_prev_tensor=torch.tensor(
-                kv_len_prev_list, device=device, dtype=torch.int32
-            ),
-            kv_len_next_tensor=torch.tensor(
-                kv_len_next_list, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_kv_prev_tensor=torch.tensor(
-                cu_kv_prev, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_kv_next_tensor=torch.tensor(
-                cu_kv_next, device=device, dtype=torch.int32
-            ),
-            actual_seq_q_prev_tensor=torch.tensor(
-                actual_seq_q_prev_list, device=device, dtype=torch.int32
-            ),
-            actual_seq_q_next_tensor=torch.tensor(
-                actual_seq_q_next_list, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_q_prev_tensor=torch.tensor(
-                cu_prev, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_q_next_tensor=torch.tensor(
-                cu_next, device=device, dtype=torch.int32
-            ),
-            actual_seq_q_combined_tensor=torch.tensor(
-                actual_seq_q_combined_list, device=device, dtype=torch.int32
-            ),
-            kv_len_combined_tensor=torch.tensor(
-                kv_len_combined_list, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_q_combined_tensor=torch.tensor(
-                cu_q_combined, device=device, dtype=torch.int32
-            ),
-            cu_seqlens_kv_combined_tensor=torch.tensor(
-                cu_kv_combined, device=device, dtype=torch.int32
-            ),
+            **_lists_to_device(device_lists, device),
             total_q_prev_tokens=cu_prev[-1],
             total_q_next_tokens=cu_next[-1],
             max_seqlen_q_prev=(
