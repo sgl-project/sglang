@@ -187,6 +187,10 @@ class TestMambaCompaction(CustomTestCase):
             with self.subTest(writer=writer):
                 f = self._fixture("cuda")
                 f.alloc.free(f.ids[8:16])
+                n = f.spec.entry_bytes()
+                # The slots the flush moves: a backup reads them, and must see
+                # their bytes after the move.
+                moved = [f.original_pages[i] for i in range(f.count - 8, f.count)]
                 stream = torch.cuda.Stream()
                 done = torch.cuda.Event()
                 host = torch.empty(f.raw.shape, dtype=torch.uint8, pin_memory=True)
@@ -198,7 +202,11 @@ class TestMambaCompaction(CustomTestCase):
                     # pending before entry; don't count already-fired coverage.
                     torch.cuda._sleep(1_000_000_000)
                     if writer == "write":
-                        host.copy_(f.pool.raw, non_blocking=True)
+                        for page in moved:
+                            host[page * n : (page + 1) * n].copy_(
+                                f.pool.raw[page * n : (page + 1) * n],
+                                non_blocking=True,
+                            )
                     else:
                         f.pool.raw.copy_(host, non_blocking=True)
                     done.record()
@@ -209,12 +217,30 @@ class TestMambaCompaction(CustomTestCase):
                     f.alloc.set_latest_forward_done_event(done)
                     f.alloc.set_inflight_forward(done, f.ids)
                 else:
+                    # A load writes every slot; a backup reads the moved ones.
                     f.alloc.set_hicache_transfer_done_event(writer, done)
+                    f.alloc.record_transfer(done, f.ids, writes=writer == "load")
                 self.assertEqual(f.alloc.flush_for_allocation(), 8)
+                if writer == "write":
+                    # The vacated slots, retaken and overwritten after the
+                    # backup's fence.
+                    retaken = f.alloc.take_physical(8)
+                    self.assertEqual(sorted(retaken.tolist()), sorted(moved))
+                    f.pool.raw[min(moved) * n : (max(moved) + 1) * n].fill_(7)
                 torch.cuda.synchronize()
                 self.assertTrue(done.query())
                 if writer == "write":
-                    self.assertTrue(torch.equal(host, expected))
+                    for page in moved:
+                        self.assertTrue(
+                            torch.equal(
+                                host[page * n : (page + 1) * n],
+                                expected[page * n : (page + 1) * n],
+                            ),
+                            f"the backup read slot {page} after it was reused",
+                        )
+                    f.pool.raw[min(moved) * n : (max(moved) + 1) * n].copy_(
+                        f.raw[min(moved) * n : (max(moved) + 1) * n]
+                    )
                 else:
                     f.raw = expected
                 self._verify(f, set(range(8, 16)))
@@ -472,6 +498,38 @@ class TestForwardWriteSets(CustomTestCase):
         self.assertEqual(state[-1][1].tolist(), [5, 6, 7, -1])
         owner = allocator.full_attn_allocator._inflight_forwards
         self.assertIs(owner[-1][1], tokens)
+
+    def test_host_copies_are_recorded_on_the_members_they_touch(self):
+        # A submitted host copy names its rows per sub-pool view; a move then
+        # waits it, or releases what it reads, only for those rows.
+        allocator = self._allocator()
+        storage = allocator.storage
+        owner_ids, state_slots = torch.tensor([3, 4]), torch.tensor([1])
+        transfers = [
+            SimpleNamespace(device_pool=storage.view(name), device_indices=ids)
+            for name, ids in (
+                (allocator.roles.owner, owner_ids),
+                (allocator.roles.state, state_slots),
+            )
+        ]
+        # A fused draft's view is not a sub-pool: its rows ride in the target's.
+        transfers.append(
+            SimpleNamespace(device_pool=object(), device_indices=torch.tensor([9]))
+        )
+        done = _Event()
+        storage.record_host_transfer(done, transfers, writes=True)
+        for band, ids in (
+            (allocator.full_attn_allocator, owner_ids),
+            (allocator.mamba_allocator, state_slots),
+        ):
+            ((signal, recorded, writes, release),) = band._transfers
+            self.assertIs(signal, done)
+            self.assertIs(recorded, ids)
+            self.assertTrue(writes)
+            self.assertIsNone(release)
+        done.fired = True
+        allocator.full_attn_allocator._prune_transfers()
+        self.assertEqual(allocator.full_attn_allocator._transfers, [])
 
     def test_unknown_token_writes_hold_non_urgent_moves(self):
         # A pipeline stage's verify forward produces its own write slots, so
