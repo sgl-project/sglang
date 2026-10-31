@@ -388,6 +388,31 @@ def get_local_ip_by_remote() -> Optional[str]:
     return None
 
 
+def get_local_ip_towards(target_host: str, target_port: int = 80) -> Optional[str]:
+    """Derive the local IP address on the interface routing towards (target_host, target_port)
+    by probing a connected UDP socket (getsockname, no network traffic sent)."""
+    target_host = target_host.strip("[]")
+    try:
+        addr_info = socket.getaddrinfo(
+            target_host,
+            target_port,
+            socket.AF_UNSPEC,
+            socket.SOCK_DGRAM,
+            0,
+            socket.AI_ADDRCONFIG,
+        )
+        for family, socktype, proto, _, sockaddr in addr_info:
+            try:
+                with socket.socket(family, socktype, proto) as s:
+                    s.connect(sockaddr)
+                    return s.getsockname()[0]
+            except OSError:
+                continue
+    except (socket.gaierror, OSError):
+        pass
+    return None
+
+
 def get_local_ip_auto(fallback: str = None) -> str:
     """
     Automatically detect the local IP address using multiple fallback strategies.
@@ -612,6 +637,11 @@ class NetworkAddress:
         Raises:
             ValueError: If the string cannot be unambiguously parsed.
         """
+        if not addr:
+            raise ValueError("Empty address string")
+
+        if "://" in addr:
+            addr = addr.split("://", 1)[1]
         if not addr:
             raise ValueError("Empty address string")
 
