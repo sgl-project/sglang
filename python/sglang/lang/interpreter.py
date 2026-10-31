@@ -318,9 +318,19 @@ class StreamExecutor:
         self.num_api_spec_tokens = num_api_spec_tokens
         self.speculated_text = ""
 
+        # For streaming
+        if stream:
+            self.stream_text_event = threading.Event()
+            self.stream_var_event = {}
+        else:
+            self.stream_text_event = None
+            self.stream_var_event = None
+
         # Worker thread
         self.use_thread = use_thread
         if self.use_thread:
+            self._worker_lock = threading.Lock()
+            self._worker_stopped = False
             self.queue = queue.Queue()
 
             def _run_worker_in_context():
@@ -331,20 +341,25 @@ class StreamExecutor:
             )
             self.worker.start()
 
-        # For streaming
-        if stream:
-            self.stream_text_event = threading.Event()
-            self.stream_var_event = {}
-        else:
-            self.stream_text_event = None
-            self.stream_var_event = None
+    def _signal_all_events(self):
+        for event in self.variable_event.values():
+            event.set()
+        if self.stream_var_event:
+            for event in self.stream_var_event.values():
+                event.set()
+        if self.stream_text_event:
+            self.stream_text_event.set()
 
     def submit(self, expr: SglExpr):
-        self._init_var_event(expr)
-
         if self.use_thread:
-            self.queue.put(expr)
+            with self._worker_lock:
+                self._init_var_event(expr)
+                if self._worker_stopped:
+                    self._signal_all_events()
+                    return
+                self.queue.put(expr)
         else:
+            self._init_var_event(expr)
             self._execute(expr)
 
     def sync(self):
@@ -415,43 +430,40 @@ class StreamExecutor:
 
     def end(self):
         if self.use_thread:
-            if self.worker.is_alive():
-                self.queue.put(None)
+            with self._worker_lock:
+                if not self._worker_stopped and self.worker.is_alive():
+                    self._worker_stopped = True
+                    self.queue.put(None)
         self.backend.end_program(self)
 
     def _thread_worker_func(self):
-        error = None
-
         while True:
             expr = self.queue.get()
             if expr is None:
-                self.queue.task_done()
+                with self._worker_lock:
+                    self._worker_stopped = True
+                    self.queue.task_done()
                 break
 
             try:
                 self._execute(expr)
             except Exception as e:
                 warnings.warn(f"Error in stream_executor: {get_exception_traceback()}")
-                error = e
+                with self._worker_lock:
+                    self._worker_stopped = True
+                    self.error_ = e
+                    self.queue.task_done()
+                    while True:
+                        try:
+                            self.queue.get_nowait()
+                            self.queue.task_done()
+                        except queue.Empty:
+                            break
+                    self._signal_all_events()
                 break
             self.queue.task_done()
             if self.stream_text_event:
                 self.stream_text_event.set()
-
-        # Clean the queue and events
-        if error is not None:
-            try:
-                while True:
-                    self.queue.task_done()
-                    self.queue.get_nowait()
-            except queue.Empty:
-                pass
-            for name in self.variable_event:
-                self.variable_event[name].set()
-            if self.stream_var_event:
-                for name in self.stream_var_event:
-                    self.stream_var_event[name].set()
-            self.error_ = error
 
         if self.stream_text_event:
             self.stream_text_event.set()
