@@ -82,7 +82,11 @@ class _ForkTestWorker:
             self.process.kill()
             self.process.wait()
         if self.process.stdin is not None:
-            self.process.stdin.close()
+            # A worker that died before reading leaves the request unflushed.
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
         self.result_stream.close()
 
 
