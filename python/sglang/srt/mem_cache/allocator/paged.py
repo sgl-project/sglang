@@ -35,6 +35,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv_page_zeroer import KVPageZeroer
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
@@ -153,6 +154,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.use_triton_kernels = current_platform.capabilities.supports_triton
+        self.zeroer: KVPageZeroer | None = None
 
         # Pre-warm the torch.unique used by free(): on ROCm the first call
         # JIT-compiles rocPRIM sort/unique kernels and costs ~200ms.
@@ -166,12 +168,36 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def available_size(self):
-        return (len(self.free_pages) + self.num_staged_pages) * self.page_size
+        return (
+            len(self.free_pages) + self.num_staged_pages + self.num_zeroing_pages
+        ) * self.page_size
 
     def get_all_free_pages(self):
-        return torch.cat((self.free_pages, *self.staged_pages))
+        zeroing = [ids for _, ids in self.zeroing_pages]
+        return torch.cat((self.free_pages, *self.staged_pages, *zeroing))
+
+    def enable_zero_on_free(self, zeroer: KVPageZeroer):
+        assert type(self) is PagedTokenToKVPoolAllocator, (
+            f"{type(self).__name__} does not support zeroing KV pages on free"
+        )
+        assert zeroer.num_rows > self.num_pages, "KV buffer smaller than the pool"
+        self.zeroer = zeroer
+        self.clear()
+
+    def _reclaim_zeroed_pages(self, wait: bool):
+        # Events complete in order: they are all recorded on the zeroer's stream.
+        while self.zeroing_pages:
+            event, page_ids = self.zeroing_pages[0]
+            if event is not None:
+                if not wait and not event.query():
+                    return
+                event.synchronize()
+            self.zeroing_pages.pop(0)
+            self.num_zeroing_pages -= page_ids.numel()
+            self._make_pages_allocatable(page_ids)
 
     def merge_and_sort_free(self):
+        self._reclaim_zeroed_pages(wait=True)
         if not self.staged_pages:
             return
         self.free_pages, _ = torch.sort(self.get_all_free_pages())
@@ -186,6 +212,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         num_pages = need_size // self.page_size
+        self._reclaim_zeroed_pages(wait=False)
         if num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
@@ -220,6 +247,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Strict upper bound on num_new_pages: one request's page count grows
         # by less than extend_len / page_size + 1, so the sum is below this.
         max_new_pages = extend_num_tokens // self.page_size + bs + 1
+        self._reclaim_zeroed_pages(wait=False)
         if max_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -288,6 +316,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
+        self._reclaim_zeroed_pages(wait=False)
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -373,6 +402,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        if self.zeroer is None:
+            self._make_pages_allocatable(*page_ids)
+            return
+        ids = page_ids[0] if len(page_ids) == 1 else torch.cat(page_ids)
+        self.zeroing_pages.append((self.zeroer.zero(ids), ids))
+        self.num_zeroing_pages += ids.numel()
+
+    def _make_pages_allocatable(self, *page_ids: torch.Tensor):
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
@@ -402,6 +439,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
+        # Freed pages wait here, with the event that marks them zeroed.
+        self.zeroing_pages: list[tuple[torch.cuda.Event | None, torch.Tensor]] = []
+        self.num_zeroing_pages = 0
+        if self.zeroer is not None:
+            all_pages, self.free_pages = self.free_pages, self.free_pages[:0]
+            self._release_page_ids(all_pages)
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(
