@@ -1,4 +1,5 @@
 import concurrent.futures
+import dataclasses
 import threading
 import unittest
 from collections import defaultdict
@@ -49,6 +50,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -1845,12 +1849,16 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                         sampling_logprobs_mode=mode,
                     )
                 )
+                fields = dict.fromkeys(
+                    f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                )
+                fields["model_config"] = SimpleNamespace(
+                    self_opened_think_start_ids=None
+                )
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
-                    batch_result_processor=SimpleNamespace(
-                        _maybe_update_reasoning_tokens=lambda req, token_id: None
-                    ),
+                    batch_result_processor=SchedulerBatchResultProcessor(**fields),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
@@ -1859,6 +1867,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
                     output_ids=[],
+                    require_reasoning=False,
                     return_logprob=False,
                     return_sampling_mask=True,
                     sampling_logprobs_mode=mode,
