@@ -38,6 +38,21 @@ MAX_FUSED_ROWS = 4096
 # up to a multiple of 4, plus 4 more for the scheduler's one-chunk lookahead.
 _PT_BLOCK = 256
 
+# The schedule is rebuilt per forward outside the CUDA graph, so every Triton
+# variant it can launch is compiled on the first prefill that reaches it -- a
+# whole-engine stall of over a second, mid-serving. Variants are kept to a fixed
+# set that warmup_prefill_schedule compiles at startup:
+# - the row and width arguments are not specialized (do_not_specialize), and
+#   the row buffers are laid out 16-byte aligned, as AITER's _row_plan does;
+# - the prep kernel's block takes one of these widths, not the next power of 2;
+# - past MAX_FUSED_ROWS, AITER's row plan gets a fixed max_seq_len floor, since
+#   its search length is a constexpr of it.
+_PREP_BLOCK_T = (256, 1024, MAX_FUSED_ROWS)
+_I32_PER_16B = 4
+# A 1M-token context in C4 tokens. Any bound at or past the true one gives the
+# same schedule: the smallest fitting split never exceeds the longest row's chunks.
+_ROW_PLAN_MIN_SEQ_LEN = 1 << 18
+
 
 @triton.jit
 def _pad_page_table_tile(
@@ -62,7 +77,18 @@ def _pad_page_table_tile(
     tl.store(dst_ptr + row * dst_stride + cols, vals, mask=inside)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "pt_src_stride",
+        "pt_dst_stride",
+        "T",
+        "P",
+        "s_max",
+        "w_src",
+        "w_dst",
+        "pt_tiles_per_row",
+    ]
+)
 def _prefill_schedule_prep_kernel(
     le_ptr,  # [T] int32  local_ends (== c4_seq_lens)
     chunks_ptr,  # [T] int32  out
@@ -147,7 +173,7 @@ def _prefill_schedule_prep_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["src_stride", "dst_stride", "w_src", "w_dst"])
 def _pad_page_table_kernel(
     src_ptr,
     dst_ptr,
@@ -234,7 +260,9 @@ class PrefillScheduleBuffers:
 
     One allocation, sliced into views, so refreshing the schedule costs no
     dispatches beyond the kernels themselves. Past ``MAX_FUSED_ROWS`` only the
-    row metadata is needed, because AITER's preamble owns the prefix sums.
+    row metadata is needed, because AITER's preamble owns the prefix sums. Every
+    region starts on a 16-byte boundary: Triton specializes on pointer alignment,
+    so a stride of exactly ``rows`` would fork a variant per ``rows % 4``.
     """
 
     __slots__ = (
@@ -251,25 +279,26 @@ class PrefillScheduleBuffers:
 
     def __init__(self, rows: int, device: torch.device):
         self.fused = rows <= MAX_FUSED_ROWS
+        stride = triton.cdiv(rows, _I32_PER_16B) * _I32_PER_16B
         if not self.fused:
-            self.storage = torch.empty(2 * rows, dtype=torch.int32, device=device)
+            self.storage = torch.empty(2 * stride, dtype=torch.int32, device=device)
             # Identity rows over their whole window; constant across refreshes,
             # so these two dispatches happen once per buffer, not per build.
             self.row_to_batch = self.storage[0:rows]
-            self.local_starts = self.storage[rows : 2 * rows]
+            self.local_starts = self.storage[stride : stride + rows]
             torch.arange(rows, dtype=torch.int32, device=device, out=self.row_to_batch)
             self.local_starts.zero_()
             self.chunks = self.incl = self.excl = None
             self.safe = self.total_splits = None
             return
-        self.storage = torch.empty(5 * rows + 2, dtype=torch.int32, device=device)
+        self.storage = torch.empty(5 * stride + 2, dtype=torch.int32, device=device)
         self.chunks = self.storage[0:rows]
-        self.incl = self.storage[rows : 2 * rows]
-        self.excl = self.storage[2 * rows : 3 * rows]
-        self.row_to_batch = self.storage[3 * rows : 4 * rows]
-        self.local_starts = self.storage[4 * rows : 5 * rows]
-        self.safe = self.storage[5 * rows : 5 * rows + 1]
-        self.total_splits = self.storage[5 * rows + 1 : 5 * rows + 2]
+        self.incl = self.storage[stride : stride + rows]
+        self.excl = self.storage[2 * stride : 2 * stride + rows]
+        self.row_to_batch = self.storage[3 * stride : 3 * stride + rows]
+        self.local_starts = self.storage[4 * stride : 4 * stride + rows]
+        self.safe = self.storage[5 * stride : 5 * stride + 1]
+        self.total_splits = self.storage[5 * stride + 1 : 5 * stride + 2]
 
 
 def build_prefill_schedule(
@@ -335,7 +364,7 @@ def build_prefill_schedule(
             local_ends,
             block_k=block_k,
             parallel_unit_num=parallel_unit_num,
-            max_seq_len=max_seq_len,
+            max_seq_len=triton.next_power_of_2(max(max_seq_len, _ROW_PLAN_MIN_SEQ_LEN)),
             cta_info_out=cta_info_out,
         )
         return guarded_out, buffers
@@ -359,7 +388,7 @@ def build_prefill_schedule(
         w_dst,
         pt_tiles_per_row,
         BLOCK_K=block_k,
-        BLOCK_T=max(16, triton.next_power_of_2(total_rows)),
+        BLOCK_T=next(b for b in _PREP_BLOCK_T if b >= total_rows),
         PT_BLOCK=_PT_BLOCK,
     )
 
@@ -379,6 +408,27 @@ def build_prefill_schedule(
         BLOCK_P=BLOCK_P,
     )
     return guarded_out, buffers
+
+
+def warmup_prefill_schedule(device: torch.device, page_table_bucket: int = 4) -> None:
+    """Compile every kernel variant ``build_prefill_schedule`` can launch: one per
+    prep block width, plus the page-table pad and AITER's row plan past
+    ``MAX_FUSED_ROWS``."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        CTA_INFO_WIDTH,
+    )
+
+    for rows in (*_PREP_BLOCK_T, MAX_FUSED_ROWS + 1):
+        build_prefill_schedule(
+            page_table=torch.zeros((rows, 1), dtype=torch.int32, device=device),
+            local_ends=torch.ones(rows, dtype=torch.int32, device=device),
+            cta_info_out=torch.empty(
+                (rows, CTA_INFO_WIDTH), dtype=torch.int32, device=device
+            ),
+            parallel_unit_num=rows,
+            max_seq_len=_KV_BLOCK_SIZE,
+            page_table_bucket=page_table_bucket,
+        )
 
 
 # Rows per block of the decode prep kernel's loops: its registers stay fixed as the

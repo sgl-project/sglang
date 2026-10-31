@@ -1037,6 +1037,14 @@ class DeepseekV4HipRadixBackend(
             )
 
             self._fp4_graph_row_limit = MAX_FUSED_ROWS
+        if self.enable_deepseek_v4_fp4_indexer:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+                warmup_prefill_schedule,
+            )
+
+            # Built per forward outside the graph, the prefill schedule would
+            # otherwise compile its kernels on the first prefill that needs them.
+            warmup_prefill_schedule(self.device)
         # DSv4 C4 decode / target-verify indexer on AITER's row-group kernel: no schedule,
         # its workspace built in the graph, a request's verify rows sharing each key load.
         # Every launch reads a table of one width (its compiled variant) for the server's life.
