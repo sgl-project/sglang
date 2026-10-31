@@ -4,7 +4,16 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.kpool_metadata.decode import (
+    _fused_dsa_decode_metadata_kpool_kernel,
+    fused_dsa_decode_metadata_kpool,
+)
+from sglang.kernels.ops.attention.dsa.kpool_metadata.draft_extend import (
+    _fused_dsa_draft_extend_metadata_kpool_kernel,
+    fused_dsa_draft_extend_metadata_kpool,
+)
 from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
+    _fused_dsa_target_verify_metadata_kpool_kernel,
     fused_dsa_target_verify_metadata_kpool,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -14,6 +23,119 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestKPoolMetadataFusion(CustomTestCase):
+    def test_batch_sizes_reuse_compiled_metadata_kernels(self):
+        """New batch sizes in one tile bucket must not stall on compilation."""
+        for mode, kernel in (
+            ("decode", _fused_dsa_decode_metadata_kpool_kernel),
+            ("verify", _fused_dsa_target_verify_metadata_kpool_kernel),
+            ("draft_static", _fused_dsa_draft_extend_metadata_kpool_kernel),
+            ("draft_variable", _fused_dsa_draft_extend_metadata_kpool_kernel),
+        ):
+            with self.subTest(mode=mode):
+                kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+                for bs in (5, 6, 7):
+                    self._check_batch_metadata(mode, bs)
+                    if bs == 5:
+                        compiled_after_first = len(kernel_cache)
+                    self.assertEqual(len(kernel_cache), compiled_after_first)
+
+    def _check_batch_metadata(self, mode, bs):
+        device, width, next_n, topk, kpool = "cuda", 256, 4, 64, 4
+        seq_values = [1, 64, 65, 68, 127, 128, 131][:bs]
+        seq = torch.tensor(seq_values, device=device, dtype=torch.int64)
+        req = torch.arange(bs - 1, -1, -1, device=device, dtype=torch.int64)
+        table = torch.arange(bs * width, device=device, dtype=torch.int32).view(
+            bs, width
+        )
+        if mode == "decode":
+            repeats = [1] * bs
+            expanded_values = seq_values
+            cache = seq.int()
+        elif mode == "verify":
+            repeats = [next_n] * bs
+            expanded_values = [s + i + 1 for s in seq_values for i in range(next_n)]
+            cache = (seq + next_n).int()
+        else:
+            repeats = [
+                next_n if mode == "draft_static" else 3 + i % 2 for i in range(bs)
+            ]
+            expanded_values = [
+                max(s - n + i + 1, 0)
+                for s, n in zip(seq_values, repeats)
+                for i in range(n)
+            ]
+            cache = seq.int()
+        expanded = torch.tensor(expanded_values, device=device, dtype=torch.int32)
+        rows = len(expanded_values)
+
+        def empty(*shape):
+            return torch.full(shape, -1, device=device, dtype=torch.int32)
+
+        buffers = dict(
+            cache_seqlens=empty(bs),
+            cu_seqlens_k=empty(bs + 1),
+            page_table_1=empty(rows, width),
+            dsa_cache_seqlens=empty(rows),
+            dsa_cu_seqlens_k=empty(rows + 1),
+            real_page_table=empty(rows, width // 64),
+        )
+        args = dict(
+            seq_lens=seq,
+            req_pool_indices=req,
+            req_to_token=table,
+            bs=bs,
+            dsa_index_topk=topk,
+            physical_page_size=64,
+            index_kpool=kpool,
+        )
+        if mode == "decode":
+            fused_dsa_decode_metadata_kpool(max_len=width, **args, **buffers)
+        else:
+            buffers["seqlens_expanded"] = empty(rows)
+            if mode == "verify":
+                buffers["paged_mqa_ctx_lens_2d"] = empty(bs, next_n)
+                fused_dsa_target_verify_metadata_kpool(
+                    max_seqlen_k=width, next_n=next_n, **args, **buffers
+                )
+                torch.testing.assert_close(
+                    buffers["paged_mqa_ctx_lens_2d"], cache[:, None].expand(bs, next_n)
+                )
+            else:
+                fused_dsa_draft_extend_metadata_kpool(
+                    extend_seq_lens=torch.tensor(
+                        repeats, device=device, dtype=torch.int32
+                    ),
+                    total_len=rows,
+                    max_seqlen_k=width,
+                    max_extend_len=next_n,
+                    max_total_len=bs * next_n,
+                    static_extend_len=mode == "draft_static",
+                    **args,
+                    **buffers,
+                )
+            torch.testing.assert_close(buffers["seqlens_expanded"], expanded)
+        expected_dsa = torch.minimum(expanded, topk + expanded % kpool)
+        torch.testing.assert_close(buffers["cache_seqlens"], cache)
+        torch.testing.assert_close(buffers["cu_seqlens_k"][1:], cache.cumsum(0).int())
+        torch.testing.assert_close(buffers["dsa_cache_seqlens"], expected_dsa)
+        torch.testing.assert_close(
+            buffers["dsa_cu_seqlens_k"][1:], expected_dsa.cumsum(0).int()
+        )
+        self.assertEqual(buffers["cu_seqlens_k"][0].item(), 0)
+        self.assertEqual(buffers["dsa_cu_seqlens_k"][0].item(), 0)
+        repeat_tensor = torch.tensor(repeats, device=device)
+        expected_pages = table[req].repeat_interleave(repeat_tensor, dim=0)
+        row_lens = cache.repeat_interleave(repeat_tensor)
+        live = torch.arange(width, device=device)[None, :] < row_lens[:, None]
+        torch.testing.assert_close(buffers["page_table_1"][live], expected_pages[live])
+        real_live = (
+            torch.arange(0, width, 64, device=device)[None, :] < row_lens[:, None]
+        )
+        torch.testing.assert_close(
+            buffers["real_page_table"][real_live],
+            (expected_pages[:, ::64] // 64)[real_live],
+        )
+
     def test_verify_replay_boundaries_and_request_remapping(self):
         device = "cuda"
         bs, next_n, width, topk, kpool = 4, 6, 16384, 2048, 4

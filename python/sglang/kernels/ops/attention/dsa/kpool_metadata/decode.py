@@ -35,7 +35,7 @@ def _fused_dsa_decode_metadata_kpool_kernel(
     page_table_stride_1: tl.constexpr,
     real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
-    bs: tl.constexpr,
+    bs,
     max_len,
     num_splits,
     dsa_index_topk: tl.constexpr,
