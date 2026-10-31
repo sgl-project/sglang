@@ -14,8 +14,12 @@ import zmq.asyncio
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime import ipc_array
 from sglang.multimodal_gen.runtime.distributed.ipc_cuda import CudaIpcRef
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ReleaseRealtimeSessionReq,
+)
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClient,
@@ -23,7 +27,93 @@ from sglang.multimodal_gen.runtime.scheduler_client import (
     run_zeromq_broker,
 )
 from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_S
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_async_client_warmup,
+    run_sync_client_warmup,
+)
 from sglang.srt.utils.network import get_free_port
+
+
+@pytest.mark.parametrize("client_type", [SchedulerClient, AsyncSchedulerClient])
+def test_session_release_reaches_owner_over_zmq(client_type):
+    async def run_test():
+        context = zmq.asyncio.Context()
+        servers = [context.socket(zmq.REP) for _ in range(2)]
+        endpoints = [
+            f"tcp://127.0.0.1:{server.bind_to_random_port('tcp://127.0.0.1')}"
+            for server in servers
+        ]
+        caches = [RealtimeSessionCache() for _ in servers]
+        client = client_type()
+        client.context = (
+            zmq.Context() if client_type is SchedulerClient else zmq.asyncio.Context()
+        )
+        client.server_args = SimpleNamespace(
+            scheduler_endpoints=endpoints, scheduler_rpc_timeout=2
+        )
+        client.request_logger = MagicMock()
+
+        async def serve(replica):
+            socket, cache = servers[replica], caches[replica]
+            while True:
+                request = await socket.recv_pyobj()
+                released = None
+                if isinstance(request, ReleaseRealtimeSessionReq):
+                    released = cache.release(request.session_id)
+                else:
+                    for req in request:
+                        cache.attach(req)
+                await socket.send_pyobj(
+                    OutputBatch(output={"replica": replica, "released": released})
+                )
+
+        async def forward(request):
+            if client_type is SchedulerClient:
+                return await asyncio.to_thread(client.forward, request)
+            return await client.forward(request)
+
+        tasks = [asyncio.create_task(serve(replica)) for replica in range(2)]
+        try:
+            owners = set()
+            for index in range(16):
+                session_id = f"session-{index}"
+                chunks = [
+                    await forward(
+                        [
+                            Req(
+                                prompt="a pear",
+                                realtime_session_id=session_id,
+                                block_idx=block,
+                            )
+                        ]
+                    )
+                    for block in range(2)
+                ]
+                owner = chunks[0].output["replica"]
+                owners.add(owner)
+                assert chunks[1].output["replica"] == owner
+
+                # unrelated traffic must not change session cleanup ownership
+                ordinary = await forward([Req(prompt="a pear")])
+                assert ordinary.output["replica"] == index % 2
+                for expected_released in (True, False):
+                    release = await forward(ReleaseRealtimeSessionReq(session_id))
+                    assert release.output == {
+                        "replica": owner,
+                        "released": expected_released,
+                    }
+                assert all(not cache._sessions for cache in caches)
+            assert owners == {0, 1}
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            client.close()
+            for server in servers:
+                server.close(linger=0)
+            context.destroy(linger=0)
+
+    asyncio.run(asyncio.wait_for(run_test(), timeout=30))
 
 
 @pytest.mark.parametrize(
@@ -93,6 +183,72 @@ def test_scheduler_isolates_invalid_messages_and_replies(invalid, reply_blocked)
         client.close(linger=0)
         receiver.close(linger=0)
         context.term()
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_server_warmup_reaches_every_replica_without_skewing_round_robin(
+    monkeypatch, sync
+):
+    endpoints = ["tcp://replica-0", "tcp://replica-1"]
+    warmup_reqs = [Req(prompt=f"warmup-{i}", is_warmup=True) for i in range(2)]
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.build_warmup_reqs",
+        lambda *args, **kwargs: warmup_reqs,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_image",
+        lambda *args, **kwargs: False,
+    )
+    server_args = SimpleNamespace(
+        scheduler_endpoints=endpoints,
+        scheduler_rpc_timeout=None,
+        warmup_resolutions=["512x512"],
+    )
+    client = SchedulerClient() if sync else AsyncSchedulerClient()
+    client.context = object()
+    client.server_args = server_args
+    client.request_logger = MagicMock()
+    received = {endpoint: [] for endpoint in endpoints}
+
+    def record(endpoint, batch):
+        received[endpoint].append(batch)
+        return OutputBatch()
+
+    if sync:
+        client._forward_one = lambda endpoint, batch, timeout_ms: record(
+            endpoint, batch
+        )
+    else:
+
+        async def forward_one(endpoint, batch, timeout_ms):
+            return record(endpoint, batch)
+
+        client._forward_one = forward_one
+
+    async def run_test():
+        if sync:
+            await asyncio.to_thread(run_sync_client_warmup, server_args, client.forward)
+        else:
+            await run_async_client_warmup(server_args, client.forward)
+        for endpoint in endpoints:
+            assert [req.prompt for req in received[endpoint]] == [
+                "warmup-0",
+                "warmup-1",
+            ]
+            # every replica counts the full list, not a share of it
+            assert {req.extra["warmup_total"] for req in received[endpoint]} == {2}
+            received[endpoint].clear()
+
+        # warmup left the counter alone: real traffic still starts at replica 0
+        for endpoint in endpoints:
+            batch = [Req(prompt="real")]
+            if sync:
+                await asyncio.to_thread(client.forward, batch)
+            else:
+                await client.forward(batch)
+            assert len(received[endpoint]) == 1
+
+    asyncio.run(run_test())
 
 
 def test_sync_scheduler_client_converts_configured_seconds_to_milliseconds():

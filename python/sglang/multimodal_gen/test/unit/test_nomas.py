@@ -33,9 +33,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.n
     NomasLatentSession,
     NomasSegmentCondition,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 # The framework's parallel linears resolve the TP group at construction.
 pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
+
+# On ROCm, Inductor's fused kernels are not bitwise equal to eager, and the
+# dynamic-shape create_block_mask compile fails, so these checks are CUDA-only.
+is_nvidia_cuda = torch.cuda.is_available() and current_platform.is_cuda()
 
 
 def tiny_model(device="cpu", backend="sdpa"):
@@ -120,7 +125,7 @@ def test_shared_modulation_and_residual_preserve_rounding(tokens, dtype):
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernels need CUDA")
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
 @torch.inference_mode()
 def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
     from sglang.multimodal_gen.runtime.models.dits import nomas_layers as layers
@@ -150,7 +155,7 @@ def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
     assert torch.equal(fused, layers.modulate(x, shift, scale).to(torch.bfloat16))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernels need CUDA")
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
 @torch.inference_mode()
 def test_pixelumm_fused_norm_and_swiglu_are_bitwise_exact():
     from sglang.multimodal_gen.runtime.models.vaes import nomas as vae
@@ -385,7 +390,7 @@ def test_registration_cli_routing_and_full_parameter_count():
     assert sum(p.numel() for p in model.parameters()) == 8_553_434_592
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FlexAttention")
+@pytest.mark.skipif(not is_nvidia_cuda, reason="CUDA FlexAttention")
 @torch.inference_mode()
 def test_growing_history_across_twelve_segments():
     # Exercise more distinct history lengths than Dynamo's default recompile
@@ -703,6 +708,54 @@ def test_event_plan_and_budget():
         check_cache_budget(config, 10080 * 20)
     with pytest.raises(ValueError, match="KV requires"):
         check_cache_budget(config, 10080, free_bytes=9 * 2**30)
+
+
+def test_free_bytes_counts_freed_memory_held_by_the_allocator(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        _free_bytes,
+    )
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (10, 100))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 50)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 20)
+    assert _free_bytes(torch.device("cuda", 0)) == 40
+
+
+@pytest.mark.parametrize(
+    "frames, flush, ok", [(13, False, True), (17, False, False), (4, True, True)]
+)
+def test_sequence_parallel_indivisible_segment_rejected_by_input_validation(
+    monkeypatch, frames, flush, ok
+):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas import (
+        stages,
+    )
+    from sglang.multimodal_gen.runtime.realtime.nomas import NOMAS_FLUSH_CONDITION
+
+    monkeypatch.setattr(
+        stages.RealtimeInputValidationStage, "forward", lambda self, batch, args: batch
+    )
+    # 352x640 is 220 tokens per latent frame: 4 latents split over 8 ranks, 5 do not.
+    monkeypatch.setattr(stages, "get_ulysses_ctx", lambda: (8, 0))
+    batch = SimpleNamespace(
+        height=352,
+        width=640,
+        num_frames=frames,
+        prompt="road",
+        segments=None,
+        continuation_prompts=None,
+        prompt_format="plain",
+        condition_inputs={NOMAS_FLUSH_CONDITION: flush},
+        session=None,
+        extra={},
+    )
+    args = SimpleNamespace(pipeline_config=NomasPipelineConfig())
+    stage = object.__new__(stages.NomasInputValidationStage)
+    if ok:
+        stage.forward(batch, args)
+    else:
+        with pytest.raises(ValueError, match="sequence-parallel"):
+            stage.forward(batch, args)
 
 
 def test_action_windows_and_camera_gate_follow_upstream():

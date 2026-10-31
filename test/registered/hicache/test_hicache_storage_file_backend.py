@@ -30,8 +30,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=1000, suite="stage-b-test-2-gpu-large-amd")
+register_cuda_ci(est_time=100, stage="base-b", runner_config="2-gpu-large")
+register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -288,6 +288,11 @@ class TestHiCacheStorageRandomFailure(HiCacheStorageBaseMixin, CustomTestCase):
             "SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE": "0.05",
         }
         return server_args, env_vars
+
+    # The inherited test requires a storage hit, but an injected failure turns
+    # the prefetch into a miss; test_random_failures_degrade_to_cache_misses
+    # covers this configuration instead.
+    test_basic_backup_and_prefetch = None
 
     def test_random_failures_degrade_to_cache_misses(self):
         base_prompt = self.gen_prompt(768)

@@ -142,7 +142,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
 
         written = []
 
-        def put(keys, pointers, sizes, group_ids):
+        def put(keys, pointers, sizes, group_ids, session_ids=None):
             written.extend(keys)
             return [0] * len(keys)
 
@@ -396,7 +396,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
                 written = []
 
-                def put(keys, pointers, sizes, group_ids):
+                def put(keys, pointers, sizes, group_ids, session_ids=None):
                     written.extend(keys)
                     return [0] * len(keys)
 
