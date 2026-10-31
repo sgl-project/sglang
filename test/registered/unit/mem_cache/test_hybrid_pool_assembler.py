@@ -1425,6 +1425,96 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
+    def test_shared_hosts_use_one_captured_description_per_device_pool(self):
+        """Shared backing and both hosts must consume the same captured views."""
+        bundle = _build_unified_swa_pool()
+        pool = bundle.token_to_kv_pool
+        full, swa = map(pool.layer_router.view, ("full", "swa"))
+        full_info = full.get_device_pool_infos()
+        swa_info = swa.get_device_pool_infos()
+        with (
+            patch.object(full, "get_device_pool_infos", side_effect=[full_info]),
+            patch.object(swa, "get_device_pool_infos", side_effect=[swa_info]),
+            patch.object(
+                full,
+                "get_page_envelope_buffer",
+                side_effect=AssertionError("recapture"),
+            ),
+            patch.object(
+                swa, "get_page_envelope_buffer", side_effect=AssertionError("recapture")
+            ),
+            patch.object(
+                full,
+                "get_contiguous_buf_infos",
+                side_effect=AssertionError("legacy read"),
+            ),
+            patch.object(
+                swa,
+                "get_contiguous_buf_infos",
+                side_effect=AssertionError("legacy read"),
+            ),
+        ):
+            full_host, swa_host = _build_unified_host_pair(bundle)
+        self.addCleanup(full_host.destroy)
+        self.addCleanup(swa_host.destroy)
+        self.assertIs(
+            full_host._device_page_buffer,
+            full_info[0].buffer_info.page_envelope.pages,
+        )
+        self.assertIs(
+            swa_host._device_page_buffer,
+            swa_info[0].buffer_info.page_envelope.pages,
+        )
+        self.assertIs(
+            full_host.shared_allocation_domain, swa_host.shared_allocation_domain
+        )
+        indices = full_host.alloc(full_host.available_size())
+        self.assertIsNotNone(indices)
+        self.assertIsNone(
+            swa_host.alloc(swa_host.available_size() + swa_host.page_size)
+        )
+        full_host.free(indices)
+        self.assertIsNotNone(swa_host.alloc(swa_host.page_size))
+
+    def test_unbacked_page_view_is_rejected_before_host_allocation(self):
+        """A reserved tensor view cannot authorize transfer beyond backed bytes."""
+        bundle = _build_unified_swa_pool()
+        full = bundle.token_to_kv_pool.layer_router.view("full")
+        pages = full.get_page_envelope_buffer()
+        accessible_bytes = pages.nbytes - pages.shape[1]
+        with (
+            patch.object(full._arena, "accessible_bytes", accessible_bytes),
+            patch(
+                "sglang.srt.mem_cache.pool_host.unified._SharedPageEnvelopeHostBacking"
+            ) as backing,
+        ):
+            with self.assertRaisesRegex(ValueError, "page-envelope"):
+                _build_unified_host_pair(bundle)
+            backing.assert_not_called()
+
+    def test_fused_draft_description_has_no_page_envelope(self):
+        """Fused draft K/V rides in its host's envelopes, so describing it must not
+        request an envelope of its own."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1]}, regions={"full": region}
+        )
+        bundle = _build_unified_swa_pool(fused_draft=placement)
+        draft = DraftMHAView(
+            arena=bundle.arena,
+            host_spec=bundle.storage.plan.sub_pool("full").spec,
+            layer_lanes={0: 0},
+            page_size=bundle.token_to_kv_pool.page_size,
+        )
+        (info,) = draft.get_device_pool_infos()
+        self.assertIsNone(info.buffer_info.page_envelope)
+        for described, actual in zip(
+            info.buffer_info.buffers.k, draft.k_buffer, strict=True
+        ):
+            self.assertIs(described, actual)
+
     def test_packed_drafts_are_not_silently_dropped_by_shared_arena(self):
         storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
         draft = _build_unified_swa_pool().token_to_kv_pool
