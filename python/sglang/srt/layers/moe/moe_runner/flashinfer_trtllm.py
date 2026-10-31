@@ -9,6 +9,10 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.moe.trtllm_prepared_fp4 import (
+    try_prepared_k3_mxfp4,
+    try_prepared_k3_nvfp4,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -22,6 +26,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_out_wrapper,
     trtllm_fp8_block_scale_routed_moe_out_wrapper,
@@ -1217,7 +1222,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
+            routed_kwargs = dict(
                 topk_ids=routing,
                 routing_bias=None,
                 hidden_states=x_quant,
@@ -1249,6 +1254,13 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )
+            result = try_prepared_k3_mxfp4(
+                quant_info.w13_weight,
+                prepared_metadata=route_quant_handoff.take_metadata(routing),
+                **routed_kwargs,
+            )
+            if result is None:
+                result = trtllm_fp4_block_scale_routed_moe(**routed_kwargs)
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
                 result = FlashInferTrtllmDeferredFinalizeOutput(
@@ -1468,7 +1480,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
-    if hidden_states_scale is not None:
+    prepared_nvfp4 = None
+    if (
+        hidden_pad == 0
+        and hidden_states_scale is None
+        and not quant_info.use_per_token_activation
+    ):
+        prepared_nvfp4 = route_quant_handoff.take(
+            hidden_states, quant_info.w13_input_scale_quant
+        )
+    if prepared_nvfp4 is not None:
+        _, hs_fp4, hs_scale_linear = prepared_nvfp4
+    elif hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
@@ -1541,8 +1564,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
+        # Pre-quantized input and fused preparation both produce BF16 output.
         output_dtype = (
-            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+            hidden_states.dtype
+            if hidden_states_scale is None and prepared_nvfp4 is None
+            else torch.bfloat16
         )
         # A padded kernel output is a scratch buffer; the sliced copy is the
         # tensor that reaches the all-reduce.
@@ -1590,14 +1616,31 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
-        result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
+        result = None
+        if defer_finalize or 1 < hs_fp4.shape[0] <= 8:
+            # The static scale Parameter persists across calls; weight .data
+            # views are recreated by ModelOpt and cannot own this workspace.
+            result = try_prepared_k3_nvfp4(
+                quant_info.w13_input_scale_quant,
+                prepared_metadata=(
+                    route_quant_handoff.take_metadata(routing)
+                    if prepared_nvfp4 is not None
+                    else None
+                ),
+                **moe_kwargs,
+            )
+        if result is None:
+            result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(
                 result,
                 top_k=_routing_top_k(routing),
             )
         else:
-            result = result[0]
+            # Both kernels wrote symm_output. The prepared body returns that
+            # tensor itself rather than a tuple, so ``result[0]`` would take
+            # row zero and broadcast it across the tokens of a verify batch.
+            result = symm_output
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
