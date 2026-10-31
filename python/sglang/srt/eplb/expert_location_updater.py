@@ -32,8 +32,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 _is_npu = is_npu()
 if _is_npu:
     from sglang.srt.hardware_backend.npu.eplb import (
-        NpuExpertWeightStaging,
-        get_eplb_migration_group,
+        update_expert_weights_with_staging,
     )
 
 
@@ -154,7 +153,7 @@ def _update_expert_weights_raw(
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
     if _is_npu:
-        return _update_expert_weights_with_staging(
+        return update_expert_weights_with_staging(
             weights_by_layer=routed_experts_weights_of_layer,
             old_metadata=old_expert_location_metadata,
             new_metadata=new_expert_location_metadata,
@@ -162,6 +161,7 @@ def _update_expert_weights_raw(
             nnodes=nnodes,
             rank=rank,
             log_metrics=log_metrics,
+            update_layer_fn=update_expert_weights_single_layer,
         )
 
     temp_buffers = create_temp_buffers(
@@ -195,94 +195,6 @@ def _update_expert_weights_raw(
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
     return missing_logical_experts_by_layers
-
-
-def _update_expert_weights_with_staging(
-    weights_by_layer: Dict[int, List[torch.Tensor]],
-    old_metadata: ExpertLocationMetadata,
-    new_metadata: ExpertLocationMetadata,
-    layer_ids: List[int],
-    nnodes: int,
-    rank: int,
-    log_metrics: bool,
-) -> Dict[int, List[int]]:
-    """Migrate each participating layer through ND storage, preserving model addresses."""
-    layer_ids, local_updates = _select_expert_weight_updates(
-        old_metadata, new_metadata, layer_ids, rank
-    )
-    if not layer_ids:
-        return {}
-
-    staging = NpuExpertWeightStaging(weights_by_layer, layer_ids, rank)
-    group = get_eplb_migration_group()
-    world_size = torch.distributed.get_world_size()
-    temp_buffers = []
-    missing_experts_by_layer = {}
-
-    for layer, old_placement, new_placement, local_changed in local_updates:
-        weights = weights_by_layer[layer]
-        # Allocate once, on the first layer this rank participates in.
-        if not temp_buffers:
-            temp_buffers = staging.create_temp_buffers(weights)
-        migration_weights = staging.load(weights)
-        missing_experts = []
-        update_expert_weights_single_layer(
-            routed_experts_weights=migration_weights,
-            temp_buffers=temp_buffers,
-            old_physical_to_logical_map=old_placement,
-            new_physical_to_logical_map=new_placement,
-            num_local_physical_experts=old_metadata.num_local_physical_experts,
-            num_gpu_per_node=world_size // nnodes,
-            rank=rank,
-            world_size=world_size,
-            missing_logical_experts_info=missing_experts,
-            log_metrics=log_metrics,
-            group=group,
-        )
-        # Unchanged local slots may still send, but need no writeback.
-        if local_changed:
-            staging.store(weights, migration_weights)
-        # Release this layer's ND references before preparing the next layer.
-        del migration_weights
-        if missing_experts:
-            missing_experts_by_layer[layer] = missing_experts
-    return missing_experts_by_layer
-
-
-def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
-    """Select globally updated layers and this rank's participating layers."""
-    old_placements = old_metadata.physical_to_logical_map_cpu
-    new_placements = new_metadata.physical_to_logical_map_cpu
-    elastic_ep_enabled = ElasticEPStateManager.instance() is not None
-    if not elastic_ep_enabled:
-        layer_ids = [
-            layer
-            for layer in layer_ids
-            if not torch.equal(old_placements[layer], new_placements[layer])
-        ]
-    num_local_experts = old_metadata.num_local_physical_experts
-    start = rank * num_local_experts
-    local_slots = slice(start, start + num_local_experts)
-    local_updates = []
-    for layer in layer_ids:
-        old_placement = old_placements[layer].tolist()
-        new_placement = new_placements[layer].tolist()
-        local_changed = old_placement[local_slots] != new_placement[local_slots]
-        if not elastic_ep_enabled and not local_changed:
-            if not _rank_may_send_experts(old_placement, new_placement, local_slots):
-                continue
-        local_updates.append((layer, old_placement, new_placement, local_changed))
-    # Validate the whole selected chunk, including layers this rank skips.
-    return layer_ids, local_updates
-
-
-def _rank_may_send_experts(old_placement, new_placement, local_slots):
-    """A possible sender holds an expert needed by a changed destination slot."""
-    local_experts = set(old_placement[local_slots])
-    return any(
-        old != new and new in local_experts
-        for old, new in zip(old_placement, new_placement, strict=True)
-    )
 
 
 def create_temp_buffers(sample_tensors):
