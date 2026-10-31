@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.request_logger import (
     DiffusionRequestLogger,
@@ -137,12 +140,15 @@ def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int
 
 
 def _merge_fanout_results(results: list[Any]) -> Any:
-    """One reply for a control op sent to every replica: the first error wins,
-    because "succeeded" must mean succeeded everywhere."""
+    """Prefer fatal device errors, then the first error, over successful replies."""
+    first_error = None
     for result in results:
         if isinstance(result, OutputBatch) and result.error:
-            return result
-    return results[0]
+            if is_unrecoverable_device_error(result.error):
+                return result
+            if first_error is None:
+                first_error = result
+    return first_error if first_error is not None else results[0]
 
 
 class SchedulerClient:

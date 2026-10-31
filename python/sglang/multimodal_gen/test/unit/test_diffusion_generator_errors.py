@@ -8,6 +8,7 @@ import pytest
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
+from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.utils.device_errors import (
     DiffusionRuntimeError,
     is_unrecoverable_device_error,
@@ -192,6 +193,37 @@ def test_fatal_lora_error_rejects_later_generation(generator):
     with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
         generator.generate({"prompt": "later"})
     assert client.forward.call_count == 1
+
+
+@pytest.mark.parametrize("fatal_first", [False, True])
+def test_fatal_lora_fanout_error_rejects_later_calls(generator, fatal_first):
+    """A recoverable replica error must not hide another replica's device failure."""
+    generator, client = generator
+    scheduler = SchedulerClient()
+    scheduler.server_args = SimpleNamespace(
+        scheduler_endpoints=["tcp://replica-0", "tcp://replica-1"]
+    )
+    scheduler.request_logger = Mock()
+    replies = [
+        dg.OutputBatch(error="CUDA out of memory"),
+        dg.OutputBatch(error=_DEVICE_ERROR),
+    ]
+    if fatal_first:
+        replies.reverse()
+    scheduler._forward_one = Mock(side_effect=replies)
+    client.forward.side_effect = scheduler.forward
+
+    with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
+        generator.set_lora("adapter")
+    assert generator._runtime_error == _DEVICE_ERROR
+    with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
+        generator.set_lora("later")
+    with pytest.raises(DiffusionRuntimeError, match="illegal memory access"):
+        generator.generate({"prompt": "later"})
+
+    assert scheduler._forward_one.call_count == 2
+    assert client.forward.call_count == 1
+    client.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("mapping_raises", [False, True])
