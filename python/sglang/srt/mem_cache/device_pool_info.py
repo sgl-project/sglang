@@ -12,6 +12,10 @@ from enum import Enum
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
@@ -366,6 +370,8 @@ class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
         | MLABufferInfo
         | IndexKeyBufferInfo
         | PageRowBufferInfo
+        | DSV4PagedBufferInfo
+        | DSV4CheckpointBufferInfo
     )
 
     def __post_init__(self) -> None:
