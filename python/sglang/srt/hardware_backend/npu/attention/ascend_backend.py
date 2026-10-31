@@ -2893,9 +2893,7 @@ class AscendAttnBackend(AttentionBackend):
                         if layer.sliding_window_size != -1
                         else FULL_ATTENTION_WINDOW
                     ),
-                    next_tokens=(
-                        0 if layer.sliding_window_size == -1 else FULL_ATTENTION_WINDOW
-                    ),
+                    next_tokens=0,
                     atten_mask=self.fia_mask.to(torch.int8),
                     sparse_mode=sparse_mode,
                     softmax_scale=layer.scaling,
