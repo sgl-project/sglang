@@ -222,6 +222,24 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         result = self.processor(logits, params)
         self.assertTrue(torch.equal(result, original))
 
+    def test_skips_when_budget_is_bool(self):
+        """Test that boolean thinking_budget values are rejected rather than treated as 0/1."""
+        req = _make_req(origin_input_ids=[self.START], output_ids=[100] * 10)
+        for budget in (False, True):
+            params = [{"thinking_budget": budget, "__req__": req}]
+            logits = self._logits()
+            original = logits.clone()
+            result = self.processor(logits, params)
+            self.assertTrue(torch.equal(result, original))
+
+    def test_skips_when_req_is_none(self):
+        """Test that missing __req__ is skipped without raising AttributeError."""
+        params = [{"thinking_budget": 0}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
     def test_none_params_returns_unchanged(self):
         """Test that passing None as param list returns logits unchanged."""
         logits = self._logits()
@@ -447,6 +465,18 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         self.assertEqual(result[0, 0].item(), 0.0)
         # Batch 1 has ban applied
         self.assertTrue(torch.isinf(result[1, 1]) and result[1, 1] < 0)
+
+    def test_window_spanning_origin_and_output_ids(self):
+        """Test n-gram matching across the boundary of origin_input_ids and output_ids."""
+        req = MagicMock()
+        req.origin_input_ids = array("q", [9, 1, 2, 3])
+        req.output_ids = [1, 2]
+        params = [{"__req__": req, "ngram_size": 3, "window_size": 5}]
+        logits = self._logits()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.isinf(result[0, 3]) and result[0, 3] < 0)
+        self.assertEqual(result[0, 9].item(), 0.0)
+
 
     def test_search_end_leq_search_start_skips(self):
         """Test skip when window is too small for the ngram_size."""
