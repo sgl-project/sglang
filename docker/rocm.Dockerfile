@@ -442,7 +442,10 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="78566d459c140956fd15606e102132b1acc83eec"
+# Includes kvcache-ai/Mooncake#4657: keep KFD free VRAM accurate when HIP
+# buffers are registered through dma-buf. MC_HIP_KFD_PIN_FIX=1 probes the
+# driver by default; no SGLang-side override is needed.
+ARG MOONCAKE_COMMIT="a7f04df3451c4296f6cd1ff9d37b660042393aa8"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
