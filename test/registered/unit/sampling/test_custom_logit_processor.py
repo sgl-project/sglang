@@ -751,7 +751,7 @@ class TestPageLengthCap(CustomTestCase):
 
     def test_a_reuse_window_counts_only_the_pages_it_owns(self):
         """A reused window's prompt opens with two context pages whose text is
-        spliced in rather than decoded (see session/uocr_doc_reuse.py). Counting
+        spliced in rather than decoded by Unlimited-OCR v2 reuse. Counting
         them would turn the page instead of stopping on the window's last."""
         P = self.PAGE
         spliced = [30, 31, P]  # the previous window's text tail and its marker

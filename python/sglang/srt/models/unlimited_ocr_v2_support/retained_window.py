@@ -7,7 +7,7 @@ import msgspec
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 
 
-class DocumentSessionSlot(msgspec.Struct):
+class RetainedWindow(msgspec.Struct):
     """Owns a retained window's KV row until it is released exactly once.
 
     Mutable: ``kv`` is replaced by the detached row and ``released`` flips once.

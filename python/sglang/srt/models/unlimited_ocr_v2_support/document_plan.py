@@ -1,4 +1,4 @@
-"""Batch-by-batch bookkeeping for a multi-window Unlimited-OCR document plan."""
+"""Window-plan bookkeeping for Unlimited-OCR v2 document processing."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class DocumentBatchLayout(msgspec.Struct, frozen=True):
     new_pages: Tuple[int, ...]
 
 
-class DocumentKVState(msgspec.Struct):
+class DocumentPlanState(msgspec.Struct):
     """Validated ``[(lo, hi, emit_from), ...]`` plan, advanced one batch at a time."""
 
     page_count: int
@@ -41,7 +41,7 @@ class DocumentKVState(msgspec.Struct):
         page_count: int,
         overlap_pages: int,
         plan: Sequence[Tuple[int, int, int]],
-    ) -> DocumentKVState:
+    ) -> DocumentPlanState:
         """Build the state for a ``[(lo, hi, emit_from), ...]`` split plan."""
         return cls(
             page_count=page_count,

@@ -131,12 +131,12 @@ _OWNER_SITES = {
     ): 1,
     # document reuse owns the retained row and the appended copied tokens
     (
-        "session/uocr_doc_reuse.py",
+        "models/unlimited_ocr_v2_support/document_reuse.py",
         "DocReuse._retain_finished",
         "truncate",
     ): 1,
     (
-        "session/uocr_doc_reuse.py",
+        "models/unlimited_ocr_v2_support/document_reuse.py",
         "DocReuse._splice_text",
         "allocate_decode",
     ): 1,

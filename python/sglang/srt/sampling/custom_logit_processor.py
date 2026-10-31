@@ -212,7 +212,7 @@ class PageGuardState(msgspec.Struct):
 
 def _window_pages(req) -> tuple[int, bool]:
     """Leading prompt pages a document window does not transcribe, and whether
-    it ends on the marker past its own pages (see session/uocr_doc_reuse.py)."""
+    it ends on the marker past its own pages (Unlimited-OCR v2 reuse)."""
     st = req.uocr_doc
     if st is None:
         return 0, False

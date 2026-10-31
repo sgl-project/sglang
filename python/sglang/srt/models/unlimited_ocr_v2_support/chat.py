@@ -40,7 +40,7 @@ from sglang.srt.models.unlimited_ocr_v2_support import (
 )
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as uocr_doc_reuse
 from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
-from sglang.srt.models.unlimited_ocr_v2_support.document_plan import DocumentKVState
+from sglang.srt.models.unlimited_ocr_v2_support.document_plan import DocumentPlanState
 from sglang.srt.runtime_context import get_mm, get_serving
 
 if TYPE_CHECKING:
@@ -931,7 +931,7 @@ class ChatDocSplitter:
         overlap_pages = next(
             (emit_from - lo for lo, _, emit_from in plan if emit_from > lo), 0
         )
-        doc_kv_state = DocumentKVState.from_plan(
+        doc_kv_state = DocumentPlanState.from_plan(
             page_count=doc_split.count_images(request.messages),
             overlap_pages=overlap_pages,
             plan=plan,

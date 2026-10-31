@@ -375,7 +375,7 @@ class _FakeAllocator:
 
 
 class _FakeHolder:
-    """Mirrors DocumentSessionSlot's idempotent release contract."""
+    """Mirrors RetainedWindow's idempotent release contract."""
 
     def __init__(self, allocated=8, holds=True):
         self.kv = SimpleNamespace(

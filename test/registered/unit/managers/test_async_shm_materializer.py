@@ -120,7 +120,7 @@ class AsyncShmMaterializerTest(CustomTestCase):
         self.assertTrue(second_done.wait(2))
 
         with patch(
-            "sglang.srt.managers.scheduler_components.async_shm_materializer.wait"
+            "sglang.srt.models.unlimited_ocr_v2_support.async_shm.wait"
         ) as wait_mock:
             coordinator.wait_for_progress()
         wait_mock.assert_called_once_with(
@@ -273,11 +273,11 @@ class AsyncShmMaterializerTest(CustomTestCase):
         value = SimpleNamespace(mm_inputs=SimpleNamespace(mm_items=[item]))
         with (
             patch(
-                "sglang.srt.managers.scheduler_components.async_shm_materializer.TokenizedGenerateReqInput",
+                "sglang.srt.models.unlimited_ocr_v2_support.async_shm.TokenizedGenerateReqInput",
                 SimpleNamespace,
             ),
             patch(
-                "sglang.srt.managers.scheduler_components.async_shm_materializer.MultimodalProcessorOutput",
+                "sglang.srt.models.unlimited_ocr_v2_support.async_shm.MultimodalProcessorOutput",
                 SimpleNamespace,
             ),
         ):

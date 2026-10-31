@@ -429,7 +429,7 @@ class DocEntry(msgspec.Struct):
     Mutable (``kept`` is set after trimming); ``DocReuse.sources`` keys entries by id().
     """
 
-    holder: Any  # DocumentSessionSlot owning the finished window's KV row
+    holder: Any  # RetainedWindow owning the finished window's KV row
     input_ids: List[int]
     output_ids: List[int]
     text_ok: bool
@@ -1092,7 +1092,7 @@ class DocReuse:
             FINISH_MATCHED_TOKEN,
         )
         from sglang.srt.models.unlimited_ocr_v2_support.retained_window import (
-            DocumentSessionSlot,
+            RetainedWindow,
         )
 
         cp = _doc_params(req)
@@ -1138,7 +1138,7 @@ class DocReuse:
 
         cache = self._cache
         committed = req.kv.kv_committed_len
-        holder = DocumentSessionSlot()
+        holder = RetainedWindow()
         holder.kv = req.detach_kv()
         # release_kv_cache stops once the row is claimed, so the request's tree
         # lock (taken on the match's root anchor at admission) is dropped here.

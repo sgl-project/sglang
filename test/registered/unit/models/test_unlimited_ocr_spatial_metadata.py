@@ -221,11 +221,12 @@ class TestUnlimitedOCRCropTransfer(CustomTestCase):
         source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         with (
             patch(
-                "sglang.srt.models.unlimited_ocr_crop_transfer._stage",
+                "sglang.srt.models.unlimited_ocr_v2_support.crop_transfer._stage",
                 side_effect=[RuntimeError("injected"), source.bfloat16()],
             ),
             self.assertLogs(
-                "sglang.srt.models.unlimited_ocr_crop_transfer", level="WARNING"
+                "sglang.srt.models.unlimited_ocr_v2_support.crop_transfer",
+                level="WARNING",
             ),
         ):
             self.assertTrue(transfer.submit(source, torch.bfloat16))

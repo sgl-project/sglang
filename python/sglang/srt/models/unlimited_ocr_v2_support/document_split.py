@@ -2,8 +2,8 @@
 
 Batches are contiguous: the scheduler hands each one the previous batch's KV
 tail, so a batch needs no page of its own for context. A request can set
-``overlap_pages`` to carry preceding pages anyway, which is what a run without
-KV reuse needs to keep the split lossless.
+``overlap_pages`` to carry preceding pages in the recompute fallback; both
+windowing modes provide less context than whole-document inference.
 """
 
 from __future__ import annotations
