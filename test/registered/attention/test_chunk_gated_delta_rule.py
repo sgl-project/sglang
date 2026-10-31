@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -545,6 +546,81 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     self.assertTrue(torch.isnan(output.float()).all())
         # Nothing is written past the rows of the output.
         self.assertTrue(torch.isnan(padded[:, T:].float()).all())
+
+    def test_pipelined_scan_is_bit_identical(self):
+        """With SGLANG_GDN_CHUNK_PIPELINE one long sequence runs as up to 4
+        parts over two streams; the output, the per-chunk states and the final
+        state are the same bits as in one pass, also with a padded tail and a
+        part boundary inside the last chunk. Batches of several sequences,
+        sequences under 8192 tokens and read-only states keep the one pass."""
+        device = get_device()
+        dtype = torch.bfloat16
+        Hg, H, K, V, pool_size = 2, 6, 128, 128, 4
+        torch.manual_seed(0)
+        cases = (
+            # label, rows, sequence lengths, inplace_update
+            ("16384 tokens, 4 parts", 16384, [16384], True),
+            ("12600 tokens, 3 parts", 12600, [12600], True),
+            ("8192 tokens, 2 parts", 8192, [8192], True),
+            ("10000 tokens + padded tail", 10240, [10000], True),
+            ("8000 tokens, one pass", 8000, [8000], True),
+            ("two sequences, one pass", 18000, [9000, 9000], True),
+            ("read-only state, one pass", 16384, [16384], False),
+        )
+        for label, T, lens, inplace_update in cases:
+            with self.subTest(label):
+                pool_init = (
+                    torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device)
+                    * 0.1
+                )
+                cache_indices = torch.arange(
+                    1, len(lens) + 1, dtype=torch.int32, device=device
+                )
+                cu_seqlens = torch.tensor(
+                    [0] + torch.tensor(lens).cumsum(0).tolist(),
+                    dtype=torch.long,
+                    device=device,
+                )
+                q = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                k = torch.randn(1, T, Hg, K, dtype=dtype, device=device)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, T, H, dtype=torch.float32, device=device)
+                )
+                results = []
+                for pipeline in (False, True):
+                    pool = pool_init.clone()
+                    output = torch.full_like(v, float("nan"))
+                    with envs.SGLANG_GDN_CHUNK_PIPELINE.override(pipeline):
+                        o, _, h = chunk_gated_delta_rule(
+                            q=q,
+                            k=k,
+                            v=v,
+                            g=g,
+                            beta=beta,
+                            initial_state=pool,
+                            initial_state_indices=cache_indices,
+                            cu_seqlens=cu_seqlens,
+                            head_first=False,
+                            use_qk_l2norm_in_kernel=True,
+                            inplace_update=inplace_update,
+                            output=output,
+                        )
+                    self.assertEqual(o.data_ptr(), output.data_ptr())
+                    results.append((o, h, pool))
+                (o0, h0, pool0), (o1, h1, pool1) = results
+                self.assertTrue(torch.equal(o1, o0))
+                self.assertTrue(torch.equal(h1, h0))
+                self.assertTrue(torch.equal(pool1, pool0))
+                if sum(lens) < T:
+                    self.assertTrue(
+                        torch.equal(
+                            o1[:, sum(lens) :], torch.zeros_like(o1[:, sum(lens) :])
+                        )
+                    )
 
     # ------------------------------------------------------------------
     # The fused kkt + solve kernel writes all of A (no zero fill first)

@@ -2128,6 +2128,11 @@ class Envs:
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 
+    # GDN prefill: run the chunk scan of one long sequence (>= 8192 tokens) as up
+    # to 4 parts, with the per-chunk kernels on a side stream beside the serial
+    # chunk_h recurrence. Bit-identical to one pass.
+    SGLANG_GDN_CHUNK_PIPELINE = EnvBool(False)
+
     # ===================================================================
     # Plugin system
     # ===================================================================
