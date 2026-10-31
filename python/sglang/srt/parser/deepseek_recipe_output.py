@@ -11,9 +11,14 @@ from typing import Any, Optional
 import msgspec
 
 from sglang.srt.parser.deepseek_recipe_renderer import (
+    THINK_END_TOKEN,
+    THINK_START_TOKEN,
     DeepSeekRecipe,
     load_deepseek_recipe,
 )
+
+# The most tokens one UTF-8 character can span, a byte each.
+_MAX_UTF8_BYTES = 4
 
 
 class RecipeToolCallDelta(msgspec.Struct, frozen=True):
@@ -172,12 +177,19 @@ class DeepSeekRecipeOutputParser:
     ) -> list[int]:
         # The scheduler matched `stop` in the decoded text and ended on the token
         # completing it; the earliest match ending there starts at most
-        # len(stop) - 1 characters before that token.
+        # len(stop) - 1 characters before that token. A stop not found there, as
+        # a `stop_regex` pattern is not, is not cut.
         decode = self._hf_tokenizer.decode
         start = len(token_ids) - 1
-        last = decode(token_ids[start:], skip_special_tokens=False)
-        text = last
-        while start > 0 and (stop not in text or len(text) - len(last) < len(stop) - 1):
+        text = decode(token_ids[start:], skip_special_tokens=False)
+        reach = len(text) + len(stop) - 1
+        tokens_past_reach = 0
+        while start > 0 and (stop not in text or len(text) < reach):
+            if len(text) >= reach:
+                # A character split across tokens decodes whole only with all of them.
+                if tokens_past_reach == _MAX_UTF8_BYTES:
+                    break
+                tokens_past_reach += 1
             start -= 1
             text = decode(token_ids[start:], skip_special_tokens=False)
         cut = text.find(stop)
@@ -220,3 +232,28 @@ class DeepSeekRecipeOutputParser:
                 )
             )
         return delta
+
+
+def parse_output_text(
+    deepseek_recipe: DeepSeekRecipe,
+    text: str,
+    *,
+    parse_tool_calls: bool,
+    thinking: Optional[bool] = None,
+) -> RecipeOutputDelta:
+    """`text` parsed as a whole output; the markers it spells count as the tokens
+    the model would have sampled. With `thinking` None, text that opens with
+    `<think>` or closes a thinking block is reasoning up to `</think>`."""
+    tokenizer = deepseek_recipe.hf_tokenizer
+    output_ids = tokenizer.encode(text, add_special_tokens=False).ids
+    if thinking is None:
+        thinking = output_ids[:1] == [tokenizer.token_to_id(THINK_START_TOKEN)]
+        if thinking:
+            output_ids = output_ids[1:]
+        thinking = thinking or tokenizer.token_to_id(THINK_END_TOKEN) in output_ids
+    parser = DeepSeekRecipeOutputParser(
+        deepseek_recipe,
+        thinking_stage=deepseek_recipe.parse_start(thinking=thinking),
+        parse_tool_calls=parse_tool_calls,
+    )
+    return parser.finish(output_ids, {"type": "stop"})

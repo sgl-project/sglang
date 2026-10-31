@@ -111,12 +111,20 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
+  Local shared-memory reply files are cleaned up when the RPC completes, fails, or is cancelled; timing out does not abort GPU work already in flight. A hard process kill cannot run this cleanup, so isolate `/dev/shm` per deployment rather than sharing it across unrelated services.
+- `--sleep-on-idle`: reduce idle scheduler CPU usage by waiting for socket events. Disabled by default, matching SRT, to minimize idle-to-active wake-up latency. Applies only to monolithic serving with one rank per DP replica; TP/SP/CFG multi-rank replicas keep polling. Each wait ends when a message arrives, a pending allocator-cache release is due, or one second elapses. Active generation is unchanged; benchmark low-QPS tail latency before enabling it in latency-sensitive deployments.
 - `--enable-trace`: export OpenTelemetry traces for the diffusion scheduler and worker stages.
 - `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
+
+Keep internal scheduler ports on a trusted network: they use Python pickle,
+not an authenticated public API. On a monolithic scheduler, malformed payloads
+in valid request envelopes receive an error without discarding other requests
+received in the same poll.
+This isolation does not make untrusted pickle safe or recover from GPU failures.
 
 ### Disaggregated serving
 
@@ -466,13 +474,33 @@ SGLang Diffusion separates process liveness from inference readiness:
 | Endpoint | Success condition | Recommended use |
 | --- | --- | --- |
 | `GET /liveness` | The HTTP server is accepting requests. It remains `200` during server warmup. | Kubernetes liveness probe |
-| `GET /health` | The server is ready for normal inference traffic. It returns `503` while server-based synthetic warmup is running and `200` after it completes. | Startup and readiness probes |
+| `GET /health` | Server-based synthetic warmup has completed, tracked local workers are alive, and the local broker and any disaggregation routing loop are running. Returns `503` otherwise. | Startup and readiness probes |
 | `GET /health_generate` | Compatibility alias for `/health`. It does not currently issue a generation request in SGLang Diffusion. | Existing integrations only |
 
-`/health` gates only server-based warmup. With `--warmup-mode off` or
-`--warmup-mode request`, it returns `200` once the HTTP server starts; those modes
+With `--warmup-mode off` or `--warmup-mode request`, `/health` returns `200`
+once the HTTP server starts, provided its local backend is running; those modes
 do not promise that compilation or other first-request work has completed. If
 server-based warmup fails, the server terminates instead of reporting ready.
+
+For standard serving (including `--webui`) and locally launched disaggregated
+pools, losing any tracked worker makes `/health` return `503`; `/liveness`
+continues to report HTTP availability. The same applies when the local offline
+broker or disaggregation routing loop exits, even if its process is still alive.
+The broker replies to malformed jobs and inference errors without stopping;
+an unrecoverable socket receive or send error stops it and makes the server unready.
+A local monitor checks these components once per
+second, fails outstanding scheduler requests, and rejects new POST requests with
+`503`, even without an RPC timeout. Completed job status and content remain
+readable until the server stops. Remove the instance from routing and restart
+the whole server; workers and in-flight jobs are not automatically recovered.
+
+An allocator OOM during a multi-rank forward terminates the affected worker:
+other ranks may still be inside collectives, so continuing the next request is
+unsafe. Single-GPU replicas, including independent DP replicas, retain normal
+request-level OOM handling. The monitor does not detect arbitrary hangs, unusable
+CUDA contexts, or workers on other machines. A standalone disaggregation router
+does not own remote worker processes and cannot validate their health through this
+check; it only validates its own routing loop and broker.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
@@ -490,6 +518,11 @@ export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
 See [Environment Variables](/docs/sglang-diffusion/environment_variables) for the full set of storage options.
+
+Cancellation waits for active uploads to finish before request cleanup can remove
+their source files. Allow for the storage SDK's timeouts and retries in your
+shutdown grace period. Cancellation does not roll back objects already uploaded;
+use your bucket's lifecycle rules for object retention.
 
 ## Component Path Overrides
 

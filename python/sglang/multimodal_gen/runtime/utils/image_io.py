@@ -2,6 +2,7 @@
 import base64
 import os
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -11,6 +12,21 @@ def ensure_path_within_root(target_path: str, root_dir: str) -> str:
     if root_path != candidate and root_path not in candidate.parents:
         raise ValueError("Upload path escapes the uploads root")
     return str(candidate)
+
+
+def save_image_bytes_to_path(content: bytes, target_path: str) -> str:
+    """Publish a complete input without truncating an existing file on failure."""
+    directory = os.path.dirname(target_path)
+    os.makedirs(directory, exist_ok=True)
+    fd, part_path = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        os.replace(part_path, target_path)
+    finally:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+    return target_path
 
 
 def save_base64_image_to_path(
@@ -41,14 +57,9 @@ def save_base64_image_to_path(
     target_path = f"{target_path}.{ext}"
     if uploads_root is not None:
         target_path = ensure_path_within_root(target_path, uploads_root)
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
     try:
         image_data = base64.b64decode(data)
     except Exception as exc:
         raise Exception(f"Failed to decode base64 image: {str(exc)}") from exc
 
-    with open(target_path, "wb") as f:
-        f.write(image_data)
-
-    return target_path
+    return save_image_bytes_to_path(image_data, target_path)
