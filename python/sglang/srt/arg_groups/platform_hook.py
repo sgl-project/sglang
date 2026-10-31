@@ -136,7 +136,24 @@ def handle_xpu_backends(server_args: Any):
         # Decode graph is opt-in on XPU: unless the user explicitly set
         # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
         # disabled so the default startup doesn't require graph capture.
-        if (Phase.DECODE, "backend") not in server_args._cuda_graph_config_locked:
+        locked = getattr(server_args, "_cuda_graph_config_locked", set())
+        if (Phase.DECODE, "backend") not in locked:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+        elif (
+            cfg.tp_size > 1 and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "XPU decode graphs do not support tp_size > 1 because "
+                "all-reduce collectives are not captured during XPUGraph capture; "
+                "disabling decode graph for tp_size=%d.",
+                cfg.tp_size,
+            )
             declare_resolution(
                 server_args,
                 "_handle_xpu_backends",
