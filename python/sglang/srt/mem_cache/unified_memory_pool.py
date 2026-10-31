@@ -38,10 +38,12 @@ class UnifiedMambaSlotAllocator:
         mea,
         device: str,
         take: Optional[Callable[[int], Optional[torch.Tensor]]] = None,
+        capacity: Optional[Callable[[], int]] = None,
     ):
         self._multi_ended_allocator = mea
         # Slots are taken through the chain allocator when one owns the band.
         self._take = mea.alloc if take is None else take
+        self._capacity = capacity
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
 
@@ -67,8 +69,10 @@ class UnifiedMambaSlotAllocator:
         return self.size - self._multi_ended_allocator.allocated_count()
 
     def schedulable_available_size(self) -> int:
-        # Byte-coordinated count (>= N => alloc(N) succeeds); credits the peer's
-        # drainable holes since alloc flushes the peer before extending.
+        # The slots a take can have now (>= N => alloc(N) succeeds): the chain's
+        # layout search when a chain owns the band.
+        if self._capacity is not None:
+            return self._capacity()
         return self._multi_ended_allocator.schedulable_available_size()
 
     @property
@@ -133,6 +137,7 @@ def _wire_mamba_slot_allocator(
     take: Callable[[int], Optional[torch.Tensor]],
     state: StateStorage,
     device,
+    capacity: Optional[Callable[[], int]] = None,
 ) -> UnifiedMambaSlotAllocator:
     """Install Mamba slot allocation and host capacities."""
     state_pool = state.pool
@@ -140,6 +145,7 @@ def _wire_mamba_slot_allocator(
         mamba_end,
         device=device,
         take=take,
+        capacity=capacity,
     )
     state.slots = slot_allocator
     state_pool.host_capacity_tokens = state_pool.size
