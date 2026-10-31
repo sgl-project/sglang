@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -130,7 +129,6 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
@@ -1200,6 +1198,7 @@ class Req(ReqDllmMixin):
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
@@ -1561,6 +1560,7 @@ class Req(ReqDllmMixin):
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+        self.encoding_format = encoding_format
 
         # Beam search overlay: leader and internal members share one BeamGroup.
         self.beam_group = None
@@ -1608,6 +1608,21 @@ class Req(ReqDllmMixin):
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    @property
+    def resumable_by_rebootstrap(self) -> bool:
+        """A rebootstrap recomputes the KV from token ids alone."""
+        return (
+            self.multimodal_inputs is None
+            and self.input_embeds is None
+            and self.positional_embed_overrides is None
+        )
+
+    @property
+    def resumable_by_reprefill(self) -> bool:
+        """input_embeds cover only the prompt, so a re-prefill restarts the
+        generation; that is invisible until output has been sent."""
+        return self.input_embeds is None or self.send_token_offset == 0
 
     @property
     def is_beam_leader(self) -> bool:
@@ -2278,10 +2293,7 @@ class Req(ReqDllmMixin):
         not sent: like a handoff token it is the pending decode input, so the
         decode commit keeps it and ignores the token the prefill samples.
         """
-        # TODO: multi-modal requests are not supported here. The payload only
-        # carries token ``input_ids`` and drops any image/audio/video inputs, so
-        # the rebootstrap recompute would not reproduce the original prefix KV
-        # for multi-modal requests. Add multi-modal support before enabling it.
+        # TODO: carry multimodal inputs and embeds; such requests are aborted.
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
@@ -2475,6 +2487,18 @@ def set_mamba_track_indices_from_reqs(
         batch.mamba_track_indices[freed_rows] = -1
 
 
+def unresumable_abort_message() -> str:
+    if get_disagg().disaggregation_mode == "decode":
+        return (
+            "Retracted request aborted: the rebootstrap recomputes the KV from "
+            "token ids, which cannot rebuild multimodal inputs or embeds. Retry later."
+        )
+    return (
+        "Retracted request aborted: an input_embeds request that has sent output "
+        "cannot be recomputed. Retry later."
+    )
+
+
 def release_req(
     *,
     req: Req,
@@ -2485,7 +2509,7 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> bool:
-    """Returns False when the KV backup failed and the request cannot be resumed."""
+    """Returns whether the request can be resumed."""
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -2493,16 +2517,19 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
-    backup_saved = True
     # The config bag reflects role flips; server_args keeps the launch role.
-    if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = backup_kv_cache(
+    if get_disagg().disaggregation_mode != "decode":
+        resumable = req.resumable_by_reprefill
+    elif offload_kv:
+        resumable = backup_kv_cache(
             req,
             tree_cache,
             req_to_token_pool,
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    else:
+        resumable = req.resumable_by_rebootstrap
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2510,7 +2537,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
-    return backup_saved
+    return resumable
 
 
 def retract_all(
@@ -2521,9 +2548,11 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> None:
+) -> List[Req]:
+    """Returns the requests that cannot be resumed."""
+    unresumable = []
     for idx in range(len(reqs)):
-        release_req(
+        if not release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
             req_to_token_pool=req_to_token_pool,
@@ -2531,7 +2560,9 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
-        )
+        ):
+            unresumable.append(reqs[idx])
+    return unresumable
 
 
 def compute_extend_logprob_start_len(
@@ -2611,14 +2642,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
-
-    # For split prefill
-    split_index: int = 0
-    split_prefill_finished: bool = False
-    split_forward_count: int = 1
-    split_forward_batch: ForwardBatch = None
-    # A full prefill has one result but can span several run_batch calls.
-    split_prefill_start: Optional[Tuple[int, float]] = None
 
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
@@ -3377,11 +3400,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
 
-    def prepare_for_split_prefill(self):
-        self.prepare_for_extend()
-        # For split prefill, we need to set the forward mode to SPLIT_PREFILL
-        self.forward_mode = ForwardMode.SPLIT_PREFILL
-
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
@@ -3609,9 +3627,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
-                # No backup exists and the device KV is already freed, so the
-                # request cannot resume.
-                if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
+                # No backup or rebuild exists and the device KV is already freed.
+                if get_disagg().disaggregation_mode != "decode":
+                    message = unresumable_abort_message()
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                elif (
+                    get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+                ):
                     message = "Retraction host KV pool exhausted. Aborting the request."
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 else:
@@ -4158,7 +4180,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
-            split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
         )
 

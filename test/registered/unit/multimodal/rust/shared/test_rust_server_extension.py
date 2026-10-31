@@ -83,8 +83,6 @@ class _StreamedReq:
         self.output_ids = self.output_ids_through_stop = array("q", output_ids)
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
-        self.decoded_text = ""
         self.origin_input_ids = [1, 2]
         self.reasoning_tokens = 0
         self.cached_tokens = 0
@@ -121,9 +119,6 @@ class _StreamedReq:
 
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
-
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
 
     def check_match_stop_str_prefix(self):
         return False
@@ -869,12 +864,8 @@ class TestRustServerExtension(CustomTestCase):
             rids=["a", "b", "c", "d"],
             finished_reasons=[None] * 4,
             prompt_tokens=[3, 3, 3, 3],
-            output_ids=[
-                array("q", [7, 8]),
-                array("q", [9]),
-                array("q", [5]),
-                array("q"),
-            ],
+            output_ids_flat=array("q", [7, 8, 9, 5]),
+            output_ids_offsets=[0, 2, 3, 4, 4],
             cached_tokens=[0] * 4,
             reasoning_tokens=[0] * 4,
             weight_versions=None,

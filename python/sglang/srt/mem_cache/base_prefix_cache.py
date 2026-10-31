@@ -84,6 +84,15 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # Host-only checkpoint: hicache host-pool index. The radix node keeps this
+    # and no GPU slot. Mutually exclusive with mamba_value.
+    mamba_host_value: Optional[torch.Tensor] = None
+    # GPU slot to copy into the host pool. Set by prepare; the copy itself
+    # waits until the insert key is known, so a leaf that already has mamba
+    # never pays the D2H.
+    mamba_host_src: Optional[torch.Tensor] = None
+    # Both mamba values stay empty and the leaf already holds the checkpoint.
+    allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
 
