@@ -417,5 +417,136 @@ class TestNulByteGrammarRejection(unittest.TestCase):
                 dispatch.assert_called_once_with(key_string)
 
 
+class TestOutlinesJumpForward(unittest.TestCase):
+    """Test OutlinesGrammar.try_jump_forward and OutlinesJumpForwardMap byte parsing."""
+
+    def _make_outlines_grammar_cls(self):
+        import os
+        import sys
+        import types
+
+        saved = {}
+        stubs = {
+            "interegular": types.SimpleNamespace(
+                patterns=types.SimpleNamespace(InvalidSyntax=Exception),
+                InvalidSyntax=Exception,
+                parse_pattern=lambda *a, **kw: None,
+            ),
+            "outlines": types.SimpleNamespace(),
+            "outlines.caching": types.SimpleNamespace(
+                cache=lambda *a, **kw: (lambda fn: fn)
+            ),
+            "outlines.fsm": types.SimpleNamespace(),
+            "outlines.fsm.guide": types.SimpleNamespace(RegexGuide=object),
+            "outlines.fsm.json_schema": types.SimpleNamespace(
+                build_regex_from_schema=lambda *a, **kw: ""
+            ),
+            "outlines.fsm.regex": types.SimpleNamespace(
+                FSMInfo=object,
+                make_byte_level_fsm=lambda *a, **kw: None,
+                make_deterministic_fsm=lambda *a, **kw: (None, None),
+            ),
+            "outlines.models": types.SimpleNamespace(),
+            "outlines.models.transformers": types.SimpleNamespace(
+                TransformerTokenizer=object
+            ),
+        }
+        for name, mod in stubs.items():
+            if name not in sys.modules:
+                saved[name] = None
+                sys.modules[name] = mod
+
+        prev_env = os.environ.get("SGLANG_DISABLE_OUTLINES_DISK_CACHE")
+        os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = "false"
+        try:
+            from sglang.srt.constrained.outlines_backend import OutlinesGrammar
+            from sglang.srt.constrained.outlines_jump_forward import (
+                JumpEdge,
+                OutlinesJumpForwardMap,
+                init_state_to_jump_forward,
+            )
+
+            return (
+                OutlinesGrammar,
+                OutlinesJumpForwardMap,
+                JumpEdge,
+                init_state_to_jump_forward,
+            )
+        finally:
+            if prev_env is None:
+                os.environ.pop("SGLANG_DISABLE_OUTLINES_DISK_CACHE", None)
+            else:
+                os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = prev_env
+            for name in saved:
+                sys.modules.pop(name, None)
+
+    def test_try_jump_forward_consumes_continuation_bytes_without_mutating_map(self):
+        OutlinesGrammar, OutlinesJumpForwardMap, JumpEdge, _ = (
+            self._make_outlines_grammar_cls()
+        )
+        jf_map = OutlinesJumpForwardMap.__new__(OutlinesJumpForwardMap)
+        jf_map.state_to_jump_forward = {
+            0: JumpEdge(symbol=None, symbol_next_state=None, byte=0x9C, byte_next_state=1),
+            1: JumpEdge(symbol=None, symbol_next_state=None, byte=0x8D, byte_next_state=2),
+            2: JumpEdge(symbol=":", symbol_next_state=3, byte=ord(":"), byte_next_state=3),
+        }
+        grammar = OutlinesGrammar(guide=MagicMock(), jump_forward_map=jf_map)
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.side_effect = lambda toks: [
+            100 + i for i, _ in enumerate(toks)
+        ]
+
+        res = grammar.try_jump_forward(tokenizer)
+        self.assertEqual(res, ([100, 101], 2))
+        tokenizer.convert_tokens_to_ids.assert_called_once_with(["<0x9C>", "<0x8D>"])
+        self.assertEqual(grammar.jump_forward_str_state(res), (":", 3))
+
+    def test_try_jump_forward_returns_none_when_no_continuation_or_symbol_jump(self):
+        OutlinesGrammar, OutlinesJumpForwardMap, JumpEdge, _ = (
+            self._make_outlines_grammar_cls()
+        )
+        # Two multi-byte UTF-8 paths sharing lead byte 0xE6 and continuation 0xA0,
+        # but branching before completing a symbol -> symbol is None at state 0.
+        jf_map = OutlinesJumpForwardMap.__new__(OutlinesJumpForwardMap)
+        jf_map.state_to_jump_forward = {
+            0: JumpEdge(symbol=None, symbol_next_state=None, byte=0xE6, byte_next_state=1),
+            1: JumpEdge(symbol=None, symbol_next_state=None, byte=0xA0, byte_next_state=2),
+        }
+        grammar = OutlinesGrammar(guide=MagicMock(), jump_forward_map=jf_map)
+        tokenizer = MagicMock()
+
+        self.assertIsNone(grammar.try_jump_forward(tokenizer))
+        tokenizer.convert_tokens_to_ids.assert_not_called()
+
+    def test_init_state_to_jump_forward_parses_current_hex_symbol(self):
+        import types
+
+        _, _, _, init_state_to_jump_forward = self._make_outlines_grammar_cls()
+        import sglang.srt.constrained.outlines_jump_forward as ojf
+
+        fake_fsm_info = types.SimpleNamespace(
+            alphabet_symbol_mapping={"a": 0, "\x0080": 0},
+            alphabet_anything_value=999,
+            transitions={(0, 0): 1},
+            finals=set(),
+        )
+        fake_fsm = types.SimpleNamespace(fsm_info=fake_fsm_info)
+        with (
+            patch.object(
+                ojf.interegular,
+                "parse_pattern",
+                return_value=types.SimpleNamespace(
+                    to_fsm=lambda: types.SimpleNamespace(reduce=lambda: None)
+                ),
+            ),
+            patch.object(ojf, "make_byte_level_fsm", return_value=None),
+            patch.object(ojf, "make_deterministic_fsm", return_value=(fake_fsm, None)),
+        ):
+            state_map = init_state_to_jump_forward("a")
+        # State 0 has two outgoing byte transitions ('a' and 0x80), so it must be
+        # excluded rather than raising ValueError on int(symbols[0][1:], 16).
+        self.assertEqual(state_map, {})
+
+
 if __name__ == "__main__":
     unittest.main()
