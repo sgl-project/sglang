@@ -33,12 +33,15 @@ def cache_class():
 
 
 @pytest.mark.parametrize("store_raises", [False, True])
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 def test_store_orders_indices_and_producer_event_on_forward_stream(
-    cache_class, store_raises
+    cache_class, store_raises, device_type
 ):
     cache = cache_class.__new__(cache_class)
     caller = object()
-    forward = SimpleNamespace(device=torch.device("cuda:0"), wait_stream=mock.Mock())
+    forward = SimpleNamespace(
+        device=torch.device(f"{device_type}:0"), wait_stream=mock.Mock()
+    )
     active = [caller]
     sequence = []
     forward.wait_stream.side_effect = lambda stream: sequence.append(("wait", stream))
@@ -60,7 +63,7 @@ def test_store_orders_indices_and_producer_event_on_forward_stream(
 
     def submit(*args, **kwargs):
         # The connector records the producer event on the current stream.
-        assert torch.cuda.current_stream() is forward
+        assert device_module.current_stream() is forward
         sequence.append(("event", forward))
         if store_raises:
             raise RuntimeError("store failed")
@@ -79,6 +82,10 @@ def test_store_orders_indices_and_producer_event_on_forward_stream(
     cache.lmcache_connector = mock.Mock(chunk_size=256)
     cache.lmcache_connector.get_store_start.return_value = 0
     cache.lmcache_connector.submit_store.side_effect = submit
+    device_module = SimpleNamespace(
+        current_stream=mock.Mock(side_effect=lambda device=None: active[-1]),
+        stream=mock.Mock(side_effect=select),
+    )
     req = SimpleNamespace(rid="request", extra_key=None, cache_salt="salt")
     matched = MatchResult(
         device_prefix_len=256,
@@ -89,13 +96,18 @@ def test_store_orders_indices_and_producer_event_on_forward_stream(
     with (
         mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=matched),
         mock.patch.object(
-            torch.cuda, "current_stream", side_effect=lambda device=None: active[-1]
+            torch, "get_device_module", return_value=device_module
+        ) as get_device_module,
+        mock.patch.object(
+            torch.cuda,
+            "current_stream",
+            side_effect=AssertionError("Store must use the producer device backend"),
         ),
-        mock.patch.object(torch.cuda, "stream", side_effect=select),
     ):
         cache._submit_store(req, list(range(256)))
 
     forward.wait_stream.assert_called_once_with(caller)
+    get_device_module.assert_called_once_with(forward.device)
     assert active == [caller]
     assert [name for name, _ in sequence] == [
         "wait",
