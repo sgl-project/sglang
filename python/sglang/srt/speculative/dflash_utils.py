@@ -21,6 +21,7 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_npu
 
@@ -219,9 +220,8 @@ def apply_dflash_verify_logits_adjustments(
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    Per-request penalties are broadcast over the verify block instead of
+    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
     """
     if sampling_info is None:
         return
@@ -246,8 +246,8 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    acc_additive_penalties = sampling_info.acc_additive_penalties
+    acc_scaling_penalties = sampling_info.acc_scaling_penalties
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -259,33 +259,23 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
-    if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
-        linear_penalty = torch.zeros(
+    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
+    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
+    if acc_additive_penalties is not None:
+        get_logits_3d().add_(acc_additive_penalties[:, None, :])
+    if acc_scaling_penalties is not None:
+        apply_scaling_penalties(get_logits_3d(), acc_scaling_penalties[:, None, :])
+
+    if grammar_mask is not None:
+        vocab_mask_bias = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        grammar_mask.apply(vocab_mask_bias)
         get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
         )
-        return
-
-    if acc_linear_penalties is not None:
-        if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
-        ):
-            acc_linear_penalties = acc_linear_penalties.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
 
     if logit_bias is not None:
         if (
