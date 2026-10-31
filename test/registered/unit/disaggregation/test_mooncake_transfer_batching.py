@@ -14,8 +14,13 @@ from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+    TransferIntent,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+FOREGROUND = TransferIntent.FOREGROUND
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -79,9 +84,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         self.assertEqual(
             manager.engine.batch_transfer_sync.call_args_list,
             [
-                call("session", [1000, 2000], [5100, 6200], [20, 40]),
-                call("session", [1020, 2040], [5120, 6240], [20, 40]),
-                call("session", [1040, 2080], [5140, 6280], [10, 20]),
+                call("session", [1000, 2000], [5100, 6200], [20, 40], FOREGROUND),
+                call("session", [1020, 2040], [5120, 6240], [20, 40], FOREGROUND),
+                call("session", [1040, 2080], [5140, 6280], [10, 20], FOREGROUND),
             ],
         )
 
@@ -97,6 +102,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                     [1000, 2000],
                     [5100, 6200],
                     [50, 100],
+                    FOREGROUND,
                 )
 
     def test_stops_after_first_failed_index_batch(self):
@@ -118,9 +124,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         self.assertEqual(
             manager.engine.batch_transfer_sync.call_args_list,
             [
-                call("session", [1000, 2000], [5100, 6400], [20, 40]),
-                call("session", [1020, 2040], [5120, 6440], [20, 40]),
-                call("session", [1040, 2080], [5140, 6480], [10, 20]),
+                call("session", [1000, 2000], [5100, 6400], [20, 40], FOREGROUND),
+                call("session", [1020, 2040], [5120, 6440], [20, 40], FOREGROUND),
+                call("session", [1040, 2080], [5140, 6480], [10, 20], FOREGROUND),
             ],
         )
 
@@ -132,8 +138,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         self.assertEqual(manager.engine.batch_transfer_sync.call_count, 2)
         manager.engine.batch_transfer_sync.assert_has_calls(
             [
-                call("session", [1000], [5100], [50]),
-                call("session", [2000], [6200], [100]),
+                call("session", [1000], [5100], [50], FOREGROUND),
+                call("session", [2000], [6200], [100], FOREGROUND),
             ],
             any_order=True,
         )
@@ -143,7 +149,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
     def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
         """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
 
-        def copy_bytes(session, sources, destinations, lengths):
+        def copy_bytes(session, sources, destinations, lengths, intent=None):
             for src, dst, length in zip(sources, destinations, lengths, strict=True):
                 ctypes.memmove(dst, src, length)
             return 0
