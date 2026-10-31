@@ -44,11 +44,7 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
-    if not (
-        cfg.enable_prefill_cp
-        and cfg.pp_size == 1
-        and resolved.attn_cp_size == cfg.tp_size
-    ):
+    if not (cfg.enable_prefill_cp and resolved.attn_cp_size == cfg.tp_size):
         return False
     prefill_attention_backend, _ = attention_backends_of(resolved)
     try:
@@ -60,5 +56,8 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         # Other backends (or an unresolved backend/strategy) cannot use CP BCG.
         return False
     if combination not in PREFILL_CP_BCG_SUPPORTED_COMBINATIONS:
+        return False
+    # Zigzag replays hand PP stage boundaries over in the eager CP-local layout.
+    if cfg.pp_size != 1 and combination[0] != ContextParallelStrategyKind.ZIGZAG:
         return False
     return get_cp_bcg_input_type(combination[0]).supports(server_args)
