@@ -132,7 +132,7 @@ print("windows:", response.metadata["doc_split_batches"])
 
 </Accordion>
 
-Check `metadata.doc_split_complete` before treating a non-streaming split response as a complete document. If a window exceeds the context limit, the response contains the successful windows, reports `finish_reason: "length"`, and lists the rejected window in `metadata.doc_split_incomplete_batches`.
+Check `metadata.doc_split_complete` before treating a non-streaming split response as a complete document. If a window exceeds the context limit while other windows succeed, the response contains those successful windows, reports `finish_reason: "length"`, and lists the rejected window in `metadata.doc_split_incomplete_batches`.
 
 <Accordion title="Example Output">
 
