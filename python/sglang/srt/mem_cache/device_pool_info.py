@@ -108,6 +108,8 @@ class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     v_head_dim: int
     dtype: torch.dtype
     device: torch.device
+    # Value encoding when the physical buffers carry raw FP8 bytes.
+    value_dtype: torch.dtype | None = None
     scales: KVScaleBuffers | None = None
     # Resolve current contiguous backing at transfer time for relocatable pools.
     transfer_buffers: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -173,6 +175,8 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     kv_cache_dim: int
     dtype: torch.dtype
     device: torch.device
+    # Value encoding when the physical buffers carry raw FP8 bytes.
+    value_dtype: torch.dtype | None = None
     packed_fp8: bool = False
     scales: tuple[torch.Tensor, ...] | None = None
     native_buffers: Callable[[], MLASplitBuffers] | None = None

@@ -492,6 +492,7 @@ class MHAView(MHAKVView):
                     head_dim=self.head_dim,
                     v_head_dim=self.v_head_dim,
                     dtype=self.store_dtype,
+                    value_dtype=self.dtype,
                     device=(
                         buffers.k[0].device
                         if len(buffers.k)

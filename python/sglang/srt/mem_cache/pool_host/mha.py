@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
     host_memory_budget_bytes,
+    resolve_storage_dtype,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -209,6 +210,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.target_layer_num = len(buffer_info.buffers.k)
         self._transfer_device = buffer_info.device
         self.dtype = buffer_info.dtype
+        self._value_dtype = buffer_info.value_dtype or buffer_info.dtype
         self.head_dim = buffer_info.head_dim
         self.v_head_dim = buffer_info.v_head_dim
         self.head_num = buffer_info.head_num
@@ -247,6 +249,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                 else buffer_info.buffers.v_data_ptrs
             )
         self._initialize_transfer_views(buffer_info, write_back_staging)
+
+    def get_storage_dtype(self) -> torch.dtype:
+        return resolve_storage_dtype(self.dtype, self._value_dtype)
 
     def _initialize_transfer_views(self, buffer_info, write_back_staging) -> None:
         self.element_dim = self.head_num * self.head_dim

@@ -805,6 +805,7 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
         model_name = storage_model_name(model_name, self.storage_host_pool)
+        storage_dtype = self.storage_host_pool.get_storage_dtype()
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
@@ -834,6 +835,11 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
+            kv_cache_dtype=(
+                str(storage_dtype).removeprefix("torch.")
+                if storage_dtype is not None
+                else None
+            ),
             unified_suffixes=(unified_plan.suffixes if unified_plan else None),
             unified_chunk_spans=unified_chunk_spans,
             dcp_size=dcp_size,

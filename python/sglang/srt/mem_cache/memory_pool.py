@@ -2349,6 +2349,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             head_dim=self.head_dim,
             v_head_dim=self.v_head_dim,
             dtype=self.store_dtype,
+            value_dtype=self.dtype,
             device=buffers.k[0].device if len(buffers.k) else torch.device(self.device),
             scales=self._mha_scale_buffers(),
         )
@@ -4744,6 +4745,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             qk_rope_head_dim=self.qk_rope_head_dim,
             kv_cache_dim=self.kv_cache_dim,
             dtype=self.store_dtype,
+            value_dtype=self.dtype,
             device=self.data_ptrs.device,
             packed_fp8=self.dsa_kv_cache_store_fp8,
             scales=None

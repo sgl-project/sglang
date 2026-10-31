@@ -161,7 +161,9 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                         controller = HiCacheController.__new__(HiCacheController)
                         controller.mem_pool_device = view_type.__new__(view_type)
                         controller.mem_pool_host = SimpleNamespace(
-                            layout="page_first", storage_format_tag=None
+                            layout="page_first",
+                            storage_format_tag=None,
+                            get_storage_dtype=lambda: torch.float16,
                         )
                         controller.storage_host_pool = controller.mem_pool_host
                         controller.enable_storage_metrics = False
@@ -196,6 +198,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                                 continue
                             config = controller._generate_storage_config()
                         self.assertEqual(config.is_mla_model, is_mla)
+                        self.assertEqual(config.kv_cache_dtype, "float16")
                         self.assertEqual(
                             config.is_storage_writer, not is_mla or tp_rank < dcp_size
                         )

@@ -130,6 +130,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
         # Buffer-info host pools expose the physical dtype and no device_pool.
         host_pool = SimpleNamespace(
             dtype=torch.uint8,
+            get_storage_dtype=lambda: device_pool.dtype,
             head_num=0 if mla else 4,
             head_group_num=1,
             start_layer=4,
@@ -354,6 +355,8 @@ class TestControllerUnifiedKeys(CustomTestCase):
         self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))
         self.assertEqual((config.attn_cp_rank, config.attn_cp_size), (1, 2))
         self.assertTrue(config.is_mla_model)
+        self.assertEqual(config.kv_cache_dtype, "float8_e4m3fn")
+        self.assertEqual(config.unified_suffixes, ["shared"])
 
     def test_config_pairs_grid_keys_with_physical_page_spans(self):
         # MHA key order alternates head groups, while each group's layers are

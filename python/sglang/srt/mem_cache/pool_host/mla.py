@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.pool_host._kvcacheio import (
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    resolve_storage_dtype,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -93,6 +94,7 @@ class MLAHostAllocation(msgspec.Struct, frozen=True, kw_only=True):
     size_per_token: int
     draft_layer_num: int = 0
     packed_fp8: bool = False
+    value_dtype: torch.dtype | None = None
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
@@ -134,6 +136,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
             )
         self.dtype = buffer_info.dtype
+        self._value_dtype = buffer_info.value_dtype or buffer_info.dtype
         self.layout = layout
         self.page_unified_layout = page_unified_layout
         self.kv_lora_rank = buffer_info.kv_lora_rank
@@ -264,6 +267,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return
 
         self._initialize_transfer_views(write_back_staging)
+
+    def get_storage_dtype(self) -> torch.dtype:
+        return resolve_storage_dtype(self.dtype, self._value_dtype)
 
     def _initialize_transfer_views(self, write_back_staging=None) -> None:
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
