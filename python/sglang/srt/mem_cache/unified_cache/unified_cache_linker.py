@@ -535,7 +535,7 @@ class UnifiedCacheLinkerWrapper:
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
     ) -> None:
-        for index, pending in enumerate(self.pending_offloads):
+        for pending in self.pending_offloads:
             if pending.lock_node_id != ack_id:
                 continue
             publish_node_ids = []
@@ -544,9 +544,7 @@ class UnifiedCacheLinkerWrapper:
                     publish_node_ids.extend(new_node_ids)
                 else:
                     publish_node_ids.append(node_id)
-            self.pending_offloads[index] = pending._replace(
-                publish_node_ids=publish_node_ids
-            )
+            pending.publish_node_ids[:] = publish_node_ids
             return
 
     def num_completed_offloads(self) -> int:
@@ -559,9 +557,13 @@ class UnifiedCacheLinkerWrapper:
         return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
-        assert len(successes) <= len(self.pending_offloads)
-        for success in successes:
-            pending = self.pending_offloads.pop(0)
+        n = len(successes)
+        assert n <= len(self.pending_offloads)
+        if n == 0:
+            return
+        completed = self.pending_offloads[:n]
+        del self.pending_offloads[:n]
+        for pending, success in zip(completed, successes):
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
