@@ -165,7 +165,9 @@ class PrefillBudget:
     ) -> bool:
         return paged_input <= min(self.remaining_current, self.remaining_total)
 
-    def available_chunk_tokens(self, chunk_limit: int) -> int | None:
+    def available_chunk_tokens(
+        self, chunk_limit: int, *, can_wait: bool = False
+    ) -> int | None:
         available_tokens = int(self.remaining_total)
         if is_cp_sharded_padded():
             available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
@@ -173,8 +175,22 @@ class PrefillBudget:
             chunk_limit,
             available_tokens,
         )
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        if available > 0:
+            return available
+        # The running decodes' reserved growth leaves no budget, but a
+        # single-pool continuation must make progress to release its KV: take
+        # what the pool can back now, in whole pages with one to spare. A full
+        # chunk past the free pages makes the allocator raise "Prefill out of
+        # memory" and kills the scheduler.
+        allocatable = int(self.remaining_current) - self.page_size
+        if is_cp_sharded_padded():
+            allocatable = get_cp_sharded_padded_available_tokens(allocatable)
+        allocatable = allocatable // self.page_size * self.page_size
+        if allocatable > 0:
+            return min(chunk_limit, allocatable)
+        # Nothing allocatable: skip a step while a running decode can finish or
+        # retract and free pages; otherwise try (and report a real OOM).
+        return None if can_wait else chunk_limit
 
     def fit_chunk(
         self,
@@ -332,7 +348,10 @@ class SWAPrefillBudget(PrefillBudget):
             return super().has_capacity() and self.remaining_swa >= 0
         return super().has_capacity() and self.remaining_swa > 0
 
-    def available_chunk_tokens(self, chunk_limit: int) -> int | None:
+    def available_chunk_tokens(
+        self, chunk_limit: int, *, can_wait: bool = False
+    ) -> int | None:
+        # SWA already skips a continuation without room (None), whatever can_wait.
         available_tokens = int(self.remaining_total)
         if is_cp_sharded_padded():
             available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
@@ -458,12 +477,16 @@ class ChainPrefillBudget(SWAPrefillBudget):
             return PrefillBudget.check_prefill(self, **kwargs)
         return super().check_prefill(**kwargs)
 
-    def available_chunk_tokens(self, chunk_limit: int) -> int | None:
+    def available_chunk_tokens(
+        self, chunk_limit: int, *, can_wait: bool = False
+    ) -> int | None:
         if self.rules.window == "joint":
             return chunk_limit if chunk_limit > 0 else None
         if self.rules.window == "none":
-            return PrefillBudget.available_chunk_tokens(self, chunk_limit)
-        return super().available_chunk_tokens(chunk_limit)
+            return PrefillBudget.available_chunk_tokens(
+                self, chunk_limit, can_wait=can_wait
+            )
+        return super().available_chunk_tokens(chunk_limit, can_wait=can_wait)
 
     def fit_chunk(self, **kwargs) -> int | None:
         if self.rules.window == "joint":
