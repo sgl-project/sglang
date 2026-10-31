@@ -323,6 +323,12 @@ class PipelineConfig:
 
         del server_args
 
+    def supports_causal_pipeline(self) -> bool:
+        return False
+
+    def causal_pipeline_num_steps(self) -> int:
+        raise NotImplementedError("This model does not support causal pipelines")
+
     def supports_action_endpoint(self) -> bool:
         """Whether this pipeline exposes the generic action generation API."""
 
