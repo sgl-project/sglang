@@ -46,6 +46,12 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     num_virtual_pages: int
     low_page: int = 0  # float only
     high_page: int = 0  # float only
+    # A pin source is busy: the whole band stays where it is.
+    pinned: bool = False
+    # Pages ``[first, end)`` holding every page that cannot move (a load
+    # reservation, a quarantined page); the band's extent must keep covering
+    # them. None when there is none.
+    fixed: Optional[Tuple[int, int]] = None
 
     @property
     def transparent(self) -> bool:
@@ -134,6 +140,8 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
+        band.pinned_by_source(),
+        band.fixed_extent(),
     )
 
 
@@ -911,8 +919,9 @@ class PlanTake(msgspec.Struct, frozen=True, gc=False, kw_only=True):
 class TakePlan(msgspec.Struct, frozen=True, gc=False, kw_only=True):
     """A layout serving a demand. ``flush``: ends compacted first. ``targets``:
     the page block ``[first, end)`` each relocated float ends up in, holding its
-    live pages and, as holes, its demand. ``takes``: every demanded band's take
-    (a relocated float takes ``reuse`` of its block's holes)."""
+    live pages and, as holes, its demand (and, when its fixed pages reach
+    further, more holes). ``takes``: every demanded band's take (a relocated
+    float takes ``reuse`` of its block's holes)."""
 
     step: str
     flush: Tuple[str, ...]
@@ -928,17 +937,24 @@ def _fixed_takes(
     b: BandSnapshot, pages: int, *, step: str, total_bytes: int
 ) -> Tuple[PlanTake, ...]:
     """The takes a band that stays in place can make, as extents on bytes. An
-    end compacted first (any step but NO_MOVE, when unblocked) holds just its
-    live pages; otherwise it keeps its span and reuses its holes. A float in
-    place reuses holes and extends one side, either one."""
+    end compacted first (any step but NO_MOVE, when not pinned) holds just its
+    live pages, reaching as far as its farthest fixed page with holes between;
+    otherwise it keeps its span and reuses its holes. A float in place reuses
+    holes and extends one side, either one."""
     e = b.page_bytes
     if b.grow == "float":
         low, high = b.low_byte // e, b.high_byte // e
         holes = b.holes
-    elif step != NO_MOVE and not b.blocked:
-        holes = 0
-        low = b.min_page if b.grow == "up" else b.num_pages - b.live
-        high = b.min_page + b.live if b.grow == "up" else b.num_pages
+    elif step != NO_MOVE and not b.pinned and (b.lazy or b.fixed is None):
+        if b.grow == "up":
+            low, high = b.min_page, b.min_page + b.live
+            if b.fixed is not None:
+                high = max(high, b.fixed[1])
+        else:
+            low, high = b.num_pages - b.live, b.num_pages
+            if b.fixed is not None:
+                low = min(low, b.fixed[0])
+        holes = high - low - b.live
     else:
         holes = b.holes if b.lazy else 0
         low, high = b.low_byte // e, b.high_byte // e
@@ -970,16 +986,29 @@ def _fixed_takes(
     return tuple(out)
 
 
+def _block_end(b: BandSnapshot, pages: int, start: int) -> int:
+    """End byte of a placed float's block starting at byte ``start``: room for
+    its live pages and demand, reaching past its last fixed page."""
+    end = start + (b.live + pages) * b.page_bytes
+    if b.fixed is not None:
+        end = max(end, b.fixed[1] * b.page_bytes)
+    return end
+
+
 def _pack(
     low_byte: int, movers: Tuple[Tuple[BandSnapshot, int], ...]
 ) -> Optional[Tuple[Tuple[int, ...], int]]:
     """The placed floats of a segment packed leftmost in chain order, each on
     its own grid within its index room: their start bytes and the frontier the
-    last leaves, or None when one runs past its index room."""
+    last leaves, or None when one runs past its index room or starts past its
+    first fixed page. A block's end never falls as its start falls, so the
+    leftmost packing leaves every later float the most room."""
     x, starts = low_byte, []
     for b, pages in movers:
         start = max(_align_up(x, b.page_bytes), b.min_page * b.page_bytes)
-        x = start + (b.live + pages) * b.page_bytes
+        if b.fixed is not None and start > b.fixed[0] * b.page_bytes:
+            return None
+        x = _block_end(b, pages, start)
         if x > b.num_pages * b.page_bytes:
             return None
         starts.append(start)
@@ -1002,7 +1031,8 @@ def _segment_starts(
     """Start bytes of a segment's placed floats: the demand first, then the
     slack split between the segment's gaps by ``weights`` (one per gap, evenly
     when all are zero), each float clamped between its leftmost packed start
-    and its latest start that still lets the floats after it fit."""
+    and its latest start that still lets the floats after it fit (never past
+    its first fixed page)."""
     _, end = _pack(low_byte, movers)
     slack = high_byte - end
     if not any(weights):
@@ -1014,6 +1044,8 @@ def _segment_starts(
         b, pages = movers[i]
         e = b.page_bytes
         y = (min(y, b.num_pages * e) - (b.live + pages) * e) // e * e
+        if b.fixed is not None:
+            y = min(y, b.fixed[0] * e)
         latest[i] = y
     starts, x = [], low_byte
     for i, (b, pages) in enumerate(movers):
@@ -1022,7 +1054,7 @@ def _segment_starts(
         gap = slack * weights[i] // total
         start = min(max(_align_up(x + gap, e), earliest), latest[i])
         starts.append(start)
-        x = start + (b.live + pages) * e
+        x = _block_end(b, pages, start)
     return tuple(starts)
 
 
@@ -1063,8 +1095,10 @@ def plan(
     leftmost on every float's own grid decides whether it fits, and the fit
     only gets easier as the segment's low frontier falls, so of a fixed band's
     takes the one with the lowest high byte is kept: the walk is exact for
-    this world and linear in the number of bands. A blocked band (a pinned
-    one) is always in place.
+    this world and linear in the number of bands. A pinned band is always in
+    place; a band's fixed pages only bound where it may be laid out: a
+    compacted end reaches its farthest fixed page, a relocated float's block
+    covers them.
     """
     if step not in PLAN_STEPS:
         raise ValueError(f"unknown plan step {step!r}")
@@ -1081,7 +1115,7 @@ def plan(
         if b.live + pages > b.num_pages - b.min_page:
             return None
         placed = b.transparent or (
-            b.grow == "float" and step == RELAYOUT and not b.blocked
+            b.grow == "float" and step == RELAYOUT and not b.pinned
         )
         if placed:
             if b.live or pages:
@@ -1114,12 +1148,9 @@ def plan(
             for (b, pages), start in zip(segment, starts):
                 first = start // b.page_bytes
                 if b.live:
-                    targets[b.name] = (first, first + b.live + pages)
-                    takes[b.name] = PlanTake(
-                        reuse=pages,
-                        low_byte=start,
-                        high_byte=(first + b.live + pages) * b.page_bytes,
-                    )
+                    end = _block_end(b, pages, start)
+                    targets[b.name] = (first, end // b.page_bytes)
+                    takes[b.name] = PlanTake(reuse=pages, low_byte=start, high_byte=end)
                 else:
                     takes[b.name] = PlanTake(
                         side="place",
@@ -1131,9 +1162,7 @@ def plan(
     flush = (
         ()
         if step == NO_MOVE
-        else tuple(
-            b.name for b in snapshot.bands if b.grow != "float" and not b.blocked
-        )
+        else tuple(b.name for b in snapshot.bands if b.grow != "float" and not b.pinned)
     )
     return TakePlan(step=step, flush=flush, targets=targets, takes=takes)
 
