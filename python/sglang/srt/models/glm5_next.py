@@ -1392,10 +1392,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 )
             parallel = get_parallel()
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in (2, 4, 8)
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return (
+                    "HIP shared experts fusion is validated only for TP2, TP4 and TP8."
+                )
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096
@@ -1416,6 +1418,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "clamped SiLU G1U1 activation."
                 )
             if quant_config is not None and quant_config.get_name() == "quark":
+                if parallel.tp_size == 2:
+                    return "HIP Quark shared experts fusion is validated only for TP4 and TP8."
                 return cls._quark_mxfp4_shared_fusion_disable_reason(
                     text_config, quant_config
                 )
