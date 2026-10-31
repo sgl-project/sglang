@@ -24,15 +24,17 @@ def _parse_gemma4_value(value_str: str) -> object:
     if not value_str:
         return value_str
 
-    # Boolean
+    # Boolean or null
     if value_str == "true":
         return True
     if value_str == "false":
         return False
+    if value_str == "null":
+        return None
 
     # Number (int or float)
     try:
-        if "." in value_str:
+        if "." in value_str or "e" in value_str.lower():
             return float(value_str)
         return int(value_str)
     except ValueError:
