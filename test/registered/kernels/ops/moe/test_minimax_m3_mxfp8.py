@@ -177,7 +177,10 @@ def _ref_moe(x, w13, w2, topk_weights, topk_ids, alpha, beta, limit):
             if limit is not None:
                 gate = gate.clamp(max=limit)
                 up = up.clamp(min=-limit, max=limit)
-            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+            if alpha is None:
+                act = torch.nn.functional.silu(gate) * up
+            else:
+                act = gate * torch.sigmoid(alpha * gate) * (up + beta)
             g2 = act @ w2[e].float().T  # [H]
             out[t] += topk_weights[t, j].float() * g2
     return out.to(x.dtype)
@@ -222,6 +225,37 @@ def test_mxfp8_native_moe(T, H, inter, E, top_k):
     w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)
     w2_deq = dequant_mxfp8_to_bf16(w2_fp8, w2_scale)
     ref = _ref_moe(x, w13_deq, w2_deq, topk_weights, topk_ids, alpha, beta, limit)
+    assert got.shape == (T, H)
+    assert _relerr(got, ref) < 5e-2
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "T,H,inter,E,top_k", [(8, 256, 512, 8, 2), (33, 512, 384, 16, 4)]
+)
+@torch.inference_mode()
+def test_mxfp8_native_moe_plain_silu(T, H, inter, E, top_k):
+    from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import fused_experts_mxfp8
+
+    torch.manual_seed(0)
+    w13_bf16 = torch.randn(E, 2 * inter, H, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    w2_bf16 = torch.randn(E, H, inter, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    w13_fp8, w13_scale = _mxfp8_e4m3_quantize_torch(w13_bf16)
+    w2_fp8, w2_scale = _mxfp8_e4m3_quantize_torch(w2_bf16)
+
+    x = torch.randn(T, H, device=DEVICE, dtype=torch.bfloat16) * 0.5
+    logits = torch.randn(T, E, device=DEVICE, dtype=torch.float32)
+    topk_weights, topk_ids = logits.softmax(dim=-1).topk(top_k, dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
+
+    # Runner defaults of a standard SiLU-gated MoE (e.g. Qwen3-MoE): no
+    # gemm1_alpha / gemm1_limit, gate_up_interleaved left at True.
+    got = fused_experts_mxfp8(
+        x, w13_fp8, w2_fp8, topk_weights, topk_ids, w13_scale, w2_scale
+    )
+    w13_deq = dequant_mxfp8_to_bf16(w13_fp8, w13_scale)
+    w2_deq = dequant_mxfp8_to_bf16(w2_fp8, w2_scale)
+    ref = _ref_moe(x, w13_deq, w2_deq, topk_weights, topk_ids, None, None, None)
     assert got.shape == (T, H)
     assert _relerr(got, ref) < 5e-2
 
