@@ -1491,6 +1491,7 @@ class HunyuanImage3AR(PipelineStage):
                     dtype=latent_dtype
                 )
 
+                self.check_cancelled(reqs)
         finally:
             self.ar_model.model.clear_prefix_kv_cache()
 
