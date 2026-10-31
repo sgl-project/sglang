@@ -9,6 +9,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     Flux3ImagePipelineConfig,
     Flux3ImageSamplingParams,
 )
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import StageSpec
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
@@ -37,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ImageConditionEncodeStage,
     Flux3ImageDecodeStage,
     Flux3ImageDenoiseStage,
+    Flux3ImagePostprocessStage,
     Flux3ImageTextEncodeStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -51,6 +53,46 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_config_cls = Flux3ImagePipelineConfig
     sampling_params_cls = Flux3ImageSamplingParams
     _required_config_modules: list[str] = []
+    stage_specs = (
+        StageSpec(
+            "flux3_text_encode",
+            outputs=("extra.flux3_text",),
+            components=("text_encoder",),
+            after=(),
+        ),
+        StageSpec(
+            "flux3_condition_encode",
+            outputs=("extra.flux3_condition", "extra.flux3_crop", "width", "height"),
+            components=("vae",),
+            after=(),
+        ),
+        StageSpec(
+            "flux3_denoise",
+            inputs=("extra.flux3_text", "extra.flux3_condition", "width", "height"),
+            outputs=("latents", "latent_ids"),
+            components=("transformer",),
+            after=(),
+        ),
+        StageSpec(
+            "flux3_decode",
+            inputs=("latents", "latent_ids"),
+            outputs=("output",),
+            components=("vae",),
+        ),
+        StageSpec(
+            "flux3_postprocess",
+            inputs=("output", "extra.flux3_crop"),
+            outputs=("output", "result.output"),
+        ),
+    )
+
+    def _needs_component(self, server_args, component, *affinities):
+        if self.deployment_plan is not None:
+            return (
+                component
+                in self.deployment_plan.roles[server_args.stage_role].components
+            )
+        return any(server_args.disagg_role.includes_stage(role) for role in affinities)
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role not in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
@@ -84,14 +126,13 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             )
 
         device = get_local_torch_device()
-        role = server_args.disagg_role
         modules = {}
-        if role.includes_stage(RoleType.DENOISER):
+        if self._needs_component(server_args, "transformer", RoleType.DENOISER):
             modules["transformer"] = self._load_transformer(
                 server_args, package, device
             )
-        if role.includes_stage(RoleType.IMAGE_ENCODER) or role.includes_stage(
-            RoleType.DECODER
+        if self._needs_component(
+            server_args, "vae", RoleType.IMAGE_ENCODER, RoleType.DECODER
         ):
             vae_device = (
                 torch.device("cpu")
@@ -106,7 +147,7 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 vae, load_file(str(package.vae), device=str(vae_device)), assign=True
             )
             modules["vae"] = vae
-        if role.includes_stage(RoleType.PROMPT_ENCODER):
+        if self._needs_component(server_args, "text_encoder", RoleType.PROMPT_ENCODER):
             modules["text_encoder"] = self._load_text_encoder(
                 server_args, package, device
             )
@@ -186,6 +227,9 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 package_config=package_config,
             ),
             "flux3_decode",
+        )
+        self.add_stage_factory(
+            RoleType.DECODER, Flux3ImagePostprocessStage, "flux3_postprocess"
         )
 
 
