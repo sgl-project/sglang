@@ -594,15 +594,13 @@ def _static_owner_region(token_to_kv_pool) -> Region:
         ptrs, lens, item_lens = token_to_kv_pool.get_sparse_kv_buf_infos()
     else:
         ptrs, lens, item_lens = token_to_kv_pool.get_contiguous_buf_infos()
-    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
-
-    # A pool wrapping one token KV view (its other layers hold state), or one
-    # whose main page rows pair by layer id, reports per-entry layer ids for the
-    # peers to pair by.
+    # A pool wrapping one token KV view (its other layers hold state), or a
+    # MiniMax sparse pool whose main KV holds only its sparse layers, reports
+    # per-entry layer ids for the peers to pair by.
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        or isinstance(token_to_kv_pool, MiniMaxSparseKVPool)
         else ()
     )
     return Region(
@@ -703,16 +701,30 @@ def _static_state_entries(
                 "PD disaggregation for MiniMax sparse layers with index value "
                 "(index_kv_pool) is not yet supported; only K-only sparse layers are."
             )
+        # Both components hold only this PP stage's layers, so publish global
+        # layer ids for the peers to pair entries by.
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
-            add(StateType.MINIMAX_INDEX_K, dp, dl, il)
+            add(
+                StateType.MINIMAX_INDEX_K,
+                dp,
+                dl,
+                il,
+                layer_ids=token_to_kv_pool.get_index_k_state_layer_ids(),
+            )
         dense_ptrs, dense_lens, dense_item_lens = (
             token_to_kv_pool.get_dense_kv_state_buf_infos()
         )
         # An all-sparse pool has no dense layers; registering an empty component
         # would make every transfer carry a state with nothing to move.
         if dense_ptrs:
-            add(StateType.MINIMAX_DENSE_KV, dense_ptrs, dense_lens, dense_item_lens)
+            add(
+                StateType.MINIMAX_DENSE_KV,
+                dense_ptrs,
+                dense_lens,
+                dense_item_lens,
+                layer_ids=token_to_kv_pool.get_dense_kv_state_layer_ids(),
+            )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
