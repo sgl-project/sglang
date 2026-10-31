@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.cache_write_usage import cache_write_usage_for_req
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -248,6 +249,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         families = {slot.family for slot in params.tree_slots}
         self._index_slots(params.tree_slots)
+        self._cache_write_slot_families = tuple(
+            slot.family for slot in params.tree_slots
+        )
         # Whether a slot keeps the trailing window of a prefix.
         self.is_swa_enabled = TREE_WINDOW in families
         # Whether a slot keeps a prefix's recurrent state checkpoints.
@@ -640,6 +644,8 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if params.req is not None:
+            self._prepare_cache_write_usage(params.req)
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -1173,6 +1179,54 @@ class UnifiedRadixCache(BasePrefixCache):
     def maybe_hand_to_session(self, req: Req) -> None:
         self.session.take(req)
 
+    def _prepare_cache_write_usage(self, req: Req):
+        usage = cache_write_usage_for_req(req)
+        # Session-owned rows, external linkers, custom components and bigram
+        # cache keys do not yet have this measurement contract. Do not turn an
+        # unknown write amount into a known zero, even if a later tree insert
+        # happens to use the built-in implementation.
+        if not getattr(req, "_cache_write_tracking_enabled", False):
+            usage.mark_unknown()
+        elif req.session is not None or req.session_id is not None:
+            usage.mark_unknown()
+        elif get_disagg().disaggregation_mode == "decode":
+            # The decode response does not receive the prefill worker's write
+            # count, even when the local radix cache is disabled.
+            usage.mark_unknown()
+        elif self.disable:
+            usage.mark_supported()
+        elif (
+            self.linker is not None
+            or get_disagg().disaggregation_decode_enable_offload_kvcache
+            or self._tree_core_backend not in ("python", "rust")
+            or self.tree_core.is_eagle
+            # TreeCore currently emits adopted token ranges under BASE, not
+            # the token family's configured id. Never treat a missing range
+            # under a non-BASE token slot as a measured zero.
+            or self.slot_id(TREE_TOKEN) != BASE_COMPONENT_TYPE
+            or self._cache_write_slot_families.count(TREE_TOKEN) != 1
+            or self._cache_write_slot_families.count(TREE_STATE) > 1
+            or any(
+                family not in (TREE_TOKEN, TREE_STATE)
+                for family in self._cache_write_slot_families
+            )
+            or len(self._components_tuple) != len(self._cache_write_slot_families)
+            or type(self.component_of(TREE_TOKEN)) is not FullComponent
+            or (
+                self.slot_id(TREE_STATE) is not None
+                and type(self.component_of(TREE_STATE)) is not MambaComponent
+            )
+            or not any(type(comp) is FullComponent for comp in self._components_tuple)
+            or any(
+                type(comp) not in (FullComponent, MambaComponent)
+                for comp in self._components_tuple
+            )
+        ):
+            usage.mark_unknown()
+        else:
+            usage.mark_supported()
+        return usage
+
     def free_kv_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
         # A restore's host-to-device copy may still be writing this row's
         # pages; they must not return to the allocator before it finishes.
@@ -1180,6 +1234,7 @@ class UnifiedRadixCache(BasePrefixCache):
         super().free_kv_row(kv, ranges)
 
     def claim_kv_row(self, req: Req) -> bool:
+        self._prepare_cache_write_usage(req)
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
@@ -1188,6 +1243,35 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
         return self.session.try_cache_finished_req(req)
+
+    def _reusable_prompt_write_len(
+        self, req: Req, inserted_node: NodeId, effective_cache_len: int
+    ) -> Optional[int]:
+        # The inserted path is already canonical. Inspect it without issuing
+        # a second match, which would refresh LRU and can split tree nodes.
+        (path,) = self.tree_core.collect_path_info([inserted_node])
+        for node in path:
+            if node.full_value_len != node.path_end - node.path_start:
+                return None
+        device_prefix_len = path[-1].path_end if path else 0
+        boundary = min(
+            len(req.origin_input_ids), effective_cache_len, device_prefix_len
+        )
+        if not self.is_mamba_enabled:
+            return boundary
+        # A state after generated output cannot restore the prompt alone. Walk
+        # the canonical matched path without splitting nodes or refreshing LRU;
+        # count only through a checkpoint at or before the prompt boundary.
+        for node in reversed(path):
+            if (
+                node.path_end <= boundary
+                and self.tree_core.get_component_device_value(
+                    node.node_id, self.slot_id(TREE_STATE)
+                )
+                is not None
+            ):
+                return node.path_end
+        return 0
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
@@ -1198,6 +1282,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        self._prepare_cache_write_usage(req)
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
@@ -1207,6 +1292,7 @@ class UnifiedRadixCache(BasePrefixCache):
         move its tree lock onto the node the insert ended on."""
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
+        write_usage = self._prepare_cache_write_usage(req)
         is_finished = req.finished()
         token_ids = req.full_untruncated_fill_ids[:up_to]
 
@@ -1227,6 +1313,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            track_adopted_ranges=write_usage.tokens is not None,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1335,6 +1422,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
 
+        if write_usage.tokens is not None:
+            # Measurement uses a canonical reusable boundary. Request ownership
+            # still follows the inserted path, including PD/SWA-specific rules.
+            reusable_len = self._reusable_prompt_write_len(
+                req, result.last_device_node, effective_cache_len
+            )
+            if reusable_len is None or (
+                result.adopted_ranges is None and page_aligned_len
+            ):
+                write_usage.mark_unknown()
+            else:
+                write_usage.record(
+                    (result.adopted_ranges or {}).get(BASE_COMPONENT_TYPE, ()),
+                    reusable_prefix_len=reusable_len,
+                    cached_prefix_len=req.cached_tokens,
+                )
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.
         new_last_node = result.last_device_node

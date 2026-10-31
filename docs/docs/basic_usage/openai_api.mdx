@@ -7,3 +7,42 @@ description: "Documentation for OpenAI-Compatible APIs"
 - [Openai Api Embeddings](./openai_api_embeddings)
 
 For the Anthropic-compatible `/v1/messages` endpoint (including Claude Code integration), see [Anthropic-Compatible API](./anthropic_api).
+
+## Prompt usage across APIs
+
+Chat, Responses and Messages use the same public input boundary. For K3,
+reported prompt usage excludes the model-owned assistant generation stub;
+physical KV keys and scheduler token counts keep the complete input.
+The Messages `/v1/messages/count_tokens` endpoint uses this boundary too.
+
+Responses reports the public input total, caps cached input at that total, and
+uses it in `total_tokens` for both ordinary and streaming output. Messages
+splits the same total into uncached input, cache reads and measured cache
+creation. When creation is unknown, it remains unclassified rather than being
+assumed to be zero.
+
+## Cache write usage
+
+With `--enable-cache-report`, supported Python frontend unified-cache paths report newly adopted,
+reusable prompt tokens separately from cache reads:
+
+| API | Field |
+| --- | --- |
+| Chat Completions / Completions | `usage.prompt_tokens_details.cache_write_tokens` |
+| Responses | `usage.input_tokens_details.cache_write_tokens` |
+| Messages | `usage.cache_creation_input_tokens` |
+
+These counters exclude generated output, duplicate tree insertions and internal
+recomputation of an originally cached prefix. Hybrid caches count only through a
+reusable recurrent-state checkpoint. Disabled caching reports a measured zero;
+uninstrumented cache paths, sessions and parallel choices can remain unknown.
+
+Chat and Messages omit unknown write counts. Responses keeps the SDK-required
+numeric field and adds `cache_write_tokens_reported`: a false value means its zero
+is a compatibility placeholder, not a measured amount. Use the final cumulative
+stream usage snapshot rather than summing intermediate snapshots. Messages
+updates input/cache usage in its terminal `message_delta` only when a cache
+write was measured; its start event leaves cache creation unclassified. The
+separate Rust frontend does not yet report these writes.
+
+Cache write usage does not promise a retention duration or define a billing policy.
