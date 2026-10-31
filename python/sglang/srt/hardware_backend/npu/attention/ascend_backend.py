@@ -3490,61 +3490,25 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
-        if topk_indices is not None:
-            # DSA path: a mixed batch is just a varlen extend batch (decode
-            # rows are 1-token extends), same as a prefill batch.
-            return self.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache,
-                q_rope=q_rope,
-                k_rope=k_rope,
-                topk_indices=topk_indices,
-            )
-        if self.use_mla:
+        if self.use_mla and topk_indices is None:
             raise NotImplementedError(
                 "The 'enable-mixed-chunk' feature is currently unsupported when using the MLA backend (without DSA sparse attention) on Ascend NPU devices."
             )
-        if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer,
-                KVWriteLoc(
-                    forward_batch.out_cache_loc,
-                    self.forward_metadata.swa_out_cache_loc,
-                ),
-                k,
-                v,
-            )
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        num_block, block_size, _, _ = k_cache.shape
-        key = k_cache.view(num_block, block_size, -1)
-        value = v_cache.view(num_block, block_size, -1)
-
-        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-
-        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            query,
-            key,
-            value,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            block_size=block_size,
-            block_table=self.forward_metadata.block_tables,
-            atten_mask=self.mix_mask,
-            sparse_mode=3,
-            actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-            actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
-            scale=layer.scaling,
-        )
-
-        return attn_output.view(
-            attn_output.shape[0], layer.tp_q_head_num * layer.v_head_dim
+        # A mixed batch is a varlen extend batch (decode rows are 1-token
+        # extends), so reuse the extend path
+        return self.forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            topk_indices=topk_indices,
+            sinks=sinks,
         )
 
 
