@@ -436,7 +436,7 @@ class OpenAIServingChat(OpenAIServingBase):
             hasattr(self.tokenizer_manager.model_config, "hf_config")
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type
-            in ("gemma4", "gemma4_unified")
+            in ("gemma4", "gemma4_text", "gemma4_unified")
         )
         self.is_minimax_m3 = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
