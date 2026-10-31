@@ -23,7 +23,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
     marlin_moe_permute_scales,
-    moe_awq_to_marlin_zero_points,
+    marlin_zero_points,
+    unpack_cols,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
@@ -280,6 +281,23 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
             layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
 
+    def _convert_zero_points_to_marlin(self, packed: torch.Tensor) -> torch.Tensor:
+        # CT packs output-channel zero points in natural order. Unlike AWQ,
+        # there is no dequantizer interleave to undo before Marlin conversion.
+        groups = packed.shape[1]
+        outputs = packed.shape[2] * self.packed_factor
+        return torch.stack(
+            [
+                marlin_zero_points(
+                    unpack_cols(expert, self.num_bits, groups, outputs),
+                    groups,
+                    outputs,
+                    self.num_bits,
+                )
+                for expert in packed
+            ]
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
@@ -385,19 +403,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         # Repack zero
         if not self.sym:
-            marlin_w13_zp = moe_awq_to_marlin_zero_points(
-                layer.w13_weight_zero_point,
-                size_k=layer.w13_weight_zero_point.shape[1],
-                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
-                num_bits=self.num_bits,
+            marlin_w13_zp = self._convert_zero_points_to_marlin(
+                layer.w13_weight_zero_point
             )
             replace_tensor("w13_weight_zero_point", marlin_w13_zp)
 
-            marlin_w2_zp = moe_awq_to_marlin_zero_points(
-                layer.w2_weight_zero_point,
-                size_k=layer.w2_weight_zero_point.shape[1],
-                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
-                num_bits=self.num_bits,
+            marlin_w2_zp = self._convert_zero_points_to_marlin(
+                layer.w2_weight_zero_point
             )
             replace_tensor("w2_weight_zero_point", marlin_w2_zp)
 
