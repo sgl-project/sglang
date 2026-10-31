@@ -625,6 +625,7 @@ class TestMlaPrefixFia(unittest.TestCase):
             return x @ weight, None
 
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.dcp_size = 1
         backend.use_mla = True
         backend.use_fia = use_fia
         backend.is_dllm_model = False
