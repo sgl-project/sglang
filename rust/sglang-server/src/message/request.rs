@@ -758,7 +758,7 @@ impl TryFrom<api_v1::KvHintsEnvelope> for KvHintsEnvelope {
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
 /// modality already fanned out to this request's own item list. Also the MM
 /// processor's input: the MM worker moves it out of the request whole, and
-/// `payload::to_mm_input` converts it to the driver's.
+/// `payload::resolve_media_work` resolves it to bytes.
 ///
 /// Constructed directly only by tests: `core::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.

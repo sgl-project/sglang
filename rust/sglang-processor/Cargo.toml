@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["parser", "render", "tokenizer"]
+default = ["mm", "parser", "render", "tokenizer"]
+mm = ["dep:dynamo-multimodal"]
 parser = ["dep:dynamo-parsers", "dep:dynamo-protocols", "dep:regex", "dep:uuid"]
 render = [
     "dep:dynamo-protocols",
@@ -38,6 +39,7 @@ deepseek-recipe-core = { version = "=0.2.0", optional = true }
 deepseek-recipe-encoding = { version = "=0.2.0", optional = true }
 # DeepSeek prompt ids as recipe encodes them; the version is recipe's.
 tokenizers = { version = "0.23.2", default-features = false, optional = true }
+dynamo-multimodal = { version = "=0.2.3", default-features = false, optional = true }
 dynamo-parsers = { version = "=9.2.8", optional = true }
 dynamo-protocols = { version = "7.0.0", optional = true }
 dynamo-renderer = { version = "7.1.1", optional = true }
