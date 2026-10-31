@@ -104,6 +104,15 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
+
+def _aiter_has_mla_verify() -> bool:
+    try:
+        import aiter.mla_verify  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
@@ -432,12 +441,18 @@ class AiterAttnBackend(AttentionBackend):
             and self.dcp_world_size > 1
             and self.mla_decode_backend == "asm"
         )
-        self.mla_verify_backend = envs.SGLANG_AITER_MLA_VERIFY_BACKEND.get().lower()
-        if self.mla_verify_backend not in ("gluon", "asm"):
+        mla_verify_backend = envs.SGLANG_AITER_MLA_VERIFY_BACKEND.get().lower()
+        if mla_verify_backend not in ("auto", "gluon", "asm"):
             raise ValueError(
-                "SGLANG_AITER_MLA_VERIFY_BACKEND must be 'gluon' or 'asm', "
-                f"got {self.mla_verify_backend!r}"
+                "SGLANG_AITER_MLA_VERIFY_BACKEND must be 'auto', 'gluon' or 'asm', "
+                f"got {mla_verify_backend!r}"
             )
+        # auto: AITER's host-side Gluon/HipKittens choice where it supports the
+        # verify shape (use_k3_mla_verify), asm elsewhere.
+        self.mla_verify_auto = mla_verify_backend == "auto"
+        self.mla_verify_backend = "asm" if self.mla_verify_auto else mla_verify_backend
+        self.use_k3_mla_verify = False
+        self._k3_mla_verify_kernel = None
         self._cprr_launch_logged = False
         # fast_mode / intra_batch_mode for the cp verify schedule. Not the
         # module defaults: those size reduce_partial_map at 65536 entries
@@ -727,6 +742,21 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = -1
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+            self.use_k3_mla_verify = (
+                self.mla_verify_auto
+                and _aiter_has_mla_verify()
+                and is_gfx95_supported()
+                and self.dcp_world_size <= 1
+                and self.kv_cache_dtype == fp8_dtype
+                and self.num_draft_tokens == 8
+                and getattr(self, "num_head", None) == 12
+                and prefer_mla_gluon_decode(
+                    head_pad_mode=self.head_pad_mode,
+                    num_head=self.num_head,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+            )
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -1348,6 +1378,43 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
             )
         return self._arange_buf[:length]
+
+    def _forward_k3_mla_verify(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k_descale,
+    ) -> torch.Tensor:
+        from aiter.mla_verify import MLA_VERIFY_HK, mla_verify_hk
+
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+        )
+
+        kernel = get_capture_attention_variant() or self._k3_mla_verify_kernel
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if kernel == MLA_VERIFY_HK:
+            return mla_verify_hk(
+                q,
+                k_buffer,
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+                layer.scaling,
+                k_descale if k_descale is not None else self.k_scale,
+            )
+        return mla_gluon_decode(
+            q=q,
+            k_buffer=k_buffer,
+            layer=layer,
+            kv_indices=self.forward_metadata.kv_indices,
+            kv_indptr=self.forward_metadata.kv_indptr,
+            sm_scale=layer.scaling,
+            kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+            min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(forward_batch),
+            qlen=self.num_draft_tokens,
+        )
 
     def _asm_context_prefill_indices(
         self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
@@ -2386,8 +2453,20 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self._build_dcp_verify_ragged_indices(
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
-                if _use_mla_ps_kernel and (
-                    self.dcp_world_size <= 1 or use_asm_cprr_verify
+                if self.use_k3_mla_verify:
+                    from aiter.mla_verify import select_mla_verify_kernel
+
+                    from sglang.srt.layers.attention.graph_variants import (
+                        k3_mla_verify_max_kv_len,
+                    )
+
+                    self._k3_mla_verify_kernel = select_mla_verify_kernel(
+                        bs, k3_mla_verify_max_kv_len(forward_batch, draft_num)
+                    )
+                if (
+                    _use_mla_ps_kernel
+                    and not self.use_k3_mla_verify
+                    and (self.dcp_world_size <= 1 or use_asm_cprr_verify)
                 ):
                     max_seqlen_qo = draft_num
                     is_cp_round_robin = self.dcp_world_size > 1
@@ -3238,8 +3317,10 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and (
-                    self.dcp_world_size <= 1 or use_asm_cprr_verify
+                if (
+                    _use_mla_ps_kernel
+                    and not self.use_k3_mla_verify
+                    and (self.dcp_world_size <= 1 or use_asm_cprr_verify)
                 ):
                     num_kv_splits = self.max_split_per_batch
                     is_cp_round_robin = self.dcp_world_size > 1
@@ -3989,6 +4070,10 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                if self.use_k3_mla_verify:
+                    return self._forward_k3_mla_verify(
+                        q, K_Buffer, layer, forward_batch, k_descale
+                    )
                 if prefer_mla_gluon_decode(
                     head_pad_mode=getattr(self, "head_pad_mode", "none"),
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
