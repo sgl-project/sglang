@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
+    _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
     ConvRotInt8ComfyKitchenLinearMethod,
@@ -1567,6 +1568,41 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsNone(spec.param_dtype)
         self.assertEqual(len(spec.post_load_hooks), 1)
         self.assertIs(nunchaku_config.model_cls, _FakeFluxTransformer)
+
+    def test_patch_nunchaku_scales_reads_only_the_needed_keys(self):
+        # The checkpoint's int4 weights dwarf these scale tensors; patching
+        # must not need to fully deserialize the file to reach them.
+        fake_svdq_cls = type("SVDQW4A4Linear", (torch.nn.Module,), {})
+        linear_mod = types.ModuleType("nunchaku.models.linear")
+        linear_mod.SVDQW4A4Linear = fake_svdq_cls
+        model = torch.nn.Module()
+        block = fake_svdq_cls()
+        block.wtscale = torch.tensor(0.0)
+        model.add_module("block", block)
+
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {
+                    "block.wtscale": torch.tensor(7.0),
+                    "block.qweight": torch.zeros(1024, 1024, dtype=torch.uint8),
+                },
+                f.name,
+            )
+
+            with (
+                patch(
+                    "sglang.multimodal_gen.runtime.layers.quantization.configs."
+                    "nunchaku_config.safetensors_load_file",
+                    side_effect=AssertionError(
+                        "must not fully deserialize the checkpoint"
+                    ),
+                    create=True,
+                ),
+                patch.dict(sys.modules, {"nunchaku.models.linear": linear_mod}),
+            ):
+                _patch_nunchaku_scales(model, [f.name])
+
+        self.assertEqual(model.block.wtscale.item(), 7.0)
 
     def test_flux2_mixed_nvfp4_fallback_disables_conflicting_offloads(self):
         server_args = self._make_server_args(

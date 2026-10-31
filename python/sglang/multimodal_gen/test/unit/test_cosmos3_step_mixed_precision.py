@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precisi
     StepMixedPrecisionController,
     StepMixedPrecisionFp8LinearMethod,
     StepPolicy,
+    apply_fp8_w8a16_linear,
     install_step_mixed_precision,
     read_checkpoint_step_policy,
     resolve_step_policy,
@@ -260,6 +261,11 @@ class TestInstallAndDispatch(unittest.TestCase):
         )
 
     def test_w8a16_matches_dequantized_reference(self):
+        # apply_fp8_w8a16_linear scales the (small) output in FP32 rather than
+        # pre-scaling the (large) weight rounded to bf16 first -- a different,
+        # more accurate rounding path even for this per-tensor scalar scale,
+        # so this checks accuracy against an FP32 reference rather than
+        # bit-closeness to the old pre-scale-the-weight formula.
         layer, w_fp8, scale = _make_loaded_fp8_linear()
         controller = StepMixedPrecisionController(first_steps=1, last_steps=0)
         install_step_mixed_precision(
@@ -270,10 +276,33 @@ class TestInstallAndDispatch(unittest.TestCase):
 
         x = torch.randn(5, layer.input_size, dtype=torch.bfloat16)
         out, _ = layer(x)
-        expected = torch.nn.functional.linear(
+
+        old_formula = torch.nn.functional.linear(
             x, w_fp8.to(torch.bfloat16) * scale.to(torch.bfloat16)
         )
-        torch.testing.assert_close(out, expected)
+        reference = torch.nn.functional.linear(x.float(), w_fp8.float() * scale.float())
+
+        new_err = (out.float() - reference).abs().max().item()
+        old_err = (old_formula.float() - reference).abs().max().item()
+        self.assertLessEqual(new_err, old_err + 1e-6)
+
+    def test_w8a16_channelwise_scale_broadcasts_against_the_output(self):
+        # _make_loaded_fp8_linear only exercises a per-tensor scalar scale;
+        # the channelwise expansion is a separate shape branch.
+        torch.manual_seed(0)
+        x = torch.randn(3, 8, dtype=torch.bfloat16)
+        w16 = torch.randn(5, 8, dtype=torch.float32) / 8
+        scale = torch.rand(5, dtype=torch.float32) * 0.1 + 0.95
+        w_fp8 = (w16 / scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(w_fp8.t().contiguous(), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+
+        out = apply_fp8_w8a16_linear(layer, x, None)
+        reference = torch.nn.functional.linear(
+            x.float(), w_fp8.float() * scale.unsqueeze(1)
+        )
+        torch.testing.assert_close(out.float(), reference, rtol=0.05, atol=0.05)
 
     def test_install_wraps_hf_quant_config_variant(self):
         # The `modelopt_fp8` hf_quant_config path uses a different

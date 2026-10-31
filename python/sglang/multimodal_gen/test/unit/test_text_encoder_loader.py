@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    _swizzled_nvfp4_scales_to_linear,
+)
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -229,6 +232,24 @@ def test_comfy_nvfp4_dynamic_matmul(dtype):
     zero = method.apply(layer, torch.zeros_like(x))
     assert torch.isfinite(zero).all()
     assert torch.count_nonzero(zero) == 0
+
+
+def test_comfy_full_precision_nvfp4_unswizzles_scale_once_at_load():
+    # ComfyNvfp4LinearMethod.apply (above) still feeds scaled_mm_nvfp4 the raw
+    # swizzled layer.weight_scale directly, so the unswizzle for the
+    # full-precision path must not mutate it; it caches the linear-layout
+    # version under its own attribute instead.
+    config = ComfyNvfp4Config({"proj": {"format": "nvfp4"}})
+    method = ComfyFullPrecisionNvfp4LinearMethod(config, has_pre_quant_scale=False)
+    layer = nn.Module()
+    swizzled = torch.randint(0, 255, (128, 4), dtype=torch.uint8)
+    layer.weight_scale = nn.Parameter(swizzled, requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+
+    expected = _swizzled_nvfp4_scales_to_linear(swizzled)
+    assert torch.equal(layer._weight_scale_linear, expected)
+    assert torch.equal(layer.weight_scale.data, swizzled)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
