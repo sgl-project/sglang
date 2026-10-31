@@ -464,6 +464,11 @@ class KVStorage:
         torch._assert_async((pages >= 0).all(), "unbound window rows in a host load")
         return pages * band.page_size + rows % band.page_size
 
+    def end_load_reservation(self, sub_pool: str) -> None:
+        """A queued host load renamed its reserved window rows by owner ids:
+        they may move before the copy is submitted."""
+        self._band(sub_pool).end_load_reservation()
+
     def bind_window(
         self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
     ) -> None:

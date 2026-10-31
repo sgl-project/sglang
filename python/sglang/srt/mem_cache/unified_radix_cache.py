@@ -2213,6 +2213,7 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer.device_indices = storage.owner_ids_of_window_rows(
                 sub_pool, transfer.device_indices
             )
+            storage.end_load_reservation(sub_pool)
 
     def _build_sidecar_transfers(
         self,

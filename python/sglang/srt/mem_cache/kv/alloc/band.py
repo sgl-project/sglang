@@ -2270,6 +2270,12 @@ class Band:
         ):
             self.unfix_pages(_LOAD_RESERVATION)
 
+    def end_load_reservation(self) -> None:
+        """The tree bound the reserved rows to owner ids and the queued load now
+        names them by those ids, which it translates at submission: the rows
+        move like any page from here on."""
+        self.unfix_pages(_LOAD_RESERVATION)
+
     def _wait_band_transfers(self) -> None:
         """Order the current stream after the transfers recorded on this band,
         before a free that hands pages back at once (eager compaction, a float's
