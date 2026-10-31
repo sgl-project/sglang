@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _zero_topk_weights_padded_region,
     capture_routed_experts_if_allowed,
+    fused_topk_torch_native,
     select_experts,
 )
 
@@ -51,8 +52,33 @@ def fused_topk_npu(
         )
         topk_weights = topk_weights.to(torch.float32)
 
-    # Fast path: simple top-k without grouped routing and bias
-    elif not use_grouped_topk and correction_bias is None:
+    # The fused sigmoid op normalizes the selected scores even with renorm=False.
+    elif (
+        not use_grouped_topk
+        and correction_bias is None
+        and topk_config.scoring_func == "sigmoid"
+        and not renormalize
+    ):
+        topk_weights, topk_ids = fused_topk_torch_native(
+            hidden_states,
+            router_logits,
+            topk_config.top_k,
+            renormalize=False,
+            scoring_func="sigmoid",
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        if (
+            topk_config.apply_routed_scaling_factor_on_output
+            and topk_config.routed_scaling_factor is not None
+        ):
+            topk_weights *= topk_config.routed_scaling_factor
+
+    # Fast path: softmax top-k without grouped routing and bias.
+    elif (
+        not use_grouped_topk
+        and correction_bias is None
+        and topk_config.scoring_func == "softmax"
+    ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,
@@ -67,6 +93,11 @@ def fused_topk_npu(
                 else topk_weights[:, :-1]
             )
         topk_weights = topk_weights.to(torch.float32)
+        if (
+            topk_config.apply_routed_scaling_factor_on_output
+            and topk_config.routed_scaling_factor is not None
+        ):
+            topk_weights *= topk_config.routed_scaling_factor
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
