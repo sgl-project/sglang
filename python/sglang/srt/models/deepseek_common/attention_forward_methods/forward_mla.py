@@ -933,6 +933,9 @@ class DeepseekMLAForwardMixin:
                 attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif torch.compiler.is_compiling():
+            attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             attn_bmm_output = torch.empty(
                 (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
