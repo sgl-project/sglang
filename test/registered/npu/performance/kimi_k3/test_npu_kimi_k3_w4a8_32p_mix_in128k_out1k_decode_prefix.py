@@ -3,7 +3,7 @@ import unittest
 
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    BENCHSERVING,
+    AISBENCHMARK,
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
@@ -16,25 +16,36 @@ logger = logging.getLogger(__name__)
 # (4-node mix): 131072 shared prefix in / 1024 out, C12/N12, mean
 # TPOT <= 30 ms.
 #
-# Benchmark: the framework's built-in sglang.bench_serving path with the
-# generated-shared-prefix (GSP) dataset - the same tool and shape the dev
-# acceptance runs use (test-decode_prefix.sh). The earlier aisbench route
-# (run_aisbench.sh + the aisbench_auto_tools_prefix toolkit) never produced
-# a valid C12 measurement: with --repeat_rate 100 every generated request is
-# byte-identical, the OpenCompass dataset loader dedups them, and only 4
-# unique requests ever ran (run 40431214784: TPOT 41.4-45.8 ms at an
-# effective C4). The aisbench route also pulled in a fragile dependency
-# chain (venv install on a shared PVC, toolkit config patching, tokenizer
-# trust_remote_code); bench_serving needs none of that.
+# Benchmark: the dev's own method. Every dev scenario in Perf-1015
+# (including this 128k decode shape) is measured with aisbench in
+# fixed-count perf mode (dev suite Perf-1015-aisbench-fixed /
+# aisbench_fixed_decode_20261017: dev C12 = 25.03 ms mean TPOT, accept
+# 4.24, cache hit 99.9%). Aligning with that method requires two things
+# the previous plain-aisbench attempt (run 41029888702, TPOT 44.4 ms) was
+# missing:
+#   1. Raw /v1/completions, NO chat template (api_type="raw" ->
+#      run_aisbench.sh generates a VLLMCustomAPI model config; dev:
+#      "AIS接口为 /v1/completions，不套 chat template"). The chat template
+#      turns the natural-text continuation into an assistant QA task whose
+#      digit-heavy output collapses DSPARK acceptance to 1.2-1.9.
+#   2. Dev's warmup ordering: cache_fill (4 requests x batch 1,
+#      round-robin over DP0-3, prefix materialized on every DP rank) ->
+#      shape_warm (one full-shape unscored pass) -> formal single batch
+#      N=C=12 with the built-in warmup disabled (aisbench defaults to 1
+#      extra request). Dev's formal rounds start at a 99.9% prefix cache
+#      hit; without the warmup the formal requests race their own 128k
+#      prefill and decode/prefill interleaving skews TPOT.
 #
-# GSP parameters: 1 group of 12 prompts sharing one system prompt of
-# 95% x 131072 tokens; the remaining 5% is a per-request question, so the
-# requests are distinct (no dedup) while the prefix still dominates. The
-# 4 warmup requests (first GSP prompt, output capped at 32 tokens) are sent
-# at C4 and prime the shared prefix on all 4 DP ranks via round-robin;
-# pop_sglang_is_in_ci_for_gsp keeps SGLANG_IS_IN_CI out of the bench
-# environment so the warmup prefix cache is NOT flushed before the
-# measured pass.
+# Dataset: identical natural-text rows from one GSM8K QA pool padded past
+# 131072 tokens (generate_gsm8k_shared_prefix_dataset, aisbench layout) -
+# the same 100%-cache shared-prefix shape the dev suite uses (its ShareGPT
+# prefix is likewise one fixed text repeated for every request). The
+# aisbench main loader does not dedup identical rows (run 41027224138:
+# "Total data num: 12").
+#
+# Fallback if this regresses: benchmark_tool = BENCHSERVING +
+# dataset_name = "gsm8k-shared-prefix" (commit 5a0a303708, run
+# 41001026946, Mean TPOT 22.10 ms SUCCESS).
 #
 # The server config is the B103-proven accuracy baseline (DSPARK draft,
 # radix cache, decode graphs {1,4,16}) - this scenario MUST NOT share a
@@ -178,31 +189,25 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     mean TPOT <= 30 ms (dev measured 23.2-25.9 ms at C12 on this shape)."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
-    benchmark_tool = BENCHSERVING
-    # Natural-text shared prefix from GSM8K: the built-in
-    # generated-shared-prefix prompts are random token ids the DSPARK draft
-    # cannot predict (accept len ~1.6); GSM8K question text keeps the draft
-    # acceptance in the dev 3-4 range (dev confirmed, run 40993824705).
-    dataset_name = "gsm8k-shared-prefix"
+    # Dev-aligned aisbench fixed-count perf run (see the module comment):
+    # raw completions, cache-fill + shape warmup, then one measured single
+    # batch N=C=12.
+    benchmark_tool = AISBENCHMARK
+    dataset_type = "gsm8k-shared-prefix"
     dataset_path = None
     input_len = 131072
     output_len = 1024
     num_prompts = 12
     max_concurrency = 12
-    random_range_ratio = 1
     request_rate = 0
-    # repeat_rate is GSP-only; the gsm8k-shared-prefix generator fixes the
-    # prefix at ~99% of input_len and gives each row its own short question.
-    repeat_rate = None
-    # One warmup request per DP rank primes the shared prefix everywhere
-    # before the measured pass (bench_serving caps warmup output at 32).
-    warmup_requests = 4
-    pop_sglang_is_in_ci_for_gsp = True
-    # Greedy decoding: with the default temperature 1.0 the DSPARK draft
-    # accept length collapsed to ~1.6 tokens (dev measured 3.94) and TPOT
-    # landed at 63.7 ms vs the dev 25.9 ms. Dev's perf passes always pin
-    # temperature to 0.
-    temperature = 0
+    # Raw /v1/completions model config - the prompt goes out verbatim with
+    # no chat template (dev Perf-1015 section 4.0).
+    api_type = "raw"
+    # Warmup ordering copied from the dev fixed-decode suite: 4 requests at
+    # batch 1 spread the shared prefix over DP0-3, then one unscored
+    # full-shape pass settles the hybrid-cache state before scoring.
+    warmup_dp = 4
+    warmup_shape = 1
     tpot = 30.0
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix(self):

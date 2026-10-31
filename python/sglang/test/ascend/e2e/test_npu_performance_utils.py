@@ -657,6 +657,9 @@ def run_aisbench(
     repeat_rate=None,
     dp=None,
     generation_kwargs=None,
+    api_type="chat",
+    warmup_dp=0,
+    warmup_shape=0,
 ):
 
     if dataset_type == "sharegpt":
@@ -694,6 +697,28 @@ def run_aisbench(
             )
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
+
+    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
+        # Pure-decode case on aisbench (dev Perf-1015 method): identical
+        # natural-text rows (one GSM8K QA pool padded past input_len) so
+        # every request hits the same ~131072-token radix prefix, mirroring
+        # the dev 99.9% cache-hit shared-prefix shape. Emitted as
+        # test.jsonl because GSM8KDataset hardcodes that name inside the
+        # config's path dir. Identical rows are NOT deduped by the aisbench
+        # main loader (run 41027224138 log: "Total data num: 12").
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix/test.jsonl"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+                output_format="aisbench",
+            )
+        dataset_path = dataset_file
+        dataset_type = AISBENCHMARK_DATASET_GSM8K
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
@@ -742,6 +767,12 @@ def run_aisbench(
         cmd += f" --dp {dp}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
+    if api_type != "chat":
+        cmd += f" --api-type {api_type}"
+    if warmup_dp:
+        cmd += f" --warmup-dp {warmup_dp}"
+    if warmup_shape:
+        cmd += f" --warmup-shape {warmup_shape}"
 
     logger.info(f"Command: {cmd}")
 
@@ -1258,6 +1289,9 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1394,6 +1428,9 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1564,6 +1601,9 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                api_type=getattr(self, "api_type", "chat"),
+                warmup_dp=getattr(self, "warmup_dp", 0),
+                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 

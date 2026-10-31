@@ -51,6 +51,16 @@ INTERNAL_TEMPLATE_DIR="/root/.cache/.cache/aisbench_auto_tools_prefix-master"
 REQUEST_RATE=0
 REPEAT_RATE=0
 DP=1
+# API_TYPE raw = /v1/completions with the prompt sent verbatim (no chat
+# template) - the layout every dev perf measurement uses (Perf-1015 section
+# 4.0: "AIS接口为 /v1/completions，不套 chat template"). Default chat keeps
+# the historical VLLMCustomAPIChatStream behaviour for existing cases.
+API_TYPE="chat"
+# Dev fixed-decode suite warmup passes: WARMUP_DP requests at batch 1 fill
+# the shared prefix on every DP rank (round-robin), WARMUP_SHAPE=1 adds one
+# full-shape unscored pass. Both are disabled by default.
+WARMUP_DP=0
+WARMUP_SHAPE=0
 
 GENERATION_KWARGS=""
 
@@ -126,6 +136,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dp)
             DP="$2"
+            shift 2
+            ;;
+        --api-type)
+            API_TYPE="$2"
+            shift 2
+            ;;
+        --warmup-dp)
+            WARMUP_DP="$2"
+            shift 2
+            ;;
+        --warmup-shape)
+            WARMUP_SHAPE="$2"
             shift 2
             ;;
         -h|--help)
@@ -268,6 +290,49 @@ models = [
         trust_remote_code=True,
         generation_kwargs=${final_generation_kwargs},
         pred_postprocessor=dict(type=extract_non_reasoning_content),
+    )
+]
+EOF
+  echo "============== ${model_config_file} - Begin =============="
+  echo "$(cat ${model_config_file})"
+  echo "============== ${model_config_file} - End ================"
+}
+
+function gen_model_config_file_vllm_api_raw() {
+  # Raw /v1/completions model config: the prompt row is sent verbatim with
+  # no chat template. This mirrors the dev perf suite (Perf-1015-aisbench-fixed
+  # fixed_decode.py builds on ais_bench VLLMCustomAPI, whose _get_url is
+  # v1/completions) and the historical dev GSM8K decode runs ("AIS接口为
+  # /v1/completions，不套 chat template"). The chat-template variant turns a
+  # natural-text continuation into an assistant QA task whose digit-heavy
+  # output collapses the DSPARK draft acceptance (CI run 41029888702: accept
+  # 4.9 -> 1.2-1.9, TPOT 44.4 ms vs dev 25.0 ms on the same server shape).
+  model_config_file=${MODEL_CONFIG_PATH}/${TMP_CFG}.py
+  echo "Writing raw-completions model config into file: ${model_config_file}"
+
+  final_generation_kwargs=$(get_generation_kwargs)
+
+  cat > "${model_config_file}" << EOF
+from ais_bench.benchmark.models import VLLMCustomAPI
+models = [
+    dict(
+        attr="service",
+        type=VLLMCustomAPI,
+        abbr='vllm-api-general-stream',
+        path="$MODEL_PATH",
+        model="$MODEL",
+        stream=True,
+        request_rate=${REQUEST_RATE},
+        use_timestamp=False,
+        retry=2,
+        api_key="",
+        host_ip="$IP",
+        host_port=$PORT,
+        url="",
+        max_out_len=${OUTPUT_LEN},
+        batch_size=$BATCH_SIZE,
+        trust_remote_code=True,
+        generation_kwargs=${final_generation_kwargs},
     )
 ]
 EOF
@@ -521,7 +586,11 @@ if [ "$MODE" == "perf" ];then
 
         DATASET_NAME=gsm8k_custom_${MODEL}
         gen_dataset_gsm8k_config_file "${dataset_dir}"
-        gen_model_config_file_vllm_api_stream_chat
+        if [ "$API_TYPE" == "raw" ];then
+            gen_model_config_file_vllm_api_raw
+        else
+            gen_model_config_file_vllm_api_stream_chat
+        fi
 
         if awk "BEGIN{exit !(${REPEAT_RATE:-0} > 0)}"; then
             echo "===== [Step 2/4] Prefix Mode Detected: Updating temporary config file ====="
@@ -601,7 +670,19 @@ EOF
             echo "IP: $IP | Port: $PORT | Model: $MODEL | Model Path: $MODEL_PATH"
             echo "Input tokens: ${INPUT_LEN} | Output tokens: ${OUTPUT_LEN} | Batch size: ${BATCH_SIZE} | Prompts num: ${NUM_PROMPTS}"
 
-            CMD="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
+            if [ "$API_TYPE" == "raw" ];then
+                # Dev-aligned perf invocation: the built-in warmup defaults
+                # to 1 request (ais_bench openicl_api_infer
+                # num_warmups default), which would leak into the measured
+                # window; dev disables it (--num-warmups 0) and runs its
+                # own unscored warmup passes instead (see the tail of this
+                # script). --batch-size is passed on the CLI like the dev
+                # fixed_decode.py cli() does.
+                CMD_BASE="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-warmups 0"
+                CMD="${CMD_BASE} --num-prompts $NUM_PROMPTS --batch-size $BATCH_SIZE --work-dir $OUTPUT_PATH "
+            else
+                CMD="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
+            fi
         fi
     else
         echo "The dataset type $DATASET_TYPE is not supported."
@@ -627,6 +708,23 @@ else
     exit 1
 fi
 
+if [ -n "${CMD_BASE:-}" ];then
+    # Unscored warmup passes, mirroring the dev fixed-decode suite ordering
+    # (cache_fill -> shape_warm -> formal). cache_fill sends WARMUP_DP
+    # requests at batch 1 so round-robin routing materializes the shared
+    # prefix on every DP rank; shape_warm runs one full-shape pass so the
+    # hybrid-cache state settles before scoring. Each writes its own
+    # work-dir, so the formal summarizer output below remains the only
+    # parsed result.
+    if [ "${WARMUP_DP:-0}" -gt 0 ];then
+        echo "===== Warmup cache-fill: ${WARMUP_DP} request(s) x batch 1 (one per DP rank) ====="
+        eval "${CMD_BASE} --num-prompts ${WARMUP_DP} --batch-size 1 --work-dir ${OUTPUT_PATH}/warmup_cache_fill"
+    fi
+    if [ "${WARMUP_SHAPE:-0}" == "1" ];then
+        echo "===== Warmup shape: N=${NUM_PROMPTS} C=${BATCH_SIZE} ====="
+        eval "${CMD_BASE} --num-prompts ${NUM_PROMPTS} --batch-size ${BATCH_SIZE} --work-dir ${OUTPUT_PATH}/warmup_shape"
+    fi
+fi
 source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
 echo "Run command: ${CMD}"
 eval "${CMD}"
