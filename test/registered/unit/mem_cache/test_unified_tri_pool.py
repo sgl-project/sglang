@@ -1810,6 +1810,18 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
     def _build(self, **kw):
         return TestUnifiedTriPool._build(self, **kw)
 
+    @staticmethod
+    def _empty_tree():
+        """A prefix tree with nothing evictable."""
+        return SimpleNamespace(
+            full_evictable_size=lambda: 0,
+            swa_evictable_size=lambda: 0,
+            auxiliary_swa_evictable_size=lambda: 0,
+            mamba_evictable_size=lambda: 0,
+            supports_mamba=lambda: True,
+            window_retain_size=lambda component: 1 << 20,
+        )
+
     def test_a_pair_each_side_can_host_alone_is_still_refused(self):
         # page_size 1 leaves no slack between the per-side and joint views;
         # the double-count only has room to show on a paged grid.
@@ -1831,7 +1843,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         )
         self.assertFalse(
             allocator.prealloc_fits(
-                MagicMock(),
+                self._empty_tree(),
                 full_demand,
                 swa_demand,
                 full_budget_tokens=full_demand,
@@ -1844,7 +1856,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         page_size = allocator.page_size
         self.assertTrue(
             allocator.prealloc_fits(
-                MagicMock(),
+                self._empty_tree(),
                 page_size,
                 page_size,
                 full_budget_tokens=page_size,
@@ -1853,7 +1865,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         )
         self.assertFalse(
             allocator.prealloc_fits(
-                MagicMock(),
+                self._empty_tree(),
                 page_size,
                 page_size,
                 full_budget_tokens=page_size - 1,
