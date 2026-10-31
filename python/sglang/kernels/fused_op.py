@@ -669,7 +669,11 @@ class BaseFusedOp(nn.Module, ABC):
             else None
         )
         if registered is not None:
-            self._resolved_oot_compile_forward = registered
+            self._resolved_oot_compile_forward = (
+                registered.__func__
+                if isinstance(registered, types.MethodType)
+                else registered
+            )
             compile_forward = self._forward_oot_compile
         else:
             compile_forward = self._torch_compile_forward(num_tokens=num_tokens)

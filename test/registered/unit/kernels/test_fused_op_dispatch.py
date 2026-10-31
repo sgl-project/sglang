@@ -396,14 +396,25 @@ def test_oot_registered_fn_is_bound(monkeypatch):
     assert _CudaOnlyPlatformOp()(torch.zeros(1)) == "_CudaOnlyPlatformOp"
 
 
-def test_oot_registered_bound_method_receives_op_instance(monkeypatch):
+def test_oot_registered_bound_method_receives_op_instance(monkeypatch, _compiler_state):
+    """A shared bound method uses the op's state in eager and compile modes."""
     _mock_platform(monkeypatch, oot_key="myplat")
     donor = _OotTensorOp()
     donor.offset = 9
     BaseFusedOp.register_oot_forward(_OotTensorOp, donor.forward_native, "myplat")
+    BaseFusedOp.register_oot_compile_forward(
+        _OotTensorOp, donor.forward_native, "myplat"
+    )
     op = _OotTensorOp()
     op.offset = 3
     x = torch.tensor([1.0, 2.0])
+    torch.testing.assert_close(op(x), x - 3)
+    op.enter_torch_compile(num_tokens=1)
+    try:
+        compiled = torch.compile(_OotModel(op).forward, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(x), (x * 2 - 3) * 3)
+    finally:
+        op.leave_torch_compile()
     torch.testing.assert_close(op(x), x - 3)
 
 
