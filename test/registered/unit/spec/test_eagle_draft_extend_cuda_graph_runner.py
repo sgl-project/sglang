@@ -187,6 +187,8 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
             extend_seq_lens=None,
             extend_seq_lens_cpu=None,
             out_cache_loc_virtual=None,
+            iteration_ids=None,
+            iteration_cols=None,
             kv_loc_plan=None,
             kv_loc_cols=None,
             spec_info=SimpleNamespace(
