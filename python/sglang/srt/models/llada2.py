@@ -709,7 +709,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         # dispatcher
         if get_moe_a2a_backend().is_deepep():
             self.deepep_dispatcher = DeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
+                group=get_parallel().tp_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
