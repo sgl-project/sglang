@@ -360,6 +360,61 @@ the `cuda_graph` tag is a no-op there.
 > allocator accounting, and the second stays flat because torch keeps the freed block
 > cached. Query actual device memory via sysman (`ZES_ENABLE_SYSMAN=1`) instead.
 
+## RL Weight Sync (`update_weights_from_tensor`) on Intel XPU
+
+Online RL training pushes fresh weights into a colocated engine after every
+optimizer step. The API is the same as on CUDA — pass device tensors inside a
+weight-update session:
+
+```python
+engine.begin_weight_update()
+engine.update_weights_from_tensor([(name, tensor) for name, tensor in params])
+engine.end_weight_update()
+```
+
+The transport underneath differs. PyTorch has no XPU tensor IPC — there is no
+`UntypedStorage._share_xpu_` and no XPU branch in
+`torch/multiprocessing/reductions.py` (tracked in
+[intel/torch-xpu-ops#1678](https://github.com/intel/torch-xpu-ops/issues/1678)) —
+so SGLang stages each serialized XPU tensor through a POSIX shared-memory
+segment: the trainer copies device to host, the payload carries only the
+segment name, and each scheduler copies host to its own device. Practical
+consequences:
+
+- **Size `/dev/shm` for one copy of the bucket.** `Engine.update_weights_from_tensor`
+  and `load_lora_adapter_from_tensors` stage each tensor once for the whole TP
+  group and unlink the staging when the call returns. With `--pp-size` above 1
+  they stage one copy per TP rank instead, because later pipeline stages load
+  after the call has returned; the last stage unlinks each copy, so a request
+  rejected before loading (outside a weight-update session) leaves its staging
+  behind. Per-rank
+  producers such as `sglang.srt.weight_sync.utils.update_weights` (what veRL
+  calls) stage one copy on every rank. Exhaustion surfaces as a
+  `Failed to stage a ... XPU tensor through shared memory` error; raise
+  `--shm-size` in containers.
+- **Cost is one device-to-host plus one host-to-device copy per tensor**, measured
+  at roughly 1 GiB/s and 2 GiB/s respectively on Arc Pro B60. Fewer, larger
+  buckets (or `load_format="flattened_bucket"`) amortize the per-tensor overhead.
+- **Producer and consumer must be on the same node**, as with CUDA IPC.
+- **Serializing payloads yourself** — `load_format="flattened_bucket"`, or a raw
+  `POST /update_weights_from_tensor` — needs one call first, which CUDA does not:
+
+  ```python
+  from sglang.srt.utils.xpu_tensor_shm import (
+      monkey_patch_xpu_tensor_reductions,
+      staged_xpu_segments,
+  )
+
+  monkey_patch_xpu_tensor_reductions()  # already done in an Engine's process
+  ```
+
+  If the caller waits for the request, serialize and send inside
+  `with staged_xpu_segments(pp_size=...):` so the staging is reclaimed on return.
+  A payload serialized outside that block is unlinked by its reader on the last
+  pipeline stage, so a crash between staging and loading leaves
+  `sgl_shm_xputensor_<pid>_*` segments behind in `/dev/shm`; remove them once no
+  weight sync is in flight.
+
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
 SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.
