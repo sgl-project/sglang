@@ -1,0 +1,282 @@
+"""Synchronous DVPP JPEGD with caller-owned torch_npu context.
+
+The accepted baseline 4:2:0 path uses device NV12 memory. It never resets or
+finalizes the caller's runtime; failures are not converted into CPU success.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import warnings
+from dataclasses import dataclass
+from io import BytesIO
+
+from PIL import Image, JpegImagePlugin
+
+from sglang.srt.hardware_backend.npu.jpeg.normalize import (
+    UnsupportedSOF,
+    inspect_420_sof,
+    normalize_420_sof,
+)
+
+
+class UnsupportedJPEG(ValueError):
+    """Valid media outside the supported NPU JPEG input contract."""
+
+
+class ACLFailure(RuntimeError):
+    pass
+
+
+def check(ret, operation):
+    if ret != 0:
+        raise ACLFailure(f"{operation}: ACL error {ret}")
+
+
+def align_up(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
+
+@dataclass(frozen=True)
+class JPEGInfo:
+    width: int
+    height: int
+    width_stride: int
+    height_stride: int
+
+    @property
+    def decode_width(self):
+        return align_up(self.width, 2)
+
+    @property
+    def decode_height(self):
+        return align_up(self.height, 2)
+
+    @property
+    def nv12_bytes(self):
+        return self.width_stride * self.height_stride * 3 // 2
+
+
+def inspect_jpeg(data: bytes):
+    """Read device eligibility and metadata without CPU pixel decoding."""
+    if not isinstance(data, bytes):
+        raise TypeError("encoded input must be bytes")
+    if not data:
+        raise ValueError("encoded input must not be empty")
+    if len(data) > 32 * 1024 * 1024:
+        raise UnsupportedJPEG("encoded input exceeds the 32 MiB device-path limit")
+    with Image.open(BytesIO(data)) as im:
+        if im.format != "JPEG":
+            raise UnsupportedJPEG("not JPEG")
+        w, h = im.size
+        if im.info.get("progressive") or im.info.get("progression"):
+            raise UnsupportedJPEG("progressive JPEG uses CPU fallback")
+        if im.mode != "RGB" or JpegImagePlugin.get_sampling(im) != 2:
+            raise UnsupportedJPEG("v1 accepts only three-component YCbCr 4:2:0 JPEG")
+        # VPC color conversion accepts at most 4096 in either dimension.
+        # Its even decode extent and the NV12 strides remain within that limit.
+        if not (32 <= w <= 4096 and 32 <= h <= 4096):
+            raise UnsupportedJPEG("JPEGD/VPC requires dimensions in [32, 4096]")
+        try:
+            inspect_420_sof(data, w, h)
+        except UnsupportedSOF as error:
+            raise UnsupportedJPEG(str(error)) from error
+        if im.getexif() or im.info.get("icc_profile") or im.info.get("exif"):
+            raise UnsupportedJPEG("EXIF/ICC metadata uses CPU fallback")
+    return JPEGInfo(w, h, align_up(w, 64), align_up(h, 16))
+
+
+class DeviceFrame:
+    """Owned device NV12 allocation. Valid only until frame/decoder close."""
+
+    def __init__(self, decoder, ptr, size, info):
+        self.decoder, self.ptr, self.size, self.info = decoder, ptr, size, info
+
+    def close(self):
+        d = self.decoder
+        with d.lock:
+            if self.ptr:
+                d._activate()
+                check(d.acl.media.dvpp_free(self.ptr), "dvpp_free output")
+                self.ptr = 0
+                d.frames.discard(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None and self.decoder.poisoned:
+            # Keep potentially active DMA memory and preserve the original error.
+            return
+        self.close()
+
+
+class JPEGDecoder:
+    """Reuse a JPEGD stream/channel within the caller's initialized context."""
+
+    def __init__(self, device: int):
+        if not isinstance(device, int) or isinstance(device, bool) or device < 0:
+            raise ValueError("an explicit non-negative device ID is required")
+        import acl  # provided by the selected CANN environment
+
+        self.acl = acl
+        self.pid, self.lock, self.frames = os.getpid(), threading.RLock(), set()
+        self.context = self.stream = self.channel = None
+        self.channel_created = False
+        self.poisoned = False
+        try:
+            current, ret = acl.rt.get_device()
+            check(ret, "acl.rt.get_device")
+            if current != device:
+                raise ACLFailure(
+                    f"current context device {current} != requested {device}"
+                )
+            self.context, ret = acl.rt.get_context()
+            check(ret, "acl.rt.get_context")
+            if not self.context:
+                raise ACLFailure("caller has not initialized an ACL context")
+            self.stream, ret = acl.rt.create_stream()
+            check(ret, "acl.rt.create_stream")
+            self.channel = acl.media.dvpp_create_channel_desc()
+            if not self.channel:
+                raise ACLFailure("dvpp_create_channel_desc returned null")
+            check(acl.media.dvpp_create_channel(self.channel), "dvpp_create_channel")
+            self.channel_created = True
+        except Exception:
+            self.close()
+            raise
+
+    def _activate(self):
+        if self.pid != os.getpid():
+            raise RuntimeError("decoder cannot be used after fork")
+        if self.poisoned:
+            raise ACLFailure(
+                "stream synchronization failed; terminate this worker process"
+            )
+        if self.context is None:
+            raise RuntimeError("decoder is closed")
+        check(self.acl.rt.set_context(self.context), "acl.rt.set_context")
+
+    def decode(self, data: bytes) -> DeviceFrame:
+        info = inspect_jpeg(data)
+        data = normalize_420_sof(data, info.width, info.height)
+        with self.lock:
+            self._activate()
+            a = self.acl
+            host_ptr = a.util.bytes_to_ptr(data)  # keep data alive through sync
+            w, h, components, fmt, ret = a.media.dvpp_jpeg_get_image_info_v2(
+                host_ptr, len(data)
+            )
+            check(ret, "dvpp_jpeg_get_image_info_v2")
+            if (w, h, components) != (info.decode_width, info.decode_height, 3):
+                raise ACLFailure("PIL header and DVPP header disagree")
+            size, ret = a.media.dvpp_jpeg_predict_dec_size(
+                host_ptr, len(data), 1
+            )  # NV12
+            check(ret, "dvpp_jpeg_predict_dec_size")
+            size = max(size, info.nv12_bytes)
+            inp = out = desc = None
+            submitted = False
+            try:
+                inp, ret = a.media.dvpp_malloc(len(data))
+                check(ret, "dvpp_malloc input")
+                out, ret = a.media.dvpp_malloc(size)
+                check(ret, "dvpp_malloc output")
+                check(
+                    a.rt.memcpy(inp, len(data), host_ptr, len(data), 1),
+                    "memcpy H2D JPEG",
+                )
+                desc = a.media.dvpp_create_pic_desc()
+                if not desc:
+                    raise ACLFailure("dvpp_create_pic_desc returned null")
+                for name, value in (
+                    ("data", out),
+                    ("size", size),
+                    ("format", 1),
+                    ("width", w),
+                    ("height", h),
+                    ("width_stride", info.width_stride),
+                    ("height_stride", info.height_stride),
+                ):
+                    check(
+                        getattr(a.media, "dvpp_set_pic_desc_" + name)(desc, value),
+                        "dvpp_set_pic_desc_" + name,
+                    )
+                # Treat even a failed submit conservatively: drain before free.
+                submitted = True
+                check(
+                    a.media.dvpp_jpeg_decode_async(
+                        self.channel, inp, len(data), desc, self.stream
+                    ),
+                    "dvpp_jpeg_decode_async",
+                )
+                ret = a.rt.synchronize_stream(self.stream)
+                if ret:
+                    self.poisoned = True
+                    check(ret, "synchronize_stream")
+                submitted = False
+                check(
+                    a.media.dvpp_get_pic_desc_ret_code(desc), "JPEGD completion status"
+                )
+                actual = tuple(
+                    getattr(a.media, "dvpp_get_pic_desc_" + n)(desc)
+                    for n in ("width", "height", "width_stride", "height_stride")
+                )
+                if actual != (
+                    info.decode_width,
+                    info.decode_height,
+                    info.width_stride,
+                    info.height_stride,
+                ):
+                    raise ACLFailure(f"unexpected JPEGD layout: {actual}")
+                frame = DeviceFrame(self, out, size, info)
+                self.frames.add(frame)
+                out = None  # ownership moves to frame
+                return frame
+            finally:
+                if submitted and not self.poisoned:
+                    if a.rt.synchronize_stream(self.stream) != 0:
+                        self.poisoned = True
+                # If synchronization failed, DMA may still use these addresses.
+                # Leave them to process teardown rather than freeing live memory.
+                if not self.poisoned:
+                    for function, resource in (
+                        (a.media.dvpp_destroy_pic_desc, desc),
+                        (a.media.dvpp_free, inp),
+                        (a.media.dvpp_free, out),
+                    ):
+                        if resource:
+                            ret = function(resource)
+                            if ret:
+                                warnings.warn(f"cleanup {function.__name__}: {ret}")
+
+    def close(self):
+        with self.lock:
+            if self.pid != os.getpid():
+                raise RuntimeError("decoder cannot be closed after fork")
+            if self.poisoned:
+                raise ACLFailure(
+                    "poisoned stream: terminate worker to reclaim resources"
+                )
+            if self.context is not None:
+                check(self.acl.rt.set_context(self.context), "set_context for close")
+            for frame in list(self.frames):
+                frame.close()
+            if self.channel_created:
+                check(
+                    self.acl.media.dvpp_destroy_channel(self.channel),
+                    "dvpp_destroy_channel",
+                )
+                self.channel_created = False
+            if self.channel:
+                check(
+                    self.acl.media.dvpp_destroy_channel_desc(self.channel),
+                    "dvpp_destroy_channel_desc",
+                )
+                self.channel = None
+            if self.stream is not None:
+                check(self.acl.rt.destroy_stream(self.stream), "destroy_stream")
+                self.stream = None
+            if self.context is not None:
+                self.context = None
