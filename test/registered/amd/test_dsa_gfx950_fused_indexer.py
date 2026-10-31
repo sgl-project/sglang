@@ -142,10 +142,148 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             page_table_64,
             logits,
             ghist,
-            self.loader.LOGITS_BLOCKS_PER_ROW,
+            *self.loader.logits_launch(rows, page_table_64.shape[1], 1),
         )
         torch.cuda.synchronize()
         return logits, ghist, (q_fp8, kv, gate, seqlens, page_table_64, ctx)
+
+    # -- node 3, sibling-group kernel ----------------------------------------
+    def _verify_rows(self, ctxs, pt_width, share=True):
+        """MTP verify rows: LOGITS_GROUP_ROWS rows per request, consecutive, with
+        lengths ctx-5..ctx and (when ``share``) one page table per request, as
+        _gfx950_fused_decode broadcasts it."""
+        g = self.loader.LOGITS_GROUP_ROWS
+        rows = g * len(ctxs)
+        gen = torch.Generator(device=self.dev).manual_seed(1234 + rows)
+        max_pages = max(-(-c // PAGE_SIZE) for c in ctxs)
+        total_pages = max_pages * rows
+        kv = torch.randn(
+            total_pages, PAGE_SIZE * 132, generator=gen, device=self.dev
+        ).to(FP8)
+        perm = torch.randperm(total_pages, generator=gen, device=self.dev).int()
+        page_table_64 = torch.zeros(rows, pt_width, dtype=torch.int32, device=self.dev)
+        seqlens = torch.empty(rows, dtype=torch.int32, device=self.dev)
+        for i, c in enumerate(ctxs):
+            n = -(-c // PAGE_SIZE)
+            for j in range(g):
+                r = i * g + j
+                src = i * max_pages if share else r * max_pages
+                page_table_64[r, :n] = perm[src : src + n]
+                seqlens[r] = c - (g - 1) + j
+        q_fp8 = torch.randn(rows, N_HEADS, HEAD_DIM, generator=gen, device=self.dev).to(
+            FP8
+        )
+        gate = torch.rand(rows, N_HEADS, generator=gen, device=self.dev)
+        return q_fp8, kv, gate, seqlens, page_table_64
+
+    def _logits(self, inputs, cols, variant, blocks_per_row):
+        q_fp8, kv, gate, seqlens, page_table_64 = inputs
+        rows = q_fp8.shape[0]
+        logits = torch.zeros(rows, cols, dtype=torch.float32, device=self.dev)
+        ghist = torch.zeros(
+            rows, self.topk_mod.hist_stride(), dtype=torch.int32, device=self.dev
+        )
+        self.logits_mod.logits_hist(
+            q_fp8,
+            kv,
+            gate,
+            seqlens,
+            page_table_64,
+            logits,
+            ghist,
+            blocks_per_row,
+            variant,
+        )
+        torch.cuda.synchronize()
+        return logits, ghist
+
+    def _select(self, logits, ghist, seqlens, page_table_64):
+        rows, cols = logits.shape
+        cap = max(TOPK, cols)
+        out = torch.empty(rows, TOPK, dtype=torch.int32, device=self.dev)
+        self.topk_mod.topk_transform(
+            logits,
+            seqlens,
+            page_table_64,
+            out,
+            ghist,
+            torch.zeros(rows, 32, dtype=torch.int32, device=self.dev),
+            torch.empty(rows, cap, dtype=torch.int32, device=self.dev),
+            torch.empty(rows, cap, dtype=torch.float32, device=self.dev),
+            self.loader.TOPK_G,
+            PAGE_SIZE,
+        )
+        torch.cuda.synchronize()
+        return [set(r) - {-1} for r in out.tolist()]
+
+    def _assert_variants_agree(self, ctxs, pt_width, share=True):
+        """All three logits kernels: bit-identical logits on every row's valid
+        columns, and the same node-4 selection from each one's histogram (which
+        may differ below the bins node 4 reads, see the gated flush)."""
+        inputs = self._verify_rows(ctxs, pt_width, share=share)
+        seqlens, page_table_64 = inputs[3], inputs[4]
+        rows = seqlens.shape[0]
+        cols = pt_width * PAGE_SIZE
+        _, variant = self.loader.logits_launch(
+            rows, pt_width, self.loader.LOGITS_GROUP_ROWS
+        )
+        self.assertEqual(variant, 2, "expected the sibling-group kernel")
+        short_bpr = max(
+            self.loader.LOGITS_SHORT_BLOCKS_PER_ROW,
+            -(-pt_width // (8 * 64 * 8)) * 8,
+        )
+        runs = {
+            "m": self._logits(inputs, cols, 0, self.loader.LOGITS_BLOCKS_PER_ROW),
+            "s": self._logits(inputs, cols, 1, short_bpr),
+            "grp": self._logits(inputs, cols, 2, 0),
+        }
+        # topk_transform zeroes the histogram it reads, so select once per run.
+        ref_l = runs["m"][0]
+        selections = {
+            name: self._select(lg, hg, seqlens, page_table_64)
+            for name, (lg, hg) in runs.items()
+        }
+        for name, (lg, _) in runs.items():
+            for r in range(rows):
+                n = int(seqlens[r])
+                self.assertTrue(
+                    torch.equal(lg[r, :n], ref_l[r, :n]),
+                    f"{name} row {r}: logits differ from logits_hist_m",
+                )
+            self.assertEqual(selections[name], selections["m"], name)
+
+    def test_group_logits_match_per_row(self):
+        g = self.loader.LOGITS_GROUP_ROWS
+        n_req = -(-self.loader.LOGITS_GROUP_MIN_ROWS // g)
+        for ctxs in (
+            [65536] * n_req,
+            [131072 - 4096 * i for i in range(n_req)],
+            [4096, 200000] + [70000] * (n_req - 2),
+            [300000] * (48 // g),
+        ):
+            with self.subTest(ctxs=ctxs):
+                self._assert_variants_agree(ctxs, pt_width=8192)
+
+    def test_group_logits_unshared_tables_stay_exact(self):
+        """Rows grouped by position whose page tables differ take the kernel's
+        general path; the result must still match the per-row kernel."""
+        n_req = -(-self.loader.LOGITS_GROUP_MIN_ROWS // self.loader.LOGITS_GROUP_ROWS)
+        self._assert_variants_agree([32768] * n_req, pt_width=1024, share=False)
+
+    def test_logits_launch_selection(self):
+        launch = self.loader.logits_launch
+        L = self.loader
+        g, lo = L.LOGITS_GROUP_ROWS, L.LOGITS_GROUP_MIN_ROWS
+        self.assertEqual(launch(48, 16386, g), (0, 2))
+        self.assertEqual(launch(lo, 16386, g), (0, 2))
+        self.assertEqual(launch(48, 16386, 1), (L.LOGITS_BLOCKS_PER_ROW, 0))
+        self.assertEqual(launch(48, 16386, 4), (L.LOGITS_BLOCKS_PER_ROW, 0))
+        self.assertNotEqual(launch(lo - g, 16386, g)[1], 2)
+        for rows, pages in ((8, 16386), (12, 128), (24, 40000)):
+            b, variant = launch(rows, pages, 1)
+            self.assertEqual(variant, 1)
+            self.assertEqual(b % 8, 0)
+            self.assertLessEqual(-(-pages // (b * 8)), 64)
 
     def _assert_matches_standard_path(self, rows, ctx, pt_width=0):
         """Node 4 against the path it replaces, on identical logits.
