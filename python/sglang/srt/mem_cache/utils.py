@@ -175,6 +175,13 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     return hash_values
 
 
+def event_salt_parent_hash(cache_salt: str) -> str:
+    """Parent hash that seeds the event chain of a cache_salt namespace."""
+    return hashlib.sha256(
+        b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
+    ).hexdigest()
+
+
 def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     """Hash tokens with the legacy salt seed; omit extra_key."""
     namespace = (node.key.extra_key, node.key.cache_salt)
@@ -197,9 +204,7 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     if current is not None and current.event_hash_value:
         parent_hash = current.event_hash_value[-1]
     elif node.key.cache_salt is not None:
-        parent_hash = hashlib.sha256(
-            b"sglang-cache-salt-v1\0" + node.key.cache_salt.encode("utf-8")
-        ).hexdigest()
+        parent_hash = event_salt_parent_hash(node.key.cache_salt)
     else:
         parent_hash = None
 

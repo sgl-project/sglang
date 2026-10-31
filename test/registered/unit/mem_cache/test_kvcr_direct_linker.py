@@ -125,6 +125,7 @@ class Runtime:
         self.client = Client()
         self.events = deque()
         self.removals = {}
+        self.event_hashes = {}
         self.closed = False
         self.close_error = False
 
@@ -272,6 +273,79 @@ class TestKVCRDirectLinker(CustomTestCase):
                 KVCRDirectLinker(
                     None, self.params, components=set(), runtime_factory=make_runtime
                 )
+
+    def test_namespaced_lookup_submits_event_hashes(self):
+        import importlib.util
+        import sys
+
+        with patch.dict("sys.modules"):
+            # setUp stubs kvcr.types; the real parser needs the real module.
+            sys.modules.pop("kvcr.types")
+            if importlib.util.find_spec("kvcr.hints.fetch") is None:
+                self.skipTest("pinned KVCR hint parser unavailable")
+            from kvcr.hints.fetch import KV_FETCH
+            from kvcr.hints.parser import parse_hints
+        from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
+        from sglang.srt.mem_cache.storage.kvcr.runtime import KVCRRuntime
+
+        storage = ["00000000000000ff" + "ab" * 24, "00000000000000fe" + "cd" * 24]
+        events = [(1 << 63) + 5, (1 << 63) + 6]
+        adapter = SimpleNamespace(
+            _layout=self.linker.layout, event_hashes=self.runtime.event_hashes
+        )
+        hints, dispatched = {}, set()
+
+        def submit_hint(envelope, request_id=None):
+            # Real KVCR parsing of the SGLang-decoded envelope.
+            parsed, rejected = parse_hints(envelope, {KV_FETCH.action_type: KV_FETCH})
+            self.assertEqual(rejected, [])
+            hints[request_id] = parsed[0].block_hashes
+
+        def query(keys, request_id=None):
+            # RemoteFWDram.query: serve a key iff adapter.decode(key) is hinted.
+            decoded = [KVCRRuntime.decode(adapter, key) for key in keys]
+            dispatched.update(decoded)
+            return [
+                (SimpleNamespace(value="FETCHABLE"), SimpleNamespace(value="REMOTE_G2"))
+                if value in hints.get(request_id, ())
+                else (SimpleNamespace(value="MISS"), None)
+                for value in decoded
+            ]
+
+        self.client.submit_hint = submit_hint
+        self.client.query = query
+        envelope = decode_kv_hints_envelope(
+            hint_envelope(
+                [
+                    hint_action(
+                        {
+                            "source_control_endpoint": "tcp://192.0.2.7:19500",
+                            "block_hashes": events,
+                        }
+                    )
+                ]
+            )
+        )
+        # The wrapper registers the tail's event hashes before lookup.
+        self.linker.set_page_event_hashes(dict(zip(storage, events)))
+        self.linker.set_request_context(CacheRequestHandle("a", 0), envelope)
+        transfers = [PoolTransfer(PoolName.KV, keys=storage)]
+        self.assertEqual(self.linker.lookup("a", transfers), [1, 2])
+        self.assertEqual(dispatched, set(events))
+        self.assertEqual(adapter.event_hashes, dict(zip(storage, events)))
+        # An unregistered storage key is hinted by its own hash prefix.
+        unregistered = "00000000000000fd" + "ef" * 24
+        key = self.linker.layout.encode_key(unregistered, PoolName.KV)
+        self.assertEqual(KVCRRuntime.decode(adapter, key), 0xFD)
+
+    def test_reregistered_event_hash_survives_eviction(self):
+        with patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker._MAX_EVENT_HASHES", 2
+        ):
+            self.linker.set_page_event_hashes({"a": 1, "b": 2})
+            self.linker.set_page_event_hashes({"a": 1})
+            self.linker.set_page_event_hashes({"c": 3})
+        self.assertEqual(self.runtime.event_hashes, {"a": 1, "c": 3})
 
     def test_layer_first_window_and_no_implicit_deposit(self):
         self.linker.load("a", self.transfer(["same"], 0))

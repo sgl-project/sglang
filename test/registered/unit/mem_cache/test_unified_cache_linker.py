@@ -1928,5 +1928,46 @@ def test_linker_load_preserves_swa_boundaries(
         swa.update_external_linker_load.assert_not_called()
 
 
+@pytest.mark.parametrize("device_pages", [0, 2])
+@pytest.mark.parametrize(
+    "namespace", [{"cache_salt": "tenant-a"}, {"extra_key": "ns", "cache_salt": "t"}]
+)
+def test_tail_event_hashes_equal_published_event_hashes(device_pages, namespace):
+    """A salted lookup must hint the same hashes the publisher emitted."""
+    page, pages = 4, 6
+    tokens = array("q", range(1, page * pages + 1))
+    key = RadixKey(tokens, **namespace)
+    root = SimpleNamespace(
+        parent=None,
+        key=RadixKey(array("q")),
+        hash_value=None,
+        event_hash_value=None,
+    )
+    node = SimpleNamespace(
+        parent=root, key=key, hash_value=None, event_hash_value=None, id=1
+    )
+    recorder = KVCacheEventRecorder(enabled=True, page_size=page, dynamo_format=True)
+    recorder.record_store(node)
+    published = [
+        block_hash % (1 << 64)
+        for event in recorder.take()
+        for block_hash in event.block_hashes
+    ]
+    assert len(published) == pages
+
+    wrapper = SimpleNamespace(
+        cache=SimpleNamespace(
+            page_size=page,
+            tree_core=SimpleNamespace(kv_events=recorder),
+        )
+    )
+    assert (
+        UnifiedCacheLinkerWrapper._tail_event_hashes(
+            wrapper, key, device_pages * page, pages - device_pages
+        )
+        == published[device_pages:]
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

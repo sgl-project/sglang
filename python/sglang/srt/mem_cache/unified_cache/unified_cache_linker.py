@@ -30,7 +30,11 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.disaggregation.kv_events import (
+    StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -44,7 +48,12 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.utils import (
+    event_salt_parent_hash,
+    get_hash_str,
+    get_storage_hash_str,
+    hash_str_to_int64,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.kv_hints import KvHintsEnvelope
@@ -141,6 +150,9 @@ class UnifiedCacheLinker(ABC):
         self, handle: CacheRequestHandle, kv_hints: KvHintsEnvelope | None
     ) -> None:
         """Snapshot attempt-scoped hints; accepted loads retain their own scope."""
+
+    def set_page_event_hashes(self, event_hashes: dict[str, int]) -> None:
+        """Map storage hashes to the unsigned event hashes a router hints with."""
 
     def release_request_context(self, handle: CacheRequestHandle) -> None:
         """Release request scope without revoking accepted transfers."""
@@ -313,6 +325,11 @@ class UnifiedCacheLinkerWrapper:
             self.release_request(previous, cancel_load=False)
         self._request_handles[req.rid] = handle
         self.cache_linker.set_request_context(handle, req.kv_hints)
+        event_hashes = self._tail_event_hashes(key, device_hit_len, len(tail_hashes))
+        if event_hashes:
+            self.cache_linker.set_page_event_hashes(
+                dict(zip(tail_hashes, event_hashes))
+            )
 
         def confirm(pages):
             return self.cache_linker.confirm_lookup(req.rid, lookup_transfers, pages)
@@ -401,6 +418,34 @@ class UnifiedCacheLinkerWrapper:
             last_hash,
             page_size=page,
         )
+
+    def _tail_event_hashes(
+        self, key: RadixKey, device_hit_len: int, tail_pages: int
+    ) -> list[int]:
+        """Unsigned event hashes of the tail pages, as published and hinted.
+
+        Empty when events are not namespaced: storage and event hashes agree then.
+        """
+        if key.extra_key is None and key.cache_salt is None:
+            return []
+        if not self.cache.tree_core.kv_events.dynamo_format:
+            return []
+        page = self.cache.page_size
+        seed = kv_event_namespace_seed(
+            extra_key=key.extra_key, cache_salt=key.cache_salt
+        )
+        chain = get_hash_str(
+            key[: device_hit_len + tail_pages * page],
+            event_salt_parent_hash(key.cache_salt)
+            if key.cache_salt is not None
+            else None,
+            page_size=page,
+        )
+        return [
+            namespaced_block_hash(hash_str_to_int64(value), namespace_seed=seed)
+            % (1 << 64)
+            for value in chain[device_hit_len // page :]
+        ]
 
     # ---- init_load_back: remote -> request-private device slots ----
 
