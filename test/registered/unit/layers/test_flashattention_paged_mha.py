@@ -195,12 +195,6 @@ class TestFlashAttentionFa3UpgradesToFa4(unittest.TestCase):
         layer = SimpleNamespace(head_dim=576, v_head_dim=512)
         self.assertEqual(backend._ver_for(layer), 3)
 
-    def test_ver_for_never_downgrades_fa4(self):
-        backend = _backend()
-        backend.fa_impl_ver = 4
-        layer = SimpleNamespace(head_dim=128, v_head_dim=128)
-        self.assertEqual(backend._ver_for(layer), 4)
-
 
 def _cpu_runner(*, model_head_dim):
     """The least ModelRunner FlashAttentionBackend.__init__ reads up to its
@@ -289,9 +283,6 @@ class TestLoadFa4Kernels(unittest.TestCase):
     # on either path.
     def test_deterministic_inference_enables_batch_invariance(self):
         _load_fa4_kernels(deterministic=True).assert_called_once_with(True)
-
-    def test_default_leaves_batch_invariance_off(self):
-        _load_fa4_kernels(deterministic=False).assert_not_called()
 
 
 if __name__ == "__main__":

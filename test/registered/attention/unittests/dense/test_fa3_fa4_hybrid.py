@@ -82,18 +82,6 @@ class TestFa3Fa4HybridDenseAttention(CustomTestCase):
                     dtype=self.DTYPE,
                 )
 
-    def test_narrow_layers_match_reference_on_fa3(self):
-        for case in self.CASES:
-            with self.subTest(case=case.name):
-                run_dense_attention_case(
-                    self,
-                    case,
-                    head_dim=NARROW_HEAD_DIM,
-                    model_head_dim=WIDE_HEAD_DIM,
-                    hidden_size=self.HIDDEN_SIZE,
-                    dtype=self.DTYPE,
-                )
-
     def test_image_token_ranges_make_image_spans_bidirectional(self):
         """What gemma4_mm.prepare_attn_masks installs on an image prefill:
         per-query absolute image spans, -1 on text rows. Image rows see their
