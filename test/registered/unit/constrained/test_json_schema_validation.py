@@ -1,17 +1,34 @@
 """Unit tests for backend-specific JSON Schema prevalidation."""
 
+import json
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from llguidance import LLTokenizer
+from xgrammar import GrammarCompiler, TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaDepthExceeded,
+    JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
+    build_fsm_with_budget,
+    check_regex_ast_complexity,
     validate_outlines_json_schema,
+    validate_schema_bounds,
     validate_xgrammar_json_schema,
 )
-from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
-from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+from sglang.srt.constrained.llguidance_backend import GuidanceBackend, GuidanceGrammar
+from sglang.srt.constrained.outlines_backend import (
+    OutlinesGrammar,
+    OutlinesGrammarBackend,
+)
+from sglang.srt.constrained.xgrammar_backend import (
+    XGrammarGrammar,
+    XGrammarGrammarBackend,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -209,6 +226,439 @@ class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
 
         self.assertIsInstance(result, InvalidGrammarObject)
         backend._compile_regex.assert_not_called()
+
+
+class TestOptionalStructuralFormatSchemaValidation(CustomTestCase):
+    def test_rejects_unsupported_schema_inside_optional_format(self):
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+        backend._from_context = MagicMock(return_value="compiled")
+        structural_tag = {
+            "format": {
+                "type": "optional",
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": {"contains": {}},
+                },
+            }
+        }
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("contains", result.error_message)
+        backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+    def test_sanitizes_missing_schema_inside_optional_format(self):
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+        backend._from_context = MagicMock(return_value="compiled")
+        structural_tag = {
+            "format": {
+                "type": "optional",
+                "content": {"type": "json_schema"},
+            }
+        }
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertEqual(result, "compiled")
+        compiled_tag = json.loads(
+            backend.grammar_compiler.compile_structural_tag.call_args.args[0]
+        )
+        self.assertEqual(compiled_tag["format"]["content"]["json_schema"], {})
+
+
+class TestBoundedLinearPatterns(CustomTestCase):
+    patterns = (
+        "^[0-9a-f]{32}$",  # MD5
+        "^[0-9a-f]{40}$",  # SHA-1
+        "^[0-9a-f]{64}$",  # SHA-256
+        "^[0-9a-f]{128}$",  # SHA-512
+        "^[a-z]{32,64}$",  # Bounded ranges of one character atom grow linearly.
+        "^key_[a-z0-9]{32,64}$",  # A fixed prefix keeps the range linear.
+        "a" * 501,  # Long literal patterns must reach the actual FSM budget check.
+        "[0-9a-f]{64}",  # Unanchored SHA-256: a homogeneous repetition is linear.
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "^(?:[0-9a-f]{8}){8}$",
+        "^[*+?()|]{64}$",  # Metacharacters inside a class are character atoms.
+    )
+
+    def _assert_dispatch_accepts(self, backend, grammar_type):
+        for pattern in self.patterns:
+            with self.subTest(pattern=pattern):
+                schema = json.dumps({"type": "string", "pattern": pattern})
+                self.assertIsInstance(backend.dispatch_json(schema), grammar_type)
+
+    def test_xgrammar_dispatch_accepts_fixed_patterns(self):
+        backend = object.__new__(XGrammarGrammarBackend)
+        info = TokenizerInfo([chr(i) for i in range(129)], stop_token_ids=[128])
+        backend.grammar_compiler = GrammarCompiler(tokenizer_info=info)
+        backend.any_whitespace = True
+        backend.max_whitespace_cnt = None
+        backend.override_stop_tokens = None
+        backend.vocab_size = 129
+        self._assert_dispatch_accepts(backend, XGrammarGrammar)
+
+    def test_outlines_dispatch_accepts_fixed_patterns(self):
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend.whitespace_pattern = None
+        backend.outlines_tokenizer = MagicMock()
+        # Keep schema conversion and FSM budget checks real; only the external
+        # token guide needs a model tokenizer.
+        with patch("sglang.srt.constrained.outlines_backend.RegexGuide"):
+            self._assert_dispatch_accepts(backend, OutlinesGrammar)
+
+    def test_outlines_regex_dispatch_accepts_long_literal(self):
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend.whitespace_pattern = None
+        backend.outlines_tokenizer = MagicMock()
+        with patch("sglang.srt.constrained.outlines_backend.RegexGuide"):
+            result = backend.dispatch_regex("a" * 501)
+
+        self.assertIsInstance(result, OutlinesGrammar)
+
+    def test_llguidance_dispatch_accepts_fixed_patterns(self):
+        backend = object.__new__(GuidanceBackend)
+        backend.llguidance_tokenizer = LLTokenizer("byte")
+        backend.any_whitespace = True
+        backend.whitespace_pattern = None
+        self._assert_dispatch_accepts(backend, GuidanceGrammar)
+
+    def test_linear_patterns_still_obey_state_budget(self):
+        validate_schema_bounds({"type": "string", "pattern": "^[ab]{64}$"})
+        for pattern in (
+            "^[ab]{10001}$",
+            "^[ab]{0,10001}$",
+            "[ab]{10001}",
+            "^(?:[ab]{100}){101}$",
+        ):
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(JSONSchemaStateExplosion):
+                    validate_schema_bounds({"type": "string", "pattern": pattern})
+
+    def test_ambiguous_patterns_keep_explosion_checks(self):
+        for pattern in (
+            "[ab]*a[ab]{100}",
+            "[ab]{100}a[ab]{100}$",
+            "^[ab]{0,100}a[ab]{100}$",
+        ):
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(JSONSchemaStateExplosion):
+                    validate_schema_bounds({"type": "string", "pattern": pattern})
+
+
+class TestSchemaBoundsValidation(unittest.TestCase):
+    """Tests for schema depth and state explosion validation."""
+
+    def test_validate_schema_bounds_accepts_valid_schema(self):
+        """A normal schema should pass validation."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+        }
+        validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_excessive_depth(self):
+        """Schema with nesting depth > 64 should be rejected."""
+        schema = {"type": "object"}
+        current = schema
+        for i in range(65):  # 65 levels = depth 65 > 64
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        with self.assertRaises(JSONSchemaDepthExceeded):
+            validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_accepts_boundary_depth(self):
+        """Schema at exactly depth 64 should pass."""
+        schema = {"type": "object"}
+        current = schema
+        for i in range(64):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_excessive_states(self):
+        """Schema with too many properties should be rejected."""
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {
+            "type": "object",
+            "properties": properties,
+        }
+
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_allof_explosion(self):
+        """Schema with many allOf clauses should be rejected."""
+        all_of = []
+        for i in range(3000):
+            all_of.append(
+                {"type": "object", "properties": {f"x{i}": {"type": "string"}}}
+            )
+        schema = {
+            "type": "object",
+            "allOf": all_of,
+        }
+
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_circular_ref(self):
+        """Schema with circular $ref should be rejected."""
+        schema = {"type": "object", "properties": {"self": {"$ref": "#"}}}
+        # This won't actually detect as circular without ref resolution
+        # but validates the check exists
+        validate_schema_bounds(schema)
+
+    def test_validate_schema_bounds_rejects_regex_explosion(self):
+        """Schema with complex regex pattern should be rejected."""
+        schema = {
+            "type": "string",
+            "pattern": "[ab]*a[ab]{100}",  # This pattern can cause ~16K states
+        }
+        # The pattern complexity heuristic should catch this
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+
+    def test_xgrammar_rejects_deep_schema_before_compilation(self):
+        """XGrammar backend should reject deep schemas before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        # Create a deeply nested schema (depth > 64)
+        schema = {"type": "object"}
+        current = schema
+        for i in range(65):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("nesting depth exceeds", result.error_message)
+        backend.grammar_compiler.compile_json_schema.assert_not_called()
+
+    def test_xgrammar_rejects_state_explosion_before_compilation(self):
+        """XGrammar backend should reject state explosion before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {"type": "object", "properties": properties}
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("DFA states", result.error_message)
+        backend.grammar_compiler.compile_json_schema.assert_not_called()
+
+    def test_outlines_rejects_deep_schema_before_compilation(self):
+        """Outlines backend should reject deep schemas before regex compilation."""
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend._compile_regex = MagicMock()
+
+        schema = {"type": "object"}
+        current = schema
+        for i in range(65):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("nesting depth exceeds", result.error_message)
+        backend._compile_regex.assert_not_called()
+
+    def test_outlines_rejects_state_explosion_before_compilation(self):
+        """Outlines backend should reject state explosion before regex compilation."""
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend._compile_regex = MagicMock()
+
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {"type": "object", "properties": properties}
+
+        import json
+
+        result = backend.dispatch_json(json.dumps(schema))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("DFA states", result.error_message)
+        backend._compile_regex.assert_not_called()
+
+    def test_xgrammar_rejects_deep_schema_in_structural_tag(self):
+        """XGrammar backend should reject deep schemas in structural tags before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        # Create a deeply nested schema
+        schema = {"type": "object"}
+        current = schema
+        for i in range(65):
+            current["properties"] = {"nested": {"type": "object"}}
+            current = current["properties"]["nested"]
+
+        import json
+
+        # Test legacy structural tag
+        structural_tag = {
+            "structures": [
+                {"begin": "<tool>", "schema": json.dumps(schema), "end": "</tool>"}
+            ],
+            "triggers": ["<tool>"],
+        }
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("nesting depth exceeds", result.error_message)
+        backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+    def test_xgrammar_rejects_state_explosion_in_structural_tag(self):
+        """XGrammar backend should reject state explosion in structural tags before compilation."""
+        backend = object.__new__(XGrammarGrammarBackend)
+        backend.grammar_compiler = MagicMock()
+
+        properties = {}
+        for i in range(6000):
+            properties[f"prop_{i}"] = {"type": "string"}
+        schema = {"type": "object", "properties": properties}
+
+        import json
+
+        # Test new format structural tag
+        structural_tag = {"format": {"type": "json_schema", "json_schema": schema}}
+
+        result = backend.dispatch_structural_tag(json.dumps(structural_tag))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("DFA states", result.error_message)
+        backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+
+class TestRegexASTComplexityValidation(unittest.TestCase):
+    """Tests for regex AST complexity validation (Tier 1)."""
+
+    def test_check_regex_ast_complexity_accepts_email(self):
+        """Standard email regex should pass."""
+        check_regex_ast_complexity(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}")
+
+    def test_check_regex_ast_complexity_accepts_uuid(self):
+        """UUID regex should pass."""
+        check_regex_ast_complexity(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        )
+
+    def test_check_regex_ast_complexity_accepts_iso_date(self):
+        """ISO date regex should pass."""
+        check_regex_ast_complexity(r"\d{4}-\d{2}-\d{2}")
+
+    def test_check_regex_ast_complexity_rejects_nested_quantifiers(self):
+        """Deeply nested quantifiers like ((a+)+)+ should be rejected."""
+        with self.assertRaises(JSONSchemaStateExplosion):
+            check_regex_ast_complexity(r"(((((a+)+)+)+)+)+")  # 6 levels > 5
+
+    def test_check_regex_ast_complexity_accepts_shallow_nested_quantifiers(self):
+        """Shallow nested quantifiers (≤5 levels) should pass."""
+        check_regex_ast_complexity(r"((((a+)+)+)+)+")  # 5 levels = boundary
+
+    def test_check_regex_ast_complexity_rejects_large_bounded_in_nested(self):
+        """Large bounded repetition inside another quantifier should be rejected."""
+        with self.assertRaises(JSONSchemaStateExplosion):
+            check_regex_ast_complexity(r"(a{101})+")  # {101} inside +
+
+    def test_check_regex_ast_complexity_accepts_large_bounded_not_nested(self):
+        """Large bounded repetition not nested should pass."""
+        check_regex_ast_complexity(r"a{101}")
+
+    def test_check_regex_ast_complexity_accepts_boundary_bounded_in_nested(self):
+        """Bounded repetition of exactly 100 inside quantifier should pass."""
+        check_regex_ast_complexity(r"(a{100})+")
+
+    def test_check_regex_ast_complexity_rejects_excessive_non_linear_ast(self):
+        """Large patterns without a linear estimate still hit the AST limit."""
+        pattern = "[ab]*" + "a" * 501
+        with self.assertRaises(JSONSchemaStateExplosion):
+            check_regex_ast_complexity(pattern)
+
+    def test_check_regex_ast_complexity_accepts_large_linear_literal(self):
+        check_regex_ast_complexity("a" * 501)
+
+    def test_check_regex_ast_complexity_accepts_boundary_ast_nodes(self):
+        """Pattern with exactly 500 AST nodes should pass."""
+        pattern = "a" * 500
+        check_regex_ast_complexity(pattern)
+
+
+class TestBoundedFSMConstruction(CustomTestCase):
+    def test_stops_determinization_at_configured_state_budget(self):
+        with self.assertRaisesRegex(
+            JSONSchemaStateExplosion, "before determinization completed"
+        ):
+            build_fsm_with_budget(r"[ab]*a[ab]{13}", max_states=16)
+
+    def test_large_linear_literal_reaches_fsm_state_budget(self):
+        with self.assertRaisesRegex(
+            JSONSchemaStateExplosion, "before determinization completed"
+        ):
+            build_fsm_with_budget("a" * 501, max_states=16)
+
+    def test_huge_bounded_repeat_stops_at_state_budget(self):
+        with self.assertRaisesRegex(
+            JSONSchemaStateExplosion, "before determinization completed"
+        ):
+            build_fsm_with_budget(r"a{1000000000}", max_states=16)
+
+
+class TestFSMBudgetValidation(unittest.TestCase):
+    """Tests for FSM compilation with budget enforcement (Tier 2)."""
+
+    def test_build_fsm_with_budget_accepts_email(self):
+        """Email regex should compile within budget."""
+        fsm = build_fsm_with_budget(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}")
+        self.assertLess(len(fsm.states), 100)
+
+    def test_build_fsm_with_budget_accepts_uuid(self):
+        """UUID regex should compile within budget."""
+        fsm = build_fsm_with_budget(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        )
+        self.assertLess(len(fsm.states), 100)
+
+    def test_build_fsm_with_budget_accepts_iso_date(self):
+        """ISO date regex should compile within budget."""
+        fsm = build_fsm_with_budget(r"\d{4}-\d{2}-\d{2}")
+        self.assertLess(len(fsm.states), 100)
+
+    def test_build_fsm_with_budget_rejects_explosive_pattern(self):
+        """Pattern [ab]*a[ab]{13} should timeout or exceed state budget."""
+        with self.assertRaises(JSONSchemaStateExplosion):
+            build_fsm_with_budget(r"[ab]*a[ab]{13}")
+
+    def test_build_fsm_with_budget_rejects_manual_unroll(self):
+        """Manually unrolled pattern should also be rejected by state budget."""
+        # [ab]*a[ab][ab]...{13 times} - equivalent to [ab]*a[ab]{13}
+        pattern = "[ab]*" + "a" + "[ab]" * 13
+        with self.assertRaises(JSONSchemaStateExplosion):
+            build_fsm_with_budget(pattern)
 
 
 if __name__ == "__main__":
