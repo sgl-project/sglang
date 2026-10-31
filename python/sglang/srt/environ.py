@@ -1170,6 +1170,9 @@ class Envs:
     # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Use the vendor's public normal-mode strategy option for affected NPU
+    # DeepEP deployments. ZBAL and low-latency-only buffers are unchanged.
+    SGLANG_USE_NPU_DEEPEP_ALLTOALL = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)

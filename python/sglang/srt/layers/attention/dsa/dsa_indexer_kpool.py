@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
@@ -39,7 +40,7 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
-if is_npu():
+if is_npu() and not is_npu_arch35():
     try:
         import custom_ops  # noqa: F401
     except ImportError:
@@ -131,6 +132,23 @@ def _mqa_logits_row_chunks(
         slice(start, min(start + rows_per_chunk, num_rows))
         for start in range(0, num_rows, rows_per_chunk)
     )
+
+
+def _a5_full_topk_for_short_sequences(topk_result, causal_lens):
+    """Select all causal tokens below the A5 2048-token sparse threshold.
+
+    Use device lengths, not a Python max(seq_lens_cpu) branch: a captured
+    decode graph must keep working as requests cross the threshold.
+    """
+    n_real = min(topk_result.shape[0], causal_lens.shape[0])
+    lengths = causal_lens[:n_real].to(torch.int32).unsqueeze(1)
+    indices = torch.arange(
+        topk_result.shape[1], dtype=torch.int32, device=topk_result.device
+    ).unsqueeze(0)
+    full = torch.where(indices < lengths, indices, -1)
+    result = torch.full_like(topk_result, -1)
+    result[:n_real] = torch.where(lengths < 2048, full, topk_result[:n_real])
+    return result
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -279,6 +297,14 @@ class IndexerKPool(MultiPlatformOp):
             and not is_in_breakable_cuda_graph()
             and not dsa_use_prefill_cp(forward_batch)
         )
+
+    @torch.compile(dynamic=True, disable=is_npu())
+    def _get_logits_head_gate_npu(self, x: torch.Tensor):
+        weights, _ = self.weights_proj(x.float())
+        scale = self.n_heads**-0.5 * self.softmax_scale
+        weights = weights * scale
+        weights = weights.unsqueeze(-1)
+        return weights
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -1885,3 +1911,416 @@ class IndexerKPool(MultiPlatformOp):
                 "kpool indexer is only supported on CUDA and ROCm"
             )
         return topk_result
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        layer_scatter_modes=None,
+        dynamic_scale: torch.Tensor = None,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """NPU BF16 compression and vendor lightning-indexer top-k path."""
+
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+
+        if metadata is None:
+            return None
+
+        assert forward_batch.seq_lens_cpu is not None
+        mode = forward_batch.forward_mode
+        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
+            return torch.full(
+                (x.shape[0], self.index_topk + self.index_kpool - 1),
+                -1,
+                dtype=torch.int,
+                device=x.device,
+            )
+
+        # ── Compute query, key, gate_score (no dual stream on NPU) ──
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        if self.rope_head_dim > 0 and not self.skip_rope:
+            q_rope, _ = torch.split(
+                query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
+            k_rope, _ = torch.split(
+                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope
+        gate_score = F.linear(x, self.index_kpool_compress_gate)
+
+        # ── Write phase: compress + tail ──
+        # Draft extend v2 is also an extend path, so identify MTP first to avoid
+        # selecting the regular extend plan.
+        is_mtp = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+
+        if is_mtp:
+            self._compress_write_mtp_npu(
+                key, gate_score, forward_batch, layer_id, metadata
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            self._compress_write_decode_npu(
+                key, gate_score, positions, forward_batch, layer_id, metadata
+            )
+        elif forward_batch.forward_mode.is_extend_without_speculative():
+            self._compress_write_extend_npu(
+                key, gate_score, forward_batch, layer_id, metadata
+            )
+        else:
+            raise NotImplementedError(
+                f"NPU kpool does not support forward_mode={forward_batch.forward_mode}"
+            )
+
+        if (
+            is_mtp or forward_batch.forward_mode.is_extend_without_speculative()
+        ) and not return_indices:
+            # Layers that skip top-k only update the index cache and do not need
+            # to continue with read-side computation.
+            return None
+
+        # Decode prepares weights and pooled page metadata in fused kernels.
+        if forward_batch.forward_mode.is_decode_or_idle():
+            w_bf16, pool_seqlens, pool_block_tables = (
+                self._prepare_decode_indexer_inputs_npu(x, metadata)
+            )
+            topk_result = self._get_topk_paged_npu(
+                layer_id,
+                query,
+                w_bf16,
+                metadata,
+                prepared=(pool_seqlens, pool_block_tables),
+            )
+            return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
+
+        # ── Compute weights (logits head gate) ──
+        # NPU uses BF16 (no FP8 quant), so q_scale = 1 (no act_quant).
+        # _get_logits_head_gate computes: weights_proj(x) * n_heads^-0.5 * q_scale * softmax_scale
+        # With q_scale=1, this matches the transformers reference exactly:
+        #   scores = relu(q @ k^T * softmax_scale)
+        #   index_scores = matmul(weights_proj(x) * n_heads^-0.5, scores)
+        weights = self._get_logits_head_gate_npu(x)
+
+        # Extend and MTP use per-query causal lengths with vendor paged-cache
+        # top-k. The write phase above rejects unsupported forward modes.
+        topk_result = self._get_topk_ragged_npu(layer_id, query, weights, metadata)
+
+        return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
+
+    def _fix_short_sequence_topk_a5(self, topk_result, metadata, mode):
+        if not is_npu_arch35() or self.index_topk < 2048:
+            return topk_result
+        causal_lens = (
+            metadata.get_seqlens_int32()
+            if mode.is_decode_or_idle()
+            else metadata.get_seqlens_expanded()
+        )
+        return _a5_full_topk_for_short_sequences(topk_result, causal_lens)
+
+    def _compress_write_mtp_npu(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+    ) -> None:
+        """Execute the KPool ring-write plan shared by target verify and draft extend v2.
+
+        ``key`` and ``gate_score`` use a fixed ``batch_size * N`` layout. The
+        plan provides the ring-write offset for each request and masks rows for
+        tokens that were not accepted during draft extend.
+        """
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_write_tail_and_maybe_compress,
+        )
+
+        plan = metadata.attn_metadata.kpool_write_plan
+        assert plan is not None, "NPU DSA kpool MTP requires kpool_write_plan"
+
+        pool = get_token_to_kv_pool()
+        # MTP writes must maintain both the incomplete-pool tail and the
+        # compressed BF16 index cache.
+        tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+        kpool_write_tail_and_maybe_compress(
+            index_k_cache=pool.get_index_k_with_scale_buffer(layer_id),
+            key=key,
+            score=gate_score,
+            tail_k=tail_k,
+            tail_score=tail_score,
+            ape=self.index_kpool_compress_ape,
+            req_pool_indices=plan.req,
+            write_start=plan.write_start,
+            tail_logical_start=plan.tail_logical_start,
+            write_loc=plan.write_loc,
+            out_cache_loc=forward_batch.out_cache_loc,
+            num_draft_tokens=plan.num_draft_tokens,
+            effective_n_per_batch=plan.effective_n_per_batch,
+        )
+
+    def _compress_write_decode_npu(
+        self, key, gate_score, positions, forward_batch, layer_id, metadata
+    ):
+        """NPU decode-step compress write."""
+        batch = key.shape[0]
+        if batch == 0:
+            return
+        pool = get_token_to_kv_pool()
+        pool.kpool_decode_update_index_cache(
+            layer_id=layer_id,
+            key=key,
+            slot_score=gate_score,
+            ape=self.index_kpool_compress_ape,
+            block_tables=metadata.get_page_table_64(),
+            req_pool_indices=forward_batch.req_pool_indices[:batch],
+            positions=positions[:batch],
+            seq_lens=metadata.get_seqlens_int32()[:batch],
+            out_cache_loc=forward_batch.out_cache_loc[:batch],
+        )
+
+    def _compress_write_extend_npu(
+        self, key, gate_score, forward_batch, layer_id, metadata
+    ):
+        """Execute the precomputed NPU extend cache-write and tail-update plan."""
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+
+        pool = get_token_to_kv_pool()
+        buf = pool.get_index_k_with_scale_buffer(layer_id)
+        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
+
+        attn_metadata = getattr(metadata, "attn_metadata", None)
+        plan = getattr(attn_metadata, "kpool_extend_plan", None)
+        assert plan is not None, "NPU DSA kpool extend requires kpool_extend_plan"
+
+        # The NPU index cache is BF16, so tail updates cannot reuse the GPU
+        # FP8 scatter implementation.
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_assemble_softmax_rotate_write_cache,
+            scatter_kpool_tail_updates,
+        )
+
+        writes, tails = plan.writes, plan.tails
+        if not writes.is_empty:
+            kpool_assemble_softmax_rotate_write_cache(
+                index_k_cache=buf,
+                chunk_k=key,
+                chunk_score=gate_score,
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                req_pool_idx=writes.req,
+                n_from_tail=writes.n_from_tail,
+                chunk_src_start=writes.chunk_src,
+                tail_logical_base=writes.tail_logical_base,
+                ape=self.index_kpool_compress_ape,
+                loc=writes.write_loc,
+            )
+        if not tails.is_empty:
+            scatter_kpool_tail_updates(
+                pool=pool,
+                chunk_k=key,
+                chunk_score=gate_score,
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                req_pool_idx=tails.req,
+                dst_logical_start=tails.dst_logical_start,
+                chunk_src_start=tails.chunk_src,
+                n_write=tails.n_write,
+            )
+
+    def _prepare_decode_indexer_inputs_npu(self, x, metadata):
+        """Fused decode prep for npu_lightning_indexer inputs (2 Triton kernels).
+
+        Replaces _get_logits_head_gate_npu (weights GEMM + scale + bf16 cast)
+        and the torch-side pool_seqlens / pool_block_tables construction, which
+        torch.compile splits into ~13 small ops.
+        """
+        from sgl_kernel_npu.operators.indexer import (
+            kpool_indexer_prepare_decode_input,
+        )
+
+        seqlens_32 = metadata.get_seqlens_int32()
+        # Decode may run with a padded query batch (graph capture); the kernel
+        # derives N from x.shape and asserts it equals the seqlens row count.
+        x = x[: seqlens_32.shape[0]]
+        block_tables = metadata.get_page_table_64().contiguous()
+
+        return kpool_indexer_prepare_decode_input(
+            x,
+            self.weights_proj.weight,
+            seqlens_32,
+            block_tables,
+            pool_size=self.index_kpool,
+            n_heads_pow=self.n_heads**-0.5,
+            softmax_scale=self.softmax_scale,
+        )
+
+    def _get_topk_paged_npu(
+        self, layer_id, query_bf16, weights, metadata, prepared
+    ) -> torch.Tensor:
+        """NPU paged topk via npu_lightning_indexer fused op on pooled cache.
+
+        Args:
+            prepared: (pool_seqlens, pool_block_tables) from fused decode prep.
+        """
+        import torch_npu
+
+        pool = get_token_to_kv_pool()
+        seqlens_32 = metadata.get_seqlens_int32()
+
+        num_q = query_bf16.shape[0]
+        n_real = seqlens_32.shape[0]
+        if n_real < num_q:
+            query_bf16 = query_bf16[:n_real]
+            weights = weights[:n_real]
+
+        pool_size = self.index_kpool
+        pool_seqlens, pool_block_tables = prepared
+
+        kv_cache = pool.get_index_k_with_scale_buffer(layer_id)
+
+        q_tnd = query_bf16.contiguous().view(n_real, self.n_heads, self.head_dim)
+        w_2d = weights[:n_real]
+        if w_2d.ndim == 3:
+            w_2d = w_2d.squeeze(-1)
+
+        actual_seq_lengths_q = torch.arange(
+            1, n_real + 1, dtype=torch.int32, device=query_bf16.device
+        )
+        n_pool_topk = self.index_topk // pool_size
+        result = torch_npu.npu_lightning_indexer(
+            query=q_tnd,
+            key=kv_cache,
+            weights=w_2d.to(torch.bfloat16),
+            actual_seq_lengths_query=actual_seq_lengths_q,
+            actual_seq_lengths_key=pool_seqlens,
+            block_table=pool_block_tables,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=n_pool_topk,
+            sparse_mode=3,
+        )
+        pool_indices = result[0].squeeze(1)  # may be padded by NPU op
+        pool_indices = pool_indices[:n_real]  # trim padding
+
+        return self._expand_pool_topk_and_append_tail_batched(
+            pool_indices, seqlens_32, n_real, num_q
+        )
+
+    def _get_topk_ragged_npu(
+        self, layer_id, query_bf16, weights, metadata
+    ) -> torch.Tensor:
+        """NPU ragged topk via npu_lightning_indexer fused op on pooled cache.
+
+        Uses per-token causal pool seqlens (like decode per_token mode) so each
+        query token only sees pools up to its causal position.
+        """
+        import torch_npu
+        from sgl_kernel_npu.operators.indexer import (
+            build_pooled_page_table,
+        )
+
+        pool = get_token_to_kv_pool()
+        block_tables = metadata.get_page_table_64()
+        seqlens_expanded = metadata.get_seqlens_expanded()
+
+        num_q = query_bf16.shape[0]
+        n_real_tokens = seqlens_expanded.shape[0]
+
+        pool_size = self.index_kpool
+        # Per-token causal pool seqlens: token i sees pools [0 .. seqlens_expanded[i]//pool_size)
+        pool_seqlens_per_token = torch.div(
+            seqlens_expanded, pool_size, rounding_mode="floor"
+        ).to(torch.int32)
+
+        # Expand block_tables from per-request to per-token
+        token_request_ids = metadata.get_token_to_batch_idx()
+        block_tables_per_token = block_tables[token_request_ids]
+        pool_block_tables = build_pooled_page_table(
+            block_tables_per_token, pool_size
+        ).contiguous()
+
+        kv_cache = pool.get_index_k_with_scale_buffer(layer_id)
+
+        q_tnd = (
+            query_bf16[:n_real_tokens]
+            .contiguous()
+            .view(n_real_tokens, self.n_heads, self.head_dim)
+        )
+        w_2d = weights[:n_real_tokens]
+        if w_2d.ndim == 3:
+            w_2d = w_2d.squeeze(-1)
+
+        # Treat each token as a 1-token request (like decode per_token mode)
+        actual_seq_lengths_q = torch.arange(
+            1, n_real_tokens + 1, dtype=torch.int32, device=query_bf16.device
+        )
+
+        n_pool_topk = self.index_topk // pool_size
+        result = torch_npu.npu_lightning_indexer(
+            query=q_tnd,
+            key=kv_cache,
+            weights=w_2d.to(torch.bfloat16),
+            actual_seq_lengths_query=actual_seq_lengths_q,
+            actual_seq_lengths_key=pool_seqlens_per_token,
+            block_table=pool_block_tables,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=n_pool_topk,
+            sparse_mode=3,
+        )
+        pool_indices = result[0].squeeze(1)  # [n_real_tokens, n_pool_topk]
+        pool_indices = pool_indices[:n_real_tokens]  # truncate padding rows
+
+        return self._expand_pool_topk_and_append_tail_batched(
+            pool_indices, seqlens_expanded, n_real_tokens, num_q
+        )
+
+    def _expand_pool_topk_and_append_tail_batched(
+        self,
+        pool_indices: torch.Tensor,
+        seq_lens_per_token: torch.Tensor,
+        n_real: int,
+        num_q_padded: int,
+    ) -> torch.Tensor:
+        """Expand pool-level topk indices to token-level and append tail tokens.
+
+        All batch rows are processed together without per-request loops.
+
+        Args:
+            pool_indices: [>=n_real, n_pool_topk] — selected pool positions per query
+            seq_lens_per_token: [>=n_real] — total seq_len of the request each query belongs to
+            n_real: number of real query rows
+            num_q_padded: output row count (>= n_real, padded rows filled with -1)
+
+        Returns:
+            [num_q_padded, index_topk + pool_size - 1] int32 token-level indices
+        """
+        from sgl_kernel_npu.operators.indexer import (
+            expand_kpool_group_and_tail_to_topk,
+        )
+
+        pool_size = self.index_kpool
+        n_pool_topk = pool_indices.shape[1]
+        index_topk = n_pool_topk * pool_size
+
+        return expand_kpool_group_and_tail_to_topk(
+            pool_indices.to(torch.int32),
+            seq_lens_per_token.to(torch.int32),
+            n_real,
+            num_q_padded,
+            pool_size,
+            index_topk,
+        )

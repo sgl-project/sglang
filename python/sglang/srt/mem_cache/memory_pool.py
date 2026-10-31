@@ -674,6 +674,7 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.is_kda = cache_params.is_kda
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
@@ -4117,6 +4118,8 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         start_layer: Optional[int] = None,
+        layer_shard_rank: Optional[int] = None,
+        layer_shard_size: int = 1,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         # When provided (shared-KV-pool path), use this pool for the
@@ -4173,11 +4176,25 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            DSAPoolClass = (
-                full_kv_pool_class
-                if full_kv_pool_class is not None
-                else DSATokenToKVPool
-            )
+            pool_kwargs = {}
+            if full_kv_pool_class is not None:
+                DSAPoolClass = full_kv_pool_class
+            elif _is_npu:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                DSAPoolClass = NPUMLATokenToKVPool
+            else:
+                DSAPoolClass = DSATokenToKVPool
+            if layer_shard_rank is not None and layer_shard_size > 1:
+                from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                    LayerSplitDSATokenToKVPool,
+                )
+
+                DSAPoolClass = LayerSplitDSATokenToKVPool
+                pool_kwargs["layer_shard_rank"] = layer_shard_rank
+                pool_kwargs["layer_shard_size"] = layer_shard_size
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4194,6 +4211,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                **pool_kwargs,
             )
         else:
             MLAPoolClass = (

@@ -1541,10 +1541,10 @@ class VisionAttention(nn.Module):
             # is being captured, which makes Inductor attempt an illegal
             # CPU-to-CUDA copy. The eager version is captured as part of the
             # graph, so its pointwise work is still replayed without launch
-            # overhead.
+            # overhead. On NPU, use FP32 rotation and cast Q/K back.
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
-                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                if _is_npu or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)

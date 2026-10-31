@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -121,6 +121,8 @@ class KPoolWritePlan:
 
 
 def _is_kpool_layout_enabled(kpool: int, physical_page_size: int) -> bool:
+    if is_npu():
+        return kpool > 1 and physical_page_size % kpool == 0
     return kpool > 1 and physical_page_size == 64 and physical_page_size % kpool == 0
 
 
@@ -866,3 +868,223 @@ def init_kpool_write_plan(
         effective_n_per_batch=effective_n_per_batch,
     )
     return metadata
+
+
+# ── NPU variants ──────────────────────────────────────────────────────────
+def init_kpool_extend_metadata_npu(
+    metadata,
+    forward_batch: ForwardBatch,
+    *,
+    pool_size: int,
+    real_page_size: int,
+    slots_per_page: int,
+    full_real_page_table: torch.Tensor,
+    local_seqlens_expanded: torch.Tensor,
+) -> DSAMetadata:
+    """NPU variant of init_kpool_extend_metadata.
+
+    Reuses the platform-agnostic CPU plan (_kpool_cpu_plan) and the PyTorch
+    write-location computation from _kpool_plan_to_gpu, but skips the
+    ragged-layout construction (Triton kernel) since the NPU read path uses
+    npu_lightning_indexer instead of deep_gemm.fp8_mqa_logits.
+    """
+    if (
+        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        or not is_npu()
+        or forward_batch.extend_seq_lens_cpu is None
+        or forward_batch.seq_lens_cpu is None
+    ):
+        return metadata
+
+    cpu = _kpool_cpu_plan(forward_batch, pool_size, slots_per_page)
+
+    device = forward_batch.seq_lens.device
+    n_pool = len(cpu.pool_pool_id)
+    n_tail = len(cpu.tail_req)
+
+    # ── Pack int64 tensors (req, pool_id, chunk_src, batch_idx, tail_req, tail_chunk_src) ──
+    i64_total = 4 * n_pool + 2 * n_tail
+    if i64_total > 0:
+        i64_cpu = torch.tensor(
+            cpu.pool_req
+            + cpu.pool_pool_id
+            + cpu.pool_chunk_src
+            + cpu.pool_batch_idx
+            + cpu.tail_req
+            + cpu.tail_chunk_src,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        i64_gpu = i64_cpu.to(device, non_blocking=True)
+        c = 0
+        pool_req_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        pool_pool_id_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        pool_chunk_src_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        pool_batch_idx_t = i64_gpu[c : c + n_pool]
+        c += n_pool
+        tail_req_t = i64_gpu[c : c + n_tail]
+        c += n_tail
+        tail_chunk_src_t = i64_gpu[c : c + n_tail]
+    else:
+        empty_i64 = torch.empty((0,), dtype=torch.int64, device=device)
+        pool_req_t = pool_pool_id_t = pool_chunk_src_t = pool_batch_idx_t = empty_i64
+        tail_req_t = tail_chunk_src_t = empty_i64
+
+    # ── Pack int32 tensors (n_from_tail, tail_logical_base, dst_logical_start, n_write) ──
+    i32_total = 2 * n_pool + 2 * n_tail
+    if i32_total > 0:
+        i32_cpu = torch.tensor(
+            cpu.pool_n_from_tail
+            + cpu.pool_tail_logical_base
+            + cpu.tail_dst_logical_start
+            + cpu.tail_n_write,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        i32_gpu = i32_cpu.to(device, non_blocking=True)
+        c = 0
+        pool_n_from_tail_t = i32_gpu[c : c + n_pool]
+        c += n_pool
+        pool_tail_logical_base_t = i32_gpu[c : c + n_pool]
+        c += n_pool
+        tail_dst_logical_start_t = i32_gpu[c : c + n_tail]
+        c += n_tail
+        tail_n_write_t = i32_gpu[c : c + n_tail]
+    else:
+        empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
+        pool_n_from_tail_t = pool_tail_logical_base_t = empty_i32
+        tail_dst_logical_start_t = tail_n_write_t = empty_i32
+
+    # ── Compute write locations (PyTorch, same as _kpool_plan_to_gpu) ──
+    if n_pool > 0:
+        pool_page_group = torch.div(
+            pool_pool_id_t, slots_per_page, rounding_mode="floor"
+        )
+        token_page_row = pool_page_group * pool_size
+        packed_page = full_real_page_table[pool_batch_idx_t, token_page_row].to(
+            torch.int64
+        )
+        pool_write_locs = packed_page * slots_per_page + torch.remainder(
+            pool_pool_id_t, slots_per_page
+        )
+    else:
+        pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
+
+    empty_i32_dev = torch.empty((0,), dtype=torch.int32, device=device)
+
+    plan = KPoolExtendPlan(
+        writes=PoolWriteRows(
+            req=pool_req_t,
+            pool_id=pool_pool_id_t,
+            n_from_tail=pool_n_from_tail_t,
+            chunk_src=pool_chunk_src_t,
+            tail_logical_base=pool_tail_logical_base_t,
+            write_loc=pool_write_locs,
+        ),
+        tails=TailWriteRows(
+            req=tail_req_t,
+            dst_logical_start=tail_dst_logical_start_t,
+            chunk_src=tail_chunk_src_t,
+            n_write=tail_n_write_t,
+        ),
+        pooled_seq_lens_expanded=None,
+        seq_lens_expanded=local_seqlens_expanded,
+        ragged_concat_page_table=empty_i32_dev,
+        ragged_q_ks=empty_i32_dev,
+        ragged_q_ke=empty_i32_dev,
+        ragged_total_k_rows=0,
+        ragged_k_u8=None,
+        ragged_k_scale=None,
+        ragged_paged_page_table=None,
+        ragged_paged_page_table_row_index=None,
+        cp=None,
+    )
+    metadata.kpool_extend_plan = plan
+    return
+
+
+def update_kpool_write_plan_npu(
+    metadata,
+    *,
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    pool_size: int,
+    real_page_size: int,
+    num_draft_tokens: int,
+    forward_mode: ForwardMode,
+    slots_per_page: int,
+    effective_n_per_batch: Optional[torch.Tensor] = None,
+) -> None:
+    """Refresh the NPU plan in place through the shared Triton kernel.
+
+    ``effective_n_per_batch`` masks unaccepted draft-extend-v2 tokens.
+    """
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_npu():
+        return
+    is_verify = forward_mode.is_target_verify()
+    is_decode = forward_mode.is_decode_or_idle()
+    is_v2 = forward_mode.is_draft_extend_v2()
+    if not (is_verify or is_decode or is_v2):
+        return
+
+    plan = metadata.kpool_write_plan
+    assert plan is not None, "kpool_write_plan must be allocated before update"
+
+    bs = write_start.shape[0]
+    if bs == 0 or num_draft_tokens == 0:
+        return
+    assert real_page_table.shape[0] == bs, (
+        "NPU kpool write plan expects one real_page_table row per request; "
+        f"got {real_page_table.shape[0]} rows for batch size {bs}."
+    )
+    expected_write_loc_shape = (
+        bs,
+        kpool_max_closed_pools(num_draft_tokens, pool_size),
+    )
+    assert plan.write_loc.shape == expected_write_loc_shape, (
+        "NPU kpool graph replay must update the capture-time plan in place; "
+        f"captured write_loc shape={plan.write_loc.shape}, "
+        f"replay shape={expected_write_loc_shape}."
+    )
+
+    has_per_q = plan.pool_seqlens_per_q is not None and plan.seqlens_per_q is not None
+    per_q_out = plan.pool_seqlens_per_q if has_per_q else None
+    seq_per_q_out = plan.seqlens_per_q if has_per_q else None
+
+    # Graph replay reuses fixed-size plan buffers. Refresh the accepted-token
+    # counts before updating the plan to retain draft-v2 valid-row masking.
+    if is_v2 and plan.effective_n_per_batch is not None:
+        plan.effective_n_per_batch[:bs].zero_()
+        if effective_n_per_batch is not None:
+            effective_bs = min(bs, effective_n_per_batch.shape[0])
+            plan.effective_n_per_batch[:effective_bs].copy_(
+                effective_n_per_batch[:effective_bs].to(
+                    device=plan.effective_n_per_batch.device,
+                    dtype=torch.int32,
+                )
+            )
+
+    # The shared kernel expects b * N page-table rows and divides entries by
+    # pool_size. NPU metadata stores one row of physical page IDs per request;
+    # adapt those units at this boundary while retaining capture-time outputs.
+    reuse_page_table = torch.repeat_interleave(
+        real_page_table * pool_size, num_draft_tokens, dim=0
+    ).contiguous()
+    update_kpool_write_plan_cuda_graph(
+        write_start,
+        req_pool_indices,
+        reuse_page_table,
+        req_out=plan.req,
+        write_start_out=plan.write_start,
+        tail_logical_start_out=plan.tail_logical_start,
+        write_loc_out=plan.write_loc,
+        pool_seqlens_per_q_out=per_q_out,
+        seqlens_per_q_out=seq_per_q_out,
+        kpool=pool_size,
+        num_draft_tokens=num_draft_tokens,
+        index_page_size=slots_per_page,
+    )

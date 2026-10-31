@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -644,6 +644,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         index_page_size: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
         is_draft_worker: bool = False,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
@@ -721,6 +726,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_page_padding = index_page_padding
         self.is_draft_worker = is_draft_worker
 
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress
+        self.tail_extra_slots = tail_extra_slots
+        self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [False] * layer_num
+        )
+        assert len(self.skip_topk_layers) == layer_num
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -784,7 +799,115 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         self.index_head_dim, self.device
                     )
 
+        self._init_kpool_compress_tail_buffers(
+            index_kpool=index_kpool,
+            tail_extra_slots=tail_extra_slots,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+            max_running_requests=max_running_requests,
+        )
         self._finalize_allocation_log(size)
+
+    def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
+        # Skip tail allocation for local layers that do not run indexer top-k.
+        return not self.skip_topk_layers[local_layer_idx]
+
+    def _init_kpool_compress_tail_buffers(
+        self,
+        index_kpool: int,
+        tail_extra_slots: int,
+        index_head_dim: Optional[int],
+        layer_num: int,
+        device: str,
+        max_running_requests: Optional[int],
+    ) -> None:
+        if not self.kpool_use_compress or index_head_dim is None:
+            self._compress_tail_k = None
+            self._compress_tail_score = None
+            return
+
+        assert max_running_requests is not None, (
+            "NPUMLATokenToKVPool with kpool compress requires max_running_requests"
+        )
+        req_pool_size = max_running_requests + 1
+        tail_dtype = torch.bfloat16
+        tail_width = index_kpool + tail_extra_slots
+        self._compress_tail_k: Optional[List[torch.Tensor]] = [
+            torch.zeros(
+                req_pool_size if self._should_allocate_index_layer(i) else 0,
+                tail_width,
+                index_head_dim,
+                dtype=tail_dtype,
+                device=device,
+            )
+            for i in range(layer_num)
+        ]
+        self._compress_tail_score: Optional[List[torch.Tensor]] = [
+            torch.zeros(
+                req_pool_size if self._should_allocate_index_layer(i) else 0,
+                tail_width,
+                index_head_dim,
+                dtype=tail_dtype,
+                device=device,
+            )
+            for i in range(layer_num)
+        ]
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        # Return the index-key cache, which stores compressed keys in KPool mode.
+        return self.get_index_k_buffer(layer_id)
+
+    def get_compress_tail_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Return references to the per-request tail key and score buffers.
+        assert self.kpool_use_compress, (
+            "get_compress_tail_buffers called when kpool compress is disabled"
+        )
+        idx = layer_id - self.start_layer
+        return (
+            self._compress_tail_k[idx],
+            self._compress_tail_score[idx],
+        )
+
+    def kpool_decode_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        round_scale: bool = False,
+    ) -> None:
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_decode_update_and_maybe_write_cache,
+        )
+
+        assert self.kpool_use_compress, (
+            "kpool_decode_update_index_cache called when kpool compress is disabled"
+        )
+        idx = layer_id - self.start_layer
+        buf = self.get_index_k_with_scale_buffer(layer_id)
+        kpool_decode_update_and_maybe_write_cache(
+            buf=buf,
+            tail_k=self._compress_tail_k[idx],
+            tail_score=self._compress_tail_score[idx],
+            key=key,
+            slot_score=slot_score,
+            ape=ape,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            pool_size=self.index_kpool,
+            slots_per_page=self.page_size,
+        )
 
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
@@ -881,6 +1004,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         data_ptrs = [buf.data_ptr() for buf in buffers]
         data_lens = [buf.nbytes for buf in buffers]
         item_lens = [buf[0].nbytes for buf in buffers]
+        return data_ptrs, data_lens, item_lens
+
+    def get_compress_tail_buf_infos(self):
+        """Buffer infos for per-request DSA kpool compress-tail rows."""
+        if not self.kpool_use_compress:
+            return [], [], []
+        # Keys first, then scores — keep zero-row (skip-topk) entries so layer
+        # offsets stay aligned across PD peers; item_len=0 makes transfer
+        # backends skip them.
+        tail_buffers = list(self._compress_tail_k) + list(self._compress_tail_score)
+        data_ptrs = [buf.data_ptr() for buf in tail_buffers]
+        data_lens = [buf.nbytes for buf in tail_buffers]
+        item_lens = [buf[0].nbytes if buf.shape[0] > 0 else 0 for buf in tail_buffers]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
@@ -1041,13 +1177,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
-        torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.qk_rope_head_dim
-            ),
-            loc.view(-1, 1),
-            cache_v.view(-1, 1, self.qk_rope_head_dim),
-        )
+        if self.qk_rope_head_dim > 0:
+            torch_npu.npu_scatter_nd_update_(
+                self.v_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.qk_rope_head_dim
+                ),
+                loc.view(-1, 1),
+                cache_v.view(-1, 1, self.qk_rope_head_dim),
+            )
 
     def _set_fia_nz_kv_buffer(
         self,

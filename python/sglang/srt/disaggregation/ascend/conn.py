@@ -124,22 +124,11 @@ class AscendKVManager(MooncakeKVManager):
             disaggregation_mode=self.disaggregation_mode,
         )
 
-    def register_buffer_to_engine(self):
-        # MemFabric aligns registered buffers to 2 MiB. Register everything in
-        # one batch so overlapping aligned ranges from small tensors are merged
-        # before they are published to the peer.
-        ptrs = list(self.kv_args.kv_data_ptrs)
-        lens = list(self.kv_args.kv_data_lens)
-        ptrs.extend(self.kv_args.aux_data_ptrs)
-        lens.extend(self.kv_args.aux_data_lens)
-        for component_ptrs, component_lens in zip(
-            self.kv_args.state_data_ptrs or [],
-            self.kv_args.state_data_lens or [],
-        ):
-            ptrs.extend(component_ptrs)
-            lens.extend(component_lens)
-        if ptrs:
-            self.engine.batch_register(ptrs, lens)
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        # Empty KV views retain layer positions in PD metadata but have no
+        # registered memory to transfer.
+        transfer_blocks = [block for block in transfer_blocks if block[2] != 0]
+        return super()._transfer_data(mooncake_session_id, transfer_blocks)
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
