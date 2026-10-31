@@ -61,7 +61,7 @@ import numpy as np
 import torch
 from parameterized import parameterized_class
 
-from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
 from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     _release_nccl_window_buffer,
@@ -1450,6 +1450,7 @@ def _make_pool_stub(spec, shard_rank=0, debug=True, table_pages=4096):
     stub._epoch = 0
     stub._write_plan_key = stub._write_plan = None
     stub._translate_cache = {}
+    stub._gather_views = {}
     stub._debug_plan_checks = debug
     stub.translate_loc_to_scratch = lambda loc: (
         PageInterleaveKVPoolMixin.translate_loc_to_scratch(stub, loc)
@@ -1792,7 +1793,7 @@ class TestShardedPoolFootprint(CustomTestCase):
         # The MLA write path asserts against decode context parallelism.
         enter_scope(self, get_parallel().override(dcp_enabled=False))
 
-    def _sharded_pool(self, shard_size, shard_rank):
+    def _sharded_pool(self, shard_size, shard_rank, **pool_overrides):
         spec = PageShardSpec(
             shard_rank=shard_rank,
             shard_size=shard_size,
@@ -1813,7 +1814,7 @@ class TestShardedPoolFootprint(CustomTestCase):
                 self.PAGES_PER_RANK * PS,
                 shard_spec=spec,
                 shard_group=group,
-                **self.POOL_KWARGS,
+                **{**self.POOL_KWARGS, **pool_overrides},
             )
 
     def test_full_logical_capacity_stores_each_token_once(self):
@@ -1856,6 +1857,124 @@ class TestShardedPoolFootprint(CustomTestCase):
                     )
                 # One copy across the group: each token on exactly one rank.
                 self.assertTrue(torch.equal(torch.cat(stored).sort().values, token))
+
+    def test_mla_rope_write_lands_owned_rows_only(self):
+        """Non-owned tokens (and padding loc 0) go to the skipped slot 0."""
+        enter_scope(self, get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0))
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        size = self.PAGES_PER_RANK * PS
+        for shard_size in (2, 4):
+            with self.subTest(shard_size=shard_size):
+                pools = [
+                    self._sharded_pool(shard_size, r, device=device)
+                    for r in range(shard_size)
+                ]
+                alloc = PageInterleavePoolAllocator(
+                    size=size,
+                    physical_page_size=PS,
+                    shard_size=shard_size,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                    kvcache=pools[0],
+                    need_sort=False,
+                )
+                num_tokens = shard_size * size
+                real = _alloc_extend(alloc, 0, num_tokens, None)
+                loc = torch.cat([real, torch.zeros(3, dtype=real.dtype)])
+                token = torch.arange(loc.numel())
+                nope = torch.zeros(loc.numel(), 1, 16, dtype=torch.bfloat16)
+                nope[:, 0, 0] = (token % 128 + 1).to(torch.bfloat16)
+                nope[:, 0, 1] = (token // 128 + 1).to(torch.bfloat16)
+                rope = torch.full((loc.numel(), 1, 8), 7.0, dtype=torch.bfloat16)
+                for rank, pool in enumerate(pools):
+                    pool.set_mla_kv_buffer(
+                        SimpleNamespace(layer_id=0),
+                        loc.to(device),
+                        nope.to(device),
+                        rope.to(device),
+                    )
+                    buf = pool.kv_buffer[0].float().cpu()
+                    rows = torch.nonzero(buf[:, 0, 0]).squeeze(1)
+                    self.assertTrue(torch.equal(rows, torch.arange(PS, PS + size)))
+                    self.assertTrue((buf[rows, 0, 16:] == 7).all())
+                    owned = pool.placement.local_mask(real, rank)
+                    local_rows = pool.placement.local_index(real[owned])
+                    self.assertTrue(
+                        torch.equal(
+                            buf[local_rows, 0, :2],
+                            nope[: real.numel()][owned][:, 0, :2].float(),
+                        )
+                    )
+
+
+class TestLayerAheadGather(CustomTestCase):
+    """Pack on compute; one fork wait, all-gather and ready on the gather stream."""
+
+    def _stub(self, shard_size=2, shard_rank=1, block=3, rows=16):
+        calls = []
+
+        class _Event:
+            def __init__(self, name):
+                self.name = name
+
+            def record(self, stream=None):
+                calls.append(("record", self.name, stream))
+
+        class _Comm:
+            @contextmanager
+            def change_state(self, enable):
+                calls.append(("enable", enable))
+                yield
+
+            def all_gather(self, out, send, sizes=None, stream=None):
+                calls.append(("all_gather", out, send, stream))
+
+        gather_stream = SimpleNamespace(
+            wait_event=lambda e: calls.append(("wait", e.name))
+        )
+        pool = torch.arange(rows * 2, dtype=torch.float32).view(rows, 2)
+        stub = SimpleNamespace(
+            start_layer=0,
+            layer_num=4,
+            shard_size=shard_size,
+            shard_rank=shard_rank,
+            _epoch=5,
+            _send_rows=torch.tensor([4, 9, 0][:block]),
+            _gather_views={},
+            _fork_event=_Event("fork"),
+            kv_gather_stream=gather_stream,
+            kv_gather_comm=_Comm(),
+            layer_transfer_counter=None,
+            _slots=[
+                SimpleNamespace(
+                    tensors={"kv": torch.full((shard_size * block + 2, 2), -1.0)},
+                    ready=_Event(f"ready{i}"),
+                    resident_key=None,
+                )
+                for i in range(2)
+            ],
+        )
+        stub._gather_pairs = lambda local_layer: [(pool + 100 * local_layer, "kv")]
+        stub._gather_send_rows = lambda name: stub._send_rows
+        return stub, calls, pool
+
+    def test_packs_on_compute_and_gathers_on_gather_stream(self):
+        stub, calls, pool = self._stub()
+        PageInterleaveKVPoolMixin._prefetch_layer(stub, 1)
+        slot = stub._slots[1]
+        block = 3
+        send = slot.tensors["kv"][block : 2 * block]
+        self.assertTrue(torch.equal(send, (pool + 100)[stub._send_rows]))
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds, ["record", "wait", "enable", "all_gather", "record"])
+        self.assertIsNone(calls[0][2])  # fork recorded on the current stream
+        _, out, sent, stream = calls[3]
+        self.assertIs(stream, stub.kv_gather_stream)
+        self.assertEqual(out.data_ptr(), slot.tensors["kv"].data_ptr())
+        self.assertEqual(out.shape[0], 2 * block)
+        self.assertEqual(sent.data_ptr(), send.data_ptr())
+        self.assertEqual(calls[4][1:], ("ready1", stub.kv_gather_stream))
+        self.assertEqual(slot.resident_key, (1, 5))
 
 
 class TestShardSendFilter(CustomTestCase):
@@ -2196,9 +2315,22 @@ class TestRotationPhase(_TreeCoreBackendCase):
 
 class TestGatherWaitsForLayerLoad(CustomTestCase):
     """A HiCache load-back writes pool rows on its own stream; the gather
-    reads them directly, not through the waiting getters, so it waits first."""
+    reads them directly, not through the waiting getters, so it waits first,
+    on the gather stream so the compute stream keeps overlapping the load."""
 
     def _pool(self, events, counter):
+        gather_stream = SimpleNamespace(
+            wait_event=lambda event: events.append("fork_wait"),
+            wait_stream=lambda stream: events.append(("wait_stream", stream)),
+        )
+
+        @contextmanager
+        def on_stream(stream):
+            self.assertIs(stream, gather_stream)
+            events.append("enter")
+            yield
+            events.append("exit")
+
         slot = SimpleNamespace(
             tensors={"k": torch.zeros(N * PS, 1)},
             ready=SimpleNamespace(record=lambda stream: None),
@@ -2221,13 +2353,15 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             _send_rows=torch.arange(PS),
             _gather_send_rows=lambda name: torch.arange(PS),
             _gather_pairs=gather_pairs,
-            kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
-            device_module=SimpleNamespace(
-                stream=lambda stream: nullcontext(), current_stream=lambda: None
-            ),
+            _gather_views={},
+            _fork_event=SimpleNamespace(record=lambda: events.append("fork")),
+            kv_gather_stream=gather_stream,
             kv_gather_comm=SimpleNamespace(
                 change_state=lambda enable: nullcontext(),
-                all_gather=lambda out, inp: events.append("all_gather"),
+                all_gather=lambda out, inp, stream: events.append("all_gather"),
+            ),
+            device_module=SimpleNamespace(
+                current_stream=lambda: "compute", stream=on_stream
             ),
             layer_transfer_counter=counter,
         )
@@ -2236,12 +2370,53 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         events = []
         counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, counter), 3)
-        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather"])
+        self.assertEqual(
+            events,
+            [
+                ("wait_stream", "compute"),
+                "enter",
+                ("wait", 1),
+                ("gather", 1),
+                "exit",
+                "all_gather",
+            ],
+        )
 
     def test_no_counter_no_wait(self):
         events = []
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
-        self.assertEqual(events, [("gather", 1), "all_gather"])
+        self.assertEqual(events, [("gather", 1), "fork", "fork_wait", "all_gather"])
+
+
+class TestShardedDecodeRankMapping(CustomTestCase):
+    """Every decode attn-TP rank pulls its full MLA latent from all sharded
+    prefill ranks, whatever the two attn-TP sizes are."""
+
+    def _resolve(self, prefill_attn_tp, decode_attn_tp, decode_rank):
+        decode = object.__new__(CommonKVManager)
+        decode.attn_tp_size = decode_attn_tp
+        decode.kv_args = SimpleNamespace(engine_rank=decode_rank)
+        decode.is_mla_backend, decode.is_hybrid_mla_backend = True, False
+        decode.attn_cp_size, decode.attn_cp_rank = 1, 0
+        decode.pp_size, decode.pp_rank = 1, 0
+        info = SimpleNamespace(
+            attn_tp_size=prefill_attn_tp,
+            attn_cp_size=1,
+            pp_size=1,
+            enable_kv_cache_sharding=True,
+        )
+        decode._resolve_rank_mapping(info)
+        return info
+
+    def test_decode_pulls_from_every_prefill_rank(self):
+        # (prefill attn TP, decode attn TP); decode attn TP 1 is DP attention.
+        for prefill_tp, decode_tp in ((2, 2), (4, 2), (2, 4), (8, 1)):
+            for decode_rank in range(decode_tp):
+                info = self._resolve(prefill_tp, decode_tp, decode_rank)
+                self.assertIsNone(info.target_tp_rank)
+                self.assertEqual(info.target_tp_ranks, list(range(prefill_tp)))
+                self.assertEqual(info.required_dst_info_num, decode_tp)
+                self.assertEqual(info.required_prefill_response_num, prefill_tp)
 
 
 if __name__ == "__main__":
