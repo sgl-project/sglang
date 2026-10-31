@@ -6,6 +6,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 from typing import Optional
 
 import torch
@@ -43,6 +44,8 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 # Convert natural-log gates to log2 space before the exp2-based chunk kernels.
 # log2(e) rounded to fp32, matching flash-linear-attention.
 RCP_LN2 = 1.4426950216293335
+
+_FUSE_KDA_QKV_PACK = os.getenv("SGLANG_KDA_FUSED_QKV_PACK", "0") == "1"
 
 
 def cdiv(a: int, b: int) -> int:
@@ -1296,7 +1299,20 @@ def chunk_kda(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if use_qk_l2norm_in_kernel:
+    packed_qkv = False
+    if _FUSE_KDA_QKV_PACK and use_qk_l2norm_in_kernel:
+        from sglang.kernels.ops.attention.fla.kda_qkv_pack import (
+            kda_qkv_pack,
+            supports_kda_qkv_pack,
+        )
+
+        if supports_kda_qkv_pack(q, k, v):
+            # Read the conv output's strided Q/K/V directly. Preserve the
+            # l2norm reduction/division, but omit temporary Q/K copies.
+            q, k, v = kda_qkv_pack(q, k, v)
+            packed_qkv = True
+
+    if use_qk_l2norm_in_kernel and not packed_qkv:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
