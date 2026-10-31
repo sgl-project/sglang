@@ -1,6 +1,7 @@
 """No-relief placement is downward closed and its physical takes are realizable."""
 
 import itertools
+import random
 import unittest
 from types import SimpleNamespace
 
@@ -23,7 +24,7 @@ from sglang.test.unified_allocator_fixtures import (
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-def _build(*, state, lazy, draft_dim):
+def _build(*, state, lazy, draft_dim, device="cpu"):
     setup_allocator_context()
     placement = FusedDraftPlacement.from_counts(
         counts={"draft_swa": [1]},
@@ -51,8 +52,58 @@ def _build(*, state, lazy, draft_dim):
             state_slots=8,
             lazy=lazy,
             fused_draft=placement,
+            device=device,
         )
     ).token_to_kv_pool_allocator
+
+
+def _random_history(allocator, rng):
+    """Allocate and free requests, sometimes freeing only their draft window,
+    so the bands' frontiers and holes end up anywhere."""
+    live = []
+    for _ in range(rng.randint(2, 7)):
+        r = rng.random()
+        if r < 0.55 or not live:
+            got = allocator.alloc(4 * rng.randint(1, 6))
+            if got is not None:
+                live.append(got)
+        elif r < 0.8:
+            ids = live.pop(rng.randrange(len(live)))
+            allocator.free_window("draft_swa", ids)
+            allocator.free(ids)
+        else:
+            allocator.free_window("draft_swa", live[rng.randrange(len(live))])
+
+
+def _load_back(allocator, rng, full, swa, auxiliary_swa, state_slots):
+    """Issue a host load's takes in a random band order: the owner's token
+    ids, each window's host rows, and state slots. Returns the first refused
+    sub-pool (or None) and the window rows reserved, which only a prefix tree
+    binds."""
+    storage = allocator.storage
+    takes = [("full", full), ("swa", swa), ("draft_swa", auxiliary_swa)]
+    if state_slots:
+        takes.append(("mamba", state_slots))
+    rng.shuffle(takes)
+    reserved = []
+    for name, units in takes:
+        if not units:
+            continue
+        if name == "full":
+            got = allocator.full_attn_allocator.alloc(units)
+        else:
+            take, give_back = storage.host_load_alloc(name)
+            got = take(units)
+            if got is not None and name != "mamba":
+                reserved.append((give_back, got))
+        if got is None:
+            return name, reserved
+    return None, reserved
+
+
+def _give_back(reserved):
+    for give_back, rows in reserved:
+        give_back(rows)
 
 
 def _save(bands):
@@ -321,6 +372,80 @@ class TestMultiwindowPlacement(unittest.TestCase):
                     all(b._physical_take_scope is None for b in allocator.members)
                 )
                 self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_load_back_scope_lays_out_what_reclaim_promised(self):
+        """Reclaim says a host load fits once the chain relays its window
+        bands out; entering the load's scope must make that relayout instead
+        of refusing the reservation it was promised. (Several windows reclaim
+        for a load as for a preallocation.)"""
+        for state, demand in (
+            (False, dict(full=0, swa=8, auxiliary_swa=0, state_slots=0)),
+            (True, dict(full=0, swa=32, auxiliary_swa=32, state_slots=1)),
+        ):
+            for lazy in (False, True):
+                with self.subTest(state=state, lazy=lazy):
+                    allocator = _build(state=state, lazy=lazy, draft_dim=8)
+                    for tokens in (8, 20, 20):
+                        self.assertIsNotNone(allocator.alloc(tokens))
+                    args = (demand["full"], demand["swa"])
+                    kwargs = dict(
+                        auxiliary_swa_tokens=demand["auxiliary_swa"],
+                        state_slots=demand["state_slots"],
+                    )
+                    pages = allocator._policy._demands(
+                        allocator, *args, *kwargs.values()
+                    )
+                    # Only a relayout serves it: no layout in place does.
+                    self.assertIsNone(
+                        no_relief_plan(allocator.pricing_snapshot(), pages)
+                    )
+                    self.assertIsNone(
+                        allocator.reclaim_for_prealloc(None, *args, **kwargs)
+                    )
+                    with allocator.scoped_physical_takes(*args, **kwargs):
+                        refused, reserved = _load_back(
+                            allocator, random.Random(0), *args, *kwargs.values()
+                        )
+                    self.assertIsNone(refused)
+                    _give_back(reserved)
+                    self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_reclaimed_load_back_always_takes(self):
+        """Whenever reclaim says a host load is ready, its scope opens and
+        every take succeeds, whatever the history and take order."""
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            histories = 0
+            for seed in range(60 if device == "cpu" else 15):
+                for state, lazy in itertools.product((False, True), (False, True)):
+                    rng = random.Random(seed)
+                    allocator = _build(
+                        state=state, lazy=lazy, draft_dim=8, device=device
+                    )
+                    _random_history(allocator, rng)
+                    full, swa, aux = (4 * rng.randint(0, 8) for _ in range(3))
+                    state_slots = rng.randint(0, 2) if state else 0
+                    if not (full or swa or aux or state_slots):
+                        continue
+                    args = (full, swa)
+                    kwargs = dict(auxiliary_swa_tokens=aux, state_slots=state_slots)
+                    # Nothing is cached, so reclaim is ready exactly when the
+                    # demand fits.
+                    if not allocator.ensure_capacity(*args, **kwargs):
+                        continue
+                    self.assertIsNone(
+                        allocator.reclaim_for_prealloc(None, *args, **kwargs)
+                    )
+                    histories += 1
+                    with self.subTest(device=device, seed=seed, state=state, lazy=lazy):
+                        with allocator.scoped_physical_takes(*args, **kwargs):
+                            refused, reserved = _load_back(
+                                allocator, rng, full, swa, aux, state_slots
+                            )
+                        self.assertIsNone(refused)
+                        _give_back(reserved)
+                        self.assertEqual(allocator.verify_byte_accounting(), [])
+            self.assertGreater(histories, 20 if device == "cpu" else 5)
 
     def test_exception_closes_scope_without_undoing_submitted_work(self):
         allocator = _build(state=False, lazy=True, draft_dim=8)

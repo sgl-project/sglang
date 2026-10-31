@@ -207,6 +207,40 @@ class TestChainRealize(CustomTestCase):
         window.set_hicache_transfer_done_event("load", object())
         self.assertEqual(window.fixed_pages(), set())
 
+    def _check_answers_are_takes(self, device, seed, count):
+        # The allocator's own answers: `ensure_capacity` is exactly whether the
+        # take succeeds, and admission (no cache to evict) never says yes to a
+        # take that would fail.
+        rng = random.Random(seed)
+        outcomes = set()
+        for _ in range(count):
+            setup_allocator_context()
+            chain = rng.choice(("swa", "tri"))
+            allocator = _allocator(device, chain, lazy=rng.random() < 0.8)
+            self._history(rng, allocator)
+            tokens = rng.choice((1, 2, 4, 8, 16, 24, 32))
+            if rng.random() < 0.5 or allocator.mamba_allocator is None:
+                fits = allocator.ensure_capacity(tokens, tokens)
+                admitted = allocator.can_reserve(tokens, tokens)
+                taken = allocator.alloc(tokens)
+            else:
+                fits = allocator.ensure_capacity(0, 0, state_slots=tokens % 4 + 1)
+                admitted = fits
+                taken = allocator.alloc_state_slots(tokens % 4 + 1)
+            self.assertEqual(fits, taken is not None)
+            if admitted:
+                self.assertIsNotNone(taken)
+            outcomes.add(fits)
+            self.assertFalse(allocator.verify_byte_accounting())
+        self.assertEqual(outcomes, {False, True})
+
+    def test_capacity_answers_are_takes_on_cpu(self):
+        self._check_answers_are_takes("cpu", seed=11, count=600)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_capacity_answers_are_takes_on_cuda(self):
+        self._check_answers_are_takes("cuda", seed=12, count=80)
+
     def test_feasible_demands_realize_on_cpu(self):
         self._check("cpu", seed=7, count=800)
 
