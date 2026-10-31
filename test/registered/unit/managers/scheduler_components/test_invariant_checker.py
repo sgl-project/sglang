@@ -293,6 +293,16 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         )
         self.assertTrue(leak, messages)
 
+    def test_prefetch_private_pages_are_accounted_outside_running_batches(self):
+        checker = self._make_checker()
+        req = self._active_partial_page(checker)
+        self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
+        self.running_batch = self.last_batch
+        checker.get_prefetch_req = lambda: req
+        self.assertEqual(checker._requests_owning_rows(), [req])
+        with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
+            checker.self_check_during_busy()
+
     def test_busy_check_detects_one_unowned_page(self):
         checker = self._make_checker()
         self._active_partial_page(checker)

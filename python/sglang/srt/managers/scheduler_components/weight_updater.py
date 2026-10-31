@@ -102,6 +102,17 @@ class SchedulerWeightUpdaterManager:
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
 
+    def _has_pending_prefetch(self) -> bool:
+        # DP attention groups can finish prefetch at different times.
+        pending = torch.tensor(
+            [getattr(self.scheduler, "_pending_prefetch", None) is not None],
+            dtype=torch.int32,
+        )
+        torch.distributed.all_reduce(
+            pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+        )
+        return bool(pending.item())
+
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
@@ -137,6 +148,12 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if self._has_pending_prefetch():
+            return UpdateWeightFromDiskReqOutput(
+                success=False,
+                message="KV prefetch is in progress",
+                num_paused_requests=0,
+            )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -189,6 +206,10 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
+        if self._has_pending_prefetch():
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False, message="KV prefetch is in progress"
+            )
         if self._session is None:
             return UpdateWeightsFromDistributedReqOutput(
                 success=False,
@@ -231,6 +252,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
+        if self._has_pending_prefetch():
+            return UpdateWeightsFromTensorReqOutput(
+                success=False, message="KV prefetch is in progress"
+            )
         if self._session is None:
             return UpdateWeightsFromTensorReqOutput(
                 success=False,
@@ -264,6 +289,10 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if self._has_pending_prefetch():
+            return UpdateWeightsFromIPCReqOutput(
+                success=False, message="KV prefetch is in progress"
+            )
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -308,6 +337,10 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
+        if self._has_pending_prefetch():
+            return BeginWeightUpdateReqOutput(
+                success=False, message="KV prefetch is in progress"
+            )
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,

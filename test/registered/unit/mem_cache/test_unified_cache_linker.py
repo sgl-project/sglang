@@ -4,6 +4,7 @@ import threading
 import unittest
 from array import array
 from collections import defaultdict
+from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -223,6 +224,8 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.pending_offloads = []
         self.queued_loads = {}
         self.started_loads = []
+        self.loading_rids = {}
+        self.hold_prefetch = False
         self.load_landed = True
         self.completed_offloads = []
 
@@ -280,12 +283,21 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.queued_loads[rid] = self._clone_transfers(transfers)
         return True
 
+    def start_prefetch(self, rid):
+        self.started_loads.append([rid])
+        self.queued_loads.pop(rid)
+        self.prefetch_completion = Future()
+        if not self.hold_prefetch:
+            self.prefetch_completion.set_result(self.load_landed)
+        return self.prefetch_completion
+
     def start_layer_wise_loading(self):
         if not self.queued_loads:
             return -1
         rids = list(self.queued_loads)
         self.started_loads.append(rids)
         index = self.layer_done_counter.update_producer()
+        self.loading_rids[index] = rids
         self.layer_done_counter.complete(index, 0)
         return index
 
@@ -293,7 +305,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         return self.queued_loads.pop(rid, None) is not None
 
     def finish_layer_wise_loading(self, counter_index):
-        for rid in self.started_loads[counter_index]:
+        for rid in self.loading_rids.pop(counter_index):
             self.queued_loads.pop(rid, None)
         self.layer_done_counter.finish(counter_index)
         return self.load_landed
@@ -355,7 +367,8 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         req.finished_reason = FINISH_LENGTH(0)
         req.refresh_fill_ids()
-        return cache.linker.prefetch(req)
+        result = cache.linker.prefetch(req)
+        return cache.linker.poll_prefetch() if result is None else result
 
     def test_explicit_prefetch_publishes_only_the_stored_prefix(self):
         self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -387,6 +400,37 @@ class TestUnifiedCacheLinkerPythonBackend(
         self.assertEqual(self._prefetch(consumer, tokens, cache_salt="other"), (0, 0))
         self.assertEqual(len(reader.started_loads), 1)
         consumer.sanity_check()
+
+    def test_explicit_prefetch_stays_private_while_other_requests_insert(self):
+        tokens = list(range(1, 7))
+        cache, pool, reader = self._mamba_linker_consumer(tokens)
+        reader.hold_prefetch = True
+        before = len(pool.free_slots), pool.mamba_allocator.available_size()
+        self.assertIsNone(self._prefetch(cache, tokens))
+        pending = cache.linker.pending_prefetch
+        self.assertFalse(pending.completion.done())
+        prefetch_row = pending.req.kv.req_pool_idx
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).device_prefix_len,
+            0,
+        )
+        self.assertEqual(len(pool.free_slots), before[0] - 1)
+        # An independent inference request can insert even the same prefix.
+        self._insert(cache, cache.token_to_kv_pool_allocator, pool, tokens)
+        for _ in reader.offload_calls:
+            reader.complete_next_offload(True)
+        cache.check_hicache_events()
+        self.assertIsNone(cache.linker.poll_prefetch())
+        reader.prefetch_completion.set_result(True)
+        self.assertEqual(cache.linker.poll_prefetch(), (0, 6))
+        self.assertIn(prefetch_row, pool.free_slots)
+        # The fixture insertion still owns its own request row.
+        self.assertEqual(len(pool.free_slots), before[0] - 1)
+        self.assertEqual(pool.mamba_allocator.available_size(), before[1] - 1)
+        self.assertIsNone(cache.linker.pending_prefetch)
+        cache.sanity_check()
 
     def test_explicit_prefetch_failed_load_releases_slots_without_publication(self):
         self.cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -1852,3 +1896,38 @@ class TestTransferReadyEvents(CustomTestCase):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("failure", [None, "ready", "load"])
+def test_mooncake_explicit_prefetch_does_not_consume_inference_loads(failure):
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pending_loads = {"inference": ["normal"], "prefetch": ["explicit"]}
+    linker.layer_done_counter = LayerWiseLoadCounter(1)
+    normal = linker.layer_done_counter.update_producer()
+    linker.layer_done_counter.set_consumer(normal)
+    linker.load_queue = queue.Queue()
+    linker.stats = {"load": 0}
+    linker.record_transfer_ready = MagicMock(return_value=MagicMock())
+    if failure == "ready":
+        linker.record_transfer_ready.return_value.synchronize.side_effect = (
+            RuntimeError("ready failed")
+        )
+    completion = linker.start_prefetch("prefetch")
+    assert not completion.done()
+    assert linker.pending_loads == {"inference": ["normal"]}
+    assert linker.layer_done_counter.consumer_index == normal
+
+    def load(index, transfers):
+        if failure == "load":
+            raise RuntimeError("load failed")
+        assert transfers == [["explicit"]]
+        assert not completion.done()
+        linker.layer_done_counter.complete(index, 0)
+        assert not completion.done()  # Layer completion is not job completion.
+
+    linker.load_layer_wise = load
+    linker.load_queue.put(None)
+    linker.load_thread_func()
+    assert completion.result() is (failure is None)
+    assert linker.layer_done_counter.consumer_index == normal
+    assert normal in linker.layer_done_counter.futures

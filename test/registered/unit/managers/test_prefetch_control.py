@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -75,3 +75,72 @@ def test_prefetch_reports_all_replica_success_and_minimum_counts(success):
     assert result.success is success
     assert (result.prefetched_tokens, result.cached_tokens) == (2, 6)
     assert "second replica" in result.message
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "update_weights_from_disk",
+        "update_weights_from_distributed",
+        "update_weights_from_tensor",
+        "update_weights_from_ipc",
+        "begin_weight_update",
+    ],
+)
+@pytest.mark.parametrize("local_pending", [False, True])
+def test_prefetch_blocks_weight_mutation_before_any_runner_is_touched(
+    method, local_pending
+):
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager,
+    )
+
+    updater = SchedulerWeightUpdaterManager.__new__(SchedulerWeightUpdaterManager)
+    updater.scheduler = SimpleNamespace(
+        _pending_prefetch=object() if local_pending else None
+    )
+    updater.tp_cpu_group = object()
+
+    def peer_pending(tensor, op, group):
+        assert group is updater.tp_cpu_group
+        assert tensor.item() == local_pending
+        tensor.fill_(1)
+
+    with patch("torch.distributed.all_reduce", side_effect=peer_pending) as reduce:
+        result = getattr(updater, method)(None)
+    reduce.assert_called_once()
+    assert not result.success
+    assert "prefetch" in result.message
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_scheduler_prefetch_response_is_deferred_until_publication(failed):
+    from unittest.mock import Mock
+
+    from sglang.srt.managers.io_struct import PrefetchReqInput
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    request = PrefetchReqInput(token_ids=[1, 2], http_worker_ipc="worker-a")
+    scheduler._pending_prefetch = (request, object())
+    scheduler.tree_cache = SimpleNamespace(
+        linker=SimpleNamespace(
+            poll_prefetch=Mock(
+                side_effect=[None, RuntimeError("load failed") if failed else (2, 2)]
+            )
+        )
+    )
+    scheduler.send_control_output = Mock()
+    scheduler._poll_prefetch()
+    assert scheduler._pending_prefetch is not None
+    scheduler.send_control_output.assert_not_called()
+    scheduler._poll_prefetch()
+    result, routed_request = scheduler.send_control_output.call_args.args
+    assert result.success is (not failed)
+    assert result.cached_tokens == (0 if failed else 2)
+    if failed:
+        assert "load failed" in result.message
+    scheduler._poll_prefetch()
+    scheduler.send_control_output.assert_called_once()
+    assert routed_request is request
+    assert scheduler._pending_prefetch is None

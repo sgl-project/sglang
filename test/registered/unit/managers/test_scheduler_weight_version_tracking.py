@@ -337,6 +337,9 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         patcher = patch("torch.distributed.barrier")
         patcher.start()
         self.addCleanup(patcher.stop)
+        reduce_patcher = patch("torch.distributed.all_reduce")
+        reduce_patcher.start()
+        self.addCleanup(reduce_patcher.stop)
         self.recorded = []
 
     def _build_manager(self, target, draft):

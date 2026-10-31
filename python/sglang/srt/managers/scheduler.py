@@ -471,6 +471,7 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Allocate per instance only when a consumer first defers a response.
     _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
+    _pending_prefetch: Optional[Tuple[PrefetchReqInput, Req]] = None
 
     def __init__(
         self,
@@ -2289,6 +2290,7 @@ class Scheduler(
                 else:
                     self.send_control_output(output, recv_req)
 
+        self._poll_prefetch()
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
@@ -2580,6 +2582,9 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_prefetch_req=lambda: (
+                self._pending_prefetch[1] if self._pending_prefetch else None
+            ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -5418,6 +5423,7 @@ class Scheduler(
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
                 or self._deferred_responses
+                or self._pending_prefetch
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -5505,6 +5511,7 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
+            and self._pending_prefetch is None
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
@@ -5677,7 +5684,7 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def prefetch(self, recv_req: PrefetchReqInput) -> PrefetchReqOutput:
+    def prefetch(self, recv_req: PrefetchReqInput) -> Optional[PrefetchReqOutput]:
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
             MooncakeDirectLinker,
         )
@@ -5699,11 +5706,15 @@ class Scheduler(
                 success=False,
                 message="Prefetch does not support PP, Eagle or Mamba extra buffers",
             )
-        # ponytail: synchronous at idle; add scheduler states for concurrent prefetch.
-        idle = torch.tensor([int(self.is_fully_idle())], dtype=torch.int)
-        cache._all_reduce_attn_groups(idle, torch.distributed.ReduceOp.MIN)
-        if not idle.item():
-            return PrefetchReqOutput(success=False, message="Worker is busy")
+        if self.weight_updater.offload_tags or self.weight_updater._session is not None:
+            return PrefetchReqOutput(
+                success=False,
+                message="Memory is offloaded or weights are being updated",
+            )
+        if self._pending_prefetch is not None:
+            return PrefetchReqOutput(
+                success=False, message="Another explicit prefetch is in progress"
+            )
         req = Req(
             rid=recv_req.rid,
             origin_input_text="",
@@ -5714,12 +5725,31 @@ class Scheduler(
         req.finished_reason = FINISH_LENGTH(0)
         req.refresh_fill_ids()
         try:
-            prefetched, cached = cache.linker.prefetch(req)
+            result = cache.linker.prefetch(req)
         except (RuntimeError, ValueError) as error:
             return PrefetchReqOutput(success=False, message=str(error))
+        if result is None:
+            self._pending_prefetch = (recv_req, req)
+            return None
         return PrefetchReqOutput(
-            success=True, prefetched_tokens=prefetched, cached_tokens=cached
+            success=True, prefetched_tokens=result[0], cached_tokens=result[1]
         )
+
+    def _poll_prefetch(self) -> None:
+        if self._pending_prefetch is None:
+            return
+        try:
+            result = self.tree_cache.linker.poll_prefetch()
+            if result is None:
+                return
+            output = PrefetchReqOutput(
+                success=True, prefetched_tokens=result[0], cached_tokens=result[1]
+            )
+        except (RuntimeError, ValueError) as error:
+            output = PrefetchReqOutput(success=False, message=str(error))
+        recv_req, _ = self._pending_prefetch
+        self._pending_prefetch = None
+        self.send_control_output(output, recv_req)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

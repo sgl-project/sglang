@@ -195,6 +195,10 @@ class UnifiedCacheLinker(ABC):
         not here.
         """
 
+    def start_prefetch(self, rid: str) -> Future[bool]:
+        """Start only this queued load, without changing the forward consumer."""
+        raise NotImplementedError("Independent prefetch is not supported")
+
     @abstractmethod
     def start_layer_wise_loading(self) -> int:
         """Start queued loads and return the layer-counter consumer index."""
@@ -246,6 +250,12 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+class _PendingPrefetch(NamedTuple):
+    req: Req
+    anchor: NodeId
+    completion: Future[bool]
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -291,6 +301,7 @@ class UnifiedCacheLinkerWrapper:
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
         self._publishing_prefetch = False
+        self.pending_prefetch: Optional[_PendingPrefetch] = None
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -302,13 +313,13 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
-    def prefetch(self, req: Req) -> tuple[int, int]:
-        """Load a stored prefix into the tree at an idle scheduler boundary."""
+    def prefetch(self, req: Req) -> Optional[tuple[int, int]]:
+        """Reserve a stored prefix and start loading it alongside inference."""
         from sglang.srt.mem_cache.common import release_kv_cache
 
         cache = self.cache
-        if self.inflight_load_rids:
-            raise RuntimeError("External linker has an in-flight load")
+        if self.pending_prefetch is not None:
+            raise RuntimeError("Another explicit prefetch is in progress")
         key = RadixKey(req.origin_input_ids, cache_salt=req.cache_salt)
         match = cache.match_prefix(MatchPrefixParams(key=key))
         cached = match.device_prefix_len
@@ -348,7 +359,7 @@ class UnifiedCacheLinkerWrapper:
         req.kv.cache_protected_len = cached
         transfers = []
         row = None
-        owned = landed = False
+        owned = started = False
         try:
             try:
                 row = cache.req_to_token_pool.alloc_rows(1)
@@ -400,39 +411,64 @@ class UnifiedCacheLinkerWrapper:
                 error = exc
             if not all_ranks_succeeded(error is None):
                 raise RuntimeError("Could not prepare prefetch on all ranks") from error
-            index = self.cache_linker.start_layer_wise_loading()
-            counter = self.cache_linker.layer_done_counter
-            counter.set_consumer(index)
-            # No forward runs to wait on layers or issue MLA peer broadcasts.
-            counter.wait_until(counter.num_layers - 1)
-            device_module.current_stream().synchronize()
-            landed = all_ranks_succeeded(
-                self.cache_linker.finish_layer_wise_loading(index)
+            completion = self.cache_linker.start_prefetch(req.rid)
+            self.pending_prefetch = _PendingPrefetch(
+                req, match.last_device_node, completion
             )
-            if not landed:
-                raise RuntimeError("External linker prefetch load failed")
+            started = True
         finally:
-            self.cache_linker.cancel_queued_load(req.rid)
-            if owned:
-                self._publishing_prefetch = landed
-                try:
-                    release_kv_cache(req, cache, checkpoint=landed)
-                    if landed:
-                        cache.tree_core.mark_external_cache_stored_path(
-                            req.last_node, match.last_device_node
-                        )
-                finally:
-                    self._publishing_prefetch = False
-            else:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT, req, transfers, prefix_len
+            if not started:
+                self.cache_linker.cancel_queued_load(req.rid)
+                if owned:
+                    release_kv_cache(req, cache, checkpoint=False)
+                else:
+                    self._update_load(
+                        ExternalLinkerLoadPhase.ABORT, req, transfers, prefix_len
+                    )
+                    if row is not None:
+                        cache.req_to_token_pool.free_rows(row)
+                    cache.unlock(req.lock)
+                    req.lock = None
+        return None
+
+    def poll_prefetch(self) -> Optional[tuple[int, int]]:
+        pending = self.pending_prefetch
+        ready = torch.tensor([int(pending.completion.done())], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
+        if not ready.item():
+            return None
+        landed = torch.tensor([int(pending.completion.result())], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        result = self._finish_prefetch(bool(landed.item()))
+        if not landed.item():
+            raise RuntimeError("External linker prefetch load failed")
+        return result
+
+    def _finish_prefetch(self, landed: bool) -> tuple[int, int]:
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        pending = self.pending_prefetch
+        cache, req = self.cache, pending.req
+        key = RadixKey(req.origin_input_ids, cache_salt=req.cache_salt)
+        # Another request may have inserted the same prefix during the transfer.
+        before = cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
+        self._publishing_prefetch = landed
+        try:
+            release_kv_cache(req, cache, checkpoint=landed)
+            if landed:
+                cache.tree_core.mark_external_cache_stored_path(
+                    req.last_node, pending.anchor
                 )
-                if row is not None:
-                    cache.req_to_token_pool.free_rows(row)
-                cache.unlock(req.lock)
-                req.lock = None
-        result = cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
-        return max(0, result - cached), result
+        finally:
+            self._publishing_prefetch = False
+            self.pending_prefetch = None
+        cached = cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
+        return max(0, cached - before), cached
+
+    def _discard_prefetch(self) -> None:
+        # Called only after reset/close has quiesced the transfer thread.
+        if self.pending_prefetch is not None:
+            self._finish_prefetch(False)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -739,6 +775,7 @@ class UnifiedCacheLinkerWrapper:
 
     def reset(self) -> None:
         self.cache_linker.reset()
+        self._discard_prefetch()
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -763,6 +800,7 @@ class UnifiedCacheLinkerWrapper:
 
     def close(self) -> None:
         self.cache_linker.close()
+        self._discard_prefetch()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()

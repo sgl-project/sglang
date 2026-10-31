@@ -332,8 +332,9 @@ class TokenizerControlMixin:
     ) -> PrefetchReqOutput:
         """Warm the available page-aligned prefix in L1, without inference.
 
-        Requires an idle Mooncake external-linker engine. Missing KV is not
-        computed; returned counts are minima across the engine's DP replicas.
+        Requires the Mooncake external linker. Loading overlaps inference;
+        the response follows publication. Missing KV is not computed, and
+        returned counts are minima across the engine's DP replicas.
         """
         if not isinstance(token_ids, list) or not token_ids:
             raise ValueError("token_ids must be a nonempty list")

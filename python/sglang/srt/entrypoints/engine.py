@@ -1523,8 +1523,9 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Restore the available page-aligned Mooncake prefix into L1.
 
-        Requires an idle external-linker engine; incoming requests wait for the
-        synchronous load. PP, Eagle and Mamba extra buffers are unsupported.
+        Loads in the background while inference continues and returns after
+        scheduler-side publication. One explicit prefetch may be in flight.
+        PP, Eagle and Mamba extra buffers are unsupported.
         Missing KV is not computed. Counts are minima across DP replicas;
         restored pages remain evictable. Use the generation cache_salt.
 
