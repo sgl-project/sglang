@@ -867,7 +867,7 @@ def prewarm_mhc_pre(
         max_num_tokens, hc_mult * hidden_size
     )
 
-    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    logger.info("MHC prenorm prewarm: %d n_splits buckets", len(buckets))
     with torch.inference_mode():
         for num_tokens in buckets:
             mhc_pre(
