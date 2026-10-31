@@ -8,9 +8,14 @@ namespace sglang {
 
 namespace device {
 
-// Batcher odd-even merge sort over L keys, padded to a power of two; compare-
-// exchanges touching the padding are no-ops and dropped. Built at compile time:
-// nvcc does not fully unroll the nested loop form for 16 inputs (stack + loop).
+/**
+ * \brief Batcher odd-even merge sorting network over L keys, built at compile time.
+ *
+ * The network is padded to a power of two; compare-exchanges that touch the
+ * padding are dropped. A constexpr pair table is used because nvcc does not
+ * fully unroll the nested loop form for 16 inputs (stack frame + local loop).
+ * \tparam L Number of keys, at least 1.
+ */
 template <uint32_t L>
 struct MergeSortNetwork {
  private:
@@ -53,7 +58,15 @@ struct MergeSortNetwork {
   }
 };
 
-// Sorts a[0, N) in descending order.
+/**
+ * \brief Sorts a[0, N) in descending order with a fully unrolled merge network.
+ *
+ * Keep `a` in registers (compile-time indices only). When only a prefix of the
+ * result is read, ptxas drops the compare-exchanges that cannot reach it.
+ * \tparam N Number of elements.
+ * \tparam T Element type with `math::max` / `math::min`.
+ * \param a Elements, sorted in place.
+ */
 template <uint32_t N, typename T>
 SGL_DEVICE void merge_sort(T* a) {
   constexpr MergeSortNetwork<N> kNet{};
@@ -66,6 +79,7 @@ SGL_DEVICE void merge_sort(T* a) {
   }
 }
 
+/// \brief Array overload of `merge_sort`; N is deduced.
 template <uint32_t N, typename T>
 SGL_DEVICE void merge_sort(T (&a)[N]) {
   return merge_sort<N>(static_cast<T*>(a));

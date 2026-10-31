@@ -48,7 +48,7 @@ def _jit_route_warp_module(
     topk: int,
     num_groups: int,
     topk_groups: int,
-    scoring: Scoring,
+    scoring_func: str,
     dtype: torch.dtype,
     bias_dtype: torch.dtype,
     muse_spark: bool,
@@ -59,7 +59,7 @@ def _jit_route_warp_module(
         topk,
         num_groups,
         topk_groups,
-        scoring.cpp_name,
+        Scoring(scoring_func).cpp_name,
         dtype,
         bias_dtype,
         is_arch_support_pdl(),
@@ -143,8 +143,7 @@ def moe_route_warp(
     rank with ``bias_alt`` instead of ``bias``. Caller must have checked
     :func:`covered`."""
     num_tokens, num_experts = scores.shape
-    scoring = Scoring(scoring_func)
-    softmax = scoring is Scoring.SOFTMAX
+    softmax = scoring_func == Scoring.SOFTMAX
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
     grouped = num_expert_group > 1
@@ -153,7 +152,7 @@ def moe_route_warp(
         topk - num_fused_shared_experts,
         num_expert_group if grouped else 1,
         topk_group if grouped else 1,
-        scoring,
+        scoring_func,
         scores.dtype,
         torch.float32 if softmax else bias.dtype,
         muse_spark=False,
@@ -219,7 +218,7 @@ def muse_spark_route_warp(
         topk,
         1,
         1,
-        Scoring.SIGMOID,
+        Scoring.SIGMOID.value,
         scores.dtype,
         bias.dtype,
         muse_spark=True,
