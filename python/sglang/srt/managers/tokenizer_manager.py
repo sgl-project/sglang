@@ -2436,8 +2436,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for rid in rids:
                 if rid in self.rid_to_state:
                     self.abort_request(rid)
-                else:
-                    self.abort_request(rid, force=True)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)

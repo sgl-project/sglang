@@ -1452,6 +1452,49 @@ class TestPriorityRange(CustomTestCase):
 class TestChatDisconnectAbort(CustomTestCase):
     """Regression tests for Issue #46517: Disconnected chat requests must abort on scheduler."""
 
+    def test_completed_stream_cleanup_preserves_prefix_related_request(self):
+        """Finishing job must not abort job-1 when delayed response cleanup runs."""
+
+        async def drive():
+            tm = _make_tokenizer_manager(self)
+            tm.server_args.tokenizer_worker_num = 1
+            tm._dispatch_to_scheduler = Mock()
+            short = _make_req_state("job")
+            long = _make_req_state("job-1")
+            for state in (short, long):
+                state.obj.stream = True
+                state.obj.is_single = True
+                state.dispatched = True
+                tm.rid_to_state[state.obj.rid] = state
+            cleanup = tm.create_abort_task(short.obj)
+
+            await tm._handle_batch_output(_make_batch_str_output("job"))
+            self.assertNotIn("job", tm.rid_to_state)
+            self.assertIs(tm.rid_to_state["job-1"], long)
+
+            # Run the response's delayed background task after normal completion.
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                await cleanup()
+            self.assertEqual(tm._dispatch_to_scheduler.call_args_list, [])
+
+            await tm._handle_batch_output(
+                _make_batch_str_output("job-1", finished_reason=_NOT_FINISHED)
+            )
+            self.assertFalse(long.finished)
+            self.assertFalse(long.abort_sent)
+            self.assertIsNone(long.out_list[-1]["meta_info"]["finish_reason"])
+
+            # Cleanup must still abort a request that has not finished.
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                await tm.create_abort_task(long.obj)()
+            sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+            self.assertEqual(len(sent), 1)
+            self.assertIsInstance(sent[0], AbortReq)
+            self.assertEqual(sent[0].rid, "job-1")
+            self.assertTrue(long.abort_sent)
+
+        asyncio.run(drive())
+
     def test_batch_output_aborts_orphan_ongoing_request(self):
         """When an unfinished output arrives for an rid deleted from rid_to_state,
         TokenizerManager must force-dispatch an AbortReq to stop the scheduler."""
