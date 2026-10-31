@@ -1584,6 +1584,27 @@ class HiSparseCoordinator:
             skip_io=self.skip_io,
         )
 
+    def swap_in_selected_dsa_pages(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        global_layer_id: int,
+    ) -> torch.Tensor:
+        """Convert DSA global layer IDs to PP-local HiSparse buffer indices.
+
+        DSv4 callers already use compressed pool indices and retain the
+        original swap_in_selected_pages entry point.
+        """
+        if self.is_dsv4_hisparse or self.is_m3_hisparse:
+            raise ValueError("Global DSA layer conversion requires a DSA pool")
+        local_layer_id = global_layer_id - self.mem_pool_device.start_layer
+        if not 0 <= local_layer_id < self.mem_pool_device.layer_num:
+            raise ValueError(f"DSA layer {global_layer_id} outside this PP stage")
+        return self.swap_in_selected_pages(
+            req_pool_indices, compressed_seq_lens, top_k_result, local_layer_id
+        )
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,

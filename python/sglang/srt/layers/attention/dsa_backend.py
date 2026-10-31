@@ -2359,7 +2359,7 @@ class DeepseekSparseAttnBackend(
                 assert topk_indices is not None
                 grouped_topk_indices = topk_indices.view(num_reqs, num_steps, -1)
                 assert metadata.dsa_seqlens_expanded is not None
-                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+                page_table_1 = self.hisparse_coordinator.swap_in_selected_dsa_pages(
                     forward_batch.req_pool_indices,
                     metadata.dsa_seqlens_expanded,
                     grouped_topk_indices,
@@ -2672,7 +2672,7 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
-            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
+            page_table_1 = self.hisparse_coordinator.swap_in_selected_dsa_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 topk_indices,
