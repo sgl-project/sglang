@@ -3,8 +3,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -41,9 +42,14 @@ def _route_auth_level(app, path):
     return getattr(route.endpoint, "_auth_level", AuthLevel.NORMAL)
 
 
+@pytest.mark.parametrize("transport", ["http", "websocket"])
 @pytest.mark.parametrize(
     "level,api_key,admin_api_key,statuses",
     [
+        (AuthLevel.NORMAL, None, None, [200, 200, 200, 200]),
+        (AuthLevel.NORMAL, "user-secret", None, [401, 401, 200, 401]),
+        (AuthLevel.NORMAL, None, "admin-secret", [200, 200, 200, 200]),
+        (AuthLevel.NORMAL, "user-secret", "admin-secret", [401, 401, 200, 401]),
         (AuthLevel.ADMIN_OPTIONAL, None, None, [200, 200, 200, 200]),
         (AuthLevel.ADMIN_OPTIONAL, "user-secret", None, [401, 401, 200, 401]),
         (AuthLevel.ADMIN_OPTIONAL, None, "admin-secret", [401, 401, 401, 200]),
@@ -60,14 +66,23 @@ def _route_auth_level(app, path):
     ],
 )
 def test_nested_routes_preserve_management_auth_level(
-    level, api_key, admin_api_key, statuses
+    level, api_key, admin_api_key, statuses, transport
 ):
     router = APIRouter()
 
-    @router.post("/management")
     @auth_level(level)
     async def management():
         return {"success": True}
+
+    @auth_level(level)
+    async def management_ws(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_json({"success": True})
+
+    if transport == "http":
+        router.add_api_route("/management", management, methods=["POST"])
+    else:
+        router.add_api_websocket_route("/management", management_ws)
 
     outer = APIRouter()
     outer.include_router(router, prefix="/v1")
@@ -82,7 +97,41 @@ def test_nested_routes_preserve_management_auth_level(
         (None, "wrong-secret", "user-secret", "admin-secret"), statuses
     ):
         headers = {} if token is None else {"Authorization": f"Bearer {token}"}
-        assert client.post("/api/v1/management", headers=headers).status_code == status
+        if transport == "http":
+            assert (
+                client.post("/api/v1/management", headers=headers).status_code == status
+            )
+        elif status == 200:
+            with client.websocket_connect("/api/v1/management", headers=headers) as ws:
+                assert ws.receive_json() == {"success": True}
+        else:
+            with pytest.raises(WebSocketDisconnect) as exc:
+                with client.websocket_connect("/api/v1/management", headers=headers):
+                    pass
+            assert exc.value.code == 1008
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/realtime_video/generate", "/v1/actions/realtime", "/openpi/policy"],
+)
+@pytest.mark.parametrize("token", [None, "wrong-secret", "admin-secret"])
+def test_diffusion_websockets_reject_unauthorized_handshakes(monkeypatch, path, token):
+    server_args = _server_args(api_key="user-secret", admin_api_key="admin-secret")
+    server_args.pipeline_config.supports_action_endpoint = lambda: True
+    server_args.pipeline_config.supports_openpi_endpoint = lambda: True
+    forward = AsyncMock()
+    monkeypatch.setattr(async_scheduler_client, "forward", forward)
+    app = create_app(server_args)
+    assert _route_auth_level(app, path) == AuthLevel.NORMAL
+    client = TestClient(app)
+
+    headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(path, headers=headers):
+            pass
+    assert exc.value.code == 1008
+    forward.assert_not_awaited()
 
 
 def test_cli_parser_accepts_api_keys_without_exposing_them_in_repr():
