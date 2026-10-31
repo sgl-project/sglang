@@ -63,6 +63,30 @@ _SPECIALS = [
     "<sop>",
     "/nothink",
 ]
+# Text that NFC rewrites: combining marks after ASCII and non-ASCII letters,
+# Hangul jamo that compose into syllables, singletons (Angstrom and Kelvin
+# signs, Greek question mark), and non-ASCII digits.
+_NFC_ATOMS = [
+    "e\u0301",
+    "A\u030a",
+    "a\u0308\u0301",
+    "\u00e9",
+    "\u0301",
+    "\u0327\u0301",
+    "\u1100",
+    "\u1161",
+    "\u11a8",
+    "\u1100\u1161\u11a8",
+    "\u212b",
+    "\u212a",
+    "\u037e",
+    "\u0663\u0664",
+    "\uff11",
+]
+_NFC_CORPUS = [
+    "cafe\u0301 na\u0308ive \u212bngstro\u0308m \u1100\u1161\u11a8 x\u0327\u0301",
+    "line one\nTwo e\u0301 a\u0308 o\u0302 \u0663\u0664 12 345\n",
+]
 
 
 @lru_cache(maxsize=1)
@@ -99,8 +123,38 @@ def _safe_backend_json():
     return backend.to_str()
 
 
-def _tokenizer(mutate=None, **kwargs):
-    backend = Tokenizer.from_str(_safe_backend_json())
+@lru_cache(maxsize=1)
+def _qwen35_backend_json():
+    """A Qwen3.5 shaped backend: NFC normalizer, then the Qwen3.5 Split regex
+    (letter runs take combining marks, single digits) + ByteLevel + BPE."""
+    backend = Tokenizer(models.BPE())
+    backend.normalizer = normalizers.NFC()
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(
+                Regex(ppe._QWEN35_SPLIT_REGEX), behavior="isolated", invert=False
+            ),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ]
+    )
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        (_TRAIN_CORPUS + _NFC_CORPUS) * 20,
+        trainers.BpeTrainer(
+            vocab_size=900,
+            show_progress=False,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            special_tokens=[],
+        ),
+    )
+    backend.add_tokens(
+        [AddedToken(t, normalized=False, special=True) for t in _SPECIALS]
+    )
+    return backend.to_str()
+
+
+def _tokenizer(mutate=None, backend_json=_safe_backend_json, **kwargs):
+    backend = Tokenizer.from_str(backend_json())
     if mutate is not None:
         mutate(backend)
     return PreTrainedTokenizerFast(tokenizer_object=backend, **kwargs)
@@ -324,6 +378,158 @@ class TestSafePipelineIdsAreIdentical(_EncodeCase):
             ppe.parallel_prompt_encode(self.tokenizer, text, {})
         self.assertEqual(ppe._parallel_pid, 101)
         self.assertTrue(ppe._parallel_ok)
+
+
+def _nfc_fuzz_texts():
+    """Random texts over the cut-point atoms and text NFC rewrites, with the
+    rewrites placed on both sides of "letter|space letter" and "\\n|letter"."""
+    rng = random.Random(2)
+    atoms = list("aZ x b\n\r\t.,'1 ") + _NFC_ATOMS + _SPECIALS
+    atoms += [" " + a for a in _NFC_ATOMS] + ["\n" + a for a in _NFC_ATOMS]
+    atoms += ["x " + a for a in _NFC_ATOMS] + [a + " x" for a in _NFC_ATOMS]
+    texts = [
+        "".join(rng.choice(atoms) for _ in range(rng.randint(0, 300)))
+        for _ in range(3000)
+    ]
+    texts += [
+        "".join(rng.choice(atoms) for _ in range(rng.randint(5000, 30000)))
+        for _ in range(20)
+    ]
+    return texts
+
+
+class TestQwen35PipelineIdsAreIdentical(_EncodeCase):
+    def setUp(self):
+        super().setUp()
+        self._no_min_chars()
+        self.tokenizer = _tokenizer(backend_json=_qwen35_backend_json)
+
+    def test_the_plan_takes_intra_gap_cuts(self):
+        plan = ppe._plan_for(self.tokenizer)
+        self.assertIsNotNone(plan)
+        self.assertIsNotNone(plan[2], "added tokens must be matched")
+        self.assertIs(plan[4], ppe._INTRA_CUT, "intra-gap cuts must be enabled")
+        self.assertEqual(
+            _chunk_ids(self.tokenizer, "abcd e\u0301fgh\nijk", all_cuts=True)[1],
+            ["abcd", " e\u0301fgh\n", "ijk"],
+        )
+
+    def test_edge_cases_encode_the_same_at_every_cut_point(self):
+        texts = list(_EDGE_TEXTS) + ["".join(_NFC_ATOMS), " ".join(_NFC_ATOMS)]
+        texts += ["x " + a + " y\n" + a for a in _NFC_ATOMS]
+        for text in list(texts):
+            texts += ["<think>" + text, text + "</think>"]
+        for text in texts:
+            reference = self.tokenizer.encode(text)
+            self.assertEqual(
+                _chunk_ids(self.tokenizer, text, all_cuts=True)[0],
+                reference,
+                repr(text[:80]),
+            )
+            self._assert_matches_encode(self.tokenizer, text)
+
+    def test_fuzzed_texts_encode_the_same_at_every_cut_point(self):
+        for text in _nfc_fuzz_texts():
+            reference = self.tokenizer.encode(text)
+            self.assertEqual(
+                _chunk_ids(self.tokenizer, text, all_cuts=True)[0],
+                reference,
+                repr(text[:80]),
+            )
+            self.assertEqual(
+                ppe.parallel_prompt_encode(self.tokenizer, text, {}), reference
+            )
+
+    def test_a_normalized_added_token_turns_the_intra_gap_cuts_off(self):
+        """Under a normalizer, tokens matched on normalized text are not cut
+        points, so an intra-gap cut could split one ("foo bar" below)."""
+        tokenizer = _tokenizer(
+            lambda b: b.add_tokens([AddedToken("foo bar", normalized=True)]),
+            backend_json=_qwen35_backend_json,
+        )
+        plan = ppe._plan_for(tokenizer)
+        self.assertIsNotNone(plan, "the raw added tokens are still cut points")
+        self.assertIsNone(plan[4])
+        text = "<think>" + "x foo bar y\nfoo bar\n" * 500
+        self.assertEqual(
+            _chunk_ids(tokenizer, text, all_cuts=True)[0], tokenizer.encode(text)
+        )
+        self._assert_matches_encode(tokenizer, text)
+
+
+class TestThreadPoolWhenRayonIsOff(_EncodeCase):
+    """SGLang turns tokenizers' pool off for multimodal models
+    (TOKENIZERS_PARALLELISM=false); the pieces then go through a thread pool,
+    one `encode_batch` call each, with the same ids."""
+
+    def setUp(self):
+        super().setUp()
+        self._no_min_chars()
+        env = unittest.mock.patch.dict(ppe.os.environ, TOKENIZERS_PARALLELISM="false")
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(setattr, ppe, "_encode_pool", ppe._encode_pool)
+        self.addCleanup(setattr, ppe, "_encode_pool_pid", ppe._encode_pool_pid)
+        self.addCleanup(setattr, ppe, "_parallel_pid", ppe._parallel_pid)
+        self.text = (
+            "<|user|>\n" + "the quick brown fox jumps over the lazy dog\n" * 2000
+        )
+
+    def _count_backend_calls(self, tokenizer):
+        backend = tokenizer._tokenizer
+        calls = []
+
+        class _Spy:
+            def __getattr__(self, name):
+                return getattr(backend, name)
+
+            def encode_batch(self, inputs, **kwargs):
+                calls.append(len(inputs))
+                return backend.encode_batch(inputs, **kwargs)
+
+        plan = ppe._plan_for(tokenizer)
+        ppe._plans[tokenizer] = (_Spy(),) + plan[1:]
+        return calls
+
+    def test_the_pieces_are_encoded_one_per_call_with_identical_ids(self):
+        for backend_json in (_safe_backend_json, _qwen35_backend_json):
+            with self.subTest(backend_json.__name__):
+                ppe._encode_pool = None
+                tokenizer = _tokenizer(backend_json=backend_json)
+                calls = self._count_backend_calls(tokenizer)
+                self.assertEqual(
+                    ppe.parallel_prompt_encode(tokenizer, self.text, {}),
+                    tokenizer.encode(self.text),
+                )
+                self.assertIsNotNone(ppe._encode_pool)
+                self.assertGreater(len(calls), 1)
+                self.assertEqual(set(calls), {1})
+
+    def test_tokenizers_pool_is_used_when_it_is_on(self):
+        ppe._encode_pool = None
+        tokenizer = _tokenizer()
+        calls = self._count_backend_calls(tokenizer)
+        with unittest.mock.patch.dict(ppe.os.environ, TOKENIZERS_PARALLELISM="true"):
+            self.assertEqual(
+                ppe.parallel_prompt_encode(tokenizer, self.text, {}),
+                tokenizer.encode(self.text),
+            )
+        self.assertIsNone(ppe._encode_pool)
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(calls[0], 1)
+
+    def test_a_forked_process_gets_its_own_pool(self):
+        tokenizer = _tokenizer()
+        ppe.parallel_prompt_encode(tokenizer, self.text, {})
+        parent_pool = ppe._encode_pool
+        with unittest.mock.patch.object(
+            ppe.os, "getpid", return_value=ppe._encode_pool_pid + 1
+        ):
+            self.assertEqual(
+                ppe.parallel_prompt_encode(tokenizer, self.text, {}),
+                tokenizer.encode(self.text),
+            )
+        self.assertIsNot(ppe._encode_pool, parent_pool)
 
 
 def _metaspace(backend):
