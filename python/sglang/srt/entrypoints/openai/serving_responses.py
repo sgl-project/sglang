@@ -349,6 +349,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         if model_error is not None:
             return model_error
 
+        lora_path = (
+            self._resolve_lora_path(request.model, None) if request.model else None
+        )
+
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
@@ -587,6 +591,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             if processed_messages
                             else None
                         ),
+                        lora_path=lora_path,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
@@ -3115,6 +3120,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                lora_path=adapted_request.lora_path,
             )
 
             # Update sampling params with reduced max_tokens

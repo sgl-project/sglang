@@ -1940,6 +1940,15 @@ class EnginePassthroughTestCase(CustomTestCase):
         self.assertEqual(adapted_request.routed_dp_rank, 2)
         self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 
+    def test_lora_adapter_from_model_parameter_forwarded_to_engine(self):
+        serving = make_serving()
+        captured = self._capture(
+            serving,
+            ResponsesRequest(model="x:adapter1", input="hi", store=False),
+        )
+
+        self.assertEqual(captured["adapted_request"].lora_path, "adapter1")
+
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
@@ -2487,7 +2496,9 @@ def test_standalone_builtin_tools_without_storage(response_serving):
         name="browser", description="Browser", tools=[]
     )
     serving.supports_browsing = True
-    request = ResponsesRequest(model="x", input="hi", tools=[{"type": "web_search"}])
+    request = ResponsesRequest(
+        model="x:adapter1", input="hi", tools=[{"type": "web_search"}]
+    )
     response = asyncio.run(create_response_result(serving, request))
     assert isinstance(response, ResponsesResponse), response.body
     tool_session.call_tool.assert_awaited_once_with("search", {"query": "answer"})
@@ -2496,6 +2507,7 @@ def test_standalone_builtin_tools_without_storage(response_serving):
     assert serving.tokenizer_manager.generate_request.call_count == 2
     continuation = serving.tokenizer_manager.generate_request.call_args_list[1].args[0]
     assert "Search result: 42" in get_encoding().decode(continuation.input_ids)
+    assert continuation.lora_path == "adapter1"
     assert not serving.msg_store and not serving.response_store
 
 
