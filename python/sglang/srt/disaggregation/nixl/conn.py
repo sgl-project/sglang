@@ -371,6 +371,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_aux_item_lens: Optional[List[int]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -421,6 +422,11 @@ class KVArgsRegisterInfo:
             dst_kv_ptrs=dst_kv_ptrs,
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
+            dst_aux_item_lens=(
+                list(struct.unpack(f"{len(msg[24]) // 8}Q", msg[24]))
+                if len(msg) > 24
+                else None
+            ),
             dst_state_data_ptrs=dst_state_data_ptrs,
             gpu_id=int(msg[8].decode("ascii")),
             decode_tp_size=int(msg[9].decode("ascii")),
@@ -1604,6 +1610,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
+        # The early-send wait is this thread's first device call; with no device
+        # bound it opens a context on device 0 on every rank not on GPU 0.
+        device_bound = False
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -1630,6 +1639,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
+
+                # Same wait as mooncake's worker: before reading source KV, skipped
+                # for a failed room, cleared so a deferred re-enqueue does not wait.
+                if kv_chunk.wait_event is not None:
+                    if self.check_status(room) != KVPoll.Failed:
+                        if not device_bound:
+                            torch.get_device_module(get_device().device).set_device(
+                                self.kv_args.gpu_id
+                            )
+                            device_bound = True
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
 
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
@@ -1680,6 +1701,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
+                    self.validate_aux_buffers(
+                        dst_info.dst_aux_ptrs, dst_info.dst_aux_item_lens
+                    )
                     decode_tp_size = dst_info.decode_tp_size
 
                     # Skip KV RDMA transfer when there are no pages to send
@@ -1868,6 +1892,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
                             dst_info.dst_aux_ptrs,
+                            dst_info.dst_aux_item_lens,
                             req.dst_aux_index,
                         )
                         handles.append(aux_xfer_handle)
@@ -2708,19 +2733,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_name: str,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
+        dst_aux_item_lens: Optional[List[int]],
         dst_aux_index: int,
     ):
+        self.validate_aux_buffers(dst_aux_ptrs, dst_aux_item_lens)
         src_addrs = []
         dst_addrs = []
 
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        if dst_aux_item_lens is None:
+            dst_aux_item_lens = prefill_aux_item_lens
 
         # Stop at the shorter list; see check_peer_aux_buffer_count.
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_aux_item_lens[i] * dst_aux_index
             src_addrs.append((src_addr, length, 0))
             dst_addrs.append((dst_addr, length, 0))
 
@@ -3301,6 +3330,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
@@ -3464,7 +3494,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_item_len = 0
             dst_num_slots = 0
 
-        return [
+        message = [
             GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3491,6 +3521,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
         ]
+        if self.customized_info_enabled:
+            message.append(
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+            )
+        return message
 
     def build_receiver_metadata_message(
         self,

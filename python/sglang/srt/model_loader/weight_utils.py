@@ -1396,23 +1396,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
 
 
 def _load_pt_file(bin_file: str) -> dict:
-    """Load a PyTorch checkpoint file, handling legacy tar format.
-
-    PyTorch 2.6 changed the default of weights_only from False to True.
-    Legacy tar format files cannot be loaded with weights_only=True.
-    This function tries weights_only=True first, then falls back to False
-    for legacy tar format files from trusted sources (HuggingFace Hub).
-    """
-    try:
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-    except RuntimeError as e:
-        if "legacy .tar format" in str(e):
-            logger.warning(
-                "Loading %s with weights_only=False (legacy tar format)",
-                os.path.basename(bin_file),
-            )
-            return torch.load(bin_file, map_location="cpu", weights_only=False)
-        raise
+    """Load a PyTorch checkpoint file with weights_only=True (no pickle execution)."""
+    return torch.load(bin_file, map_location="cpu", weights_only=True)
 
 
 def pt_weights_iterator(
@@ -1771,6 +1756,11 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for name, param in model.state_dict().items():
+        # UE8M0 MXFP8 block scales (uint8): 127 is 2**0. Left at zero, every
+        # MXFP8 weight scales to 2**-127.
+        if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
+            param.fill_(127)
+            continue
         if torch.is_floating_point(param):
             # Neutral FP4 global scales keep fused gate/up projections compatible.
             if name.endswith(("weight_scale_inv", "weight_scale_2")):

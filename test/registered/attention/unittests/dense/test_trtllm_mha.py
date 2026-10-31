@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -140,6 +141,32 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    # fmha_v2 prefill (SM90/SM120); prefixes cross pages to hit the [B, 2, M] offsets.
+    # head_dim/page_size match flashinfer's fmha_v2 paged tests.
+    FMHA_V2_HEAD_DIM = 128
+    FMHA_V2_EXTEND_CASES = (
+        DenseAttentionCase(
+            name="trtllm_mha_fmha_v2_extend_page_boundary",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=32,
+            prefix_lens=(0, 31, 33, 64),
+            extend_lens=(40, 2, 30, 17),
+        ),
+        DenseAttentionCase(
+            name="trtllm_mha_fmha_v2_gqa_extend_page_boundary",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=2,
+            page_size=32,
+            prefix_lens=(30, 70),
+            extend_lens=(5, 30),
+        ),
+    )
+
     # EAGLE draft CG runner — chain only (topk=1). trtllm_mha is constrained
     # to topk=1 via `trtllm_mha_backend.py:459,492` so tree-mode tests don't
     # apply. This test exercises the draft-decode CG capture/replay path
@@ -216,6 +243,76 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                         head_dim=self.HEAD_DIM,
                         hidden_size=self.HIDDEN_SIZE,
                     )
+
+    @unittest.skipUnless(
+        is_sm90_supported() or is_sm120_supported(),
+        "fmha_v2 prefill runs only on SM90/SM120",
+    )
+    def test_fmha_v2_extend_cases(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnBackend,
+        )
+
+        # Records whether each prefill passed K/V without copying the pool.
+        build_inputs = TRTLLMHAAttnBackend._fmha_v2_paged_inputs
+        no_copy = []
+
+        def spy(backend, **kwargs):
+            qkv, block_tables = build_inputs(backend, **kwargs)
+            no_copy.append(isinstance(qkv[1], tuple))
+            return qkv, block_tables
+
+        for hnd in (False, True):
+            for case in self.FMHA_V2_EXTEND_CASES:
+                no_copy.clear()
+                with (
+                    self.subTest(case=case.name, hnd=hnd),
+                    envs.SGLANG_USE_HND_KVCACHE.override(hnd),
+                    mock.patch.object(
+                        TRTLLMHAAttnBackend, "_fmha_v2_paged_inputs", spy
+                    ),
+                    # The HND pool writes K/V by index assignment, which autograd rejects.
+                    torch.no_grad(),
+                ):
+                    run_dense_attention_case(
+                        self,
+                        case,
+                        head_dim=self.FMHA_V2_HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                        max_context_len=128,
+                    )
+                    self.assertEqual(no_copy, [True], "fell back to the KV copy")
+
+    @unittest.skipUnless(
+        is_sm90_supported() or is_sm120_supported(),
+        "fmha_v2 prefill runs only on SM90/SM120",
+    )
+    def test_xqa_decode_after_fmha_v2_prefill(self):
+        # Both kernels share one workspace; XQA decode needs its semaphore
+        # region still zeroed after an fmha_v2 prefill.
+        run_dense_attention_case(
+            self,
+            self.FMHA_V2_EXTEND_CASES[0],
+            head_dim=self.FMHA_V2_HEAD_DIM,
+            hidden_size=self.HIDDEN_SIZE,
+            max_context_len=128,
+        )
+        decode_case = DenseAttentionCase(
+            name="trtllm_mha_xqa_decode_after_fmha_v2",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=32,
+            prefix_lens=(31, 64, 300),
+        )
+        run_dense_attention_case(
+            self,
+            decode_case,
+            head_dim=self.FMHA_V2_HEAD_DIM,
+            hidden_size=self.HIDDEN_SIZE,
+            max_context_len=512,
+        )
 
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:

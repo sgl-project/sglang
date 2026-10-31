@@ -14,7 +14,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.2 | Ascend A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-2-w4a8-3p1d-32p-in16k-out1k-50ms) |
+| GLM-5.2 | A3 Series Products | 32 | PD Disaggregation | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-2-w4a8-3p1d-32p-in16k-out1k-50ms) |
 
 ## Optimal Configuration
 
@@ -24,7 +24,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 **Model**: GLM-5.2
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 32
 

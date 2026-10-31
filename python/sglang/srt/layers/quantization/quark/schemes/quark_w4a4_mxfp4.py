@@ -14,6 +14,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import LinearMethodBase
 from sglang.srt.layers.quantization.dequantization import (
     copy_missing_attrs,
     dequantize_fp8,
@@ -367,7 +368,7 @@ if _is_hip:
         )
 
 
-__all__ = ["QuarkW4A4MXFP4"]
+__all__ = ["QuarkW4A4MXFP4", "AiterMxfp4OnlineLinearMethod"]
 logger = logging.getLogger(__name__)
 
 OCP_MX_BLOCK_SIZE = 32
@@ -968,3 +969,86 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return y.view(*output_shape)
         else:
             return y
+
+
+class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
+    """MXFP4 GEMM for a loaded BF16 linear that ``quantize_`` converts once.
+
+    A model sets this method on a BF16 linear after ``create_weights``. The
+    loader then calls ``process_weights_after_loading``, which runs ``quantize_``.
+    ``quantize_`` stores the weight and its E8M0 scales preshuffled. Batches of
+    at most ``PRESHUFFLE_MAX_M`` rows run the Triton preshuffled GEMM if AITER
+    has a tuned config for (N, K). All other batches run the ASM ``gemm_a4w4``.
+    """
+
+    PRESHUFFLE_MAX_M = 64
+
+    @classmethod
+    def quantize_(cls, layer: torch.nn.Module) -> None:
+        from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+        from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+            _get_config,
+        )
+
+        w = layer.weight.data
+        n, k = w.shape
+        # gemm_a4w4 and the preshuffled scales read whole 256x256 tiles.
+        assert w.dtype == torch.bfloat16 and n % 256 == 0 and k % 256 == 0, (
+            f"online MXFP4 needs a BF16 weight with N, K % 256 == 0, got {w.dtype} {n}x{k}"
+        )
+        w_q, w_s = _dynamic_mxfp4_quant_orig(w)
+        layer.weight = torch.nn.Parameter(
+            shuffle_weight(w_q.view(torch.uint8), layout=(16, 16)),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            shuffle_scale(w_s.view(torch.uint8)), requires_grad=False
+        )
+        layer.mxfp4_preshuffle_tuned = _get_config(
+            cls.PRESHUFFLE_MAX_M, n, k // 2, True
+        )[1]
+        layer.quant_method = cls()
+
+    def create_weights(self, *args, **kwargs):
+        raise NotImplementedError("use quantize_() on a loaded BF16 linear")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if layer.weight.dtype == torch.bfloat16:
+            self.quantize_(layer)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
+        m, n = x.shape[0], layer.weight.shape[0]
+        w_s = layer.weight_scale
+        if m <= self.PRESHUFFLE_MAX_M and layer.mxfp4_preshuffle_tuned:
+            # Below 32 rows the kernel takes un-shuffled activation scales.
+            x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=m >= 32)
+            x_s = x_s.view(torch.uint8)
+            x_s = x_s.view(x_s.shape[0] // 32, -1) if m >= 32 else x_s[:m]
+            y = torch.empty(m, n, dtype=x.dtype, device=x.device)
+            gemm_afp4wfp4_preshuffle(
+                x_q.view(torch.uint8),
+                layer.weight.view(n // 16, -1),
+                x_s,
+                w_s.view(w_s.shape[0] // 32, -1),
+                x.dtype,
+                y,
+            )
+        else:
+            x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
+            y = gemm_a4w4(
+                x_q,
+                layer.weight.view(x_q.dtype),
+                x_s,
+                w_s.view(x_s.dtype),
+                dtype=x.dtype,
+                bpreshuffle=True,
+            )[:m]
+        return y if bias is None else y + bias
