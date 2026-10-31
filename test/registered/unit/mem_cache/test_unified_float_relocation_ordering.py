@@ -1,5 +1,7 @@
-"""A float band's relocation is ordered after the running forward on the GPU,
-and returns to the host while that forward still runs."""
+"""A float band's relocation waits, on the GPU, only for a running forward
+that writes a moved page, and returns to the host while that forward still
+runs; pages it vacates are fenced against later writes while a forward may
+still read them."""
 
 import unittest
 
@@ -24,12 +26,7 @@ _ROLES = ChainRoles(owner="full", window="swa", state="mamba")
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestFloatRelocationAgainstARunningForward(CustomTestCase):
-    def test_make_room_waits_on_the_gpu_not_the_host(self):
-        """REGRESSION: `make_room` waited for the forward before reading its
-        holes and built its page lists with pageable copies, so the scheduler
-        thread stalled until the forward ended. Every live float page is
-        rewritten by a delayed forward; the moved pages must carry those
-        bytes, and `make_room` must return before the forward does."""
+    def _float(self):
         setup_allocator_context()
         full, swa, mamba = tri_sub_pool_specs(head_num=1, head_dim=8)
         pool = arena_of(
@@ -70,10 +67,22 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
             # A running scheduler has loaded these kernels and pinned buffers.
             flt.prewarm_compaction()
             flt._to_device([0])
+            # Every specialization the write-set translation is launched with.
+            flt.ids.translate(live[:1])
+            flt.ids.translate(live[1:2])
+            flt.ids.translate(live)
             torch.empty(1, device="cuda")
             torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
         torch.cuda.synchronize()
+        return pool, flt, live, epp, ask, schedule, forward
 
+    def test_make_room_waits_on_the_gpu_not_the_host(self):
+        """REGRESSION: `make_room` waited for the forward before reading its
+        holes and built its page lists with pageable copies, so the scheduler
+        thread stalled until the forward ended. Every live float page is
+        rewritten by a delayed forward; the moved pages must carry those
+        bytes, and `make_room` must return before the forward does."""
+        pool, flt, live, epp, ask, schedule, forward = self._float()
         pages = flt.ids.virtual_to_physical[live].tolist()
         done = torch.cuda.Event()
         with torch.cuda.stream(forward):
@@ -82,7 +91,7 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
                 pool.raw[page * epp : (page + 1) * epp].fill_(100 + k)
             done.record()
         flt.set_latest_forward_done_event(done)
-        flt.set_inflight_forward(done, None)
+        flt.set_inflight_forward(done, live)
 
         with torch.cuda.stream(schedule):
             opened = flt.make_room(side="low", min_bytes=ask)
@@ -97,6 +106,85 @@ class TestFloatRelocationAgainstARunningForward(CustomTestCase):
                 bool((raw[page * epp : (page + 1) * epp] == 100 + k).all()),
                 f"live page {k} lost the forward's write",
             )
+
+    def test_pages_a_forward_only_reads_move_at_once_and_stay_fenced(self):
+        """A move waits only for a forward that writes a moved page. A delayed
+        forward that only reads the live pages must not hold `make_room`: the
+        copies run while it still runs. The pages it vacates stay readable:
+        a take that lands on them, and a write into them, wait that forward."""
+        pool, flt, live, epp, ask, schedule, forward = self._float()
+        pages = flt.ids.virtual_to_physical[live].tolist()
+        original = pool.raw.clone()
+        seen = torch.empty((len(pages), epp), dtype=torch.uint8, device="cuda")
+        with torch.cuda.stream(forward):
+            torch.cuda._sleep(500_000_000)
+            for k, page in enumerate(pages):
+                seen[k].copy_(pool.raw[page * epp : (page + 1) * epp])
+            done = torch.cuda.Event()
+            done.record()
+        flt.set_latest_forward_done_event(done)
+        flt.set_inflight_forward(done, None)
+
+        with torch.cuda.stream(schedule):
+            opened = flt.make_room(side="low", min_bytes=ask)
+            copied = torch.cuda.Event()
+            copied.record()
+        copied.synchronize()
+        self.assertFalse(done.query(), "the move waited for a reading forward")
+        moved = flt.ids.virtual_to_physical[live].tolist()
+        vacated = sorted(set(pages) - set(moved))
+        self.assertTrue(vacated, "the geometry vacated no page")
+        with torch.cuda.stream(schedule):
+            # The vacated pages now lie in the gap; overwrite them, as a later
+            # hand-out of that space would, after waiting their fence.
+            first, end = vacated[0], vacated[-1] + 1
+            flt._wait_fences(first, end)
+            pool.raw[first * epp : end * epp].fill_(7)
+        self.assertFalse(done.query(), "the forward ended before the overwrite")
+        torch.cuda.synchronize()
+        self.assertGreaterEqual(opened, ask)
+        expected = torch.stack(
+            [original[p * epp : (p + 1) * epp] for p in pages]
+        ).cuda()
+        self.assertTrue(torch.equal(seen, expected), "a vacated page was overwritten")
+        raw = pool.raw.cpu()
+        for k, page in enumerate(moved):
+            self.assertTrue(
+                torch.equal(
+                    raw[page * epp : (page + 1) * epp],
+                    original[pages[k] * epp : (pages[k] + 1) * epp].cpu(),
+                ),
+                f"live page {k} lost its bytes",
+            )
+
+    def test_holes_a_relocation_creates_wait_their_fences(self):
+        """BUG REGRESSION. A relocation checked fences only for its copy
+        destinations and handed the rest of its new block to the free list,
+        so a take could write bytes a neighbour vacated while a forward still
+        read them. Every page of the block the float did not already hold is
+        fenced before the block becomes writable, holes included."""
+        _, flt, _, _, _, schedule, _ = self._float()
+        low, high = flt.low_wm_page, flt.high_wm_page
+        gap_low, _ = flt._gap_pages()
+        self.assertGreater(gap_low, 0, "the geometry left no low gap")
+        waited = []
+        real = flt._wait_fences
+
+        def record(first, end):
+            waited.append((first, end))
+            real(first, end)
+
+        flt._wait_fences = record
+        with torch.cuda.stream(schedule):
+            # Grow the block by one page below: no live page moves, so the new
+            # page becomes a hole, never a copy destination.
+            moved = flt.relocate_into(low - 1, high)
+        torch.cuda.synchronize()
+        self.assertEqual(moved, 0)
+        self.assertTrue(
+            any(first <= low - 1 < end for first, end in waited),
+            f"the new hole {low - 1} was not fenced: {waited}",
+        )
 
 
 if __name__ == "__main__":

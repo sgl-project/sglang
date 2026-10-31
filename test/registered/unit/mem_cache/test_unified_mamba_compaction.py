@@ -204,7 +204,10 @@ class TestMambaCompaction(CustomTestCase):
                     done.record()
                 self.assertFalse(done.query())
                 if writer == "forward":
+                    # The forward rewrites every slot: a move waits for the
+                    # writers its sources were recorded with.
                     f.alloc.set_latest_forward_done_event(done)
+                    f.alloc.set_inflight_forward(done, f.ids)
                 else:
                     f.alloc.set_hicache_transfer_done_event(writer, done)
                 self.assertEqual(f.alloc.flush_for_allocation(), 8)
@@ -270,6 +273,78 @@ class TestMambaCompaction(CustomTestCase):
         f.raw = expected
         self._verify(f, set(range(8, 16)))
         self.assertEqual((early, late), (0, 8))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_urgent_flush_waits_only_for_writers_of_its_sources(self):
+        # A running forward writes one slot that stays put and reads the slots
+        # the urgent flush moves. The copies must not wait for it; the slots the
+        # frontier retreats past stay readable until it ends, so taking that
+        # space back and overwriting it waits for the forward on the GPU.
+        f = self._fixture("cuda")
+        f.alloc.free(f.ids[8:16])
+        n = f.spec.entry_bytes()
+        moved = list(range(f.count - 8, f.count))
+        vacated = [f.original_pages[i] for i in moved]
+        kept = f.original_pages[0]
+        expected = f.raw.clone()
+        expected[kept * n : (kept + 1) * n] = 100
+        payload = torch.full((n,), 100, dtype=torch.uint8, device="cuda")
+        seen = torch.empty((len(vacated), n), dtype=torch.uint8, device="cuda")
+        schedule = torch.cuda.Stream()
+        forward = torch.cuda.Stream()
+        with torch.cuda.stream(schedule):
+            # Loading a kernel module and growing the caching allocator both wait
+            # for every stream; warm both first, as a running scheduler has.
+            f.alloc.prewarm_compaction()
+            f.alloc.ids.translate(f.ids[:1])
+            f.alloc.ids.translate(f.ids[1:2])
+            f.alloc._to_device([0])
+            torch.empty(1, device="cuda")
+            torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        f.move.reset_mock()  # the warm-up copies the sink onto itself
+        done = torch.cuda.Event()
+        with torch.cuda.stream(forward):
+            torch.cuda._sleep(500_000_000)
+            f.pool.raw[kept * n : (kept + 1) * n].copy_(payload)
+            for k, page in enumerate(vacated):
+                seen[k].copy_(f.pool.raw[page * n : (page + 1) * n])
+            done.record()
+        f.alloc.set_latest_forward_done_event(done)
+        f.alloc.set_inflight_forward(done, f.ids[:1])
+        with torch.cuda.stream(schedule):
+            self.assertEqual(f.alloc.flush_for_allocation(), 8)
+            copied = torch.cuda.Event()
+            copied.record()
+            # The frontier retreated past the vacated slots; take them back.
+            retaken = f.alloc.take_physical(8)
+            f.pool.raw[min(vacated) * n : (max(vacated) + 1) * n].fill_(7)
+        copied.synchronize()
+        self.assertFalse(
+            done.query(), "the copies waited for a forward that wrote none"
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(sorted(retaken.tolist()), sorted(vacated))
+        self.assertEqual(max(vacated) - min(vacated) + 1, len(vacated))
+        reads = torch.stack([f.raw[p * n : (p + 1) * n] for p in vacated])
+        self.assertTrue(
+            torch.equal(seen.cpu(), reads), "a vacated slot was overwritten"
+        )
+        raw = f.pool.raw.cpu()
+        self.assertTrue(
+            torch.equal(
+                raw[kept * n : (kept + 1) * n], expected[kept * n : (kept + 1) * n]
+            )
+        )
+        for i in moved:
+            page = int(f.alloc.ids.virtual_to_physical[f.ids[i]])
+            old = f.original_pages[i]
+            self.assertTrue(
+                torch.equal(
+                    raw[page * n : (page + 1) * n], f.raw[old * n : (old + 1) * n]
+                ),
+                f"slot {i} lost its bytes",
+            )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_pending_read_sources_drain_with_closed_gate(self):
