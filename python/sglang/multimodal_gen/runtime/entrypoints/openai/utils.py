@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -575,6 +578,8 @@ async def process_generation_batch(
             scheduler_batches if scheduler_batches is not None else [batch]
         )
 
+        if result.cancelled:
+            raise RequestCancelledError(batch.client_request_ids())
         # failed finalization can leave tensors or encoded files attached
         if result.error:
             raise RuntimeError(
