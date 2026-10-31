@@ -1723,12 +1723,17 @@ class KVWriteLoc:
     bound to the batch, or ids produced separately and marked so. A unified
     pool's write door refuses a loc not marked physical; other pools do not
     check.
+
+    ``window_locs``: when a runner's layers attend through several window
+    sub-pools, the write ids of each window sub-pool other than the one
+    ``swa_loc`` names, keyed by sub-pool name.
     """
 
     loc: torch.Tensor
     swa_loc: Optional[torch.Tensor] = None
     full_loc: Optional[torch.Tensor] = None
     physical: bool = False
+    window_locs: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def for_batch(
@@ -1737,17 +1742,19 @@ class KVWriteLoc:
         *,
         swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
+        window_locs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
-        physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
-        the same mark, so it must come from the same plan (as
-        ``RunnerIds.write_ids`` does); a loc produced separately states
+        physical mark. A ``swa_loc``, ``full_loc`` or ``window_locs`` passed
+        here travels under the same mark, so it must come from the same plan
+        (as ``RunnerIds.write_ids`` does); a loc produced separately states
         its own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
             swa_loc,
             full_loc,
             physical=forward_batch.out_cache_loc_is_physical,
+            window_locs=window_locs,
         )
 
     @classmethod
@@ -1776,6 +1783,12 @@ class KVWriteLoc:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
             self.full_loc = self.full_loc[: self.loc.shape[0]]
+        if self.window_locs is not None:
+            n = self.loc.shape[0]
+            self.window_locs = {
+                name: ids if ids.shape[0] == n else ids[:n]
+                for name, ids in self.window_locs.items()
+            }
 
 
 def unwrap_write_loc(loc_info):
