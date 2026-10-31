@@ -742,6 +742,7 @@ class XPUAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ):
         if k is None and v is None:
             # Shared-KV RadixAttention uses kv_shared_layer_index as layer_id,
@@ -825,6 +826,8 @@ class XPUAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+        if slopes is not None:
+            kwargs["alibi_slopes"] = slopes
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -1401,6 +1404,7 @@ class XPUAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is None and v is None:
             # Cross-layer KV sharing (Gemma 4): see forward_extend for details.
@@ -1464,6 +1468,8 @@ class XPUAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+        if slopes is not None:
+            kwargs["alibi_slopes"] = slopes
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
