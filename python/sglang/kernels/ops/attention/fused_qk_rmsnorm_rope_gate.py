@@ -12,12 +12,22 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+
+try:
+    from triton.language.extra.cuda import libdevice
+except Exception:  # noqa: BLE001
+    # ROCm / non-CUDA Triton may not ship the CUDA libdevice shim. libdevice is
+    # only dereferenced under EXPLICIT_ROPE_FMA (constexpr, default False), which
+    # Triton prunes, so a None placeholder keeps the kernel importable on gfx950.
+    libdevice = None
 
 
 def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
     if not torch.cuda.is_available():
+        return False
+    if getattr(torch.version, "hip", None) is not None:
+        # PDL (gdc_launch_dependents) is NVIDIA Hopper+ only; ROCm has no equivalent.
         return False
     try:
         major, _ = torch.cuda.get_device_capability()
