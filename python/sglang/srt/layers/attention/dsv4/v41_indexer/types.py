@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 
 import msgspec
 import torch
-
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -30,6 +29,22 @@ def get_tail_row_indices(
 class CandidateMetadata:
     def tail(self, rows_per_request: List[int]) -> CandidateMetadata:
         raise NotImplementedError(f"{type(self).__name__} is not a prefill publish")
+
+
+class PrefillIndexerBudget(msgspec.Struct):
+    """One lazy workspace allowance shared by all layers and the replay tail."""
+
+    bytes: Optional[int] = None
+
+    def resolve(self, device: torch.device) -> int:
+        from sglang.srt.layers.attention.mqa_logits_utils import mqa_logits_budget_bytes
+
+        if self.bytes is None:
+            self.bytes = mqa_logits_budget_bytes(
+                device_index=device.index,
+                allow_sync=not torch.cuda.is_current_stream_capturing(),
+            )
+        return self.bytes
 
 
 class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -69,6 +84,8 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # None when this forward's attention reads only the positions (sparse prefill).
     out_raw_indices: torch.Tensor
     out_page_indices: Optional[torch.Tensor]
+
+    budget: Optional[PrefillIndexerBudget] = None
 
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)

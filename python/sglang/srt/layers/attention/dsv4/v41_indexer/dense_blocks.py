@@ -16,6 +16,8 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 
+from sglang.srt.utils.common import ceil_align
+
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
@@ -251,7 +253,19 @@ def _publish_prefill_blocks(
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
-    for tile, logits in score_tiles(data, kv):
+    scratch_row_bytes, scratch_bytes = _candidate_scratch_bytes(
+        width=ceil_align(
+            max(data.lens_per_request, default=0), FLAT_LOGITS_WIDTH_ALIGN
+        ),
+        topk=topk,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
+        publish=True,
+        consume=False,
+    )
+    for tile, logits in score_tiles(
+        data, kv, scratch_row_bytes=scratch_row_bytes + 8, scratch_bytes=scratch_bytes
+    ):
         _publish_tile_blocks(
             data=data,
             tile=tile,
@@ -307,7 +321,19 @@ def _consume_prefill_blocks(
     selected = data.empty_selection(topk)
     # the block-aligned slices of `_consume_tile_blocks` stay within the logits width
     assert FLAT_LOGITS_WIDTH_ALIGN % block_size == 0
-    for tile, logits in score_tiles(data, kv):
+    scratch_row_bytes, scratch_bytes = _candidate_scratch_bytes(
+        width=ceil_align(
+            max(data.lens_per_request, default=0), FLAT_LOGITS_WIDTH_ALIGN
+        ),
+        topk=topk,
+        topk_blocks=blocks.shape[1],
+        block_size=block_size,
+        publish=False,
+        consume=True,
+    )
+    for tile, logits in score_tiles(
+        data, kv, scratch_row_bytes=scratch_row_bytes + 8, scratch_bytes=scratch_bytes
+    ):
         _consume_tile_blocks(
             data=data,
             tile=tile,
@@ -355,3 +381,36 @@ def _requests_in_tile(data: DeepGEMMPrefillData, tile: slice):
         if begin < stop and lc > 0:
             yield slice(begin - tile.start, stop - tile.start), lc
         start = end
+
+
+def _candidate_scratch_bytes(
+    *,
+    width: int,
+    topk: int,
+    topk_blocks: int,
+    block_size: int,
+    publish: bool,
+    consume: bool,
+) -> tuple[int, int]:
+    blocks = (width + block_size - 1) // block_size
+    block_topk = min(topk_blocks, blocks)
+    padded_width = blocks * block_size
+    if publish:
+        padded_scores = 4 * padded_width
+        block_scores = 4 * blocks
+        masked_block_scores = 2 * block_scores + blocks
+        block_selection = block_scores + 12 * block_topk
+        converted_block_ids = 20 * block_topk
+        return max(
+            width,
+            padded_scores + block_scores,
+            masked_block_scores,
+            block_selection,
+            converted_block_ids,
+        ), 8 * width
+    if consume:
+        block_scatter = blocks + 1 + 17 * block_topk
+        masks = 2 * padded_width
+        selected_score_validation = 32 * topk
+        return max(block_scatter, masks, selected_score_validation), 0
+    return 0, 0
