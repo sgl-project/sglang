@@ -2,6 +2,16 @@ import torch
 import triton
 import triton.language as tl
 
+# Batch-scan width (``bs_upper``) of the allocation kernels. It is a constexpr,
+# so every new power of two compiled another kernel the first time the running
+# batch outgrew the warmup's batches: ~0.2 s mid-serving under host profiling.
+# One width serves every batch up to 64 requests; the extra lanes are masked.
+_MIN_BATCH_SCAN_WIDTH = 64
+
+
+def batch_scan_width(bs: int) -> int:
+    return max(1 << max(bs - 1, 0).bit_length(), _MIN_BATCH_SCAN_WIDTH)
+
 
 @triton.jit(do_not_specialize=["num_pages", "full_page_representatives"])
 def get_and_clear_swa_pages_kernel(
@@ -125,8 +135,8 @@ def alloc_extend_kernel(
     pid = tl.program_id(0)
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     extend_lens = seq_lens - pre_lens
 
     seq_len = tl.load(seq_lens_ptr + pid)
@@ -211,7 +221,7 @@ def alloc_decode_kernel(
     pid = tl.program_id(0)
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
 
     seq_len = tl.load(seq_lens_ptr + pid)
