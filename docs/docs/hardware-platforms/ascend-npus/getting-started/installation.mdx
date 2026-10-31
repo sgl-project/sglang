@@ -153,6 +153,37 @@ docker pull quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
 
 ## Preparing the Running Environment
 
+Pick one of the two methods below based on your situation:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "38%"}} />
+    <col style={{width: "62%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Recommended scenarios</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#method-2-using-docker-image">Using Docker Image</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>New to SGLang on NPU, or deploying a serving environment</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#method-1-installing-from-source-with-prerequisites">Installing from source with prerequisites</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Developing or debugging SGLang, or pinning/customizing component versions</td>
+    </tr>
+  </tbody>
+</table>
+
+**For most users, the Docker image is the recommended path.** It is the most convenient option: the matched component
+set from the [version mapping table](#component-version-mapping-for-sglang) comes pre-installed, and validated image
+builds are tested as a whole. Installing from source is the more flexible option: you choose every component version
+and control the build yourself, with no prebuilt binaries you cannot inspect. Whichever path you take, strictly follow
+the version mapping table and do not mix versions across CANN sets.
+
 ### Method 1: Installing from source with prerequisites
 
 The steps in this method install the component set from the [version mapping table](#component-version-mapping-for-sglang).
@@ -230,6 +261,16 @@ pip install torch_npu==$TORCH_NPU_VERSION --extra-index-url https://ascend.devcl
 
 If you are using other versions of `torch` and install `torch_npu`, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
+After the installation, verify that PyTorch can compute on the NPUs — it should print `True`, then a small tensor
+computed on the device:
+
+```bash Command
+python3 -c "import torch; print(torch.npu.is_available()); x = torch.arange(1, 5, dtype=torch.float32).npu(); print(x * x)"
+```
+
+The expected second line is `tensor([1., 4., 9., 16.], device='npu:0')` — the squares of `1, 2, 3, 4`, computed on the
+device. You may also see some compatibility warnings caused by device differences; they are safe to ignore.
+
 #### Triton on Ascend
 
 We provide our own implementation of Triton for Ascend.
@@ -259,7 +300,10 @@ and so does a package from a release that predates this module; check with
 
 #### DeepEP-compatible Library
 
-We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check
+the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+It is optional and needed only when serving MoE models with expert parallelism through
+`--moe-a2a-backend deepep`; plain TP deployments can skip it.
 
 #### Additional dependencies
 
@@ -338,6 +382,9 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 
 **Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
+
 <Tabs>
   <Tab title="A3 Series">
 
@@ -354,7 +401,6 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for downloading models by SGLang.
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
@@ -378,7 +424,6 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for downloading models by SGLang.
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
@@ -407,6 +452,9 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
 
 ### Disable NUMA balancing
 
+The kernel's background NUMA page migration adds memory-bandwidth overhead and latency jitter to SGLang's large resident
+working set (weights and KV cache); disabling it keeps serving latency stable.
+
 ```bash Command
 sudo sysctl -w kernel.numa_balancing=0
 # Check
@@ -426,7 +474,39 @@ cat /proc/sys/vm/swappiness # shows 10
 
 ### Running Service For Large Language Models
 
+Pick a deployment mode based on your workload:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "50%"}} />
+    <col style={{width: "32%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Characteristics</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended scenarios</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>PD mixed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefill and decode in one server: single process, no router, requests go straight to the server; heavy prefill batches share hardware with decode and can raise inter-token latency</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Getting started, small to medium scale, no strict inter-token-latency requirement</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>PD disaggregation</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dedicated prefill and decode pools behind a router, KV cache transferred over the network (requires <a href="#memfabric-hybrid">MemFabric-Hybrid</a>); each phase scales and tunes independently, at the cost of more components and nodes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Large scale, long prompts, high concurrency, where stable inter-token latency matters</td>
+    </tr>
+  </tbody>
+</table>
+
 #### PD Mixed Scene
+
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
 <Tabs>
   <Tab title="A3 Series">
@@ -459,9 +539,20 @@ python3 -m sglang.launch_server \
   </Tab>
 </Tabs>
 
+The example above uses `meta-llama/Llama-3.1-8B-Instruct`. To run another model, change the `--model-path` value and
+make sure it is listed in [Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models).
+
 #### PD Disaggregation Scene
 
+PD disaggregation requires the prefill server, the decode server, and the router to communicate with one another.
+Make sure the hosts can reach one another over the network and that the `PREFILL_IP:FREE_PORT` store address is
+accessible from every node. The example below runs all three on a single machine, each using its own port and NPU
+(via `--base-gpu-id`); the same steps apply to a multi-node cluster, provided the hosts can reach one another.
+
 1. Launch Prefill Server
+
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
 <Tabs>
   <Tab title="A3 Series">
@@ -520,6 +611,9 @@ python3 -m sglang.launch_server \
 
 2. Launch Decode Server
 
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
+
 <Tabs>
   <Tab title="A3 Series">
 
@@ -570,6 +664,9 @@ python3 -m sglang.launch_server \
 
 3. Launch Router
 
+The router command requires the `sglang-router` package. It is pre-installed in the Docker image; if you installed
+SGLang from source and do not have it yet, run `pip install sglang-router` first.
+
 ```bash Command
 python3 -m sglang_router.launch_router \
     --pd-disaggregation \
@@ -588,6 +685,9 @@ The `8995` in command script is the disaggregation bootstrap port. It must match
 ### Running Service For Multimodal Language Models
 
 #### PD Mixed Scene
+
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
 <Tabs>
   <Tab title="A3 Series">
@@ -629,6 +729,9 @@ python3 -m sglang.launch_server \
 
   </Tab>
 </Tabs>
+
+The example above uses `Qwen/Qwen3-VL-30B-A3B-Instruct`. For other multimodal models, see the multimodal section of
+[Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models#multimodal-language-models).
 
 ## Testing the Service
 
@@ -714,3 +817,24 @@ curl http://127.0.0.1:30000/v1/chat/completions \
     }]
   }'
 ```
+
+## FAQ
+
+### How do I provide model weights?
+
+The launch commands in this guide pass a Hugging Face model ID (e.g., `meta-llama/Llama-3.1-8B-Instruct`) to
+`--model-path`. Pick one way to provide the weights:
+
+- **Automatic download**: export `HF_TOKEN` (required for gated models such as Llama) and let SGLang download the
+  weights from Hugging Face on first launch; they are cached under `~/.cache/huggingface` and reused afterwards.
+- **Pre-downloaded weights**: download the weights to the machine yourself, then replace the model ID in the commands
+  with the local weights path, e.g., `--model-path /path/to/Llama-3.1-8B-Instruct`.
+
+When running in Docker, the `drun` alias mounts `~/.cache/` from the host, so weights already in the host's Hugging
+Face cache are visible inside the container.
+
+## Next Steps
+
+For mainstream models, we provide step-by-step deployment tutorials and tuned, best-practice launch scripts — see
+[Model Tutorials](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials) and
+[Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices).

@@ -19,6 +19,11 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 To identify your device, run `npu-smi info -l`: A3 Series reports `Chip Count: 2` per NPU.
 For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
+<Tip>
+If `npu-smi` is reported as `command not found`, the NPU driver is not installed on the host. Start from
+[installing the NPU HDK](https://www.hiascend.com/hardware/firmware-drivers?ids=d803%2C89dda9ba9de741349efa03687a487678%2C28%2CAArch64%2Coffline_run_file).
+</Tip>
+
 ### Docker
 
 Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
@@ -140,3 +145,16 @@ INFO:     Finished server process [<SGLANG_PID>]
 
 The server has now stopped. You can verify it with `ps -ef | grep sglang` — the expected output is nothing (no matching process),
 then exit the container by pressing `Ctrl+D`.
+
+## Next Steps
+
+- [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+  — Complete installation guide covering source install, Docker build, version mapping, and system settings
+- [Model Tutorials](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials)
+  — Step-by-step deployment tutorials for mainstream models
+- [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices)
+  — Tuned, benchmark-proven launch configurations for mainstream models
+- [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning)
+  — Performance optimization parameters for SGLang on NPUs
+- [Supported Models](/docs/hardware-platforms/ascend-npus/reference/support_models)
+  — LLM, multimodal, and embedding models supported on NPUs
