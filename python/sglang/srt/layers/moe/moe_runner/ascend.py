@@ -370,7 +370,7 @@ def pre_permute_standard_to_ascend(
 
     layer = _routing_layer(runner_config)
     hidden_states = dispatch_output.hidden_states
-    topk_weights = topk_output.topk_weights.to(hidden_states.dtype)
+    topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids.to(torch.int32)
 
     quant_mode, tp_all_gather, group_list_type = ascend_dispatch.get_routing(layer)
