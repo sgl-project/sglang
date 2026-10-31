@@ -142,7 +142,13 @@ class TestPagedExpertsAuto(_PagedMatchesUnpaged, CustomTestCase):
     def setUpClass(cls):
         cls.reference = _serve_and_score(cls.model, DEFAULT_URL_FOR_TEST, [])
         fraction = _mem_fraction_for_experts(cls.model, cls.resident_share)
-        args = ["--mem-fraction-static", f"{fraction:.3f}", "--enable-paged-experts"]
+        args = [
+            "--mem-fraction-static",
+            f"{fraction:.3f}",
+            "--enable-paged-experts",
+            "--paged-experts-num-resident",
+            "auto",
+        ]
         log = io.StringIO()
         cls.paged = _serve_and_score(cls.model, PAGED_URL, args, log=log)
         cls.log = log.getvalue()
