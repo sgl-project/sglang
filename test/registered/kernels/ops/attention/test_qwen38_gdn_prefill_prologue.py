@@ -12,6 +12,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     QWEN38_GDN_HEAD_DIM,
     QWEN38_GDN_NUM_QK_HEADS,
     QWEN38_GDN_NUM_V_HEADS,
+    QWEN38_GDN_PROLOGUE_TILE_M,
     QWEN38_GDN_PROLOGUE_WIDE_BLOCK_M,
     QWEN38_GDN_PROLOGUE_WIDE_MIN_TOKENS,
     QWEN38_GDN_QKV_DIM,
@@ -341,6 +342,28 @@ class TestQwen38GDNPrefillPrologue(unittest.TestCase):
             [wide + tile - 1],
             [wide - tile - 3, tile + 1, 2],
             [16384 + 52],
+        ):
+            for has_initial_state in (False, True):
+                with self.subTest(
+                    lengths=lengths,
+                    has_initial_state=has_initial_state,
+                ):
+                    self._assert_prologue_exact(
+                        lengths,
+                        has_initial_state=has_initial_state,
+                    )
+
+    def test_tiled_kernel_tile_edges_exact(self):
+        """The tiled producer at its token-tile edges: sequences that fill a
+        tile, end one past it, are shorter than the conv state or than a tile,
+        and a long one that ends inside a tile."""
+        tile = QWEN38_GDN_PROLOGUE_TILE_M
+        for lengths in (
+            [tile],
+            [tile + 1],
+            [tile - 1, 1, 2],
+            [3, 2 * tile + 5, 1],
+            [4096 + 7],
         ):
             for has_initial_state in (False, True):
                 with self.subTest(
