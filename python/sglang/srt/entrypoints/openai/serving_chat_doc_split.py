@@ -757,12 +757,18 @@ class ChatDocSplitter:
     is served by ``handle_window``, the base class's ``handle_request``.
     """
 
-    def __init__(self, serving: OpenAIServingChat, *, handle_window: Callable):
+    def __init__(
+        self,
+        serving: OpenAIServingChat,
+        *,
+        handle_window: Callable,
+        config: UocrDocumentConfig,
+    ):
         self._serving = serving
         self._tokenizer_manager = serving.tokenizer_manager
         self._hf_config = serving.tokenizer_manager.model_config.hf_config
         self._handle_window = handle_window
-        self._config = UocrDocumentConfig.from_args(get_mm())
+        self._config = config
 
     @classmethod
     def for_model(
@@ -772,7 +778,11 @@ class ChatDocSplitter:
         architectures = serving.tokenizer_manager.model_config.hf_config.architectures
         if not architectures or architectures[0] != UNLIMITED_OCR_V2_ARCH:
             return None
-        return cls(serving, handle_window=handle_window)
+        return cls(
+            serving,
+            handle_window=handle_window,
+            config=UocrDocumentConfig.from_args(get_mm()),
+        )
 
     async def handle_request(self, request, raw_request):
         """Serve a chat request, splitting a long document into page windows.

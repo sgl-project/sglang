@@ -6,6 +6,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.entrypoints.openai import doc_split, serving_chat_doc_split
 from sglang.srt.entrypoints.openai.doc_kv_state import DocumentKVState
 from sglang.srt.entrypoints.openai.protocol import (
@@ -603,7 +604,7 @@ class _ScriptedWindows:
             }
 
 
-def _splitter(windows: _ScriptedWindows):
+def _splitter(windows: _ScriptedWindows, *, config=None):
     tokenizer_manager = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=_HF_CONFIG),
         max_req_input_len=10**6,
@@ -628,10 +629,11 @@ def _splitter(windows: _ScriptedWindows):
             None,
         ),
     )
-    with get_context().override_server_args():
-        return serving_chat_doc_split.ChatDocSplitter(
-            serving, handle_window=windows.handle_window
-        )
+    return serving_chat_doc_split.ChatDocSplitter(
+        serving,
+        handle_window=windows.handle_window,
+        config=UocrDocumentConfig() if config is None else config,
+    )
 
 
 def _document_request(n_pages: int, *, stream: bool) -> ChatCompletionRequest:
@@ -803,10 +805,10 @@ class TestPromptKeepsInlinePagePlaceholders(CustomTestCase):
 
 class TestDocumentPolicy(CustomTestCase):
     def test_one_window_limit_applies_to_all_modes_and_requests_can_tighten_it(self):
-        with get_context().override_server_args(
-            uocr_doc_split=True, uocr_doc_page_window=3
-        ):
-            splitter = _splitter(_ScriptedWindows([]))
+        splitter = _splitter(
+            _ScriptedWindows([]),
+            config=UocrDocumentConfig(uocr_doc_split=True, uocr_doc_page_window=3),
+        )
         for mode in ("gundam", "base", "tiny", "large"):
             with self.subTest(mode=mode):
                 request = _document_request(4, stream=False)
