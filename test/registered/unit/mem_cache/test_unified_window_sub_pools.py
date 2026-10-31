@@ -125,6 +125,61 @@ class TestWindowNames(CustomTestCase):
             three.wire_entries()
 
 
+class TestDraftWindowFusesByLifetime(CustomTestCase):
+    def test_draft_window_rides_in_the_target_window_of_its_length(self):
+        """A draft window equal to any target window shares that window's
+        entries; one equal to none gets a band of its own, named by its length
+        as a target window of that length would be."""
+        from sglang.srt.mem_cache.kv.plan import sub_pool_names
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftKVGeometry,
+            DraftKVProfile,
+            DraftLayerSet,
+            PlacementContext,
+            place_fused_draft,
+        )
+
+        target_windows = (64, 16)
+        decls = _decls(target_windows)
+        for draft_window, host, new_band in (
+            (64, "swa", False),
+            (16, "swa_16", False),
+            (8, "swa_8", True),
+        ):
+            with self.subTest(draft_window=draft_window):
+                placement = place_fused_draft(
+                    profile=DraftKVProfile(
+                        num_layers=1,
+                        kinds={
+                            "window": DraftLayerSet(
+                                layer_ids=(0,),
+                                window=draft_window,
+                                geometry=DraftKVGeometry(
+                                    head_num=1, head_dim=8, v_head_dim=8
+                                ),
+                            )
+                        },
+                    ),
+                    num_runners=1,
+                    ctx=PlacementContext(
+                        host_names=sub_pool_names(decls),
+                        target_windows=target_windows,
+                    ),
+                    store_dtype=torch.bfloat16,
+                ).placement
+                self.assertEqual(placement.hosts(), (host,))
+                self.assertEqual(host in placement.new_bands, new_band)
+                self.assertEqual(placement.host_kind(host).name, "swa")
+                plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
+                carriers = [
+                    s.name for s in plan.sub_pools if s.spec.draft_region is not None
+                ]
+                self.assertEqual(carriers, [host])
+                self.assertEqual(
+                    len(plan.windows()), len(target_windows) + int(new_band)
+                )
+
+
 class TestSeveralWindowsAllocate(CustomTestCase):
     def _check(self, device, seed, count):
         rng = random.Random(seed)
