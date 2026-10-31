@@ -24,7 +24,7 @@ register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-la
 
 _HEAD_DIM = 128
 _CONV_STATE_W = 3
-_SLOTS = 8
+_FREE_SLOTS = 4
 _BATCH = 4
 
 
@@ -32,24 +32,30 @@ def _randn(shape, dtype, generator, scale=1.0):
     return (torch.randn(shape, device="cuda", generator=generator) * scale).to(dtype)
 
 
-def _make_case(heads: int, seed: int):
+def _make_case(heads: int, seed: int, batch: int):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     seg = heads * _HEAD_DIM
     conv_dim = 3 * seg
 
     # Keep magnitudes moderate so fp32 state updates stay in a stable range.
-    mixed_qkv = _randn((_BATCH, conv_dim), torch.bfloat16, generator, scale=0.2)
-    a = _randn((_BATCH, seg), torch.bfloat16, generator, scale=0.2)
-    b = _randn((_BATCH, heads), torch.bfloat16, generator, scale=0.2)
-    onorm_g = _randn((_BATCH, seg), torch.bfloat16, generator, scale=0.2)
+    mixed_qkv = _randn((batch, conv_dim), torch.bfloat16, generator, scale=0.2)
+    a = _randn((batch, seg), torch.bfloat16, generator, scale=0.2)
+    b = _randn((batch, heads), torch.bfloat16, generator, scale=0.2)
+    onorm_g = _randn((batch, seg), torch.bfloat16, generator, scale=0.2)
 
     conv_states = _randn(
-        (_SLOTS, _CONV_STATE_W, conv_dim), torch.bfloat16, generator, scale=0.2
+        (batch + _FREE_SLOTS, _CONV_STATE_W, conv_dim),
+        torch.bfloat16,
+        generator,
+        scale=0.2,
     )
     ssm_states = _randn(
-        (_SLOTS, heads, _HEAD_DIM, _HEAD_DIM), torch.float32, generator, scale=0.02
+        (batch + _FREE_SLOTS, heads, _HEAD_DIM, _HEAD_DIM),
+        torch.float32,
+        generator,
+        scale=0.02,
     )
-    cache_indices = torch.arange(_BATCH, device="cuda", dtype=torch.int32)
+    cache_indices = torch.arange(batch, device="cuda", dtype=torch.int32)
 
     conv_weights = _randn((conv_dim, 4), torch.float32, generator, scale=0.1)
     conv_bias = _randn((conv_dim,), torch.float32, generator, scale=0.05)
@@ -98,7 +104,9 @@ def _run_unfused_reference(
         conv_state_indices=cache_indices,
     )
     out = torch.empty(
-        (_BATCH, 1, heads, _HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+        (mixed_qkv.shape[0], 1, heads, _HEAD_DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     out, _ = fused_recurrent_kda_packed_decode(
         qkv,
@@ -115,7 +123,7 @@ def _run_unfused_reference(
     )
     ref = rms_norm_gated(
         out,
-        onorm_g.view(1, _BATCH, heads, _HEAD_DIM),
+        onorm_g.view(1, -1, heads, _HEAD_DIM),
         onorm_weight,
         None,
         activation="sigmoid",
@@ -126,16 +134,22 @@ def _run_unfused_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "heads,tp_size,lower_bound",
+    "heads,tp_size,lower_bound,batch",
     [
-        pytest.param(3, 32, None, id="tp32_h3"),
-        pytest.param(6, 16, None, id="tp16_h6"),
-        pytest.param(12, 8, None, id="tp8_h12"),
-        pytest.param(8, 8, -5.0, id="glm53_flash_tp8_h8"),
-        pytest.param(16, 4, -5.0, id="glm53_flash_tp4_h16"),
+        pytest.param(3, 32, None, _BATCH, id="tp32_h3"),
+        pytest.param(6, 16, None, _BATCH, id="tp16_h6"),
+        pytest.param(12, 8, None, _BATCH, id="tp8_h12"),
+        pytest.param(8, 8, -5.0, _BATCH, id="glm53_flash_tp8_h8"),
+        pytest.param(16, 4, -5.0, _BATCH, id="glm53_flash_tp4_h16"),
+        # 576 and 640 (token, head) blocks take the 3-stage state staging with
+        # stage reuse; on SM90 also the streaming state variant.
+        pytest.param(8, 8, -5.0, 72, id="glm53_flash_tp8_h8_b72"),
+        pytest.param(16, 4, -5.0, 40, id="glm53_flash_tp4_h16_b40"),
     ],
 )
-def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int, lower_bound):
+def test_kda_fused_decode_matches_unfused_chain(
+    heads: int, tp_size: int, lower_bound, batch: int
+):
     (
         mixed_qkv,
         a,
@@ -149,7 +163,7 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int, lower_
         a_log,
         dt_bias,
         onorm_weight,
-    ) = _make_case(heads=heads, seed=20260731 + tp_size)
+    ) = _make_case(heads=heads, seed=20260731 + tp_size, batch=batch)
 
     conv_ref = conv_states.clone()
     conv_fused = conv_states.clone()
