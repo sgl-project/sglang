@@ -36,6 +36,10 @@ def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
     runner.is_encoder_decoder = False
     runner._pad_to_bucket = lambda raw_bs, buckets: raw_bs
     runner._make_graph_key = lambda bs: ("graph", bs)
+    # execute() replays the key recorded by load_batch's planning pass; the
+    # bare __new__ runner never ran load_batch, so seed the planned key here.
+
+    runner._replay_graph_key = ("graph", 2)
     attention = SimpleNamespace(init_forward_metadata_out_graph=mock.Mock())
     runner.attn_backend = attention
     runner.backend = SimpleNamespace(

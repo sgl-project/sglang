@@ -124,6 +124,8 @@ def _select_block(
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
         # Small words convert to FP32 exactly, so the winning small noise stays precise.
+
+        bits = bits.to(tl.int64) & 0xFFFFFFFF
         uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
         exp_noise = -libdevice.log1p(-uniform)
         key = value / temperature - tl.log(exp_noise)
