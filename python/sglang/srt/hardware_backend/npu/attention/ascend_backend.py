@@ -25,8 +25,9 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SparseKVOffloadMode,
     get_sparsity_driven_kv_offload_sparse_context_len,
-    is_sparsity_driven_kv_offload_enabled,
+    resolve_sparse_kv_offload_mode,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -357,11 +358,20 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
-        self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
+        self.sparse_kv_offload_mode = resolve_sparse_kv_offload_mode(
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
         )
+        self.enable_sparsity_driven_kv_offload = (
+            self.sparse_kv_offload_mode.uses_host_kv_offload
+        )
         self.sparse_kv_manager = None
+        if self.sparse_kv_offload_mode is SparseKVOffloadMode.PD_PREFILL_NATIVE:
+            logger.info(
+                "Sparsity-driven KV offload is configured, but disabled on "
+                "PD prefill workers so native NPU KV cache remains the "
+                "transfer source."
+            )
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 SparseKVCacheManager,
