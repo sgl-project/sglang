@@ -220,7 +220,8 @@ class TestMambaCompaction(CustomTestCase):
     def test_cuda_every_unfinished_forward_guards_its_state_writes(self):
         # A pipeline stage keeps several microbatch forwards in flight, each
         # writing its own requests' state slots in place. A non-urgent flush must
-        # not move a slot any of them writes; an urgent one waits for all of them.
+        # not move a slot any of them writes; an urgent one orders its copies
+        # after all of them on the GPU, and returns to the host while they run.
         f = self._fixture("cuda")
         f.alloc.free(f.ids[8:16])
         n = f.spec.entry_bytes()
@@ -241,6 +242,7 @@ class TestMambaCompaction(CustomTestCase):
             # Both pointer alignments the write-set translation is launched with.
             f.alloc.ids.translate(f.ids[:1])
             f.alloc.ids.translate(f.ids[1:2])
+            f.alloc._to_device([0])
             torch.empty(1, device="cuda")
             torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
         torch.cuda.synchronize()
@@ -261,6 +263,9 @@ class TestMambaCompaction(CustomTestCase):
             early = f.alloc.flush_opportunistic()
             self.assertFalse(events[0].query(), "the forwards ended before the flush")
             late = f.alloc.flush_for_allocation()
+            self.assertFalse(
+                events[0].query(), "the urgent relief blocked the host on the forward"
+            )
         torch.cuda.synchronize()
         f.raw = expected
         self._verify(f, set(range(8, 16)))
@@ -285,6 +290,7 @@ class TestMambaCompaction(CustomTestCase):
         # an actual delayed reader validates the CUDA completion/drain boundary.
         sources = f.alloc._free_phys_pages
         self.assertEqual(set(sources.cpu().tolist()), set(old_sources))
+        f.alloc.set_latest_forward_done_event(done)
         f.alloc._free_phys_pages = sources[:0]
         f.alloc._pending_reuse[done] = (list(old_sources), [sources])
         f.alloc._pending_reuse_pages_cpu.update(old_sources)
@@ -303,6 +309,8 @@ class TestMambaCompaction(CustomTestCase):
         self.assertEqual(f.alloc._free_phys_pages.numel(), 0)
         done.synchronize()
         self.assertTrue(torch.equal(observed.cpu(), expected))
+        # The reader's result is processed: its forward retires.
+        f.alloc.retire_forward(done)
         self.assertEqual(f.alloc.flush_opportunistic(), 0)
         self.assertFalse(f.alloc._pending_reuse)
         self.assertFalse(f.alloc._pending_reuse_pages_cpu)
@@ -407,7 +415,9 @@ class TestForwardWriteSets(CustomTestCase):
                 state_slots=(),
             )
         self.assertEqual(owner.flush_opportunistic(), 0)
+        # Retiring the newer forward retires the older one with it.
         unknown.fired = known.fired = True
+        allocator.storage.retire_forward(known)
         self.assertGreater(owner.flush_opportunistic(), 0)
 
 

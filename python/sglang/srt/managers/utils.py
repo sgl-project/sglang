@@ -83,6 +83,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None

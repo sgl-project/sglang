@@ -160,6 +160,13 @@ class _Stream:
         self.log.append(("wait_stream", stream))
 
 
+class _Copy:
+    """A copy's done event, still pending."""
+
+    def query(self) -> bool:
+        return False
+
+
 @contextlib.contextmanager
 def _recorded_stream():
     log = []
@@ -223,7 +230,7 @@ class TestPhysicalReservation(_ConfigCase):
             self.assertEqual(swa.flush_opportunistic(), 0)
             self.assertEqual(moves, [])
 
-            load_done = object()
+            load_done = _Copy()
             allocator.set_hicache_transfer_done_event(H2D, load_done)
             # Queued: compaction waits on the copy, then relocates rows.
             self.assertGreater(swa._flush(urgent=True), 0)
@@ -367,8 +374,8 @@ class TestAllocationAndTransferOrder(_ConfigCase):
         expected_source = rows.seed(source, 100)
         expected_target = rows.seed(target, 200)
         allocator.free(gap)
-        allocator.set_hicache_transfer_done_event(D2H, object())
-        allocator.set_hicache_transfer_done_event(H2D, object())
+        allocator.set_hicache_transfer_done_event(D2H, _Copy())
+        allocator.set_hicache_transfer_done_event(H2D, _Copy())
 
         with _recorded_stream() as waits:
             fresh = allocator.alloc(2 * PAGE)

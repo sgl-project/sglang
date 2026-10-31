@@ -278,7 +278,8 @@ class Band:
     _capacity_epoch: int = 0
     watermark_physical: _CapacityField[int] = _CapacityField()
     live_page_count: _CapacityField[int] = _CapacityField()
-    _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
+    # Behind the `_free_phys_pages` property, which also tracks its host copy.
+    _free_pages: _CapacityField[torch.Tensor] = _CapacityField()
     # The owner's unminted virtual pages (None on a band that binds the owner's).
     free_virtual_ids: _CapacityField[Optional[torch.Tensor]] = _CapacityField()
 
@@ -369,11 +370,14 @@ class Band:
 
         # --- Lazy compaction state (all unused when lazy_compaction=False) ---
         # `_pending_reuse`: compaction-src pages whose remap completed but whose
-        #   reader event hasn't fired -- reusing one races a live READ.
+        #   reader forward hasn't retired -- reusing one races a live READ.
         # `live_page_count`: CPU slot-conservation counter, invariant under compaction.
         # KV copy and v2p/p2v remap both run on `schedule_stream`, so single-stream
         # ordering serializes them -- no separate copy-done event needed.
         self.lazy_compaction = lazy_compaction
+        # The host copy of `_free_phys_pages`, or None when unknown; see the
+        # property below.
+        self._free_pages_host: Optional[List[int]] = None
         self._free_phys_pages: torch.Tensor = torch.empty(
             0, dtype=torch.int64, device=device
         )
@@ -416,13 +420,20 @@ class Band:
         self.pin_sources: Tuple[Callable[[], bool], ...] = ()
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
         # (done_event, written virtual ids, or None when unknown) of every
-        # forward that may still be running, oldest first, for `_flush`'s
-        # write-race check. Forwards run in order on one stream, so the newest
-        # event covers them all. `_flush` materializes the write set lazily,
-        # avoiding a sync here.
+        # forward not yet retired, oldest first, for `_flush`'s write-race check.
+        # Forwards run in order on one stream, so the newest event covers them
+        # all. `_flush` materializes the write set lazily, avoiding a sync here.
         self._inflight_forwards: List[
             Tuple[torch.cuda.Event, Optional[torch.Tensor]]
         ] = []
+        # Recorded forwards in launch order. A forward retires when the scheduler
+        # processes its result, or when an urgent relief waits for it. Move and
+        # reuse decisions read retirement, never whether an event has fired, so
+        # every tensor-parallel rank makes the same ones; the GPU waits on the
+        # events themselves.
+        self._forward_seq = 0
+        self._retired_seq = 0
+        self._event_seq: Dict[Hashable, int] = {}
         self._hicache_transfer_done_events: Dict[Hashable, torch.cuda.Event] = {}
         # A host load's explicit pin: HiCache reserves physical pages during
         # load-back, then binds them into the tree before the H2D copy is
@@ -529,17 +540,115 @@ class Band:
         # `torch.cat` of the ranges destroys the shape the stride derivation needs.
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         self._inverse_history.clear()
-        self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._set_free_pages(
+            torch.empty(0, dtype=torch.int64, device=self.device), host=[]
+        )
         self._pending_reuse.clear()
         self._pending_reuse_pages_cpu.clear()
         self.live_page_count = 0
         self._inflight_forwards.clear()
         self._latest_forward_done_event = None
+        self._retired_seq = self._forward_seq
+        self._event_seq.clear()
         self._hicache_transfer_done_events.clear()
         self._load_pinned_pages = 0
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
+
+    # -- the free list on the host, and ordering after forwards --
+
+    @property
+    def _free_phys_pages(self) -> torch.Tensor:
+        """Free physical pages inside the band, the list allocation and the
+        flush take from."""
+        return self._free_pages
+
+    @_free_phys_pages.setter
+    def _free_phys_pages(self, pages: torch.Tensor) -> None:
+        # A list rebuilt on the device is no longer known on the host.
+        self._free_pages = pages
+        self._free_pages_host = None
+
+    def _set_free_pages(
+        self, pages: torch.Tensor, *, host: Optional[List[int]]
+    ) -> None:
+        """Rebind the free list together with its host copy, in the same order."""
+        self._free_pages = pages
+        self._free_pages_host = host
+
+    def _free_pages_snapshot(self) -> List[int]:
+        """The free list on the host. Reads the device only when the host copy
+        is unknown; callers must not mutate the returned list."""
+        if self._free_pages_host is None:
+            self._free_pages_host = self._free_pages.tolist()
+        return self._free_pages_host
+
+    def _to_device(self, host_ids: List[int]) -> torch.Tensor:
+        """Page ids planned on the host, as a device tensor, through pinned
+        memory and without blocking: a pageable copy first synchronizes the
+        stream, which after a forward wait parks the host until that forward
+        ends."""
+        pinned = torch.device(self.device).type == "cuda"
+        return torch.tensor(host_ids, dtype=torch.int64, pin_memory=pinned).to(
+            self.device, non_blocking=True
+        )
+
+    def _chain_bands(self) -> List[Band]:
+        """This band and every chain neighbour reachable through the peers."""
+        bands = [self]
+        for side in ("low_peer", "high_peer"):
+            band = getattr(self, side)
+            while band is not None and all(band is not b for b in bands):
+                bands.append(band)
+                band = getattr(band, side)
+        return bands
+
+    def _wait_on_stream(self, event) -> None:
+        """Order the current stream's later work after ``event``, without
+        blocking the host. A host read issued after such a wait parks the host
+        until the event fires, so every chain band's free list is read first.
+        Whether the event has fired decides only whether a wait is needed,
+        never a layout."""
+        if event.query():
+            return
+        for band in self._chain_bands():
+            band._free_pages_snapshot()
+        torch.cuda.current_stream().wait_event(event)
+
+    def _register_forward(self, event) -> None:
+        if event is not None and event not in self._event_seq:
+            self._forward_seq += 1
+            self._event_seq[event] = self._forward_seq
+
+    def _retired(self, event) -> bool:
+        """Whether the forward that recorded ``event`` has retired. The band
+        forgets retired events, so an unknown event is a retired one."""
+        if event is None:
+            return True
+        return self._event_seq.get(event, 0) <= self._retired_seq
+
+    def retire_forward(self, event) -> None:
+        """The scheduler processed this forward's result: it, and every forward
+        recorded before it, retires."""
+        seq = self._event_seq.get(event)
+        if seq is None or seq <= self._retired_seq:
+            return
+        self._retired_seq = seq
+        self._event_seq = {
+            e: s
+            for e, s in self._event_seq.items()
+            if s > seq or e in self._pending_reuse
+        }
+        self._prune_inflight_forwards()
+
+    def _retire_through(self, event) -> None:
+        """Retire on a stream wait for ``event``: everything recorded up to it
+        ran before it on the forward stream."""
+        seq = self._event_seq.get(event)
+        if seq is not None and seq > self._retired_seq:
+            self._retired_seq = seq
+            self._prune_inflight_forwards()
 
     # -- size reporting --
 
@@ -1249,16 +1358,23 @@ class Band:
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
             self.live_page_count -= int(freed_p_pages.shape[0])
 
-    def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
+    def _release_phys_pages_batch(
+        self, pages: torch.Tensor, *, host: Optional[List[int]] = None
+    ) -> None:
         """Cat `pages` onto `_free_phys_pages`. `_flush` calls it only AFTER its
         trailing dst-slice, so `_free_phys_pages == holes_cpu` for the whole walk.
         No watermark / `live_page_count` change: vacated srcs re-enter as storage.
+        ``host``: the same pages on the host, keeping the free list's host copy.
         """
         if pages.numel() == 0:
             return
         self._stats_n_release_batch += 1
         with record_function("Band._release_phys_pages_batch"):
-            self._free_phys_pages = torch.cat([self._free_phys_pages, pages])
+            known = self._free_pages_host
+            self._set_free_pages(
+                torch.cat([self._free_phys_pages, pages]),
+                host=None if known is None or host is None else known + host,
+            )
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction: move survivors out of the vacated band into the holes
@@ -1399,10 +1515,11 @@ class Band:
     # -- lazy compaction primitives --
 
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
-        """Stash the most-recent forward's `forward_done` event; `_pending_reuse`
-        uses it to gate src reuse on read-path settling. None = no in-flight forward.
+        """Record the most-recent forward's `forward_done` event; `_pending_reuse`
+        gates src reuse on its retirement. None = no in-flight forward.
         """
         with record_function("Band.set_latest_forward_done_event"):
+            self._register_forward(event)
             self._latest_forward_done_event = event
 
     def set_inflight_forward(
@@ -1418,11 +1535,12 @@ class Band:
         launches the next microbatch before the previous one ends. Pass
         `written_virtual=None` when the forward writes nothing here, and
         ``writes_unknown`` when its write ids cannot be read before it ends:
-        nothing then moves until it does. No-op in eager mode.
+        nothing then moves until it retires. No-op in eager mode.
         """
         with record_function("Band.set_inflight_forward"):
             if not self.lazy_compaction:
                 return
+            self._register_forward(forward_done)
             self._prune_inflight_forwards()
             if writes_unknown:
                 self._inflight_forwards.append((forward_done, None))
@@ -1430,10 +1548,11 @@ class Band:
                 self._inflight_forwards.append((forward_done, written_virtual))
 
     def _prune_inflight_forwards(self) -> None:
-        """Drop the forwards that completed, so later checks in the same tick
-        don't re-query fired events."""
+        """Drop the forwards that retired."""
         self._inflight_forwards = [
-            inflight for inflight in self._inflight_forwards if not inflight[0].query()
+            inflight
+            for inflight in self._inflight_forwards
+            if not self._retired(inflight[0])
         ]
 
     def _materialize_inflight_write_set(self) -> Optional[Set[int]]:
@@ -1530,9 +1649,11 @@ class Band:
             pass
 
     def _drain_pending_reuse(self, *, urgent: bool) -> None:
-        """Move ready `_pending_reuse` entries back into `_free_phys_pages`.
-        Urgent uses `stream.wait_event` on unfired events -- a stream-side
-        dependency, not a host block. No watermark / `live_page_count` change.
+        """Move ready `_pending_reuse` entries back into `_free_phys_pages`: those
+        whose reader forward retired, and every entry when urgent. The stream
+        waits each one's event -- a stream-side dependency, not a host block (a
+        retired forward can still be running its tail). No watermark /
+        `live_page_count` change.
         """
         self._stats_n_drain_calls += 1
         if not self._pending_reuse:
@@ -1541,11 +1662,10 @@ class Band:
             ready_tensors: List[torch.Tensor] = []
             ready_entries: List[Tuple[torch.cuda.Event, List[int]]] = []
             for event, (cpu_list, gpu_batches) in self._pending_reuse.items():
-                if event is None or event.query():
-                    ready_tensors.extend(gpu_batches)
-                    ready_entries.append((event, cpu_list))
-                elif urgent:
-                    torch.cuda.current_stream().wait_event(event)
+                if urgent or self._retired(event):
+                    if event is not None:
+                        self._wait_on_stream(event)
+                        self._retire_through(event)
                     ready_tensors.extend(gpu_batches)
                     ready_entries.append((event, cpu_list))
 
@@ -1554,8 +1674,14 @@ class Band:
                 self._pending_reuse_pages_cpu.difference_update(cpu_list)
 
             if ready_tensors:
-                self._free_phys_pages = torch.cat(
-                    [self._free_phys_pages] + ready_tensors
+                host = self._free_pages_host
+                self._set_free_pages(
+                    torch.cat([self._free_phys_pages] + ready_tensors),
+                    host=(
+                        None
+                        if host is None
+                        else host + [p for _, cpu in ready_entries for p in cpu]
+                    ),
                 )
                 self._stats_n_drain_did_work += 1
                 self._stats_n_drained_pages_total += sum(
@@ -1626,13 +1752,13 @@ class Band:
                 n += 1
             new_wm = wm - n
             holes_cpu = all_cpu[: M - n]
-            self._free_phys_pages = self._free_phys_pages[: M - n]
+            self._set_free_pages(self._free_phys_pages[: M - n], host=holes_cpu)
         else:
             while n < M and all_cpu[n] == wm + 1 + n:
                 n += 1
             new_wm = wm + n
             holes_cpu = all_cpu[n:]
-            self._free_phys_pages = self._free_phys_pages[n:]
+            self._set_free_pages(self._free_phys_pages[n:], host=holes_cpu)
         self.watermark_physical = new_wm
         self._stats_n_pages_absorbed += n
         return new_wm, holes_cpu
@@ -1640,11 +1766,13 @@ class Band:
     def _settle_inflight_forward(self) -> None:
         """Stream-wait the in-flight forward's done event so freed slots are safe
         to MOVE (write settled) and REUSE (read settled): the event is recorded
-        after the WHOLE forward, so one wait covers both hazards.
+        after the WHOLE forward, so one wait covers both hazards. Every recorded
+        forward retires: all ran before it on the forward stream.
         """
         ev = self._latest_forward_done_event
         if ev is not None:
-            torch.cuda.current_stream().wait_event(ev)
+            self._wait_on_stream(ev)
+            self._retired_seq = self._forward_seq
             self._inflight_forwards.clear()
 
     def _flush(self, *, urgent: bool) -> int:
@@ -1678,11 +1806,12 @@ class Band:
         with record_function("Band._flush"):
             self._drain_pending_reuse(urgent=urgent)
 
-            # Sort ASCENDING.
-            if self._free_phys_pages.numel() > 1:
-                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
-
-            all_cpu = self._free_phys_pages.tolist()  # one batched D2H sync
+            # Sort ASCENDING, on the host: a device sort would drop the host copy,
+            # and reading it back after a forward wait blocks.
+            all_cpu = self._free_pages_snapshot()  # at most one batched D2H sync
+            if any(a > b for a, b in zip(all_cpu, all_cpu[1:])):
+                all_cpu = sorted(all_cpu)
+                self._set_free_pages(self._to_device(all_cpu), host=all_cpu)
 
             # `holes_cpu` = interior holes; `_free_phys_pages == holes_cpu` after.
             new_wm, holes_cpu = self._absorb_boundary_holes(all_cpu)
@@ -1708,7 +1837,7 @@ class Band:
             # trailing dst-slice so `_free_phys_pages` stays byte-identical to
             # `holes_cpu` for the whole walk; catting mid-flush would chop the
             # wrong end. Event-PENDING srcs still route to `_pending_reuse`.
-            released_fired: List[torch.Tensor] = []
+            released_fired: List[Tuple[torch.Tensor, List[int]]] = []
 
             cursor: Optional[int] = None
             j_cursor: Optional[int] = None
@@ -1748,9 +1877,9 @@ class Band:
                         srcs.clear()
                         dsts.clear()
                         if self._inflight_forwards:
-                            torch.cuda.current_stream().wait_event(
-                                self._inflight_forwards[-1][0]
-                            )
+                            newest = self._inflight_forwards[-1][0]
+                            self._wait_on_stream(newest)
+                            self._retire_through(newest)
                             self._inflight_forwards.clear()
                         write_set = set()  # forward drained -> no race
                         latest_event = None
@@ -1801,21 +1930,26 @@ class Band:
                 else:
                     self.watermark_physical = new_wm + n_reclaimed
                 self._stats_n_pages_absorbed += n_reclaimed
-                self._free_phys_pages = self._free_phys_pages[:0]
+                self._set_free_pages(self._free_phys_pages[:0], host=[])
             else:
                 # Non-urgent partial pass: the watermark stays. `_free_phys_pages`
                 # is still == holes_cpu, so the consumed dsts are exactly the front
                 # (grow-up) / back (grow-down) `n_dst_consumed` entries.
                 if n_dst_consumed > 0:
                     if self.grow_direction == "up":
-                        self._free_phys_pages = self._free_phys_pages[n_dst_consumed:]
+                        self._set_free_pages(
+                            self._free_phys_pages[n_dst_consumed:],
+                            host=holes_cpu[n_dst_consumed:],
+                        )
                     else:
-                        self._free_phys_pages = self._free_phys_pages[:-n_dst_consumed]
+                        self._set_free_pages(
+                            self._free_phys_pages[:-n_dst_consumed],
+                            host=holes_cpu[:-n_dst_consumed],
+                        )
                 if released_fired:
                     self._release_phys_pages_batch(
-                        released_fired[0]
-                        if len(released_fired) == 1
-                        else torch.cat(released_fired)
+                        torch.cat([pages for pages, _ in released_fired]),
+                        host=[p for _, host in released_fired for p in host],
                     )
             if n_moves > 0:
                 self._stats_n_flush_did_work += 1
@@ -1828,12 +1962,12 @@ class Band:
         srcs: List[int],
         dsts: List[int],
         latest_event: Optional[torch.cuda.Event],
-        released_fired: List[torch.Tensor],
+        released_fired: List[Tuple[torch.Tensor, List[int]]],
     ) -> None:
         """Issue the page copies (`_move_pages`) plus ONE bulk v2p/p2v remap for
-        the accumulated `(src, dst)` pairs. Fired srcs accumulate in
-        `released_fired` (merged by `_flush` after its dst-slice); event-pending
-        srcs route to `_pending_reuse` for read-race gating.
+        the accumulated `(src, dst)` pairs. Srcs whose readers retired accumulate
+        in `released_fired` (merged by `_flush` after its dst-slice); the others
+        route to `_pending_reuse` for read-race gating.
         """
         if not srcs:
             return
@@ -1841,8 +1975,8 @@ class Band:
             f"[{self.sub_pool_name}] page copy while the band is pinned"
         )
         with record_function("Band._commit_move_batch"):
-            src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
-            dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
+            src_pages_t = self._to_device(srcs)
+            dst_pages_t = self._to_device(dsts)
             v_moveds_t = self.ids.physical_to_virtual[src_pages_t]
             torch._assert_async(
                 (v_moveds_t >= 0).all(),
@@ -1857,9 +1991,11 @@ class Band:
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
             # Src disposition. `src_pages_t` is reused as the `_pending_reuse` GPU
             # tensor (no second H2D at drain).
-            event_fired = latest_event is None or latest_event.query()
-            if event_fired:
-                released_fired.append(src_pages_t)
+            if self._retired(latest_event):
+                if latest_event is not None:
+                    # A retired forward can still run its tail; reuse after it.
+                    self._wait_on_stream(latest_event)
+                released_fired.append((src_pages_t, list(srcs)))
             else:
                 cpu_list, gpu_batches = self._pending_reuse.setdefault(
                     latest_event, ([], [])
@@ -1945,11 +2081,10 @@ class Band:
         its finish event is observed, so allocation never reuses them."""
         if not self._hicache_transfer_done_events:
             return
-        current_stream = torch.cuda.current_stream()
         events = tuple(self._hicache_transfer_done_events.values())
         self._hicache_transfer_done_events.clear()
         for event in events:
-            current_stream.wait_event(event)
+            self._wait_on_stream(event)
 
     def _expand_pages_to_tokens(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:
@@ -2397,7 +2532,7 @@ class FloatBand(Band):
             return 0
         self._holes_dirty = False
         before = self._span_pages()
-        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        holes = set(self._free_pages_snapshot())
         changed = False
         while self.low_wm_page in holes:
             holes.remove(self.low_wm_page)
@@ -2408,9 +2543,8 @@ class FloatBand(Band):
             self.high_wm_page -= 1
             changed = True
         if changed:
-            self._free_phys_pages = torch.tensor(
-                sorted(holes), dtype=torch.int64, device=self.device
-            )
+            remaining = sorted(holes)
+            self._set_free_pages(self._to_device(remaining), host=remaining)
         return before - self._span_pages()
 
     # -- on-demand data movement --
@@ -2423,8 +2557,9 @@ class FloatBand(Band):
         means the ask is impossible now or movement is gated, and state is then
         unchanged.
         Scheduler-phase only; stream safety is owned HERE, not by the caller --
-        the entry settles the in-flight forward before the first copy. Moves at
-        most min(L_live, G) pages: every live page when the ask exceeds them.
+        the in-flight forward is settled right before the first copy, after the
+        plan is read and built on the host. Moves at most min(L_live, G) pages:
+        every live page when the ask exceeds them.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
         epp = self.entry_bytes_per_page
@@ -2432,9 +2567,6 @@ class FloatBand(Band):
         gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
         if self.moves_blocked():
             return gap_side_bytes
-        # Order the copies after the in-flight forward, or they carry pre-write
-        # bytes; one wait covers read AND write (the event is post-forward).
-        self._settle_inflight_forward()
         lo, hi = self._region_bounds_pages()
         if gap_side_bytes >= min_bytes or self._is_frontier_transparent():
             return gap_side_bytes
@@ -2447,7 +2579,7 @@ class FloatBand(Band):
 
         need_pages = (min_bytes - gap_side_bytes + epp - 1) // epp
 
-        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        holes = set(self._free_pages_snapshot())
         span = range(self.low_wm_page, self.high_wm_page)
         live_pages_sorted = [p for p in span if p not in holes]
 
@@ -2495,13 +2627,12 @@ class FloatBand(Band):
                 dsts += list(range(self.high_wm_page, self.high_wm_page + n_fresh))
 
         if srcs:
-            self._move_pages_and_rebind(
-                torch.tensor(srcs, dtype=torch.int64, device=self.device),
-                torch.tensor(dsts, dtype=torch.int64, device=self.device),
-            )
-            self.ids.physical_to_virtual.index_fill_(
-                0, torch.tensor(srcs, dtype=torch.int64, device=self.device), -1
-            )
+            src_t, dst_t = self._to_device(srcs), self._to_device(dsts)
+            # Order the copies after the in-flight forward, or they carry pre-write
+            # bytes; one wait covers read AND write (the event is post-forward).
+            self._settle_inflight_forward()
+            self._move_pages_and_rebind(src_t, dst_t)
+            self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
 
         # Reconstruct the span from final live positions: everything between
         # the extremes is span; non-live pages inside are holes.
@@ -2514,9 +2645,7 @@ class FloatBand(Band):
             for p in range(self.low_wm_page, self.high_wm_page)
             if p not in final_live_set
         ]
-        self._free_phys_pages = torch.tensor(
-            new_holes, dtype=torch.int64, device=self.device
-        )
+        self._set_free_pages(self._to_device(new_holes), host=new_holes)
         self._holes_dirty = True  # the span moved; re-check its boundaries
         self._absorb_span_boundary_holes()
 
@@ -2535,12 +2664,10 @@ class FloatBand(Band):
             src_set = {s for s, _ in pairs}
             dst_set = {d for _, d in pairs}
             if src_set.isdisjoint(dst_set):
-                src_t = torch.tensor(
-                    [s for s, _ in pairs], dtype=torch.int64, device=self.device
-                )
-                dst_t = torch.tensor(
-                    [d for _, d in pairs], dtype=torch.int64, device=self.device
-                )
+                src_t = self._to_device([s for s, _ in pairs])
+                dst_t = self._to_device([d for _, d in pairs])
+                # Settle right before the first copy -- see `make_room`.
+                self._settle_inflight_forward()
                 self._move_pages_and_rebind(src_t, dst_t)
                 self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
             else:
@@ -2551,14 +2678,11 @@ class FloatBand(Band):
                 ordered = [pair for pair in pairs if pair[1] < pair[0]] + [
                     pair for pair in reversed(pairs) if pair[1] > pair[0]
                 ]
-                # Built ONCE: `torch.tensor(..., device=cuda)` in the loop is a
-                # pageable H2D per page, and a shift can span the whole pool.
-                src_all = torch.tensor(
-                    [s for s, _ in ordered], dtype=torch.int64, device=self.device
-                )
-                dst_all = torch.tensor(
-                    [d for _, d in ordered], dtype=torch.int64, device=self.device
-                )
+                # Built ONCE: a copy per page in the loop is an H2D per page, and
+                # a shift can span the whole pool.
+                src_all = self._to_device([s for s, _ in ordered])
+                dst_all = self._to_device([d for _, d in ordered])
+                self._settle_inflight_forward()
                 for i in range(len(ordered)):
                     s_t, d_t = src_all[i : i + 1], dst_all[i : i + 1]
                     self._move_pages_and_rebind(s_t, d_t)
@@ -2568,7 +2692,9 @@ class FloatBand(Band):
             self.high_wm_page = final[-1] + 1
         else:
             self._reset_watermarks()
-        self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
+        self._set_free_pages(
+            torch.empty(0, dtype=torch.int64, device=self.device), host=[]
+        )
         return len(pairs)
 
     def _byte_accounting_violations(self) -> List[str]:
@@ -2622,9 +2748,8 @@ class FloatBand(Band):
         assert retreat_side in ("low", "high")
         if self.moves_blocked() or self._hole_pages() == 0:
             return 0
-        # Settle before the first copy -- see `make_room`.
-        self._settle_inflight_forward()
-        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        # `_relocate_to_positions` settles before its first copy.
+        holes = set(self._free_pages_snapshot())
         live_sorted = [
             p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes
         ]
