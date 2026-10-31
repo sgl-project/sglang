@@ -264,6 +264,10 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
+      // GB300 MoE runner: flashinfer_trtllm (FlashInfer's fused MXFP8 MoE)
+      // replaces deep_gemm — requires the first FlashInfer release containing
+      // flashinfer-ai/flashinfer#8042; see the MoE-runner Note in the M3 page
+      // for the measured gains and the current-release caveat.
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -274,7 +278,7 @@ sgl-eval run mmmu_pro \\
         "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
-        "--moe-runner-backend deep_gemm",
+        "--moe-runner-backend flashinfer_trtllm",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.75",
         "--host {{HOST_IP}}",
