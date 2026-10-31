@@ -1,4 +1,4 @@
-"""Breakable CUDA graph must survive tensor parallelism.
+"""Breakable CUDA graph must register legacy custom all-reduce inputs under TP.
 
 With ``--tp-size > 1`` every ``RowParallelLinear`` issues a per-block all-reduce
 that lands *inside* a captured BCG segment (BCG's break points are the attention
@@ -107,6 +107,8 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
 
         env = os.environ.copy()
         env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+        # this regression checks the legacy implementation's graph registration
+        env["SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"] = "0"
 
         try:
             result = subprocess.run(
