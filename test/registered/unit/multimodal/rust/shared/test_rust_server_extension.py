@@ -3,9 +3,9 @@
 import json
 import os
 import pickle
-import threading
 import unittest
 from array import array
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
@@ -1065,9 +1065,8 @@ class TestRustServerExtension(CustomTestCase):
                 ModelServer.launch(scheduler)
             masks["scheduler"] = os.sched_getaffinity(0)
 
-        thread = threading.Thread(target=launch)
-        thread.start()
-        thread.join()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(launch).result()
 
         self.assertEqual(masks["mm"], set(server_cores))
         self.assertEqual(masks["scheduler"], full_mask)

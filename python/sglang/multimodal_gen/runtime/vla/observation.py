@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.srt.multimodal.cache.digest import structured_digest
 
 
 @dataclass
@@ -24,10 +24,8 @@ class VLAObservationBatch:
 
 
 def tensor_fingerprint(tensor: torch.Tensor) -> str:
-    """Hash tensor content with SRT's CPU/CUDA implementation."""
-
-    shape = ",".join(str(dim) for dim in tensor.shape)
-    return f"{tensor.dtype}:{shape}:{tensor_hash(tensor):016x}"
+    """Keep the full typed identity for exact-match observation KV reuse."""
+    return structured_digest(tensor).hex()
 
 
 def collate_vla_observation_batches(

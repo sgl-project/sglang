@@ -346,7 +346,7 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
 def test_multimodal_static_cache_reuses_precomputed_combined_hash(monkeypatch):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
-    item_hashes = [item.hash for item in items]
+    item_hashes = [item.cache_key for item in items]
     combined_hash = mm_schedule.MultiModalStaticCache.combine_hashes(item_hashes)
     expected = torch.ones((sum(_num_tokens(item) for item in items), HIDDEN))
     mm_schedule.embedding_cache.set(

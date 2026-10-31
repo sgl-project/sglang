@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
+import sglang.srt.multimodal.cache.digest as digest_module
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05CoreModel,
@@ -339,6 +340,32 @@ def test_prefix_cache_key_distinguishes_bucket_layouts_and_mask_holes():
 
     assert exact != bucketed
     assert model.build_prefix_cache_key(first) != model.build_prefix_cache_key(second)
+
+
+def test_prefix_cache_key_retains_the_digest_suffix(monkeypatch):
+    """A shared 64-bit digest prefix must not reuse another observation's KV."""
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    model.config = Pi05PipelineConfig()
+    model.dtype = torch.bfloat16
+    model.model_path = "lerobot/pi05_base"
+    observation = SimpleNamespace(
+        metadata={"camera_order": ("front",)},
+        images={"front": torch.zeros(1, 3, 2, 2)},
+        image_masks={"front": torch.tensor(True)},
+        tokens=torch.tensor([[1, 2]]),
+        token_masks=torch.tensor([[True, True]]),
+    )
+    keys = []
+    for suffix in (b"a", b"b"):
+        # inject full digests with identical leading bytes, not real BLAKE3 collisions
+        digest = b"x" * 31 + suffix
+        monkeypatch.setattr(
+            digest_module.blake3,
+            "blake3",
+            lambda *args, **kwargs: SimpleNamespace(digest=lambda: digest),
+        )
+        keys.append(model.build_prefix_cache_key(observation))
+    assert keys[0] != keys[1]
 
 
 def test_bucket_miss_keeps_action_denoise_eager():
