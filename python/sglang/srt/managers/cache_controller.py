@@ -31,6 +31,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     count_pool_hits,
 )
+from sglang.srt.mem_cache.unified_cache.storage_agreement import (
+    LocalQueryOutcomeMixin,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -272,7 +275,10 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchOperation(StorageOperation, LocalQueryOutcomeMixin):
+    # The base controller stages the KV pool only; hybrid adds sidecar pools.
+    pool_transfers: Optional[List[PoolTransfer]] = None
+
     def __init__(
         self,
         request_id: str,
@@ -285,6 +291,9 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
+        # The query's own verdict per pool (page count); the base controller
+        # queries the KV pool only, so this stays empty here.
+        self.query_pool_hit_pages: dict[PoolName, int] = {}
         self.start_time = time.monotonic()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
@@ -351,6 +360,11 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        # Storage worker threads, started by _start_storage_threads.
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.prefetch_sync_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
 
         # Storage control queues, (re)created whenever the storage threads start.
         self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
@@ -512,15 +526,19 @@ class HiCacheController:
             pass
 
         # Best-effort joins (threads are daemon, but join keeps state clean).
-        threads = []
-        if hasattr(self, "prefetch_thread"):
-            threads.append(self.prefetch_thread)
-        if hasattr(self, "backup_thread"):
-            threads.append(self.backup_thread)
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
-        if hasattr(self, "prefetch_sync_thread"):
-            threads.append(self.prefetch_sync_thread)
+        threads = [
+            thread
+            for thread in (
+                getattr(self, name, None)
+                for name in (
+                    "prefetch_thread",
+                    "backup_thread",
+                    "prefetch_io_aux_thread",
+                    "prefetch_sync_thread",
+                )
+            )
+            if thread is not None
+        ]
 
         for t in threads:
             try:
@@ -539,6 +557,17 @@ class HiCacheController:
     # A subclass whose attach continues registering host pools after super()
     # returns fires on_host_pools_registered() itself, once.
     _registers_host_pools_after_super_attach = False
+
+    # Set by the tree cache when its scheduler-thread engine agrees hit queries
+    # across ranks: the query worker then records local outcomes instead of
+    # reducing them itself (the PP ticket path keeps the worker reduce).
+    scheduler_agrees_queries = False
+
+    def storage_query_worker_alive(self) -> bool:
+        """Whether this backend can still answer hit queries. A backend without
+        a query thread (a native controller) always can."""
+        thread = self.prefetch_thread
+        return thread is None or thread.is_alive()
 
     def attach_storage_backend(
         self,
@@ -1448,6 +1477,17 @@ class HiCacheController:
                         operation.request_id,
                     )
                     hash_value, storage_hit_count = [], 0
+
+                if self.scheduler_agrees_queries:
+                    # The scheduler thread agrees this verdict with the other
+                    # ranks and publishes it in submission order. A failed
+                    # query is a miss without pool verdicts: nothing heals.
+                    operation.publish_local_query(
+                        storage_hit_count // self.page_size,
+                        operation.query_pool_hit_pages,
+                        operation.local_restorable_pages(),
+                    )
+                    continue
 
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
