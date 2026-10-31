@@ -82,8 +82,11 @@ class SchedulerKvEventsPublisher:
         kv_metrics.num_requests_waiting = self.get_stats().num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.get_stats().token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.get_stats().cache_hit_rate
-        kv_metrics.data_parallel_rank = (
-            get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
+        parallel = get_parallel()
+        kv_metrics.data_parallel_rank = select_kv_publisher_dp_rank(
+            parallel.attn_dp_size,
+            parallel.attn_dp_rank,
+            parallel.dp_rank,
         )
 
         if not self.send_metrics_from_scheduler.closed:

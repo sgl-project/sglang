@@ -1393,7 +1393,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if parallel.dp_rank is not None:
+            if getattr(parallel, "attn_dp_size", 1) > 1:
+                labels["dp_rank"] = parallel.attn_dp_rank
+            elif parallel.dp_rank is not None:
                 labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
