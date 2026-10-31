@@ -974,15 +974,18 @@ def build_dense_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    model_head_dim: int | None = None,
 ) -> DenseAttentionFixture:
     seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    # A hybrid model (Gemma-4: 256-wide SWA layers, 512-wide global layers)
+    # declares its widest head model-wide; the layer under test may be narrower.
     model_config = TinyModelConfig(
         num_heads=case.num_heads,
         num_kv_heads=case.num_kv_heads,
-        head_dim=head_dim,
+        head_dim=model_head_dim or head_dim,
         hidden_size=hidden_size,
         context_len=max_context_len,
         sliding_window_size=case.sliding_window_size,
@@ -1275,6 +1278,7 @@ def run_dense_attention_case(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
     loc_layout: str = "shuffled_pages",
+    model_head_dim: int | None = None,
 ):
     fixture = build_dense_attention_fixture(
         testcase,
@@ -1285,6 +1289,7 @@ def run_dense_attention_case(
         dtype=dtype,
         device=device,
         loc_layout=loc_layout,
+        model_head_dim=model_head_dim,
     )
     actual = run_dense_fixture_eager(fixture)
     expected = expected_dense_fixture_output(fixture)
