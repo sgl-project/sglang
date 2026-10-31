@@ -128,3 +128,46 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("ue8m0", [False, True])
+def test_lmcache_namespace_names_a_ue8m0_index_cache(cache_class, ue8m0):
+    def parent_init(self, params):
+        self.__dict__.update(
+            token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+            req_to_token_pool=None,
+            tree_core=SimpleNamespace(page_size=64),
+            tree_components=(),
+            _sliding_window_size=None,
+        )
+
+    connector = cache_class.__init__.__globals__["UnifiedLMCacheMPConnector"]
+    connector.reset_mock()
+    model_config = SimpleNamespace(model_path="org/model")
+    params = SimpleNamespace(
+        token_to_kv_pool_allocator=mock.Mock(),
+        tp_cache_group=None,
+        pp_size=1,
+        pp_rank=0,
+        pp_cache_group=None,
+    )
+    with (
+        mock.patch.object(UnifiedRadixCache, "__init__", parent_init),
+        mock.patch.object(cache_class, "_find_mamba_component", return_value=None),
+        mock.patch(
+            "sglang.srt.layers.attention.dsa.utils.index_k_cache_is_ue8m0",
+            return_value=ue8m0,
+        ),
+        mock.patch("atexit.register"),
+    ):
+        cache_class(
+            params,
+            model_config=model_config,
+            tp_size=1,
+            tp_rank=0,
+            lmcache_config_file=None,
+            forward_stream=None,
+        )
+    stored = connector.call_args.kwargs["model_config"].model_path
+    assert stored == ("org/model-index_k-ue8m0" if ue8m0 else "org/model")
+    assert model_config.model_path == "org/model"

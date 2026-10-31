@@ -400,8 +400,8 @@ def _row_chunks(*, rows_per_chunk, num_rows, num_cols, device):
 def _fake_deep_gemm():
     # Logits carry each row's weight, so a mis-offset q/weights slice shows up.
     return SimpleNamespace(
-        fp8_mqa_logits=lambda q, kv, w, ks, ke, clean_logits: (
-            w[:, :1].expand(q.shape[0], kv[0].shape[0]).clone()
+        fp8_fp4_mqa_logits=lambda q, kv, w, ks, ke, max_seqlen_k: (
+            w[:, :1].expand(q.shape[0], max_seqlen_k).clone()
         )
     )
 
@@ -462,11 +462,12 @@ def _chunk_backend(*, topk, index_topk=4, index_kpool=4):
         alt_stream=None,
         _topk_from_kpool_logits=topk,
         _get_index_k_read_buffer=lambda pool, layer_id: None,
-        _fp8_mqa_logits=IndexerKPool._fp8_mqa_logits,
+        _aiter_mqa_logits=IndexerKPool._aiter_mqa_logits,
+        mx_mqa_logits=False,
+        ue8m0_index_cache=False,
     )
-    backend._kpool_topk_by_row_chunks = MethodType(
-        IndexerKPool._kpool_topk_by_row_chunks, backend
-    )
+    for name in ("_kpool_topk_by_row_chunks", "_fp8_mqa_logits"):
+        setattr(backend, name, MethodType(getattr(IndexerKPool, name), backend))
     return backend
 
 
@@ -495,7 +496,9 @@ def _refuse_deep_gemm(*args, **kwargs):
 @contextmanager
 def _chunking_patches(*, rows_per_chunk, kv_pool, rocm=False):
     deep_gemm = (
-        SimpleNamespace(fp8_mqa_logits=_refuse_deep_gemm) if rocm else _fake_deep_gemm()
+        SimpleNamespace(fp8_fp4_mqa_logits=_refuse_deep_gemm)
+        if rocm
+        else _fake_deep_gemm()
     )
     with ExitStack() as stack:
         # deep_gemm is bound only under `if is_cuda()`, so create it on CPU.

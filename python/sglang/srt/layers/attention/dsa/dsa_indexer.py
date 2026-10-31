@@ -15,12 +15,18 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     prepare_aiter_rope_caches,
 )
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
+    IndexKScaleFmt,
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    mx_kv_scale,
+    pack_ue8m0_x4,
+    uses_mx_mqa_logits,
+)
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
     dcp_split_rows,
@@ -37,7 +43,9 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    _use_torch_mqa_logits,
     aiter_can_use_preshuffle_paged_mqa,
+    dsa_index_k_cache_is_ue8m0,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
     hadamard_preserved,
@@ -56,6 +64,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
     mqa_logits_free_mem_fraction,
+    mqa_logits_ragged_budget_cols,
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
@@ -424,6 +433,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
+        # SM100 DeepGEMM reads MXFP8, so index-K scales are powers of two there and
+        # are stored as packed UE8M0 when DeepGEMM reads the paged cache
+        self.mx_mqa_logits = _is_cuda and uses_mx_mqa_logits(get_device().device)
+        self.ue8m0_index_cache = dsa_index_k_cache_is_ue8m0(kpool=False)
+        self.index_k_scale_fmt = self.scale_fmt or (
+            "ue8m0" if self.mx_mqa_logits else None
+        )
+        self.index_k_cache_fmt = (
+            IndexKScaleFmt.UE8M0
+            if self.ue8m0_index_cache
+            else IndexKScaleFmt.POW2
+            if self.mx_mqa_logits
+            else IndexKScaleFmt.FP32
         )
 
         # gfx950 fused decode indexer. All three conditions below must hold; the
@@ -1051,6 +1074,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     self._indexer_cos_sin_cache,
                     positions if rows is None else positions.index_select(0, rows),
                     page_size,
+                    k_scale_fmt=self.index_k_cache_fmt,
                 )
             return
 
@@ -1277,10 +1301,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
-        use_cute_dsl = (
-            self.paged_mqa_logits_backend.is_cutedsl()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
-        )
+        use_cute_dsl = self.paged_mqa_logits_backend.is_cutedsl()
+        draft_extend = forward_batch.forward_mode.is_draft_extend_v2()
         dsl_expand_factor, dsl_atom = 1, 1
         if (
             use_cute_dsl
@@ -1297,6 +1319,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 num_heads=self.n_heads,
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        if self.mx_mqa_logits and not use_cute_dsl and not _use_torch_mqa_logits():
+            assert self.ue8m0_index_cache, (
+                "SM100 DeepGEMM paged MQA logits need the UE8M0 index cache, which "
+                "only the deepgemm paged backend writes"
+            )
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
@@ -1322,9 +1349,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
-                    seqlens_32_2d, blocksize, self.sm_count
-                )
+                schedule_metadata = resolve_paged_mqa_logits_metadata_fn(
+                    cutedsl=use_cute_dsl
+                )(seqlens_32_2d, blocksize, self.sm_count)
 
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size
@@ -1405,23 +1432,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 clean_logits=False,
             )
         elif use_cute_dsl:
+            # Draft extend scores one row per query token, as the DeepGEMM split path does
             logits = cutedsl_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                metadata.get_seqlens_int32(),
+                (
+                    seqlens_32.reshape(-1)[:q_offset]
+                    if draft_extend
+                    else metadata.get_seqlens_int32()
+                ),
                 block_tables,
-                schedule_metadata,
+                None if draft_extend else schedule_metadata,
                 max_seq_len,
                 q_offset=q_offset,
-                B=B,
-                next_n=next_n,
+                B=q_offset if draft_extend else B,
+                next_n=1 if draft_extend else next_n,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 dsl_expand_factor=dsl_expand_factor,
                 dsl_atom=dsl_atom,
                 blocksize=blocksize,
                 sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
+                get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(
+                    cutedsl=True
+                ),
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
@@ -1562,7 +1596,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
+        k_scale = k_scale.view(
+            torch.int32 if self.ue8m0_index_cache else torch.float32
+        ).squeeze(-1)
+        if self.mx_mqa_logits and not _use_torch_mqa_logits():
+            k_scale = mx_kv_scale(k_scale)
         kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
@@ -1570,6 +1608,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        budget_cols = mqa_logits_ragged_budget_cols(
+            k_offset,
+            mx=self.mx_mqa_logits,
+            deep_gemm=_is_cuda and not _use_torch_mqa_logits(),
+        )
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
@@ -1588,7 +1631,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             row_lo, row_hi = 0, q_offset
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
-            num_cols=k_offset,
+            num_cols=budget_cols,
             get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
             rocm=_is_hip,
         )
@@ -1644,7 +1687,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         max_rows = max(1, row_hi - row_lo)
         if need_chunk:
-            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+            bytes_per_row = budget_cols * self._MQA_LOGITS_BYTES_PER_ELEM
             max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
             max_rows = min(max_rows, q_offset)
 
@@ -1873,6 +1916,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     buf,
                     loc,
                     pool.index_page_size,
+                    k_scale_fmt=self.index_k_cache_fmt,
                 )
             return
 
@@ -1900,7 +1944,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Fallback: original path
         assert act_quant is not None
-        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+        k_fp8, k_scale = act_quant(key, self.block_size, self.index_k_scale_fmt)
+        if self.ue8m0_index_cache:
+            k_scale = pack_ue8m0_x4(k_scale).view(torch.float32)
 
         if not out_cache_loc.is_contiguous():
             out_cache_loc = out_cache_loc.contiguous()

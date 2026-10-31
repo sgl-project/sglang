@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     kpool_assemble_softmax_rotate_write_cache,
@@ -163,7 +164,6 @@ class TestDsaKpoolMultiPool(CustomTestCase):
             ),
             ape=ape,
             loc=torch.arange(expected_closed_pools, dtype=torch.int64, device="cuda"),
-            round_scale=False,
         )
 
         actual_cache = self._empty_cache()
@@ -187,7 +187,7 @@ class TestDsaKpoolMultiPool(CustomTestCase):
                 1, num_draft_tokens + 1, dtype=torch.int64, device="cuda"
             ),
             num_draft_tokens=num_draft_tokens,
-            round_scale=False,
+            k_scale_fmt=IndexKScaleFmt.FP32,
             effective_n_per_batch=torch.tensor(
                 [effective_n], dtype=torch.int32, device="cuda"
             ),

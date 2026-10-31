@@ -32,6 +32,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    dsv4_fp8_index_cache_is_ue8m0,
+    fp8_mqa_logits,
+    fp8_paged_mqa_logits,
+    mx_kv_scale,
+    uses_mx_mqa_logits,
+)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -714,10 +721,14 @@ class C4IndexerBackendMixin:
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         rows_per_chunk = None
         if indexer_metadata.mqa_logits_budget_bytes is not None:
-            # fp8_mqa_logits allocates [query_rows, align256(max_seqlen_k)] fp32.
+            # fp8_mqa_logits allocates [query_rows, align256(max_seqlen_k)] fp32,
+            # after DeepGEMM's BF16 logits on SM100.
+            row_bytes = mqa_logits_row_bytes(max_seqlen_k)
+            if uses_mx_mqa_logits(page_table.device):
+                row_bytes = row_bytes * 3 // 2
             rows_per_chunk = mqa_logits_rows_per_chunk(
                 num_rows=query_rows,
-                row_bytes=mqa_logits_row_bytes(max_seqlen_k),
+                row_bytes=row_bytes,
                 budget_bytes=indexer_metadata.mqa_logits_budget_bytes,
             )
         plan = NonPagedIndexerPlan(
@@ -748,7 +759,11 @@ class C4IndexerBackendMixin:
             seq_len_sum=plan.seq_len_sum,
             max_seq_len=plan.max_seq_len,
         )
-        return k_u8.view(FP8_DTYPE), scale_u8.view(torch.float32).squeeze(-1)
+        scale_dtype = torch.int32 if dsv4_fp8_index_cache_is_ue8m0() else torch.float32
+        scale = scale_u8.view(scale_dtype).squeeze(-1)
+        if uses_mx_mqa_logits(scale.device):
+            scale = mx_kv_scale(scale)
+        return k_u8.view(FP8_DTYPE), scale
 
     @staticmethod
     def _nonpaged_mqa_logits(
@@ -759,15 +774,12 @@ class C4IndexerBackendMixin:
         plan: NonPagedIndexerPlan,
         rows: slice,
     ) -> torch.Tensor:
-        import deep_gemm
-
-        return deep_gemm.fp8_mqa_logits(
+        return fp8_mqa_logits(
             q_indexer[rows],
             kv,
             weights[rows],
             plan.ks[rows],
             plan.ke[rows],
-            clean_logits=False,
             max_seqlen_k=plan.max_seqlen_k,
         )
 
@@ -856,7 +868,7 @@ class C4IndexerBackendMixin:
             weights = weights.float()
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            fn = fp8_paged_mqa_logits
         elif use_aiter_fp4:
             fn = None
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
@@ -877,7 +889,7 @@ class C4IndexerBackendMixin:
 
             fn = fp8_paged_mqa_logits_triton
         else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+            fn = fp8_paged_mqa_logits
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 

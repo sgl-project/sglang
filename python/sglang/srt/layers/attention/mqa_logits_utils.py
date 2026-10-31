@@ -30,6 +30,14 @@ def mqa_logits_free_mem_fraction() -> float:
     return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 
 
+def mqa_logits_ragged_budget_cols(num_keys: int, *, mx: bool, deep_gemm: bool) -> int:
+    """FP32 columns per row the full-width ragged logits hold at peak: DeepGEMM's
+    compressed logits stay live while they expand, BF16 on SM100, FP32 elsewhere."""
+    if mx:
+        return num_keys * 3 // 2
+    return num_keys * 2 if deep_gemm else num_keys
+
+
 def mqa_logits_needs_budget_check(*, num_rows: int, num_cols: int) -> bool:
     return num_rows * num_cols >= MQA_LOGITS_STATIC_SKIP_ELEMS
 

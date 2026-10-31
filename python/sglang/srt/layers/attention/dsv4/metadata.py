@@ -8,6 +8,10 @@ from typing import Any, Iterator, List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    get_paged_mqa_logits_metadata,
+    uses_mx_mqa_logits,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_budget_bytes,
     mqa_logits_needs_budget_check,
@@ -65,9 +69,11 @@ Some other notes:
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
-# DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this on
-# SM120 (shared-memory cap), so SM120 always splits larger batches.
+# DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this
+# (shared-memory cap), so larger batches always split. SM100 keeps two ints per
+# row in shared memory and fails past ~29k rows.
 _SM120_INDEXER_M_CHUNK = 4096
+_SM100_INDEXER_M_CHUNK = 16384
 
 
 def plan_indexer_row_chunks(
@@ -75,16 +81,16 @@ def plan_indexer_row_chunks(
     num_rows: int,
     num_cols: int,
     budget_bytes: Optional[int],
-    sm120_row_cap: Optional[int],
+    row_cap: Optional[int],
 ) -> Optional[int]:
     """Query rows per paged-indexer chunk; None runs the whole batch in one call.
 
     The fp32 logits are [num_rows, num_cols] per layer, so the chunk is the
-    smaller of the SM120 kernel cap and what the memory budget allows.
+    smaller of the metadata kernel's row cap and what the memory budget allows.
     """
     rows_per_chunk = None
-    if sm120_row_cap is not None and num_rows > sm120_row_cap:
-        rows_per_chunk = sm120_row_cap
+    if row_cap is not None and num_rows > row_cap:
+        rows_per_chunk = row_cap
     if budget_bytes is not None:
         need_chunk, budget_bytes = mqa_logits_should_chunk(
             num_rows=num_rows,
@@ -137,7 +143,11 @@ def copy_metadata(
         if src_val is None and dst_val is None:
             continue
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-        if hasattr(dst_val, "copy_"):
+        if isinstance(dst_val, list):
+            assert len(dst_val) == len(src_val), f"{field_name=} chunk count differs"
+            for dst_item, src_item in zip(dst_val, src_val):
+                dst_item.copy_(src_item)
+        elif hasattr(dst_val, "copy_"):
             dst_val.copy_(src_val)
         else:
             warnings.warn(
@@ -209,9 +219,15 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
+            # DeepGEMM uses its own SM100 varlen format and 128-token splits
+            # on SM120; neither matches the JIT builder's 256-token splits
+            mx = uses_mx_mqa_logits(self.compressed_seq_lens.device)
             use_jit_indexer = (
                 not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
+                and not (
+                    (mx or _IS_SM120) and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                )
                 and (
                     envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                     or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -219,10 +235,10 @@ class PagedIndexerMetadata:
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
-                    get_paged_mqa_logits_metadata,
+                    get_paged_mqa_logits_metadata as schedule_fn,
                 )
             else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+                schedule_fn = get_paged_mqa_logits_metadata
 
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
@@ -236,9 +252,18 @@ class PagedIndexerMetadata:
             self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
             self.rows_per_chunk = plan_indexer_row_chunks(
                 num_rows=num_rows,
-                num_cols=self.max_compressed_seq_len,
+                # SM100 also holds DeepGEMM's BF16 logits while they widen to FP32
+                num_cols=self.max_compressed_seq_len * 3 // 2
+                if mx
+                else self.max_compressed_seq_len,
                 budget_bytes=self.mqa_logits_budget_bytes,
-                sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
+                row_cap=(
+                    _SM120_INDEXER_M_CHUNK
+                    if _IS_SM120
+                    else _SM100_INDEXER_M_CHUNK
+                    if mx and not use_jit_indexer
+                    else None
+                ),
             )
             if self.rows_per_chunk is not None and group > 1:
                 self.rows_per_chunk = max(group, self.rows_per_chunk // group * group)
@@ -254,7 +279,7 @@ class PagedIndexerMetadata:
             if self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
-                    get_paged_mqa_logits_metadata(
+                    schedule_fn(
                         compressed_seq_lens[rows].view(-1, group),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
@@ -264,7 +289,7 @@ class PagedIndexerMetadata:
                     )
                 ]
             else:
-                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                self.deep_gemm_metadata = schedule_fn(
                     compressed_seq_lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
@@ -346,22 +371,29 @@ class PagedIndexerMetadata:
         return chunks
 
     def copy_(self, other: PagedIndexerMetadata):
-        # A chunked schedule list has no in-place copy; rebind it instead.
+        # Captured graphs read each chunk's schedule and top-k plan by address, so
+        # equally chunked metadata copies them in place; differently chunked rebinds.
         chunked = isinstance(self.deep_gemm_metadata, list) or isinstance(
             other.deep_gemm_metadata, list
         )
-        if is_hip() or chunked:
+        same_chunks = chunked and self.rows_per_chunk == other.rows_per_chunk
+        if is_hip() or (chunked and not same_chunks):
             copy_fields = ["page_table", "compressed_seq_lens"]
-            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
+            assign_fields = [
+                "deep_gemm_metadata",
+                "nonpaged_plan",
+                "topk_metadata_chunks",
+            ]
         else:
-            copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
+            copy_fields = [
+                "page_table",
+                "compressed_seq_lens",
+                "deep_gemm_metadata",
+                "topk_metadata_chunks",
+            ]
             assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
-        assign_fields += [
-            "rows_per_chunk",
-            "mqa_logits_budget_bytes",
-            "topk_metadata_chunks",
-        ]
+        assign_fields += ["rows_per_chunk", "mqa_logits_budget_bytes"]
         copy_metadata(
             src=other,
             dst=self,

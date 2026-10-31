@@ -40,6 +40,27 @@ SGL_DEVICE float inv_scale_ue8m0(int32_t exp) {
   return __uint_as_float((127 + 127 - exp) << 23);
 }
 
+// Per-token index-K cache scale formats, the `kScaleFmt` template argument
+inline constexpr int kIndexKScaleFP32 = 0;
+// FP32 rounded up to a power of two
+inline constexpr int kIndexKScalePow2 = 1;
+// That power of two as packed UE8M0: its exponent byte for each of the 4 32-channel groups (MXFP8)
+inline constexpr int kIndexKScaleUE8M0 = 2;
+
+// Returns the inverse scale to quantize with; `stored` gets the 4 scale bytes for the cache.
+template <int kScaleFmt>
+SGL_DEVICE float quant_index_k_scale(float scale, uint32_t& stored) {
+  static_assert(kScaleFmt >= kIndexKScaleFP32 && kScaleFmt <= kIndexKScaleUE8M0);
+  if constexpr (kScaleFmt == kIndexKScaleFP32) {
+    stored = __float_as_uint(scale);
+    return 1.0f / scale;
+  } else {
+    const int32_t exp = cast_to_ue8m0(scale);
+    stored = kScaleFmt == kIndexKScaleUE8M0 ? uint32_t(exp) * 0x01010101u : uint32_t(exp) << 23;
+    return inv_scale_ue8m0(exp);
+  }
+}
+
 // Clamp to [-FP8_E4M3_MAX, FP8_E4M3_MAX].
 // Uses platform-specific max from type.cuh (448 for E4M3FN, 224 for E4M3FNUZ).
 SGL_DEVICE float fp8_e4m3_clip(float val) {

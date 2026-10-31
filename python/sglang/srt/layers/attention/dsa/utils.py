@@ -6,6 +6,16 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    dsv4_fp8_index_cache_is_ue8m0,
+    fp8_mqa_logits,
+    fp8_paged_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    uses_mx_mqa_logits,
+)
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_needs_budget_check,
     mqa_logits_static_budget_bytes,
@@ -20,6 +30,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_parallel,
     process_model_config,
@@ -76,8 +87,6 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     Reached only on gfx950, since gfx950_fused_indexer.supported_hardware() is
     evaluated first. Every decline here is therefore a configuration or toolchain
     error; it is logged, as a warning when the path was asked for by name."""
-    from sglang.srt.runtime_context import get_exec
-
     requested = get_exec().kernel.enable_dsa_fused_indexer
     if requested is False:
         return False  # asked for the standard path; not worth a line per server
@@ -355,6 +364,42 @@ def _use_torch_mqa_logits() -> bool:
     return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
 
 
+def dsa_index_k_cache_is_ue8m0(kpool: bool) -> bool:
+    """Whether the DSA index-K cache stores packed UE8M0 scales: on SM100 when
+    DeepGEMM reads the paged cache, which it always does for the k-pool layout."""
+    if not (is_cuda() and uses_mx_mqa_logits(torch.device("cuda"))):
+        return False
+    backend = DSAPagedMQALogitsBackend.resolve(
+        get_exec().kernel.dsa_paged_mqa_logits_backend
+    )
+    return kpool or (backend.is_deepgemm() and not _use_torch_mqa_logits())
+
+
+def index_k_cache_is_ue8m0(kv_pool) -> Optional[bool]:
+    """Whether ``kv_pool``'s index-K cache stores packed UE8M0 scales rather than
+    FP32 in the same bytes; None for pools without a DSA / DSV4 FP8 index-K cache."""
+    # Imported here: the memory pools import the attention backends
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if isinstance(kv_pool, DeepSeekV4TokenToKVPool):
+        return dsv4_fp8_index_cache_is_ue8m0() and not (
+            get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        )
+    dsa_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
+    if isinstance(dsa_pool, DSATokenToKVPool):
+        return dsa_index_k_cache_is_ue8m0(kpool=dsa_pool.index_kpool > 1)
+    return None
+
+
+def with_index_k_storage_tag(model_name: Optional[str], kv_pool) -> Optional[str]:
+    """``model_name`` as storage keys use it: tagged for a UE8M0 index-K cache,
+    whose scales share their bytes with the FP32 format."""
+    if not index_k_cache_is_ue8m0(kv_pool):
+        return model_name
+    return f"{model_name}-index_k-ue8m0" if model_name else "index_k-ue8m0"
+
+
 @lru_cache(maxsize=1)
 def resolve_num_sms() -> int:
     """SM count used to size the paged-MQA-logits schedule.
@@ -373,15 +418,16 @@ def resolve_num_sms() -> int:
     ).multi_processor_count
 
 
-@lru_cache(maxsize=1)
-def resolve_paged_mqa_logits_metadata_fn():
-    if _use_torch_mqa_logits():
-        from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+@lru_cache(maxsize=None)
+def resolve_paged_mqa_logits_metadata_fn(cutedsl: bool = False):
+    # The CuTe DSL kernel walks 256-token KV splits; DeepGEMM's SM100 schedule uses 384
+    if cutedsl or _use_torch_mqa_logits():
+        from sglang.kernels.ops.attention.dsv4 import (
+            get_paged_mqa_logits_metadata as jit_paged_mqa_logits_metadata,
+        )
 
-        return get_paged_mqa_logits_metadata
-    import deep_gemm
-
-    return deep_gemm.get_paged_mqa_logits_metadata
+        return jit_paged_mqa_logits_metadata
+    return get_paged_mqa_logits_metadata
 
 
 def _fp8_paged_mqa_logits_torch(
@@ -457,9 +503,7 @@ def _fp8_paged_mqa_logits_torch(
 def resolve_fp8_paged_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_paged_mqa_logits_torch
-    import deep_gemm
-
-    return deep_gemm.fp8_paged_mqa_logits
+    return fp8_paged_mqa_logits
 
 
 def _fp8_mqa_logits_torch(
@@ -499,6 +543,4 @@ def _fp8_mqa_logits_torch(
 def resolve_fp8_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_mqa_logits_torch
-    import deep_gemm
-
-    return deep_gemm.fp8_mqa_logits
+    return fp8_mqa_logits

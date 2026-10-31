@@ -8,6 +8,7 @@ from queue import Empty, Queue
 
 import torch
 
+from sglang.srt.layers.attention.dsa.utils import with_index_k_storage_tag
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -90,7 +91,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_mla_model=rank_replicated,
             enable_storage_metrics=False,
             is_page_first_layout=False,
-            model_name=get_model().model_path,
+            model_name=with_index_k_storage_tag(get_model().model_path, kvcache),
             extra_config=extra_config,
         )
         if storage is None:

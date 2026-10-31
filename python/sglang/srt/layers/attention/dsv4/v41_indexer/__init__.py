@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_sm100_supported
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -95,8 +95,9 @@ def make_candidate_indexer(
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
+    # Dense/paged FP4 supports SM120, but the sparse-table API is SM100-only.
     # Without candidate blocks no layer is a candidate source or consumer.
-    if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    if not is_sm100_supported() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (

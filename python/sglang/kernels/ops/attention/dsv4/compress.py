@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -52,6 +53,7 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool,
     layout: KVLayout,
     fp8_2buff: bool = False,
+    indexer_scale_fmt: int = 0,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -62,6 +64,7 @@ def _jit_compress_norm_rope_module(
         bf16_store,
         layout.cpp_name,
         is_arch_support_pdl(),
+        indexer_scale_fmt,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -461,8 +464,11 @@ def compress_norm_rope_store(
     layout: Union[KVLayout, str] = KVLayout.V4,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
+    # FP8 indexer only
+    k_scale_fmt: IndexKScaleFmt = IndexKScaleFmt.FP32,
 ) -> None:
     layout = KVLayout.parse(layout)
+    assert k_scale_fmt == IndexKScaleFmt.FP32 or (kv.shape[-1] == 128 and not use_fp4)
     if layout is not KVLayout.V4:
         assert kv.shape[-1] == 512 and not use_fp4 and not bf16_store, (
             "the V4.1 layouts are paged FlashMLA main-KV caches"
@@ -523,6 +529,7 @@ def compress_norm_rope_store(
             bf16_store,
             layout,
             fp8_2buff,
+            int(k_scale_fmt),
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()

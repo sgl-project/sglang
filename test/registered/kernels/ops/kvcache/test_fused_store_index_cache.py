@@ -26,9 +26,11 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
     from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
+        IndexKScaleFmt,
         can_use_dsa_fused_store,
         fused_store_index_k_cache,
     )
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import pack_ue8m0_x4
 
     HAS_FUSED = True
 except ImportError:
@@ -454,6 +456,30 @@ def test_reference_writes_nonzero():
 
     assert deq.abs().sum().item() > 0, "Reference buffer is all zeros — error!"
     torch.testing.assert_close(deq, key.float(), rtol=0.15, atol=5e-2)
+
+
+def test_fused_store_ue8m0_scale_is_the_packed_power_of_two():
+    """SM100 DeepGEMM reads MXFP8: the rounded store keeps the same FP8 bytes, and
+    the packed one stores that power-of-two scale as 4 replicated UE8M0 bytes."""
+    _skip_if_unavailable()
+    torch.manual_seed(0)
+    num_tokens = 200
+    key = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    loc = torch.randperm(4 * PAGE_SIZE, device="cuda")[:num_tokens]
+    bufs = []
+    for k_scale_fmt in (IndexKScaleFmt.POW2, IndexKScaleFmt.UE8M0):
+        buf = _make_buffer(4)
+        fused_store_index_k_cache(key, buf, loc, PAGE_SIZE, k_scale_fmt=k_scale_fmt)
+        bufs.append(buf.view(4, -1))
+    torch.cuda.synchronize()
+
+    data_bytes = PAGE_SIZE * HEAD_DIM
+    fp32_buf, ue8m0_buf = bufs
+    assert torch.equal(fp32_buf[:, :data_bytes], ue8m0_buf[:, :data_bytes])
+    scale = fp32_buf[:, data_bytes:].contiguous().view(torch.float32)
+    assert torch.equal(torch.exp2(torch.log2(scale).round()), scale)
+    packed = ue8m0_buf[:, data_bytes:].contiguous().view(torch.int32)
+    assert torch.equal(packed, pack_ue8m0_x4(scale))
 
 
 if __name__ == "__main__":
