@@ -165,6 +165,10 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
+# A receiver may use the pipeline's SamplingParams subclass. Only defaults
+# shared with the base class can be omitted without changing their meaning.
+_BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
+
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -305,7 +309,12 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
                 # explicitly set it).
                 continue
             value = getattr(sp, name, None)
-            if value is None:
+            base_field = _BASE_SAMPLING_PARAM_FIELDS.get(name)
+            if (
+                base_field is not None
+                and _is_default(value, base_field)
+                and _is_default(value, f)
+            ):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
@@ -739,8 +748,10 @@ class SchedulerDisaggMixin:
         # in progress. The slot must remain valid until the main thread waits
         # on load_event. Freeing is done in _disagg_prefetch_event_loop.
 
-        # Build Req (CPU work, overlapped with load)
-        req = self._build_disagg_req(scalar_fields, tensors)
+        # Model extras may restore CPU tensors from the loaded GPU payload.
+        # Enqueue those copies after the load on the same transfer stream.
+        with torch.get_device_module().stream(self._transfer_stream):
+            req = self._build_disagg_req(scalar_fields, tensors)
 
         # NOTE: Do NOT call scheduler_mod.set_timesteps() here!
         # This runs on the prefetch thread. set_timesteps mutates shared
@@ -1335,8 +1346,10 @@ class SchedulerDisaggMixin:
             stream=self._transfer_stream,
         )
 
-        # 2. Build Req from scalar fields + tensors (CPU work, overlapped)
-        req = self._build_disagg_req(scalar_fields, tensors)
+        # 2. Restore extras on the loading stream so CPU copies cannot race
+        # the asynchronous receive-buffer load.
+        with torch.get_device_module().stream(self._transfer_stream):
+            req = self._build_disagg_req(scalar_fields, tensors)
 
         # 3. Init scheduler timesteps if denoiser (CPU work, overlapped)
         if self._disagg_role == RoleType.DENOISER:

@@ -434,6 +434,13 @@ def minimax_h3_plan_from_batch(batch: Any) -> MiniMaxH3ResolvedPlan | None:
     if not isinstance(extra, Mapping):
         return None
     cached = extra.get(MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY)
+    if isinstance(cached, dict):
+        # Disaggregated roles receive the frozen pre-queue plan as JSON.
+        # Rebuilding from the canonical request would lose probed geometry
+        # and audio-derived duration, and may access encoder-local media.
+        cached = msgspec.convert(cached, type=MiniMaxH3ResolvedPlan)
+        if isinstance(extra, dict):
+            extra[MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY] = cached
     if cached is not None:
         if not isinstance(cached, MiniMaxH3ResolvedPlan):
             raise ValueError(
