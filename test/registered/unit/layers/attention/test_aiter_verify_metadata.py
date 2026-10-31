@@ -186,20 +186,32 @@ class TestAiterCprrKernelHeads(CustomTestCase):
             cprr_intra_batch_mode=False,
             v_head_dim=128,
             cprr_v_head_dim=512,
+            _cprr_supports_cache={},
         )
         with patch.object(aiter_backend, "get_mla_decode_shape_support", support):
-            self.assertTrue(
-                aiter_backend.AiterAttnBackend._asm_cprr_supports(backend, 96, 8)
-            )
+            for _ in range(2):
+                self.assertTrue(
+                    aiter_backend.AiterAttnBackend._asm_cprr_supports(backend, 96, 8)
+                )
         self.assertEqual(support.calls[0]["v_head_dim"], 512)
+        # Target verify asks on every step; aiter is asked once.
+        self.assertEqual(len(support.calls), 1)
 
     def test_table_decides_where_aiter_cannot(self):
-        # An aiter that cannot tell (supported=None) or has no query at all.
-        unknown = _ShapeSupport({(96, 8)}, supported=None)
+        # An aiter with no kernel table for its backend (supported=None), or with
+        # no query at all.
+        unknown = _ShapeSupport({(96, 6), (96, 8), (128, 6), (128, 8)}, supported=None)
         for query in (unknown, None):
             with patch.object(aiter_backend, "get_mla_decode_shape_support", query):
                 self.assertEqual(_cprr_kernel_heads(96, 6), 96)
                 self.assertEqual(_cprr_kernel_heads(96, 8), 128)
+
+    def test_table_never_overrides_a_fold(self):
+        # The table says 96 heads are native at q_len 6, but aiter's planner folds
+        # them: running 96 unpadded would fold on one side only.
+        folds_96 = _ShapeSupport({(128, 6)}, supported=None)
+        with patch.object(aiter_backend, "get_mla_decode_shape_support", folds_96):
+            self.assertEqual(_cprr_kernel_heads(96, 6), 128)
 
     def test_unsupported_shape_is_not_native(self):
         unsupported = _ShapeSupport({(96, 8), (128, 8)}, supported=False)
