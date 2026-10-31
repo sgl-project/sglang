@@ -36,7 +36,6 @@ from sglang.srt.layers.attention.unlimited_dash_ops.dash_router import (
     router_from_sparse_config,
 )
 from sglang.srt.layers.attention.unlimited_dash_ops.dash_stage0 import (
-    KBarCache,
     resolve_stage0,
 )
 from sglang.srt.layers.attention.unlimited_dash_ops.decode_meta import (
@@ -176,7 +175,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
 
         # Per-layer head_cls page summaries and index-key rotaries live here so
         # the model layers stay stateless w.r.t. the step.
-        self._kbar: list[Optional[KBarCache]] = [None] * self.num_layers
+        self._kbar: list[Optional[torch.Tensor]] = [None] * self.num_layers
         # head_cls per layer, recorded on first use for out-of-forward summaries.
         self._uocr_head_cls: dict[int, torch.Tensor] = {}
         self._logged_first = False
@@ -271,7 +270,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 continue
             keys = self.index_kv_view(lid)[pages].float()
             k_bar = _summary_keys(keys, valid, head_cls.float(), inv_sqrt_d)
-            self._kbar_cache(lid).k_bar[pages] = k_bar
+            self._kbar_cache(lid)[pages] = k_bar
 
     @torch.no_grad()
     def seed_coord_row(
@@ -537,15 +536,17 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             self._eager_allow_mask = buf
         return buf[: md.num_reqs, : md.max_block]
 
-    def _kbar_cache(self, layer_id: int) -> KBarCache:
+    def _kbar_cache(self, layer_id: int) -> torch.Tensor:
         cache = self._kbar[layer_id]
         n_pages = self._index_pages()
-        if cache is not None and cache.k_bar.shape[0] == n_pages:
+        if cache is not None and cache.shape[0] == n_pages:
             return cache
         # The KV pool exists well before capture, so a rebuild means the page count
         # changed; under capture it would strand every later `k_bar[page]` write.
         self._no_alloc_while_capturing(f"head_cls summary cache (layer {layer_id})")
-        cache = KBarCache(n_pages, self.idx_head_dim, self.device)
+        cache = torch.zeros(
+            n_pages, self.idx_head_dim, dtype=torch.float32, device=self.device
+        )
         self._kbar[layer_id] = cache
         return cache
 
@@ -1253,7 +1254,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         width = route(
             md,
             router=router,
-            k_bar=kbar.k_bar,
+            k_bar=kbar,
             kv=kv,
             idx_q=idx_q,
             head_cls=head_cls,
