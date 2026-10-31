@@ -99,3 +99,23 @@ TP16, or compare the different-batch operator deltas as isolated offload cost.
 These tests do not replace a broad accuracy evaluation. Random-token prompts
 can produce greedy sequence differences in both paths; the retrieval check and
 operator references establish only the stated validation scope.
+
+
+## Native CopySFA overlap follow-up
+
+The paired `fix/mtp3-copysfa-overlap-20261031` branch additionally enables
+resident-refresh overlap in native LIM MTP3 verify. The manager passes the
+explicit `resident_refresh_tail=True` contract flag; generic callers and cold
+fills preserve their complete-copy semantics. Install the matching kernel
+build before starting this framework branch. No new environment flag is needed.
+
+This follow-up passed60 distinct native-operator checks,14 synthetic real-manager
+lifecycle cases and4 CPU adapter compatibility checks on one assigned A3 die.
+Same-address B16/Q4 Graph3x150 measurements at C16384 were531.501->366.095us
+for true miss union400 and633.839->455.227us for union700. These are operator
+measurements in the new runtime, not a remeasurement of the earlier full-model
+TPOT, throughput or accuracy results documented above.
+
+See the paired kernel documentation
+[Native LIM MTP3 CopySFA overlap](https://github.com/JinyanYi/sgl-kernel-npu/blob/fix/mtp3-copysfa-overlap-20261031/docs/a3_mtp_copy_sfa_overlap.md)
+for the producer contract, regression scope and per-capacity results.

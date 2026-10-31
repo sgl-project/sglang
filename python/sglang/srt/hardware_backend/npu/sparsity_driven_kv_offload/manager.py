@@ -727,6 +727,7 @@ class SparseKVCacheManager:
             scale_value,
             operator=self._copy_sfa_operator,
             full_visible=True,
+            resident_refresh_tail=True,
         )
         result = output[:, :query_heads].reshape(rows, -1)
         return result.masked_fill(~route_valid[:, None], 0)
