@@ -2525,6 +2525,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
