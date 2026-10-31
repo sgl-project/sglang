@@ -65,7 +65,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             num_runners=1,
             ctx=PlacementContext(
                 host_names=("full", "swa") if target_window else ("full", "mamba"),
-                target_window=target_window,
+                target_windows=(target_window,) if target_window else (),
             ),
             store_dtype=torch.bfloat16,
         )
@@ -564,7 +564,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa"), target_window=128),
+            ctx=PlacementContext(host_names=("full", "swa"), target_windows=(128,)),
             store_dtype=torch.bfloat16,
         ).placement
         self.assertEqual(placement.hosts(), ("full",))
