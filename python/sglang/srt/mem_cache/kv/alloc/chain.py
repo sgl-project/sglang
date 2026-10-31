@@ -293,6 +293,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
+        # Largest-fit reads, each kept until the capacity epoch moves.
+        self._fit_memo: Dict[Hashable, Tuple[tuple, int]] = {}
         self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._policy = interim_policy_for(
             self,
@@ -383,34 +385,116 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _cap_full_available(self, tokens):
         return self.full_attn_allocator.cap_available(tokens)
 
+    # -- capacity reads --
+    #
+    # Every read answers from the same layout search as the take, on the
+    # current snapshot. A sub-pool's availability is the largest demand of
+    # that sub-pool ALONE (every other sub-pool demanding nothing) that a take
+    # can serve now: tokens for a token sub-pool, slots for the state sub-pool.
+    # Sub-pools share bytes, so the availabilities of several sub-pools do not
+    # add up: a per-sub-pool shortfall (demand minus availability) that is zero
+    # everywhere does not prove a joint demand fits; ask `ensure_capacity`.
+
+    def _units_fit(self, demands: Dict[str, int]) -> bool:
+        """Whether a take of these units (pages of a token sub-pool, slots of
+        the state sub-pool) succeeds now: the FULL cap, the virtual ids each
+        id owner has left, then the layout search the take itself runs."""
+        owner = self.full_attn_allocator
+        owner_pages = demands.get(owner.sub_pool_name, 0)
+        if owner_pages > len(owner.free_virtual_ids):
+            return False
+        if self._full_cap_reclaim(owner_pages * self.page_size):
+            return False
+        # A window binds the owner's virtual pages: it can never hold more.
+        bound = owner.ids.num_virtual_ids - owner.min_page_index
+        if any(demands.get(w.sub_pool_name, 0) > bound for w in self._windows):
+            return False
+        state = self.mamba_allocator
+        if state is not None and demands.get(state.sub_pool_name, 0) > len(
+            state.free_virtual_ids
+        ):
+            return False
+        return feasible(
+            self.pricing_snapshot(), {n: d for n, d in demands.items() if d > 0}
+        )
+
+    def _largest_fit(self, query: Hashable, names: Tuple[str, ...], hi: int) -> int:
+        """The most units that fit when each of ``names`` takes that many.
+        A fit is downward closed (a smaller demand of the same shape fits
+        whenever a larger one does), so a binary search finds the boundary."""
+        key = (self._snapshot_key_now(), self.full_attn_allocator.max_live_tokens, hi)
+        memo = self._fit_memo.get(query)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        low, high = 0, max(0, hi)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if self._units_fit(dict.fromkeys(names, mid)):
+                low = mid
+            else:
+                high = mid - 1
+        self._fit_memo[query] = (key, low)
+        return low
+
+    def _id_bound(self, band: Band) -> int:
+        """Units a sub-pool's demand can never exceed: its id owner's room."""
+        if band is self.mamba_allocator:
+            return len(band.free_virtual_ids)
+        owner = self.full_attn_allocator
+        if band is owner:
+            return len(owner.free_virtual_ids)
+        return owner.ids.num_virtual_ids - owner.min_page_index
+
+    def units_available(self, sub_pool: str) -> int:
+        """The sub-pool's availability (see the contract above): a take of at
+        most this many units of it alone succeeds now, and one more does not."""
+        band = self.bands[self._band_positions[sub_pool]]
+        pages = self._largest_fit(sub_pool, (sub_pool,), self._id_bound(band))
+        return pages if band is self.mamba_allocator else pages * self.page_size
+
     def available_size(self) -> int:
-        return self._cap_full_available(self._policy.available_size(self))
+        """Tokens one more token allocation can take now: the owner and every
+        window take each new token together."""
+        names = tuple(
+            b.sub_pool_name for b in (self.full_attn_allocator, *self._windows)
+        )
+        hi = self._id_bound(self.full_attn_allocator)
+        return self._largest_fit("tokens", names, hi) * self.page_size
 
     def full_available_size(self) -> int:
-        return self._cap_full_available(self._policy.full_available_size(self))
+        return self.units_available(self.full_attn_allocator.sub_pool_name)
 
     def swa_available_size(self) -> int:
-        return self._policy.swa_available_size(self)
+        if self.swa_attn_allocator is None:
+            return self._policy.swa_available_size(self)
+        return self.units_available(self.swa_attn_allocator.sub_pool_name)
+
+    def state_slots_available(self) -> int:
+        return self.units_available(self.mamba_allocator.sub_pool_name)
 
     def conserve_full_available_size(self) -> int:
+        """The sizing's nominal owner share minus the owner tokens held: the
+        static split, not what a take can serve."""
         return self._policy.conserve_full_available_size(self)
 
     def conserve_swa_available_size(self) -> int:
+        """The sizing's nominal window share minus the window tokens held."""
         return self._policy.conserve_swa_available_size(self)
 
     def schedulable_full_available_size(self) -> int:
-        return self.full_attn_allocator.schedulable_available_size()
+        return self.full_available_size()
 
     def schedulable_swa_available_size(self) -> int:
-        return self.swa_attn_allocator.schedulable_available_size()
+        return self.swa_available_size()
 
     @property
     def current_full_capacity(self) -> int:
-        return self._policy.current_full_capacity(self)
+        """Owner tokens held now plus what the owner alone could still take."""
+        return self.full_available_size() + self.full_attn_allocator.allocated_count()
 
     @property
     def current_swa_capacity(self) -> int:
-        return self._policy.current_swa_capacity(self)
+        return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
 
     @property
     def size_full(self) -> int:
@@ -475,26 +559,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         take itself answers, so a yes here is a successful take."""
         if full_tokens < 0 or swa_tokens < 0:
             return False
-        if self._full_cap_reclaim(full_tokens):
-            return False
-        demands = self.page_demands(
-            full_tokens,
-            swa_tokens,
-            auxiliary_swa_tokens=auxiliary_swa_tokens,
-            state_slots=state_slots,
-        )
-        owner = self.full_attn_allocator
-        if demands[owner.sub_pool_name] > len(owner.free_virtual_ids):
-            return False
-        # A window binds the owner's virtual pages: it can never hold more.
-        owner_pages = owner.ids.num_virtual_ids - owner.min_page_index
-        if any(demands[w.sub_pool_name] > owner_pages for w in self._windows):
-            return False
-        state = self.mamba_allocator
-        if state is not None and state_slots > len(state.free_virtual_ids):
-            return False
-        return feasible(
-            self.pricing_snapshot(), {n: d for n, d in demands.items() if d > 0}
+        return self._units_fit(
+            self.page_demands(
+                full_tokens,
+                swa_tokens,
+                auxiliary_swa_tokens=auxiliary_swa_tokens,
+                state_slots=state_slots,
+            )
         )
 
     def admission_windows(self, tree_cache) -> Tuple[Tuple[str, int, int, int], ...]:
@@ -654,7 +725,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return max(plan[0], cap_reclaim), plan[1]
 
     def prealloc_fits_assumes_reclaim(self) -> bool:
-        return self._policy.prealloc_fits_assumes_reclaim(self)
+        """Whether decode-node preallocation reclaims the evictable entries its
+        admission credits before it takes: chains with a window do."""
+        return bool(self._windows)
 
     def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
         return self.admits(
@@ -719,12 +792,29 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
-        """Each sub-pool's (capacity, available units), by sub-pool name."""
-        return self._policy.usage(self)
+        """Each sub-pool's (capacity, available units), by sub-pool name: the
+        units it holds plus its availability, and its availability."""
+        owner = self.full_attn_allocator
+        usage = {
+            owner.sub_pool_name: (
+                self.current_full_capacity,
+                self.full_available_size(),
+            )
+        }
+        for window in self._windows:
+            free = self.units_available(window.sub_pool_name)
+            usage[window.sub_pool_name] = (window.allocated_count() + free, free)
+        if self.mamba_allocator is not None:
+            usage[self.mamba_allocator.sub_pool_name] = (
+                self.state.pool.size,
+                self.state_slots_available(),
+            )
+        return usage
 
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
-        return self._policy.swa_capacity_and_available(
-            self, full_capacity=full_capacity, swa_capacity=swa_capacity
+        return (
+            (self.current_full_capacity, self.full_available_size()),
+            (self.current_swa_capacity, self.swa_available_size()),
         )
 
     def max_new_tokens_for_memory(

@@ -18,10 +18,13 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc import interim
 from sglang.srt.mem_cache.kv.alloc.pricing import (
+    FLUSH_ENDS,
+    NO_MOVE,
     float_byte_shortfall,
     float_end_certificate,
     float_high_target,
     float_reclaim_satisfied,
+    plan,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -137,7 +140,8 @@ class TestTriJointReclaim(CustomTestCase):
                     # genuinely over-capacity request.
                     demand = 4 if count == 8 else 9
                     if count == 24:
-                        demand = min(a.full_available_size(), a.swa_available_size())
+                        # One token past what owner and window can take together.
+                        demand = a.available_size() + 1
                     # Eviction is needed exactly when the records' first prefix
                     # in eviction order must go: without it the demand does not
                     # fit (5 states leave room already).
@@ -570,10 +574,15 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(extra)
                     key = RadixKey(array("q", [1, 2, 3, 4]))
                     cache.insert(InsertParams(key=key, value=slots))
-                    self.assertEqual(allocator.full_available_size(), 2)
+                    # Six tokens fit only if the float moves: not in place, while
+                    # the reads, which credit the move, report them.
+                    six = {n: d for n, d in allocator.page_demands(6, 6).items() if d}
+                    self.assertIsNone(
+                        plan(allocator.pricing_snapshot(), six, FLUSH_ENDS)
+                    )
                     self.assertGreaterEqual(allocator.conserve_full_available_size(), 6)
                     self.assertGreaterEqual(allocator.swa_available_size(), 6)
-                    self.assertLess(allocator.available_size(), 6)
+                    self.assertGreaterEqual(allocator.available_size(), 6)
                     self.assertEqual(
                         float_byte_shortfall(
                             chain_snapshot(allocator), float_chain(allocator), 6
@@ -1051,12 +1060,18 @@ class TestTriGeometry(CustomTestCase):
             vp = vp[vp >= ma.min_page_index]
             mk.buf[ma.ids.virtual_to_physical[vp]] = vp + 1000
             ma.free(vp[1:-1:cut])
-            if npage * ps <= a.available_size() or not float_end_certificate(
-                chain_snapshot(a), float_chain(a), npage * ps
+            # Cases the ends must compact for: no layout without moves holds them.
+            demands = {
+                n: d for n, d in a.page_demands(npage * ps, npage * ps).items() if d
+            }
+            if plan(a.pricing_snapshot(), demands, NO_MOVE) is not None or not (
+                float_end_certificate(chain_snapshot(a), float_chain(a), npage * ps)
             ):
                 continue
             with self.subTest(page_size=ps, ratio=ratio, cut=cut, demand=npage):
                 recognized.add(ps)
+                # The read credits the compaction.
+                self.assertGreaterEqual(a.available_size(), npage * ps)
                 saved = payload(a, kv, mk)
                 prior = snapshot(a)
                 for _ in range(20):
@@ -1084,7 +1099,11 @@ class TestTriGeometry(CustomTestCase):
         for pd_open, host_open in ((True, False), (False, True), (False, False)):
             with self.subTest(pd_open=pd_open, host_open=host_open):
                 a, kv, mk = build_geometry(1, (1, 4), True, "swa_edges", False)
-                self.assertLess(a.available_size(), 5)
+                # Five tokens need the float to move: no layout without moves
+                # holds them, and the read, which credits the move, reports them.
+                five = {n: d for n, d in a.page_demands(5, 5).items() if d}
+                self.assertIsNone(plan(a.pricing_snapshot(), five, NO_MOVE))
+                self.assertGreaterEqual(a.available_size(), 5)
                 self.assertTrue(
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
                 )

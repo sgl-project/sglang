@@ -53,13 +53,27 @@ def _build(lazy: bool):
     return inst, allocator, kvcache
 
 
+def _assert_read_fresh(test, allocator):
+    """The memoized capacity reads must equal the same reads recomputed with
+    every memo dropped (the snapshot and the largest-fit memos)."""
+    names = [b.sub_pool_name for b in allocator.bands]
+    memoized = (
+        allocator.available_size(),
+        [allocator.units_available(n) for n in names],
+    )
+    allocator._fit_memo.clear()
+    allocator._snapshot_key = None
+    fresh = (
+        allocator.available_size(),
+        [allocator.units_available(n) for n in names],
+    )
+    test.assertEqual(memoized, fresh)
+
+
 class TestCapacityMemoCoherence(unittest.TestCase):
     def _assert_memos_fresh(self, allocator):
         """Every memoized capacity view must equal a fresh recompute."""
-        self.assertEqual(
-            allocator.available_size(),
-            allocator._policy._compute_available_size(allocator),
-        )
+        _assert_read_fresh(self, allocator)
         for band in (
             allocator.full_attn_allocator,
             allocator.swa_attn_allocator,
@@ -209,10 +223,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
         return inst, allocator
 
     def _assert_memos_fresh(self, allocator):
-        self.assertEqual(
-            allocator.available_size(),
-            allocator._policy._compute_available_size(allocator),
-        )
+        _assert_read_fresh(self, allocator)
         for band in (
             allocator.full_attn_allocator,
             allocator.swa_attn_allocator,
