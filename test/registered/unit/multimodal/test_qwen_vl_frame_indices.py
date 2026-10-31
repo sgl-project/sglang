@@ -53,9 +53,7 @@ class TestQwenVLFrameIndices(CustomTestCase):
                 expected = (
                     torch.linspace(0, total_frames - 1, nframes).round().long()
                 ).tolist()
-                self.assertEqual(
-                    self._sampled_indices(total_frames, nframes), expected
-                )
+                self.assertEqual(self._sampled_indices(total_frames, nframes), expected)
 
 
 if __name__ == "__main__":
