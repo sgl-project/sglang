@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
+from sglang.srt.arg_groups.moe_hook import mori_max_dispatch_tokens_per_rank
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
@@ -26,7 +27,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -115,6 +116,10 @@ def mori_recv_bound(
     ):
         return 0
     return sum(sender_rows)
+
+
+def _max_dispatch_tokens_per_rank() -> int:
+    return mori_max_dispatch_tokens_per_rank(get_server_args())
 
 
 def _should_record_expert_distribution() -> bool:
@@ -774,9 +779,7 @@ class _MoriEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
-        self.num_max_dispatch_tokens_per_rank = (
-            envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        )
+        self.num_max_dispatch_tokens_per_rank = _max_dispatch_tokens_per_rank()
         self.dispatch_dtype = DispatchDtype.bf16
         self.combine_dtype = CombineDtype.bf16
         self.quant_config = {}

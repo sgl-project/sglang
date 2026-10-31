@@ -60,6 +60,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    mori_max_dispatch_tokens_per_rank,
     resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
@@ -2105,6 +2106,53 @@ class TestMoriEpv2AsyncLLResolution(CustomTestCase):
         ):
             with self.subTest(deepep_mode=deepep_mode, async_ll=async_ll, sdma=sdma):
                 self.assertEqual(self._resolve(deepep_mode, async_ll, sdma), expected)
+
+
+class TestMoriDispatchTokensPerRank(CustomTestCase):
+    """Unset, the MoRI dispatch budget follows the per-rank chunked prefill, so a
+    DP-split chunk above the old fixed 4096 default no longer fails the startup
+    check; it never drops below 4096 (decode batches of a mixed server share the
+    op), a disaggregated decode server keeps 4096 and an explicit value wins."""
+
+    def setUp(self):
+        self._env = patch.dict(os.environ)
+        self._env.start()
+        os.environ.pop("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", None)
+        # EPv1 skips the EPv2 support probe, which needs a model config.
+        envs.SGLANG_MORI_EP_V2.set(False)
+
+    def tearDown(self):
+        self._env.stop()
+
+    @staticmethod
+    def _server_args(chunked_prefill_size, disaggregation_mode="null"):
+        return ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="mori",
+            tp_size=8,
+            chunked_prefill_size=chunked_prefill_size,
+            disaggregation_mode=disaggregation_mode,
+        )
+
+    def test_unset_follows_per_rank_chunked_prefill(self):
+        server_args = self._server_args(8192)
+        self.assertEqual(mori_max_dispatch_tokens_per_rank(server_args), 8192)
+        handle_a2a_moe(server_args)
+
+    def test_unset_never_below_default(self):
+        self.assertEqual(
+            mori_max_dispatch_tokens_per_rank(self._server_args(1024)), 4096
+        )
+        self.assertEqual(
+            mori_max_dispatch_tokens_per_rank(self._server_args(8192, "decode")), 4096
+        )
+
+    def test_explicit_value_wins(self):
+        envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.set(2048)
+        server_args = self._server_args(8192)
+        self.assertEqual(mori_max_dispatch_tokens_per_rank(server_args), 2048)
+        with self.assertRaises(AssertionError):
+            handle_a2a_moe(server_args)
 
 
 class TestFlashinferMegaMoeConfig(CustomTestCase):
