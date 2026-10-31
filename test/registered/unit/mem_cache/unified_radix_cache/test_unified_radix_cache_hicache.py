@@ -1045,6 +1045,90 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
         cache.sanity_check()
 
+    def _count_blocking_waits(self, cache):
+        """Record how many queued copies each blocking write-back wait drains."""
+        waits = []
+        writing_check = cache.writing_check
+
+        def count_waits(write_back=False, finish_count=None):
+            if write_back and cache.ongoing_write_through:
+                waits.append(len(cache.ongoing_write_through))
+            return writing_check(write_back=write_back, finish_count=finish_count)
+
+        return waits, mock.patch.object(cache, "writing_check", side_effect=count_waits)
+
+    @requires_hicache
+    def test_hicache_write_back_evict_waits_once_per_batch(self):
+        """Write-back eviction copies a batch of unbacked leaves to host behind
+        one blocking wait, then demotes them together; once the leaves cover
+        the request, the parent they expose stays on device."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        parent_seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, parent_seq)
+        leaf_seqs = [parent_seq + self._make_seq(1000 * (i + 1), 1) for i in range(3)]
+        for seq in leaf_seqs:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        leaves = [match_prefix(cache, seq).last_device_node for seq in leaf_seqs]
+        parent = node_parent(cache, leaves[0])
+        leaf_tokens = sum(node_key_length(cache, leaf) for leaf in leaves)
+
+        waits, patch = self._count_blocking_waits(cache)
+        with patch:
+            result = cache.evict(EvictParams(num_tokens=leaf_tokens))
+            self.assertGreaterEqual(result.num_tokens_evicted, leaf_tokens)
+            self.assertEqual(waits, [3])
+            for leaf in leaves:
+                self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+                self.assertTrue(cache.tree_core.is_backuped(leaf))
+            self.assertFalse(cache.tree_core.is_full_device_evicted(parent))
+
+            # Leaves first in one batch, then the parent they exposed.
+            for leaf_seq in leaf_seqs:
+                match_prefix(cache, leaf_seq)
+            waits.clear()
+            parent_tokens = node_key_length(cache, parent)
+            result = cache.evict(EvictParams(num_tokens=parent_tokens))
+            self.assertGreaterEqual(result.num_tokens_evicted, parent_tokens)
+            self.assertEqual(waits[0], 1)
+        self.assertTrue(cache.tree_core.is_full_device_evicted(parent))
+        self.assertTrue(cache.tree_core.is_backuped(parent))
+        cache.sanity_check()
+
+    @requires_hicache
+    def test_hicache_write_back_evict_chain_shares_the_leaves_wait(self):
+        """A device-only chain evicted in one call follows the per-victim
+        order, leaves then their parent, and the parent joins its leaves'
+        wait, also when a leaf's SWA window backup covers it."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        parent_seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, parent_seq)
+        leaf_seqs = [parent_seq + self._make_seq(1000 * (i + 1), 1) for i in range(2)]
+        for seq in leaf_seqs:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        leaves = [match_prefix(cache, seq).last_device_node for seq in leaf_seqs]
+        # An SWA boundary split can turn the parent into several nodes.
+        chain = list(leaves)
+        node = node_parent(cache, leaves[0])
+        while node != cache.root_node_handle():
+            chain.append(node)
+            node = node_parent(cache, node)
+        total = len(parent_seq) + sum(len(seq) - len(parent_seq) for seq in leaf_seqs)
+
+        waits, patch = self._count_blocking_waits(cache)
+        with patch:
+            result = cache.evict(EvictParams(num_tokens=total))
+        self.assertGreaterEqual(result.num_tokens_evicted, total)
+        # An SWA stack may add later waits for its own walk.
+        self.assertEqual(waits[0], len(chain))
+        for node in chain:
+            self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+            self.assertTrue(cache.tree_core.is_backuped(node))
+        cache.sanity_check()
+
     @requires(
         lambda cfg: not cfg.has_swa,
         "SWA boundary splits deepen the chain non-deterministically",
