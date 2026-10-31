@@ -399,7 +399,7 @@ class TestDeepSeekV32Streaming(unittest.TestCase):
         self.assertEqual(len(result.calls), 2)
 
     def test_unclosed_tags_parse_in_linear_time(self):
-        """Many unclosed tool_calls or parameter tags must not stall the parser
+        """Many unclosed function_calls or parameter tags must not stall the parser
         (it runs on the event loop); the complete call before them survives."""
         unclosed_params = _wrapped(
             _invoke(
@@ -407,10 +407,10 @@ class TestDeepSeekV32Streaming(unittest.TestCase):
                 _param("city", "true", "x")[: -len(f"</{DSML}parameter>")] * 6000,
             )
         )
-        unclosed_sections = f"<{DSML}tool_calls> " * 6000
+        unclosed_sections = f"<{DSML}function_calls> " * 6000
 
         start = time.perf_counter()
-        result = DeepSeekV4Detector().detect_and_parse(
+        result = DeepSeekV32Detector().detect_and_parse(
             _weather_call("SF") + unclosed_sections, self.tools
         )
         _, calls = self._feed([_weather_call("SF") + unclosed_params])
