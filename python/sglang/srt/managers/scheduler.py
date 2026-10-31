@@ -394,6 +394,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Cap on rids printed per --log-schedule-decisions line.
+_MAX_LOGGED_RIDS = 16
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -469,6 +472,9 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Allocate per instance only when a consumer first defers a response.
     _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
+    # Class-level defaults so stub schedulers built via __new__ skip the log.
+    log_schedule_decisions: bool = False
+    _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
 
     def __init__(
         self,
@@ -4212,16 +4218,37 @@ class Scheduler(
     ) -> None:
         if not self.log_schedule_decisions:
             return
+        if get_parallel().attn_tp_rank != 0 or get_parallel().attn_cp_rank != 0:
+            return
         # KV budget this pass saw: free now plus what eviction could reclaim.
         pool_stats = self.pool_stats_observer.get_pool_stats()
+        counters = (
+            len(self.waiting_queue),
+            len(running_batch.reqs),
+            len(adder.preempt_list),
+            pool_stats.full_available_size,
+            pool_stats.full_evictable_size,
+        )
+        if not can_run_list:
+            # A blocked queue retries every iteration; log only state changes.
+            if counters == self._last_empty_schedule_decision:
+                return
+            self._last_empty_schedule_decision = counters
+        else:
+            self._last_empty_schedule_decision = None
+
+        picked_rids = [req.rid for req in can_run_list[:_MAX_LOGGED_RIDS]]
+        num_hidden = len(can_run_list) - len(picked_rids)
+        more = f" (+{num_hidden} more)" if num_hidden > 0 else ""
+        num_left, num_running, num_preempted, kv_free, kv_evictable = counters
         logger.info(
             f"Schedule prefill: #picked={len(can_run_list)}, "
-            f"#left-in-queue={len(self.waiting_queue)}, "
-            f"#running={len(running_batch.reqs)}, "
-            f"#preempted={len(adder.preempt_list)}, "
-            f"kv-free-tokens={pool_stats.full_available_size}, "
-            f"kv-evictable-tokens={pool_stats.full_evictable_size}, "
-            f"picked-rids={[req.rid for req in can_run_list]}"
+            f"#left-in-queue={num_left}, "
+            f"#running={num_running}, "
+            f"#preempted={num_preempted}, "
+            f"kv-free-tokens={kv_free}, "
+            f"kv-evictable-tokens={kv_evictable}, "
+            f"picked-rids={picked_rids}{more}"
         )
 
     def _get_new_batch_prefill_raw(
@@ -6502,7 +6529,7 @@ def configure_scheduler_process(
     faulthandler.enable()
 
     # The PID suffix is parsed by debug_utils/log_parser.py; keep them in sync.
-    configure_logger(server_args, prefix=f"{prefix} PID{os.getpid()}")
+    configure_logger(server_args, prefix=f"{prefix} PID%(process)d")
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
