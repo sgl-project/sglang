@@ -384,12 +384,6 @@ class MLAView(MLAKVView):
             ),
         )
 
-    def host_pool_decls(self):
-        """The host pool HiCache keeps for this view's buffers."""
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
-
-        return (make_kv_pool_decl(self),)
-
     def get_contiguous_buf_infos(self):
         """PD registration: one entry, the raw arena, addressed as
         ``raw_ptr + physical_page_id * page_bytes``. The layers interleave in

@@ -37,8 +37,8 @@ def _default_cache_subdir(name: str) -> str:
     return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
-def _default_tree_cache_sanity_check() -> bool:
-    """Enable the expensive tree-cache sanity check by default in CI."""
+def _default_on_in_ci() -> bool:
+    """Enable an expensive self-check by default in CI."""
     return envs.SGLANG_IS_IN_CI.get()
 
 
@@ -506,7 +506,9 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
-    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
+    # Check each schedule that the running requests equal the ones batches hold.
+    SGLANG_ENABLE_RUNNING_REQS_CHECK = EnvBool(_default_on_in_ci)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -786,6 +788,7 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES = EnvInt(0)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.
@@ -1068,6 +1071,9 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Run Quark MXFP4 (W4A4) MoE checkpoints as W4A16 via triton_kernels on
+    # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
+    SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
@@ -1302,6 +1308,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
     SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
+    # Opt in to the dual decode graph for triton_v2 LoRA: a base-only graph for
+    # adapter-free batches next to the adapter graph (two graphs per batch
+    # size); off by default.
+    SGLANG_ENABLE_LORA_DUAL_GRAPH = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
@@ -1723,6 +1733,12 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in: store radix mamba checkpoints only in the hicache host pool.
+    # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
+    # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
+    # still writes. Requires --enable-hierarchical-cache. Off keeps the
+    # donated GPU slot and the previous ratio.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -1928,6 +1944,10 @@ class Envs:
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # SM90 paged decode indexer: split all rows' tiles evenly over the GPU instead of a
+    # fixed number of CTAs per row, so one long context no longer sets the step time, and
+    # load each row's queries once. Scores are bitwise identical to the per-row kernel.
+    SGLANG_OPT_DSV41_FAST_DECODE_INDEXER = EnvBool(True)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.

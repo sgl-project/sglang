@@ -791,31 +791,3 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
-
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                self.model_runner,
-                return_hidden_states_before_norm=False,
-            )
-            batch.split_forward_batch = forward_batch
-
-        out = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
-        )
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        if logits_output:
-            next_token_ids = self.model_runner.sample(
-                logits_output, batch.split_forward_batch
-            )
-        else:
-            next_token_ids = None
-        self._maybe_finalize_elastic_cuda_graph_scale()
-        batch_result = GenerationBatchResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            expert_distribution_metrics=out.expert_distribution_metrics,
-        )
-        batch_result.next_token_ids = next_token_ids
-        return batch_result
