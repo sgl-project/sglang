@@ -169,13 +169,14 @@ class DecodeKVCacheOffloadManager:
             IdSpaceKind.SLIDING_WINDOW
         ].ids(virtual_indices)
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
-        live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
-        if live_swa_indices.numel() == 0:
+        # Window rows go by the owner's ids; the copy translates them.
+        live_indices = virtual_indices[swa_indices > 0].to(torch.int64)
+        if live_indices.numel() == 0:
             return full_indices, []
         return full_indices, [
             PoolTransfer(
                 name=PoolName.SWA,
-                device_indices=live_swa_indices,
+                device_indices=live_indices,
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]

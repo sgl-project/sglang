@@ -440,6 +440,19 @@ class KVStorage:
             dcp_rank=0,
         )
 
+    def owner_ids_of_window_rows(
+        self, sub_pool: str, window_rows: torch.Tensor
+    ) -> torch.Tensor:
+        """The owner token ids bound to these window rows: the name a queued
+        host load gives the rows once they are bound, so that it reaches them
+        wherever they move before it is submitted."""
+        band = self._band(sub_pool)
+        rows = window_rows.to(torch.int64)
+        pages = band.ids.physical_to_virtual[rows // band.page_size]
+        # Checked on the device: a host-side check would wait for the GPU.
+        torch._assert_async((pages >= 0).all(), "unbound window rows in a host load")
+        return pages * band.page_size + rows % band.page_size
+
     def bind_window(
         self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
     ) -> None:
@@ -728,9 +741,10 @@ class KVStorage:
         self, sub_pool: str
     ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
         """How a host transfer turns the controller's ids for the sub-pool into
-        the rows its view indexes, or None when they index it as they are (a
-        window's host loads bind physical pages). Called on the transfer
-        stream; pins keep the rows in place until the copy is acknowledged."""
+        the rows its view indexes. A window's controller ids are the owner's
+        token ids, as the owner's are. Called at submission, after a start event
+        recorded on the submitting stream, so a move made before it is seen and
+        a move made after it waits for the copy."""
         roles = self._allocator.roles
         if sub_pool == roles.owner:
             band = self._allocator.full_attn_allocator
@@ -739,7 +753,7 @@ class KVStorage:
             return lambda ids: self._host_token_ids(sub_pool, ids)
         if sub_pool == roles.state:
             return self._allocator.state.slots.translate
-        return None
+        return lambda ids: self._host_token_ids(sub_pool, ids)
 
     def add_pin_source(
         self, sub_pools: Sequence[str], busy: Callable[[], bool]
