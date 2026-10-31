@@ -1,6 +1,6 @@
 """Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs torch.
 
-``benchmark_fp8`` (SM103 only) times the complete block-FP8 projection: the W8A16 JIT
+``benchmark_fp8`` (SM10x only) times the complete block-FP8 projection: the W8A16 JIT
 kernel vs DeepGEMM W8A8 vs BF16 GEMMs.
 
 Run on SM90+ (Hopper or later):
@@ -114,10 +114,9 @@ def benchmark_fp8(m, n, k, provider):
     torch.manual_seed(0)
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     w = (16 * torch.randn((n, k), device="cuda")).to(torch.float8_e4m3fn)
-    scales = torch.exp2(
-        torch.randint(119, 125, ((n + 127) // 128, k // 128), device="cuda").float()
-        - 127
-    )
+    # Exponent bits instead of torch.exp2, which compiles through NVRTC: CUDA 13.0's NVRTC rejects SM107.
+    exponents = torch.randint(119, 125, ((n + 127) // 128, k // 128), device="cuda")
+    scales = (exponents.int() << 23).view(torch.float32)
     bf16_w = (
         w.float()
         * scales.repeat_interleave(128, dim=0)[:n].repeat_interleave(128, dim=1)
@@ -156,5 +155,5 @@ if __name__ == "__main__":
     else:
         benchmark.run(print_data=True)
         arch = get_jit_cuda_arch()
-        if (arch.major, arch.minor) == (10, 3):
+        if arch.major == 10:
             benchmark_fp8.run()

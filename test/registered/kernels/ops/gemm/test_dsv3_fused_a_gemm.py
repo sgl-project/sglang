@@ -20,6 +20,7 @@ from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=60, stage="base-c", runner_config="4-gpu-gb300")
 
 # hd_in must be a multiple of 256; 2048/6144/7168 cover the real fused-A shapes
@@ -59,10 +60,9 @@ def cuda_device():
 
 
 @pytest.fixture
-def cuda_sm103(cuda_device):
-    arch = get_jit_cuda_arch()
-    if (arch.major, arch.minor) != (10, 3):
-        pytest.skip("SM103 (GB300) required")
+def cuda_sm10x(cuda_device):
+    if get_jit_cuda_arch().major != 10:
+        pytest.skip("SM10x required")
 
 
 def _fp8_case(m, n, k, scale_format):
@@ -75,7 +75,8 @@ def _fp8_case(m, n, k, scale_format):
         stored = scales
     else:
         exponents = torch.randint(119, 125, shape, device="cuda", dtype=torch.int32)
-        scales = torch.exp2(exponents.float() - 127)
+        # Exponent bits instead of torch.exp2, which compiles through NVRTC: CUDA 13.0's NVRTC rejects SM107.
+        scales = (exponents << 23).view(torch.float32)
         # Build the packed layout independently of the production scale transform.
         # Poison unused K bytes to expose reading beyond the last block.
         padded = torch.full(
@@ -93,7 +94,7 @@ def _fp8_case(m, n, k, scale_format):
     return x, w, stored, effective_w
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 @pytest.mark.parametrize("scale_format", ["fp32", "ue8m0"])
 @pytest.mark.parametrize("m", [1, 3, 8, 9, 16])
 @pytest.mark.parametrize(
@@ -118,7 +119,7 @@ def test_fp8_fused_a_gemm(m, n, k, scale_format):
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 @pytest.mark.parametrize("m", [6, 12])
 def test_fp8_fused_a_gemm_large_activations(m):
     # The tuned shapes run FP16 operands: activations in the thousands are exact, and the sums (far beyond
@@ -130,7 +131,7 @@ def test_fp8_fused_a_gemm_large_activations(m):
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 @pytest.mark.parametrize("scale_format", ["fp32", "ue8m0"])
 def test_fp8_fused_a_gemm_strided_scales(scale_format):
     x, w, scales, effective_w = _fp8_case(9, 144, 640, scale_format)
@@ -146,7 +147,7 @@ def test_fp8_fused_a_gemm_strided_scales(scale_format):
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 @pytest.mark.parametrize("scale_format", ["fp32", "ue8m0"])
 def test_fp8_fused_a_gemm_graph_and_compile(scale_format):
     x, w, scales, effective_w = _fp8_case(9, 144, 640, scale_format)
@@ -179,7 +180,7 @@ def _late_writer(src, dst, n_elements, one, zero, spin, BLOCK: tl.constexpr):
     tl.store(dst + offs, x.to(tl.bfloat16), mask=mask)
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 def test_fp8_fused_a_gemm_waits_for_its_pdl_producer():
     """In a graph, behind a producer that releases its dependent early and stores late, the GEMM reads the new output.
 
@@ -211,7 +212,7 @@ def test_fp8_fused_a_gemm_waits_for_its_pdl_producer():
         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 @pytest.mark.parametrize("m", [0, 17])
 def test_fp8_fused_a_gemm_rejects_m(m):
     x, w, scales, _ = _fp8_case(m, 16, 128, "fp32")
@@ -276,6 +277,8 @@ def _fp8_projection_reference(layer, x):
         "unlisted_shape",
         "sm90",
         "sm100",
+        "sm107",
+        "sm120",
         "bias",
         "deterministic",
         "mxfp8_view",
@@ -292,7 +295,7 @@ def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
     block_size, mxfp8_view = [128, 128], False
     if case == "unlisted_shape":
         monkeypatch.setattr(dispatch, "_FP8_SMALL_M_SHAPES", frozenset())
-    elif case in ("sm90", "sm100"):
+    elif case in ("sm90", "sm100", "sm107", "sm120"):
         monkeypatch.setattr(dispatch, "_DEVICE_SM", int(case[2:]))
     elif case == "bias":
         fp8_projection.bias = torch.ones(144, device="cuda")
@@ -316,7 +319,7 @@ def test_fp8_small_m_eligible(fp8_projection, monkeypatch, case):
         layer=fp8_projection,
         weight_block_size=block_size,
         block_fp8_as_mxfp8=mxfp8_view,
-    ) == (case == "eligible")
+    ) == (case in ("eligible", "sm100", "sm107"))
 
 
 @pytest.mark.parametrize("case", ["explicit_backend", "kill_switch"])
@@ -358,7 +361,7 @@ def test_fp8_small_m_linear_declines(fp8_projection, case):
     assert fp8_small_m_linear(fp8_projection, x) is None
 
 
-@pytest.mark.usefixtures("cuda_sm103")
+@pytest.mark.usefixtures("cuda_sm10x")
 def test_fp8_small_m_apply_after_weight_loading(fp8_projection):
     method = fp8_projection.quant_method
     assert not method.small_m_w8a16

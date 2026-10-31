@@ -4,7 +4,7 @@ JIT kernel for DeepSeek V3 fused QKV-A GEMM (min-latency).
 Runtime-compiled CUDA C++ kernel for SM90+ (Hopper) GPUs.
 Shapes: hd_in a multiple of 256, hd_out a multiple of 16, num_tokens 1-16, bfloat16.
 
-``dsv3_fused_a_gemm_fp8`` is the W8A16 variant for block-FP8 weights (128x128 scales); SM103 only.
+``dsv3_fused_a_gemm_fp8`` is the W8A16 variant for block-FP8 weights (128x128 scales); SM10x only.
 """
 
 from __future__ import annotations
@@ -95,17 +95,16 @@ def dsv3_fused_a_gemm(
     return result
 
 
-def _is_sm103() -> bool:
+def _is_sm10x() -> bool:
     if is_hip_runtime():
         return False
-    arch = get_jit_cuda_arch()
-    return (arch.major, arch.minor) == (10, 3)
+    return get_jit_cuda_arch().major == 10
 
 
 @cache_once
 def dsv3_fused_a_gemm_fp8_module(k: int, n: int, scale_dtype: torch.dtype) -> Module:
-    if not _is_sm103():
-        raise RuntimeError("dsv3_fused_a_gemm_fp8 is validated on SM103 (GB300) only")
+    if not _is_sm10x():
+        raise RuntimeError("dsv3_fused_a_gemm_fp8 is validated on SM10x only")
     if k <= 0 or k % 128 or n <= 0 or n % 16:
         raise ValueError("K must be a positive multiple of 128; N a multiple of 16")
     if scale_dtype not in (torch.float32, torch.int32):

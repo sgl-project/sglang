@@ -24,7 +24,6 @@ _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
-_SM103 = frozenset({CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
@@ -204,7 +203,7 @@ register_kernel(
         op="gemm.dsv3_fused_a_gemm_fp8",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm_fp8",
-        capabilities=_SM103,
+        capabilities=_SM10X,
     )
 )
 register_kernel(

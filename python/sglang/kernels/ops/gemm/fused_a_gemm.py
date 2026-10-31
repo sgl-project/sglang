@@ -10,7 +10,7 @@ All backends share the signature ``(mat_a, mat_b, output=None) -> Tensor`` with
 ``mat_a`` row-major ``[M, K]`` (M in [1, 16], bf16) and ``mat_b`` the column-major
 weight ``[K, N]`` (``weight.T``).
 
-On SM103, the block-FP8 projections in ``_FP8_SMALL_M_SHAPES`` are served by the JIT
+On SM10x, the block-FP8 projections in ``_FP8_SMALL_M_SHAPES`` are served by the JIT
 W8A16 kernel (row-major weights, BF16 activations): ``Fp8LinearMethod`` checks
 ``fp8_small_m_eligible`` once after weight loading and calls ``fp8_small_m_linear``
 from ``apply``. Other layers keep their normal dispatch, and so does every layer when
@@ -62,10 +62,10 @@ def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
 def fp8_small_m_eligible(
     layer: torch.nn.Module, weight_block_size: list[int], block_fp8_as_mxfp8: bool
 ) -> bool:
-    # SM103 (GB300) only, the one architecture the kernel is validated on; MXFP8-view layers keep their own kernel.
+    # SM10x only (SM100, SM103, SM107), where the kernel is validated; MXFP8-view layers keep their own kernel.
     if (
         not _IS_CUDA
-        or _DEVICE_SM != 103
+        or _DEVICE_SM // 10 != 10
         or weight_block_size != [128, 128]
         or block_fp8_as_mxfp8
         or layer.bias is not None

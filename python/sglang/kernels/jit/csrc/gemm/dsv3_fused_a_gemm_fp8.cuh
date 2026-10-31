@@ -40,7 +40,7 @@ constexpr Config default_config(uint32_t k_blocks) {
 }
 
 // Configs for the GLM-5.2 TP4 shard shapes; tokens is 8 for M<=8 and 16 for M in 9..16.
-// min_ctas = ceil(CTAs / 152 SMs): the register cap that keeps the whole grid resident in one wave.
+// min_ctas = ceil(CTAs / 128 SMs): the register cap that keeps the whole grid resident in one wave on 128+ SMs.
 constexpr Config tuned_config(uint32_t n, uint32_t k_blocks, uint32_t tokens) {
   if (n == 2624 && k_blocks == 48) return {8, 3, 2, true, 2, true};   // fused qkv_a
   if (n == 4096 && k_blocks == 16) return {16, 1, 1, true, 2, true};  // q_b, indexer wq_b
