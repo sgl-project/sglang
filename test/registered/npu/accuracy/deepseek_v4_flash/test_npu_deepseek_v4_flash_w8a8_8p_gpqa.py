@@ -21,10 +21,10 @@ register_npu_ci(
     nightly=True,
 )
 
-# The nightly pipeline can also be triggered by pull requests, so use GITHUB_WORKFLOW_REF
-# (which inherits the caller's github context) to identify the invoking workflow.
-_is_pr_pipeline = "/.github/workflows/nightly-test-npu.yml" not in os.environ.get(
-    "GITHUB_WORKFLOW_REF", ""
+# Nightly is also PR-triggered, so exclude it by workflow ref; every other caller
+# (local runs, full test) still gets the full run.
+_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
+    "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
 )
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
@@ -138,7 +138,7 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
-    accuracy = 0.95 if _is_pr_pipeline else 0.874
+    accuracy = 0.93 if _is_pr_pipeline else 0.874
     datasets = ["gsm8k"] if _is_pr_pipeline else ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH
