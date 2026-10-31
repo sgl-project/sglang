@@ -749,7 +749,11 @@ def run_aisbench(
                 output_file=dataset_file,
                 output_format="aisbench",
             )
-        dataset_path = dataset_file
+        # run_aisbench.sh's gsm8k branch resolves the dataset as
+        # <dataset_dir>/test.jsonl and ignores the file name, so publish the
+        # generated rows under that name.
+        dataset_path = "/tmp/datasets/test.jsonl"
+        shutil.copyfile(dataset_file, dataset_path)
         dataset_type = AISBENCHMARK_DATASET_GSM8K
         logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
