@@ -38,9 +38,8 @@ class TestEagerIdleBackend(CustomTestCase):
         previous = set_forward_context(None)
         self.addCleanup(set_forward_context, previous)
 
-    def _runner(self, default, *, pdmux=False, loaded_batch=None):
+    def _runner(self, default, *, loaded_batch=None):
         runner = object.__new__(EagerRunner)
-        runner.enable_pdmux = pdmux
         runner.model_context = nullcontext
         runner.load_batch = Mock(side_effect=lambda batch, _: loaded_batch or batch)
 
@@ -114,15 +113,6 @@ class TestEagerIdleBackend(CustomTestCase):
         self.assertIs(result.positions, loaded.positions)
         self.assertIs(result.kwargs["pp_proxy_tensors"], pp_inputs)
         self.assertIs(result.moe_bound_getter, loaded.moe_num_token_non_padded)
-
-    def test_pdmux_idle_keeps_the_active_backend_without_loading_a_batch(self):
-        default, active = _Backend(), _Backend()
-        runner = self._runner(default, pdmux=True)
-        batch = self._batch(3)
-        with forward_context(ForwardContext(attn_backend=active)):
-            result = runner.execute(batch)
-        self.assertIs(result.metadata, batch)
-        runner.load_batch.assert_not_called()
 
     def test_default_context_and_direct_call_retain_default_backend(self):
         for direct in (False, True):
