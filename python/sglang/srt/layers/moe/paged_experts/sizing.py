@@ -80,6 +80,19 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     return int((free_gb - slack_gb - mm_gb) * _GIB)
 
 
+def _kv_tokens(kv_configurator, budget_bytes: int) -> int:
+    """The tokens the KV cache holds in ``budget_bytes``, as SGLang's pool configurator sizes
+    it."""
+    from sglang.srt.model_executor.pool_configurator import (
+        create_memory_pool_configurator,
+    )
+
+    configurator = create_memory_pool_configurator(kv_configurator)
+    return configurator.calculate_pool_sizes(
+        max(budget_bytes, 0), get_schedule().page_size
+    ).max_total_num_tokens
+
+
 def _bytes_per_slot(method) -> int:
     """One more GPU slot of a layer: a row of every paged tensor."""
     from sglang.srt.layers.moe.paged_experts.method import _row_bytes
@@ -138,7 +151,8 @@ class ExpertSlotSizing:
 
     def _size_mamba_cache(self) -> Optional[int]:
         """Mamba state for the requests the KV cache aims for, within SGLang's own share of the
-        budget (which is the slots' under ``auto``)."""
+        budget (which is the slots' under ``auto``) and what the KV cache's minimum leaves: one
+        full-length request comes first, more requests queue."""
         kvc = self.kv_configurator
         if (
             kvc.mambaish_config is None
@@ -157,6 +171,12 @@ class ExpertSlotSizing:
             f"--max-running-requests {requests}" if requests else "one request"
         )
         slots = max(per_request, min((requests or 1) * per_request, share))
+        # One request fewer at a time until the KV cache's minimum fits next to them.
+        while slots > per_request and (
+            _kv_tokens(kvc, self.budget_before_kv - slots * per_slot)
+            < self.floor.minimum
+        ):
+            slots = max(per_request, slots - per_request)
         get_context().override("paged_experts.sizing", max_mamba_cache_size=slots)
         return slots
 

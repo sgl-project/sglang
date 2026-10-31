@@ -166,7 +166,8 @@ than the context; a warning says so.
 
 On hybrid models with Mamba layers and no `--max-mamba-cache-size`, the Mamba state pool holds
 the requests the KV cache aims for: the `--max-running-requests` you set, or one; never more
-than SGLang's own share of the budget (`--mamba-full-memory-ratio`).
+than SGLang's own share of the budget (`--mamba-full-memory-ratio`), and never so many that one
+full-length request no longer fits in the KV cache next to it: the rest queue.
 
 Ways to give the experts more memory:
 
