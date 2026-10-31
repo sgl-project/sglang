@@ -603,8 +603,8 @@ def handle_a2a_moe(server_args: Any):
         if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
                 required_mori_dispatch_tokens_per_rank(server_args)
-            ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
-                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
+            ) <= mori_max_dispatch_tokens_per_rank(server_args), (
+                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK "
                 "must be >= the per-rank MoRI dispatch tokens "
                 "(chunked_prefill_size by default)"
             )
@@ -903,6 +903,25 @@ def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
     """Max tokens a single rank dispatches through MoRI in one forward."""
     cfg = resolving_view(server_args)
     return cfg.chunked_prefill_size
+
+
+def mori_max_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Rows per rank each MoRI dispatch/combine op holds.
+
+    An explicit SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK wins. Unset, a server
+    that prefills sizes it to its per-rank chunked prefill, never below the default,
+    which also covers the decode batches of a non-disaggregated server; a
+    disaggregated decode server keeps the default.
+    """
+    configured = envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    cfg = resolving_view(server_args)
+    if (
+        configured.is_set()
+        or cfg.disaggregation_mode == "decode"
+        or cfg.chunked_prefill_size <= 0
+    ):
+        return configured.get()
+    return max(required_mori_dispatch_tokens_per_rank(server_args), configured.get())
 
 
 def required_pplx_dispatch_tokens_per_rank(server_args: Any) -> int:

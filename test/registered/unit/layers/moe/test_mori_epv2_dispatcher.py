@@ -101,6 +101,7 @@ class _MoriEPv2TestCase(CustomTestCase):
                 moriep, "_should_record_expert_distribution", return_value=False
             ),
             patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(moriep, "_max_dispatch_tokens_per_rank", return_value=4096),
         ]
         for item in self._patches:
             item.start()

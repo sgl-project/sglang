@@ -131,6 +131,9 @@ def main():
     dp_attention.set_dp_buffer_len(sum(sender_rows), tokens, False, metadata_rows)
 
     adapter.is_tbo_enabled = lambda: False
+    adapter._max_dispatch_tokens_per_rank = (
+        envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get
+    )
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
