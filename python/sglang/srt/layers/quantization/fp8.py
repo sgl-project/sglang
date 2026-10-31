@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    pack_block32_scale_ue8m0_for_deepgemm,
     pack_mxfp8_weight_scale_for_deepgemm,
     prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
@@ -769,14 +770,68 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    @property
+    def _serves_deepgemm_runner(self) -> bool:
+        return (
+            getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+        )
+
+    @property
+    def uses_sm120_block32_deepgemm(self) -> bool:
+        return (
+            _is_cuda
+            and get_platform().is_sm120
+            and self.weight_block_size == [32, 32]
+            and self._serves_deepgemm_runner
+        )
+
+    def _refresh_block32_packed_scale(self, layer: Module) -> None:
+        """Keep this layer's packed UE8M0 block32 scales in step with its checkpoint.
+
+        CUDA graphs capture the buffer address, so a reload copies in place and
+        anything that would move, resize or retype the buffer is refused instead.
+        """
+        packed_scale = pack_block32_scale_ue8m0_for_deepgemm(
+            layer.weight,
+            layer.weight_scale_inv,
+            self.weight_block_size,
+            use_deepgemm_runner=self._serves_deepgemm_runner,
+            output_dtype=getattr(layer, "orig_dtype", None),
+        )
+        eligible = packed_scale is not None
+        previous_eligible = getattr(layer, "_deepgemm_block32_scale_eligible", None)
+        if previous_eligible is not None and previous_eligible != eligible:
+            raise RuntimeError(
+                "Block32 DeepGEMM scale eligibility changed during weight reload; "
+                "CUDA graph recapture is required."
+            )
+        layer._deepgemm_block32_scale_eligible = eligible
+        if not eligible:
+            return
+
+        cached_scale = getattr(layer, "_deepgemm_block32_weight_scale", None)
+        if cached_scale is None:
+            layer.register_buffer(
+                "_deepgemm_block32_weight_scale", packed_scale, persistent=False
+            )
+        elif (
+            cached_scale.shape != packed_scale.shape
+            or cached_scale.dtype != packed_scale.dtype
+            or cached_scale.device != packed_scale.device
+        ):
+            raise RuntimeError(
+                "Block32 DeepGEMM scale layout changed during weight reload; "
+                "CUDA graph recapture is required."
+            )
+        else:
+            cached_scale.copy_(packed_scale)
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
             return
-        use_deepgemm_runner = (
-            getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
-            is deepgemm_w8a8_block_fp8_linear_with_fallback
-        )
+        use_deepgemm_runner = self._serves_deepgemm_runner
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -882,14 +937,24 @@ class Fp8LinearMethod(LinearMethodBase):
             from sglang.srt.layers import deep_gemm_wrapper
 
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                # UE8M0 DeepGEMM casts these fp32 scales in the kernel, which
-                # holds only for powers of two; the linear keeps others on Triton.
-                layer.weight_scale_inv.power_of_two = bool(
-                    (torch.frexp(weight_scale)[0] == 0.5).all().item()
-                )
+                # Packed UE8M0 casting requires a zero FP32 mantissa, excluding subnormals.
+                power_of_two = torch.frexp(weight_scale)[0] == 0.5
+                if self.uses_sm120_block32_deepgemm:
+                    power_of_two &= weight_scale >= torch.finfo(torch.float32).tiny
+                layer.weight_scale_inv.power_of_two = bool(power_of_two.all().item())
+                if not getattr(layer, "keep_plain_weight_layout", False):
+                    self._refresh_block32_packed_scale(layer)
         if hasattr(layer, "_block_fp8_bf16_weight"):
             layer._block_fp8_bf16_weight = None
             layer._derived_weight_cache_error = None
+        if self.uses_sm120_block32_deepgemm:
+            # Gate by runner, not rank-local scale values, so all ranks reject together.
+            layer._derived_weight_cache_error = (
+                "Online weight updates are not supported with SM120 block32 "
+                "DeepGEMM: tensor and distributed updates do not refresh packed "
+                "weight scales. Restart with --fp8-gemm-backend triton to allow "
+                "online updates."
+            )
         if (
             _is_cuda
             and get_platform().is_sm90
@@ -1453,12 +1518,18 @@ class Fp8LinearMethod(LinearMethodBase):
             extra_kwargs = (
                 {"weight_bf16": cached_weight} if cached_weight is not None else {}
             )
+            # Readers other than the DeepGEMM runner keep the checkpoint scales.
+            weight_scale = (
+                getattr(layer, "_deepgemm_block32_weight_scale", layer.weight_scale_inv)
+                if self._serves_deepgemm_runner
+                else layer.weight_scale_inv
+            )
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
                     block_size=self.weight_block_size,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
                     **extra_kwargs,
@@ -1468,7 +1539,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
                 **extra_kwargs,
