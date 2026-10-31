@@ -286,6 +286,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -333,7 +334,11 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.rust_server.server import RustServer
+from sglang.srt.rust_server.server import (
+    RustServer,
+    claim_sigterm_before_compiles,
+    drain_notify_name,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -700,7 +705,7 @@ class Scheduler(
         # so the registry is accepting once this returns.) Must also precede
         # the request receiver, which reads self.recv_from_tokenizer to pick
         # its ingress transport.
-        self.maybe_init_rust_server()
+        self.maybe_init_rust_server(port_args)
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
@@ -1346,6 +1351,7 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_reqs = RunningReqs()
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -2508,7 +2514,7 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         )
 
-    def maybe_init_rust_server(self) -> None:
+    def maybe_init_rust_server(self, port_args: PortArgs) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
         set, and point the ingress receiver at it. All the plumbing lives in
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
@@ -2528,6 +2534,9 @@ class Scheduler(
             return
 
         rust_server = self.get_rust_server_class().launch(self)
+        rust_server.install_sigterm_drain(
+            notify=drain_notify_name(port_args.instance_id)
+        )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
@@ -2618,6 +2627,12 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_running_reqs=lambda: self.running_reqs,
+            get_pp_running_mbs=lambda: (
+                self.running_mbs if get_parallel().pp_size > 1 else ()
+            ),
+            get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            prefill_launch_starts_running=self._prefill_launch_starts_running,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -4092,6 +4107,7 @@ class Scheduler(
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                self.running_reqs.join(new_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = new_batch
                 else:
@@ -4135,6 +4151,7 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -4569,6 +4586,7 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        self.running_reqs.leave(adder.preempt_list)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4718,6 +4736,25 @@ class Scheduler(
             if not req.finished()
         ]
 
+    def _prefill_launch_starts_running(self) -> bool:
+        """Whether launching a request's last prefill chunk starts it running: not
+        under PD (KV transfer, or the prebuilt merge), HiSparse (after staging) or
+        dLLM (never)."""
+        return (
+            self.disaggregation_mode == DisaggregationMode.NULL
+            and self.dllm_config is None
+            and not self.enable_hisparse
+        )
+
+    def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
+        """Launching a request's last prefill chunk starts it running. A row of a
+        mixed or DP-converted step that is running already stays; one a result
+        processed just before this launch finished does not join."""
+        if self._prefill_launch_starts_running() and batch.forward_mode.is_extend():
+            self.running_reqs.join(
+                r for r in batch.reqs if r is not batch.chunked_req and not r.finished()
+            )
+
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
         if not self.enable_skip_finishing_decode or not self.result_queue:
@@ -4766,6 +4803,7 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -4915,6 +4953,8 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        self._join_launched_reqs(batch)
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -5375,6 +5415,8 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+        # Running requests finish only in a step's processing.
+        self.running_reqs.leave_finished()
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -6190,6 +6232,8 @@ class Scheduler(
                 offload_kv=False,
             )
         self.running_batch.reqs = []
+        # Under PP the other micro-batches keep running.
+        self.running_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if req in unresumable:
                 abort_reason = FINISH_ABORT(
@@ -6561,6 +6605,8 @@ def configure_scheduler_process(
     the context. display_* ranks are cosmetic; runtime ranks stay local.
     """
     kill_itself_when_parent_died()
+    if envs.SGLANG_RUST_SERVER.get():
+        claim_sigterm_before_compiles()
 
     # Generate the logger prefix
     parallel = get_parallel()
