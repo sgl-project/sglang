@@ -943,14 +943,23 @@ def _qwen38_gdn_prologue_kernel(
             mask=((src >= 0) & in_seq)[:, None],
             other=0.0,
         )
-        if back >= 1:
-            xj = tl.where((src == -1)[:, None], s2[None, :], xj)
-        if back >= 2:
-            xj = tl.where((src == -2)[:, None], s1[None, :], xj)
-        if back >= 3:
-            xj = tl.where((src == -3)[:, None], s0[None, :], xj)
+        # Only a first block has rows before the start: the branch (uniform
+        # per program) keeps the selects out of every other block.
+        if first:
+            if back >= 1:
+                xj = tl.where((src == -1)[:, None], s2[None, :], xj)
+            if back >= 2:
+                xj = tl.where((src == -2)[:, None], s1[None, :], xj)
+            if back >= 3:
+                xj = tl.where((src == -3)[:, None], s0[None, :], xj)
         wj = tl.load(w_ptr + (feat0 + offs_n) * stride_w_dim + j)
-        acc += xj * wj[None, :]
+        # The BF16 product x * w as a bf16 * bf16 multiply gives it: exact in
+        # fp32 (8-bit significands), rounded once to BF16. Spelled out so that
+        # gfx950's convert instruction does the rounding; the implicit BF16
+        # multiply rounds with integer ops (~5 VALU per element and tap), and
+        # this kernel is VALU-bound. Same bits.
+        prod = (xj.to(tl.float32) * wj.to(tl.float32)[None, :]).to(tl.bfloat16)
+        acc += prod.to(tl.float32)
     acc = acc / (1 + tl.exp(-acc))
     y = acc.to(x_ptr.dtype.element_ty)
 

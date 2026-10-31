@@ -425,6 +425,48 @@ class TestQwen38GDNPrefillPrologue(unittest.TestCase):
                         self._assert_exact(name, candidate, reference)
                     self._assert_exact("conv_state", normed_state, raw_state)
 
+    def test_tap_products_at_extreme_magnitudes_exact(self):
+        """Tap products far from 1 (FP32 subnormal, ~2^100, signed zero and
+        BF16-subnormal inputs) round to BF16 as the legacy kernel's BF16
+        multiply rounds them."""
+        for has_initial_state in (False, True):
+            with self.subTest(has_initial_state=has_initial_state):
+                inputs = _make_inputs(
+                    [700, 64, 333],
+                    has_initial_state=has_initial_state,
+                )
+                x = inputs["x"]
+                x[:, 0::7] *= 2.0**100
+                x[:, 1::7] *= 2.0**-100
+                x[:, 2::7] = -0.0
+                x[:, 3::7] *= 2.0**-130
+                inputs["weight"][::5] *= 2.0**-30
+                inputs["conv_state"][:, ::3] *= 2.0**-110
+                ref_state = inputs["conv_state"].clone()
+                fused_state = inputs["conv_state"].clone()
+                expected = _legacy_prologue(inputs, ref_state)
+                actual = qwen38_gdn_prefill_prologue(
+                    inputs["x"],
+                    inputs["weight"],
+                    inputs["bias"],
+                    fused_state,
+                    inputs["query_start_loc"],
+                    inputs["seq_lens_cpu"],
+                    inputs["cache_indices"],
+                    inputs["has_initial_state"],
+                    inputs["A_log"],
+                    inputs["a"],
+                    inputs["b"],
+                    inputs["dt_bias"],
+                )
+                for name, candidate, reference in zip(
+                    ("q_raw_post_conv", "k_raw_post_conv", "v"),
+                    actual,
+                    expected[:3],
+                ):
+                    self._assert_exact(name, candidate, reference)
+                self._assert_exact("conv_state", fused_state, ref_state)
+
     def test_signed_zero_and_softplus_threshold_exact(self):
         inputs = _make_inputs([8], has_initial_state=False)
         inputs["A_log"].zero_()
