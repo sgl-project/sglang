@@ -70,6 +70,46 @@ class TestVirtualBatches(CustomTestCase):
         self.assertEqual(k_local.tolist(), [4, 2])
         self.assertEqual(tuple(block_table_local.shape), (2, 2))  # chunk 4 / page 2
 
+    def test_clamped_chunk_rounds_up_to_a_whole_page(self):
+        """A 1000-token sequence fits in one 8192-token chunk, so it must stay one block."""
+        q_start = np.array([0, 1000], dtype=np.int32)
+        seq_lens = np.array([1000], dtype=np.int32)
+        q_local, _, k_local, block_table_local = make_local_attention_virtual_batches(
+            8192, q_start, seq_lens, _page_table(1, width=16), 128
+        )
+        self.assertEqual(q_local.tolist(), [1000])
+        self.assertEqual(k_local.tolist(), [1000])
+        self.assertEqual(tuple(block_table_local.shape), (1, 8))  # 1024 / page 128
+
+    def test_clamped_chunk_matches_the_model_chunk(self):
+        """Clamping only narrows the block table; the blocks match the model chunk."""
+        rng = np.random.default_rng(0)
+        chunk = 512
+        for page_size in (1, 16, 64, 128):
+            for _ in range(50):
+                bs = int(rng.integers(1, 5))
+                seq_lens = rng.integers(1, 1500, size=bs).astype(np.int32)
+                q_lens = np.array([rng.integers(1, s + 1) for s in seq_lens])
+                q_start = np.pad(np.cumsum(q_lens), (1, 0)).astype(np.int32)
+                width = int(seq_lens.max()) // page_size + 1
+                page_table = _page_table(bs, width=width)
+
+                clamped = make_local_attention_virtual_batches(
+                    chunk, q_start, seq_lens, page_table, page_size
+                )
+                model = make_local_attention_virtual_batches(
+                    chunk,
+                    q_start,
+                    seq_lens,
+                    page_table,
+                    page_size,
+                    preserve_attn_chunk_size=True,
+                )
+                for got, want in zip(clamped[:3], model[:3]):
+                    np.testing.assert_array_equal(got, want)
+                num_pages = clamped[3].shape[1]
+                torch.testing.assert_close(clamped[3], model[3][:, :num_pages])
+
 
 class TestLocalAttentionMetadataBuilder(CustomTestCase):
     def _builder(self, swa_translate=None, max_context_len=16):

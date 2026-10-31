@@ -250,7 +250,10 @@ def make_local_attention_virtual_batches(
         block_table_local: Block table for local attention
     """
     if not preserve_attn_chunk_size:
-        max_seq_len = seq_lens_np.max()
+        # Round the longest sequence up to a whole page before clamping. Rounding
+        # it down would put a chunk boundary inside a sequence that fits in one
+        # model chunk, and its tail would stop attending to the keys before it.
+        max_seq_len = cdiv(seq_lens_np.max(), page_size) * page_size
         effective_chunk_size = min(attn_chunk_size, max_seq_len)
         effective_chunk_size = (effective_chunk_size // page_size) * page_size
         if effective_chunk_size < page_size:
