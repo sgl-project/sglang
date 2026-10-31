@@ -151,6 +151,9 @@ impl SglangService for GrpcService {
             Ok(HealthStatus::Stalled) => Err(Status::unavailable(
                 "no scheduler output within the health-check timeout",
             )),
+            Ok(HealthStatus::Draining) => {
+                Err(Status::unavailable("server is draining before shutdown"))
+            }
             Err(error) => Err(native_api::status(error)),
         }
     }

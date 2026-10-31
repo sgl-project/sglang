@@ -332,7 +332,11 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.rust_server.server import RustServer
+from sglang.srt.rust_server.server import (
+    RustServer,
+    claim_sigterm_before_compiles,
+    drain_notify_name,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -699,7 +703,7 @@ class Scheduler(
         # so the registry is accepting once this returns.) Must also precede
         # the request receiver, which reads self.recv_from_tokenizer to pick
         # its ingress transport.
-        self.maybe_init_rust_server()
+        self.maybe_init_rust_server(port_args)
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
@@ -2466,7 +2470,7 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         )
 
-    def maybe_init_rust_server(self) -> None:
+    def maybe_init_rust_server(self, port_args: PortArgs) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
         set, and point the ingress receiver at it. All the plumbing lives in
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
@@ -2486,6 +2490,9 @@ class Scheduler(
             return
 
         rust_server = self.get_rust_server_class().launch(self)
+        rust_server.install_sigterm_drain(
+            notify=drain_notify_name(port_args.instance_id)
+        )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
@@ -6436,6 +6443,8 @@ def configure_scheduler_process(
     the context. display_* ranks are cosmetic; runtime ranks stay local.
     """
     kill_itself_when_parent_died()
+    if envs.SGLANG_RUST_SERVER.get():
+        claim_sigterm_before_compiles()
 
     # Generate the logger prefix
     parallel = get_parallel()
