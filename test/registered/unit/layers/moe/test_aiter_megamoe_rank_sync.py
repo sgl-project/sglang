@@ -24,6 +24,7 @@ def test_mlp_sync_retains_full_vector_without_tp_gather():
         tbo_split_seq_index=None,
         global_forward_mode=None,
         can_run_decode_cuda_graph=False,
+        can_reuse_lora_routing=False,
         can_run_draft_cuda_graph=False,
         can_run_prefill_cuda_graph=False,
         prefill_cuda_graph_max_prefix_len=0,

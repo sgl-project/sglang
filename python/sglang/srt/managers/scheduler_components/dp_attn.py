@@ -161,6 +161,7 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    can_reuse_lora_routing: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -187,6 +188,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                int(self.can_reuse_lora_routing),
             ],
             device=device,
             dtype=dtype,
@@ -206,6 +208,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # can_reuse_lora_routing
             ],
             device=device,
             dtype=dtype,
@@ -283,7 +286,8 @@ class MLPSyncBatchInfo:
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        global_info_cpu = global_info_tensor.cpu()
+        tp0_info_cpu = global_info_cpu[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
@@ -294,6 +298,8 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        # Resident adapter slots can change on any TP/CP rank, not just TP0.
+        self.can_reuse_lora_routing = bool(global_info_cpu[:, :, 11].min())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -345,6 +351,12 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    batch.can_reuse_lora_routing = (
+        not skip_global_metadata
+        and mlp_sync_info.can_reuse_lora_routing
+        and mlp_sync_info.can_run_decode_cuda_graph
+        and not mlp_sync_info.is_extend_in_batch
+    )
     batch.can_run_dp_draft_cuda_graph = mlp_sync_info.can_run_draft_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
     batch.dp_prefill_cuda_graph_max_prefix_len = (
@@ -641,6 +653,11 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        can_reuse_lora_routing=(
+            not skip_all_gather
+            and model_runner.lora_manager is not None
+            and model_runner.lora_manager.can_reuse_dp_lora_routing(local_batch)
+        ),
     )
 
     if num_dp_ranks == 1:
