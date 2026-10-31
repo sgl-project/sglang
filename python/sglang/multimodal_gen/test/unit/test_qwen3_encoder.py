@@ -4,6 +4,9 @@ import torch
 
 import sglang.multimodal_gen.runtime.models.encoders.qwen3 as qwen3
 import sglang.srt.layers.activation as srt_activation
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    _drop_unread_layers,
+)
 from sglang.multimodal_gen.runtime.models.encoders.qwen3 import Qwen3ForCausalLM
 from sglang.srt.layers.activation import SiluAndMul
 
@@ -97,3 +100,31 @@ def test_fp8_qkv_scale_uses_the_packed_parameter_loader():
 
     assert loaded == {"layers.0.self_attn.qkv_proj.weight_scale_inv"}
     torch.testing.assert_close(scale[:, 0], torch.tensor([2.0, 0.0, 0.0]))
+
+
+class _AddLayer(torch.nn.Module):
+    def __init__(self, i):
+        super().__init__()
+        self.i = i
+
+    def forward(self, position_ids, hidden_states, residual, attention_lengths):
+        return hidden_states + self.i + 1, residual
+
+
+def test_drop_unread_layers_keeps_read_hidden_states():
+    model = Qwen3ForCausalLM.__new__(Qwen3ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(output_hidden_states=True)
+    model.layers = torch.nn.ModuleList(_AddLayer(i) for i in range(8))
+    model.norm = _IdentityNorm()
+    model.get_input_embeddings = lambda ids: torch.zeros(*ids.shape, 4)
+    input_ids = torch.zeros(1, 3, dtype=torch.long)
+    read = (2, 4, 6)
+
+    full = model(input_ids=input_ids).hidden_states
+    _drop_unread_layers(model, read)
+    trimmed = model(input_ids=input_ids).hidden_states
+
+    assert len(model.layers) == max(read) + 1
+    for k in read:
+        assert torch.equal(trimmed[k], full[k])
