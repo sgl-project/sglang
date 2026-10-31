@@ -50,12 +50,15 @@ from sglang.srt.mem_cache.kv.alloc.interim import (
     interim_policy_for,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
+    NO_MOVE,
     ChainSnapshot,
     TakePlan,
     feasible,
     first_plan,
     move_order,
-    no_relief_plan,
+)
+from sglang.srt.mem_cache.kv.alloc.pricing import plan as plan_layout
+from sglang.srt.mem_cache.kv.alloc.pricing import (
     reclaimed_snapshot,
     snapshot_chain,
 )
@@ -78,18 +81,18 @@ class _ScopedPhysicalTakes:
 
     def __init__(self, allocator, demands):
         self.allocator = allocator
-        self.demands = dict(demands)
+        self.demands = {name: n for name, n in demands if n > 0}
         # Admission and reclaim answered with every rearrangement the chain can
         # make; make the one this reservation needs before any take is issued,
         # so the takes then fit in place, in whatever order they come.
-        if no_relief_plan(
-            allocator.pricing_snapshot(), tuple(self.demands.items())
+        if plan_layout(
+            allocator.pricing_snapshot(), self.demands, NO_MOVE
         ) is None and not allocator.lay_out_for(self.demands):
             raise RuntimeError(
                 "physical reservation needs reclamation before its scope"
             )
         snapshot = allocator.pricing_snapshot()
-        if no_relief_plan(snapshot, tuple(self.demands.items())) is None:
+        if plan_layout(snapshot, self.demands, NO_MOVE) is None:
             raise RuntimeError("a realized layout does not hold its reservation")
         self.initial_live = {band.name: band.live for band in snapshot.bands}
         self.applying = False
@@ -101,17 +104,22 @@ class _ScopedPhysicalTakes:
             - (current.live - self.initial_live[current.name])
             for current in snapshot.bands
         }
-        if pages > remaining[band.sub_pool_name]:
+        if pages > remaining[band.sub_pool_name] or any(
+            n < 0 for n in remaining.values()
+        ):
             return None
-        plan = no_relief_plan(snapshot, tuple(remaining.items()))
-        if plan is None:
-            return None
-        take = plan.takes[band.sub_pool_name].prefix(
-            pages, page_bytes=band.entry_bytes_per_page
+        # Planned again from the current layout: the takes so far consumed
+        # prefixes of earlier plans, so the rest still fits in place.
+        layout = plan_layout(
+            snapshot, {name: n for name, n in remaining.items() if n > 0}, NO_MOVE
         )
+        if layout is None:
+            return None
         self.applying = True
         try:
-            return band.take_planned_physical_pages(take)
+            return band.take_planned_pages(
+                layout.takes[band.sub_pool_name].prefix(pages)
+            )
         finally:
             self.applying = False
 
@@ -1093,23 +1101,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         taken = {}
         for band in self.bands:
             take = plan.takes.get(band.sub_pool_name)
-            if take is None:
-                continue
-            extended = 0 if take.pages is None else take.pages[1] - take.pages[0]
-            pages = take.reuse + extended
-            if not pages:
+            if take is None or not take.count():
                 continue
             if bind_at_frontier and band.takes_at_frontier(take):
                 taken[band.sub_pool_name] = None
                 continue
-            if band.grow_direction == "float":
-                physical = band.take_physical_pages(pages, placement=take.pages)
-            else:
-                physical = band.take_physical_pages(pages)
+            physical = band.take_planned_pages(take)
             if physical is None:
                 raise RuntimeError(
-                    f"{band.sub_pool_name}: the planned take of {pages} pages "
-                    "was refused"
+                    f"{band.sub_pool_name}: the planned take of {take.count()} "
+                    "pages was refused"
                 )
             taken[band.sub_pool_name] = physical
         return taken
@@ -1168,17 +1169,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def scoped_physical_takes(
         self, full_tokens, swa_tokens, *, auxiliary_swa_tokens=None, state_slots=0
     ):
-        """Consume a pre-realized reservation across independently issued H2D takes."""
-        if len(self._windows) <= 1:
-            yield
-            return
+        """Consume a pre-realized reservation across independently issued H2D
+        takes. Every chain shape realizes the reservation's layout here, before
+        the takes pin their bands."""
         if any(band._physical_take_scope is not None for band in self.members):
             raise RuntimeError("physical reservation scopes cannot be nested")
         scope = _ScopedPhysicalTakes(
             self,
-            self._policy._demands(
-                self, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
-            ),
+            self.page_demands(
+                full_tokens,
+                swa_tokens,
+                auxiliary_swa_tokens=auxiliary_swa_tokens,
+                state_slots=state_slots,
+            ).items(),
         )
         for band in self.members:
             band._physical_take_scope = scope
