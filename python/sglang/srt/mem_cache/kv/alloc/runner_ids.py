@@ -62,7 +62,7 @@ DCP index kernels select them.
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
@@ -95,6 +95,26 @@ def _localized(name: str, space: IdSpace, localize) -> IdSpace:
         return IdSpace(key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize)
     to_space = space.write
     return msgspec.structs.replace(space, write=lambda ids: to_space(localize(ids)))
+
+
+def _window_metadata_builders(backend) -> list:
+    """The attention backends that build window metadata for `backend`'s
+    forwards, so the ones whose window capability binds.
+
+    A multi-step draft wrapper is not an attention backend: it builds no
+    metadata of its own and delegates every step to one backend per step
+    (`attn_backends`), so those answer for it. A wrapper that is itself an
+    attention backend answers for itself as well.
+    """
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+    steps = getattr(backend, "attn_backends", None)
+    if steps is None:
+        return [backend]
+    builders = list(steps)
+    if isinstance(backend, AttentionBackend):
+        builders.append(backend)
+    return builders
 
 
 class ReadTable(msgspec.Struct, frozen=True):
@@ -151,6 +171,7 @@ class RunnerIds:
         # the pool does (`_call_spaces`): only an NPU DCP target's plan
         # localizes its writes.
         self._spaces: Dict[str, IdSpace] = {}
+        self.window_sub_pools: Tuple[str, ...] = ()
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             if is_cp_sharded_padded():
@@ -165,19 +186,12 @@ class RunnerIds:
                 if plan is None or plan.fused_draft is None
                 else set(plan.fused_draft.new_bands)
             )
-            windows = (
-                set()
-                if not is_unified_target or plan is None
-                else {s.name for s in plan.windows()} - drafts
-            )
-            if len(windows) > 1:
-                # Attention backends bind one window's write and read ids per
-                # runner; layers of another window would take that window's.
-                raise NotImplementedError(
-                    f"this runner's layers attend through window sub-pools "
-                    f"{sorted(windows)}; attention backends read one window per "
-                    "runner, so layers with windows of different lengths are "
-                    "not supported yet"
+            # The window sub-pools this runner's layers read, each through its
+            # own id space; a backend bound to the runner must serve them all
+            # (`bind_and_verify_backends`).
+            if is_unified_target and plan is not None:
+                self.window_sub_pools = tuple(
+                    sorted({s.name for s in plan.windows()} - drafts)
                 )
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
@@ -751,6 +765,17 @@ class RunnerIds:
         for backend in backends:
             if backend is None:
                 continue
+            for builder in _window_metadata_builders(backend):
+                if len(self.window_sub_pools) > builder.max_window_sub_pools:
+                    # Layers of another window would take the bound window's ids.
+                    raise NotImplementedError(
+                        f"this runner's layers attend through window sub-pools "
+                        f"{list(self.window_sub_pools)}, but "
+                        f"{type(builder).__name__} reads at most "
+                        f"{builder.max_window_sub_pools} per runner; layers with "
+                        "windows of different lengths need a backend that builds "
+                        "window metadata per window sub-pool"
+                    )
             if backend.runner_ids is None:
                 backend.runner_ids = self
                 continue

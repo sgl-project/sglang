@@ -180,29 +180,124 @@ class TestDraftWindowFusesByLifetime(CustomTestCase):
                 )
 
 
-class TestRunnerReadsOneWindow(CustomTestCase):
-    def test_runner_refuses_layers_of_several_windows(self):
-        """Backends bind one window's ids per runner: a runner whose layers
-        attend through two window sub-pools is refused, not given one window's
-        ids for both."""
+class _Backend:
+    """An attention backend as the runner binds it."""
+
+    def __init__(self, max_window_sub_pools):
+        self.max_window_sub_pools = max_window_sub_pools
+        self.runner_ids = None
+
+
+class _MultiStepWrapper:
+    """A multi-step draft wrapper as the draft worker binds it: no attention
+    backend itself, one backend per draft step."""
+
+    def __init__(self, steps):
+        self.attn_backends = steps
+        self.runner_ids = None
+
+
+class TestRunnerAddressesEveryWindow(CustomTestCase):
+    def _runner(self, storage, req_to_token):
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
-        for windows, refused in (((64,), False), ((64, 16), True)):
+        allocator = storage.allocator
+        return RunnerIds(
+            req_to_token=req_to_token,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=allocator.get_kvcache(),
+            page_size=4,
+            device="cpu",
+        )
+
+    def test_each_window_writes_and_reads_its_own_rows(self):
+        """A runner over several window sub-pools names each one's write ids
+        and page table through that sub-pool's own pages."""
+        from test_runner_ids import _FakeForwardBatch
+
+        for windows in ((64, 16), (64, 16, 8)):
             with self.subTest(windows=windows):
                 storage = _storage(windows)
                 allocator = storage.allocator
-                build = lambda: RunnerIds(
-                    req_to_token=torch.zeros((3, 64), dtype=torch.int32),
-                    token_to_kv_pool_allocator=allocator,
-                    token_to_kv_pool=allocator.get_kvcache(),
-                    page_size=4,
-                    device="cpu",
+                names = sorted(window_sub_pool_name(w, windows) for w in windows)
+                held = allocator.alloc(8)
+                virt = allocator.alloc(8)
+                req_to_token = torch.zeros((3, 64), dtype=torch.int32)
+                req_to_token[0, :16] = torch.cat([held, virt]).to(torch.int32)
+                runner = self._runner(storage, req_to_token)
+                self.assertEqual(runner.window_sub_pools, tuple(names))
+                batch = _FakeForwardBatch(
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([16]),
+                    seq_lens_cpu=torch.tensor([16]),
+                    out_cache_loc=virt,
                 )
+                plan = runner.own_plan(batch)
+                rows = set()
+                for name in names:
+                    band = allocator.window_allocators[name]
+                    pages = band.ids.virtual_to_physical
+                    want = pages[virt // 4] * 4 + virt % 4
+                    got = plan.write_ids(runner, kind=name)
+                    self.assertTrue(torch.equal(got, want), name)
+                    table = plan.read_table(kind=name, reader=runner)
+                    page_ids = table.ids[table.row_ids[0], :4]
+                    want_pages = pages[req_to_token[0, :16:4].long() // 4]
+                    self.assertTrue(torch.equal(page_ids.long(), want_pages), name)
+                    rows.add((name, tuple(want.tolist())))
+                self.assertEqual(len(rows), len(names))
+
+    def test_backends_bind_only_as_many_windows_as_they_serve(self):
+        """Backends build window metadata per runner: one that serves fewer
+        window sub-pools than the runner's layers read is refused by name."""
+        for windows, refused in (((64,), False), ((64, 16), True)):
+            with self.subTest(windows=windows):
+                runner = self._runner(
+                    _storage(windows), torch.zeros((3, 64), dtype=torch.int32)
+                )
+                backend = _Backend(max_window_sub_pools=1)
                 if refused:
-                    with self.assertRaisesRegex(NotImplementedError, "swa_16"):
-                        build()
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "_Backend.*swa_16|swa_16.*_Backend"
+                    ):
+                        runner.bind_and_verify_backends([backend])
+                    self.assertIsNone(backend.runner_ids)
                 else:
-                    self.assertIsNotNone(build().space("swa"))
+                    runner.bind_and_verify_backends([backend])
+                    self.assertIs(backend.runner_ids, runner)
+                wide = _Backend(max_window_sub_pools=len(windows))
+                runner.bind_and_verify_backends([wide])
+                self.assertIs(wide.runner_ids, runner)
+
+    def test_multi_step_wrappers_answer_through_their_step_backends(self):
+        """A multi-step draft wrapper carries no window capability of its own:
+        it binds when every step backend serves the runner's windows, and is
+        refused, naming the step backend, when one does not."""
+        for windows, step_capacity, refused in (
+            ((64,), 1, False),
+            ((64, 16), 1, True),
+            ((64, 16), 2, False),
+        ):
+            with self.subTest(windows=windows, step_capacity=step_capacity):
+                runner = self._runner(
+                    _storage(windows), torch.zeros((3, 64), dtype=torch.int32)
+                )
+                steps = [_Backend(max_window_sub_pools=step_capacity) for _ in range(3)]
+                wrapper = _MultiStepWrapper(steps)
+                bound = [wrapper, *steps]
+                if refused:
+                    with self.assertRaisesRegex(NotImplementedError, "_Backend"):
+                        runner.bind_and_verify_backends(bound)
+                    self.assertIsNone(wrapper.runner_ids)
+                    continue
+                runner.bind_and_verify_backends(bound)
+                for backend in bound:
+                    self.assertIs(backend.runner_ids, runner)
+        # A one-step draft wraps no step backend; it still binds.
+        runner = self._runner(_storage((64,)), torch.zeros((3, 64), dtype=torch.int32))
+        empty = _MultiStepWrapper([])
+        runner.bind_and_verify_backends([empty])
+        self.assertIs(empty.runner_ids, runner)
 
 
 class TestSeveralWindowsAllocate(CustomTestCase):
