@@ -10,6 +10,10 @@ import triton.language as tl
 
 _BLOCK_SIZE = 1024
 
+# Prefix searched for the top-p pivot. Arbitrary; wide enough to hold the
+# nucleus at usual top_p, and a row it misses keeps its full width.
+_TOP_P_PIVOT_PREFIX = 2048
+
 
 @triton.jit
 def _mask_and_partial_sum_kernel(
@@ -89,14 +93,45 @@ def _renorm_from_pivots(probs_fp32: torch.Tensor, pivots: torch.Tensor) -> torch
     return out
 
 
+def _top_p_pivots(probs_fp32: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Smallest prob whose retained mass covers top_p.
+
+    A descending prefix matches the ascending full-sort pivot, ties included.
+    A prefix that misses top_p returns 0 and keeps the row, with no host sync.
+    """
+    vocab_size = probs_fp32.shape[-1]
+    k = _TOP_P_PIVOT_PREFIX
+    if not 0 < k < vocab_size:
+        sorted_probs = torch.sort(probs_fp32, dim=-1).values
+        cdf = torch.cumsum(sorted_probs, dim=-1)
+        cutoff = torch.searchsorted(
+            cdf, (1.0 - top_ps).unsqueeze(1), right=False
+        ).squeeze(1)
+        cutoff.clamp_(max=vocab_size - 1)
+        return sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+
+    top_vals, _ = torch.topk(probs_fp32, k, dim=-1, sorted=True)
+    cdf_desc = torch.cumsum(top_vals, dim=-1)
+    idx = torch.searchsorted(cdf_desc, top_ps.unsqueeze(1), right=True).squeeze(1)
+    idx.clamp_(max=k - 1)
+    pivots = top_vals.gather(1, idx.unsqueeze(1)).squeeze(1)
+    # Prefix mass did not cover top_p -> keep the whole row instead of truncating.
+    return torch.where(
+        cdf_desc[:, -1] > top_ps, pivots, torch.zeros_like(pivots)
+    ).contiguous()
+
+
 def top_p_renorm_probs_triton(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
-    """Apply exact top-p thresholding and renormalize each probability row.
+    """Apply top-p thresholding and renormalize each probability row.
 
     Sorting and prefix sums use PyTorch's device kernels because a vocabulary-sized
     in-register Triton sort does not scale to 100K+ vocabularies. Triton performs
     the bandwidth-heavy masking, partial reduction, and normalization.
+
+    Exact when the top _TOP_P_PIVOT_PREFIX probs cover top_p; a row they miss
+    is kept whole.
     """
     probs_fp32 = _prepare_probs(probs)
     batch_size, vocab_size = probs_fp32.shape
@@ -119,15 +154,8 @@ def top_p_renorm_probs_triton(
             (batch_size,), float(top_p), device=probs.device, dtype=torch.float32
         )
 
-    # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
-    # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
-    sorted_probs = torch.sort(probs_fp32, dim=-1).values
-    cdf = torch.cumsum(sorted_probs, dim=-1)
-    cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
-        1
-    )
-    cutoff.clamp_(max=vocab_size - 1)
-    pivots = sorted_probs.gather(1, cutoff.unsqueeze(1)).squeeze(1).contiguous()
+    # Match FlashInfer's threshold semantics: retain all ties at the pivot.
+    pivots = _top_p_pivots(probs_fp32, top_ps)
 
     return _renorm_from_pivots(probs_fp32, pivots)
 

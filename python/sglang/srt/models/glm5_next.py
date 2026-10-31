@@ -1391,11 +1391,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "backend is enabled."
                 )
             parallel = get_parallel()
+            # TP1 is unsharded, so the shared expert already matches one routed expert.
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in (1, 4, 8)
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return (
+                    "HIP shared experts fusion is validated only for TP1, TP4 and TP8."
+                )
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096
