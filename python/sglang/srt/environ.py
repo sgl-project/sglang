@@ -1083,6 +1083,12 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    # Kimi-K3 on gfx950: fuse the router top-k with aiter's MoE route sort for decode
+    # batches up to this many tokens; 0 disables.
+    SGLANG_ROCM_K3_FUSED_ROUTE_SORT_MAX_TOKENS = EnvInt(16)
+    # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at most 8
+    # tokens: past that its single quant workgroup costs more than a launch).
+    SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
