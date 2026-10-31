@@ -220,6 +220,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
+        self._write_back_eviction_headroom_tokens = max(
+            0, envs.SGLANG_OPT_HICACHE_WRITE_BACK_EVICTION_HEADROOM_TOKENS.get()
+        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -715,9 +718,26 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
+    def _with_write_back_headroom(self, params: EvictParams) -> EvictParams:
+        """Grow nonzero Full/SWA shortfalls by the write_back reserve, capped by evictable."""
+        headroom = self._write_back_eviction_headroom_tokens
+        if headroom == 0 or not self.is_write_back:
+            return params
+
+        def grow(shortfall: int, evictable: int) -> int:
+            if shortfall <= 0:
+                return shortfall
+            return shortfall + min(headroom, max(0, evictable - shortfall))
+
+        return EvictParams(
+            num_tokens=grow(params.num_tokens, self.full_evictable_size()),
+            swa_num_tokens=grow(params.swa_num_tokens, self.swa_evictable_size()),
+            mamba_num=params.mamba_num,
+        )
+
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
-        return self._evict(params)
+        return self._evict(self._with_write_back_headroom(params))
 
     @rank_consensus(
         same_params=["params", "allocation_reclaim_satisfied is not None"],
@@ -747,6 +767,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
             )
 
+        params = self._with_write_back_headroom(params)
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
             ct: (ct, self._component_available_size(ct) + request_cnt)
