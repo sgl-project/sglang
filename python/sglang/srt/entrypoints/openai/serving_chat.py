@@ -104,6 +104,9 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_no_tool_call_structural_tag,
+)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1923,6 +1926,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+        elif (
+            effective_tools
+            and self.chat_encoding_spec == "kimi_k3"
+            and self.tool_call_parser == "kimi_k3"
+        ):
+            tool_call_constraint = (
+                "structural_tag",
+                get_kimik3_no_tool_call_structural_tag(
+                    thinking_mode=xgrammar_reasoning
+                ),
+            )
 
         if tool_call_constraint is None and self._takes_turn_grammar(
             request, output_constrained=output_constrained
