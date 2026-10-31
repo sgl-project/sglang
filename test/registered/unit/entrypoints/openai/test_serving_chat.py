@@ -3081,6 +3081,23 @@ class ServingChatTestCase(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must be a JSON object"):
             self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv32_handles_continue_final_message_only_assistant(self):
+        """A lone continued assistant leaves a valid generation prompt."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv32"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "assistant", "content": "partial answer"}],
+            continue_final_message=True,
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        encode_calls = self.chat.tokenizer_manager.tokenizer.encode.call_args_list
+        rendered = " ".join(str(call.args[0]) for call in encode_calls)
+        assert "<｜Assistant｜></think>" in rendered
+
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None

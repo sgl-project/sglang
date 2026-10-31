@@ -379,6 +379,14 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
     return config or None
 
 
+def _dsv32_assistant_generation_header(thinking_mode: ThinkingMode) -> str:
+    return "<｜Assistant｜>" + (
+        encoding_dsv32.thinking_start_token
+        if thinking_mode == ThinkingMode.THINKING
+        else encoding_dsv32.thinking_end_token
+    )
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -2104,11 +2112,14 @@ class OpenAIServingChat(OpenAIServingBase):
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
+            # The strip may empty the list; remember it, because the empty
+            # system message inserted below for the tool host would mask it.
+            messages_emptied = not messages
 
             request_tools = request.tools if tools else None
 
-            # An empty system message hosts the request tools.
-            if messages[0]["role"] != "system":
+            # The final assistant strip can leave no message to index here.
+            if not messages or messages[0]["role"] != "system":
                 messages.insert(0, {"role": "system", "content": ""})
             if request_tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request_tools]
@@ -2120,6 +2131,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
+                if messages_emptied:
+                    # The strip emptied the list, so nothing rendered the
+                    # assistant generation header. Emit it explicitly or the
+                    # prefix would continue bare text, not an assistant turn.
+                    header_ids = self.tokenizer_manager.tokenizer.encode(
+                        _dsv32_assistant_generation_header(thinking_mode)
+                    )
+                    if (
+                        header_ids
+                        and header_ids[0]
+                        == self.tokenizer_manager.tokenizer.bos_token_id
+                    ):
+                        header_ids = header_ids[1:]
+                    prompt_ids = prompt_ids + header_ids
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )
