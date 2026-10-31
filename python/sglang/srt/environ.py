@@ -668,6 +668,10 @@ class Envs:
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
     SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    # Prefill the part of a long prompt that does not fill a whole chunk first,
+    # then whole chunks, so the short chunk's attention sees almost no context
+    # instead of the whole prompt. See PrefillAdder.remainder_first_len.
+    SGLANG_CHUNKED_PREFILL_REMAINDER_FIRST = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     max_bootstrap_input_len,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -347,6 +348,98 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
+
+    def chunk_lengths(self, req, prompt_len, page_size):
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=page_size, rem_chunk_tokens=16384
+        )
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        lengths = [req.extend_len]
+        while req.prefix_len + req.extend_len < prompt_len:
+            req.prefix_len += req.extend_len
+            adder = self.create_adder(
+                self.create_running_batch(),
+                page_size=page_size,
+                rem_chunk_tokens=16384,
+            )
+            adder.add_chunked_req(req)
+            lengths.append(req.extend_len)
+        return lengths
+
+    def test_remainder_first_prefills_the_partial_chunk_first(self):
+        # The part of a long prompt that does not fill a whole chunk runs first
+        # (rounded up to the page), the rest as whole chunks; also for
+        # ignore_eos requests without a radix cache, which take their own path.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 1 << 20
+        cases = (
+            (100052, 1, [1748] + [16384] * 6, [16384] * 6 + [1748]),
+            (100052, 64, [1792] + [16384] * 5 + [16340], [16384] * 6 + [1748]),
+            (98304, 1, [16384] * 6, [16384] * 6),
+            (16000, 1, [16000], [16000]),
+        )
+        for ignore_eos in (False, True):
+            self.mock_tree_cache.disable = ignore_eos
+            for prompt_len, page_size, remainder_first, default in cases:
+                for enabled, expected in ((True, remainder_first), (False, default)):
+                    with (
+                        self.subTest(
+                            ignore_eos=ignore_eos,
+                            prompt_len=prompt_len,
+                            page_size=page_size,
+                            enabled=enabled,
+                        ),
+                        envs.SGLANG_CHUNKED_PREFILL_REMAINDER_FIRST.override(enabled),
+                    ):
+                        req = self.create_shared_req(f"long-{prompt_len}-{page_size}")
+                        req.sampling_params.ignore_eos = ignore_eos
+                        req.full_untruncated_fill_ids = list(range(prompt_len))
+                        req.origin_input_ids = req.full_untruncated_fill_ids
+                        self.assertEqual(
+                            self.chunk_lengths(req, prompt_len, page_size), expected
+                        )
+
+    def test_remainder_first_chunk_shares_the_batch_with_whole_requests(self):
+        # The budget a remainder-first chunk leaves goes to requests that fit
+        # whole; a second request that needs chunking waits for the next batch.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 1 << 20
+        for ignore_eos in (False, True):
+            self.mock_tree_cache.disable = ignore_eos
+            with (
+                self.subTest(ignore_eos=ignore_eos),
+                envs.SGLANG_CHUNKED_PREFILL_REMAINDER_FIRST.override(True),
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=1, rem_chunk_tokens=16384
+                )
+                reqs = {}
+                for rid, length in (
+                    ("long", 100052),
+                    ("short", 4000),
+                    ("second", 20000),
+                ):
+                    reqs[rid] = self.create_shared_req(rid)
+                    reqs[rid].sampling_params.ignore_eos = ignore_eos
+                    reqs[rid].full_untruncated_fill_ids = list(range(length))
+                    reqs[rid].origin_input_ids = reqs[rid].full_untruncated_fill_ids
+                adder.add_one_req(
+                    reqs["long"], has_chunked_req=False, truncation_align_size=None
+                )
+                adder.add_one_req(
+                    reqs["short"], has_chunked_req=False, truncation_align_size=None
+                )
+                result = adder.add_one_req(
+                    reqs["second"], has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(result, AddReqResult.OTHER)
+                self.assertEqual(adder.can_run_list, [reqs["long"], reqs["short"]])
+                self.assertEqual(
+                    [r.extend_len for r in adder.can_run_list], [1748, 4000]
+                )
+                self.assertIs(adder.new_chunked_req, reqs["long"])
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an

@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import math
 import os
 import random
 from collections import Counter
@@ -647,6 +648,13 @@ class PrefillAdder:
                 tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
             )
         )
+        # Prefill a long prompt's partial chunk first, then whole chunks.
+        self.chunk_size = rem_chunk_tokens
+        self.remainder_first = (
+            envs.SGLANG_CHUNKED_PREFILL_REMAINDER_FIRST.get()
+            and dllm_config is None
+            and rem_chunk_tokens is not None
+        )
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -859,6 +867,31 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def remainder_first_len(
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        chunk_len: int,
+        truncation_align_size: Optional[int],
+    ) -> int:
+        """First chunk of a prompt that needs chunking: the part of it that
+        does not fill a whole chunk, rounded up to the cut grid, so that the
+        rest of the prompt runs as whole chunks.
+
+        A chunk shorter than the chunk size under-fills the attention kernel's
+        grid (a 1748-token chunk is one wave over 37% of the CUs of an MI355X
+        for a 24-head layer). Run first, it attends to the chunk alone; run
+        last, to the whole prompt.
+        """
+        remainder = extend_input_len % self.chunk_size
+        if remainder == 0:
+            return chunk_len
+        grid = math.lcm(
+            self.page_size, truncation_align_size or 1, self.mamba_chunk_grid
+        )
+        end = -(-(prefix_len + remainder) // grid) * grid
+        return min(end - prefix_len, chunk_len)
 
     def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
         """Round a *truncated* chunk down to the mamba kernel chunk grid.
@@ -1352,11 +1385,18 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
+            if self.new_chunked_req is not None:
+                # One chunked request per batch, as in _select_prefill_admission.
+                return AddReqResult.OTHER
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(
                 self.rem_chunk_tokens, cand_extend_input_len
             )
+            if self.remainder_first:
+                trunc_len = self.remainder_first_len(
+                    req.prefix_len, cand_extend_input_len, trunc_len, None
+                )
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1623,6 +1663,10 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
+            if self.new_chunked_req is not None:
+                # One chunked request per batch: the scheduler continues one at a
+                # time. Only a remainder-first chunk leaves budget behind it.
+                return AddReqResult.OTHER
             if (
                 has_chunked_req
                 and get_schedule().schedule_policy == "shortest-prefill-first"
@@ -1650,6 +1694,13 @@ class PrefillAdder:
                 extend_len = end - prefix_len
             if extend_len <= 0:
                 return AddReqResult.OTHER
+            if self.remainder_first and not replay_len:
+                extend_len = self.remainder_first_len(
+                    prefix_len,
+                    len(req.full_untruncated_fill_ids) - prefix_len,
+                    extend_len,
+                    truncation_align_size,
+                )
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len
