@@ -10,7 +10,23 @@ import torch
 from PIL import Image
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+    CacheDitConfig,
+    cache_dit_overrides_key,
+    disable_cache_on_transformer,
+    enable_cache_on_transformer,
+    get_scm_mask,
+    refresh_context_on_transformer,
+    resolve_cache_dit_request_overrides,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_group,
+    get_tp_group,
+    get_world_size,
+)
+from sglang.multimodal_gen.runtime.models.dits.hidream import O1CacheBlockAdapter
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -1058,6 +1074,27 @@ def _chunk_items(items: list[dict], cap: int) -> list[list[dict]]:
     return chunks
 
 
+def _register_o1_cache_dit_spec() -> None:
+    """Teach cache-dit where the HiDream adapter keeps its blocks.
+
+    The adapter class name deliberately matches no cache-dit built-in family
+    prefix, so the registry has to be told about it explicitly.
+    """
+    from cache_dit import ForwardPattern
+
+    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+        _CUSTOM_BLOCK_ADAPTER_SPECS,
+        CustomBlockAdapterSpec,
+    )
+
+    _CUSTOM_BLOCK_ADAPTER_SPECS.setdefault(
+        O1CacheBlockAdapter.__name__,
+        CustomBlockAdapterSpec(
+            blocks_attr="blocks", forward_pattern=ForwardPattern.Pattern_3
+        ),
+    )
+
+
 class HiDreamGenerationStage(PipelineStage):
     """Full generation stage: preprocessing -> denoising -> decoding."""
 
@@ -1065,6 +1102,13 @@ class HiDreamGenerationStage(PipelineStage):
         super().__init__()
         self.model = model
         self.processor = processor
+        # cache-dit mount state: the adapter wrapper is built once and stays
+        # mounted while consecutive requests want the same knobs; the key is
+        # the frozen per-request override set it was mounted with.
+        self._cache_dit_adapter: O1CacheBlockAdapter | None = None
+        self._cache_dit_enabled = False
+        self._cache_dit_active_key: tuple | None = None
+        self._cache_dit_request_overrides: dict = {}
 
     @property
     def role_affinity(self) -> RoleType:
@@ -1111,11 +1155,11 @@ class HiDreamGenerationStage(PipelineStage):
             for item, img in zip(chunk, self._run_trajectory(chunk, ctx)):
                 results[item["index"]] = img
 
+        # always 4-D [num_outputs, 3, H, W]: the grouped save/split paths
+        # count outputs via the leading dim (the old serial contract kept
+        # a size-1 batch dim for single images)
         output = OutputBatch()
-        if len(results) == 1:
-            output.output = results[0]
-        else:
-            output.output = torch.stack(results, dim=0)
+        output.output = torch.stack(results, dim=0)
         return output
 
     def _build_ctx(self, batch: Req, server_args: ServerArgs) -> dict:
@@ -1188,6 +1232,19 @@ class HiDreamGenerationStage(PipelineStage):
             "pad_token_id": int(pad_token_id),
             "max_batched_outputs": int(
                 getattr(server_args.pipeline_config, "max_batched_outputs", 4) or 1
+            ),
+            "is_warmup": bool(getattr(batch, "is_warmup", False)),
+            "enable_torch_compile": bool(
+                getattr(server_args, "enable_torch_compile", False)
+            ),
+            "enable_breakable_cuda_graph": bool(
+                getattr(server_args, "enable_breakable_cuda_graph", False)
+            ),
+            # cache-dit: per-request switch (env default when unset) plus knobs;
+            # unknown knob names fail the request here, at the batch boundary
+            "cache_dit_requested": self._cache_dit_requested_for_batch(batch),
+            "cache_dit_overrides": resolve_cache_dit_request_overrides(
+                getattr(sampling_params, "cache_dit_params", None)
             ),
         }
 
@@ -1475,6 +1532,8 @@ class HiDreamGenerationStage(PipelineStage):
         # injects no per-step noise, so the trajectory is fixed by
         # the initial draw; a bad draw must be re-rolled.
         reroll_enabled = not inject_noise and ref_paths is not None
+        use_cache_dit = self._maybe_enable_cache_dit(ctx, num_steps, reroll_enabled)
+        cache_adapter = self._cache_dit_adapter if use_cache_dit else None
 
         precomputed = (None, None)
         for step_idx, step_t in enumerate(
@@ -1495,7 +1554,7 @@ class HiDreamGenerationStage(PipelineStage):
                 cache_enabled=False,
             ):
                 x_pred_cond, embeds = self._forward_batch(
-                    cond, vinputs, t_pixeldit.to(device), precomputed
+                    cond, vinputs, t_pixeldit.to(device), precomputed, cache_adapter
                 )
             if embeds is not None and precomputed[0] is None:
                 precomputed = embeds
@@ -1527,7 +1586,11 @@ class HiDreamGenerationStage(PipelineStage):
                     cache_enabled=False,
                 ):
                     x_pred_uncond, _ = self._forward_batch(
-                        uncond, vinputs, t_pixeldit.to(device), precomputed
+                        uncond,
+                        vinputs,
+                        t_pixeldit.to(device),
+                        precomputed,
+                        cache_adapter,
                     )
                 x_tgt_uncond = x_pred_uncond[
                     :, uncond["txt_len"] : uncond["txt_len"] + tgt_image_len
@@ -1579,14 +1642,14 @@ class HiDreamGenerationStage(PipelineStage):
         best_frac = frac.clone()
         best_z = z.clone()
         best_x = x_tgt.clone()
-        best_seed = [int(it["seed"]) + 1 for it in chunk]
+        best_seed = [int(it["seed"]) for it in chunk]
         active = [i for i in range(z.shape[0]) if frac[i] > threshold]
         attempt = 0
         while active and attempt < REROLL_MAX_ATTEMPTS:
             attempt += 1
             reroll_seeds = {}
             for i in active:
-                reroll_seeds[i] = int(chunk[i]["seed"]) + 1 + attempt
+                reroll_seeds[i] = int(chunk[i]["seed"]) + attempt
                 logger.warning(
                     "TI2I seed reroll: step-0 x_pred out-of-range fraction "
                     "%.3f > %.3f (row %d, seed %s); re-rolling to generator "
@@ -1599,7 +1662,7 @@ class HiDreamGenerationStage(PipelineStage):
                     attempt,
                     REROLL_MAX_ATTEMPTS,
                 )
-                reroll_gen = torch.Generator("cpu")
+                reroll_gen = torch.Generator(z.device)
                 reroll_gen.manual_seed(reroll_seeds[i])
                 z[i] = draw_initial_noise(
                     init_noise_scale,
@@ -1703,35 +1766,294 @@ class HiDreamGenerationStage(PipelineStage):
             expanded["image_grid_thw"] = sample["image_grid_thw"]
         return expanded
 
+    def _cache_dit_requested(self) -> bool:
+        """Request-independent server default (init-time decisions only)."""
+        return envs.SGLANG_CACHE_DIT_ENABLED
+
+    def _cache_dit_requested_for_batch(self, batch: Req) -> bool:
+        """Per-request Cache-DiT switch; the server default applies when unset."""
+        enable = batch.sampling_params.enable_cache_dit
+        if enable is None:
+            return self._cache_dit_requested()
+        return bool(enable)
+
+    def _cache_dit_has_separate_cfg(self, ctx: dict) -> bool:
+        """Whether CFG runs as separate cond/uncond forwards per step."""
+        return ctx["guidance_scale"] > 1.0
+
+    def _unmount_cache_dit(self) -> None:
+        """Remove Cache-DiT hooks so subsequent batches run the native forward."""
+        if self._cache_dit_adapter is not None:
+            disable_cache_on_transformer(self._cache_dit_adapter)
+        self._cache_dit_adapter = None
+        self._cache_dit_enabled = False
+        self._cache_dit_active_key = None
+
+    def _parse_cache_dit_scm_bins(
+        self,
+    ) -> tuple[list[int] | None, list[int] | None, str]:
+        overrides = self._cache_dit_request_overrides
+        scm_preset = overrides.get("scm_preset", envs.SGLANG_CACHE_DIT_SCM_PRESET)
+        request_compute_bins = overrides.get("scm_compute_bins")
+        request_cache_bins = overrides.get("scm_cache_bins")
+        if request_compute_bins is not None or request_cache_bins is not None:
+            if request_compute_bins is None or request_cache_bins is None:
+                raise ValueError(
+                    "cache_dit_params SCM custom bins require both "
+                    "scm_compute_bins and scm_cache_bins."
+                )
+            compute_bins = [int(x) for x in request_compute_bins]
+            cache_bins = [int(x) for x in request_cache_bins]
+            return compute_bins, cache_bins, scm_preset
+        compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
+        cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
+        compute_bins = None
+        cache_bins = None
+        if compute_bins_str and cache_bins_str:
+            try:
+                compute_bins = [int(x.strip()) for x in compute_bins_str.split(",")]
+                cache_bins = [int(x.strip()) for x in cache_bins_str.split(",")]
+            except ValueError as exc:
+                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", exc)
+                scm_preset = "none"
+        elif compute_bins_str or cache_bins_str:
+            logger.warning(
+                "SCM custom bins require both compute_bins and cache_bins. "
+                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
+                compute_bins_str,
+                cache_bins_str,
+                scm_preset,
+            )
+        return compute_bins, cache_bins, scm_preset
+
+    def _cache_dit_scm_masks(
+        self, num_inference_steps: int
+    ) -> tuple[str, str, list[int] | None]:
+        scm_compute_bins, scm_cache_bins, scm_preset = self._parse_cache_dit_scm_bins()
+        scm_policy = self._cache_dit_request_overrides.get(
+            "scm_policy", envs.SGLANG_CACHE_DIT_SCM_POLICY
+        )
+        steps_computation_mask = get_scm_mask(
+            preset=scm_preset,
+            num_inference_steps=num_inference_steps,
+            compute_bins=scm_compute_bins,
+            cache_bins=scm_cache_bins,
+        )
+        return scm_preset, scm_policy, steps_computation_mask
+
+    def _cache_dit_knob(self, key: str, env_value: Any) -> Any:
+        """One DBCache knob: request > env."""
+        return self._cache_dit_request_overrides.get(key, env_value)
+
+    def _build_cache_dit_config(
+        self,
+        num_inference_steps: int,
+        steps_computation_mask: list[int] | None,
+        scm_policy: str,
+    ) -> CacheDitConfig:
+        knob = self._cache_dit_knob
+        return CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=knob("Fn_compute_blocks", envs.SGLANG_CACHE_DIT_FN),
+            Bn_compute_blocks=knob("Bn_compute_blocks", envs.SGLANG_CACHE_DIT_BN),
+            max_warmup_steps=knob("max_warmup_steps", envs.SGLANG_CACHE_DIT_WARMUP),
+            residual_diff_threshold=knob(
+                "residual_diff_threshold", envs.SGLANG_CACHE_DIT_RDT
+            ),
+            max_continuous_cached_steps=knob(
+                "max_continuous_cached_steps", envs.SGLANG_CACHE_DIT_MC
+            ),
+            enable_taylorseer=knob(
+                "enable_taylorseer", envs.SGLANG_CACHE_DIT_TAYLORSEER
+            ),
+            taylorseer_order=knob("taylorseer_order", envs.SGLANG_CACHE_DIT_TS_ORDER),
+            enable_dmd=knob("enable_dmd", envs.SGLANG_CACHE_DIT_DMD),
+            dmd_history=knob("dmd_history", envs.SGLANG_CACHE_DIT_DMD_HISTORY),
+            dmd_rank=knob("dmd_rank", envs.SGLANG_CACHE_DIT_DMD_RANK),
+            dmd_ridge=knob("dmd_ridge", envs.SGLANG_CACHE_DIT_DMD_RIDGE),
+            dmd_svd_precision=knob(
+                "dmd_svd_precision", envs.SGLANG_CACHE_DIT_DMD_SVD_PRECISION
+            ),
+            num_inference_steps=num_inference_steps,
+            steps_computation_mask=steps_computation_mask,
+            steps_computation_policy=scm_policy,
+        )
+
+    def _maybe_enable_cache_dit(
+        self, ctx: dict, num_steps: int, reroll_enabled: bool
+    ) -> bool:
+        """Enable cache-dit on the decoder loop for this trajectory (idempotent).
+
+        Returns whether the step loop should route its forwards through the
+        adapter. HiDream is not a diffusers DiT, so the block loop is exposed
+        through O1CacheBlockAdapter (see its docstring for the naming
+        constraint) and SGLANG_CACHE_DIT_* apply as for the other models.
+
+        Not mounted while the deterministic TI2I reroll is active: the reroll
+        issues extra step-0 forwards, which would desynchronise cache-dit's
+        step counter.
+        """
+        requested = ctx["cache_dit_requested"]
+        if ctx["enable_breakable_cuda_graph"]:
+            # cache-dit wraps the block loop with step-skipping control flow
+            # that must not be baked into a captured CUDA graph
+            if requested:
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because breakable "
+                    "CUDA graphs are enabled."
+                )
+            return False
+        self._cache_dit_request_overrides = ctx["cache_dit_overrides"]
+        has_separate_cfg = requested and self._cache_dit_has_separate_cfg(ctx)
+        desired_key = (
+            (
+                cache_dit_overrides_key(self._cache_dit_request_overrides),
+                has_separate_cfg,
+            )
+            if requested
+            else None
+        )
+        # opt-out or knob change: unmount, then remount below (or return)
+        if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
+            self._unmount_cache_dit()
+        # NOTE: every chunk runs its own num_steps loop, so a mounted adapter
+        # only needs its step counter refreshed per request.
+        if self._cache_dit_enabled:
+            _, scm_policy, steps_computation_mask = self._cache_dit_scm_masks(num_steps)
+            refresh_context_on_transformer(
+                self._cache_dit_adapter,
+                num_steps,
+                steps_computation_mask=steps_computation_mask,
+                steps_computation_policy=scm_policy,
+            )
+            return True
+
+        if not requested:
+            return False
+        # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
+        # warmup to mount cache-dit before Dynamo traces the transformer.
+        if ctx["is_warmup"] and not ctx["enable_torch_compile"]:
+            return False
+        if reroll_enabled:
+            logger.info(
+                "cache-dit skipped for this trajectory: the deterministic TI2I "
+                "seed reroll adds step-0 forwards."
+            )
+            return False
+
+        world_size = get_world_size()
+        parallelized = world_size > 1
+
+        sp_group = None
+        tp_group = None
+        if parallelized:
+            sp_group_candidate = get_sp_group()
+            tp_group_candidate = get_tp_group()
+
+            sp_world_size = sp_group_candidate.world_size if sp_group_candidate else 1
+            tp_world_size = tp_group_candidate.world_size if tp_group_candidate else 1
+
+            has_sp = sp_world_size > 1
+            has_tp = tp_world_size > 1
+
+            sp_group = sp_group_candidate.device_group if has_sp else None
+            tp_group = tp_group_candidate.device_group if has_tp else None
+
+            logger.info(
+                "cache-dit enabled in distributed environment (world_size=%d, has_sp=%s, has_tp=%s)",
+                world_size,
+                has_sp,
+                has_tp,
+            )
+
+        _, scm_policy, steps_computation_mask = self._cache_dit_scm_masks(num_steps)
+        config = self._build_cache_dit_config(
+            num_steps,
+            steps_computation_mask=steps_computation_mask,
+            scm_policy=scm_policy,
+        )
+
+        _register_o1_cache_dit_spec()
+        adapter = O1CacheBlockAdapter(self.model)
+        self._cache_dit_adapter = enable_cache_on_transformer(
+            adapter,
+            config,
+            model_name="hidream_o1",
+            sp_group=sp_group,
+            tp_group=tp_group,
+            has_separate_cfg=has_separate_cfg,
+        )
+        logger.info(
+            "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
+            num_steps,
+            config.Fn_compute_blocks,
+            config.Bn_compute_blocks,
+            config.residual_diff_threshold,
+        )
+        self._cache_dit_enabled = True
+        self._cache_dit_active_key = desired_key
+        return True
+
     def _forward_batch(
         self,
         sample: dict,
         vinputs: torch.Tensor,
         t_pixeldit: torch.Tensor,
         precomputed: tuple,
+        cache_adapter: O1CacheBlockAdapter | None = None,
     ) -> tuple[torch.Tensor, tuple | None]:
-        """Run one (possibly batched) forward; returns (x_pred, embeds)."""
+        """Run one (possibly batched) forward; returns (x_pred, embeds).
+
+        ``cache_adapter`` routes just the decoder block loop through cache-dit;
+        the embeddings, final norm and patch head still run in the model, so
+        step-skipping never touches the request-static conditioning.
+        """
         device = vinputs.device
         precomputed_image_embeds, precomputed_deepstack_image_embeds = precomputed
-        kwargs = {}
-        if sample.get("pixel_values") is not None:
-            kwargs["pixel_values"] = sample["pixel_values"].to(device)
-            kwargs["image_grid_thw"] = sample["image_grid_thw"].to(device)
+        pixel_values = sample.get("pixel_values")
+        vision_kwargs = {}
+        if pixel_values is not None:
+            vision_kwargs["pixel_values"] = pixel_values.to(device)
+            vision_kwargs["image_grid_thw"] = sample["image_grid_thw"].to(device)
             if precomputed_image_embeds is not None:
-                kwargs["precomputed_image_embeds"] = precomputed_image_embeds
-                kwargs["precomputed_deepstack_image_embeds"] = (
+                vision_kwargs["precomputed_image_embeds"] = precomputed_image_embeds
+                vision_kwargs["precomputed_deepstack_image_embeds"] = (
                     precomputed_deepstack_image_embeds
                 )
-        outputs = self.model(
-            input_ids=sample["input_ids"].to(device),
-            position_ids=sample["position_ids"].to(device),
-            vinputs=vinputs,
-            timestep=t_pixeldit.reshape(-1).to(device),
-            token_types=sample["token_types"].to(device),
-            use_flash_attn=True,  # official flash two-pass attention path
-            pad_mask=sample.get("pad_mask"),
-            **kwargs,
-        )
+        common_kwargs = {
+            "input_ids": sample["input_ids"].to(device),
+            "position_ids": sample["position_ids"].to(device),
+            "vinputs": vinputs,
+            "timestep": t_pixeldit.reshape(-1).to(device),
+            "token_types": sample["token_types"].to(device),
+        }
+
+        if cache_adapter is None:
+            outputs = self.model(
+                **common_kwargs,
+                use_flash_attn=True,  # official flash two-pass attention path
+                pad_mask=sample.get("pad_mask"),
+                **vision_kwargs,
+            )
+        else:
+            inputs_embeds, conds, embeds_pair = self.model.forward_pre(
+                **common_kwargs,
+                **vision_kwargs,
+            )
+            hidden_states = cache_adapter(
+                inputs_embeds,
+                conds["cos"],
+                conds["sin"],
+                conds["idx_ar"],
+                sample.get("pad_mask"),
+                conds["visual_pos_masks"],
+                conds["deepstack_visual_embeds"],
+            )
+            outputs = self.model.forward_post(hidden_states, apply_norm=True)
+            if pixel_values is not None:
+                outputs["cond_image_embeds"] = embeds_pair[0]
+                outputs["cond_deepstack_image_embeds"] = embeds_pair[1]
+
         embeds = None
         if "cond_image_embeds" in outputs:
             embeds = (
@@ -1838,5 +2160,6 @@ class HiDreamGenerationStage(PipelineStage):
         for idx in indices:
             rows = per_batch[idx]
             output = OutputBatch()
-            output.output = rows[0] if len(rows) == 1 else torch.stack(rows, dim=0)
+            # always 4-D [num_outputs, 3, H, W] (see forward())
+            output.output = torch.stack(rows, dim=0)
             results[idx] = output
