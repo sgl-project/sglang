@@ -201,6 +201,7 @@ _AITER_TOPK_GATING_MAX_ROWS = 4096
 def _use_aiter_topk_gating_softmax(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
+    topk: int,
     correction_bias: Optional[torch.Tensor],
     num_fused_shared_experts: int,
     packed_out: Optional[torch.Tensor],
@@ -216,6 +217,7 @@ def _use_aiter_topk_gating_softmax(
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[1] == 512
         and gating_output.dtype == torch.bfloat16
+        and topk == 10
         and gating_output.is_contiguous()
         and gating_output.shape[0] <= _AITER_TOPK_GATING_MAX_ROWS
         and correction_bias is None
@@ -1329,6 +1331,7 @@ def fused_topk(
             if _use_aiter_topk_gating_softmax(
                 hidden_states,
                 gating_output,
+                topk,
                 correction_bias,
                 num_fused_shared_experts,
                 packed_out,

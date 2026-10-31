@@ -26,6 +26,7 @@ def _envelope(
     num_fused_shared_experts=0,
     packed_out=None,
     hidden_dtype=torch.bfloat16,
+    topk=TOPK,
 ):
     hidden_states = torch.empty(
         gating_output.shape[0],
@@ -36,6 +37,7 @@ def _envelope(
     return topk_module._use_aiter_topk_gating_softmax(
         hidden_states,
         gating_output,
+        topk,
         correction_bias,
         num_fused_shared_experts,
         packed_out,
@@ -150,6 +152,7 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
                         )
                     )
                     self.assertFalse(_envelope(logits.float(), hidden_size))
+                    self.assertFalse(_envelope(logits, hidden_size, topk=8))
                     self.assertFalse(
                         _envelope(
                             torch.empty(
