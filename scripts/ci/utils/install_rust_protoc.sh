@@ -20,5 +20,9 @@ else
     SUDO=""
 fi
 
-${SUDO} bash "${SCRIPT_DIR}/install_protoc.sh"
+# Host lock shared with ci_install_dependency.sh: runners sharing one host must
+# not run apt or unpack into /usr/local concurrently.
+HOST_LOCK=(flock --timeout 1800 /tmp/sglang-ci-host.lock)
+command -v flock >/dev/null 2>&1 || HOST_LOCK=()
+${SUDO} "${HOST_LOCK[@]}" bash "${SCRIPT_DIR}/install_protoc.sh"
 bash "${SCRIPT_DIR}/install_rustup.sh"
