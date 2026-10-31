@@ -2391,10 +2391,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None
 
-    def _server_args_for_dump(self) -> Union[ServerArgs, Dict[str, Any]]:
-        if not get_exec().features.enable_watermark:
-            return self.server_args
-        return redact_watermark_secrets(self.server_args.resolved_dict())
+    def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
+        # Redact even with watermarking off: the Python API accepts a server
+        # key without --enable-watermark.
+        try:
+            return redact_watermark_secrets(self.server_args.resolved_dict())
+        except Exception as e:
+            logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
+            return None
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
         """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
