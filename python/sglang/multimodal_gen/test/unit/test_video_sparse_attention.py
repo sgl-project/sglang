@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
@@ -11,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn i
     VideoSparseAttentionMetadataBuilder,
     _compute_cur_topk,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import no_cuda_sync
 
 
 def test_video_sparse_attention_tile_buffer_reuse_and_untile():
@@ -104,3 +106,41 @@ def test_vsa_cur_topk_clamps_to_valid_block_range():
 
     metadata.VSA_sparsity = -0.01
     assert _compute_cur_topk(metadata) == num_kv_blocks
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or bool(torch.version.hip), reason="CUDA required"
+)
+@torch.inference_mode()
+def test_vsa_fused_layout_cache_and_sp_fallback():
+    """Reuse padding safely without host syncs; refresh shape/dtype and retain SP fallback."""
+    metadata = VideoSparseAttentionMetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=(5, 7, 9),
+        patch_size=(1, 1, 1),
+        VSA_sparsity=0.8,
+        device=torch.device("cuda"),
+    )
+    impl = object.__new__(VideoSparseAttentionImpl)
+    impl.sp_size = 1
+    for dtype, dim in [(torch.bfloat16, 64), (torch.float16, 64), (torch.float16, 128)]:
+        x = torch.randn(4, 315, 2, dim, device="cuda", dtype=dtype)
+        expected = impl.tile(x, metadata).clone()
+        actual = impl.preprocess_qkv(x, metadata)
+        assert torch.equal(actual, expected)
+        assert torch.equal(impl.postprocess_output(actual, metadata), x)
+        pointer = actual.data_ptr()
+        metadata.fused_tile_buf.fill_(123)
+        with no_cuda_sync():
+            actual = impl.preprocess_qkv(qkv=x, attn_metadata=metadata)
+        assert actual.data_ptr() == pointer
+        assert torch.equal(actual, expected)
+        for part in actual.chunk(4, dim=0):
+            transposed = part.transpose(1, 2)
+            assert transposed.is_contiguous()
+            assert transposed.contiguous().data_ptr() == part.data_ptr()
+        impl.sp_size = 2
+        fallback = impl.preprocess_qkv(x, metadata)
+        assert fallback is metadata.tile_buf
+        assert torch.equal(fallback, expected)
+        impl.sp_size = 1

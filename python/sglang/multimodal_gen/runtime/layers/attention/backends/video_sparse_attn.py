@@ -161,6 +161,7 @@ class VideoSparseAttentionMetadata(AttentionMetadata):
     non_pad_index: torch.LongTensor
     untile_combined_index: torch.LongTensor
     tile_buf: torch.Tensor | None = None
+    fused_tile_buf: torch.Tensor | None = None
 
     # adaption for FastWan2.1-T2V-1.3B-Diffusers
     # Sequence lengths for the forward batch
@@ -278,12 +279,48 @@ class VideoSparseAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         return x[:, untile_combined_index]
 
+    def _can_use_fused_tile(
+        self,
+        qkv: torch.Tensor,
+        attn_metadata: VideoSparseAttentionMetadata,
+    ) -> bool:
+        return (
+            qkv.is_cuda
+            and torch.version.hip is None
+            and qkv.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and not qkv.requires_grad
+            and self.sp_size == 1
+            and qkv.shape[-1] in (64, 128)
+            and qkv.shape[1] == math.prod(attn_metadata.dit_seq_shape)
+            and min(qkv.shape) > 0
+        )
+
     def preprocess_qkv(
         self,
         qkv: torch.Tensor,
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
-        return self.tile(qkv, attn_metadata)
+        if not self._can_use_fused_tile(qkv, attn_metadata):
+            return self.tile(qkv, attn_metadata)
+
+        from sglang.kernels.ops.diffusion import vsa_tile_to_bhsd
+
+        padded_seq = math.prod(attn_metadata.num_tiles) * math.prod(VSA_TILE_SIZE)
+        shape = (qkv.shape[0], qkv.shape[2], padded_seq, qkv.shape[3])
+        buf = attn_metadata.fused_tile_buf
+        if (
+            buf is None
+            or buf.shape != shape
+            or buf.dtype != qkv.dtype
+            or buf.device != qkv.device
+        ):
+            buf = torch.empty(shape, dtype=qkv.dtype, device=qkv.device)
+            attn_metadata.fused_tile_buf = buf
+        vsa_tile_to_bhsd(
+            x=qkv, dit_seq_shape=tuple(attn_metadata.dit_seq_shape), out=buf
+        )
+        # Preserve the BSHD interface; forward() restores BHSD without copying.
+        return buf.transpose(1, 2)
 
     def postprocess_output(
         self,
