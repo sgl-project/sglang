@@ -39,6 +39,7 @@ import resource
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,7 @@ from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
+from torch.distributed import ProcessGroup
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
@@ -456,22 +458,11 @@ def get_available_gpu_memory(
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
-        num_gpus = torch.xpu.device_count()
-        assert gpu_id < num_gpus
-
-        if torch.xpu.current_device() != gpu_id:
-            logger.warning(
-                "current device is not %s, but %s, which may cause useless "
-                "memory allocation for torch XPU context.",
-                gpu_id,
-                torch.xpu.current_device(),
-            )
-
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        free_gpu_memory, total_gpu_memory = current_platform.get_available_memory(
+            gpu_id
+        )
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -5179,3 +5170,199 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+
+# VMM helpers shared by cuda_vmm_utils, xpu_vmm_utils and their device-neutral
+# callers; nothing here may import a driver binding.
+# (src_rank, base_idx, fd_count) sent in front of every SCM_RIGHTS fd
+_FD_HEADER = struct.Struct("<QQQ")
+FD_SEND_TIMEOUT_S = 120.0
+
+
+class Reservation(Protocol):
+    """One VA range plus its mappings, as the device-neutral callers use it;
+    cuda_vmm_utils and xpu_vmm_utils each implement it. ``map`` returns a handle
+    that outlives the reservation only with ``retain_handle=True``.
+    """
+
+    base: int
+    size: int
+
+    def map(self, offset: int, size: int, *, retain_handle: bool) -> int: ...
+
+    def map_existing(self, offset: int, size: int, handle: int) -> None: ...
+
+    def unmap_existing(self, offset: int, size: int) -> None: ...
+
+    def close(self, *, release_handles: bool = True) -> None: ...
+
+
+def align_up(value: int, alignment: int) -> int:
+    """Round ``value`` up to a positive byte ``alignment``."""
+    return (int(value) + alignment - 1) // alignment * alignment
+
+
+def align_down(value: int, alignment: int) -> int:
+    """Round ``value`` down to a positive byte ``alignment``."""
+    return int(value) // alignment * alignment
+
+
+def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
+    """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cpu")
+    dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
+    return flag.item() == 1
+
+
+def send_fd(sock: socket.socket, fd: int, src_rank: int, base_idx: int) -> None:
+    """Send one fd as an SCM_RIGHTS message behind a (src_rank, base_idx) header."""
+    fds = array("i", [int(fd)])
+    header = _FD_HEADER.pack(int(src_rank), int(base_idx), 1)
+    sent = sock.sendmsg(
+        [header],
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds.tobytes())],
+    )
+    if sent != len(header):
+        raise RuntimeError(f"sendmsg sent {sent} bytes, expected {len(header)}")
+
+
+def recv_fd(sock: socket.socket) -> Optional[Tuple[int, int, int]]:
+    """Receive one send_fd message as (src_rank, base_idx, fd); None at end of stream."""
+    fd_item_size = array("i").itemsize
+    data, ancdata, _, _ = sock.recvmsg(_FD_HEADER.size, socket.CMSG_SPACE(fd_item_size))
+    if not data:
+        return None
+    if len(data) != _FD_HEADER.size:
+        raise RuntimeError(
+            f"received truncated fd header: {len(data)} < {_FD_HEADER.size}"
+        )
+    src_rank, base_idx, fd_count = _FD_HEADER.unpack(data)
+    fds = array("i")
+    for level, cmsg_type, cmsg_data in ancdata:
+        if level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+            fds.frombytes(cmsg_data[: len(cmsg_data) - (len(cmsg_data) % fd_item_size)])
+    if fd_count != 1 or len(fds) != 1:
+        for fd in fds:
+            os.close(fd)
+        raise RuntimeError(
+            f"expected one fd, got header={fd_count}, ancillary={len(fds)}"
+        )
+    return int(src_rank), int(base_idx), int(fds[0])
+
+
+def exchange_posix_fds(
+    group: ProcessGroup,
+    rank: int,
+    world_size: int,
+    local_fds: List[int],
+    peer_base_counts: List[int],
+) -> Dict[Tuple[int, int], int]:
+    """Exchange POSIX file descriptors across ranks via SCM_RIGHTS over a UNIX
+    socket. Returns ``{(src_rank, base_idx): fd}`` for every peer. The caller
+    owns the received fds and must close them.
+
+    ``local_fds`` are only sent, never consumed. Whether they may be closed
+    afterwards is the driver's rule rather than this function's: CUDA hands out a
+    fresh fd, Level Zero's belongs to the driver. See VmmBackend.owns_exported_fds.
+    """
+    sock_kind = socket.SOCK_SEQPACKET
+    sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
+    sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
+    try:
+        server = socket.socket(socket.AF_UNIX, sock_kind)
+    except BaseException:
+        os.rmdir(sock_dir)
+        raise
+    server.settimeout(FD_SEND_TIMEOUT_S)
+    received_fds: Dict[Tuple[int, int], int] = {}
+    errors: List[BaseException] = []
+    # a timed-out exchange abandons the recv thread while it can still receive,
+    # so it closes late fds itself rather than storing them for nobody
+    received_lock = threading.Lock()
+    abandoned = threading.Event()
+
+    def recv_loop() -> None:
+        try:
+            for _ in range(world_size - 1):
+                conn, _ = server.accept()
+                with conn:
+                    conn.settimeout(FD_SEND_TIMEOUT_S)
+                    while True:
+                        packet = recv_fd(conn)
+                        if packet is None:
+                            break
+                        src_rank, base_idx, fd = packet
+                        key = (src_rank, base_idx)
+                        with received_lock:
+                            if abandoned.is_set():
+                                os.close(fd)
+                                return
+                            if key in received_fds:
+                                os.close(fd)
+                                raise RuntimeError(f"duplicate fd for {key}")
+                            received_fds[key] = fd
+        except BaseException as error:
+            errors.append(error)
+
+    try:
+        server.bind(sock_path)
+        server.listen(world_size)
+        paths: List[Optional[str]] = [None] * world_size
+        dist.all_gather_object(paths, sock_path, group=group)
+
+        thread = threading.Thread(target=recv_loop, daemon=True)
+        thread.start()
+        try:
+            for peer_rank, peer_path in enumerate(paths):
+                if peer_rank == rank:
+                    continue
+                with socket.socket(socket.AF_UNIX, sock_kind) as sock:
+                    sock.settimeout(FD_SEND_TIMEOUT_S)
+                    sock.connect(peer_path)
+                    for base_idx, fd in enumerate(local_fds):
+                        send_fd(sock, fd, rank, base_idx)
+        finally:
+            thread.join(FD_SEND_TIMEOUT_S)
+
+        if thread.is_alive():
+            raise RuntimeError("timed out waiting for POSIX fd exchange")
+        if errors:
+            raise RuntimeError("POSIX fd exchange receive failed") from errors[0]
+
+        expected = {
+            (src_rank, base_idx)
+            for src_rank, count in enumerate(peer_base_counts)
+            if src_rank != rank
+            for base_idx in range(count)
+        }
+        missing = expected.difference(received_fds)
+        extra = set(received_fds).difference(expected)
+        if missing or extra:
+            raise RuntimeError(
+                "POSIX fd exchange mismatch: "
+                f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
+            )
+        return received_fds
+    except BaseException:
+        # on any failure the caller never sees these fds, so they are closed here;
+        # a close error must not replace the failure being raised
+        with received_lock:
+            abandoned.set()
+            leftover = list(received_fds.values())
+            received_fds.clear()
+        for fd in leftover:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        server.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(sock_dir)
+        except OSError:
+            pass

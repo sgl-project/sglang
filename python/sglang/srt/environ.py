@@ -1219,6 +1219,10 @@ class Envs:
     # ===================================================================
     # Intel XPU
     # ===================================================================
+    # Path to a Level Zero loader exporting the VMM entry points; needed only
+    # where the loader on the default search path predates 1.28.
+    SGLANG_XPU_ZE_LOADER_SO_PATH = EnvStr(None)
+
     # Triton warps per program for the XPU LayerNorm+modulate kernels. Layout
     # only, the bit-exact result does not depend on it; 4 measured fastest on
     # Arc Pro B70.
