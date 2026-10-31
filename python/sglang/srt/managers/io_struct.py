@@ -1909,6 +1909,18 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
     success: bool
 
 
+class PrefetchReqInput(BaseReq, kw_only=True):
+    token_ids: List[int]
+    cache_salt: Optional[str] = None
+
+
+class PrefetchReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+    prefetched_tokens: int = 0
+    cached_tokens: int = 0
+
+
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
 

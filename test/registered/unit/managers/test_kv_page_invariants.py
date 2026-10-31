@@ -37,6 +37,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         get_last_batch = lambda self: None
         get_running_batch = lambda self: None
         get_chunked_req = lambda self: None
+        get_prefetch_req = lambda self: None
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (

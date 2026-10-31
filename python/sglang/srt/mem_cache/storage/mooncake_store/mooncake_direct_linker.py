@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from concurrent.futures import Future
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -225,6 +226,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         freeze_gc("Mooncake direct linker")
         self.gc_frozen = True
 
+    def start_prefetch(self, rid: str) -> Future[bool]:
+        completion = Future()
+        ready = self.record_transfer_ready()
+        index = self.layer_done_counter.update_producer()
+        pending = {rid: self.pending_loads.pop(rid)}
+        # All ranks read independently: prefetch must not require a forward's
+        # layer waits or change its MLA broadcast/consumer state.
+        self.load_queue.put((index, pending, ready, completion))
+        self.stats["load"] += 1
+        return completion
+
     def start_layer_wise_loading(self) -> int:
         broadcaster = self.mla_broadcaster
         if broadcaster is not None:
@@ -264,7 +276,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if broadcaster is not None:
             self.broadcast_loads[counter_index] = (0, prepared, ready)
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready))
+            self.load_queue.put((counter_index, pending, ready, None))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -294,7 +306,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready = task
+                counter_index, pending, ready, completion = task
                 try:
                     ready.synchronize()
                     self.load_layer_wise(counter_index, list(pending.values()))
@@ -302,6 +314,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
             finally:
+                if task is not None and completion is not None:
+                    completion.set_result(self.layer_done_counter.finish(counter_index))
                 self.load_queue.task_done()
 
     def load_layer_wise(
