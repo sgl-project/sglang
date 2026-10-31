@@ -1576,8 +1576,16 @@ class KimiK3DeltaAttention(nn.Module):
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
         self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
+        self.split_qkvg = (
+            self.use_full_rank_gate
+            and _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+            and quant_config.is_layer_skipped(f"{prefix}.q_proj")
+            != quant_config.is_layer_skipped(f"{prefix}.g_proj")
+        )
 
-        if self.use_full_rank_gate:
+        if self.use_full_rank_gate and not self.split_qkvg:
             # Fuse only the wide projections [q, k, v, g]: folding b (12/rank)
             # and f_a (128, replicated) in skews the output dim and degrades
             # GEMM kernel selection; they stay as separate tiny GEMVs. ROCm
@@ -2120,7 +2128,7 @@ class KimiK3DeltaAttention(nn.Module):
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
-        if self.do_fuse_qkvbfg or self.use_full_rank_gate:
+        if self.do_fuse_qkvbfg or (self.use_full_rank_gate and not self.split_qkvg):
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, defer_f_b=defer_f_b
             )
@@ -3275,6 +3283,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # still conditional on do_fuse_qkvbfg.
                     if param_name == ".fused_qkvg_proj":
                         if not getattr(layer, "use_full_rank_gate", False):
+                            continue
+                        if layer.split_qkvg:
                             continue
                     elif not getattr(layer, "do_fuse_qkvbfg", False):
                         continue

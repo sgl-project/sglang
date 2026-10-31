@@ -52,6 +52,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return torch.int32
 
     def _get_update_attr_name(self):
+        modelslim_cache_layout = (
+            self.model_runner.kv_cache_configurator.modelslim_cache_layout
+        )
+        if modelslim_cache_layout is not None:
+            return "actual_seq_kvlen"
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
