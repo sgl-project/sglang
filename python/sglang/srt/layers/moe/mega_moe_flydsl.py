@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 _MORI_SHMEM_READY = False
 _MEGA_MOE_INSTANCE: dict = {}
+# Large-input protocol slot per MoE module (draft layers reuse layer ids).
+_LAYER_SLOTS: dict = {}
+_LAYER_SLOT_MARGIN = 8
 
 
 def _import_aiter_megamoe():
@@ -194,6 +197,7 @@ def _get_or_build_mega_moe(
     quant: str,
     swiglu_limit: float,
     mtpr: int,
+    layer_slots: int = 1,
 ):
     rank, world = _ep_rank_world()
     shape_key = (rank, world, model_dim, inter_dim, experts, topk, quant, swiglu_limit)
@@ -223,9 +227,76 @@ def _get_or_build_mega_moe(
             w2_scale=layer._mega_w2_scale,
             max_tok_per_rank=capacity,
             swiglu_limit=swiglu_limit,
+            **({"large_m_state_slots": layer_slots} if _large_m_enabled() else {}),
         )
         logger.info("Aiter MegaMoE: built capacity max_tok_per_rank=%d", capacity)
+    # The large-input path exists only on the full-capacity instance.
+    if (
+        _large_m_enabled()
+        and not _MEGA_MOE_INSTANCE[(*shape_key, _mtpr())].large_m_available
+    ):
+        raise RuntimeError(
+            "SGLANG_OPT_USE_AITER_MEGA_LARGE_M is set but the aiter large-input path "
+            "is not available (is AITER_MEGA_LARGE_M=1 set?)"
+        )
     return _MEGA_MOE_INSTANCE[(*shape_key, mtpr)]
+
+
+def _large_m_enabled() -> bool:
+    return envs.SGLANG_OPT_USE_AITER_MEGA_LARGE_M.get()
+
+
+def _use_large_m(forward_batch: ForwardBatch | None) -> bool:
+    if not (
+        _large_m_enabled()
+        and forward_batch is not None
+        and not get_is_capture_mode()
+        and forward_batch.is_extend_in_batch
+    ):
+        return False
+    # Use the scheduler's raw all-gathered counts, which match on every rank;
+    # global_num_tokens_cpu is rewritten to [1] * dp when an idle rank runs a
+    # one-token extend.
+    gathered = forward_batch.original_global_num_tokens_cpu
+    min_tokens = envs.SGLANG_OPT_AITER_MEGA_LARGE_M_MIN_TOKENS.get()
+    return not (gathered and max(gathered) < min_tokens)
+
+
+def _small_m_tokens(mega, forward_batch) -> int:
+    """DP-global max rows when this call takes the small-input path, else 0."""
+    if not envs.SGLANG_OPT_USE_AITER_MEGA_SMALL_M.get() or forward_batch is None:
+        return 0
+    if mega.small_m_mtpr <= 0:
+        raise RuntimeError(
+            "SGLANG_OPT_USE_AITER_MEGA_SMALL_M is set but the aiter small-input path is "
+            "not available (is AITER_MEGA_SMALL_M=1 set?)"
+        )
+    if forward_batch.is_extend_in_batch:
+        return 0
+    # DP-gathered counts (or, in capture, the DP-synchronized graph bucket) are
+    # the same on every rank, so every EP rank makes the same choice.
+    global_num_tokens = get_dp_global_num_tokens()
+    if not global_num_tokens:
+        return 0
+    max_tokens = max(global_num_tokens)
+    return max_tokens if max_tokens <= mega.small_m_mtpr else 0
+
+
+def _fused_paths_enabled() -> bool:
+    return _large_m_enabled() or envs.SGLANG_OPT_USE_AITER_MEGA_SMALL_M.get()
+
+
+def _bind_fused_paths(mega, layer, *, use_large_m: bool) -> None:
+    """Bind this layer's weights and protocol slot; one operator serves every path."""
+    if _large_m_enabled() and mega.large_m_available:
+        mega.set_large_m_enabled(use_large_m)
+    mega.bind_layer(
+        layer_slot=_LAYER_SLOTS.setdefault(id(layer), len(_LAYER_SLOTS)),
+        w1=layer._mega_w1,
+        w1_scale=layer._mega_w1_scale,
+        w2=layer._mega_w2,
+        w2_scale=layer._mega_w2_scale,
+    )
 
 
 def _swap_layer_weights(mega, layer) -> None:
@@ -360,10 +431,27 @@ def _run_mega_routed(
         quant=envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or "a8w4",
         swiglu_limit=float(getattr(moe.config, "swiglu_limit", 0.0) or 0.0),
         mtpr=selected_mtpr,
+        layer_slots=(
+            int(moe.config.num_hidden_layers) + _LAYER_SLOT_MARGIN
+            if _large_m_enabled()
+            else 1
+        ),
     )
-    _swap_layer_weights(mega, moe.experts)
+    small_m_tokens = 0
+    if not _fused_paths_enabled():
+        _swap_layer_weights(mega, moe.experts)
+    else:
+        _bind_fused_paths(mega, moe.experts, use_large_m=_use_large_m(forward_batch))
+        small_m_tokens = _small_m_tokens(mega, forward_batch)
 
-    output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
+    if not small_m_tokens:
+        output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[
+            :num_tokens
+        ]
+    else:
+        output = mega.forward_small_m(
+            x_in, topk_weights, topk_ids, slice_output=False, max_tokens=small_m_tokens
+        )[:num_tokens]
 
     if not moe.routed_scaling_factor_fused_in_topk:
         output.mul_(moe.routed_scaling_factor)
