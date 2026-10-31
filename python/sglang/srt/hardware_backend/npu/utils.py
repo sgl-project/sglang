@@ -1,8 +1,11 @@
+import contextlib
 import functools
 import logging
+import os
 import sys
+import threading
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 
@@ -54,6 +57,134 @@ def use_npu_arch35_mxfp8_wo_a(
         return False
     weight_block_size = getattr(quant_config, "weight_block_size", None)
     return tuple(weight_block_size or ()) == (128, 128)
+
+
+@functools.lru_cache(maxsize=None)
+def cann_transformer_ops(*names: str) -> Optional[tuple]:
+    """Named ops from the cann_ops_transformer package, or None."""
+    try:
+        import cann_ops_transformer  # noqa: F401  (registers the namespace)
+
+        ops_ns = torch.ops.cann_ops_transformer
+        return tuple(getattr(ops_ns, name) for name in names)
+    except (ImportError, AttributeError, RuntimeError):
+        return None
+
+
+def require_cann_transformer_ops(*names: str) -> tuple:
+    """Named ops from cann_ops_transformer; raises when unavailable."""
+    ops = cann_transformer_ops(*names)
+    if ops is None:
+        raise RuntimeError(
+            f"cann_ops_transformer.{', '.join(names)} is required; "
+            "install the package that ships ops-transformer."
+        )
+    return ops
+
+
+MQSMLA_OP_NAMES = (
+    "mixed_quant_sparse_flash_mla_metadata",
+    "mixed_quant_sparse_flash_mla",
+    "kv_compress_epilog",
+)
+
+
+def use_npu_arch35_mqsmla_attn() -> bool:
+    """Whether the mixed-quant ops are usable on this device."""
+    return is_npu_arch35() and cann_transformer_ops(*MQSMLA_OP_NAMES) is not None
+
+
+class NpuKvQuantPath(NamedTuple):
+    """Packed pooled-KV row geometry: nope groups of 64 with bf16 scales,
+    rows 32-byte aligned; the reader consumes quant_mode 1."""
+
+    quant_group_size: int
+    scale_itemsize: int
+    row_alignment: int
+    reader_quant_mode: int
+
+
+NPU_KV_QUANT_PATH = NpuKvQuantPath(
+    quant_group_size=64,
+    scale_itemsize=2,  # bf16
+    row_alignment=32,
+    reader_quant_mode=1,
+)
+
+
+# Vendors can shadow the libopapi_transformer.so symbols on the first
+# call; these ops are resolved once with cust-op vendors hidden.
+_CANN_OPAPI_OPS = (
+    "mixed_quant_sparse_flash_mla_metadata",
+    "mixed_quant_sparse_flash_mla",
+    "kv_compress_epilog",
+    "compressor",
+    "inplace_partial_rotary_mul",
+    "quant_lightning_indexer",
+    "quant_lightning_indexer_metadata",
+    "indexer_quant_cache",
+    "mhc_post",
+    "mhc_pre_sinkhorn",
+    "sparse_flash_mla_metadata",
+    "sparse_flash_mla",
+)
+
+
+@contextlib.contextmanager
+def _without_cust_opapi_vendors():
+    """Temporarily hide cust-op vendors from the aclnn symbol search."""
+    saved_custom = os.environ.get("ASCEND_CUSTOM_OPP_PATH")
+    saved_ld = os.environ.get("LD_LIBRARY_PATH")
+    os.environ.pop("ASCEND_CUSTOM_OPP_PATH", None)
+    if saved_ld is not None:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+            d
+            for d in saved_ld.split(os.pathsep)
+            if not (d and os.path.exists(os.path.join(d, "libcust_opapi.so")))
+        )
+    try:
+        yield
+    finally:
+        if saved_custom is not None:
+            os.environ["ASCEND_CUSTOM_OPP_PATH"] = saved_custom
+        if saved_ld is not None:
+            os.environ["LD_LIBRARY_PATH"] = saved_ld
+
+
+class _GuardedOpPacket(torch._ops.OpOverloadPacket):
+    """Packet-shaped guard; must not degrade to a bare function for dynamo."""
+
+    def __init__(self, packet):
+        self.__dict__.update(packet.__dict__)
+        self._sglang_cann_opapi_guard = True
+        self._guard_done = False
+        self._guard_lock = threading.Lock()
+
+    def __call__(self, *args, **kwargs):
+        if self._guard_done:
+            return super().__call__(*args, **kwargs)
+        with self._guard_lock:
+            if self._guard_done:
+                return super().__call__(*args, **kwargs)
+            with _without_cust_opapi_vendors():
+                result = super().__call__(*args, **kwargs)
+            self._guard_done = True
+        return result
+
+
+def _install_cann_opapi_guards() -> None:
+    """Keep CANN cust-op vendors from shadowing the transformer ops."""
+    try:
+        import cann_ops_transformer  # noqa: F401  (registers the namespace)
+    except Exception as e:
+        logger.debug("cann_ops_transformer unavailable; no aclnn guards (%s)", e)
+        return
+    namespace = torch.ops.cann_ops_transformer
+    for name in _CANN_OPAPI_OPS:
+        op = getattr(namespace, name, None)
+        if op is None or getattr(op, "_sglang_cann_opapi_guard", False):
+            continue
+        setattr(namespace, name, _GuardedOpPacket(op))
 
 
 class NPUACLFormat(IntEnum):
@@ -214,10 +345,9 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
     import torch_npu
 
@@ -230,6 +360,9 @@ def init_npu_backend():
         torch.cuda.is_available = lambda: False
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
+    _install_cann_opapi_guards()
+    # Lazily resolved handles must point at the guarded wrappers.
+    cann_transformer_ops.cache_clear()
 
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:

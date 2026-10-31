@@ -23,7 +23,12 @@ import torch_npu
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import (
+    MQSMLA_OP_NAMES,
+    NPU_KV_QUANT_PATH,
+    is_npu_arch35,
+    require_cann_transformer_ops,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -33,14 +38,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.runtime_context import get_schedule
 
-_NPU_ARCH35_KV_QUANT_GROUP_SIZE = 64
-_NPU_ARCH35_KV_ROW_ALIGNMENT = 128
-
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU PA_ND variant of the full / SWA / c4 / c128 single-KV pool.
 
-    ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
+    The sparse-attention ops read KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
     K_nope + K_rope as bf16 before A5; A5 uses packed FP8 KV rows. C4 uses its
     native page so its physical page id can
@@ -59,11 +61,13 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     def a5_packed_kv_dim(self) -> int:
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
-        scale_dim = math.ceil(nope_dim / _NPU_ARCH35_KV_QUANT_GROUP_SIZE)
-        bytes_per_token = nope_dim + rope_dim * 2 + scale_dim
+        scale_dim = math.ceil(nope_dim / NPU_KV_QUANT_PATH.quant_group_size)
+        bytes_per_token = (
+            nope_dim + rope_dim * 2 + scale_dim * NPU_KV_QUANT_PATH.scale_itemsize
+        )
         return (
-            math.ceil(bytes_per_token / _NPU_ARCH35_KV_ROW_ALIGNMENT)
-            * _NPU_ARCH35_KV_ROW_ALIGNMENT
+            math.ceil(bytes_per_token / NPU_KV_QUANT_PATH.row_alignment)
+            * NPU_KV_QUANT_PATH.row_alignment
         )
 
     def create_buffer(self, *, num_pages: int):
@@ -179,7 +183,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
     get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
     buffers in PA_ND layout at the native C4 ``kernel_page_size``, written by
     ``torch_npu.npu_scatter_nd_update_`` and read by
-    ``torch.ops.custom.npu_quant_lightning_indexer``.
+    ``cann_ops_transformer.quant_lightning_indexer``.
     """
 
     def __init__(self, *args, kernel_page_size: int, **kwargs):
@@ -467,9 +471,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
-        kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on A5 and ``torch.ops.npu.compressor``
-        elsewhere)'s ``state_cache`` argument."""
+        kv+score buffer — ``torch.ops.npu.compressor``'s ``state_cache``
+        argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
     # ------------------------------------------------------------------
@@ -526,7 +529,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         Routes to c4 / c128 kv_pool by layer compression ratio. Returns
         ``None`` for ratio == 0 (no compress KV exists). The
         from_indexer=True branch returns the dedicated quantized K buffer that
-        ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
+        ``cann_ops_transformer.quant_lightning_indexer`` consumes.
         """
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
@@ -589,14 +592,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        torch.ops.npu.kv_compress_epilog(
-            buf.view(-1, 1, buf.shape[-1]),
+        _, _, writer_op = require_cann_transformer_ops(*MQSMLA_OP_NAMES)
+        # The writer takes the 4-D cache as raw bytes (608B rows).
+        writer_op(
+            buf.view(torch.uint8),
             cache_2d,
             slot_mapping,
-            quant_group_size=_NPU_ARCH35_KV_QUANT_GROUP_SIZE,
-            quant_mode=2,
-            round_scale_flag=True,
-            layout=1,
+            quant_group_size=NPU_KV_QUANT_PATH.quant_group_size,
+            quant_mode="fp8_bf16",
+            round_scale=True,
+            x_scale=1.0,
         )
 
     def set_swa_key_buffer_radix_fused_norm_rope(
