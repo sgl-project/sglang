@@ -41,19 +41,19 @@ def update_expert_weights_with_staging(
     update_layer_fn: Callable[..., None],
 ) -> dict[int, list[int]]:
     """Migrate each participating layer through ND storage, preserving model addresses."""
-    layer_ids, local_updates = _select_expert_weight_updates(
+    changed_layer_ids, local_update_plan = _select_expert_weight_updates(
         old_metadata, new_metadata, layer_ids, rank
     )
-    if not layer_ids:
+    if not changed_layer_ids:
         return {}
 
-    staging = _ExpertWeightStaging(weights_by_layer, layer_ids, rank)
     _validate_migration_topology()
+    staging = _ExpertWeightStaging(weights_by_layer, changed_layer_ids, rank)
     world_size = dist.get_world_size()
     temp_buffers = []
     missing_experts_by_layer = {}
 
-    for layer, old_placement, new_placement, local_changed in local_updates:
+    for layer, old_placement, new_placement, local_changed in local_update_plan:
         weights = weights_by_layer[layer]
         if not temp_buffers:
             temp_buffers = staging.create_temp_buffers(weights)
@@ -99,8 +99,9 @@ def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
     old_placements = old_metadata.physical_to_logical_map_cpu
     new_placements = new_metadata.physical_to_logical_map_cpu
     elastic_ep_enabled = ElasticEPStateManager.instance() is not None
+    changed_layer_ids = layer_ids
     if not elastic_ep_enabled:
-        layer_ids = [
+        changed_layer_ids = [
             layer
             for layer in layer_ids
             if not torch.equal(old_placements[layer], new_placements[layer])
@@ -108,17 +109,20 @@ def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
     num_local_experts = old_metadata.num_local_physical_experts
     start = rank * num_local_experts
     local_slots = slice(start, start + num_local_experts)
-    local_updates = []
-    for layer in layer_ids:
+    local_update_plan = []
+    for layer in changed_layer_ids:
         old_placement = old_placements[layer].tolist()
         new_placement = new_placements[layer].tolist()
         local_changed = old_placement[local_slots] != new_placement[local_slots]
-        if not elastic_ep_enabled and not local_changed:
-            if not _rank_may_send_experts(old_placement, new_placement, local_slots):
-                continue
-        local_updates.append((layer, old_placement, new_placement, local_changed))
+        if (
+            not elastic_ep_enabled
+            and not local_changed
+            and not _rank_may_send_experts(old_placement, new_placement, local_slots)
+        ):
+            continue
+        local_update_plan.append((layer, old_placement, new_placement, local_changed))
     # Validate the whole selected chunk, including layers this rank skips.
-    return layer_ids, local_updates
+    return changed_layer_ids, local_update_plan
 
 
 def _rank_may_send_experts(old_placement, new_placement, local_slots):
