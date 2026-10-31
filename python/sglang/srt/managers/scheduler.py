@@ -281,6 +281,11 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.scheduler_components.request_lists import (
+    RequestList,
+    core_request_lists,
+    deferred_response_lists,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -5514,57 +5519,52 @@ class Scheduler(
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
 
+    def request_lists(self) -> List[RequestList]:
+        """Every list that owns live requests, built from the holders at each
+        call: the core lists, then the PD mode's, dLLM's, HiSparse's and the
+        held responses'."""
+        lists = core_request_lists(
+            waiting_queue=self.waiting_queue,
+            grammar_queue=self.grammar_manager.grammar_queue,
+            running_reqs=self.running_reqs,
+            chunked_req=self.chunked_req,
+        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            lists += self.disagg_prefill_request_lists()
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            lists += self.disagg_decode_request_lists()
+        if self.dllm_config is not None:
+            lists += self.dllm_manager.request_lists()
+        if self.hisparse_coordinator is not None:
+            lists += self.hisparse_coordinator.request_lists()
+        lists += deferred_response_lists(self._deferred_responses)
+        return lists
+
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
-        # Health check piggybacks on running requests in process_output.
-        # Only running_batch + waiting_queue guarantee active GPU processing;
-        # disagg queues (bootstrap/prealloc/transfer) may have items without
-        # any request actually running on GPU — e.g. stuck handshake, full
-        # KV cache, or stalled transfer — so they can't carry health info.
-        # Batch running status
-        idle = (
-            self.running_batch.is_empty()
-            and self.chunked_req is None
-            and not self.dllm_manager.any_staging_reqs()
-            and (self.last_batch is None or self.last_batch.is_empty())
+        # The live requests. Health check piggybacks on running requests in
+        # process_output, so it counts only the lists whose requests run soon
+        # (`RequestList.health_check`); PD queues may hold requests that run on
+        # no GPU, e.g. a stuck handshake, a full KV cache or a stalled transfer.
+        idle = not any(
+            entry.keeps_busy(
+                for_health_check=for_health_check, ignore_waiting=ignore_waiting
+            )
+            for entry in self.request_lists()
+        )
+
+        # The steps not processed yet
+        idle &= (
+            (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        if not ignore_waiting:
-            idle &= len(self.waiting_queue) == 0
-        else:
-            # A PD-decode request waiting with its transferred KV still owns
-            # its request row; a flush would free it.
-            idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
-
-        if (
-            for_health_check
-            and not self._engine_paused
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_inflight_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.decode_offload_manager is not None
+            ):
+                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -5820,16 +5820,7 @@ class Scheduler(
         old_version = get_serving().weight_version
         get_context().override("scheduler.weight_version", weight_version=new_version)
 
-        live_reqs = {
-            *self.collect_inflight_reqs(),
-            *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
-            *(req for req, _ in (self._deferred_responses or {}).values()),
-        }
-        if self.hisparse_coordinator is not None:
-            live_reqs.update(
-                act.req for act in self.hisparse_coordinator.ack_staging_queue
-            )
+        live_reqs = [req for entry in self.request_lists() for req in entry.reqs]
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"

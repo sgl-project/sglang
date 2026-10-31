@@ -8,6 +8,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler_components.request_lists import RequestList
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -461,6 +462,23 @@ class DllmManager:
         """Check if any request ID already exists in waiting queue."""
         existing_rids: Set[str] = {r.rid for r in self.waiting_queue}
         return any(req.rid in existing_rids for req in reqs)
+
+    def request_lists(self) -> List[RequestList]:
+        """The admitted requests until they finish: those this round stages,
+        and the rest. The waiting queue holds both, so the rest is built here."""
+        staged = {id(req) for req in self.staging_queue}
+        return [
+            # The fully idle check has never counted a request between rounds,
+            # even one holding KV between its blocks.
+            RequestList(
+                name="dllm_waiting",
+                reqs=[req for req in self.waiting_queue if id(req) not in staged],
+                never_busy=True,
+            ),
+            RequestList(
+                name="dllm_staging", reqs=self.staging_queue, health_check=True
+            ),
+        ]
 
     def any_staging_reqs(self) -> bool:
         """Check if there are requests in staging queue."""

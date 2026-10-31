@@ -89,6 +89,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_swa_tokens,
     kv_private_tokens,
 )
+from sglang.srt.managers.scheduler_components.request_lists import RequestList
 from sglang.srt.managers.utils import GenerationBatchResult, is_war_barrier_enabled
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -3309,6 +3310,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)
 
+    def deferred_release_reqs(self) -> List[Req]:
+        return [decode_req.req for decode_req, *_ in self._deferred_releases]
+
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
 
@@ -3397,6 +3401,42 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def disagg_decode_request_lists(self: Scheduler) -> List[RequestList]:
+        """The PD decode lists, from preallocation to the release of the KV. The
+        requests whose KV arrived wait in the core waiting list."""
+        prealloc_queue = self.disagg_decode_prealloc_queue
+        transfer_queue = self.disagg_decode_transfer_queue
+        return [
+            RequestList(
+                name="decode_prealloc",
+                reqs=[decode_req.req for decode_req in prealloc_queue.queue],
+            ),
+            # Readmitted soon, they carry the health check, except while
+            # generation is paused.
+            RequestList(
+                name="decode_retracted",
+                reqs=prealloc_queue.retracted_queue,
+                health_check=not self._engine_paused,
+            ),
+            # Held from a retract pause until resume, so the weight update
+            # between them can flush the cache.
+            RequestList(
+                name="decode_held",
+                reqs=prealloc_queue.held_rebootstrap_reqs,
+                never_busy=True,
+            ),
+            RequestList(
+                name="decode_transfer",
+                reqs=[decode_req.req for decode_req in transfer_queue.queue],
+            ),
+            # Finished already; their KV is released once the prefill side
+            # stops writing it.
+            RequestList(
+                name="decode_releasing",
+                reqs=transfer_queue.deferred_release_reqs(),
+            ),
+        ]
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
