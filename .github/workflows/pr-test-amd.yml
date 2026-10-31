@@ -22,6 +22,8 @@ on:
       - "test/**"
       - "python/sglang/kernels/aot/**"
       - ".github/workflows/pr-test-amd.yml"
+      - ".github/workflows/pr-states.yml"
+      - ".github/scripts/pr-states.test.cjs"
       - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
@@ -181,6 +183,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Validate AMD CI wiring
+        run: |
+          python3 -m pip install 'pyyaml==6.0.3'
+          python3 -m unittest scripts.ci.test_amd_ci_wiring
+          node --test .github/scripts/pr-states.test.cjs
 
       - name: Determine run mode
         id: run-mode
@@ -687,7 +695,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0, 1]
@@ -729,7 +737,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0]
@@ -771,7 +779,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0, 1, 2, 3]
@@ -921,7 +929,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         # run_suite.py load-balances the suite's parametrized cases and
@@ -1079,7 +1087,10 @@ jobs:
               {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 2},
               {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 1}
             ]
-          max-wait-minutes: '480'
+          # Leave room below the 6h GitHub-hosted job limit. A slow stage-B
+          # releases stage-C; pr-test-amd-finish still checks every stage-B job.
+          max-wait-minutes: '350'
+          fail-on-timeout: 'false'
 
   stage-c-test-4-gpu-amd:
     name: ${{ format('stage-c-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}

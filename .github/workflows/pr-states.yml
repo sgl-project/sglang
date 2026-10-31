@@ -14,7 +14,7 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)"]
+    workflows: ["PR Test Base", "PR Test Extra", "PR Test (AMD)", "PR Test Extra (AMD)"]
     types: [requested, completed]
   workflow_dispatch:
     inputs:
@@ -112,6 +112,7 @@ jobs:
             const labels = pr.labels.map(l => l.name);
             const hasCI = labels.includes('run-ci');
             const hasNvExtra = labels.includes('run-ci-nv-extra');
+            const hasAmdExtra = labels.includes('run-ci-amd-extra');
 
             // Pre-sleep below only matters when a label was just removed;
             // other no-label fires don't race against fresh indexing.
@@ -125,7 +126,7 @@ jobs:
                 workflow_id: workflowFile,
                 head_sha: sha,
                 // Every row reports the PR gate, so exclude other events for
-                // this SHA: all three workflows also accept workflow_dispatch,
+                // this SHA: all four workflows also accept workflow_dispatch,
                 // and for AMD that is a single stage rather than the full gate.
                 event: 'pull_request',
                 per_page: 10,
@@ -151,13 +152,13 @@ jobs:
             const labelOnOpts  = { preSleepMs: LABEL_ON_PRESLEEP_MS, attempts: RETRY_ATTEMPTS, delayMs: RETRY_DELAY_MS };
             const labelOffOpts = { preSleepMs: justRemovedLabel ? LABEL_OFF_PRESLEEP_MS : 0, attempts: 1 };
 
-            // The three lookups are independent, so the added one costs no
+            // The four lookups are independent, so the added one costs no
             // wall-clock time. The AMD lookup never spends the retry budget:
             // that workflow has an on.pull_request.paths filter, so a missing
             // run is usually legitimate rather than an indexing race, and the
             // race resolves itself -- `requested` is in the workflow_run
             // subscription above, so a real dispatch refreshes this block.
-            const [ptRun, peRun, amdRun] = await Promise.all([
+            const [ptRun, peRun, amdRun, amdExtraRun] = await Promise.all([
               findRun('pr-test.yml', hasCI ? labelOnOpts : labelOffOpts),
               // pr-test-extra gates on BOTH labels (see call-gate there).
               findRun(
@@ -165,6 +166,10 @@ jobs:
                 (hasCI && hasNvExtra) ? labelOnOpts : labelOffOpts,
               ),
               findRun('pr-test-amd.yml', labelOffOpts),
+              findRun(
+                'pr-test-amd-extra.yml',
+                (hasCI && hasAmdExtra) ? labelOnOpts : labelOffOpts,
+              ),
             ]);
 
             // Skipped run = "no real run" -- happens when a label is added
@@ -174,6 +179,7 @@ jobs:
             const missingCIText = ':x: **Missing `run-ci` label** -- add it to run CI tests.';
             const peBlockedByCIText = ':x: **Blocked** -- `run-ci` is required first.';
             const notNvExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-nv-extra` label to opt in.';
+            const notAmdExtraEnabledText = ':warning: **Not enabled** -- add `run-ci-amd-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
@@ -208,6 +214,13 @@ jobs:
             const amdText = isReal(amdRun)
               ? runLink(amdRun)
               : amdNotTriggeredText;
+            const amdExtraText = isReal(amdExtraRun)
+              ? runLink(amdExtraRun)
+              : !hasCI
+                ? peBlockedByCIText
+                : !hasAmdExtra
+                  ? notAmdExtraEnabledText
+                  : stalePushText;
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
@@ -217,6 +230,8 @@ jobs:
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
             const amdStart   = '<!-- slot:pr-test-amd:start -->';
             const amdEnd     = '<!-- slot:pr-test-amd:end -->';
+            const amdExtraStart = '<!-- slot:pr-test-amd-extra:start -->';
+            const amdExtraEnd   = '<!-- slot:pr-test-amd-extra:end -->';
 
             const newBlock = [
               outerStart,
@@ -226,6 +241,7 @@ jobs:
               `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
               `Latest PR Test (AMD ROCm 10): ${amdStart}${amdText}${amdEnd}`,
+              `Latest PR Test Extra (AMD): ${amdExtraStart}${amdExtraText}${amdExtraEnd}`,
               outerEnd,
             ].join('\n');
 
