@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     use_sequence_parallel_group,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -50,10 +51,13 @@ class ParallelExecutor(PipelineExecutor):
         group = get_world_group()
 
         use_nvtx = self._should_use_stage_nvtx(batch, server_args)
+        requests = batch if isinstance(batch, list) else [batch]
 
         with self._component_residency_request(stages, batch, server_args):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
+                # all ranks must check before entering rank-selective stage branches
+                raise_if_cancelled(requests)
                 paradigm = stage.parallelism_type_for(batch)
 
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
@@ -164,6 +168,7 @@ class ParallelExecutor(PipelineExecutor):
                         batch = broadcasted_batch
 
                     torch.distributed.barrier()
+            raise_if_cancelled(requests)
         return batch
 
     def execute(
