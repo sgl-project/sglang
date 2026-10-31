@@ -87,6 +87,7 @@ struct Compress128PrefillParams {
   const PlanW* __restrict__ plan_w;
   uint32_t num_compress;
   uint32_t num_write;
+  uint32_t cp_rows_per_rank;
 };
 
 template <typename Trait, bool kUsePDL, typename BufferFloat, typename InputFloat, typename OutFloat>
@@ -95,7 +96,9 @@ SGL_DEVICE void c128_forward(
     const InputFloat* kv_src,   // ragged pointer at position = 128n + 127
     OutFloat* kv_out,
     const InputFloat* score_bias,
-    const int32_t buffer_len) {
+    const int32_t buffer_len,
+    int64_t cp_input_row = -1,
+    int64_t cp_rows_per_rank = 0) {
   using namespace device;
 
   constexpr uint32_t kTileElements = Trait::kTileElements;
@@ -126,9 +129,11 @@ SGL_DEVICE void c128_forward(
     for (int32_t i = 0; i < kElementsPerWarp; ++i) {
       const int32_t j = i + warp_offset;
       __builtin_assume(j < 128);
-      const auto src = j < buffer_len ? kv_buf : kv_start;
-      kv[i] = gmem_in.load(src + j * Trait::kElementSize);
-      score[i] = gmem_in.load(src + j * Trait::kElementSize + Trait::kScoreOffset);
+      const auto src = j < buffer_len ? kv_buf + j * Trait::kElementSize
+                                      : device::compress::cp8_input_relative(
+                                            kv_src, j - 127, Trait::kElementSize, cp_input_row, cp_rows_per_rank);
+      kv[i] = gmem_in.load(src);
+      score[i] = gmem_in.load(src + Trait::kScoreOffset);
     }
   } else {  // mixed dtype
     using StorageBuffer = AlignedVector<BufferFloat, Trait::kTileElements>;
@@ -148,7 +153,8 @@ SGL_DEVICE void c128_forward(
           score[i][k] = cast<InputFloat>(score_tmp[k]);
         }
       } else {
-        const auto src = kv_start + j * Trait::kElementSize;
+        const auto src =
+            device::compress::cp8_input_relative(kv_src, j - 127, Trait::kElementSize, cp_input_row, cp_rows_per_rank);
         kv[i] = gmem_in.load(src);
         score[i] = gmem_in.load(src + Trait::kScoreOffset);
       }
@@ -314,7 +320,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
 }
 
 // compress kernel
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL, bool kRankMajor>
 C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -331,15 +337,18 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
   if (plan.is_invalid()) return;
 
-  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_src = kv_input + (kRankMajor ? device::compress::cp8_input_row(plan.ragged_id, params.cp_rows_per_rank)
+                                             : plan.ragged_id) *
+                                     Trait::kElementSize;
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   PDLWaitPrimary<kUsePDL>();
-  c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
+  c128_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
+      kv_buf, kv_src, kv_out, score_bias, plan.buffer_len, kRankMajor ? plan.ragged_id : -1, params.cp_rows_per_rank);
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL, bool kRankMajor>
 WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
@@ -360,7 +369,9 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   if (plan.is_invalid()) return;
 
   // each warp will handle a contiguous region
-  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_src = kv_input + (kRankMajor ? device::compress::cp8_input_row(plan.ragged_id, params.cp_rows_per_rank)
+                                             : plan.ragged_id) *
+                                     Trait::kElementSize;
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
@@ -397,12 +408,20 @@ WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillP
   }
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename OutFloat,
+    bool kUsePDL,
+    bool kRankMajor = false>
 struct FlashCompress128Kernel {
   using Trait = C128Trait<kHeadDim>;
   static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel = flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel = write_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel =
+      flash_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL, kRankMajor>;
+  static constexpr auto prefill_w_kernel =
+      write_c128_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL, kRankMajor>;
 
   static void run_decode(
       const tvm::ffi::TensorView kv_buffer,
@@ -413,6 +432,7 @@ struct FlashCompress128Kernel {
     using namespace host;
 
     auto N = SymbolicSize{"batch_size"};
+    RuntimeCheck(!kRankMajor, "rank-major compressor is prefill-only");
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
 
@@ -495,7 +515,11 @@ struct FlashCompress128Kernel {
         .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
+        .cp_rows_per_rank = kRankMajor ? num_q_tokens / 8 : 0,
     };
+    if constexpr (kRankMajor) {
+      RuntimeCheck(num_q_tokens > 0 && num_q_tokens % 8 == 0, "rank-major input needs equal CP8 buckets");
+    }
     RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = num_c * Trait::kNumSplit) {
       LaunchKernel(num_c_blocks, Trait::kBlockSize, device)  //

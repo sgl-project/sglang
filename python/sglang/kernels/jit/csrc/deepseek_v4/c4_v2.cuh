@@ -61,6 +61,7 @@ struct Compress4PrefillParams {
   const PlanW* __restrict__ plan_w;
   uint32_t num_compress;
   uint32_t num_write;
+  uint32_t cp_rows_per_rank;
 };
 
 template <int64_t kHeadDim_>
@@ -83,7 +84,9 @@ SGL_DEVICE void c4_forward(
     OutFloat* kv_out,
     const InputFloat* score_bias,
     const bool should_overlap,
-    const int32_t buffer_len) {
+    const int32_t buffer_len,
+    int64_t cp_input_row = -1,
+    int64_t cp_rows_per_rank = 0) {
   using namespace device;
 
   using StorageIn = AlignedVector<InputFloat, kTileElements>;
@@ -99,11 +102,11 @@ SGL_DEVICE void c4_forward(
 
   if constexpr (std::is_same_v<BufferFloat, InputFloat>) {
     if (should_overlap) {
-      const auto kv_start = kv_src - 7 * Trait::kElementSize;  // point to start
 #pragma unroll
       for (int32_t i = 0; i < 4; ++i) {
-        const auto src = i < buffer_len ? kv_buf_0 : kv_start;
-        const auto base = src + i * Trait::kElementSize;
+        const auto base = i < buffer_len ? kv_buf_0 + i * Trait::kElementSize
+                                         : device::compress::cp8_input_relative(
+                                               kv_src, i - 7, Trait::kElementSize, cp_input_row, cp_rows_per_rank);
         kv[i] = gmem_in.load(base);
         score[i] = gmem_in.load(base + Trait::kScoreOffset);
       }
@@ -117,18 +120,18 @@ SGL_DEVICE void c4_forward(
       }
     }
 
-    const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
-      const auto src = i + 4 < buffer_len ? kv_buf_1 : kv_start;
-      const auto base = src + i * Trait::kElementSize + Trait::kOverlapOffset;
+      const auto base = (i + 4 < buffer_len ? kv_buf_1 + i * Trait::kElementSize
+                                            : device::compress::cp8_input_relative(
+                                                  kv_src, i - 3, Trait::kElementSize, cp_input_row, cp_rows_per_rank)) +
+                        Trait::kOverlapOffset;
       kv[i + 4] = gmem_in.load(base);
       score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
     }
   } else {  // mixed dtype
     using StorageBuffer = AlignedVector<BufferFloat, kTileElements>;
     const auto gmem_buffer = tile::Memory<StorageBuffer>::warp();
-    const auto kv_start_0 = kv_src - 7 * Trait::kElementSize;  // point to start
 
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
@@ -142,7 +145,8 @@ SGL_DEVICE void c4_forward(
           score[i][j] = cast<InputFloat>(score_tmp[j]);
         }
       } else if (should_overlap) {
-        const auto base = kv_start_0 + i * Trait::kElementSize;
+        const auto base =
+            device::compress::cp8_input_relative(kv_src, i - 7, Trait::kElementSize, cp_input_row, cp_rows_per_rank);
         kv[i] = gmem_in.load(base);
         score[i] = gmem_in.load(base + Trait::kScoreOffset);
       } else {
@@ -153,7 +157,6 @@ SGL_DEVICE void c4_forward(
       }
     }
 
-    const auto kv_start = kv_src - 3 * Trait::kElementSize;  // point to start
 #pragma unroll
     for (int32_t i = 0; i < 4; ++i) {
       if (i + 4 < buffer_len) {
@@ -166,7 +169,9 @@ SGL_DEVICE void c4_forward(
           score[i + 4][j] = cast<InputFloat>(score_tmp[j]);
         }
       } else {
-        const auto base = kv_start + i * Trait::kElementSize + Trait::kOverlapOffset;
+        const auto base =
+            device::compress::cp8_input_relative(kv_src, i - 3, Trait::kElementSize, cp_input_row, cp_rows_per_rank) +
+            Trait::kOverlapOffset;
         kv[i + 4] = gmem_in.load(base);
         score[i + 4] = gmem_in.load(base + Trait::kScoreOffset);
       }
@@ -286,7 +291,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
   }
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL, bool kRankMajor>
 C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -305,7 +310,9 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const auto score_bias = static_cast<const InputFloat*>(params.score_bias) + split_offset;
   if (plan.is_invalid()) return;
 
-  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_src = kv_input + (kRankMajor ? device::compress::cp8_input_row(plan.ragged_id, params.cp_rows_per_rank)
+                                             : plan.ragged_id) *
+                                     Trait::kElementSize;
   // Compact output: one row per compress plan, indexed by `global_pid`.
   const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
@@ -313,10 +320,18 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   const bool need_overlap = plan.seq_len > 4;
   PDLWaitPrimary<kUsePDL>();
   c4_forward<Trait, kUsePDL, BufferFloat, InputFloat, OutFloat>(
-      kv_buf_0, kv_buf_1, kv_src, kv_out, score_bias, need_overlap, plan.buffer_len);
+      kv_buf_0,
+      kv_buf_1,
+      kv_src,
+      kv_out,
+      score_bias,
+      need_overlap,
+      plan.buffer_len,
+      kRankMajor ? plan.ragged_id : -1,
+      params.cp_rows_per_rank);
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL, bool kRankMajor>
 WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
@@ -337,7 +352,9 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   if (plan.is_invalid()) return;
 
   // each warp will handle a contiguous region
-  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_src = kv_input + (kRankMajor ? device::compress::cp8_input_row(plan.ragged_id, params.cp_rows_per_rank)
+                                             : plan.ragged_id) *
+                                     Trait::kElementSize;
   const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
   const auto gmem_input = tile::Memory<StorageInput>::warp();
 
@@ -374,11 +391,19 @@ WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParam
   }
 }
 
-template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    typename BufferFloat,
+    typename InputFloat,
+    typename OutFloat,
+    bool kUsePDL,
+    bool kRankMajor = false>
 struct FlashCompress4Kernel {
   static constexpr auto decode_kernel = flash_c4_decode<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_c_kernel = flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
-  static constexpr auto prefill_w_kernel = write_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_c_kernel =
+      flash_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL, kRankMajor>;
+  static constexpr auto prefill_w_kernel =
+      write_c4_prefill<kHeadDim, BufferFloat, InputFloat, OutFloat, kUsePDL, kRankMajor>;
   static constexpr uint32_t kBlockSize = 128;
   static constexpr uint32_t kTileDim = kTileElements * device::kWarpThreads;
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
@@ -394,6 +419,7 @@ struct FlashCompress4Kernel {
     using namespace host;
 
     auto N = SymbolicSize{"batch_size"};
+    RuntimeCheck(!kRankMajor, "rank-major compressor is prefill-only");
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
 
@@ -475,7 +501,11 @@ struct FlashCompress4Kernel {
         .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
+        .cp_rows_per_rank = kRankMajor ? num_q_tokens / 8 : 0,
     };
+    if constexpr (kRankMajor) {
+      RuntimeCheck(num_q_tokens > 0 && num_q_tokens % 8 == 0, "rank-major input needs equal CP8 buckets");
+    }
     RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = div_ceil(num_c * kNumSplit, kWarpsPerBlock)) {
       LaunchKernel(num_c_blocks, kBlockSize, device)  //

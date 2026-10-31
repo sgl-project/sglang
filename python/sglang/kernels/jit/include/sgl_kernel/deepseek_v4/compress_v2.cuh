@@ -14,6 +14,20 @@ namespace sglang {
 
 namespace device::compress {
 
+// CP8 token-interleave: logical token row -> rank-major AllGather row.
+SGL_DEVICE int64_t cp8_input_row(int64_t row, int64_t rows_per_rank) {
+  return (row % 8) * rows_per_rank + row / 8;
+}
+
+template <typename T>
+SGL_DEVICE const T*
+cp8_input_relative(const T* source, int64_t relative, int64_t width, int64_t input_row, int64_t rows_per_rank = 0) {
+  return source + (input_row < 0
+                       ? relative
+                       : cp8_input_row(input_row + relative, rows_per_rank) - cp8_input_row(input_row, rows_per_rank)) *
+                      width;
+}
+
 /// \brief Per-batch decode plan. Layout: 16 bytes.
 struct alignas(16) DecodePlan {
   uint32_t seq_len;
