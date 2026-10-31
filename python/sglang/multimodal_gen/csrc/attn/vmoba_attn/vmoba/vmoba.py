@@ -16,15 +16,22 @@ try:
         _flash_attn_varlen_forward,
     )
 except ImportError:
-
-    def _unsupported(*args, **kwargs):
-        raise ImportError(
-            "flash-attn is not installed. Please install it, e.g., `pip install flash-attn`."
+    try:
+        from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba.xpu_flash_attn import (
+            flash_attn_varlen_backward as _flash_attn_varlen_backward,
+            flash_attn_varlen_forward as _flash_attn_varlen_forward,
+            flash_attn_varlen_func,
         )
+    except ImportError:
 
-    _flash_attn_varlen_forward = _unsupported
-    _flash_attn_varlen_backward = _unsupported
-    flash_attn_varlen_func = _unsupported
+        def _unsupported(*args, **kwargs):
+            raise ImportError(
+                "flash-attn is not installed. Please install it, e.g., `pip install flash-attn`."
+            )
+
+        _flash_attn_varlen_forward = _unsupported
+        _flash_attn_varlen_backward = _unsupported
+        flash_attn_varlen_func = _unsupported
 
 from einops import rearrange
 

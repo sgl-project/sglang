@@ -5,14 +5,16 @@ import random
 import pytest
 import torch
 from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba import moba_attn_varlen
+from sglang.srt.utils import get_device
 
 
 def generate_test_data(
-    batch_size, total_seqlen, num_heads, head_dim, dtype, device="cuda"
+    batch_size, total_seqlen, num_heads, head_dim, dtype, device=None
 ):
     """
     Generates random data for testing the variable-length attention function.
     """
+    device = get_device() if device is None else device
     torch.manual_seed(42)
     random.seed(42)
     torch.cuda.manual_seed_all(42)
