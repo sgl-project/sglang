@@ -556,5 +556,7 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",
+    "lmcache_min_retrieve_tokens",
+    "lmcache_load_cost_profile",
 )
 # fmt: on

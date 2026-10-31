@@ -28,6 +28,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lmcache.load_cost_profile import (
+    LoadCostKey,
+    LoadCostProfile,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
 
@@ -51,10 +55,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         tp_rank: int,
         lmcache_config_file: Optional[str],
         forward_stream: Any,
+        min_retrieve_tokens: int = 0,
+        load_cost_profile: Optional[str] = None,
     ) -> None:
         # The parent constructor calls reset() before the connector exists.
         self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
         super().__init__(params)
+        self._min_retrieve_tokens = min_retrieve_tokens
+        self._load_cost_profile = (
+            LoadCostProfile.from_file(load_cost_profile) if load_cost_profile else None
+        )
+        self._load_cost_model_name = model_config.model_path
+        self._load_cost_world_size = tp_size * params.pp_size
         self._mamba_component = self._find_mamba_component()
         self.lmcache_connector = UnifiedLMCacheMPConnector(
             config_file=lmcache_config_file,
@@ -202,6 +214,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         ).page_aligned(self.page_size)
         if len(key) == 0:
             return
+        # Full prompt length is common across ranks. A rank-local prefix here
+        # could make only some ranks enter the connector's collectives.
+        if (
+            len(key)
+            // self.lmcache_connector.chunk_size
+            * self.lmcache_connector.chunk_size
+            < self._min_retrieve_tokens
+        ):
+            return
         token_ids = key.raw_token_ids()[: len(key)]
         lookup = self.lmcache_connector.submit_lookup(
             req_id,
@@ -235,18 +256,35 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             total_hit = min(total_hit, len(flow.key))
             local_hit_tokens = int(local_hit.item())
+            decline = (
+                total_hit <= local_hit_tokens
+                or total_hit - local_hit_tokens < self._min_retrieve_tokens
+            )
+            if not decline and self._load_cost_profile is not None:
+                decline = not self._load_cost_profile.should_load(
+                    LoadCostKey(
+                        model_name=self._load_cost_model_name,
+                        world_size=self._load_cost_world_size,
+                        chunk_size=self.lmcache_connector.chunk_size,
+                        lookup_tokens=len(flow.key),
+                        engine_computed_tokens=local_hit_tokens,
+                        external_tokens=total_hit - local_hit_tokens,
+                    )
+                )
             release_end = min(
                 total_hit,
                 local_hit_tokens
                 // self.lmcache_connector.chunk_size
                 * self.lmcache_connector.chunk_size,
             )
+            if decline:
+                release_end = total_hit
             if release_end > 0:
                 # All ranks advance state; only the leader releases remote locks.
                 self.lmcache_connector.free_lookup_locks(
                     req_id, start=0, end=release_end
                 )
-            if total_hit <= local_hit_tokens:
+            if decline:
                 self._external_flows.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid[handle] = 0
                 self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
@@ -847,6 +885,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.prefix_published = True
 
     def _submit_store(self, req: Req, token_ids: list[int]) -> None:
+        # The connector records its producer-ready event on the current stream.
+        # Include both model KV writes and caller-side index preparation before
+        # allowing an asynchronous transfer to read the cache.
+        device_module = torch.get_device_module(self._forward_stream.device)
+        self._forward_stream.wait_stream(
+            device_module.current_stream(self._forward_stream.device)
+        )
+        with device_module.stream(self._forward_stream):
+            self._submit_store_on_forward_stream(req, token_ids)
+
+    def _submit_store_on_forward_stream(self, req: Req, token_ids: list[int]) -> None:
         key = RadixKey(
             token_ids,
             req.extra_key,
