@@ -1563,12 +1563,13 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
 
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
-    """The KV byte layout both PD roles must share, for pools that have more than one."""
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    """The KV byte layout both PD roles must share, for pools that have more than one.
 
-    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-        return token_to_kv_pool.pd_kv_layout()
-    return None
+    Pools declare it through ``pd_kv_layout()`` (``KVCache`` defaults to None);
+    pools that do not define the method declare nothing.
+    """
+    pd_kv_layout = getattr(token_to_kv_pool, "pd_kv_layout", None)
+    return pd_kv_layout() if callable(pd_kv_layout) else None
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
