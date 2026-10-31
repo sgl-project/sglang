@@ -2220,9 +2220,12 @@ class TestLazyCompaction(unittest.TestCase):
         # State untouched: hole still present.
         self.assertEqual(len(fa._free_phys_pages), 1)
         self.assertEqual(len(fa._pending_reuse), 0)
-        # Firing the event prunes the write-set entry; the next flush then
-        # releases src directly, with no pending-reuse entry needed.
+        # Retiring the forward (its result processed) prunes the write-set
+        # entry; the next flush then releases src directly, with no pending-reuse
+        # entry needed. Firing alone decides nothing.
         ev.fired = True
+        self.assertEqual(fa._flush(urgent=False), 0)
+        fa.retire_forward(ev)
         n_moves2 = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves2, 1)
         self.assertEqual(len(fa._pending_reuse), 0)
@@ -2255,8 +2258,11 @@ class TestLazyCompaction(unittest.TestCase):
         # src; the page count lives in `_pending_reuse_pages_cpu`.
         self.assertEqual(len(fa._pending_reuse), 1)
         self.assertEqual(len(fa._pending_reuse_pages_cpu), n_moves)
-        # Fire the event and drain -- srcs return to availability.
+        # Firing alone does not release them; retiring the forward does.
         ev.fired = True
+        fa._drain_pending_reuse(urgent=False)
+        self.assertEqual(len(fa._pending_reuse), 1)
+        fa.retire_forward(ev)
         fa._drain_pending_reuse(urgent=False)
         self.assertEqual(len(fa._pending_reuse), 0)
         self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)

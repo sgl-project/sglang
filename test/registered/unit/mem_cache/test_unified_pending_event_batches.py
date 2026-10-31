@@ -128,6 +128,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         event = second if mode == "different" and index else first
                         if index and mode == "fired_between":
                             first.fired = True
+                            member.retire_forward(first)
                             expected.clear()
                         member.set_latest_forward_done_event(event)
                         member.set_inflight_forward(event, None)
@@ -159,15 +160,17 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         sources = set(before[moved].tolist())
                         self.assertTrue(sources)
                         all_sources.update(sources)
-                        if not event.fired:
+                        if not member._retired(event):
                             expected.setdefault(event, set()).update(sources)
                         assert_pending()
                         assert_payload()
 
                     member._drain_pending_reuse(urgent=False)
                     assert_pending()
-                    for event in (second, first):
+                    # Forwards retire in launch order, each with every earlier one.
+                    for event in (first, second):
                         event.fired = True
+                        member.retire_forward(event)
                         expected.pop(event, None)
                         member._drain_pending_reuse(urgent=False)
                         assert_pending()

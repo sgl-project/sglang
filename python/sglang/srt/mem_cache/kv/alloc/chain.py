@@ -782,6 +782,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     writes_unknown=token_writes_unknown and not is_state,
                 )
 
+    def retire_forward(self, forward_done: torch.cuda.Event) -> None:
+        """The scheduler processed this forward's result; see `Band.retire_forward`."""
+        for member in self.members:
+            member.retire_forward(forward_done)
+
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
