@@ -146,7 +146,6 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
         backend.kv_cache_dtype = kv_dtype
         backend.token_to_kv_pool = _FakeKVPool(k, v)
         backend.input_dtype = torch.bfloat16
-        backend.scale = _HEAD_DIM**-0.5
         backend.k_scale = backend.v_scale = torch.ones(1, device=_DEVICE)
         rows = bs * _NUM_Q_HEADS * backend.max_num_partitions
         backend.workspace_buffer = torch.empty(
@@ -179,6 +178,7 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
             v_scale=None,
             sliding_window_size=-1,
             logit_cap=0.0,
+            scaling=_HEAD_DIM**-0.5,
         )
         gen = torch.Generator(_DEVICE).manual_seed(1)
         q = torch.randn(
