@@ -117,9 +117,12 @@ def test_nested_routes_preserve_management_auth_level(
             assert exc.value.code == 1008
 
 
-@pytest.mark.parametrize("token", [None, "wrong-secret"])
-def test_websocket_denial_returns_http_403_on_the_wire(token):
-    """A rejected upgrade returns HTTP 403 through a real Uvicorn server."""
+@pytest.mark.parametrize(
+    "token,status",
+    [(None, 403), ("wrong-secret", 403), ("user-secret", 101)],
+)
+def test_websocket_auth_handshake_on_the_wire(token, status):
+    """Uvicorn accepts valid credentials and rejects unauthorized upgrades."""
     app = FastAPI()
     entered = False
 
@@ -169,8 +172,8 @@ def test_websocket_denial_returns_http_403_on_the_wire(token):
                 trust_env=False,
                 timeout=5,
             )
-            assert response.status_code == 403
-            assert not entered
+            assert response.status_code == status
+            assert entered == (status == 101)
         finally:
             server.should_exit = True
             thread.join(timeout=5)
