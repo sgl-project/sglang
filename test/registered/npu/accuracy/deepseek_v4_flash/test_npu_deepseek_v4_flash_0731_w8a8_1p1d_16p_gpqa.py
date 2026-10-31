@@ -140,7 +140,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--enable-cache-report",
     "--max-total-tokens",
-    130000,
+    140000,
 ]
 
 # Decode node (1 node x 16 NPUs, TP16 DP16) launch arguments.
