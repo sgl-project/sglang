@@ -37,10 +37,14 @@ _SRC = os.path.join(_DIR, "smallm_moe.hip")
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 # Dispatch cap: above this token count aiter's flydsl path is faster (crossover ~44
-# tokens at per-rank intermediate 256 / TP4). Only that shape is dispatched here; the
-# TP2 shape (intermediate 512) has a lower crossover and is left to a follow-up.
-MAX_TOK_DISPATCH = {256: 40}
+# tokens at per-rank intermediate 256 / TP4). Intermediate 512 has a lower crossover;
+# its GLM-5.3-Flash TP4 shape (8 or 9 slots) is dispatched up to 16 tokens, and its
+# Qwen3.5 TP2 shape (10 or 11) not at all.
+MAX_TOK_DISPATCH = {256: 40, 512: 16}
 MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 asm/CK
+# topk widths (routed + fused shared) dispatched per intermediate, each with a compiled p2.
+# Intermediate 128 is FP8 TP8 only.
+DISPATCH_SLOTS = {256: (10, 11), 512: (8, 9), 128: (10, 11)}
 
 _kernels: dict = {}
 _available = None
@@ -75,7 +79,7 @@ class Args(ctypes.Structure):
         ("tok", ctypes.c_int32),
         ("slots", ctypes.c_int32),
         ("E", ctypes.c_int32),
-        ("pad", ctypes.c_int32),
+        ("swiglu_limit", ctypes.c_float),
     ]
 
 
@@ -90,8 +94,10 @@ def smallm_moe_enabled() -> bool:
     failure has disabled the kernel in this process. Numerics differ slightly from the aiter path (bf16 activations
     instead of MXFP4 a4w4); GSM8K matches within run-to-run noise.
 
-    Model coverage: the kernel is compiled for Qwen3.5-397B-A17B only, MXFP4 at TP4 and FP8 block-scale at TP4/TP8
-    (hidden 4096, top-10 plus the optional fused shared expert). There is no model-name check;
+    Model coverage: hidden 4096. MXFP4 covers per-rank intermediate 256 with 10 or 11 topk slots
+    (Qwen3.5-397B-A17B at TP4) and intermediate 512 with 8 or 9 slots (GLM-5.3-Flash at TP4), top-k plus the
+    optional fused shared expert. FP8 block-scale covers Qwen3.5-397B-A17B at TP4/TP8 (intermediate 256 / 128,
+    10 or 11 slots). There is no model-name check;
     smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
     if not envs.SGLANG_ROCM_SMALLM_MOE.get():
@@ -166,7 +172,7 @@ def _get_kernels(inter: int, pre: str):
                 "p1": HipKernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
                 "p2": {
                     sl: HipKernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
-                    for sl in (10, 11)
+                    for sl in DISPATCH_SLOTS[inter]
                 },
             }
         except RuntimeError as e:
@@ -176,6 +182,10 @@ def _get_kernels(inter: int, pre: str):
 
 
 def _workspace(device, slots: int, inter: int):
+    # One buffer set per shape, shared by every call and captured graph: calls must be
+    # stream-ordered. MoE runs on the forward stream (the DeepSeek/GLM dual-stream path
+    # moves only the dense shared expert to alt_stream), so p1 of one call never
+    # overlaps p2 of another.
     key = (device, slots, inter)
     ws = _ws.get(key)
     if ws is None:
@@ -246,7 +256,10 @@ def smallm_moe_supported(
         return False
     # 704 = MAX_TOK (64) * 11 slots: the kernels stage the whole topk_ids table in a
     # fixed-size LDS array (MAX_NSLOT in smallm_moe.hip); larger tables would overrun it.
-    if topk_ids.shape[1] not in (10, 11) or tok * topk_ids.shape[1] > MAX_TOK * 11:
+    if (
+        topk_ids.shape[1] not in DISPATCH_SLOTS[inter]
+        or tok * topk_ids.shape[1] > MAX_TOK * 11
+    ):
         return False
     if (
         expert_mask is not None
@@ -259,8 +272,18 @@ def smallm_moe_supported(
     return True
 
 
-def smallm_moe_fwd(hidden_states, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale):
+def smallm_moe_fwd(
+    hidden_states,
+    w13,
+    w2,
+    topk_weights,
+    topk_ids,
+    w13_scale,
+    w2_scale,
+    swiglu_limit: float = 0.0,
+):
     """out[tok, 4096] (bf16) = sum_j w_tj * down_e(silu(gate_e(x_t)) * up_e(x_t)); e = topk_ids[t, j].
+    swiglu_limit > 0 clamps as aiter does: gate = min(gate, L), up = clamp(up, -L, L).
     w13/w2: fp4x2 [E, 2*inter, 2048] / [E, 4096, inter/2] in aiter shuffle_weight((16,16)) layout;
     w13_scale/w2_scale: e8m0 in e8m0_shuffle layout. Returns None if the workspace cannot be allocated (capture).
     FP8 block-scale: e4m3fn [E, 2*inter, 4096] / [E, 4096, inter], fp32 [E, 2*inter/128, 32] / [E, 32, inter/128]."""
@@ -300,7 +323,7 @@ def smallm_moe_fwd(hidden_states, w13, w2, topk_weights, topk_ids, w13_scale, w2
         tok,
         slots,
         E,
-        0,
+        float(swiglu_limit or 0.0),
     )
     stream = torch.cuda.current_stream().cuda_stream
     try:
