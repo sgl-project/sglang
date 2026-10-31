@@ -337,6 +337,32 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
 
+    # The six blocks above the diagonal are zero. Storing them here lets the
+    # caller allocate A without zero-filling it first.
+    b_zero = tl.zeros([BC, BC], dtype=A.dtype.element_ty)
+    p_A01 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc0, BC), (BC, BC), (1, 0))
+    p_A02 = tl.make_block_ptr(
+        A, (T, BT), (H * BT, 1), (i_tc0, 2 * BC), (BC, BC), (1, 0)
+    )
+    p_A03 = tl.make_block_ptr(
+        A, (T, BT), (H * BT, 1), (i_tc0, 3 * BC), (BC, BC), (1, 0)
+    )
+    p_A12 = tl.make_block_ptr(
+        A, (T, BT), (H * BT, 1), (i_tc1, 2 * BC), (BC, BC), (1, 0)
+    )
+    p_A13 = tl.make_block_ptr(
+        A, (T, BT), (H * BT, 1), (i_tc1, 3 * BC), (BC, BC), (1, 0)
+    )
+    p_A23 = tl.make_block_ptr(
+        A, (T, BT), (H * BT, 1), (i_tc2, 3 * BC), (BC, BC), (1, 0)
+    )
+    tl.store(p_A01, b_zero, boundary_check=(0, 1))
+    tl.store(p_A02, b_zero, boundary_check=(0, 1))
+    tl.store(p_A03, b_zero, boundary_check=(0, 1))
+    tl.store(p_A12, b_zero, boundary_check=(0, 1))
+    tl.store(p_A13, b_zero, boundary_check=(0, 1))
+    tl.store(p_A23, b_zero, boundary_check=(0, 1))
+
 
 def chunk_gated_delta_rule_fwd_intra(
     k: torch.Tensor,
@@ -388,8 +414,9 @@ def chunk_gated_delta_rule_fwd_intra(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    # Step 1: fused kkt + solve_tril
-    A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+    # Step 1: fused kkt + solve_tril. The kernel writes every element of each
+    # chunk's rows (the blocks above the diagonal as zeros), so A needs no fill.
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k,
         g=g,

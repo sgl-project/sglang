@@ -1,10 +1,13 @@
 import itertools
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -542,6 +545,74 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                     self.assertTrue(torch.isnan(output.float()).all())
         # Nothing is written past the rows of the output.
         self.assertTrue(torch.isnan(padded[:, T:].float()).all())
+
+    # ------------------------------------------------------------------
+    # The fused kkt + solve kernel writes all of A (no zero fill first)
+    # ------------------------------------------------------------------
+
+    def test_intra_writes_every_element_of_a(self):
+        """A is allocated without a fill, so the kernel must write every element
+        of each chunk's rows, including the zero blocks above the diagonal.
+
+        Runs the intra-chunk forward with fresh memory holding 0 (what a zero
+        fill gave), NaN and 7, and expects the same bits from all three.
+        """
+        device = get_device()
+        if device == "xpu":
+            self.skipTest("XPU runs its own chunk_fwd kernels")
+        dtype = torch.bfloat16
+        H, Hg, K, V, BT = 6, 2, 128, 128, 64
+        empty = torch.empty
+
+        for label, lens in (("one sequence", [300]), ("varlen", [64, 1, 130, 77])):
+            with self.subTest(label):
+                torch.manual_seed(0)
+                T = sum(lens)
+                cu_seqlens = None
+                if len(lens) > 1:
+                    cu_seqlens = torch.tensor(
+                        [0, *itertools.accumulate(lens)],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                k = torch.nn.functional.normalize(
+                    torch.randn(1, T, Hg, K, device=device), dim=-1
+                ).to(dtype)
+                v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+                g = chunk_local_cumsum(
+                    torch.nn.functional.logsigmoid(torch.randn(1, T, H, device=device)),
+                    chunk_size=BT,
+                    cu_seqlens=cu_seqlens,
+                )
+                beta = torch.sigmoid(torch.randn(1, T, H, device=device)).to(dtype)
+
+                runs = []
+                for fill in (0.0, float("nan"), 7.0):
+
+                    def stale_empty(*args, fill=fill, **kwargs):
+                        out = empty(*args, **kwargs)
+                        return out.fill_(fill) if out.is_floating_point() else out
+
+                    with mock.patch.object(torch, "empty", stale_empty):
+                        runs.append(
+                            chunk_gated_delta_rule_fwd_intra(
+                                k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens
+                            )
+                        )
+
+                w0, u0, A0 = runs[0]
+                upper = torch.ones(BT, BT, dtype=torch.bool, device=device).triu(1)
+                for fill, (w, u, A) in zip(("nan", "7"), runs[1:]):
+                    self.assertTrue(torch.equal(A, A0), f"A differs with {fill}")
+                    self.assertTrue(torch.equal(w, w0), f"w differs with {fill}")
+                    self.assertTrue(torch.equal(u, u0), f"u differs with {fill}")
+                # Within each chunk, entries above the diagonal stay zero.
+                starts = [0, *itertools.accumulate(lens)][:-1]
+                for start, n in zip(starts, lens):
+                    for c in range(0, n, BT):
+                        rows = min(BT, n - c)
+                        block = A0[0, start + c : start + c + rows].transpose(0, 1)
+                        self.assertFalse(block[:, upper[:rows]].any())
 
 
 if __name__ == "__main__":
