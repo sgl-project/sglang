@@ -555,9 +555,7 @@ def post(
         and cfg.pre_from_prev
         and cfg.mult == 4
         and cfg.hidden == 5120
-        # This 384 is the kernel's own tile limit, unrelated to the collective's
-        # push slots; it covers every narrow batch, not one particular regime.
-        and x.shape[0] <= 384
+        and x.shape[0] <= 1024
     ):
         return mhc_post_split_h(x, residual, post_mix, comb)
 
