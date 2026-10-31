@@ -513,7 +513,8 @@ def _apply_wo_a_bf16_matmul(
     emit_fp8: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
-    # on the exact validated TP4 shapes and write token-major output directly.
+    # on the exact validated shapes, G=2 (attention TP4) and, on CUDA, G=4 (TP2)
+    # and G=8 (TP1), and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
@@ -526,6 +527,9 @@ def _apply_wo_a_bf16_matmul(
         )
         and _hip.wo_a_split_k_allowed()
     )
+    # 4 and 8 groups save the einsum's output copy at every prefill row count;
+    # 2 groups keep their measured range
+    cuda_prefill_min_rows = 4096 if o.shape[1] == 2 else 1
     if (
         (
             fast_path
@@ -543,7 +547,7 @@ def _apply_wo_a_bf16_matmul(
                 )
                 or (
                     is_prefill
-                    and 4096 <= o.shape[0] <= 65536
+                    and cuda_prefill_min_rows <= o.shape[0] <= 65536
                     and get_platform().is_blackwell
                 )
             )
@@ -551,17 +555,21 @@ def _apply_wo_a_bf16_matmul(
         or hip_decode_verify
         or (hip_fast_path and is_prefill and 4096 <= o.shape[0] <= 65536)
     ) and (
-        o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+        # 4 and 8 groups take only the strided bmm; HIP routes them to its GEMMs below
+        (
+            o.shape[1:] == (2, 4096)
+            or (_is_cuda and o.shape[1:] in ((4, 4096), (8, 4096)))
+        )
+        and wo_a.shape == (o.shape[1], 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
         and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(0) >= o.shape[1] * 4096
         and wo_a.is_contiguous()
     ):
-        if is_decode and o.shape[0] == 1:
+        if o.shape[1] == 2 and is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= 8:
+        if o.shape[1] == 2 and 2 <= o.shape[0] <= 8:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
