@@ -556,6 +556,5 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "enable_prefill_weight_versions",
-    "hicache_mamba_size",
 )
 # fmt: on
