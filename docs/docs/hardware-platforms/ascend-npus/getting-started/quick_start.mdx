@@ -14,7 +14,7 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ### Supported Devices
 
-- Ascend A3 Series Products
+- A3 Series Products
 
 To identify your device, run `npu-smi info -l`: A3 Series reports `Chip Count: 2` per NPU.
 For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
@@ -47,7 +47,7 @@ If you have already downloaded model weights to a local path (e.g., `/path/to/mo
 adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```shell Command
 export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
