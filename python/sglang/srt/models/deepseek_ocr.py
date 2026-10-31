@@ -44,7 +44,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -832,7 +832,7 @@ def _build_sam(
     )
     image_encoder.eval()
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         image_encoder.load_state_dict(
             {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
             strict=True,
@@ -989,7 +989,7 @@ class NoTPAttention(torch.nn.Module):
         return output
 
 
-@torch.jit.script
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 
@@ -1416,7 +1416,7 @@ def build_qwen2_decoder_as_encoder(
         max_query=max_query,
     )
     if checkpoint is not None:
-        state_dict = torch.load(checkpoint)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         decoder_as_encoder.load_state_dict(state_dict, strict=True)
     return decoder_as_encoder
 

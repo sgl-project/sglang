@@ -20,6 +20,7 @@ pub(super) fn model_info(info: ModelInfo) -> Result<api::GetModelInfoResponse, S
         reasoning_parser,
         tool_call_parser,
         disaggregation_mode: _,
+        launch_fields: _,
     } = info;
     let preferred_sampling_params = preferred_sampling_params
         .map(|params| serde_json::to_string(&params.0))
