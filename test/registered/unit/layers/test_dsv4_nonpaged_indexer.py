@@ -1,5 +1,6 @@
 import sys
 import unittest
+from contextlib import contextmanager
 from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsv4 import v41_indexer
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
@@ -19,6 +21,8 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     iter_row_chunks,
     plan_indexer_row_chunks,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import DenseBlocksBackend
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
     mqa_logits_budget_bytes,
@@ -40,6 +44,132 @@ _MQA_UTILS = "sglang.srt.layers.attention.mqa_logits_utils"
 # issue #35201: 372K raw tokens -> 92992 c4 columns, padded to 93184 by DeepGEMM.
 _ISSUE_C4_COLS = 92992
 _ISSUE_ALIGNED_COLS = 93184
+
+
+class TestDSV41IndexerSelection(CustomTestCase):
+    @contextmanager
+    def hardware(self, sm, sparse_available, dense_available=True, cp_size=1):
+        cached = (
+            v41_indexer.is_sm100_or_newer,
+            v41_indexer.has_dense_fp4_indexer,
+            v41_indexer._use_deep_gemm_prefill,
+        )
+        for function in cached:
+            function.cache_clear()
+        deep_gemm = SimpleNamespace(
+            get_num_sms=lambda: 1,
+            get_paged_mqa_logits_metadata=lambda *args: torch.zeros(
+                (1, 2), dtype=torch.int32
+            ),
+        )
+        if dense_available:
+            deep_gemm.fp8_fp4_mqa_logits = object()
+        try:
+            with (
+                patch.object(v41_indexer, "is_cuda", return_value=True),
+                patch.object(
+                    v41_indexer, "get_device_sm", return_value=sm, create=True
+                ),
+                patch("torch.cuda.get_device_capability", return_value=divmod(sm, 10)),
+                patch("torch.cuda.is_available", return_value=True),
+                patch("torch.version.cuda", "13.0"),
+                patch("torch.cuda.Stream", return_value=object()),
+                patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                patch(
+                    "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS",
+                    sparse_available,
+                ),
+                patch(
+                    "sglang.srt.runtime_context.get_parallel",
+                    return_value=SimpleNamespace(attn_cp_size=cp_size),
+                ),
+            ):
+                yield
+        finally:
+            for function in cached:
+                function.cache_clear()
+
+    def candidates(self, topk_blocks=2048):
+        return v41_indexer.make_candidate_indexer(
+            token_to_kv_pool=SimpleNamespace(),
+            req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+            page_size=256,
+            candidate_topk_blocks=topk_blocks,
+            candidate_block_size=8,
+        )
+
+    def test_sm12x_candidate_fallback_preserves_dense_prefill(self):
+        """Unavailable sparse kernels must not prevent SM12x model startup."""
+        for sm, cp_size in product((120, 121), (1, 2)):
+            with (
+                self.subTest(sm=sm, cp_size=cp_size),
+                self.hardware(sm, False, cp_size=cp_size),
+            ):
+                prefill, decode = self.candidates()
+                self.assertIsInstance(prefill, DenseBlocksBackend)
+                self.assertIs(prefill, decode)
+                self.assertTrue(prefill.use_deep_gemm_prefill)
+                self.assertEqual((prefill.topk_blocks, prefill.block_size), (2048, 8))
+
+    def test_missing_sparse_kernel_still_fails_on_sm100(self):
+        for sm in (100, 103):
+            with self.subTest(sm=sm), self.hardware(sm, False):
+                with self.assertRaisesRegex(RuntimeError, "paged sparse MQA logits"):
+                    self.candidates()
+
+    def test_sm100_sparse_selection_preserves_cp_and_dense_capability(self):
+        for sm, cp_size, dense_available in product((100, 103), (1, 2), (False, True)):
+            with (
+                self.subTest(sm=sm, cp_size=cp_size, dense=dense_available),
+                self.hardware(sm, True, dense_available, cp_size),
+            ):
+                prefill, decode = self.candidates()
+                self.assertIsInstance(decode, SparseTableBackend)
+                self.assertEqual((decode.page_size, decode.topk_blocks), (256, 2048))
+                if cp_size == 1 and dense_available:
+                    self.assertIs(prefill, decode)
+                else:
+                    self.assertIsInstance(prefill, DenseBlocksBackend)
+
+    def test_hopper_and_disabled_candidates_do_not_require_sparse_kernels(self):
+        for sm, topk_blocks in ((90, 2048), (100, 0)):
+            with self.subTest(sm=sm, topk=topk_blocks), self.hardware(sm, False):
+                prefill, decode = self.candidates(topk_blocks)
+                self.assertIsInstance(prefill, DenseBlocksBackend)
+                self.assertIs(prefill, decode)
+
+    def test_full_topk_decode_respects_torch_schedule_selection(self):
+        """A missing native schedule must not be passed to the native decoder."""
+        for sm, torch_schedule in product((90, 100, 103, 120, 121), (False, True)):
+            with (
+                self.subTest(sm=sm, torch_schedule=torch_schedule),
+                self.hardware(sm, False),
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_schedule),
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
+                envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+                envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            ):
+                metadata = PagedIndexerMetadata(
+                    page_size=256,
+                    compressed_page_size=256,
+                    page_table=torch.zeros((1, 1), dtype=torch.int32),
+                    compressed_seq_lens=torch.tensor([8], dtype=torch.int32),
+                    use_topk_v2=False,
+                    compress_ratio=1,
+                )
+                indexer = v41_indexer.make_full_topk_indexer(
+                    token_to_kv_pool=SimpleNamespace(),
+                    req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+                )
+                if torch_schedule:
+                    self.assertIsNone(metadata.deep_gemm_metadata)
+                    self.assertFalse(indexer.use_deep_gemm_decode)
+                elif sm in (100, 103, 120, 121):
+                    self.assertIsInstance(metadata.deep_gemm_metadata, torch.Tensor)
+                    self.assertTrue(indexer.use_deep_gemm_decode)
+                else:
+                    self.assertFalse(indexer.use_deep_gemm_decode)
+                self.assertEqual(indexer.use_deep_gemm_prefill, sm != 90)
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):

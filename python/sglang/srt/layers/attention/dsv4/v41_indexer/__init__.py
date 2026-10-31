@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_device_sm, is_cuda
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -71,7 +72,9 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=(
+            is_sm100_or_newer() and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        ),
     )
 
 
@@ -104,6 +107,9 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        if get_device_sm() in (120, 121):
+            # SM12x has dense paged logits, but no sparse-table kernel.
+            return dense_blocks, dense_blocks
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
