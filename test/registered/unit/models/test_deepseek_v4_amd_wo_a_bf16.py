@@ -250,7 +250,7 @@ class TestWoABf16PrefillAndVerifyRoutes(unittest.TestCase):
 
     def test_decode_verify_and_mutable_graph(self):
 
-        for rows in (1, 2, 8, 64, 129):
+        for rows in (1, 2, 8, 64, 129, 292):
             with self.subTest(rows=rows):
                 x, w = self.operands(rows, strided=rows == 8)
                 kwargs = dict(is_decode=True, is_target_verify=rows > 1)
@@ -273,6 +273,37 @@ class TestWoABf16PrefillAndVerifyRoutes(unittest.TestCase):
                         self.assertLess(
                             (error / ref.float().square().mean()).sqrt().item(), 1e-3
                         )
+
+    def test_verify_mxfp8_handoff_and_mutable_graph(self):
+        """Verify rows above 8 for an MXFP8 wo_b: before HIP 7.15 they hand it the fp8 + ue8m0
+        of the einsum (292: hipBLASLt's strided token-major bmm is wrong there), from 7.15
+        on the strided bmm's bf16."""
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            Mxfp8Activation,
+            fp8_grid_quantize,
+        )
+
+        for rows in (64, 292):
+            with self.subTest(rows=rows):
+                x, w = self.operands(rows)
+                kwargs = dict(is_decode=False, is_target_verify=True, emit_fp8=True)
+                self.project(x, w, **kwargs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    y = self.project(x, w, **kwargs)
+                for _ in range(2):
+                    x.normal_()
+                    w.normal_(std=0.015625)
+                    graph.replay()
+                    ref = torch.einsum("tgd,grd->tgr", x, w)
+                    if not isinstance(y, Mxfp8Activation):
+                        torch.testing.assert_close(y, ref, atol=0, rtol=0)
+                        continue
+                    q, scale = fp8_grid_quantize(ref.flatten(1))
+                    self.assertTrue(
+                        torch.equal(y.q.view(torch.uint8), q.view(torch.uint8))
+                    )
+                    self.assertTrue(torch.equal(y.scale, scale))
 
     def test_dsv4_keeps_the_main_routes(self):
         """Without fast_path (DSv4) no gfx950 route runs; the aiter reroute is off by
