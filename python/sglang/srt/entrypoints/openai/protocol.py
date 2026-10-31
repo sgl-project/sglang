@@ -1531,7 +1531,13 @@ class ScoringResponse(BaseModel):
             List[List[Optional[List[float]]]],  # setwise: [num_items][Nᵢ x hidden]
         ]
     ] = None
-    token_logprobs: Optional[List[List[float]]] = None
+    # Raw label logprobs (return_token_logprobs), shaped like `scores`.
+    token_logprobs: Optional[
+        Union[
+            List[List[float]],  # pointwise: [num_rows x num_labels]
+            List[List[List[float]]],  # setwise: [num_items][Nᵢ x num_labels]
+        ]
+    ] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"
