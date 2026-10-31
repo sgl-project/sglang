@@ -372,6 +372,10 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
         }
+        # --hicache-async-ready-sync: dedicated gloo group (None = synchronous
+        # path) and the in-flight (work, counts, write_snap, load_snap).
+        self._async_ready_sync_group: Optional[torch.distributed.ProcessGroup] = None
+        self._async_ready_sync_pending: Optional[tuple] = None
 
         self.reset()
         logger.info(
@@ -451,6 +455,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._discard_restore_backups()
         self.tree_core.reset()
         self.session_refs.reset()
+        self._drop_deferred_ready_sync()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -619,6 +624,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+        self._async_ready_sync_group = self._create_async_ready_sync_group()
 
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
@@ -3800,6 +3807,119 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    # Acks finish in queue order, so step N's agreed prefix is still ready in step N + 1;
+    # consume up to the agreed ack object so an intervening drain is not counted twice.
+
+    def _create_async_ready_sync_group(
+        self,
+    ) -> Optional[torch.distributed.ProcessGroup]:
+        if not get_memory().hicache_async_ready_sync:
+            return None
+        cp = self.attn_cp_group
+        group = self.attn_tp_group if self.attn_tp_group is not None else self.tp_group
+        reason = None
+        if self.cache_controller is None:
+            reason = "no host cache controller"
+        elif self.pp_size > 1:
+            reason = "pipeline parallelism"
+        elif self.enable_storage or self.host_memory_mode != "cache":
+            reason = "a storage backend / buffer-only host memory"
+        elif cp is not None and torch.distributed.get_world_size(group=cp) > 1:
+            reason = "attention context parallelism"
+        elif group is None or torch.distributed.get_world_size(group=group) <= 1:
+            reason = "a single attention rank"
+        if reason is not None:
+            logger.warning(
+                "--hicache-async-ready-sync: not applied (%s); the ready-count "
+                "sync stays synchronous",
+                reason,
+            )
+            return None
+        ranks = torch.distributed.get_process_group_ranks(group)
+        async_group = torch.distributed.new_group(
+            ranks, backend="gloo", use_local_synchronization=True
+        )
+        logger.info(
+            "--hicache-async-ready-sync: deferred ready-count sync on its own "
+            "gloo group over ranks %s",
+            ranks,
+        )
+        return async_group
+
+    def _async_ready_sync_active(self) -> bool:
+        if self._async_ready_sync_group is None:
+            return False
+        if self.enable_storage:
+            # Storage attached at runtime (same step on every rank): its queues
+            # drain only on the synchronous path, so settle and fall back for good.
+            self._consume_deferred_ready_sync()
+            self._async_ready_sync_group = None
+            logger.warning(
+                "--hicache-async-ready-sync: storage backend attached; the "
+                "ready-count sync is synchronous from now on"
+            )
+            return False
+        return True
+
+    def _drop_deferred_ready_sync(self) -> None:
+        if self._async_ready_sync_pending is not None:
+            self._async_ready_sync_pending[0].wait()
+        self._async_ready_sync_pending = None
+
+    @staticmethod
+    def _deferred_consume_count(queue, snapshot, agreed: int) -> int:
+        """How many acks to pop from the head of ``queue`` now: up to and
+        including the agreed last ready ack of step N (``snapshot[agreed - 1]``),
+        or 0 if a blocking drain consumed it in between."""
+        if agreed <= 0:
+            return 0
+        target = snapshot[agreed - 1]
+        for i, ack in enumerate(queue):
+            if ack is target:
+                return i + 1
+        return 0
+
+    def _consume_deferred_ready_sync(self) -> None:
+        if self._async_ready_sync_pending is None:
+            return
+        cc = self.cache_controller
+        work, counts, write_snap, load_snap = self._async_ready_sync_pending
+        self._async_ready_sync_pending = None
+        work.wait()
+        write_n, load_n, digest_min, neg_digest_max = map(int, counts.tolist())
+        assert digest_min == -neg_digest_max, (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
+        self.writing_check(
+            finish_count=self._deferred_consume_count(
+                cc.ack_write_queue, write_snap, write_n
+            )
+        )
+        self.loading_check(
+            finish_count=self._deferred_consume_count(
+                cc.ack_load_queue, load_snap, load_n
+            )
+        )
+
+    def _check_hicache_events_deferred(self) -> None:
+        cc = self.cache_controller
+        self._consume_deferred_ready_sync()
+        write_snap = cc.ack_write_queue[: self._count_ready_acks(cc.ack_write_queue)]
+        load_snap = cc.ack_load_queue[: self._count_ready_acks(cc.ack_load_queue)]
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        counts = torch.tensor(
+            [len(write_snap), len(load_snap), digest, -digest],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        work = torch.distributed.all_reduce(
+            counts,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self._async_ready_sync_group,
+            async_op=True,
+        )
+        self._async_ready_sync_pending = (work, counts, write_snap, load_snap)
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
@@ -3824,6 +3944,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
+
+        if self._async_ready_sync_active():
+            self._check_hicache_events_deferred()
+            if self.buffer_pipeline is not None:
+                self.buffer_pipeline.flush_pending_writes()
+            return
 
         (
             write_finish_count,
