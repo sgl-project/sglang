@@ -1,0 +1,219 @@
+{
+  "schema_version": 2,
+  "backend": "deepep",
+  "tp_size": 2,
+  "ep_size": 2,
+  "phase": "decode",
+  "real_weights": true,
+  "repeat_id": 1,
+  "input_seed": 20260922,
+  "warmup": 2,
+  "iters": 5,
+  "num_experts": 128,
+  "topk": 8,
+  "hidden": 2048,
+  "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+  "metadata": {
+    "python": "3.12.13",
+    "packages": {
+      "torch": "2.10.0+cpu",
+      "torch-npu": "2.10.0.post4",
+      "deep-ep": "1.0.0+0234a271.cann.9.1.0.b243",
+      "sglang": null,
+      "sgl-kernel-npu": "2026.9.0",
+      "transformers": "5.19.0"
+    },
+    "sglang_commit": "000e768237025fb5227959364a5caae5ac5bf06d",
+    "sglang_diff_sha256": null,
+    "scripts_sha256": {
+      "bench_moe_tp_ep.py": "81f3076ce24a3f366c8d4f068bf6cc334e471f9bf5e816e34065011d4aa02478",
+      "bench_serving.py": "0505db70370d526cb4bf0258bcdead793139bb99b4ca0b11eb6e745167a5f982",
+      "check_equivalence.py": "a5f614deda8f53bf7c0277ad20557b098b0d4d18e99d28c689b30197c3bec7e3",
+      "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+      "launch_serving.py": "3ada15da977e2c91023c5974d7042595df98bbd2540b07d92372c3d2ab01d5c8",
+      "observe_tokens.py": "06b933993f38b9118b4d9cda91577b951bb111cc07067a64f189b528c377412e",
+      "summarize.py": "891b38a7efe4be0591af8ca5ae4a6c06f9f8d3d96232af78ddf2fba36a5916aa",
+      "summarize_profile.py": "dd9d5b97c2be69979e6f6b2054d0c0fc4061199bc2a1af212f99a99569fe0a7c",
+      "summarize_serving.py": "3b2c2e6e822296571c75a1959185ddacddab84df35f77ccfe37c0cc83e00dbbe",
+      "test_contracts.py": "fbe8c1ed0071174dffa1d0fa35f73a3adc1182f609eca486704be1cba9118b3c",
+      "test_workload.py": "3da3885ff4eea7e061adcbb3444ec5bdbd54d1ed495d578e2d499bfdd71b8d76",
+      "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+    },
+    "environment": {
+      "ASCEND_CUSTOM_OPP_PATH": "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer:/workspace/venv/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/workspace/venv/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/workspace/venv/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer:/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize",
+      "HCCL_SOCKET_IFNAME": "lo",
+      "HCCL_NPU_SOCKET_PORT_RANGE": "25100-25131",
+      "HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HYBRID_DEPLOYMENT": "1",
+      "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+      "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+      "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512"
+    },
+    "execution_mode": "torch.inference_mode; eager",
+    "image_digest": "sha256:2718547835f84b8074c1ad72f9c0a1f6b0ae52133929f5b8879f3ad1b9dc470c"
+  },
+  "results": [
+    {
+      "global_tokens": 1,
+      "tokens_per_rank": [
+        1,
+        0
+      ],
+      "input_sha256": "d8ab4623a22f93d0bc9aaca3a48f5c762fa570afc87ae790748a7d6004f488e0",
+      "median_ms": 1.0861200094223022,
+      "p95_ms": 1.5499000549316406,
+      "wall_median_ms": 1.1924989223480225,
+      "global_tokens_per_s": 920.7085693337804,
+      "samples_max_rank_ms": [
+        [
+          1.5499000549316406,
+          1.7788913249969482
+        ],
+        [
+          1.1308399438858032,
+          1.2382194995880127
+        ],
+        [
+          1.0861200094223022,
+          1.1924989223480225
+        ],
+        [
+          1.0369199514389038,
+          1.1539291143417358
+        ],
+        [
+          1.0597399473190308,
+          1.1648200750350952
+        ]
+      ],
+      "samples_per_rank_ms": [
+        [
+          [
+            1.5499000549316406,
+            1.7788913249969482
+          ],
+          [
+            1.1308399438858032,
+            1.2382194995880127
+          ],
+          [
+            1.0861200094223022,
+            1.1924989223480225
+          ],
+          [
+            1.0369199514389038,
+            1.1539291143417358
+          ],
+          [
+            1.0597399473190308,
+            1.1648200750350952
+          ]
+        ],
+        [
+          [
+            1.264680027961731,
+            1.5540812015533447
+          ],
+          [
+            0.8907600045204163,
+            1.0357108116149902
+          ],
+          [
+            0.87117999792099,
+            1.0039899349212646
+          ],
+          [
+            0.8310800194740295,
+            0.9838491678237915
+          ],
+          [
+            0.8251799941062927,
+            0.9681004881858826
+          ]
+        ]
+      ]
+    },
+    {
+      "global_tokens": 777,
+      "tokens_per_rank": [
+        389,
+        388
+      ],
+      "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+      "median_ms": 1.313099980354309,
+      "p95_ms": 2.7393999099731445,
+      "wall_median_ms": 1.4319102764129639,
+      "global_tokens_per_s": 591729.503941006,
+      "samples_max_rank_ms": [
+        [
+          2.7393999099731445,
+          2.8528497219085693
+        ],
+        [
+          1.592579960823059,
+          1.6960296630859375
+        ],
+        [
+          1.313099980354309,
+          1.4169998168945312
+        ],
+        [
+          1.3114800453186035,
+          1.4319102764129639
+        ],
+        [
+          1.2954800128936768,
+          1.4007501602172852
+        ]
+      ],
+      "samples_per_rank_ms": [
+        [
+          [
+            2.41156005859375,
+            2.729520320892334
+          ],
+          [
+            1.5085999965667725,
+            1.6640498638153076
+          ],
+          [
+            1.3000400066375732,
+            1.4046896696090698
+          ],
+          [
+            1.3032000064849854,
+            1.4303810596466064
+          ],
+          [
+            1.2822599411010742,
+            1.3938807249069214
+          ]
+        ],
+        [
+          [
+            2.7393999099731445,
+            2.8528497219085693
+          ],
+          [
+            1.592579960823059,
+            1.6960296630859375
+          ],
+          [
+            1.313099980354309,
+            1.4169998168945312
+          ],
+          [
+            1.3114800453186035,
+            1.4319102764129639
+          ],
+          [
+            1.2954800128936768,
+            1.4007501602172852
+          ]
+        ]
+      ]
+    }
+  ]
+}

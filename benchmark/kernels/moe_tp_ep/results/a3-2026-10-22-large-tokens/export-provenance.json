@@ -1,0 +1,70 @@
+{
+  "transformations": "Source, model and result paths use portable placeholders; output directory names are descriptive. Numeric measurements, software and device identities are unchanged.",
+  "files": [
+    {
+      "path": "round-count/deepep_decode_normal.json",
+      "original_sha256": "b94621d048d33ec29819610ba9c9693718c270aa29418a4995d40ce7749f9c8e",
+      "export_sha256": "b94621d048d33ec29819610ba9c9693718c270aa29418a4995d40ce7749f9c8e"
+    },
+    {
+      "path": "round-count/execution.json",
+      "original_sha256": "9653bbffb59d7982fa3679d0c90cf846770ddf49e14c0d4c0f9a85fc8c46ee97",
+      "export_sha256": "c0afabaf9d926c98200be9c251fe79ece0773cf08977e39ca1625501c8299dac"
+    },
+    {
+      "path": "round-count/prefill_n32768_seed20260922_skew0_round2_auto_comparison.json",
+      "original_sha256": "5b56b1673632a8edcae8c937da035b796dadf93eb2cb67ecc61f134cdf799edd",
+      "export_sha256": "5b56b1673632a8edcae8c937da035b796dadf93eb2cb67ecc61f134cdf799edd"
+    },
+    {
+      "path": "round-count/prefill_n32768_seed20260922_skew0_round8_auto_comparison.json",
+      "original_sha256": "5b56b1673632a8edcae8c937da035b796dadf93eb2cb67ecc61f134cdf799edd",
+      "export_sha256": "5b56b1673632a8edcae8c937da035b796dadf93eb2cb67ecc61f134cdf799edd"
+    },
+    {
+      "path": "round-count/rounds_n32768/deepep_round2_r1.json",
+      "original_sha256": "de74a0ae18a1cc8451378a8936fdf459cdb648b7914df33eb1d17851bf4ac152",
+      "export_sha256": "de74a0ae18a1cc8451378a8936fdf459cdb648b7914df33eb1d17851bf4ac152"
+    },
+    {
+      "path": "round-count/rounds_n32768/deepep_round2_r2.json",
+      "original_sha256": "d1d71923b378a3228406e6d2c508af752d4651e07328d56751eb31783c97db55",
+      "export_sha256": "d1d71923b378a3228406e6d2c508af752d4651e07328d56751eb31783c97db55"
+    },
+    {
+      "path": "round-count/rounds_n32768/deepep_round2_r3.json",
+      "original_sha256": "6e04a079c26cb14b8180310af47f4543ef66326f9b6b1fbbbc7a13c3a9508c74",
+      "export_sha256": "6e04a079c26cb14b8180310af47f4543ef66326f9b6b1fbbbc7a13c3a9508c74"
+    },
+    {
+      "path": "round-count/rounds_n32768/deepep_round8_r1.json",
+      "original_sha256": "77af148e066b7aca7472258a2ded406d2471a3aeeea670a960c2f36c51f4e5f2",
+      "export_sha256": "77af148e066b7aca7472258a2ded406d2471a3aeeea670a960c2f36c51f4e5f2"
+    },
+    {
+      "path": "round-count/rounds_n32768/deepep_round8_r2.json",
+      "original_sha256": "915c0134e21ef9839083b579112c136272e177539654b816ccf4a3d3aec0bb77",
+      "export_sha256": "915c0134e21ef9839083b579112c136272e177539654b816ccf4a3d3aec0bb77"
+    },
+    {
+      "path": "round-count/rounds_n32768/deepep_round8_r3.json",
+      "original_sha256": "1192af8b07a38dc4b1138ffde3327a6eaf38d130ed84bc2edaf75054cea9b4af",
+      "export_sha256": "1192af8b07a38dc4b1138ffde3327a6eaf38d130ed84bc2edaf75054cea9b4af"
+    },
+    {
+      "path": "model-provenance.json",
+      "original_sha256": "cd5723322dca6556543a5e5c40e7ad01020ac215be00d18098aaade51842d58c",
+      "export_sha256": "cd5723322dca6556543a5e5c40e7ad01020ac215be00d18098aaade51842d58c"
+    },
+    {
+      "path": "occupancy-checks.jsonl",
+      "original_sha256": "872955b6ba0350914753a1286e741e5a0b5807398b54eb71b0aa3fa25d022f5f",
+      "export_sha256": "872955b6ba0350914753a1286e741e5a0b5807398b54eb71b0aa3fa25d022f5f"
+    },
+    {
+      "path": "validation-summary.json",
+      "original_sha256": "ff5693ef59af5aee64b1504e374e70bd5c9461f7030da907d9564ce8438f7907",
+      "export_sha256": "543c71a2dce325e2f95af02a67c8f6575ee6fe63eda715d0003ca88abdd692f7"
+    }
+  ]
+}
