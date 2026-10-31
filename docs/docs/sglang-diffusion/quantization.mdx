@@ -11,6 +11,15 @@ independent checkpoint path, but that checkpoint is quantized only when its
 selected loader supports the serialized format. Transformer, encoder, and VAE
 precision are resolved independently.
 
+Quantization can target different parts of inference:
+
+| Target | Workflow | Where to start |
+| --- | --- | --- |
+| Linear-layer weights and activations | Quantize original weights during loading. | [Online quantization](/docs/sglang-diffusion/quantization#online-quantization): FP8, MXFP8, MXFP4, ConvRot INT8 |
+| Linear-layer weights and activations | Load a pre-quantized checkpoint. | [Quantized component repositories](/docs/sglang-diffusion/quantization#quantized-component-repositories); [ModelSlim](/docs/sglang-diffusion/quantization#modelslim) for Ascend |
+| Attention computation | Enable a supported quantized attention path. | [Attention quantization](/docs/sglang-diffusion/quantization#attention-quantization) |
+| Runtime KV cache | Compress completed causal cache chunks. | [Causal KV-cache quantization](/docs/sglang-diffusion/quantization#causal-kv-cache-quantization) |
+
 ## Quick Reference
 
 Choose the option from the source you have, not from the precision name:
@@ -258,7 +267,7 @@ Quant-VideoGen KV-cache quantization targets long-running autoregressive video
 sessions, where the causal self-attention cache can become comparable to the
 model weights. It does not change or quantize the checkpoint weights.
 
-See [Realtime and Causal Video Models](./realtime_models) for the session
+See [Realtime and Causal Video Models](/docs/sglang-diffusion/realtime_models) for the session
 lifecycle, supported pipelines, and the distinction between realtime and
 request-based causal generation.
 
@@ -350,9 +359,10 @@ support LongLive2 pinned sinks, global sinks, or dynamically growing caches.
 
 ## Online Quantization
 
-This section describes the online methods currently implemented by the
-transformer loader. They are useful when a pre-quantized transformer checkpoint
-is not available. Encoders, VAEs, and auxiliary components are independent:
+Online quantization converts **linear layers** when you
+load original FP16/BF16 weights, currently implemented by the
+transformer loader. Choose the method and device below when a
+pre-quantized checkpoint is not available. Encoders, VAEs, and auxiliary components are independent:
 their repositories may still carry serialized quantized weights, which are
 restored when the selected component loader supports that format.
 
@@ -376,18 +386,75 @@ timestep, and output projections. See the
 [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#9-feature-contracts-and-advanced-recipes)
 for its distributed serving recipe.
 
-### MXFP4 Online Quantization
+### MXFP8 Online Quantization
 
-MXFP4 provides aggressive 4-bit compression with online quantization. **Note: Requires ROCm and MI350+ (gfx95x) GPU.**
+For **online MXFP8**, start with the original FP16/BF16 model and add
+`--quantization mxfp8`. Self-describing serialized MXFP8 checkpoints instead
+select their format from checkpoint metadata.
+
+| Platform | Requirement |
+| --- | --- |
+| NVIDIA / ROCm | An MXFP8 kernel provided by the selected SRT backend |
+| Ascend | 950PR/DT Series or newer, with `npu_dynamic_mx_quant` and `npu_quant_matmul`; unavailable on A2/A3 |
 
 ```bash
 sglang generate \
-  --model-path Tongyi-MAI/Z-Image-Turbo \
-  --component-quantizations.transformer mxfp4 \
-  --prompt "a beautiful sunset" \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a fox walking through neon rain" \
   --save-output
 ```
-**Note:** Requires `aiter` package with MXFP4 kernel support
+
+### MXFP4 Online Quantization
+
+The online MXFP4 implementation and CLI value depend on your hardware.
+Choose the tab for your platform.
+
+<Tabs>
+  <Tab title="ROCm" id="mxfp4-online-rocm">
+    Use `mxfp4` on **ROCm with an MI350+ (gfx95x) GPU**. Install `aiter`
+    with MXFP4 kernel support before running this example.
+
+    ```bash
+    sglang generate \
+      --model-path Tongyi-MAI/Z-Image-Turbo \
+      --component-quantizations.transformer mxfp4 \
+      --prompt "a beautiful sunset" \
+      --save-output
+    ```
+  </Tab>
+  <Tab title="Ascend" id="mxfp4-online-ascend">
+    For online MXFP4 quantization on Ascend NPU, load the original FP16/BF16 model and add
+    `--quantization mxfp4_npu`. The `mxfp4_npu` key is used for Ascend because `mxfp4`
+    is reserved for the ROCm/aiter backend.
+
+    <Info>
+      **Requires Ascend 950PR/DT Series or newer.** The operators
+      `npu_dynamic_dual_level_mx_quant` and `npu_dual_level_quant_matmul` are not
+      available on A2/A3 Series. Use `mxfp4_npu` on Ascend; the `mxfp4` CLI value
+      selects the ROCm/aiter backend.
+    </Info>
+
+    <Note>
+      Online MXFP4 weight quantization is **experimental**. Its numerical results
+      may differ from an offline, calibrated ModelSlim checkpoint.
+    </Note>
+
+    ```bash
+    sglang generate \
+      --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+      --quantization mxfp4_npu \
+      --prompt "a fox walking through neon rain" \
+      --save-output
+    ```
+
+    <Accordion title="How online MXFP4 works">
+      Weights are quantized at load time via `npu_dynamic_dual_level_mx_quant`, and activations
+      are quantized per-token during inference before `npu_dual_level_quant_matmul`. MXFP4 uses
+      dual-level block scales with an L1 block size of 32 and an L0 block size of 512.
+    </Accordion>
+  </Tab>
+</Tabs>
 
 ### ConvRot INT8
 
@@ -1175,149 +1242,237 @@ sglang generate \
 - Current runtime validation only allows Nunchaku on NVIDIA CUDA Ampere (SM8x)
   or SM12x GPUs. Hopper (SM90) is currently rejected.
 
-## [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
-MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
+## ModelSlim
 
-- **Installation**
+[MindStudio ModelSlim](https://gitcode.com/Ascend/msmodelslim) exports quantized
+checkpoints for Ascend NPUs. SGLang reads `quant_model_description.json` to select
+the quantization scheme for each layer.
+
+Use this section for **offline linear-layer quantization** on Ascend. To
+quantize original weights during loading, use
+[online quantization](/docs/sglang-diffusion/quantization#online-quantization).
+
+<Note>
+  First check [Eco-Tech on ModelScope](https://modelscope.cn/organization/Eco-Tech) for
+  a pre-quantized checkpoint matching your model and device. If it is already
+  in the format expected by the model's SGLang loader, go directly to
+  [Run inference](/docs/sglang-diffusion/quantization#run-inference).
+</Note>
+
+### Install
+
+Install ModelSlim to create quantized checkpoints:
+
+```bash
+git clone https://gitcode.com/Ascend/msmodelslim.git
+cd msmodelslim
+bash install.sh
+```
+
+### Usage Examples
+
+#### Prepare checkpoints
+
+Choose a ModelSlim recipe supported by your model and Ascend device. Download
+the original weights, install the model-specific dependencies, and quantize
+the checkpoint. Convert the export only if its format differs from what the
+model's SGLang loader expects.
+
+<Steps>
+  <Step title="Quantize the original weights">
+    For example, quantize **Wan2.2-T2V-A14B to W8A8** using its
+    [original weights](https://modelscope.cn/models/Wan-AI/Wan2.2-T2V-A14B).
+    Replace the paths with your local directories.
 
     ```bash
-    # Clone repo and install msmodelslim:
-    git clone https://gitcode.com/Ascend/msmodelslim.git
-    cd msmodelslim
-    bash install.sh
+    msmodelslim quant \
+      --model_path /path/to/wan2_2_float_weights \
+      --save_path /path/to/wan2_2_quantized_weights \
+      --device npu \
+      --model_type Wan2_2 \
+      --quant_type w8a8 \
+      --trust_remote_code True
     ```
 
-- **Multimodal_sd quantization**
+    For other models and precision formats, use the corresponding recipe in
+    the [ModelSlim multimodal quantization examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md).
+  </Step>
+  <Step title="Convert the export to Diffusers format">
+    **This step applies to Wan2.2 exports in the original Wan format.** Its
+    SGLang loader expects Diffusers format, which uses different component
+    directories and tensor names. Skip this step for a checkpoint already in
+    the required format.
 
-    Download the original floating-point weights of the large model. Taking Wan2.2-T2V-A14B as an example, you can go to [Wan2.2-T2V-A14B](https://modelscope.cn/models/Wan-AI/Wan2.2-T2V-A14B) to obtain the original model weights. Then install other dependencies (related to the model, refer to the modelscope model card).
-    > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
+    Download the matching **unquantized Diffusers base model**, such as
+    `Wan-AI/Wan2.2-T2V-A14B-Diffusers`. This is a separate input from the original
+    Wan weights used for quantization: it supplies the pipeline configuration
+    and components that are not replaced by the quantized transformer weights.
 
-  Run quantization using one-click quantization (recommended):
-
-  ```bash
-  msmodelslim quant \
-    --model_path /path/to/wan2_2_float_weights \
-    --save_path /path/to/wan2_2_quantized_weights \
-    --device npu \
-    --model_type Wan2_2 \
-    --quant_type w8a8 \
-    --trust_remote_code True
-  ```
-
-  For more detailed examples of quantization of models, as well as information about their support, see the [examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md) section in ModelSLim repo.
-
-  > Note: SGLang does not support quantized embeddings, please disable this option when quantizing using msmodelslim.
-
-- **Auto-Detection and different formats**
-
-    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of      `quant_model_description.json` config.
-
-    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format.
-    For conversion, use the one-step `wan_repack.py` script:
+    Run from the **SGLang repository root**, with a new output directory:
 
     ```bash
-    python wan_repack.py \
-      --model-type Wan2.2-TI2V-5B \
-      --original-model-path {path_to_original_diffusers_model} \
-      --quant-path {path_to_quantized_model} \
-      --output-path {path_to_converted_model}
+    python python/sglang/multimodal_gen/tools/wan_repack.py \
+      --model-type Wan2.2-T2V-A14B \
+      --original-model-path /path/to/wan2_2_diffusers_model \
+      --quant-path /path/to/wan2_2_quantized_weights \
+      --output-path /path/to/wan2_2_quantized_diffusers_model
     ```
 
-    Supported `--model-type` values: `Wan2.2-TI2V-5B` (single-transformer), `Wan2.2-T2V-A14B` and `Wan2.2-I2V-A14B` (Cascade dual-transformer).
-    The script automatically handles: copying the base model, converting quantized weights to Diffusers format, and restoring `config.json`.
+    The script copies the base pipeline and non-transformer components, renames
+    the quantized tensors and metadata entries, and copies each transformer's
+    `config.json`. For A14B models, it maps `high_noise_model` to `transformer`
+    and `low_noise_model` to `transformer_2`.
 
-- **Usage Example**
+    | Model type | Transformer layout |
+    | --- | --- |
+    | `Wan2.2-TI2V-5B` | Single transformer |
+    | `Wan2.2-T2V-A14B` | Dual transformer (cascade) |
+    | `Wan2.2-I2V-A14B` | Dual transformer (cascade) |
+  </Step>
+</Steps>
 
-    With auto-detected flow:
+#### Run inference
 
+The launch commands are the same for supported W8A8, W4A4, MXFP8, and MXFP4
+checkpoints. Use a scheme supported by your Ascend device; MXFP8 and MXFP4
+require 950PR/DT Series or newer. SGLang selects the format from the checkpoint's
+`quant_model_description.json`, so omit online `--quantization` overrides.
+
+<Tabs>
+  <Tab title="Launch a server">
+    ```bash
+    sglang serve \
+      --model-path /path/to/quantized_model \
+      --port 30000
+    ```
+
+    See the [serving API](/docs/sglang-diffusion/api/openai_api) for sending requests.
+  </Tab>
+  <Tab title="Generate once">
     ```bash
     sglang generate \
-      --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8 \
+      --model-path /path/to/quantized_model \
       --prompt "a beautiful sunset" \
       --save-output
     ```
+  </Tab>
+</Tabs>
 
-- **Available Quantization Methods**:
-    - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
-    - [x]  ```W8A8``` linear with offline quantization of activations
-    - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
-    - [x]  ```W8A8_MXFP8``` linear with offline quantization (msmodelslim pre-quantized weights)
-    - [x]  ```mxfp8``` linear with online quantization (`--quantization mxfp8`)
-    - [x]  ```W4A4_MXFP4``` / ```W4A4_MXFP4_DUALSCALE``` linear with offline quantization (msmodelslim pre-quantized weights)
-    - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
+For A5 recipes that also quantize attention, such as `w8a8f8` and `w4a4f8` in
+the [ModelSlim Wan examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md), see
+[MXFP Flash Attention](/docs/sglang-diffusion/quantization#mxfp-flash-attention)
+to enable the attention path. Loading quantized linear weights does not
+implicitly enable quantized attention.
 
-## MXFP8 Quantization
+### Notes
 
-Self-describing serialized MXFP8 transformers are inferred from their
-checkpoint metadata. For online MXFP8 quantization, load the original
-FP16/BF16 model and add `--quantization mxfp8`. NVIDIA and ROCm reuse SRT's
-dense MXFP8 implementation; Ascend uses `npu_dynamic_mx_quant` and
-`npu_quant_matmul` with a block size of 32.
+<Note>
+  For ModelSlim checkpoints, omit online `--quantization` overrides so SGLang can
+  use the checkpoint's per-layer metadata. Keep embeddings unquantized when
+  exporting for this diffusion loader.
+</Note>
 
-```bash
-sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --quantization mxfp8 \
-  --prompt "a fox walking through neon rain" \
-  --save-output
-```
+The scheme names below come from `quant_model_description.json`. They describe
+the offline checkpoint format; SGLang selects the implementation per layer.
 
-The selected SRT backend must provide an MXFP8 kernel on NVIDIA or ROCm. On
-Ascend, the hardware requirement remains 950PR/DT Series or newer;
-`npu_dynamic_mx_quant` is not available on A2/A3 Series.
+| Checkpoint scheme | Weights | Activations |
+| --- | --- | --- |
+| `W4A4_DYNAMIC` | Pre-quantized INT4 | Quantized dynamically |
+| `W8A8` | Pre-quantized INT8 | Quantized with calibrated scales |
+| `W8A8_DYNAMIC` | Pre-quantized INT8 | Quantized dynamically |
+| `W8A8_MXFP8` | Pre-quantized MXFP8 | Quantized dynamically |
+| `W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` | Pre-quantized MXFP4 | Quantized dynamically |
 
-## MXFP8 Offline Quantization (msmodelslim)
+See [quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization)
+for hardware support by scheme.
 
-Pre-quantized MXFP8 weights exported by msmodelslim are auto-detected via `quant_model_description.json`
-(`W8A8_MXFP8` scheme). Use `wan_repack.py` to convert the quantized weights to Diffusers format,
-then load the converted model with `--model-path`:
+<Accordion title="Checkpoint storage and scales">
+  The ModelSlim export stores FP4 weight data in an FP8 container. Block scales
+  are stored in `weight_scale`; dual-level exports also include
+  `weight_dual_scale`. For exports with smooth quantization, `mul_scale` is
+  loaded and applied before activation quantization to align activations with
+  the calibrated weights.
+</Accordion>
 
-```bash
-sglang generate \
-  --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-mxfp8 \
-  --prompt "a beautiful sunset" \
-  --save-output
-```
+## Attention quantization
 
-## MXFP4 Online Quantization
+Attention quantization controls precision inside the attention operation.
+Configure it separately from the linear-layer weight and activation formats
+above. The Ascend MXFP8 path below requires a compatible online MXFP8 or offline
+ModelSlim configuration and an explicit attention opt-in.
 
-For online MXFP4 quantization on Ascend NPU, load the original FP16/BF16 model and add
-`--quantization mxfp4_npu`. The `mxfp4_npu` key is used for Ascend because `mxfp4`
-is reserved for the ROCm/aiter backend.
+### MXFP Flash Attention
 
-Weights are quantized at load time via `npu_dynamic_dual_level_mx_quant`, and activations
-are quantized per-token during inference before `npu_dual_level_quant_matmul`. MXFP4 uses
-dual-level block scales with an L1 block size of 32 and an L0 block size of 512.
+MXFP8 Flash Attention is an **opt-in attention optimization** that can be used
+with online MXFP8 or offline ModelSlim quantization. Enable it with both
+`SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1` and `--attention-backend fa`.
 
-```bash
-sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --quantization mxfp4_npu \
-  --prompt "a fox walking through neon rain" \
-  --save-output
-```
+#### Requirements
 
-> **Hardware requirement:** Ascend 950PR/DT Series or newer. `npu_dynamic_dual_level_mx_quant`
-> and `npu_dual_level_quant_matmul` are not available on A2/A3 Series.
->
-> **Note:** Online MXFP4 weight quantization is experimental. The offline msmodelslim
-> flow uses pre-quantized weights and may produce different numerical results.
+| Component | Required version or capability |
+| --- | --- |
+| Hardware | Ascend 950 (A5) |
+| PyTorch | `2.10.0` |
+| torch_npu | `>= 2.10.0.post4` |
+| CANN | `>= 9.1.1` |
+| Operators | `npu_dynamic_mx_quant`, `npu_fused_infer_attention_score_v2` |
+| Dtypes | FP8 E4M3 (`float8_e4m3fn`) and E8M0 (`float8_e8m0fnu`) |
 
-## MXFP4 Offline Quantization (msmodelslim)
+| Pattern | Behavior |
+| --- | --- |
+| Non-causal self-attention | MXFP8 with MHA or GQA; the query head count must be divisible by the KV head count |
+| Causal or cross-attention | Uses the regular attention path |
+| Ring attention / softmax LSE | Unsupported by the MXFP8 path |
 
-Pre-quantized MXFP4 weights exported by msmodelslim are auto-detected via
-`quant_model_description.json` (`W4A4_MXFP4` / `W4A4_MXFP4_DUALSCALE` scheme).
-Use `wan_repack.py` to convert the quantized weights to Diffusers format, then load
-the converted model with `--model-path`:
+<Note>
+  Select `--attention-backend fa` on Ascend to use the `ascend_fa` implementation.
+  This is currently the only backend that supports this MXFP8 attention path.
+</Note>
 
-```bash
-sglang generate \
-  --model-path {path_to_converted_mxfp4_model} \
-  --prompt "a beautiful sunset" \
-  --save-output
-```
+#### Usage Examples
 
-The offline MXFP4 checkpoint stores weights in an FP8 container and includes dual-level
-scales (`weight_scale`, `weight_dual_scale`). If exported with smooth quantization,
-`mul_scale` is loaded and applied before activation quantization to keep activations
-aligned with the calibrated weights.
+<Tabs>
+  <Tab title="Online MXFP8">
+    Load the original FP16/BF16 model with `--quantization mxfp8`.
+
+    ```bash
+    SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1 sglang generate \
+      --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+      --quantization mxfp8 \
+      --attention-backend fa \
+      --num-gpus 1 \
+      --prompt "A curious raccoon" \
+      --save-output
+    ```
+  </Tab>
+  <Tab title="Offline ModelSlim">
+    Point to your prepared ModelSlim checkpoint, including an A5 `w8a8f8`
+    or `w4a4f8` export. Omit `--quantization mxfp8` so the loader preserves
+    the checkpoint's linear-layer quantization metadata.
+
+    ```bash
+    SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1 sglang generate \
+      --model-path /path/to/quantized_model \
+      --attention-backend fa \
+      --num-gpus 1 \
+      --prompt "A curious raccoon" \
+      --save-output
+    ```
+  </Tab>
+</Tabs>
+
+The same environment variable and `--attention-backend fa` option also
+apply to `sglang serve` with the same model and quantization arguments.
+
+<Accordion title="Tune head splitting">
+  `SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE` controls how many heads are processed
+  per MXFP8 Flash Attention call. The default is `4`; set it to `0` to disable
+  splitting. Head splitting applies to MHA; GQA uses the unsplit path.
+
+  ```bash
+  export SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE=4
+  ```
+
+  See the [attention environment variables](/docs/sglang-diffusion/environment_variables)
+  for details.
+</Accordion>
