@@ -60,7 +60,7 @@ test("server builder has a footer link to the CLI reference", () => {
 });
 
 test("migrated recipes retain unverified status, valid scopes and editable ports", () => {
-  assert.equal(migrated.length, 22);
+  assert.equal(migrated.length, 23);
   const shared = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
   const builtInIds = new Set([...shared.matchAll(/\bid: "([^"]+)"/g)].map((match) => match[1]));
   for (const config of migrated) {
