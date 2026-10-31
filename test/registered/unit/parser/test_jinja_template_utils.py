@@ -6,6 +6,8 @@ from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     jinja_template_may_reorder_tool_results,
     process_content_for_template_format,
+    template_reads_reasoning,
+    template_reads_thinking,
 )
 from sglang.srt.utils import VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -546,6 +548,56 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         """
         result = detect_jinja_template_content_format(template)
         self.assertEqual(result, "openai")
+
+    def test_template_reads_thinking_and_reasoning_ast(self):
+        for fn, field in (
+            (template_reads_thinking, "thinking"),
+            (template_reads_reasoning, "reasoning_content"),
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(fn(f"{{{{ message.{field} }}}}"))
+                self.assertTrue(fn(f"{{{{ message['{field}'] }}}}"))
+                self.assertTrue(fn(f"{{{{ message.get('{field}', '') }}}}"))
+                self.assertTrue(fn(f"{{% if '{field}' in message %}}yes{{% endif %}}"))
+                self.assertTrue(
+                    fn(f"{{% if '{field}' not in message %}}no{{% endif %}}")
+                )
+                self.assertTrue(
+                    fn(f"{{{{ messages | selectattr('{field}') | list }}}}")
+                )
+                self.assertTrue(
+                    fn(f"{{{{ messages | map(attribute='{field}') | list }}}}")
+                )
+                # Comments and string literals must not trigger false positives
+                self.assertFalse(
+                    fn(f"{{# {field} in a comment #}}{{{{ message.content }}}}")
+                )
+                self.assertFalse(fn(f"{{{{ 'message.{field}' }}}}"))
+                self.assertFalse(fn("{{{{ invalid jinja"))
+                self.assertFalse(fn(None))
+
+    def test_process_content_thinking_parts_joined_without_mutating_input(self):
+        for content_format in ("openai", "string"):
+            with self.subTest(content_format=content_format):
+                msg_dict = {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "step 1"},
+                        {"type": "thinking", "thinking": "step 2"},
+                        {"type": "text", "text": "final answer"},
+                    ],
+                }
+                result = process_content_for_template_format(
+                    msg_dict, content_format, [], [], [], []
+                )
+                self.assertEqual(result["reasoning_content"], "step 1\nstep 2")
+                self.assertNotIn("reasoning_content", msg_dict)
+                if content_format == "string":
+                    self.assertEqual(result["content"], "final answer")
+                else:
+                    self.assertEqual(
+                        result["content"], [{"type": "text", "text": "final answer"}]
+                    )
 
 
 if __name__ == "__main__":
