@@ -13,7 +13,14 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @pytest.mark.parametrize(
     "batch,tokens,heads,head_dim",
-    [(2, 1536, 32, 128), (2, 126, 32, 64), (1, 7, 4, 16), (3, 5, 8, 24)],
+    [
+        (1, 1536, 32, 128),
+        (1, 126, 32, 64),
+        (2, 1536, 32, 128),
+        (2, 126, 32, 64),
+        (1, 7, 4, 16),
+        (3, 5, 8, 24),
+    ],
 )
 @pytest.mark.parametrize("flat", [False, True])
 def test_head_gate_mul_matches_eager_bitwise(
@@ -42,6 +49,28 @@ def test_head_gate_mul_rejects_strided_or_mismatched_inputs() -> None:
     assert not can_use_head_gate_mul(out.transpose(1, 2), gate)
     assert not can_use_head_gate_mul(out, gate[:, :5])
     assert not can_use_head_gate_mul(out.float(), gate)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_head_gate_mul_preserves_reference_paths(dtype, strided, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    for _ in range(2):
+        x = torch.randn(2, 12, 4, 8, device=device, dtype=dtype)
+        gate = torch.rand(2, 12, 4, device=device, dtype=dtype)
+        if strided:
+            x, gate = x[:, ::2], gate[:, ::2]
+        expected = (x * (2.0 * gate.unsqueeze(-1))).flatten(2)
+        assert torch.equal(head_gate_mul(x, gate), expected)
+
+
+def test_head_gate_mul_preserves_broadcast_gates():
+    x = torch.randn(2, 12, 4, 8)
+    gate = torch.rand(1, 12, 4)
+    expected = (x * (2.0 * gate.unsqueeze(-1))).flatten(2)
+    assert torch.equal(head_gate_mul(x, gate), expected)
 
 
 if __name__ == "__main__":

@@ -30,12 +30,11 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
-    get_forward,
     get_model,
     get_parallel,
 )
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
@@ -577,26 +576,22 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertFalse(use(moe, hidden, decode))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
                 self.assertTrue(use(moe, hidden, decode))
-                self.assertTrue(
+                for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.EXTEND):
+                    self.assertTrue(
+                        use(moe, hidden, SimpleNamespace(forward_mode=mode))
+                    )
+                self.assertFalse(
                     use(
                         moe,
                         hidden,
-                        SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                        SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2),
                     )
                 )
                 self.assertFalse(use(moe, hidden.float(), decode))
-                self.assertFalse(
-                    use(moe, torch.zeros((4096, 256), dtype=torch.bfloat16), decode)
-                )
-                # Prefill graph capture runs with is_extend_in_batch cleared.
-                with get_forward().scoped(is_extend_in_batch=False):
-                    self.assertFalse(
-                        use(
-                            moe,
-                            hidden,
-                            SimpleNamespace(forward_mode=ForwardMode.EXTEND),
-                        )
-                    )
+                with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    16
+                ):
+                    self.assertFalse(use(moe, hidden, decode))
                 self.assertFalse(use(moe, hidden, None))
 
     def test_mega_gate_routes_vision_hash_and_padding(self):

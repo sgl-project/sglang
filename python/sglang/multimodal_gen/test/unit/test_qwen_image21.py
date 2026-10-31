@@ -34,6 +34,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
@@ -49,6 +52,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+    PrefixPad,
     QwenImage21Attention,
     QwenImage21TransformerBlock,
     build_layout,
@@ -87,6 +91,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
 
 
 @pytest.fixture
@@ -892,3 +899,33 @@ def test_packed_qkv_projection_is_skipped_under_compile():
     # plain projections instead of breaking in every attention.
     with patch.object(torch.compiler, "is_compiling", return_value=True):
         assert QwenImage21Attention._project_qkv_packed(object(), None, [], []) is None
+
+
+def test_prefix_pad_replay_writes_the_captured_output():
+    def attend(q, k, v, attn_metadata):
+        return q + k.shape[1]
+
+    attention = SimpleNamespace(
+        target_attn=SimpleNamespace(attn_impl=SimpleNamespace(forward=attend))
+    )
+    prefix_pad = PrefixPad(torch.tensor(2))
+    q, kv = torch.zeros(1, 3, 2, 4), torch.zeros(1, 6, 2, 4)
+    graph = bcg.BreakableCUDAGraph()
+    capture = SimpleNamespace(
+        cuda_graph=graph,
+        _end_current_segment=lambda: None,
+        _begin_new_segment=lambda: None,
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.qwen_image21.get_forward_context",
+        return_value=SimpleNamespace(attn_metadata=None),
+    ):
+        token = bcg._current_capture_var.set(capture)
+        try:
+            out = QwenImage21Attention.attend_target(attention, q, kv, kv, prefix_pad)
+        finally:
+            bcg._current_capture_var.reset(token)
+        prefix_pad.rows.fill_(1)
+        with replay_token_scope():
+            assert graph._break_fns[0]() is None
+    assert torch.all(out == 5)
