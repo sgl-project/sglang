@@ -1462,6 +1462,15 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
+def wire_sub_pool(storage, state_type) -> str:
+    """The sub-pool a storage transfers as ``state_type``."""
+    return next(
+        entry.sub_pool
+        for entry in storage.wire_entries()
+        if _wire_state_type(entry.state_type) == state_type
+    )
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
