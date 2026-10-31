@@ -141,10 +141,10 @@ def _run_unfused_reference(
         pytest.param(12, 8, None, _BATCH, id="tp8_h12"),
         pytest.param(8, 8, -5.0, _BATCH, id="glm53_flash_tp8_h8"),
         pytest.param(16, 4, -5.0, _BATCH, id="glm53_flash_tp4_h16"),
-        # 576 and 640 (token, head) blocks take the 3-stage state staging with
-        # stage reuse; on SM90 also the streaming state variant.
+        # 576 and 1152 (token, head) blocks take the 3-stage state staging with
+        # stage reuse; on SM90 the first takes the streaming state variant.
         pytest.param(8, 8, -5.0, 72, id="glm53_flash_tp8_h8_b72"),
-        pytest.param(16, 4, -5.0, 40, id="glm53_flash_tp4_h16_b40"),
+        pytest.param(16, 4, -5.0, 72, id="glm53_flash_tp4_h16_b72"),
     ],
 )
 def test_kda_fused_decode_matches_unfused_chain(

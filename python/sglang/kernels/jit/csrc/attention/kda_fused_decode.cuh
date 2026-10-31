@@ -1059,10 +1059,11 @@ struct KdaFusedDecodeKernel {
     } else if (kH == 6) {
       kernel = select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages);
     } else if (kH == 8 || kH == 16) {
-      // Measured on H200 at 8/16 heads: evict-first state traffic is 1-8%
-      // faster up to 512 (token, head) blocks and neutral from 1024; Blackwell
-      // was not measured with it, so it keeps the default policy.
-      const bool stream_state = host::runtime::get_cc_major(device.unwrap().device_id) == 9;
+      // Measured on H200 at 8/16 heads: evict-first state traffic is 1-9%
+      // faster up to 1024 (token, head) blocks and 1-2% slower from 1600;
+      // Blackwell was not measured with it, so it keeps the default policy.
+      const bool stream_state =
+          B * static_cast<int>(kH) <= 1024 && host::runtime::get_cc_major(device.unwrap().device_id) == 9;
       if (kH == 8) {
         kernel = stream_state ? select_kda_fused_decode_k3_kernel<8, kUsePDL, true>(use_lower_bound, tma_stages)
                               : select_kda_fused_decode_k3_kernel<8, kUsePDL>(use_lower_bound, tma_stages);
