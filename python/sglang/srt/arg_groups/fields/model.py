@@ -401,3 +401,13 @@ class Model(msgspec.Struct):
             help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
         ),
     ] = 1800
+    weight_cache_max_bytes: A[
+        Optional[int],
+        Arg(
+            help="Maximum GPU memory the weight cache daemon may use for cached "
+            "weights, in bytes. When set, the daemon rejects checkpoints estimated "
+            "above this cap before loading and refuses to serve if the measured "
+            "weights exceed this cap or the --mem-fraction-static budget. Unset "
+            "keeps the previous behavior.",
+        ),
+    ] = None
