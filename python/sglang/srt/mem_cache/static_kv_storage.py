@@ -11,7 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -636,11 +636,6 @@ class StaticKVStorage:
                 else ()
             )
         )
-
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Static pools never move a row, so a transfer has nothing to pin."""
 
     def _states(self) -> _StaticStateEntries:
         if self._state_entries is None:

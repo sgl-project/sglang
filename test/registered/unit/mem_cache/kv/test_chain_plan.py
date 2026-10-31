@@ -1,8 +1,8 @@
 """The chain planner answers exactly whether a demand fits, for any chain.
 
 Ground truth enumerates every reachable final layout of a small chain, each
-band on its own page grid in chain order, with pinned bands in place and fixed
-pages inside their band's extent; the planner packs leftmost and keeps one
+band on its own page grid in chain order, with fixed pages inside their band's
+extent (a band held in place has its whole span fixed); the planner packs leftmost and keeps one
 frontier per band in place, so the two are independent derivations.
 """
 
@@ -28,9 +28,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
-def _band(
-    name, grow, e, *, num_pages, min_page, low, high, live, pinned=False, fixed=None
-):
+def _band(name, grow, e, *, num_pages, min_page, low, high, live, fixed=None):
     """A band spanning pages ``[low, high)`` with ``live`` of them live, the
     pages ``fixed`` (a ``(first, end)`` extent) among them."""
     span = high - low
@@ -43,7 +41,7 @@ def _band(
         num_pages=num_pages,
         min_page=min_page,
         lazy=True,
-        blocked=pinned or fixed is not None,
+        blocked=fixed is not None,
         holes=span - live,
         live=live,
         span=live if grow == "float" else span,
@@ -53,7 +51,6 @@ def _band(
         num_virtual_pages=num_pages,
         low_page=low if grow == "float" else 0,
         high_page=high if grow == "float" else 0,
-        pinned=pinned,
         fixed=fixed,
     )
 
@@ -89,7 +86,7 @@ def _random_chain(rng):
         if rng.random() < 0.15:
             num_pages = rng.randint(max(1, num_pages // 2), num_pages)
         min_page = rng.choice((0, 1, 2))
-        pinned = rng.random() < 0.15
+        held = rng.random() < 0.15
         first = max(min_page, -(-x // e))
         if first > num_pages:
             return None
@@ -114,7 +111,6 @@ def _random_chain(rng):
                     low=low,
                     high=high,
                     live=0,
-                    pinned=pinned,
                 )
             )
             continue  # an empty float is transparent: no frontier
@@ -138,8 +134,11 @@ def _random_chain(rng):
                 low=low,
                 high=high,
                 live=live,
-                pinned=pinned,
-                fixed=_fixed_extent(rng, low, high, live),
+                fixed=(
+                    (low, high)
+                    if held and high > low
+                    else _fixed_extent(rng, low, high, live)
+                ),
             )
         )
         x = bands[-1].high_byte
@@ -173,14 +172,14 @@ def _options(b, pages, step):
     if b.grow == "up":
         if high + ext <= b.num_pages:
             out.add((low * e, (high + ext) * e))
-        if step != NO_MOVE and not b.pinned:
+        if step != NO_MOVE:
             for top in range(b.min_page, b.num_pages + 1):
                 if covers(b.min_page, top):
                     out.add((b.min_page * e, top * e))
     elif b.grow == "down":
         if low - ext >= b.min_page:
             out.add(((low - ext) * e, high * e))
-        if step != NO_MOVE and not b.pinned:
+        if step != NO_MOVE:
             for bottom in range(b.min_page, b.num_pages + 1):
                 if covers(bottom, b.num_pages):
                     out.add((bottom * e, b.num_pages * e))
@@ -192,7 +191,7 @@ def _options(b, pages, step):
                 out.add(((low - ext) * e, high * e))
             if high + ext <= b.num_pages:
                 out.add((low * e, (high + ext) * e))
-        if step == RELAYOUT and not b.pinned:
+        if step == RELAYOUT:
             out |= {
                 (p * e, q * e)
                 for p in range(b.min_page, b.num_pages + 1)
@@ -359,7 +358,7 @@ class TestChainPlan(CustomTestCase):
         first, end = plan(chain, demands, RELAYOUT).targets["mid"]
         self.assertEqual(end - first, 2)
         self.assertTrue(8 <= first and end <= 11)
-        pinned = _band(
+        held = _band(
             "mid",
             "float",
             128,
@@ -368,16 +367,16 @@ class TestChainPlan(CustomTestCase):
             low=6,
             high=12,
             live=2,
-            pinned=True,
+            fixed=(6, 12),
         )
-        self.assertFalse(feasible(_chain((up, pinned, down), 2048), demands))
+        self.assertFalse(feasible(_chain((up, held, down), 2048), demands))
 
     def test_a_fixed_page_bounds_the_float_without_freezing_it(self):
         # The sparse float of the joint-compaction case, its high live page 11
         # fixed (a transfer holds it). Growing the low end by 4 pages and the
         # high end by 1 needs the float moved into [8, 12) around page 11; a
-        # pinned float, or one fixed at page 6 where the low end must grow,
-        # cannot serve it.
+        # float held where it stands, or one fixed at page 6 where the low end
+        # must grow, cannot serve it.
         up = _band("up", "up", 128, num_pages=16, min_page=0, low=0, high=4, live=4)
         down = _band(
             "down", "down", 128, num_pages=16, min_page=1, low=13, high=16, live=3
@@ -403,7 +402,9 @@ class TestChainPlan(CustomTestCase):
         first, end = found.targets["mid"]
         self.assertTrue(8 <= first <= 11 < end <= 12, (first, end))
         self.assertFalse(feasible(_chain((up, mid(fixed=(6, 7)), down), 2048), demands))
-        self.assertFalse(feasible(_chain((up, mid(pinned=True), down), 2048), demands))
+        self.assertFalse(
+            feasible(_chain((up, mid(fixed=(6, 12)), down), 2048), demands)
+        )
 
     def test_a_fixed_page_keeps_a_compacted_end_from_retreating_past_it(self):
         # An up end of 3 live pages spread over [0, 10), page 8 fixed: compacted,
