@@ -339,36 +339,17 @@ def _audio_resampler(source_rate: int):
 
 
 @torch.inference_mode()
-def minimax_h3_encode_reference_audio_rows(
+def minimax_h3_encode_audio_waveform_rows(
     audio_vae: Any,
-    audio_path: str,
+    waveform: torch.Tensor,
     arch_config: MiniMaxH3AudioVAEArchConfig,
-    *,
-    material_chain: str = "audio",
-    max_duration_seconds: float | None = None,
-    start_time_seconds: float = 0.0,
-    source_sample_rate: int | None = None,
-) -> dict[str, Any]:
-    """Encode a reference audio file into normalized channel-major rows.
+) -> tuple[torch.Tensor, int]:
+    """Encode a [2, samples] 32 kHz waveform into normalized channel-major rows.
 
-    Returns {"rows": [2*T, 32] fp32 cpu, "ref_audio_t": T,
-    "duration_seconds": float}.
+    Returns (rows [2*T, 32] fp32 cpu, T). The audio VAE posterior mean is used.
     """
     model = audio_vae
-    device = next(model.parameters()).device
-    waveform, source_rate = _load_waveform(
-        audio_path,
-        material_chain=material_chain,
-        max_duration_seconds=max_duration_seconds,
-        start_time_seconds=start_time_seconds,
-        source_sample_rate=source_sample_rate,
-    )
-    if waveform.numel() == 0:
-        raise ValueError(f"reference audio is empty: {audio_path}")
-    if int(source_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
-        waveform = _audio_resampler(int(source_rate))(waveform)
-    waveform = waveform.to(device)
-
+    waveform = waveform.to(next(model.parameters()).device)
     with (
         _AudioVAEDeterminismContext(),
         set_forward_context(current_timestep=0, attn_metadata=None),
@@ -400,7 +381,39 @@ def minimax_h3_encode_reference_audio_rows(
     )
     latent.sub_(mean).div_(std)
     rows = latent.reshape(-1, latent_channels).to(torch.float32).contiguous()
-    ref_audio_t = int(latent.shape[1])
+    return rows, int(latent.shape[1])
+
+
+def minimax_h3_encode_reference_audio_rows(
+    audio_vae: Any,
+    audio_path: str,
+    arch_config: MiniMaxH3AudioVAEArchConfig,
+    *,
+    material_chain: str = "audio",
+    max_duration_seconds: float | None = None,
+    start_time_seconds: float = 0.0,
+    source_sample_rate: int | None = None,
+) -> dict[str, Any]:
+    """Encode a reference audio file into normalized channel-major rows.
+
+    Returns {"rows": [2*T, 32] fp32 cpu, "ref_audio_t": T,
+    "duration_seconds": float}.
+    """
+    model = audio_vae
+    waveform, source_rate = _load_waveform(
+        audio_path,
+        material_chain=material_chain,
+        max_duration_seconds=max_duration_seconds,
+        start_time_seconds=start_time_seconds,
+        source_sample_rate=source_sample_rate,
+    )
+    if waveform.numel() == 0:
+        raise ValueError(f"reference audio is empty: {audio_path}")
+    if int(source_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
+        waveform = _audio_resampler(int(source_rate))(waveform)
+    rows, ref_audio_t = minimax_h3_encode_audio_waveform_rows(
+        model, waveform, arch_config
+    )
     return {
         "rows": rows,
         "ref_audio_t": ref_audio_t,
