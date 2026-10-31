@@ -26,19 +26,23 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+On Ascend NPUs (Atlas 800I A3), follow [SGLang installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) to select a compatible container image and host driver. The NPU recipes in [3.3 Deploying on Ascend NPUs](#ascend-npu-deployment) need that software stack; the CUDA image does not provide it.
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
 
 ### 3.1 Basic Configuration
 
-The Qwen3 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)), and Intel Xeon CPUs. The recommended launch configurations vary by hardware and model size.
+The Qwen3 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)), Intel Xeon CPUs, and Ascend NPUs (Atlas 800I A3). The recommended launch configurations vary by hardware and model size.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
 import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.jsx";
 
 <Qwen3Deployment />
+
+The generator covers the GPU and CPU targets above. For Ascend NPUs, pick a row in the [Ascend NPU scenario table](#ascend-npu-deployment) instead; those commands are validated separately and are not generated from the matrix below.
 
 ### 3.2 Configuration Tips
 
@@ -52,7 +56,339 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
   - `--speculative-eagle-topk 1`: Top-k sampling for draft tokens
   - `--speculative-num-draft-tokens 4`: Number of draft tokens per step
   - `--speculative-draft-model-path`: The path of the draft model weights. This can be a local folder or a Hugging Face repo ID such as [`lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan`](https://huggingface.co/lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan).
+- **Ascend NPU (Atlas 800I A3):** One card exposes two dies, so `--tp-size` is twice the card count (1 card -> `--tp-size 2`). Add `--attention-backend ascend --device npu`, and pair W8A8 checkpoints with `--quantization modelslim`. See [3.3 Deploying on Ascend NPUs](#ascend-npu-deployment) for the validated command of each scenario.
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
+<a id="ascend-npu-deployment" title="Referenced by the configuration tips above. Verify before removing."></a>
+
+### 3.3 Deploying on Ascend NPUs (Atlas 800I A3)
+
+SGLang serves the Qwen3 series on Ascend NPUs with the Ascend attention backend. Each model has a tutorial — [Qwen3-235B-A22B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b), [Qwen3-30B-A3B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_30b_a3b), [Qwen3-32B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_32b), [Qwen3-8B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b) — and the best-practice pages publish the validated flag set for every scenario below. This section turns those flag sets into a short selection path: pick a row, run the block.
+
+All Qwen3 NPU recipes are validated on the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Later images are not covered by the recipes and may rename or drop flags.
+
+**Scenario selection.** Every scenario here is PD co-located: prefill and decode run in one server process on one node, which the Ascend pages call PD mixed. Choose by model and card count; the variant and `--tp-size` are part of the validated recipe, so change them together.
+
+| Model | Variant | Weights | Cards | `--tp-size` | Dataset | TPOT |
+|---|---|---|---|---|---|---|
+| Qwen3-8B | W8A8 INT8 | 11.27GB | 1 | 2 | 3.5k+1.5k | 5ms |
+| Qwen3-30B-A3B | W8A8 INT8 | 31.29GB | 1 | 2 | 3.5k+1.5k | 10ms |
+| Qwen3-32B | W8A8 INT8 | 42.77GB | 2 | 4 | 3.5k+1.5k | 50ms |
+| Qwen3-235B-A22B | W8A8 INT8 | 236.80GB | 8 | 16 | 3.5k+1.5k | 50.1ms |
+
+<Tip>
+**1 x A3 card, PD co-located** is the first two rows. Qwen3-8B W8A8 (11.27GB) and Qwen3-30B-A3B W8A8 (31.29GB) each fit a single 64GB die, so one card with `--tp-size 2` serves them.
+
+Qwen3-32B and Qwen3-235B-A22B have no **tuned** single-card recipe. Their smallest validated recipes are 2 cards (32B W8A8, `--tp-size 4`) and 8 cards (235B W8A8, `--tp-size 16`). The tutorials note that 32B BF16 (65.54GB) also fits one card at `--tp-size 2`, and that 235B W8A8 (236.80GB) fits 4 cards at `--tp-size 8`; neither has published flags, so start from the recipe below and tune from there.
+</Tip>
+
+**Weights.** Download the W8A8 checkpoints before you start; `--quantization modelslim` expects the quantized layout, not the BF16 checkpoint renamed:
+
+- [Qwen3-8B-w8a8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-8B-w8a8) and [Eagle3-Qwen3-8B-zh](https://www.modelscope.cn/models/Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh) (EAGLE3 draft model)
+- [Qwen3-30B-A3B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3-30B-A3B-w8a8) and [Qwen3-a3B_eagle3](https://www.modelscope.cn/models/vllm-ascend/Qwen3-a3B_eagle3) (EAGLE3 draft model)
+- [Qwen3-32B-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-32B-W8A8) and [Eagle3-Qwen3-32B-zh](https://www.modelscope.cn/models/Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh) (EAGLE3 draft model)
+- [Qwen3-235B-A22B-W8A8](https://www.modelscope.cn/models/vllm-ascend/Qwen3-235B-A22B-W8A8) and [Qwen3-235B-A22B-Eagle3](https://www.modelscope.cn/models/nv-community/Qwen3-235B-A22B-Eagle3) (EAGLE3 draft model)
+
+#### Step 1: Start the container
+
+Pull the pinned image and start it with the driver, firmware, and runtime mounts from the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start). Pass only the dies your scenario uses: a 1-card run needs `/dev/davinci0` and `/dev/davinci1`, a 2-card run needs `davinci0`–`davinci3`, an 8-card run needs all 16 dies.
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
+```
+
+#### Step 2: Tune the host and export the shared environment
+
+Run this once per shell. It applies the host settings and the environment variables that all four scenarios share; each scenario block in step 3 adds the variables that recipe requires on top.
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the EAGLE3 draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+```
+
+#### Step 3: Launch the scenario
+
+<Tabs>
+  <Tab title="Qwen3-8B, 1 card">
+    **1 x A3 card, PD co-located.** No extra environment variables beyond step 2. The `--cuda-graph-bs-decode 1` and `--max-running-requests 1` pair targets single-stream latency; see the [8B throughput variant](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in6k-out1k5-bs16) for batch serving.
+
+    ```bash Command
+    python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --host 127.0.0.1 --port 6688 \
+        --trust-remote-code \
+        --nnodes 1 \
+        --node-rank 0 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --max-running-requests 1 \
+        --max-prefill-tokens 16384 \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --tp-size 2 \
+        --mem-fraction-static 0.894 \
+        --cuda-graph-bs-decode 1 \
+        --dtype bfloat16 \
+        --speculative-draft-model-quantization unquant \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path $DRAFT_MODEL_PATH \
+        --speculative-num-steps 4 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 5 \
+        --reasoning-parser qwen3 \
+        --tool-call-parser qwen
+    ```
+  </Tab>
+  <Tab title="Qwen3-30B-A3B, 1 card">
+    **1 x A3 card, PD co-located.** This recipe needs four extra environment variables before the launch command:
+
+    ```bash Command
+    export ASCEND_LAUNCH_BLOCKING=0
+    export DEEPEP_HCCL_BUFFSIZE=400
+    export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+    export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+
+    python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --host 127.0.0.1 --port 6688 \
+        --trust-remote-code \
+        --nnodes 1 \
+        --node-rank 0 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --max-running-requests 162 \
+        --disable-radix-cache \
+        --speculative-draft-model-quantization unquant \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 35000 \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path $DRAFT_MODEL_PATH \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --tp-size 2 \
+        --mem-fraction-static 0.87 \
+        --cuda-graph-bs-decode 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+        --dtype bfloat16 \
+        --reasoning-parser qwen3 \
+        --tool-call-parser qwen
+    ```
+  </Tab>
+  <Tab title="Qwen3-32B, 2 cards">
+    **2 x A3 cards, PD co-located.** `SGLANG_NPU_USE_DEEPGEMM=1` is part of this recipe; drop it and the decoding path changes.
+
+    ```bash Command
+    export SGLANG_NPU_USE_DEEPGEMM=1
+    export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+    export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+
+    python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --host 127.0.0.1 --port 6688 \
+        --trust-remote-code \
+        --nnodes 1 \
+        --node-rank 0 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --max-running-requests 101 \
+        --disable-radix-cache \
+        --speculative-draft-model-quantization unquant \
+        --chunked-prefill-size -1 \
+        --max-prefill-tokens 35000 \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path $DRAFT_MODEL_PATH \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --tp-size 4 \
+        --mem-fraction-static 0.845 \
+        --cuda-graph-bs-decode 16 32 64 72 88 90 92 94 96 97 98 99 100 101 \
+        --dtype bfloat16 \
+        --reasoning-parser qwen3 \
+        --tool-call-parser qwen
+    ```
+  </Tab>
+  <Tab title="Qwen3-235B-A22B, 8 cards">
+    **8 x A3 cards, PD co-located.** This recipe uses expert parallelism on top of `--tp-size 16` (16 dies) and a larger DeepEP buffer, so it needs the extra variables below. For 2-node PD disaggregation instead, see the [235B tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b#multi-node-pd-disaggregation-deployment).
+
+    ```bash Command
+    export DEEPEP_HCCL_BUFFSIZE=570
+    export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
+    export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+    export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+
+    python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --host 127.0.0.1 --port 6688 \
+        --trust-remote-code \
+        --nnodes 1 \
+        --node-rank 0 \
+        --attention-backend ascend \
+        --device npu \
+        --quantization modelslim \
+        --max-running-requests 432 \
+        --context-length 8192 \
+        --dtype bfloat16 \
+        --chunked-prefill-size 94208 \
+        --max-prefill-tokens 458880 \
+        --sampling-backend ascend \
+        --ep-dispatch-algorithm static \
+        --disable-radix-cache \
+        --moe-a2a-backend ascend_fuseep \
+        --speculative-algorithm EAGLE3 \
+        --speculative-draft-model-path $DRAFT_MODEL_PATH \
+        --speculative-num-steps 3 \
+        --speculative-eagle-topk 1 \
+        --speculative-num-draft-tokens 4 \
+        --speculative-draft-model-quantization unquant \
+        --tp 16 \
+        --dp-size 16 \
+        --enable-dp-attention \
+        --enable-dp-lm-head \
+        --mem-fraction-static 0.8 \
+        --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27 \
+        --reasoning-parser qwen3 \
+        --tool-call-parser qwen25
+    ```
+  </Tab>
+</Tabs>
+
+#### Step 4: Check the service before you benchmark
+
+Wait for `The server is fired up and ready to roll!` in the log, then send one request:
+
+```bash Command
+curl http://127.0.0.1:6688/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "'$MODEL_PATH'",
+        "messages": [{"role": "user", "content": "What is the capital of France?"}],
+        "max_tokens": 64,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": false}
+    }'
+```
+
+A working server returns HTTP 200 with `"content": "The capital of France is Paris."`. Use the chat endpoint rather than `/generate`: Qwen3 is a chat model, and without a chat template it may answer only after a long thinking preamble. Keep `"enable_thinking": false` for a deterministic check — with thinking on, the answer arrives in `reasoning_content` first. Read quality on a dataset before you trust throughput numbers — see [Accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+
+#### Step 5: Benchmark the scenario
+
+Each command matches the dataset and concurrency of its published recipe. Run it from the same container while the server is up.
+
+<Tabs>
+  <Tab title="Qwen3-8B, 1 card">
+    ```bash Command
+    python3 -m sglang.bench_serving \
+        --dataset-name random \
+        --backend sglang \
+        --host 127.0.0.1 \
+        --port 6688 \
+        --max-concurrency 1 \
+        --num-prompts 4 \
+        --random-input-len 3500 \
+        --random-output-len 1500 \
+        --random-range-ratio 1 \
+        --seed 1
+    ```
+  </Tab>
+  <Tab title="Qwen3-30B-A3B, 1 card">
+    ```bash Command
+    python3 -m sglang.bench_serving \
+        --dataset-name random \
+        --backend sglang \
+        --host 127.0.0.1 \
+        --port 6688 \
+        --max-concurrency 1 \
+        --num-prompts 1 \
+        --random-input-len 3500 \
+        --random-output-len 1500 \
+        --random-range-ratio 1 \
+        --seed 1
+    ```
+  </Tab>
+  <Tab title="Qwen3-32B, 2 cards">
+    ```bash Command
+    python3 -m sglang.bench_serving \
+        --dataset-name random \
+        --backend sglang \
+        --host 127.0.0.1 \
+        --port 6688 \
+        --max-concurrency 100 \
+        --num-prompts 400 \
+        --random-input-len 3584 \
+        --random-output-len 1536 \
+        --random-range-ratio 1 \
+        --seed 1
+    ```
+  </Tab>
+  <Tab title="Qwen3-235B-A22B, 8 cards">
+    ```bash Command
+    python3 -m sglang.bench_serving \
+        --dataset-name random \
+        --backend sglang \
+        --host 127.0.0.1 \
+        --port 6688 \
+        --max-concurrency 432 \
+        --num-prompts 1728 \
+        --random-input-len 3500 \
+        --random-output-len 1500 \
+        --random-range-ratio 1 \
+        --seed 1
+    ```
+  </Tab>
+</Tabs>
+
+#### Other published variants
+
+Swap in one of these when your workload is throughput- or batch-shaped. Each links to the validated recipe; keep its full flag set rather than mixing flags between variants.
+
+| Model | Variant | Cards | `--tp-size` | Dataset | TPOT | Recipe |
+|---|---|---|---|---|---|---|
+| Qwen3-8B | W8A8 | 1 | 1 | 3.5k+1.5k | 37ms | [high throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) |
+| Qwen3-8B | W8A8 | 1 | 2 | 6k+1.5k | 11.79ms | [batch of 16](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in6k-out1k5-bs16) |
+| Qwen3-30B-A3B | W8A8 | 1 | 2 | 3.5k+1.5k | 50ms | [high throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
+| Qwen3-30B-A3B | W8A8 | 1 | 2 | 6k+1.5k | 10.25ms | [batch of 16](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-w8a8-1p-in6k-out1k5-bs16) |
+| Qwen3-30B-A3B | BF16 | 1 | 2 | 1k+100 | — | [BF16 baseline](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b#qwen3-30b-a3b-bf16-1p-in1k-out100) |
+| Qwen3-32B | BF16 | 8 | 16 | 18k+4k | 6ms | [low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-bf16-8p-in18k-out4k-6ms) |
+| Qwen3-235B-A22B | BF16 | 8 | 16 | 11k+1.5k | 8ms | [low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b#qwen3-235b-a22b-bf16-8p-in11k-out1k5-8ms) |
+
+<Note>
+- These recipes disable the radix cache (`--disable-radix-cache`) except where the best-practice page says otherwise. Prefix-cache scenarios on A3 use a separate flag set; copy the whole matching recipe instead of adding prefix-cache flags to the commands above.
+- `--reasoning-parser qwen3` splits `<think>` blocks from the answer. Drop it only if your client already handles the raw output.
+- The TPOT values come from the linked Ascend pages. They describe those pages' full configurations and workloads, not a measurement of your own run.
+</Note>
 
 ## 4. Model Invocation
 
