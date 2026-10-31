@@ -10,7 +10,9 @@ import torch
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
+    Req,
 )
+from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -35,6 +37,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -1054,6 +1057,28 @@ class TestStreamingSessionLockLifecycle(
 
         req.finished_reason = FINISH_LENGTH(length=0)
         self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def test_dfs_weight_policy_orders_a_waiting_session_turn(self):
+        """A waiting session turn matches the slot's virtual node, which the
+        dfs-weight sort used to pass to the tree core and crash the scheduler."""
+        cache, allocator, pool = build_fixture(self.cfg)
+        slot, turn = self._later_turn(cache, allocator, pool)
+        other = Req(
+            rid="other",
+            origin_input_text="",
+            origin_input_ids=array("q", range(1, 7)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        waiting_queue = [turn, other]
+
+        SchedulePolicy("dfs-weight", cache, False, False, False).calc_priority(
+            waiting_queue
+        )
+
+        self.assertIs(turn.last_node, slot.virtual_node)
+        self.assertCountEqual(waiting_queue, [turn, other])
         cache.session.release_session("s")
         cache.sanity_check()
 
