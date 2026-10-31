@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.moe.trtllm_moe_workspace import get_trtllm_moe_workspace
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -115,6 +116,15 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
+    workspace = get_trtllm_moe_workspace(
+        "mxfp8"
+        if fp8_quantization_type is not None
+        and fp8_quantization_type == int(Fp8QuantizationType.MxFp8)
+        else "fp8_block_scale",
+        **kwargs,
+    )
+    if workspace is not None:
+        kwargs["workspace_buffer"] = workspace
     trtllm_fp8_block_scale_moe(**kwargs)
 
 
@@ -230,6 +240,15 @@ def trtllm_fp8_block_scale_routed_moe_out_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
+    workspace = get_trtllm_moe_workspace(
+        "mxfp8"
+        if fp8_quantization_type is not None
+        and fp8_quantization_type == int(Fp8QuantizationType.MxFp8)
+        else "fp8_block_scale",
+        **kwargs,
+    )
+    if workspace is not None:
+        kwargs["workspace_buffer"] = workspace
     trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 
@@ -322,6 +341,9 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
 
         kwargs["activation_type"] = ActivationType(activation_type)
 
+    workspace = get_trtllm_moe_workspace("fp8_per_tensor", **kwargs)
+    if workspace is not None:
+        kwargs["workspace_buffer"] = workspace
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)
 
 
