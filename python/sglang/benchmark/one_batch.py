@@ -550,6 +550,8 @@ class TreeCacheNamespace(SimpleNamespace):
 @torch.no_grad
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
+    allocator = model_runner.token_to_kv_pool_allocator
+    logical_allocator = getattr(allocator, "logical_attn_allocator", allocator)
     dummy_tree_cache = TreeCacheNamespace(
         page_size=get_schedule().page_size,
         device=model_runner.device,
@@ -558,8 +560,8 @@ def extend(reqs, model_runner):
         next_swa_retirement=None,
         swa_retain_window=(
             model_runner.sliding_window_size
-            if hasattr(model_runner.token_to_kv_pool_allocator, "free_swa_segment")
-            and not model_runner.token_to_kv_pool_allocator.swa_req_ring
+            if hasattr(allocator, "free_swa_segment")
+            and not getattr(logical_allocator, "swa_req_ring", False)
             else None
         ),
     )

@@ -98,6 +98,41 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
+    def test_one_batch_extend_checks_logical_swa_mode(self):
+        """HiSparse wrappers must reach batch allocation during benchmark warmup."""
+        from sglang.benchmark import one_batch
+
+        class BatchAllocationReached(Exception):
+            pass
+
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        runner = SimpleNamespace(
+            device="cpu",
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=None,
+            model_config=None,
+            sliding_window_size=128,
+        )
+        caches = []
+
+        def stop_at_allocation(**kwargs):
+            caches.append(kwargs["tree_cache"])
+            raise BatchAllocationReached
+
+        for logical, expected in (
+            (SimpleNamespace(), 128),  # A paged allocator has no ring attribute.
+            (SimpleNamespace(swa_req_ring=False), 128),
+            (SimpleNamespace(swa_req_ring=True), None),
+        ):
+            with self.subTest(logical=logical):
+                allocator.logical_attn_allocator = logical
+                with patch.object(
+                    one_batch.ScheduleBatch, "init_new", side_effect=stop_at_allocation
+                ):
+                    with self.assertRaises(BatchAllocationReached):
+                        one_batch.extend([], runner)
+                self.assertEqual(caches[-1].swa_retain_window, expected)
+
     def test_free_returns_c4_slots(self):
         """Freeing a request's logical row must return the C4 HiSparse slots its
         compressed tokens were mapped to."""

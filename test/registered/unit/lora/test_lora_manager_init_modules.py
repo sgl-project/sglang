@@ -65,6 +65,33 @@ class _ParallelLMHead(torch.nn.Module):
 
 
 class TestTiedLMHeadLoRA(CustomTestCase):
+    def test_norm_quantization_tracks_wrapped_projection(self):
+        """A static-FP8 consumer must keep tensor inputs after LoRA wrapping."""
+        from sglang.srt.layers.layernorm import (
+            GemmaRMSNorm,
+            _fp8_static_input_scale,
+        )
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+        model = torch.nn.Module()
+        model.qkv_proj = torch.nn.Linear(4, 4, bias=False)
+        model.qkv_proj.quant_method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+        model.qkv_proj.input_scale = torch.tensor([0.05])
+        model.norm = GemmaRMSNorm(4)
+        model.norm.fuse_input_quant(model.qkv_proj)
+        self.assertIsNotNone(_fp8_static_input_scale(model.norm._quant_linear))
+
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.base_model = model
+        manager.lora_backend = SimpleNamespace()
+        wrapper = BaseLayerWithLoRA(model.qkv_proj, manager.lora_backend)
+        with patch.object(lora_manager_module, "get_lora_layer", return_value=wrapper):
+            manager.set_lora_module("qkv_proj", model.qkv_proj)
+
+        self.assertIs(model.qkv_proj, wrapper)
+        self.assertIsNone(_fp8_static_input_scale(model.norm._quant_linear))
+
     def test_tied_head_gets_independent_wrapper_with_shared_base_weight(self):
         """An lm_head-only adapter must survive tied input/output embeddings."""
         model = torch.nn.Module()

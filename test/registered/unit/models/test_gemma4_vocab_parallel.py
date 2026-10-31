@@ -352,6 +352,67 @@ class TestGemma4VocabParallel(CustomTestCase):
             )
             self.assertFalse(assistant.logits_processor.do_tensor_parallel_all_gather)
 
+    def test_gathered_draft_bank_rejects_target_weight_updates(self):
+        """TP>1 draft copies must reject updates before graph-held banks go stale."""
+        from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            SchedulerWeightUpdaterManager,
+        )
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+            _unsupported_derived_weight_cache_error,
+        )
+
+        with parallel_scope(1) as (group, _):
+            model = Gemma4ForCausalLM(text_config())
+            source = model.get_input_embeddings()
+            source.weight.weight_loader(source.weight, self.weight)
+            replicated = Gemma3TextScaledWordEmbedding(259, 8, 0)
+            self.assertIsNone(getattr(source, "_derived_weight_cache_error", None))
+            padded = F.pad(self.weight, (0, 0, 0, 61))
+            group.all_gather_into_tensor = lambda output, local: output.copy_(padded)
+            bank = shared_vocab_weight(source, draft_embedding=replicated)
+            original = source.weight.detach().clone()
+            updater = WeightUpdater(
+                tp_rank=1,
+                device="cpu",
+                gpu_id=0,
+                model_config=None,
+                custom_weight_loaders={},
+                get_model=lambda: model,
+                update_model_fields=lambda *args, **kwargs: None,
+                recapture_cuda_graph=lambda: None,
+                get_model_runner=lambda: None,
+            )
+            error = _unsupported_derived_weight_cache_error(model)
+            self.assertIn("Gemma4 vocabulary bank", error)
+            self.assertEqual(
+                updater.update_weights_from_tensor(
+                    [("model.embed_tokens.weight", torch.zeros_like(original))],
+                    load_format="direct",
+                ),
+                (False, error),
+            )
+            runner = SimpleNamespace(weight_updater=updater)
+            group.cpu_group = None
+            manager = SchedulerWeightUpdaterManager(
+                tp_worker=SimpleNamespace(
+                    weight_update_runners=lambda: [("target", runner)]
+                ),
+                draft_worker=None,
+                memory_saver_adapter=None,
+                flush_cache=lambda: True,
+                is_fully_idle=lambda: True,
+            )
+            result = manager.begin_weight_update(
+                BeginWeightUpdateReqInput(selector="target")
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.message, error)
+            self.assertIsNone(manager._session)
+            torch.testing.assert_close(source.weight, original, rtol=0, atol=0)
+            torch.testing.assert_close(bank, self.weight, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

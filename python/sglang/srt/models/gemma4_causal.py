@@ -151,6 +151,13 @@ def shared_vocab_weight(
 
     if sharded:
         if embedding.tp_size > 1:
+            # The gathered bank has independent storage retained by the draft
+            # and its CUDA graphs. Online writes cannot refresh that bank.
+            embedding._derived_weight_cache_error = (
+                "Online weight updates are not supported after gathering a "
+                "Gemma4 vocabulary bank for a draft: captured CUDA graphs "
+                "retain the old weights. Restart to load new weights."
+            )
             full_weight = torch.empty(
                 (embedding.num_embeddings_padded, weight.shape[1]),
                 device=weight.device,

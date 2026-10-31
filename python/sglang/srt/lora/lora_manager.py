@@ -1017,6 +1017,11 @@ class LoRAManager:
         """Wrap any module (standard or MoE) with LoRA support."""
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
+        # Norm quantization must inspect the live consumer: LoRA needs the
+        # floating-point activation even when its base projection uses FP8.
+        for norm in self.base_model.modules():
+            if getattr(norm, "_quant_linear", None) is module:
+                norm.fuse_input_quant(lora_module)
         return lora_module
 
     def init_lora_modules(self):
