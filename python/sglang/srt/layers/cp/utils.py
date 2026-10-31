@@ -268,7 +268,11 @@ def is_mla_cp_active(forward_batch) -> bool:
 
 
 def prepare_cp_forward(forward_batch) -> None:
-    """Build CP metadata for an active context-parallel prefill batch."""
+    """Build CP metadata for an active context-parallel prefill batch.
+
+    Device metadata may be uploaded non-blocking on the current stream, so call
+    this on the stream that runs the forward.
+    """
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None

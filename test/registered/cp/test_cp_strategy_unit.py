@@ -1,5 +1,6 @@
 import unittest
 from contextlib import contextmanager
+from itertools import accumulate
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -447,6 +448,28 @@ class TestCPZigzagStrategy(CustomTestCase):
                 torch.tensor(expected["actual_seq_q_next_list"]).cumsum(dim=0).tolist()
             ),
         )
+        q_prev = expected["actual_seq_q_prev_list"]
+        q_next = expected["actual_seq_q_next_list"]
+        kv_prev = expected["kv_len_prev_list"]
+        kv_next = expected["kv_len_next_list"]
+        expected_tensors = {
+            "kv_len_prev_tensor": kv_prev,
+            "kv_len_next_tensor": kv_next,
+            "actual_seq_q_prev_tensor": q_prev,
+            "actual_seq_q_next_tensor": q_next,
+            "actual_seq_q_combined_tensor": q_prev + q_next,
+            "kv_len_combined_tensor": kv_prev + kv_next,
+            "cu_seqlens_kv_prev_tensor": [0] + list(accumulate(kv_prev)),
+            "cu_seqlens_kv_next_tensor": [0] + list(accumulate(kv_next)),
+            "cu_seqlens_q_combined_tensor": [0] + list(accumulate(q_prev + q_next)),
+            "cu_seqlens_kv_combined_tensor": [0] + list(accumulate(kv_prev + kv_next)),
+        }
+        for name, values in expected_tensors.items():
+            tensor = getattr(metadata, name)
+            self.assertEqual(tensor.dtype, torch.int32, name)
+            self.assertEqual(tensor.cpu().tolist(), values, name)
+            # Views of the shared upload buffer keep 16-byte alignment.
+            self.assertEqual(tensor.data_ptr() % 16, 0, name)
 
     def _padded_rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
         per_rank = []
