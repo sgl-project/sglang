@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -14,6 +15,34 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
+    def test_extra_config_rejects_unknown_keys(self):
+        with self.assertRaisesRegex(ValueError, "num_thread"):
+            DefaultModelLoader(
+                LoadConfig(
+                    load_format=LoadFormat.SAFETENSORS,
+                    model_loader_extra_config={"num_thread": 4},
+                )
+            )
+
+    def test_enable_gds_is_only_accepted_for_fastsafetensors(self):
+        with self.assertRaisesRegex(ValueError, "enable_gds"):
+            DefaultModelLoader(
+                LoadConfig(
+                    load_format=LoadFormat.SAFETENSORS,
+                    model_loader_extra_config={"enable_gds": False},
+                )
+            )
+
+        loader = DefaultModelLoader(
+            LoadConfig(
+                load_format=LoadFormat.FASTSAFETENSORS,
+                model_loader_extra_config={"enable_gds": False},
+            )
+        )
+        self.assertEqual(
+            loader.load_config.model_loader_extra_config, {"enable_gds": False}
+        )
+
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
         model = Mock()
