@@ -861,6 +861,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         """
         meta data for zero copy
         """
+        if self.layout == "page_unified":
+            return self._page_unified_buffer_meta(indices)
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()

@@ -215,8 +215,9 @@ class Memory(msgspec.Struct):
                 "namespace digest plus absolute layer and head-group indices), "
                 "so any topology whose shards tile the same grid shares one "
                 "cache. Implies --hicache-mem-layout page_unified and "
-                "--hicache-io-backend kernel. Currently supported by the file "
-                "backend for one chunk per page."
+                "--hicache-io-backend kernel. Supported by the file and "
+                "mooncake backends, which store one object per chunk and "
+                "serve head- and layer-partitioned grids."
             ),
             choices=["rank-suffix", "unified"],
         ),

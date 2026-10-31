@@ -43,6 +43,19 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+### Unified L3 keys (cross-TP/PP reuse)
+
+With `--hicache-storage-key-scheme unified`, Mooncake stores each page as one
+object per chunk: a layer range by kv-head group, holding both K and V, keyed
+by its grid coordinates instead of by the writer's rank. Instances of one model
+share the cache across attention-TP and PP splits when they set the same
+`--hicache-storage-head-partition` and `--hicache-storage-layer-partition`, so
+that every local shard tiles the shared chunk grid. The scheme pins
+`--hicache-mem-layout page_unified` and `--hicache-io-backend kernel`, and a
+page is a hit only when all of its chunks are present. It supports a single
+MHA or MLA KV pool; composite caches, speculative decoding, and DCP are not
+supported.
+
 ## Install Mooncake
 
 **Method 1: with pip**
@@ -337,7 +350,8 @@ For a comprehensive overview of HiCache-related parameters, please refer to [thi
 
 
 Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`,
-the regular Mooncake backend path still uses `page_first` or `page_first_direct`.
+the regular Mooncake backend path still uses `page_first` or `page_first_direct`;
+the unified key scheme uses `page_unified` instead.
 When HiSparse provides an MLA host KV pool or DeepSeek V4 C4 side pool with
 layer-first page metadata, Mooncake Store uses Mooncake's multi-buffer zero-copy
 APIs (`batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`) to store
