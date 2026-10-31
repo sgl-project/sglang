@@ -102,6 +102,7 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
@@ -277,6 +278,14 @@ def _validate_minimax_m3_request(request: ChatCompletionRequest) -> str | None:
                 "thinking.type must be 'adaptive', 'enabled' or 'disabled', "
                 f"got {thinking_type!r}."
             )
+    effort = request.reasoning_effort
+    if effort is None:
+        effort = (request.chat_template_kwargs or {}).get("reasoning_effort")
+    if effort is not None and effort not in _M3_REASONING_EFFORTS:
+        return (
+            f"reasoning_effort must be one of {', '.join(_M3_REASONING_EFFORTS)}, "
+            f"got {effort!r}."
+        )
     root_positions = [
         position
         for position, message in enumerate(request.messages)
@@ -337,8 +346,6 @@ def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     )
     if request.thinking is not None:
         template_kwargs.setdefault("thinking_mode", request.thinking["type"])
-    if effort in ("none", "minimal"):
-        template_kwargs.setdefault("thinking_mode", "disabled")
     if template_kwargs.get("thinking_mode") == "disabled":
         # An effort means nothing once thinking is off.
         effort = None
@@ -1836,7 +1843,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # A grammar reaching its terminal state ends generation regardless of
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
-            self.tool_call_parser == "glm47"
+            FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+            is Glm47MoeDetector
             and bool(effective_tools)
             and request.tool_choice != "none"
             and not any(tool.function.strict for tool in effective_tools)
@@ -3450,6 +3458,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "high" if enabled else "no_think"
             else:
                 request.reasoning_effort = "medium" if enabled else "no_think"
+            return
+
+        if self.reasoning_parser == "flint":
+            if not enabled:
+                raise ValueError(
+                    "Reasoning parser 'flint' has no thinking toggle and cannot "
+                    "be disabled via Anthropic thinking"
+                )
             return
 
         if self.reasoning_parser == "iquest_q1":

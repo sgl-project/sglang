@@ -27,6 +27,10 @@ from sglang.multimodal_gen.runtime.scheduler_client import (
     run_zeromq_broker,
 )
 from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_S
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_async_client_warmup,
+    run_sync_client_warmup,
+)
 from sglang.srt.utils.network import get_free_port
 
 
@@ -179,6 +183,72 @@ def test_scheduler_isolates_invalid_messages_and_replies(invalid, reply_blocked)
         client.close(linger=0)
         receiver.close(linger=0)
         context.term()
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_server_warmup_reaches_every_replica_without_skewing_round_robin(
+    monkeypatch, sync
+):
+    endpoints = ["tcp://replica-0", "tcp://replica-1"]
+    warmup_reqs = [Req(prompt=f"warmup-{i}", is_warmup=True) for i in range(2)]
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.build_warmup_reqs",
+        lambda *args, **kwargs: warmup_reqs,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_image",
+        lambda *args, **kwargs: False,
+    )
+    server_args = SimpleNamespace(
+        scheduler_endpoints=endpoints,
+        scheduler_rpc_timeout=None,
+        warmup_resolutions=["512x512"],
+    )
+    client = SchedulerClient() if sync else AsyncSchedulerClient()
+    client.context = object()
+    client.server_args = server_args
+    client.request_logger = MagicMock()
+    received = {endpoint: [] for endpoint in endpoints}
+
+    def record(endpoint, batch):
+        received[endpoint].append(batch)
+        return OutputBatch()
+
+    if sync:
+        client._forward_one = lambda endpoint, batch, timeout_ms: record(
+            endpoint, batch
+        )
+    else:
+
+        async def forward_one(endpoint, batch, timeout_ms):
+            return record(endpoint, batch)
+
+        client._forward_one = forward_one
+
+    async def run_test():
+        if sync:
+            await asyncio.to_thread(run_sync_client_warmup, server_args, client.forward)
+        else:
+            await run_async_client_warmup(server_args, client.forward)
+        for endpoint in endpoints:
+            assert [req.prompt for req in received[endpoint]] == [
+                "warmup-0",
+                "warmup-1",
+            ]
+            # every replica counts the full list, not a share of it
+            assert {req.extra["warmup_total"] for req in received[endpoint]} == {2}
+            received[endpoint].clear()
+
+        # warmup left the counter alone: real traffic still starts at replica 0
+        for endpoint in endpoints:
+            batch = [Req(prompt="real")]
+            if sync:
+                await asyncio.to_thread(client.forward, batch)
+            else:
+                await client.forward(batch)
+            assert len(received[endpoint]) == 1
+
+    asyncio.run(run_test())
 
 
 def test_sync_scheduler_client_converts_configured_seconds_to_milliseconds():
