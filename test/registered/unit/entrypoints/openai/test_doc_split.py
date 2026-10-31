@@ -440,9 +440,10 @@ class TestSplitterIsOnlyBuiltForUnlimitedOCRV2(CustomTestCase):
                 )
             )
         )
-        return serving_chat_doc_split.ChatDocSplitter.for_model(
-            serving, handle_window=None
-        )
+        with get_context().override_server_args():
+            return serving_chat_doc_split.ChatDocSplitter.for_model(
+                serving, handle_window=None
+            )
 
     def test_other_architectures_get_no_splitter(self):
         for architectures in (["LlamaForCausalLM"], ["UnlimitedOCRForCausalLM"], None):
@@ -627,9 +628,10 @@ def _splitter(windows: _ScriptedWindows):
             None,
         ),
     )
-    return serving_chat_doc_split.ChatDocSplitter(
-        serving, handle_window=windows.handle_window
-    )
+    with get_context().override_server_args():
+        return serving_chat_doc_split.ChatDocSplitter(
+            serving, handle_window=windows.handle_window
+        )
 
 
 def _document_request(n_pages: int, *, stream: bool) -> ChatCompletionRequest:

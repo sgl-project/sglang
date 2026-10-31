@@ -844,8 +844,7 @@ class ChatDocSplitter:
             return None
         image_mode = _doc_image_mode(request)
         options = request.doc_split_options
-        # A request cap overrides the per-mode server cap; server caps may force
-        # splitting even when the full document fits.
+        # a request may tighten the server window even when the document fits
         max_batch_pages = self._config.uocr_doc_page_window
         if options and options.max_batch_pages is not None:
             if options.max_batch_pages > max_batch_pages:

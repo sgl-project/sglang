@@ -105,6 +105,18 @@ class TestUnlimitedOCRV2Server(TestOpenAIMLLMServerBase):
         self.assertGreater(response.usage.prompt_tokens, 0)
         self.assertGreater(response.usage.completion_tokens, 0)
 
+    def test_external_processors_remain_disabled(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        with self.assertRaisesRegex(
+            openai.BadRequestError, "--enable-custom-logit-processor"
+        ):
+            client.chat.completions.create(
+                model="default",
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=1,
+                extra_body={"custom_logit_processor": "external-processor"},
+            )
+
     def test_split_document_returns_every_page_in_order(self):
         pages = [_document_page(number) for number in PAGE_NUMBERS]
         response = self._chat(
