@@ -502,12 +502,6 @@ class MHAView(MHAKVView):
             ),
         )
 
-    def host_pool_decls(self):
-        """The host pool HiCache keeps for this view's buffers."""
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
-
-        return (make_kv_pool_decl(self),)
-
     def get_contiguous_buf_infos(self):
         """PD registration: the raw arena as physical page envelopes. Every token
         sub-pool registers the same allocation with its own envelope size; the
