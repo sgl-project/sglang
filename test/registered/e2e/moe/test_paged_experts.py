@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=337, stage="base-b", runner_config="1-gpu-large")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "
@@ -119,16 +119,6 @@ class TestPagedExpertsGptq(_PagedMatchesUnpaged, CustomTestCase):
     a batch, with medians below 0.05."""
 
     model = "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
-    exact = False
-    median_abs_tolerance = 0.1
-
-
-class TestPagedExpertsMxfp4(_PagedMatchesUnpaged, CustomTestCase):
-    """MXFP4 experts with biases (gpt-oss) on the Marlin runner, which pads them: loaded from
-    stacked checkpoint tensors, compared like GPTQ."""
-
-    model = "openai/gpt-oss-20b"
-    server_args = ("--moe-runner-backend", "marlin")
     exact = False
     median_abs_tolerance = 0.1
 

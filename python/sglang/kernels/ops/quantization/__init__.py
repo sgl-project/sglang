@@ -142,3 +142,11 @@ register_kernel(
         target="sglang.kernels.ops.quantization.act_quant_triton:act_quant",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="quantization.split_fp32_to_bf16x3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.bf16x3_split:split_fp32_to_bf16x3",
+        capabilities=CUDA_ONLY,
+    )
+)
