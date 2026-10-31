@@ -1960,6 +1960,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(self._leaf("attention_backend"), deterministic_fills[0])
 
+    def test_deterministic_rocm_resolves_fp8_gemm_backend_to_triton(self):
+        # The pass runs from the deterministic-inference hook during resolution.
+        with override_platform(is_cuda=False, is_hip=True):
+            sa = self._construct(
+                "LlamaForCausalLM", "llama", enable_deterministic_inference=True
+            )
+            self.assertEqual(resolution_result(sa, "fp8_gemm_runner_backend"), "triton")
+        sa = self._construct(
+            "LlamaForCausalLM", "llama", enable_deterministic_inference=True
+        )
+        self.assertEqual(resolution_result(sa, "fp8_gemm_runner_backend"), "auto")
+
     def test_deterministic_incompatible_backend_raises(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
@@ -2054,6 +2066,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     self.assertRaises(ValueError, _deterministic_rocm_rccl_check, view)
                 else:
                     self.assertEqual(_deterministic_rocm_rccl_check(view), {})
+
+    def test_deterministic_rocm_fp8_gemm_backend(self):
+        """Deterministic ROCm runs block-FP8 linears through Triton unless the user chose
+        a backend; CUDA and normal mode keep auto."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deterministic_rocm_fp8_gemm_backend,
+        )
+
+        # (is_hip, deterministic, fp8_gemm_runner_backend, expected)
+        for is_hip, det, backend, expected in [
+            (True, True, "auto", {"fp8_gemm_runner_backend": "triton"}),
+            (True, True, "aiter", {}),
+            (True, False, "auto", {}),
+            (False, True, "auto", {}),
+        ]:
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=det,
+                    fp8_gemm_runner_backend=backend,
+                )
+            )
+            with (
+                self.subTest(is_hip=is_hip, det=det, backend=backend),
+                override_platform(is_cuda=not is_hip, is_hip=is_hip),
+            ):
+                self.assertEqual(_deterministic_rocm_fp8_gemm_backend(view), expected)
 
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
