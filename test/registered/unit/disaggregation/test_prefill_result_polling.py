@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -169,6 +170,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.chunked_req = None
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
+        self.running_reqs = RunningReqs()
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
@@ -1231,6 +1233,9 @@ class _ForwardLaunched(Exception):
 
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
+
+    _join_launched_reqs = Scheduler._join_launched_reqs
+    _prefill_launch_starts_running = Scheduler._prefill_launch_starts_running
 
     def __init__(self):
         self.scheduler_stage_metrics = None

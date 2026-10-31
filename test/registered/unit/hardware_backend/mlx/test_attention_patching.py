@@ -1169,6 +1169,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.profiler_manager = SimpleNamespace(
             _profile_batch_predicate=lambda batch: None
         )
+        scheduler._join_launched_reqs = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()

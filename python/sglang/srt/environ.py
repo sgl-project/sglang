@@ -37,8 +37,8 @@ def _default_cache_subdir(name: str) -> str:
     return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), name)
 
 
-def _default_tree_cache_sanity_check() -> bool:
-    """Enable the expensive tree-cache sanity check by default in CI."""
+def _default_on_in_ci() -> bool:
+    """Enable an expensive self-check by default in CI."""
     return envs.SGLANG_IS_IN_CI.get()
 
 
@@ -506,7 +506,9 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
-    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
+    SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
+    # Check each schedule that the running requests equal the ones batches hold.
+    SGLANG_ENABLE_RUNNING_REQS_CHECK = EnvBool(_default_on_in_ci)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -1730,6 +1732,12 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in: store radix mamba checkpoints only in the hicache host pool.
+    # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
+    # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
+    # still writes. Requires --enable-hierarchical-cache. Off keeps the
+    # donated GPU slot and the previous ratio.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
