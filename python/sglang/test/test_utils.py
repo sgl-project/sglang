@@ -237,14 +237,15 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+def _first_visible_device_index() -> int:
+    first = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip()
+    return int(first) if first.isdigit() else 0
+
+
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + _first_visible_device_index() * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + _first_visible_device_index() * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():

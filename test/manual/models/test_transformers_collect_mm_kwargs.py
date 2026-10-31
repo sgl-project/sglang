@@ -59,46 +59,25 @@ class TestCollectMmKwargs5DPadding(unittest.TestCase):
         self.assertTrue(torch.all(pixel_values[0] == 1.0))
         self.assertTrue(torch.all(pixel_values[1] == 2.0))
 
-    def test_different_patch_counts_padded_to_batch_max(self):
-        """Test: items with a different tile count must be
-        zero-padded to the batch-wide max num_patches, not just concatenated
-        as-is (which would crash on mismatched shapes or misalign data)."""
+    def test_unequal_patch_counts_require_a_model_specific_adapter(self):
         item_small = _make_item("IMAGE", torch.full((1, 3, 3, 4, 4), 1.0))  # 3 patches
         item_large = _make_item("IMAGE", torch.full((1, 5, 3, 4, 4), 2.0))  # 5 patches
         forward_batch = _make_forward_batch(
             [_make_mm_input([item_small]), _make_mm_input([item_large])]
         )
 
-        kwargs = MultiModalMixin._collect_mm_kwargs(_make_self(), forward_batch)
+        with self.assertRaisesRegex(ValueError, "cannot batch unequal patch shapes"):
+            MultiModalMixin._collect_mm_kwargs(_make_self(), forward_batch)
 
-        pixel_values = kwargs["pixel_values"]
-        self.assertEqual(pixel_values.shape, (2, 5, 3, 4, 4))
-        # item_small's real 3 patches are preserved...
-        self.assertTrue(torch.all(pixel_values[0, :3] == 1.0))
-        # ...and its padding (patches 3-4) is zeroed, not garbage/leftover data.
-        self.assertTrue(torch.all(pixel_values[0, 3:] == 0.0))
-        # item_large needed no padding at all.
-        self.assertTrue(torch.all(pixel_values[1] == 2.0))
-
-    def test_multi_image_item_with_different_patch_counts_within_one_item(self):
-        """A single multi-image item/request can itself already contain
-        per-image padding applied by the HF processor; the batch-level
-        padding must still pad up to the overall max without disturbing it."""
-        # 2 images already padded to 4 patches by the HF processor, batched
-        # against another item that only needed 2 patches.
+    def test_multi_image_items_do_not_acquire_batch_dependent_padding(self):
         item_multi_image = _make_item("IMAGE", torch.full((2, 4, 3, 4, 4), 1.0))
         item_single = _make_item("IMAGE", torch.full((1, 2, 3, 4, 4), 2.0))
         forward_batch = _make_forward_batch(
             [_make_mm_input([item_multi_image]), _make_mm_input([item_single])]
         )
 
-        kwargs = MultiModalMixin._collect_mm_kwargs(_make_self(), forward_batch)
-
-        pixel_values = kwargs["pixel_values"]
-        self.assertEqual(pixel_values.shape, (3, 4, 3, 4, 4))
-        self.assertTrue(torch.all(pixel_values[:2] == 1.0))
-        self.assertTrue(torch.all(pixel_values[2, :2] == 2.0))
-        self.assertTrue(torch.all(pixel_values[2, 2:] == 0.0))
+        with self.assertRaisesRegex(ValueError, "cannot batch unequal patch shapes"):
+            MultiModalMixin._collect_mm_kwargs(_make_self(), forward_batch)
 
     def test_decode_mode_skips_collection(self):
         """During decode (no new mm inputs to process this step), no

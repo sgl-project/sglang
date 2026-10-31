@@ -522,7 +522,6 @@ class NemotronHConfig(PretrainedConfig):
 
 class NemotronHPuzzleConfig(NemotronHConfig):
     model_type = "nemotron_h_puzzle"
-    has_no_defaults_at_init = True
 
     def __init__(
         self,

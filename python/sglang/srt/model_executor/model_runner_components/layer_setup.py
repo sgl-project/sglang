@@ -34,10 +34,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     # reorder to a dense [0..N) list.
     has_loop_attn = False
 
+    registered_attention = getattr(layer_model, "attention_instances", None)
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
         layers = layers.values()
-    for layer in layers:
+    for index, layer in enumerate(layers):
         attn_layer = None
         mha_companion_layer = None
         if hasattr(layer, "self_attn"):
@@ -72,6 +73,13 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
 
+        if registered_attention is not None:
+            attn_layer = (
+                registered_attention[str(index)]
+                if str(index) in registered_attention
+                else None
+            )
+
         if isinstance(attn_layer, nn.ModuleList):
             attention_layers.extend(attn_layer)
             mha_companion_layers.extend([mha_companion_layer] * len(attn_layer))
@@ -100,6 +108,13 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
             moe_block = layer.mixer.experts
             moe_fusion = layer.mixer
+        if registered_attention is not None:
+            while (
+                moe_block is not None
+                and not hasattr(moe_block, "moe_runner_config")
+                and hasattr(moe_block, "experts")
+            ):
+                moe_block = moe_block.experts
         moe_layers.append(moe_block)
         moe_fusions.append(moe_fusion)
         # NSA indexers (None for layers without NSA)

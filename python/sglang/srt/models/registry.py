@@ -119,7 +119,7 @@ def import_model_classes(package_name: str, strict: bool = False):
     model_arch_name_to_cls = {}
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
-        if not ispkg:
+        if not ispkg or name == package_name + ".transformers":
             if name.split(".")[-1] in envs.SGLANG_DISABLED_MODEL_ARCHS.get():
                 logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
                 continue

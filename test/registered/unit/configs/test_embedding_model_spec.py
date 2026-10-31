@@ -52,7 +52,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 8)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")

@@ -24,7 +24,11 @@ def _first_attr(obj, names: tuple[str, ...], default=None):
 
 def _uses_mrope(hf_config) -> bool:
     text_config = getattr(hf_config, "text_config", hf_config)
-    rope_scaling = getattr(text_config, "rope_scaling", None) or {}
+    rope_scaling = (
+        getattr(text_config, "rope_parameters", None)
+        or getattr(text_config, "rope_scaling", None)
+        or {}
+    )
     if isinstance(rope_scaling, dict) and "mrope_section" in rope_scaling:
         return True
     rope_type = str(getattr(text_config, "rope_type", "")).lower()
@@ -78,6 +82,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         input_ids: list[int],
         image_grid_thw: Optional[torch.Tensor] = None,
         video_grid_thw: Optional[torch.Tensor] = None,
+        second_per_grid_ts=None,
     ):
         from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 
@@ -92,6 +97,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             tokens_per_second=self._tokens_per_second,
+            second_per_grid_ts=second_per_grid_ts,
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
@@ -126,6 +132,8 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         self, processor_output: dict, input_ids: torch.Tensor
     ) -> list[MultimodalDataItem]:
         """Extract MultimodalDataItem objects from the HF processor output."""
+        from sglang.srt.models.transformers.multimodal_utils import placeholder_spans
+
         items = self.collect_mm_items_from_processor_output(processor_output)
 
         modality_to_token_id = {
@@ -137,7 +145,34 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         for item in items:
             token_id = modality_to_token_id.get(item.modality)
             if token_id is not None:
-                item.offsets = self.get_mm_items_offset(input_ids, token_id)
+                item.offsets = placeholder_spans(input_ids, token_id)
+
+        from sglang.srt.configs.transformers_backend import (
+            supports_transformers_multimodal_cache,
+        )
+        from sglang.srt.models.transformers.multimodal_utils import (
+            multimodal_fingerprint,
+            validate_multimodal_offsets,
+        )
+
+        if supports_transformers_multimodal_cache(self.hf_config):
+            validate_multimodal_offsets(items, input_ids, modality_to_token_id)
+            namespace = (
+                self.hf_config.to_json_string() + type(self._processor).__qualname__
+            )
+            for item in items:
+                item.set_hash(
+                    multimodal_fingerprint(
+                        namespace,
+                        item.modality.name,
+                        {
+                            "feature": item.feature,
+                            "precomputed_embeddings": item.precomputed_embeddings,
+                            "format": item.format.name,
+                        },
+                        item.model_specific_data,
+                    )
+                )
 
         return items
 
@@ -268,6 +303,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
                 ret.input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+                second_per_grid_ts=processor_output.get("second_per_grid_ts"),
             )
             ret.mrope_positions = mrope_positions
             ret.mrope_position_delta = mrope_position_delta

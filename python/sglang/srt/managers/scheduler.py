@@ -1374,6 +1374,10 @@ class Scheduler(
         self._deferred_input_requests: List = []
 
     def init_chunked_prefill(self):
+        from sglang.srt.configs.transformers_backend import (
+            transformers_requires_full_sequence,
+        )
+
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
@@ -1386,12 +1390,11 @@ class Scheduler(
         if (
             self.chunked_prefill_size is not None
             and self.chunked_prefill_size > 0
-            and self.model_config.is_multimodal
             and uses_transformers_backend
+            and transformers_requires_full_sequence(self.model_config)
         ):
             logger.warning(
-                "Chunked prefill is disabled for multimodal models with the "
-                "Transformers backend to avoid partial multimodal chunk mismatches."
+                "Chunked prefill is disabled because this Transformers task requires a complete sequence."
             )
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:

@@ -116,7 +116,6 @@ class TestNemotronHOmniConfig(CustomTestCase):
                         else config_class(vision_config={}, llm_config=llm_config)
                     )
                     self.assertIs(type(config.llm_config), NemotronHConfig)
-                    self.assertFalse(config.has_no_defaults_at_init)
 
 
 if __name__ == "__main__":

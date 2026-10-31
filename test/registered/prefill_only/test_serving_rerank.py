@@ -82,11 +82,11 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
             documents=["doc-a", "doc-b"],
             return_documents=True,
         )
-        # Two results with embedding as list, should coerce embedding[0] to float.
-        # Also verifies sorting (doc-b > doc-a).
+        # Two results with the scalar score wrapped in a one-element list,
+        # which must coerce to float. Also verifies sorting (doc-b > doc-a).
         ret = [
-            {"embedding": [0.1, 0.2], "meta_info": {"id": "a"}},
-            {"embedding": [0.9, -1.0], "meta_info": {"id": "b"}},
+            {"embedding": [0.1], "meta_info": {"id": "a"}},
+            {"embedding": [0.9], "meta_info": {"id": "b"}},
         ]
 
         res = self.handler._build_rerank_response(ret, req)

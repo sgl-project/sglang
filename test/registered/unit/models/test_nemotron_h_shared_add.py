@@ -44,7 +44,9 @@ class _FakeLoRABackend:
     def run_lora_a_sgemm(self, x, weights):
         return 2 * x
 
-    def run_lora_b_sgemm(self, *, x, weights, output_offset, base_output):
+    def run_lora_b_sgemm(
+        self, *, x, weights, output_offset, base_output, output_offset_cpu=None
+    ):
         return base_output + x
 
 

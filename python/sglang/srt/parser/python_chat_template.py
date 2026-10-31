@@ -172,8 +172,9 @@ def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -
     Mirrors transformers' ``apply_chat_template``: tool schemas, special tokens
     as template variables, batched conversations, and tokenization without
     added special tokens. A caller-supplied ``chat_template`` and the Jinja-only
-    ``continue_final_message`` / ``return_assistant_tokens_mask`` modes still go
-    to the original Jinja implementation.
+    ``continue_final_message`` / ``return_assistant_tokens_mask`` /
+    ``sanitize_control_tokens`` modes still go to the original Jinja
+    implementation.
     """
     jinja_apply_chat_template = getattr(
         tokenizer, "_sglang_jinja_apply_chat_template", tokenizer.apply_chat_template
@@ -187,6 +188,7 @@ def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -
         add_generation_prompt=False,
         continue_final_message=False,
         tokenize=True,
+        sanitize_control_tokens=False,
         padding=False,
         truncation=False,
         max_length=None,
@@ -200,6 +202,7 @@ def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -
             chat_template is not None
             or continue_final_message
             or return_assistant_tokens_mask
+            or sanitize_control_tokens
         ):
             return jinja_apply_chat_template(
                 conversation,
@@ -209,6 +212,7 @@ def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -
                 add_generation_prompt=add_generation_prompt,
                 continue_final_message=continue_final_message,
                 tokenize=tokenize,
+                sanitize_control_tokens=sanitize_control_tokens,
                 padding=padding,
                 truncation=truncation,
                 max_length=max_length,

@@ -63,7 +63,7 @@ dependencies = [
   "tiktoken",
   "timm==1.0.25",
   "tqdm",
-  "transformers==5.19.0",
+  "transformers==5.21.0",
   "uvicorn",
   "uvloop",
   "xxhash",

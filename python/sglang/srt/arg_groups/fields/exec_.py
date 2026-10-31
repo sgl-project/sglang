@@ -426,7 +426,11 @@ class ExecKernel(msgspec.Struct):
         "The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
     ] = None
     flashinfer_mla_disable_ragged: A[
-        bool, "Not using ragged prefill wrapper when running flashinfer mla"
+        bool,
+        Arg(
+            help="Not using ragged prefill wrapper when running flashinfer mla",
+            resolvable=True,
+        ),
     ] = False
     enable_fused_qk_norm_rope: A[
         Optional[bool],
