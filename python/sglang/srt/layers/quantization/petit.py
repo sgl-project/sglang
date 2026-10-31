@@ -272,6 +272,15 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Both backends consume one global scale without rescaling each
+        # projection's block scales, so taking max() would change its values.
+        if layer.weight_scale_2.numel() > 1 and not torch.all(
+            layer.weight_scale_2 == layer.weight_scale_2.flatten()[0]
+        ):
+            raise ValueError(
+                "Petit NVFP4 requires equal weight_scale_2 values across fused "
+                "projections; unequal global scales are not supported."
+            )
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
         layer.input_scale = Parameter(input_scale_2, requires_grad=False)

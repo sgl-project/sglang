@@ -176,7 +176,9 @@ class RotaryEmbedding(BaseFusedOp):
             )
         )
         if self._force_native:
-            inv_freq = inv_freq.cuda()
+            # Match the position tensor's initialization device, including
+            # CPU-first construction before the module is moved to the GPU.
+            inv_freq = inv_freq.to(device=torch.empty(0).device)
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:

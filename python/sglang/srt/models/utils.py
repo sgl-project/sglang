@@ -31,6 +31,7 @@ from sglang.kernels.ops.layernorm.norm import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding.base import _should_force_native_rope
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -291,6 +292,11 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    # Native RoPE does not write the KV cache. Callers must keep the separate
+    # attention cache write enabled whenever that implementation is selected.
+    if _should_force_native_rope():
+        return False
+
     pool = get_token_to_kv_pool()
     return (
         _is_cuda

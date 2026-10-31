@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.gemm import rdna4_nvfp4
+from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.petit_utils import (
@@ -160,6 +161,40 @@ class TestRdna4Nvfp4BackendSelection(CustomTestCase):
             size_k=16,
             size_n=3,
         )
+
+    def test_fused_projections_reject_unequal_global_scale_values(self):
+        """Collapsing gate/up or Q/K/V scales must not silently rescale weights."""
+        config = PetitNvFp4Config(
+            is_checkpoint_nvfp4_serialized=True, group_size=16, exclude_modules=[]
+        )
+        for widths, scales in (
+            ([2, 2], [0.125, 0.25]),
+            ([2, 1, 1], [0.25, 0.125, 0.25]),
+        ):
+            with self.subTest(widths=widths):
+                layer = MergedColumnParallelLinear(
+                    input_size=16,
+                    output_sizes=widths,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=config,
+                    tp_rank=0,
+                    tp_size=1,
+                )
+                expected_scales = torch.tensor(scales, dtype=torch.float32)
+                for shard_id, scale in enumerate(scales):
+                    layer.weight_loader_v2(
+                        layer.weight_scale_2, torch.tensor(scale), shard_id
+                    )
+                    layer.weight_loader_v2(
+                        layer.input_scale, torch.tensor(1.0), shard_id
+                    )
+
+                with self.assertRaisesRegex(ValueError, "equal weight_scale_2"):
+                    layer.quant_method.process_weights_after_loading(layer)
+
+                # A rejected layer must retain its per-projection scale values.
+                torch.testing.assert_close(layer.weight_scale_2, expected_scales)
 
     def test_apply_uses_cached_rdna4_backend(self):
         input_tensor = torch.randn(2, 16, dtype=torch.bfloat16)
