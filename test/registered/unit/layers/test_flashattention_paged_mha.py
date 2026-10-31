@@ -7,25 +7,25 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-with patch.dict(
-    sys.modules,
-    {
-        module: MagicMock()
-        for module in (
-            "sgl_kernel",
-            "sgl_kernel.quantization",
-            "sgl_kernel.scalar_type",
-        )
-    },
-):
-    from sglang.srt.layers.attention import flashattention_backend
-    from sglang.srt.layers.attention.flashattention_backend import (
-        FlashAttentionBackend,
-    )
-    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-        UnquantizedKVCacheMethod,
-    )
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+# sgl_kernel is mocked for the whole module, not under patch.dict: that would
+# evict every module first imported beneath it from sys.modules on exit, and
+# FlashAttentionBackend.__init__'s lazy ServerArgs resolution would then
+# re-execute them (and their native extensions) against the real package.
+for _module in ("sgl_kernel", "sgl_kernel.quantization", "sgl_kernel.scalar_type"):
+    sys.modules.setdefault(_module, MagicMock())
+
+from sglang.srt.layers.attention import flashattention_backend  # noqa: E402
+from sglang.srt.layers.attention.flashattention_backend import (  # noqa: E402
+    FlashAttentionBackend,
+)
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (  # noqa: E402
+    UnquantizedKVCacheMethod,
+)
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind  # noqa: E402
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds  # noqa: E402
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter  # noqa: E402
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -204,6 +204,66 @@ class TestFlashAttentionFa3UpgradesToFa4(unittest.TestCase):
         backend.fa_impl_ver = 4
         layer = SimpleNamespace(head_dim=128, v_head_dim=128)
         self.assertEqual(backend._ver_for(layer), 4)
+
+
+def _cpu_runner(*, model_head_dim):
+    """The least ModelRunner FlashAttentionBackend.__init__ reads up to its
+    model-level FA4 decisions, on the CPU device."""
+    req_to_token_pool = SimpleNamespace(
+        size=4, req_to_token=torch.zeros(5, 16, dtype=torch.int32)
+    )
+    token_to_kv_pool = SimpleNamespace(
+        id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+    )
+    token_to_kv_pool.layer_router = PlainPoolRouter(token_to_kv_pool, IdSpaceKind.FULL)
+    allocator = SimpleNamespace(hands_out_virtual_ids=False)
+    return SimpleNamespace(
+        sliding_window_size=None,
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False,
+            context_len=16,
+            attention_arch=flashattention_backend.AttentionArch.MHA,
+            is_local_attention_model=False,
+            head_dim=model_head_dim,
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=2, attn_logit_softcapping=None
+            ),
+            get_num_kv_heads=lambda tp_size: 2,
+        ),
+        device="cpu",
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool=token_to_kv_pool,
+        token_to_kv_pool_allocator=allocator,
+        runner_ids=RunnerIds(
+            req_to_token=req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=token_to_kv_pool,
+            page_size=1,
+            device="cpu",
+        ),
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="auto",
+        page_size=1,
+        is_draft_worker=False,
+        attention_chunk_size=None,
+        prefill_aware_swa=False,
+    )
+
+
+class TestFa3UpgradeHardwareGate(unittest.TestCase):
+    # FA3 itself runs on SM8x, but the FA4 kernels its wide layers need do not
+    # (FA4 asserts "paged KV not supported on SM 8.0" at the first call).
+    # Reject at init, with the triton pointer, instead of at the first prefill.
+    def test_wide_heads_on_sm8x_are_rejected_at_init(self):
+        with (
+            get_context().override_server_args(),
+            patch.object(
+                flashattention_backend, "get_device_capability", return_value=(8, 0)
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "SM90.*triton") as raised:
+                FlashAttentionBackend(_cpu_runner(model_head_dim=512))
+        self.assertIn("head_dim 512", str(raised.exception))
 
 
 def _load_fa4_kernels(*, deterministic):
