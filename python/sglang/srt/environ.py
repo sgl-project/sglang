@@ -2011,7 +2011,7 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # DSpark static verify: build the target verify metadata on a side stream beside the
-    # draft graph, for requests up to the candidate span (needs the glue switch above).
+    # draft graph (needs the glue switch above).
     SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
