@@ -558,3 +558,24 @@ register_kernel(
         ),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.topk_page_table_transform_",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.topk_page_table:topk_page_table_transform_",
+        capabilities=CUDA_ONLY,
+    )
+)
+# DSA prefill indexer top-k (sampled-threshold candidates + top-k), SM100 builds only.
+for _fn in ("fp8_indexer_topk", "fp4_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.dsa.litetopk_prefill.indexer_topk:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+            ),
+        )
+    )
+del _fn

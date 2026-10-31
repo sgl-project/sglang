@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import is_fp4_indexer_supported
+from sglang.kernels.ops.attention.dsv4.index_logits import index_weights_dtype
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 
 from .full_topk import FullTopKIndexer
@@ -66,12 +69,25 @@ def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    index_heads: int,
+    index_topk: int,
 ) -> FullTopKIndexer:
+    # Prefill top-k from the sampled-threshold fp4 indexer (kernels/ops/attention/dsa/litetopk_prefill) where it
+    # reproduces the DeepGEMM path: bf16 head weights, 32 or 64 index heads, a supported top-k.
+    use_prefill_lite_topk = (
+        envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
+        and _use_deep_gemm_prefill()
+        and is_fp4_indexer_supported()
+        and index_weights_dtype() == torch.bfloat16
+        and index_heads in (32, 64)
+        and index_topk in (512, 1024, 2048)
+    )
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
         use_deep_gemm_decode=is_sm100_or_newer(),
+        use_prefill_lite_topk=use_prefill_lite_topk,
     )
 
 
