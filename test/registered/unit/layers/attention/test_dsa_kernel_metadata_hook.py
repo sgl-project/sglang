@@ -119,6 +119,7 @@ def test_multistep_refreshes_custom_metadata_for_every_child(monkeypatch, path):
 
     for index in range(count):
         child = SimpleNamespace(
+            requires_eager_metadata=True,
             experimental_kpool_metadata_fusion=path == "kpool",
             decode_cuda_graph_metadata={size: metadata() for size in (3, 1, 0)},
             set_dsa_prefill_impl=lambda **kwargs: None,
@@ -226,6 +227,27 @@ def test_multistep_refreshes_custom_metadata_for_every_child(monkeypatch, path):
         multi.init_forward_metadata_out_graph(
             backend, batch, in_capture=path == "capture"
         )
+
+
+def test_default_multistep_replay_does_not_allocate_hook_batch(monkeypatch):
+    """Default DSA replay must not allocate a batch view for empty hooks."""
+    from sglang.srt.model_executor import forward_batch_info
+
+    backend = dsa_backend.DeepseekSparseAttnMultiStepBackend.__new__(
+        dsa_backend.DeepseekSparseAttnMultiStepBackend
+    )
+    backend.speculative_num_steps = 3
+    backend.attn_backends = [DSA.__new__(DSA), DSA.__new__(DSA)]
+    refreshed = []
+    backend._init_forward_metadata_replay = refreshed.append
+
+    def unexpected_view(*args, **kwargs):
+        pytest.fail("default replay allocated a hook batch view")
+
+    monkeypatch.setattr(forward_batch_info, "build_inner_fb_view", unexpected_view)
+    batch = SimpleNamespace(batch_size=2)
+    backend.init_forward_metadata_out_graph(batch)
+    assert refreshed == [batch]
 
 
 @pytest.mark.parametrize("multistep", [False, True])

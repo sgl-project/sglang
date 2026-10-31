@@ -4356,11 +4356,15 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        inner_fb = build_inner_fb_view(
-            forward_batch,
-            bs=forward_batch.batch_size,
-            forward_mode=ForwardMode.DECODE,
-        )
+        inner_fb = None
+        if in_capture or any(
+            backend.requires_eager_metadata for backend in self.attn_backends
+        ):
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
+                forward_mode=ForwardMode.DECODE,
+            )
         if in_capture:
             for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i].init_forward_metadata_out_graph(
@@ -4369,8 +4373,10 @@ class DeepseekSparseAttnMultiStepBackend:
             return
 
         self._init_forward_metadata_replay(forward_batch)
-        for backend in self.attn_backends[: self.speculative_num_steps - 1]:
-            backend.init_kernel_metadata(inner_fb)
+        if inner_fb is not None:
+            for backend in self.attn_backends:
+                if backend.requires_eager_metadata:
+                    backend.init_kernel_metadata(inner_fb)
 
     def _init_forward_metadata_replay(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
