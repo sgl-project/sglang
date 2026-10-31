@@ -21,23 +21,28 @@ def _module(threads: int):
         "mhc_post_combine_norm_decode",
         str(threads),
         cuda_files=["deepseek_v4/mhc_post_combine_norm_decode.cuh"],
-        cuda_wrappers=[("run", f"MhcPostCombineNormDecode<{threads}>::run")],
+        cuda_wrappers=[
+            ("run", f"MhcPostCombineNormDecode<{threads}>::run"),
+            (
+                "max_active_ctas",
+                f"MhcPostCombineNormDecode<{threads}>::max_active_ctas",
+            ),
+        ],
     )
 
 
 @cache_once
-def _rows_per_wave(device_index: int, threads: int) -> int:
-    props = torch.cuda.get_device_properties(device_index)
-    return props.multi_processor_count * (
-        props.max_threads_per_multi_processor // threads
+def _rows_per_wave(device_index: int, threads: int, quant: bool) -> int:
+    with torch.cuda.device(device_index):
+        ctas = int(_module(threads).max_active_ctas(quant))
+    return torch.cuda.get_device_properties(device_index).multi_processor_count * ctas
+
+
+def _pick_threads(m: int, device: torch.device, quant: bool) -> int:
+    return min(
+        (640, 320, 160),
+        key=lambda threads: -(-m // _rows_per_wave(device.index, threads, quant)),
     )
-
-
-def _pick_threads(m: int, device: torch.device) -> int:
-    for threads in (640, 320):
-        if m <= _rows_per_wave(device.index, threads):
-            return threads
-    return 160
 
 
 @register_custom_op(mutates_args=["updated", "normalized", "q", "sf"])
@@ -71,13 +76,10 @@ def mhc_post_combine_norm_decode(
     eps: float,
     *,
     quant: bool = False,
-    threads: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Return ``(updated_residual, normed_rows, q, sf)``; ``q``/``sf`` are None
     unless ``quant``."""
     m = x.shape[0]
-    if threads is None:
-        threads = _pick_threads(m, x.device)
     updated, normalized = torch.empty_like(residual), torch.empty_like(x)
     if quant:
         q = torch.empty((m, 5120), dtype=torch.float8_e4m3fn, device=x.device)
@@ -99,7 +101,7 @@ def mhc_post_combine_norm_decode(
         sf,
         eps,
         quant,
-        threads,
+        _pick_threads(m, x.device, quant),
     )
     if not quant:
         return updated, normalized, None, None

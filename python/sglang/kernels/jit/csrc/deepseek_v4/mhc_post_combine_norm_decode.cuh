@@ -20,7 +20,7 @@ struct MhcPostCombineNormDecodeParams {
   bf16_t *residual_out, *output;
   const float *post, *comb, *pre;
   uint8_t *q, *sf;
-  int64_t rows, padded_rows;
+  int64_t rows;
   float eps;
 };
 
@@ -170,18 +170,29 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
   }
 
   if constexpr (Quant) {
-    for (int64_t pad = p.rows + row; pad < p.padded_rows; pad += p.rows) {
-      for (int g = tid; g < kGroups; g += Threads) {
-        const int64_t off =
-            (pad / 128) * kTileBytes + (g / 4) * 512 + ((pad % 32) * 4 + ((pad / 32) % 4)) * 4 + (g % 4);
-        p.sf[off] = 0;
-      }
+    // Word i of the last 128-row tile holds tile row (i % 4) * 32 + (i % 128) / 4.
+    const int first_pad = static_cast<int>(p.rows % 128);
+    auto* tile = reinterpret_cast<uint32_t*>(p.sf + (p.rows / 128) * kTileBytes);
+    for (int i = static_cast<int>(row) * Threads + tid; first_pad && i < kTileBytes / 4;
+         i += static_cast<int>(p.rows) * Threads) {
+      if ((i % 4) * 32 + (i % 128) / 4 >= first_pad) tile[i] = 0;
     }
   }
 }
 
 template <int Threads>
 struct MhcPostCombineNormDecode {
+  static int64_t max_active_ctas(bool quant) {
+    int ctas = 0;
+    if (quant)
+      CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &ctas, mhc_post_combine_norm_decode_kernel<Threads, true>, Threads, 0));
+    else
+      CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &ctas, mhc_post_combine_norm_decode_kernel<Threads, false>, Threads, 0));
+    return ctas;
+  }
+
   static void
   run(tvm::ffi::TensorView x,
       tvm::ffi::TensorView residual,
@@ -227,7 +238,6 @@ struct MhcPostCombineNormDecode {
         quant ? static_cast<uint8_t*>(q.data_ptr()) : nullptr,
         quant ? static_cast<uint8_t*>(sf.data_ptr()) : nullptr,
         rows,
-        padded_rows,
         eps};
     if (quant)
       LaunchKernel(dim3(rows), Threads, dev.unwrap())

@@ -22,7 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from functools import cache, partial
+from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -676,22 +676,14 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
-@cache
-def _decode_post_combine_supported(cfg: HcConfig) -> bool:
+def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     return (
-        get_platform().is_blackwell
+        0 < rows <= DECODE_POST_COMBINE_MAX_ROWS
+        and get_platform().is_blackwell
         and cfg.pre_from_prev
         and cfg.mult == 4
         and cfg.hidden == 5120
         and not cfg.cp_prefill
-    )
-
-
-def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
-    return (
-        envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
-        and 0 < rows <= DECODE_POST_COMBINE_MAX_ROWS
-        and _decode_post_combine_supported(cfg)
         and not is_batch_invariant_mode_enabled()
     )
 

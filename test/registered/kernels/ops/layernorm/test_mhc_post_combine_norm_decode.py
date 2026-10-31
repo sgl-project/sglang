@@ -39,15 +39,15 @@ def _inputs(m: int):
     return x, residual, post, comb, pre, weight
 
 
-def _transition_rows():
+def _transition_rows(quant: bool):
     from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
         MAX_ROWS,
         _rows_per_wave,
     )
 
     rows = {1, MAX_ROWS}
-    for threads in (640, 320):
-        b = _rows_per_wave(torch.cuda.current_device(), threads)
+    for threads in (640, 320, 160):
+        b = _rows_per_wave(torch.cuda.current_device(), threads, quant)
         rows |= {b, b + 1}
     return sorted(r for r in rows if r <= MAX_ROWS)
 
@@ -61,7 +61,7 @@ def test_matches_unfused_across_thread_transitions(quant: bool):
     from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
-    for m in _transition_rows():
+    for m in _transition_rows(quant):
         x, residual, post, comb, pre, weight = _inputs(m)
         updated_ref = mhc_post_split_h(x, residual, post, comb)
         y_ref = hc_combine_norm(updated_ref.flatten(1), pre, weight, EPS)
