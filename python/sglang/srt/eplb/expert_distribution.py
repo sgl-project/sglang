@@ -85,10 +85,7 @@ def should_record_forward_pass(forward_batch: ForwardBatch) -> bool:
         return True
     if _is_model_capture_mode():
         return False
-    if forward_batch.forward_mode not in (
-        ForwardMode.EXTEND,
-        ForwardMode.SPLIT_PREFILL,
-    ):
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
         return False
     return int(forward_batch.extend_num_tokens or 0) > 0
 
