@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -12,7 +14,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 from sglang.multimodal_gen.configs.sample.minimax_h3 import PikaH3FlexSamplingParams
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+    MiniMaxH3DenoiseBranch,
     _minimax_h3_renoise_target_rows_,
+    minimax_h3_denoise_loop,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
+    minimax_h3_packed_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3ReleaseMetadata,
@@ -96,3 +103,79 @@ def test_renoise_update() -> None:
         last, velocity, sigma=0.8, sigma_next=0.0, generator=torch.Generator()
     )
     torch.testing.assert_close(last, denoised)
+
+
+def _renoise_run(seed: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=2,
+        latent_h=4,
+        latent_w=4,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(3, 5120),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+    video_rows = int(branch.update_mask.sum())
+    audio_rows = branch.audio_pos.numel()
+
+    def model_forward(_model, kwargs, step):
+        return (
+            torch.full((video_rows, 96), 0.1 * (step + 1)),
+            torch.full((audio_rows, 32), -0.1 * (step + 1)),
+        )
+
+    sigmas = minimax_h3_time_shift_sigmas(
+        num_steps=6, shift_scale=12.0, dmd_steps=PIKA_KNOTS
+    )
+    return minimax_h3_denoise_loop(
+        model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+        model_forward=model_forward,
+        positive=branch,
+        initial_video_rows=torch.ones(branch.img_pos.numel(), 96),
+        initial_audio_rows=torch.ones(audio_rows, 32),
+        keyframe_cond_rows=None,
+        sigmas_video=sigmas,
+        sigmas_audio=sigmas,
+        device=torch.device("cpu"),
+        renoise_generator=(
+            None if seed is None else torch.Generator().manual_seed(seed)
+        ),
+    )
+
+
+def test_renoise_loop_is_seed_deterministic() -> None:
+    video, audio = _renoise_run(7)
+    again_video, again_audio = _renoise_run(7)
+    assert torch.equal(video, again_video) and torch.equal(audio, again_audio)
+    other_video, _ = _renoise_run(8)
+    assert not torch.equal(video, other_video)
+    euler_video, _ = _renoise_run(None)
+    assert not torch.equal(video, euler_video)
+
+
+def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+
+    monkeypatch.setattr(
+        MiniMaxH3PipelineConfig, "validate_server_args", lambda self, args: None
+    )
+
+    def server_args(explicit: bool, mode: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            lora_merge_mode=mode,
+            is_arg_explicitly_set=lambda name: explicit and name == "lora_merge_mode",
+        )
+
+    implicit = server_args(False, "auto")
+    PikaH3FlexPipelineConfig().validate_server_args(implicit)
+    assert implicit.lora_merge_mode == "dynamic"
+    explicit = server_args(True, "merge")
+    PikaH3FlexPipelineConfig().validate_server_args(explicit)
+    assert explicit.lora_merge_mode == "merge"

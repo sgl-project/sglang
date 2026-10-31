@@ -435,6 +435,14 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
 class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
     """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
 
+    def validate_server_args(self, server_args) -> None:
+        # A BF16 merge rounds away about a third of the adapters' update (by
+        # norm, under auto's 50% cutoff), so keep them unmerged like the
+        # reference unless a merge mode is chosen explicitly.
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "dynamic"
+        super().validate_server_args(server_args)
+
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '

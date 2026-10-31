@@ -825,7 +825,10 @@ downloads only the two adapters (about 5.5 GB) and checks their sha256 against
 Pika's manifests. It then links the base `FL2VA/` and `Ref2VA/` partitions
 from `MiniMaxAI/MiniMax-H3` at the revision the adapters pin, so an existing
 MiniMax-H3 download is reused. The matching adapter loads at startup, and
-`model_index.json` turns on the six-step re-noising schedule.
+`model_index.json` turns on the six-step re-noising schedule. There,
+`stochastic_sampling` requires `dmd_denoising_steps`, which carries the
+knots. The adapter stays unmerged (`--lora-merge-mode dynamic`) unless a merge
+mode is passed: a BF16 merge rounds away about a third of its update.
 
 ```bash Command
 # t2va / fl2va
