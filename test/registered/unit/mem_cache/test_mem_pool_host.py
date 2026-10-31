@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import (
@@ -22,8 +23,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
-from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base, common
 from sglang.srt.mem_cache.pool_host import mamba as mamba_pool_host
+from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
     make_dsa_indexer_pool_decl,
@@ -684,6 +686,7 @@ class TestHostMemoryBudget(CustomTestCase):
             unittest.mock.patch.object(
                 base, "available_host_memory_bytes", return_value=self._AVAILABLE
             ),
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
         ):
             return base.host_memory_budget_bytes()
 
@@ -706,6 +709,228 @@ class TestHostMemoryBudget(CustomTestCase):
             ),
         ):
             self.assertEqual(base.ranks_per_host(), 8)
+
+    @staticmethod
+    def _hugetlb_allocator(free_bytes):
+        return unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=free_bytes),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
+        )
+
+    def _budget_for(
+        self, allocator, device, available, ranks=8, mode="prefer", size="2MB"
+    ):
+        with (
+            unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
+            unittest.mock.patch.object(
+                base, "available_host_memory_bytes", return_value=available
+            ),
+            envs.SGLANG_HUGEPAGE_MODE.override(mode),
+            envs.SGLANG_HUGEPAGE_SIZE.override(size),
+        ):
+            return base.host_memory_budget_bytes(allocator=allocator, device=device)
+
+    def test_budget_is_the_larger_of_plain_ram_and_the_hugetlb_pool(self):
+        # One mapping is served entirely by the hugetlb pool or entirely by
+        # plain pages, so the larger of the two is the budget; the reserve is
+        # for the OS and applies to plain RAM only.
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        for hugetlb_free, expected in (
+            (96 * gib, 96 * gib // 8),  # the hugetlb pool bounds
+            (16 * gib, 64 * gib // 8),  # plain RAM wins
+        ):
+            with self.subTest(hugetlb_free=hugetlb_free):
+                budget = self._budget_for(
+                    self._hugetlb_allocator(hugetlb_free),
+                    "cuda",
+                    available=reserve + 64 * gib,
+                )
+                self.assertEqual(budget, expected)
+
+    def test_hugetlb_credit_is_gated_off(self):
+        # No credit where a mapping cannot take MAP_HUGETLB: npu/musa allocate
+        # with torch.empty(pin_memory=True) and never see the allocator, and
+        # mode=off opts out entirely.
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = self._hugetlb_allocator(96 * gib)
+        for device, mode in (
+            ("npu", "prefer"),
+            (torch.device("xpu"), "prefer"),
+            ("cuda", "off"),
+        ):
+            with self.subTest(device=repr(device), mode=mode):
+                budget = self._budget_for(
+                    allocator, device, available=reserve + 64 * gib, mode=mode
+                )
+                self.assertEqual(budget, 64 * gib // 8)
+                allocator.free_hugetlb_bytes.assert_not_called()
+
+    def test_budget_is_handed_out_in_whole_hugepages(self):
+        mib = 1024**2
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        # 13.5 MiB of claimable plain RAM admits only 6 whole 2 MiB pages.
+        budget = self._budget_for(
+            self._hugetlb_allocator(0),
+            "cuda",
+            available=reserve + 13 * mib + mib // 2,
+            ranks=1,
+        )
+        self.assertEqual(budget, 12 * mib)
+
+    def test_allocation_bytes_rounds_each_mapping_on_the_hugetlb_path(self):
+        # Two 1.1 GiB mappings reserve 4 pages of a 1 GiB-page pool, not the
+        # 3 pages their plain sum suggests: each MAP_HUGETLB mapping rounds up
+        # on its own.
+        gib = 1024**3
+        mapping_lengths = [int(1.1 * gib), int(1.1 * gib)]
+        allocator = unittest.mock.Mock(
+            supports_hugetlb=unittest.mock.Mock(return_value=True)
+        )
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+        ):
+            self.assertEqual(
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "cuda"),
+                4 * gib,
+            )
+            # npu pins through torch and never maps MAP_HUGETLB: plain sum.
+            self.assertEqual(
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "npu"),
+                2 * int(1.1 * gib),
+            )
+        # Without SGLANG_HUGEPAGE_SIZE there is no page size to round to.
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            self.assertEqual(
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "cuda"),
+                2 * int(1.1 * gib),
+            )
+        # mode=off opts out of rounding even with a page size set.
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+        ):
+            self.assertEqual(
+                base.host_memory_allocation_bytes(mapping_lengths, allocator, "cuda"),
+                2 * int(1.1 * gib),
+            )
+
+    def test_plain_budget_is_reported_as_is_without_a_hugetlb_pool(self):
+        # A host below the reserve keeps its negative budget, and the failure
+        # message that shows it, when there is no hugetlb pool to credit.
+        gib = 1024**3
+        budget = self._budget_for(self._hugetlb_allocator(0), "cuda", available=4 * gib)
+        self.assertEqual(
+            budget, (4 * gib - base.HICACHE_HOST_MEMORY_RESERVE_BYTES) // 8
+        )
+
+    def test_required_mode_uses_only_hugetlb(self):
+        gib = 1024**3
+        budget = self._budget_for(
+            self._hugetlb_allocator(24 * gib),
+            "cuda",
+            available=1 << 50,
+            mode="required",
+        )
+        self.assertEqual(budget, 24 * gib // 8)
+        # 9 MiB of hugetlb across 4 ranks is 2.25 MiB each, but a mapping only
+        # ever takes whole 2 MiB pages, so each rank may claim just one page.
+        mib = 1024**2
+        budget = self._budget_for(
+            self._hugetlb_allocator(9 * mib),
+            "cuda",
+            available=0,
+            ranks=4,
+            mode="required",
+        )
+        self.assertEqual(budget, 2 * mib)
+        # ... and without a page size it is a configuration error.
+        with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
+            self._budget_for(
+                unittest.mock.Mock(
+                    supports_hugetlb=unittest.mock.Mock(return_value=True)
+                ),
+                "cuda",
+                available=1 << 50,
+                mode="required",
+                size="",
+            )
+
+    def test_required_mode_is_ignored_by_unsupported_allocation_paths(self):
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=False),
+        )
+        with unittest.mock.patch.object(base, "hugepage_size_requested") as parser:
+            budget = self._budget_for(
+                allocator, "cuda", available=reserve + 64 * gib, mode="required"
+            )
+            self.assertEqual(budget, 64 * gib // 8)
+            parser.assert_not_called()
+        allocator.free_hugetlb_bytes.assert_not_called()
+
+    def test_guard_passes_its_allocator_and_device(self):
+        device_pool = MHATokenToKVPool(
+            size=4,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+
+        def plain_alloc(dims, dtype, device, pin_memory, allocator, **kwargs):
+            return torch.empty(dims, dtype=dtype)
+
+        buffer_info = device_pool.get_device_pool_infos()[0].buffer_info
+        with (
+            unittest.mock.patch.object(
+                base, "host_memory_budget_bytes", return_value=1024**3
+            ) as budget,
+            unittest.mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": plain_alloc}),
+        ):
+            pool = MHATokenToKVPoolHost(
+                buffer_info=buffer_info,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=2,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+                allocator_type="default",
+                device_capacity_tokens=device_pool.size
+                if device_pool.host_capacity_tokens is None
+                else device_pool.host_capacity_tokens,
+                start_layer=device_pool.start_layer,
+                end_layer=device_pool.end_layer,
+            )
+        budget.assert_called_once_with(
+            pool.size * pool.size_per_token, pool.allocator, buffer_info.device
+        )
+
+
+class TestHostTensorAllocatorHugetlb(CustomTestCase):
+    def test_only_the_mmap_allocator_reports_the_hugetlb_pool(self):
+        # Only the base allocate() maps MAP_HUGETLB; an allocator that gets its
+        # memory elsewhere must not be credited with a pool it never touches.
+        gib = 1024**3
+
+        class Elsewhere(common.HostTensorAllocator):
+            def allocate(self, dims, dtype, device):
+                raise NotImplementedError
+
+        with unittest.mock.patch.object(
+            common, "hugetlb_pool_free_bytes", return_value=4 * gib
+        ):
+            self.assertEqual(common.HostTensorAllocator().free_hugetlb_bytes(), 4 * gib)
+            self.assertEqual(common.ShmHostTensorAllocator().free_hugetlb_bytes(), 0)
+            self.assertEqual(Elsewhere().free_hugetlb_bytes(), 0)
 
 
 class TestHostPoolGroup(CustomTestCase):
