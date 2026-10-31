@@ -21,6 +21,7 @@ from sglang.srt.managers.incremental_detokenize import (
     DetokenizeState,
     build_detokenize_header,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.session import uocr_doc_reuse as r
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -506,7 +507,7 @@ class TestMemoryPressure(CustomTestCase):
             output_ids=[],
             full_untruncated_fill_ids=list(range(prompt_len)),
             prefix_len=64 if pending is not None else 0,
-            kv=SimpleNamespace(holds_kv=False, cache_protected_len=0),
+            kv=ReqKvInfo(),
             retraction_count=0,
             uocr_doc=r.UocrReqState(pending=pending),
         )
@@ -1253,7 +1254,7 @@ class TestPrefixHandOff(CustomTestCase):
             full_untruncated_fill_ids=array("q", self.NEW),
             multimodal_inputs=None,
             sampling_params=SimpleNamespace(max_new_tokens=1000, custom_params=cp),
-            kv=SimpleNamespace(holds_kv=False, cache_protected_len=0),
+            kv=ReqKvInfo(),
             extra_key="ek",
             retraction_count=0,
             output_ids=[],
@@ -1301,7 +1302,7 @@ class TestPrefixHandOff(CustomTestCase):
         # The copy into those slots is queued for the next forward.
         self.assertEqual(len(cache.reuse._ops), 1)
         # Once the request holds its row, the row is the only record.
-        req.kv.holds_kv = True
+        req.kv.req_pool_idx = 0
         self.assertIsNone(r.prefix_device_indices(req))
 
     def test_plain_request_has_no_hand_off(self):
@@ -1422,7 +1423,7 @@ class TestRetractedRewrittenWindow(CustomTestCase):
             full_untruncated_fill_ids=array("q", self.NEW),
             multimodal_inputs=SimpleNamespace(mm_items=list(items)),
             sampling_params=SimpleNamespace(max_new_tokens=1000, custom_params=cp),
-            kv=SimpleNamespace(holds_kv=False, cache_protected_len=0),
+            kv=ReqKvInfo(),
             extra_key=None,
             retraction_count=0,
             output_ids=[],
@@ -1504,10 +1505,7 @@ class TestRetainedWindowClaim(CustomTestCase):
     PROMPT = prompt([(0, 200), (1, 200)])
 
     def _finished(self, origin):
-        from sglang.srt.managers.schedule_batch import (
-            FINISH_MATCHED_TOKEN,
-            ReqKvInfo,
-        )
+        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
         out = [PAGE] + list(range(30, 60)) + [EOS]
         committed = len(origin) + len(out) - 1

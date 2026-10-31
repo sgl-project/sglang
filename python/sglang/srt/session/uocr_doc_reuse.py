@@ -912,7 +912,7 @@ class DocReuse:
         st.text_plan = None
         st.match = (None, req.retraction_count)
         req.prefix_len = 0
-        req.kv.cache_protected_len = 0
+        req.kv.protect_prefix(0)
 
     def on_retracted(self, req: Req) -> None:
         """Give a retracted rewritten window its original prompt to recompute."""
@@ -1146,7 +1146,7 @@ class DocReuse:
             cache.session._free_kv_aligned(
                 holder.kv, committed, holder.kv.kv_allocated_len
             )
-            holder.kv.kv_allocated_len = committed
+            holder.kv.truncate(committed)
         out = req.output_ids
         if req.finished_len is not None:
             out = out[: req.finished_len]
@@ -1535,8 +1535,7 @@ class DocReuse:
             req.sampling_params.max_new_tokens += len(forced)
         st.skip_prefill_append = True
         hide_forced_text(req)
-        req.kv.kv_allocated_len += n
-        req.kv.kv_committed_len += n
+        req.kv.allocate_decode(n)
         self._input_overrides[int(row)] = int(plan.forced[-1])
         # Queued behind the copies that read the source, so its freed slots
         # cannot be reallocated and overwritten before they are read.
