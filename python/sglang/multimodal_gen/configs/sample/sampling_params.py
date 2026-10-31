@@ -406,6 +406,7 @@ class SamplingParams:
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
+    rollout_stop_step_index: int | None = None
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = field(
         default=False, metadata={"batch_sig_exclude": True}

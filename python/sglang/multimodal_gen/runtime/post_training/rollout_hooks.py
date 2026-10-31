@@ -111,6 +111,15 @@ def prepare_rollout_if_enabled(
     current_rollout_controller = build_controller(
         batch=batch, pipeline_config=pipeline_config
     )
+    stop_step_index = batch.rollout_stop_step_index
+    if (
+        stop_step_index is not None
+        and len(current_rollout_controller.sigmas) != stop_step_index + 2
+    ):
+        raise ValueError(
+            "rollout_stop_step_index is set, but this pipeline's timestep stage "
+            "did not stop the schedule at that step"
+        )
     batch.rollout_controllers = {VISUAL_STREAM: current_rollout_controller}
 
 
