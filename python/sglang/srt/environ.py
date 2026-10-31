@@ -1730,6 +1730,12 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in: store radix mamba checkpoints only in the hicache host pool.
+    # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
+    # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
+    # still writes. Requires --enable-hierarchical-cache. Off keeps the
+    # donated GPU slot and the previous ratio.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
