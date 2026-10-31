@@ -7,7 +7,6 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
-import os
 import re
 from array import array
 from collections.abc import Iterable
@@ -147,7 +146,6 @@ from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
-    get_bool_env_var,
     rank0_log,
     set_weight_attrs,
 )
@@ -159,7 +157,7 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -1944,9 +1942,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get(
-                "SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950"
-            ).lower()
+            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
