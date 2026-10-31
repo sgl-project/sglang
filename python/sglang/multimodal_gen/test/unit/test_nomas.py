@@ -26,19 +26,23 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
-    Fp8Linear,
     _quantize_block_fp8_activation,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
-    QuantoInt8Linear,
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.loader.nomas_weights import (
     FP8_CHECKPOINT_FORMAT,
-    build_nomas_int8_config,
+    Fp8Linear,
+    NomasInt8Config,
+    QuantoInt8Linear,
     configure_nomas_int8,
     inspect_nomas_fp8_checkpoint,
     inspect_nomas_int8_checkpoint,
+)
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
 from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
@@ -146,8 +150,18 @@ def test_int8_checkpoint_roundtrip_matches_dequantized_dit(tmp_path):
     quant = NomasTransformer3DModel.resolve_checkpoint_quantization([path])
     with pytest.raises(ValueError, match="one complete safetensors file"):
         NomasTransformer3DModel.resolve_checkpoint_quantization([path, path])
-    # This test bypasses resolve_transformer_quant_load_spec.
-    quant.remap_checkpoint_prefixes(NomasTransformer3DModel.param_names_mapping)
+    spec = resolve_transformer_quant_load_spec(
+        hf_config={},
+        server_args=SimpleNamespace(quantization=None, nunchaku_config=None),
+        safetensors_list=[str(path)],
+        component_model_path=str(tmp_path),
+        model_cls=NomasTransformer3DModel,
+        cls_name="NomasTransformer3DModel",
+        checkpoint_quant_config=quant,
+    )
+    quant = spec.quant_config
+    assert isinstance(quant, NomasInt8Config)
+    assert set(quant.layer_shapes) == set(targets)
     loaded = maybe_load_fsdp_model(
         NomasTransformer3DModel,
         {
@@ -192,6 +206,57 @@ def test_int8_checkpoint_roundtrip_matches_dequantized_dit(tmp_path):
         )
 
     torch.testing.assert_close(predict(loaded), predict(reference), rtol=0, atol=0)
+
+
+def test_int8_transformer_loader_rejects_fsdp(tmp_path):
+    """Checkpoint detection must reject FSDP before allocating a Nomas DiT."""
+    path = tmp_path / "nomas-int8.safetensors"
+    save_file(
+        {
+            "double_blocks.0.img_mlp.fc1.weight_q": torch.zeros(
+                2, 128, dtype=torch.int8
+            ),
+            "double_blocks.0.img_mlp.fc1.weight_scale": torch.ones(2, 1),
+        },
+        path,
+        metadata={
+            "format": "nomas-int8-bf16-single-v1",
+            "group_size": "128",
+            "quantization": "symmetric_int8_absmax",
+            "compute_dtype": "bfloat16",
+            "rounding": "half_away_from_zero",
+            "model_type": "HY-Nomas-G/2-32324-MMDiT",
+            "layers": json.dumps({"double_blocks.0.img_mlp.fc1": [2, 128]}),
+        },
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"_class_name": "NomasTransformer3DModel"})
+    )
+    args = SimpleNamespace(
+        component_weights_paths={},
+        component_quantizations={},
+        component_quantization_ignored_layers={},
+        transformer_weights_path=None,
+        quantization=None,
+        nunchaku_config=None,
+        model_paths={},
+        pipeline_config=SimpleNamespace(
+            dit_config=NomasConfig(), transformer_class_override=None
+        ),
+        should_start_component_on_cpu=lambda _: True,
+        should_use_fsdp_for_component=lambda _: True,
+    )
+    # Use real checkpoint discovery, model hook, resolver and capability check.
+    # Model allocation is forbidden: the error must happen before loading weights.
+    with (
+        patch.object(
+            NomasTransformer3DModel,
+            "__init__",
+            side_effect=AssertionError("FSDP must be rejected before model allocation"),
+        ),
+        pytest.raises(ValueError, match="nomas_int8 does not support FSDP"),
+    ):
+        TransformerLoader().load_customized(str(tmp_path), args, "transformer")
 
 
 def condition(device="cpu", dtype=torch.float32, padded=True):
@@ -1193,7 +1258,7 @@ def int8_layer():
         2,
         bias=True,
         params_dtype=torch.bfloat16,
-        quant_config=build_nomas_int8_config({"projection": [2, 130]}),
+        quant_config=NomasInt8Config({"projection": [2, 130]}),
         prefix="projection",
     )
     with torch.no_grad():
@@ -1215,14 +1280,16 @@ def test_int8_group_boundary_and_partial_final_group(int8_layer):
     "cls", [torch.nn.Linear, ColumnParallelLinear, RowParallelLinear]
 )
 def test_int8_dtype_moves_preserve_scales_and_output(int8_layer, cls):
-    model = torch.nn.Module()
+    model = tiny_model().bfloat16()
     kwargs = {} if cls is torch.nn.Linear else {"params_dtype": torch.bfloat16}
     model.projection = cls(130, 2, bias=True, **kwargs)
     model.camera = torch.nn.Linear(64, 64, dtype=torch.bfloat16)
     camera = model.camera
-    configure_nomas_int8(model, build_nomas_int8_config({"projection": [2, 130]}))
+    configure_nomas_int8(model, NomasInt8Config({"projection": [2, 130]}))
     assert model.camera is camera
     layer = model.projection
+    if cls is not torch.nn.Linear:
+        assert type(layer) is cls
     with torch.no_grad():
         for name, value in int8_layer.named_parameters():
             getattr(layer, name).copy_(value)
@@ -1311,7 +1378,7 @@ def test_parallel_weight_loaders_preserve_group_scales(cls, rank):
         4,
         bias=False,
         params_dtype=torch.bfloat16,
-        quant_config=build_nomas_int8_config({"projection": [4, 256]}),
+        quant_config=NomasInt8Config({"projection": [4, 256]}),
         prefix="projection",
         tp_group=SimpleNamespace(world_size=2, rank_in_group=rank),
         **kwargs,
@@ -1340,7 +1407,7 @@ def test_int8_row_parallel_rejects_unaligned_input_shards():
             4,
             bias=False,
             params_dtype=torch.bfloat16,
-            quant_config=build_nomas_int8_config({"projection": [4, 130]}),
+            quant_config=NomasInt8Config({"projection": [4, 130]}),
             prefix="projection",
             tp_group=SimpleNamespace(world_size=2, rank_in_group=0),
         )

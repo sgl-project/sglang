@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_config import (
@@ -19,18 +20,76 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_confi
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
-    Fp8Linear,
     validate_fp8_block_device,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
-    QuantoInt8ColumnParallelLinear,
-    QuantoInt8Linear,
-    QuantoInt8RowParallelLinear,
 )
 
 GROUP_SIZE = 128
 INT8_CHECKPOINT_FORMAT = "nomas-int8-bf16-single-v1"
 FP8_CHECKPOINT_FORMAT = "pixelumm_fp8_bf16_single_v1"
+
+
+class NomasInt8Config(QuantoInt8Config):
+    """Official Nomas manifest with shared groupwise weight-only INT8 compute."""
+
+    supports_fsdp = False
+    supports_quantized_cpu_load = True
+
+    def __init__(self, layers: dict[str, list[int]]):
+        super().__init__(
+            set(layers),
+            group_size=GROUP_SIZE,
+            scale_dtype=torch.float32,
+            compute_dtype=torch.bfloat16,
+        )
+        self.layer_shapes = layers
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "nomas_int8"
+
+    def remap_checkpoint_prefixes(self, param_names_mapping: dict) -> None:
+        from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+        mapper = get_param_names_mapping(param_names_mapping)
+        mapped = {}
+        for name, shape in self.layer_shapes.items():
+            target = mapper(name + ".weight")[0].removesuffix(".weight")
+            if target in mapped:
+                raise ValueError(f"Duplicate mapped INT8 layer: {target}")
+            mapped[target] = shape
+        self.layer_shapes = mapped
+        self.layer_prefixes = set(mapped)
+
+
+class QuantoInt8Linear(ReplicatedLinear):
+    """Replicated INT8 linear with nn.Linear's tensor return contract."""
+
+    def forward(self, x):
+        return super().forward(x)[0]
+
+
+class Fp8Linear(ReplicatedLinear):
+    """Replicated serialized FP8 linear with nn.Linear's tensor return contract."""
+
+    def _apply(self, fn, recurse=True):
+        # Byte views keep serialized FP8 weights and FP32 scales intact while
+        # carrying device/non_blocking semantics through the supplied transform.
+        protected = [
+            parameter
+            for name, parameter in self.named_parameters(recurse=False)
+            if parameter.dtype == torch.float8_e4m3fn
+            or name in ("weight_scale", "weight_scale_inv", "input_scale")
+        ]
+
+        def preserve_serialized_dtype(tensor):
+            if any(tensor is parameter for parameter in protected):
+                return fn(tensor.view(torch.uint8)).view(tensor.dtype)
+            return fn(tensor)
+
+        return super()._apply(preserve_serialized_dtype, recurse=recurse)
+
+    def forward(self, x):
+        return super().forward(x)[0]
 
 
 def inspect_nomas_fp8_checkpoint(weight_files):
@@ -197,7 +256,7 @@ def inspect_nomas_int8_checkpoint(path):
                 and reader.get_slice(key).get_dtype() != "BF16"
             ):
                 raise ValueError(f"Nomas INT8 unquantized tensor must be BF16: {key}")
-    return build_nomas_int8_config(layers)
+    return NomasInt8Config(layers)
 
 
 def resolve_nomas_checkpoint_quantization(weight_files):
@@ -221,30 +280,6 @@ def resolve_nomas_vae_checkpoint_configurator(weight_files, dtype):
     # Residency may start on CPU; validate the device that will run inference.
     validate_fp8_block_device(get_local_torch_device())
     return partial(configure_nomas_fp8, shapes=shapes)
-
-
-def build_nomas_int8_config(layers):
-    """Describe official Nomas storage using the shared INT8 configuration."""
-    return QuantoInt8Config(
-        set(layers),
-        group_size=GROUP_SIZE,
-        scale_dtype=torch.float32,
-        compute_dtype=torch.bfloat16,
-        layer_shapes=layers,
-        supports_fsdp=False,
-        supports_quantized_cpu_load=True,
-    )
-
-
-def validate_nomas_int8_config(quant_config):
-    if not (
-        isinstance(quant_config, QuantoInt8Config)
-        and quant_config.group_size == GROUP_SIZE
-        and quant_config.scale_dtype == torch.float32
-        and quant_config.compute_dtype == torch.bfloat16
-        and quant_config.layer_shapes is not None
-    ):
-        raise ValueError("Nomas supports only its official INT8 checkpoint format")
 
 
 def configure_nomas_int8(model, quant_config):
@@ -286,11 +321,7 @@ def configure_nomas_int8(model, quant_config):
                     reduce_results=original.reduce_results,
                     input_sizes=original.input_sizes,
                 )
-            cls = (
-                QuantoInt8ColumnParallelLinear
-                if isinstance(original, ColumnParallelLinear)
-                else QuantoInt8RowParallelLinear
-            )
+            cls = type(original)
         elif type(original) is nn.Linear:
             cls = QuantoInt8Linear
         else:

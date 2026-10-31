@@ -24,11 +24,14 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
+    QuantoInt8LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import ModulateProjection
 from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+    NomasInt8Config,
     configure_nomas_int8,
     resolve_nomas_checkpoint_quantization,
-    validate_nomas_int8_config,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -293,8 +296,8 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             raise ValueError("Conflicting Nomas quantization configs")
         quant_config = quant_config or config.quant_config
-        if quant_config is not None:
-            validate_nomas_int8_config(quant_config)
+        if quant_config is not None and not isinstance(quant_config, NomasInt8Config):
+            raise ValueError("Nomas supports only its official INT8 checkpoint format")
         if attention_backend == "auto":
             # FA3 + log-sum-exp merge is about 2x FlexAttention on Hopper.
             attention_backend = "fa3" if current_platform.is_hopper() else "flex"
@@ -333,6 +336,23 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.c2ws_hidden_states_layer2 = nn.Linear(64, 64)
         if quant_config is not None:
             configure_nomas_int8(self, quant_config)
+
+    def _apply(self, fn, recurse=True):
+        # Protect INT8 scales at the model boundary. Byte views carry device and
+        # non_blocking transforms through without rounding the FP32 values.
+        modules = self.modules() if recurse else (self,)
+        protected = {
+            id(module.weight_scale)
+            for module in modules
+            if isinstance(getattr(module, "quant_method", None), QuantoInt8LinearMethod)
+        }
+
+        def preserve_scale_dtype(tensor):
+            if id(tensor) in protected:
+                return fn(tensor.view(torch.uint8)).view(tensor.dtype)
+            return fn(tensor)
+
+        return super()._apply(preserve_scale_dtype, recurse=recurse)
 
     def post_load_weights(self):
         # Meta initialization / to_empty() does not restore nonpersistent buffers

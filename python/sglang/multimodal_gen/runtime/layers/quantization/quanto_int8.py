@@ -11,10 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
     LinearMethodBase,
-    ReplicatedLinear,
-    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
@@ -137,32 +134,6 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         return F.linear(x, weight, bias)
 
 
-class _Int8ScaleMixin:
-    """Keep checkpoint scale precision during component dtype/device moves."""
-
-    def _apply(self, fn, recurse=True):
-        original = self.weight_scale.detach()
-        result = super()._apply(fn, recurse=recurse)
-        if self.weight_scale.dtype != original.dtype:
-            self.weight_scale.data = original.to(self.weight_scale.device)
-        return result
-
-
-class QuantoInt8ColumnParallelLinear(_Int8ScaleMixin, ColumnParallelLinear):
-    """Column-parallel INT8 storage retaining serialized scale precision."""
-
-
-class QuantoInt8RowParallelLinear(_Int8ScaleMixin, RowParallelLinear):
-    """Row-parallel INT8 storage retaining serialized scale precision."""
-
-
-class QuantoInt8Linear(_Int8ScaleMixin, ReplicatedLinear):
-    """Replicated INT8 linear with nn.Linear's tensor return contract."""
-
-    def forward(self, x):
-        return super().forward(x)[0]
-
-
 def normalize_quanto_int8_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -182,8 +153,5 @@ def normalize_quanto_int8_weights(
 
 __all__ = [
     "QuantoInt8LinearMethod",
-    "QuantoInt8ColumnParallelLinear",
-    "QuantoInt8RowParallelLinear",
-    "QuantoInt8Linear",
     "normalize_quanto_int8_weights",
 ]
