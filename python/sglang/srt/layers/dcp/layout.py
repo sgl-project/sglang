@@ -69,9 +69,17 @@ def localize_dcp_indices(
 
     interleave_block = torch.div(indices, interleave_size, rounding_mode="floor")
     is_local = (indices >= 0) & (interleave_block % dcp_size == dcp_rank)
-    local_block = torch.div(interleave_block, dcp_size, rounding_mode="floor")
-    local_indices = local_block * interleave_size + indices % interleave_size
+    local_indices = dcp_local_row(indices, dcp_size, interleave_size)
     return torch.where(is_local, local_indices, torch.full_like(indices, -1))
+
+
+def dcp_local_row(
+    indices: torch.Tensor, dcp_size: int, interleave_size: int = 1
+) -> torch.Tensor:
+    """The row each index occupies in its owner's pool, whichever rank that is."""
+    interleave_block = torch.div(indices, interleave_size, rounding_mode="floor")
+    local_block = torch.div(interleave_block, dcp_size, rounding_mode="floor")
+    return local_block * interleave_size + indices % interleave_size
 
 
 def maybe_dcp_kernel_indices(
@@ -102,17 +110,51 @@ def filter_dcp_local_chunk_kv_indices(
     kv_indices: torch.Tensor,
     chunk_starts_cpu: torch.Tensor,
     chunk_seq_lens_cpu: torch.Tensor,
+    interleave_size: int = 1,
 ) -> torch.Tensor:
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return kv_indices
 
     dcp_size = parallel.dcp_size
+    if interleave_size != 1:
+        offsets = _dcp_local_chunk_offsets(
+            chunk_starts_cpu.tolist(),
+            chunk_seq_lens_cpu.tolist(),
+            dcp_size,
+            parallel.dcp_rank,
+            interleave_size,
+        )
+        return kv_indices[offsets.to(kv_indices.device)]
     parts = []
     offset = 0
     for start, length in zip(chunk_starts_cpu.tolist(), chunk_seq_lens_cpu.tolist()):
         first = (parallel.dcp_rank - start) % dcp_size
         parts.append(kv_indices[offset + first : offset + length : dcp_size])
+        offset += length
+    return torch.cat(parts)
+
+
+def _dcp_local_chunk_offsets(
+    chunk_starts, chunk_seq_lens, dcp_size: int, dcp_rank: int, interleave_size: int
+) -> torch.Tensor:
+    """Host offsets into the concatenated chunks of the positions this rank owns.
+
+    Per chunk, in position order. Walks owned runs, not positions, so a 1M-token
+    prefix costs ~1M / dcp_size host ints and no device sync.
+    """
+    cycle = dcp_size * interleave_size
+    run = torch.arange(interleave_size, dtype=torch.int64)
+    parts = [torch.empty(0, dtype=torch.int64)]
+    offset = 0
+    for start, length in zip(chunk_starts, chunk_seq_lens):
+        end = start + length
+        # Start of this rank's run at or before `start` (may be negative).
+        first = start - (start - dcp_rank * interleave_size) % cycle
+        run_starts = torch.arange(first, end, cycle, dtype=torch.int64)
+        positions = (run_starts[:, None] + run).reshape(-1)
+        positions = positions[(positions >= start) & (positions < end)]
+        parts.append(positions - start + offset)
         offset += length
     return torch.cat(parts)
 

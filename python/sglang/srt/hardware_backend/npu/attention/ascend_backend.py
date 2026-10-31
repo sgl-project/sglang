@@ -24,6 +24,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
+    NPUDecodeContextParallelMetadata,
+    build_dcp_extend_gather_plan,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -700,6 +704,15 @@ class AscendAttnBackend(AttentionBackend):
                         device=self.device, dtype=torch.int32
                     )
                 )
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            # Here, not in the model's prepare: deciding needs the forward mode
+            # and extend_seq_lens_cpu, which prepare is not given.
+            if isinstance(dcp_metadata, NPUDecodeContextParallelMetadata):
+                dcp_metadata.extend_gather_plan = build_dcp_extend_gather_plan(
+                    forward_batch,
+                    interleave_size=self.page_size,
+                    device=self.device,
+                )
 
         if (
             self.use_mla
@@ -1107,6 +1120,57 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+
+    def _forward_sparse_dcp_gathered(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        topk_indices: Optional[torch.Tensor],
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        dcp_metadata: NPUDecodeContextParallelMetadata,
+    ) -> torch.Tensor:
+        """DCP extend over the context the model gathered, one contiguous run
+        per request: TND keys, cumulative lengths, no block table.
+
+        Relative indices, cumulative lengths. Three of the four conventions
+        return plausible garbage: re-probe before changing.
+        """
+        if self.kv_cache_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                f"KV cache dtype {self.kv_cache_dtype} with decode context "
+                "parallelism is not supported: the gathered extend path is "
+                "bf16/fp16 only."
+            )
+        key_nope, key_rope = dcp_metadata.extend_kv
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope,
+            key=key_nope,
+            value=key_nope,
+            query_rope=q_pe,
+            key_rope=key_rope,
+            sparse_indices=_expand_dsa_sparse_indices(topk_indices),
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            sparse_block_size=1,
+            layout_query="TND",
+            # layout_kv must equal layout_query unless it is PA_BSND. The block
+            # table is omitted, not passed as None: to a tiling function the two
+            # are not always the same thing.
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        return attn_out
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -1538,6 +1602,21 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            # extend_kv is set by the model only for a DCP extend that gathered the KV.
+            dcp_metadata = forward_batch.attn_dcp_metadata
+            if (
+                isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+                and dcp_metadata.extend_kv is not None
+            ):
+                return self._forward_sparse_dcp_gathered(
+                    q_nope,
+                    q_pe,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    dcp_metadata,
+                )
+
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
