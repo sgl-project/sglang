@@ -770,7 +770,6 @@ class TestAllocationIntegration(CustomTestCase):
                         if policy == "early"
                         else ["recompute", "metadata"],
                     )
-                    self.assertEqual(queue._num_published_destinations, 1)
                 finally:
                     override.restore()
 

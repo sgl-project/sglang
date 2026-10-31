@@ -2885,10 +2885,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        # This queue now covers them.
-        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
-        if prealloc_queue is not None:
-            prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _kv_checksum_comparable(self, signature: int) -> bool:
         """Digests compare only when the prefill digested this decode's layout.

@@ -49,8 +49,8 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     # A pin source is busy: the whole band stays where it is.
     pinned: bool = False
     # Pages ``[first, end)`` holding every page that cannot move (a load
-    # reservation, a quarantined page); the band's extent must keep covering
-    # them. None when there is none.
+    # reservation); the band's extent must keep covering them. None when there
+    # is none.
     fixed: Optional[Tuple[int, int]] = None
 
     @property

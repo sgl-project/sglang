@@ -1132,7 +1132,7 @@ class TestTriGeometry(CustomTestCase):
                 tokens = (vp[:, None] * ps + torch.arange(ps)[None, :]).flatten()
                 a.free(tokens)
                 self.assertGreater(fa._flush(urgent=False), 0)
-                self.assertGreater(len(fa._pending_reuse_pages_cpu), 0)
+                self.assertGreater(len(fa.usage.pending_pages), 0)
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
                     member.pin_sources = (lambda: True,)
@@ -1159,7 +1159,7 @@ class TestTriGeometry(CustomTestCase):
                     fa.set_latest_forward_done_event(None)
                 with patch("torch.cuda.current_stream", return_value=stream):
                     fa.flush_for_allocation()
-                    self.assertFalse(fa._pending_reuse)
+                    self.assertFalse(fa.usage.pending_by_key())
                     n = max(
                         n
                         for n in range(1, 10)
