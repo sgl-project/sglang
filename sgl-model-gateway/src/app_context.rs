@@ -21,7 +21,9 @@ use crate::{
     routers::router_manager::RouterManager,
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
-    wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
+    wasm::{
+        config::WasmRuntimeConfig, module_manager::WasmModuleManager, module_roots::ModuleRoots,
+    },
 };
 
 /// Error type for AppContext builder
@@ -57,6 +59,9 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
+    /// Directories WASM modules may be loaded from. Present exactly when
+    /// `wasm_manager` is, so registration always has an allow-list to check against.
+    pub wasm_module_roots: Option<Arc<ModuleRoots>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
 }
@@ -87,6 +92,7 @@ pub struct AppContextBuilder {
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_manager: Option<Arc<OnceLock<Arc<McpManager>>>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
+    wasm_module_roots: Option<Arc<ModuleRoots>>,
 }
 
 impl AppContext {
@@ -127,6 +133,7 @@ impl AppContextBuilder {
             workflow_engines: None,
             mcp_manager: None,
             wasm_manager: None,
+            wasm_module_roots: None,
         }
     }
 
@@ -224,6 +231,17 @@ impl AppContextBuilder {
         self
     }
 
+    /// Set the module roots directly, bypassing [`RouterConfig`].
+    ///
+    /// The normal path is `with_wasm_manager`, which derives the roots from
+    /// configuration. This setter exists so that callers assembling a context by
+    /// hand — tests, chiefly — can supply roots too; without it a hand-built
+    /// context has `wasm_module_roots: None` and every registration is refused.
+    pub fn wasm_module_roots(mut self, roots: Option<Arc<ModuleRoots>>) -> Self {
+        self.wasm_module_roots = roots;
+        self
+    }
+
     pub fn build(self) -> Result<AppContext, AppContextBuildError> {
         let router_config = self
             .router_config
@@ -279,6 +297,7 @@ impl AppContextBuilder {
                 .mcp_manager
                 .ok_or(AppContextBuildError("mcp_manager"))?,
             wasm_manager: self.wasm_manager,
+            wasm_module_roots: self.wasm_module_roots,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
         })
@@ -512,15 +531,27 @@ impl AppContextBuilder {
     }
 
     /// Create wasm manager if enabled in config
+    ///
+    /// The module allow-list is established here, alongside the manager, so the
+    /// two cannot get out of step: if WASM is usable, registration has roots to
+    /// confine it. A missing or unreadable root aborts startup rather than
+    /// leaving module registration able to read anywhere on the filesystem.
     fn with_wasm_manager(mut self, config: &RouterConfig) -> Result<Self, String> {
-        self.wasm_manager = if config.enable_wasm {
-            Some(Arc::new(
-                WasmModuleManager::new(WasmRuntimeConfig::default())
-                    .map_err(|e| format!("Failed to initialize WASM module manager: {}", e))?,
-            ))
-        } else {
-            None
-        };
+        if !config.enable_wasm {
+            self.wasm_manager = None;
+            self.wasm_module_roots = None;
+            return Ok(self);
+        }
+
+        let roots = ModuleRoots::load(&config.wasm_module_roots)
+            .map_err(|e| format!("Failed to configure WASM module roots: {}", e))?;
+        debug!("WASM modules may be loaded from: {:?}", roots.roots());
+
+        self.wasm_manager = Some(Arc::new(
+            WasmModuleManager::new(WasmRuntimeConfig::default())
+                .map_err(|e| format!("Failed to initialize WASM module manager: {}", e))?,
+        ));
+        self.wasm_module_roots = Some(Arc::new(roots));
         Ok(self)
     }
 }
