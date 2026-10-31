@@ -11,8 +11,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    HostPoolConfig,
     HostPoolGroupConfig,
     check_packed_kv_rows,
+    collect_host_pool_infos,
     is_mla_pool,
     prepare_host_pool_config,
     with_packed_draft_layer_mapping,
@@ -28,7 +30,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
+from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -1276,7 +1278,7 @@ def build_mamba_host_pool(
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
-    decls: tuple[HostPoolDecl, ...],
+    kv_pool: Any,
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
     start_layer: int,
@@ -1305,14 +1307,12 @@ def build_hybrid_mamba_stack(
     mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     qsa_draft_pools = params.mtp_draft_device_pools if qsa_pool is not None else ()
     config = prepare_host_pool_config(
-        decls=decls,
+        root=kv_pool,
         full_layer_mapping=full_layer_mapping,
         transfer_layer_id_max=transfer_layer_id_max,
         transfer_page_size=params.page_size,
         packed_draft_device_pools=params.mtp_draft_device_pools,
     )
-    root = config.pools[0]
-    kv_pool = root.decl.device_pool
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
@@ -1331,7 +1331,7 @@ def build_hybrid_mamba_stack(
         page_size=params.page_size,
         use_mla=use_mla,
         host_size=kv_host_size,
-        mtp_draft_device_pools=root.packed_draft_device_pools,
+        mtp_draft_device_pools=config.packed_draft_device_pools,
     )
     mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
@@ -1373,8 +1373,8 @@ def build_hybrid_mamba_stack(
                 ),
                 device_pool=qsa_pool,
                 # The KV config carries the packed draft tail layers.
-                layer_mapping=root.layer_mapping,
-                transfer_layer_id_max=root.transfer_layer_id_max,
+                layer_mapping=config.layer_mapping,
+                transfer_layer_id_max=config.transfer_layer_id_max,
                 packed_draft_device_pools=qsa_draft_pools,
             )
         )
@@ -1637,7 +1637,7 @@ def build_unified_host_stack(
         return None if cache is None else (lambda n: cache.evict_host(n, component))
 
     owner_config = prepare_host_pool_config(
-        decls=storage.view(owner).host_pool_decls(),
+        root=storage.view(owner),
         full_layer_mapping=layer_maps[owner],
         transfer_layer_id_max=transfer_layer_id_max,
         transfer_page_size=page_size,
@@ -1645,10 +1645,10 @@ def build_unified_host_stack(
     )
     if owner not in host_pools:
         host_pools[owner] = build_kv_host_pool(
-            kv_pool=owner_config.pools[0].decl.device_pool,
+            kv_pool=owner_config.root,
             page_size=page_size,
             host_size=host_sizes[owner],
-            mtp_draft_device_pools=owner_config.pools[0].packed_draft_device_pools,
+            mtp_draft_device_pools=owner_config.packed_draft_device_pools,
             pool_label=owner,
         )
     entries = _build_pool_entries(
@@ -1656,7 +1656,6 @@ def build_unified_host_stack(
         root_host_pool=host_pools[owner],
         # The owner's host pool evicts on demand only when it shares a backing.
         root_host_evict_fn=evict_host(owner_component) if envelope else None,
-        translated_device_pool=storage.view(owner),
         device_translate=storage.host_ids(owner),
     )
     component_host_pools = {owner_component: host_pools[owner]}
@@ -1750,30 +1749,42 @@ def build_unified_host_stack(
         host_pool_group=host_pool_group,
         cache_controller=cache_controller,
         component_host_pools=component_host_pools,
-        sidecars=[
-            c.decl.sidecar_spec() for c in owner_config.pools if not c.decl.is_primary
-        ]
+        sidecars=[c.sidecar_spec() for c in owner_config.sidecars]
         + _mtp_swa_sidecar_specs(host_pool_group),
         loads_state_layer_wise=any(s.holds_state for s in sub_pools),
         pools_desc=" + ".join(e.name.value.upper() for e in entries),
-        pool_declarations=tuple(c.decl for c in owner_config.pools),
+        device_pool_names=owner_config.pool_names,
     )
 
 
-def build_host_pool_group(
-    *,
-    config: HostPoolGroupConfig,
-) -> HostPoolGroup:
-    """Allocate host pools and transfer entries from prepared configs."""
-    root = config.pools[0]
+def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
     root_host_pool = build_kv_host_pool(
-        kv_pool=root.decl.device_pool,
+        kv_pool=config.root,
         page_size=config.transfer_page_size,
-        mtp_draft_device_pools=root.packed_draft_device_pools,
+        mtp_draft_device_pools=config.packed_draft_device_pools,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
     )
+
+
+def _build_sidecar_host_pool(
+    *, config: HostPoolConfig, root: Any, root_host_pool: Any
+) -> DSAIndexerPoolHost:
+    host = DSAIndexerPoolHost(
+        config.buffer_info,
+        layer_mapping=config.device_to_host_layer,
+        target_device_layer_num=root.layer_num,
+        num_host_pages=root_host_pool.page_num,
+        transfer_page_size=root_host_pool.page_size,
+        layout=root_host_pool.layout,
+        buffer_device=root.device,
+        dtype=root.store_dtype,
+        layer_sharded=root.layer_shard_enabled,
+        allocator_type=_get_allocator_type(),
+    )
+    host.start_layer, host.end_layer = root.start_layer, root.end_layer
+    return host
 
 
 def _build_pool_entries(
@@ -1781,38 +1792,36 @@ def _build_pool_entries(
     config: HostPoolGroupConfig,
     root_host_pool: Any,
     root_host_evict_fn: Optional[Callable[[int], Any]] = None,
-    translated_device_pool: Any = None,
     device_translate: Optional[Callable[[Any], Any]] = None,
 ) -> list[PoolEntry]:
-    """``device_translate`` maps controller ids to rows for the entries over
-    ``translated_device_pool`` (a unified owner's view); sidecars over other
-    device pools index them as they are."""
-    host_pools = {config.pools[0].decl.pool_name: root_host_pool}
-    entries = []
-    for pool_config in config.pools:
-        decl = pool_config.decl
-        if not decl.is_layout_root:
-            host_pools[decl.pool_name] = decl.host_pool_builder.build(
-                decl=decl,
-                anchor_host=host_pools[decl.layout_source],
-                allocator_type=_get_allocator_type(),
-                packed_draft_device_pools=pool_config.packed_draft_device_pools,
-            )
+    """``device_translate`` maps controller ids to rows of ``config.root`` (a
+    unified owner's view), which every entry here indexes."""
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=root_host_pool,
+            device_pool=config.root,
+            layer_mapping=config.layer_mapping,
+            transfer_layer_id_max=config.transfer_layer_id_max,
+            is_anchor=True,
+            host_evict_fn=root_host_evict_fn,
+            packed_draft_device_pools=config.packed_draft_device_pools,
+            device_translate=device_translate,
+        )
+    ]
+    for sidecar in config.sidecars:
+        host_pool = _build_sidecar_host_pool(
+            config=sidecar, root=config.root, root_host_pool=root_host_pool
+        )
         entries.append(
             build_pool_entry(
-                name=decl.pool_name,
-                host_pool=host_pools[decl.pool_name],
-                device_pool=decl.device_pool,
-                layer_mapping=pool_config.layer_mapping,
-                transfer_layer_id_max=pool_config.transfer_layer_id_max,
-                is_anchor=decl.is_primary,
-                host_evict_fn=root_host_evict_fn if decl.is_layout_root else None,
-                packed_draft_device_pools=pool_config.packed_draft_device_pools,
-                device_translate=(
-                    device_translate
-                    if decl.device_pool is translated_device_pool
-                    else None
-                ),
+                name=sidecar.pool_name,
+                host_pool=host_pool,
+                device_pool=config.root,
+                layer_mapping=sidecar.layer_mapping,
+                transfer_layer_id_max=config.transfer_layer_id_max,
+                packed_draft_device_pools=config.packed_draft_device_pools,
+                device_translate=device_translate,
             )
         )
     return entries
@@ -1913,30 +1922,27 @@ def build_full_draft_pools(
         )
     ]
 
-    if isinstance(pool, DSATokenToKVPool) and pool.index_k_with_scale_buffer:
-        from sglang.srt.mem_cache.pool_host.dsa import (
-            DSAIndexerPoolHost,
-            make_dsa_indexer_pool_decl,
+    if isinstance(pool, DSATokenToKVPool):
+        config = prepare_host_pool_config(
+            root=pool,
+            full_layer_mapping=draft_layer_mapping,
+            transfer_layer_id_max=pool.layer_num,
+            transfer_page_size=controller.page_size,
         )
-
-        # Separate draft indexer: its own host pool laid out on the draft KV
-        # host pool, but transfer indices still follow the target KV anchor.
-        indexer_decl = make_dsa_indexer_pool_decl(pool, name=PoolName.DRAFT_INDEXER)
-        indexer_host_pool = DSAIndexerPoolHost(
-            decl=indexer_decl,
-            anchor_host=draft_host_pool,
-            allocator_type=_get_allocator_type(),
-        )
-        specs.append(indexer_decl.sidecar_spec())
-        entries.append(
-            build_pool_entry(
-                name=PoolName.DRAFT_INDEXER,
-                host_pool=indexer_host_pool,
-                device_pool=pool,
-                layer_mapping=draft_layer_mapping,
-                transfer_layer_id_max=indexer_host_pool.layer_num,
+        for sidecar in config.sidecars:
+            indexer_host_pool = _build_sidecar_host_pool(
+                config=sidecar, root=pool, root_host_pool=draft_host_pool
             )
-        )
+            specs.append(SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
+            entries.append(
+                build_pool_entry(
+                    name=PoolName.DRAFT_INDEXER,
+                    host_pool=indexer_host_pool,
+                    device_pool=pool,
+                    layer_mapping=sidecar.layer_mapping,
+                    transfer_layer_id_max=pool.layer_num,
+                )
+            )
 
     if isinstance(draft_kv_pool, QSATokenToKVPool):
         specs.append(SidecarPoolSpec(PoolName.DRAFT_INDEXER, PoolName.KV))
@@ -2111,7 +2117,7 @@ class StackBuildResult:
     # on the KV pool's load-back counter as KV reads do.
     loads_state_layer_wise: bool = False
     pools_desc: str = ""
-    pool_declarations: Optional[tuple[HostPoolDecl, ...]] = None
+    device_pool_names: Optional[tuple[PoolName, ...]] = None
 
 
 class StackStrategy:
@@ -2304,7 +2310,7 @@ class _MambaStrategy(StackStrategy):
         )
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
-            decls=kvcache.host_pool_decls(),
+            kv_pool=kvcache.full_kv_pool,
             mamba_pool=params.token_to_kv_pool_allocator.state.pool,
             full_layer_mapping=full_layer_mapping,
             start_layer=kvcache.start_layer,
@@ -2326,18 +2332,16 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
-            sidecars=[
-                c.decl.sidecar_spec() for c in config.pools if not c.decl.is_primary
-            ]
+            sidecars=[c.sidecar_spec() for c in config.sidecars]
             + (
                 [SidecarPoolSpec(PoolName.INDEXER, PoolName.KV)]
                 if qsa_pool is not None
                 else []
             ),
-            pool_declarations=tuple(c.decl for c in config.pools),
+            device_pool_names=config.pool_names,
             loads_state_layer_wise=True,
             pools_desc=" + ".join(
-                [c.decl.pool_name.value.upper() for c in config.pools]
+                [name.value.upper() for name in config.pool_names]
                 + ["MAMBA"]
                 + (["INDEXER"] if qsa_pool is not None else [])
             ),
@@ -2626,7 +2630,7 @@ class _DsaStrategy(StackStrategy):
         enable_storage_metrics=False,
     ):
         config = prepare_host_pool_config(
-            decls=kvcache.host_pool_decls(),
+            root=kvcache,
             full_layer_mapping={i: i for i in range(kvcache.layer_num)},
             transfer_layer_id_max=kvcache.layer_num,
             transfer_page_size=params.page_size,
@@ -2659,11 +2663,9 @@ class _DsaStrategy(StackStrategy):
             component_host_pools={
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
             },
-            sidecars=[
-                c.decl.sidecar_spec() for c in config.pools if not c.decl.is_primary
-            ],
-            pools_desc=" + ".join(c.decl.pool_name.value.upper() for c in config.pools),
-            pool_declarations=tuple(c.decl for c in config.pools),
+            sidecars=[c.sidecar_spec() for c in config.sidecars],
+            pools_desc=" + ".join(name.value.upper() for name in config.pool_names),
+            device_pool_names=config.pool_names,
         )
 
 
@@ -2695,31 +2697,30 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
     )
 
 
-# Strategies that assemble from host_pool_decls(), so every declared pool has an
-# entry by construction. A miss here is a bug, not an unsupported combination.
-_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy, _MambaStrategy)
+_INFO_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy, _MambaStrategy)
 
 
-def _check_declared_pools_present(
+def _check_device_pools_present(
     *, kvcache: Any, result: StackBuildResult, strategy: StackStrategy
 ) -> None:
-    entries = result.host_pool_group.entry_map
-    decls = result.pool_declarations
-    if decls is None:
-        decls = kvcache.host_pool_decls()
-    missing = [d.pool_name.value for d in decls if d.pool_name not in entries]
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    names = result.device_pool_names
+    if names is None:
+        root = (
+            kvcache.full_kv_pool if isinstance(kvcache, HybridLinearKVPool) else kvcache
+        )
+        infos = collect_host_pool_infos(root)
+        names = tuple(info.pool_name for info in infos) or (PoolName.KV,)
+    missing = [
+        name.value for name in names if name not in result.host_pool_group.entry_map
+    ]
     if not missing:
         return
-    msg = (
-        f"{type(kvcache).__name__} declares host pools {missing} that "
-        f"{type(strategy).__name__} did not assemble"
-    )
-    if isinstance(strategy, _DECLARATION_VERIFIED_STRATEGIES):
+    msg = f"{type(kvcache).__name__} exposes device pools {missing} that {type(strategy).__name__} did not assemble"
+    if isinstance(strategy, _INFO_VERIFIED_STRATEGIES):
         raise ValueError(msg)
-    # Pre-declaration strategies: restoring KV without these pools (e.g. the
-    # indexer's key buffers) corrupts sparse attention after a host hit.
-    # Loud until the path is migrated.
-    logger.error("%s; host restore of these pools is unsupported on this path", msg)
+    logger.error("%s. Host restore of these pools is unsupported on this path", msg)
 
 
 def _apply_stack_result(
@@ -2803,7 +2804,7 @@ def attach_hybrid_pool_to_unified_cache(
                 model_name=get_serving().served_model_name,
                 enable_storage_metrics=cache._enable_metrics_flag,
             )
-            _check_declared_pools_present(
+            _check_device_pools_present(
                 kvcache=kvcache, result=result, strategy=strategy
             )
         _apply_stack_result(cache, kvcache, params, result)

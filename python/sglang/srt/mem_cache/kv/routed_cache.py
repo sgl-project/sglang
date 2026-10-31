@@ -126,9 +126,6 @@ class RoutedKVCache(KVCache):
     def get_contiguous_buf_infos(self):
         return self._owner_view.get_contiguous_buf_infos()
 
-    def host_pool_decls(self):
-        return self._owner_view.host_pool_decls()
-
     def get_kv_cache_quant_method(self):
         """The first quantized view's method, else the views' unquantized one."""
         fallback = None
