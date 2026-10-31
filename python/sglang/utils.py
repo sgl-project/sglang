@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import shlex
 import ssl
 import subprocess
 import sys
@@ -470,8 +471,7 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     Supports leading KEY=VALUE env vars (e.g. "VAR=1 python script.py") so that
     notebook/CI commands work without requiring shell=True.
     """
-    command = command.replace("\\\n", " ").replace("\\", " ")
-    parts = command.split()
+    parts = shlex.split(command.replace("\\\n", ""))
     env = os.environ.copy()
     i = 0
     while i < len(parts):
