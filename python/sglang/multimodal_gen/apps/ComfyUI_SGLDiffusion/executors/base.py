@@ -47,26 +47,34 @@ def _hash_value(digest, value) -> None:
 _PER_CHUNK_TRANSFORMER_OPTIONS = ("cond_or_uncond", "uuids")
 
 
-def _slice_batch_row(value, index: int, batch: int):
+def _slice_batch_row(value, index: int, batch: int, _memo=None):
     """Row ``index`` of a batched ComfyUI argument.
 
     ComfyUI concatenates every cond-derived kwarg to the full batch, so a
     leading dim of ``batch`` is per-row and 1 is shared; any other size is
-    ambiguous and rejected rather than guessed.
+    ambiguous and rejected rather than guessed. A tensor repeated in the
+    value (one Flux control residual across blocks) maps to one slice.
     """
+    if _memo is None:
+        _memo = {}
     if torch.is_tensor(value):
         if value.ndim == 0 or value.shape[0] == 1:
             return value
         if value.shape[0] == batch:
-            return value[index : index + 1]
+            if id(value) not in _memo:
+                _memo[id(value)] = (value, value[index : index + 1])
+            return _memo[id(value)][1]
         raise ValueError(
             f"cannot split a batch of {batch} on a tensor of shape {tuple(value.shape)}"
         )
     if type(value) in (list, tuple):
-        return type(value)(_slice_batch_row(item, index, batch) for item in value)
+        return type(value)(
+            _slice_batch_row(item, index, batch, _memo) for item in value
+        )
     if type(value) is dict:
         return {
-            key: _slice_batch_row(item, index, batch) for key, item in value.items()
+            key: _slice_batch_row(item, index, batch, _memo)
+            for key, item in value.items()
         }
     return value
 
@@ -146,10 +154,25 @@ def _reject_unapplied_conditioning(adapter, kwargs) -> None:
         )
 
 
+def _push_worker_status() -> None:
+    """Send the status text to the ComfyUI page so SGLDWorkerStatus updates mid-run."""
+    try:
+        from server import PromptServer
+    except ImportError:  # not running inside ComfyUI
+        return
+    from ..core.generator import SGLDiffusionGenerator
+
+    PromptServer.instance.send_sync(
+        "sgld.worker_status", {"text": SGLDiffusionGenerator.shared().status_text()}
+    )
+
+
 class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
+    # The worker's RequestMetrics for the latest DiT call; read by SGLDWorkerStatus.
+    last_metrics = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -321,6 +344,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
             value = packed.extra_req.get(key)
             if value is not None:
                 extra[key] = value
+        if packed.control:
+            extra["comfyui_control"] = packed.control
         req.extra = extra
         req.generator = [
             torch.Generator("cuda") for _ in range(req.num_outputs_per_prompt)
@@ -328,6 +353,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
         if output_batch.error:
             raise RuntimeError(f"SGLang Diffusion worker failed: {output_batch.error}")
+        self.last_metrics = output_batch.metrics
+        _push_worker_status()
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
 
     def forward(self, x, timestep, context, **kwargs):
