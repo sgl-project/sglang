@@ -52,6 +52,14 @@ Use `bench_serving` by default unless there are specific needs.
   python3 -m sglang.bench_serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
   ```
 
+When choosing random inputs for `python3 -m sglang.benchmark.serving`:
+
+- `--dataset-name random` samples tokens from ShareGPT and repeats or truncates them to the requested input lengths. It downloads ShareGPT from Hugging Face unless you provide a valid local ShareGPT JSON file with `--dataset-path`.
+- `--dataset-name random --dataset-path /path/to/sharegpt.json` uses your local ShareGPT data without downloading the dataset.
+- `--dataset-name random-ids` generates token IDs directly, without downloading a dataset. It produces a different input distribution from `random`; choose it explicitly rather than treating the two as interchangeable in benchmark comparisons.
+
+These options apply to the benchmark client on CPU, regardless of the server's hardware. For a fully offline run, you also need a running local server and locally available model and tokenizer files; use `--tokenizer /path/to/tokenizer` to load the client's tokenizer locally. Avoiding the dataset download alone does not make the entire benchmark offline.
+
 **`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
 
   ```bash Command
