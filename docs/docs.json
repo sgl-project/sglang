@@ -1466,6 +1466,7 @@
                   {
                     "group": "Jina AI",
                     "pages": [
+                      "cookbook/autoregressive/Jina/Jina-OCR",
                       "cookbook/autoregressive/Jina/Jina-reranker-m0"
                     ]
                   },
