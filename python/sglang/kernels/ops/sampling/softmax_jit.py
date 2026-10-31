@@ -164,11 +164,12 @@ def _config_cost(
     )
     layers = (waves - 1) * occupancy + tail_layers
     factor = _SHARED_SM_FACTOR[min(layers, occupancy, len(_SHARED_SM_FACTOR)) - 1]
-    if input_bytes < 4 and vecs_per_thread * _vec_size(_device_info()[0]) <= _PAIRED_ELEMS:
+    if (
+        input_bytes < 4
+        and vecs_per_thread * _vec_size(_device_info()[0]) <= _PAIRED_ELEMS
+    ):
         factor *= _HALF_INPUT_PAIRED_FACTOR
-    return (
-        waves * _WAVE_OVERHEAD + layers * vecs_per_thread * threads / 512
-    ) * factor
+    return (waves * _WAVE_OVERHEAD + layers * vecs_per_thread * threads / 512) * factor
 
 
 def _select_config(

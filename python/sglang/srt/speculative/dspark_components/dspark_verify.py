@@ -8,11 +8,11 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
     BlockwiseRejection,
     RejectionNoise,
 )
-from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -79,6 +79,7 @@ _is_npu = is_npu()
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
+
 
 def target_model_type(target_worker) -> Optional[str]:
     return getattr(

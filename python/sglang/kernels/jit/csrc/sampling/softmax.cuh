@@ -99,7 +99,7 @@ struct alignas(8) SoftmaxStats {
 };
 
 struct SoftmaxParams {
-  const void* input;  // InT[rows][input_stride]
+  const void* input;          // InT[rows][input_stride]
   float* output;              // may alias `input` when InT is float
   const float* temperatures;  // nullptr, or one per `rows_per_request` rows
   int64_t input_stride;

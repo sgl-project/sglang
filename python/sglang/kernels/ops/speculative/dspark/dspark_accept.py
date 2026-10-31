@@ -635,9 +635,7 @@ def accept_greedy(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = sampling_argmax(target_logits).view(
-        bs, verify_num_draft_tokens
-    )
+    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -687,9 +685,7 @@ def accept_greedy_triton(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = sampling_argmax(target_logits).view(
-        bs, verify_num_draft_tokens
-    )
+    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
