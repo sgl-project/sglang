@@ -717,6 +717,11 @@ class TestIsNonPersistentBufferName(CustomTestCase):
 
 
 class TestHashTensor(CustomTestCase):
+    def test_checksum_preserves_pre_identity_gpu_value(self):
+        """The trainer's checksum remains compatible with the legacy GPU kernel."""
+        t = torch.arange(1 << 20, dtype=torch.int32, device="cuda")
+        self.assertEqual(_hash_tensor(t), "217789f197e070fe")
+
     def test_stable_for_same_input(self):
         t = torch.arange(64, dtype=torch.float32).cuda()
         self.assertEqual(_hash_tensor(t), _hash_tensor(t.clone()))
