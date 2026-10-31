@@ -163,7 +163,9 @@ def check_regex_ast_complexity(
         # Invalid regex syntax will be handled downstream by the parser
         return
 
-    if len(parsed) > max_ast_nodes:
+    # Let known linear patterns reach the bounded FSM builder, even when they
+    # contain more AST nodes than this structural pre-filter allows.
+    if len(parsed) > max_ast_nodes and _estimate_fixed_regex_states(pattern) is None:
         raise JSONSchemaStateExplosion(
             f"Regex AST node count ({len(parsed)}) exceeds budget ({max_ast_nodes})"
         )
@@ -406,10 +408,9 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
         (sre_parse.AT, sre_parse.AT_BEGINNING),
         (sre_parse.AT, sre_parse.AT_BEGINNING_STRING),
     )
-    # A bounded repetition of one character atom needs only states for the
-    # current run length, whether or not the pattern has start/end anchors.
-    # Do not extend this shortcut to a larger expression: an ambiguous prefix
-    # can need many states to remember candidate match positions.
+    # A standalone bounded repetition of one character atom needs only states
+    # for the current run length, even without anchors. Other unanchored
+    # expressions can need states for many candidate match positions.
     body = list(parsed)
     if is_start_anchored:
         body.pop(0)
@@ -418,6 +419,13 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
         (sre_parse.AT, sre_parse.AT_END_STRING),
     ):
         body.pop()
+    if (
+        not is_start_anchored
+        and body
+        and all(op == sre_parse.LITERAL for op, _ in body)
+    ):
+        return len(body) + 1
+
     if len(body) == 1 and body[0][0] in (
         sre_parse.MAX_REPEAT,
         sre_parse.MIN_REPEAT,
@@ -425,8 +433,6 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
         _, max_rep, child = body[0][1]
         if max_rep != sre_parse.MAXREPEAT and is_single_character_atom(child):
             return max_rep + 1
-    elif not is_start_anchored:
-        return None
 
     if not is_start_anchored:
         return None
@@ -454,6 +460,17 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
             else:
                 return None
         return width
+
+    if body and body[-1][0] in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+        min_rep, max_rep, child = body[-1][1]
+        if (
+            min_rep != max_rep
+            and max_rep != sre_parse.MAXREPEAT
+            and is_single_character_atom(child)
+        ):
+            prefix_width = fixed_width(body[:-1])
+            if prefix_width is not None:
+                return prefix_width + max_rep + 1
 
     width = fixed_width(parsed)
     return None if width is None else width + 1

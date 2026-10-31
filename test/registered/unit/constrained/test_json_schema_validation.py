@@ -276,6 +276,8 @@ class TestBoundedLinearPatterns(CustomTestCase):
         "^[0-9a-f]{64}$",  # SHA-256
         "^[0-9a-f]{128}$",  # SHA-512
         "^[a-z]{32,64}$",  # Bounded ranges of one character atom grow linearly.
+        "^key_[a-z0-9]{32,64}$",  # A fixed prefix keeps the range linear.
+        "a" * 501,  # Long literal patterns must reach the actual FSM budget check.
         "[0-9a-f]{64}",  # Unanchored SHA-256: a homogeneous repetition is linear.
         "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
         "^(?:[0-9a-f]{8}){8}$",
@@ -582,11 +584,14 @@ class TestRegexASTComplexityValidation(unittest.TestCase):
         """Bounded repetition of exactly 100 inside quantifier should pass."""
         check_regex_ast_complexity(r"(a{100})+")
 
-    def test_check_regex_ast_complexity_rejects_excessive_ast_nodes(self):
-        """Pattern with >500 AST nodes should be rejected."""
-        pattern = "a" * 501  # Each literal is a node
+    def test_check_regex_ast_complexity_rejects_excessive_non_linear_ast(self):
+        """Large patterns without a linear estimate still hit the AST limit."""
+        pattern = "[ab]*" + "a" * 501
         with self.assertRaises(JSONSchemaStateExplosion):
             check_regex_ast_complexity(pattern)
+
+    def test_check_regex_ast_complexity_accepts_large_linear_literal(self):
+        check_regex_ast_complexity("a" * 501)
 
     def test_check_regex_ast_complexity_accepts_boundary_ast_nodes(self):
         """Pattern with exactly 500 AST nodes should pass."""
@@ -600,6 +605,12 @@ class TestBoundedFSMConstruction(CustomTestCase):
             JSONSchemaStateExplosion, "before determinization completed"
         ):
             build_fsm_with_budget(r"[ab]*a[ab]{13}", max_states=16)
+
+    def test_large_linear_literal_reaches_fsm_state_budget(self):
+        with self.assertRaisesRegex(
+            JSONSchemaStateExplosion, "before determinization completed"
+        ):
+            build_fsm_with_budget("a" * 501, max_states=16)
 
 
 class TestFSMBudgetValidation(unittest.TestCase):
