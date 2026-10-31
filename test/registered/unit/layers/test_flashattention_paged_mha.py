@@ -7,10 +7,6 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-# sgl_kernel is mocked for the whole module, not under patch.dict: that would
-# evict every module first imported beneath it from sys.modules on exit, and
-# FlashAttentionBackend.__init__'s lazy ServerArgs resolution would then
-# re-execute them (and their native extensions) against the real package.
 for _module in ("sgl_kernel", "sgl_kernel.quantization", "sgl_kernel.scalar_type"):
     sys.modules.setdefault(_module, MagicMock())
 
