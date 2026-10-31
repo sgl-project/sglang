@@ -1741,15 +1741,21 @@ class UnifiedRadixCache(BasePrefixCache):
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
         )
+        transfers = self.cache_controller._l2_load_transfers(
+            load_host, load_device, load_pools
+        )
         completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
+            transfers,
             transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
         self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
             (id(self), "restore"), completion.finish_event
         )
+        storage = self.token_to_kv_pool_allocator.storage
+        if storage is not None:
+            storage.record_host_transfer(
+                completion.finish_event, transfers, writes=True
+            )
         req.kv.restore_done_event = completion.finish_event
         self._pending_restore_backups.append((completion.finish_event, backup))
 
