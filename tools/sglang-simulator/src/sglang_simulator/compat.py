@@ -97,3 +97,48 @@ def validate_benchmark_runtime() -> None:
             f"{', '.join(missing)}. The simulator must be adapted to this "
             "SGLang revision before it can run."
         )
+
+
+def request_prefix_length(req) -> int:
+    """Read the cached-prefix representation used by the installed Req API.
+
+    Newer Req exposes a scalar; earlier Req stores the cached token indices.
+    Neither field is a default for the full input length or a cost fallback.
+    """
+    value = getattr(req, "prefix_len", None)
+    if value is not None:
+        if type(value) is not int or value < 0:
+            raise SGLangCompatibilityError(
+                "Req.prefix_len must be a nonnegative integer"
+            )
+        return value
+    indices = getattr(req, "prefix_indices", None)
+    if indices is not None:
+        return len(indices)
+    raise SGLangCompatibilityError(
+        "Req has neither prefix_len nor prefix_indices; adapt the Simulator to this Req API"
+    )
+
+
+def request_extend_length(req) -> int:
+    """Read the actual prefill token count from a supported Req representation.
+
+    The Range API exposes ``extend_range.length``; its start/end pair is not
+    itself a two-token sequence. Missing metadata is never replaced by zero.
+    """
+    for name in ("extend_input_len", "extend_len"):
+        value = getattr(req, name, None)
+        if value is not None:
+            if type(value) is not int or value < 0:
+                raise SGLangCompatibilityError(
+                    f"Req.{name} must be a nonnegative integer"
+                )
+            return value
+    span = getattr(req, "extend_range", None)
+    value = getattr(span, "length", None)
+    if type(value) is int and value >= 0:
+        return value
+    raise SGLangCompatibilityError(
+        "Req has no valid extend_input_len, extend_len or extend_range.length; "
+        "adapt the Simulator to this Req API"
+    )

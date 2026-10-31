@@ -8,15 +8,7 @@ from sglang_simulator.compat import (
     apply_simulator_server_args,
     validate_launch_runtime,
 )
-from sglang_simulator.simulation.sglang.hook_bootstrap import (
-    install_simulator_hooks,
-    run_simulator_detokenizer_process,
-    run_simulator_scheduler_process,
-)
 from sglang_simulator.utils import get_logger
-
-install_simulator_hooks()
-
 
 logger = get_logger("sgl_simulator")
 
@@ -71,7 +63,19 @@ def apply_simulator_defaults(raw_args: argparse.Namespace, argv: list[str]) -> N
     torch.cuda.get_device_capability = lambda *_args, **_kwargs: (10, 0)
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    from sglang_simulator.afd.launch import prepare_launch
+
+    argv, afd_temporary_config = prepare_launch(sys.argv[1:] if argv is None else argv)
+    if argv is None:
+        return
+    from sglang_simulator.simulation.sglang.hook_bootstrap import (
+        install_simulator_hooks,
+        run_simulator_detokenizer_process,
+        run_simulator_scheduler_process,
+    )
+
+    install_simulator_hooks()
     validate_launch_runtime()
 
     from sglang.srt.entrypoints.http_server import launch_server
@@ -86,7 +90,6 @@ if __name__ == "__main__":
     g = parser.add_argument_group("simulation")
     SimulationArgs.add_cli_args(g)
 
-    argv = sys.argv[1:]
     raw_args = parser.parse_args(argv)
     apply_simulator_defaults(raw_args, argv)
     apply_simulator_server_args(raw_args)
@@ -107,3 +110,9 @@ if __name__ == "__main__":
         )
     finally:
         kill_process_tree(os.getpid(), include_parent=False)
+        if afd_temporary_config is not None:
+            afd_temporary_config.cleanup()
+
+
+if __name__ == "__main__":
+    main()
