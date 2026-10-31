@@ -191,6 +191,7 @@ impl TryFrom<api::SamplingParams> for SamplingParams {
                 key: watermark.key,
                 context_window: watermark.context_window,
             }),
+            ngram_corpus_ids: p.ngram_corpus_ids.map(|l| l.items),
             ..defaults
         })
     }
