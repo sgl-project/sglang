@@ -30,8 +30,10 @@ GATE_WITHOUT_COUNT = frozenset(
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForCausalLMMTP",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5ForSequenceClassification",
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5VLForSequenceClassification",
         "Qwen4ExpForCausalLMMTP",
         "Qwen4ExpForConditionalGeneration",
     }
