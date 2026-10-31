@@ -102,6 +102,7 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
@@ -1836,7 +1837,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # A grammar reaching its terminal state ends generation regardless of
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
-            self.tool_call_parser == "glm47"
+            FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
+            is Glm47MoeDetector
             and bool(effective_tools)
             and request.tool_choice != "none"
             and not any(tool.function.strict for tool in effective_tools)
@@ -3450,6 +3452,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = "high" if enabled else "no_think"
             else:
                 request.reasoning_effort = "medium" if enabled else "no_think"
+            return
+
+        if self.reasoning_parser == "flint":
+            if not enabled:
+                raise ValueError(
+                    "Reasoning parser 'flint' has no thinking toggle and cannot "
+                    "be disabled via Anthropic thinking"
+                )
             return
 
         if self.reasoning_parser == "iquest_q1":

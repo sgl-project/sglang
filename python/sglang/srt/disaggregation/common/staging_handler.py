@@ -107,6 +107,11 @@ class DecodeStagingHandler:
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
+        self._staging_lifecycle = threading.Condition()
+        self._room_tokens: dict[int, object] = {}
+        self._inflight_submits: dict[object, int] = {}
+        self._claimed_chunks: set[tuple[object, int]] = set()
+        self._closing_rooms: set[int] = set()
 
         k_buffers = kv_buffer_info["k_buffers"]
         assert k_buffers, "k_buffers must not be empty"
@@ -195,8 +200,12 @@ class DecodeStagingHandler:
         if self.device.type == "xpu":
             decode_req._req_to_token_ready = create_device_event(self.device)
             decode_req._req_to_token_ready.record(self.scheduler.schedule_stream)
-        self._room_to_decode_req[room] = decode_req
-        self._room_to_receiver[room] = decode_req.kv_receiver
+        with self._staging_lifecycle:
+            while room in self._closing_rooms:
+                self._staging_lifecycle.wait()
+            self._room_tokens[room] = object()
+            self._room_to_decode_req[room] = decode_req
+            self._room_to_receiver[room] = decode_req.kv_receiver
         # Scatter offsets shift suffix-relative page_start by the decode prefix,
         # exact only when the prefix is page-aligned. Fail just this request on a
         # mismatch instead of raising, which would kill the prefill scheduler.
@@ -213,22 +222,32 @@ class DecodeStagingHandler:
             decode_req._staging_failed = True
 
     def unregister_decode_req(self, room: int) -> None:
-        # Pop before release_room so no new arrival can start consuming the slots.
-        decode_req = self._room_to_decode_req.pop(room, None)
-        receiver = self._room_to_receiver.pop(room, None)
-        self._writer_counts.pop(room, None)
-        if decode_req is not None:
-            self.release_room(room, decode_req, receiver)
-        self.kv_manager._staging_ctx.room_receivers.pop(room, None)
-        self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+        with self._staging_lifecycle:
+            while room in self._closing_rooms:
+                self._staging_lifecycle.wait()
+            self._closing_rooms.add(room)
+            token = self._room_tokens.pop(room, None)
+            decode_req = self._room_to_decode_req.pop(room, None)
+            receiver = self._room_to_receiver.pop(room, None)
+            self._writer_counts.pop(room, None)
+            while token is not None and self._inflight_submits.get(token, 0):
+                self._staging_lifecycle.wait()
+
+        try:
+            if decode_req is not None:
+                self.release_room(room, decode_req, receiver)
+            self.kv_manager._staging_ctx.room_receivers.pop(room, None)
+            self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
+        finally:
+            with self._staging_lifecycle:
+                self._closing_rooms.remove(room)
+                self._staging_lifecycle.notify_all()
 
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
         clean Success, releases watermark-pinning leaks on failure/abort."""
-        # Drain in-flight scatters before freeing anything, including one whose
-        # event is not yet in _chunk_events (submit_chunk_scatter records it
-        # after launching the kernel), so no scatter reads a freed staging slot
-        # or writes into KV-pool pages the failure path frees for reuse.
+        # submit_chunk_scatter publishes its event before teardown reaches here.
+        # Drain those scatters before freeing their staging and KV-pool slots.
         stream = self.staging_allocator._scatter_stream
         if stream is not None:
             stream.synchronize()
@@ -263,42 +282,57 @@ class DecodeStagingHandler:
         Called from decode_thread.  Records a device event on decode_req so
         the main thread can later check completion and free the allocation.
         """
-        decode_req = self._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "[STAGING] submit_chunk_scatter: room=%s not registered, "
-                "chunk_idx=%s. This should not happen if register_decode_req "
-                "is called at kv_receiver.init() time.",
-                room,
-                chunk_idx,
-            )
-            return False
-        receiver = self._room_to_receiver.get(room)
-        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
-        if chunk_idx >= len(chunk_infos):
-            return False
-        alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
-        if staging_offset < 0 or alloc_id < 0:
-            return False
+        with self._staging_lifecycle:
+            decode_req = self._room_to_decode_req.get(room)
+            if decode_req is None:
+                logger.warning(
+                    "[STAGING] submit_chunk_scatter: room=%s not registered, "
+                    "chunk_idx=%s. This should not happen if register_decode_req "
+                    "is called at kv_receiver.init() time.",
+                    room,
+                    chunk_idx,
+                )
+                return False
+            receiver = self._room_to_receiver.get(room)
+            token = self._room_tokens.get(room)
+            chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+            if token is None or chunk_idx >= len(chunk_infos):
+                return False
+            alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
+            claim = (token, chunk_idx)
+            if staging_offset < 0 or alloc_id < 0 or claim in self._claimed_chunks:
+                return False
+            self._claimed_chunks.add(claim)
+            self._inflight_submits[token] = self._inflight_submits.get(token, 0) + 1
 
-        ok = self._scatter_region(
-            staging_offset, page_start, num_pages, decode_req, receiver
-        )
-        if ok:
-            event = create_device_event(self.device)
-            event.record(self.staging_allocator._scatter_stream)
-            # Append before zeroing so the completion check always sees either
-            # the slot or the event.
-            decode_req._chunk_events.append((event, alloc_id))
-            chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
-        else:
-            logger.warning(
-                "submit_chunk_scatter failed room=%s chunk_idx=%s tp_rank=%s",
-                room,
-                chunk_idx,
-                self.tp_rank,
+        try:
+            ok = self._scatter_region(
+                staging_offset, page_start, num_pages, decode_req, receiver
             )
-        return ok
+            if ok:
+                event = create_device_event(self.device)
+                event.record(self.staging_allocator._scatter_stream)
+                # Append before zeroing so the completion check always sees either
+                # the slot or the event.
+                decode_req._chunk_events.append((event, alloc_id))
+                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+            else:
+                logger.warning(
+                    "submit_chunk_scatter failed room=%s chunk_idx=%s tp_rank=%s",
+                    room,
+                    chunk_idx,
+                    self.tp_rank,
+                )
+            return ok
+        finally:
+            with self._staging_lifecycle:
+                self._claimed_chunks.remove(claim)
+                remaining = self._inflight_submits[token] - 1
+                if remaining:
+                    self._inflight_submits[token] = remaining
+                else:
+                    del self._inflight_submits[token]
+                    self._staging_lifecycle.notify_all()
 
     def is_staging_room(self, room: int) -> bool:
         """Check if a room is registered for staging scatter."""
