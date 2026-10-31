@@ -1,10 +1,10 @@
 """CPU tests execute the actual upstream-worktree eligibility method."""
 
 import ast
-from pathlib import Path
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 SOURCE = (
