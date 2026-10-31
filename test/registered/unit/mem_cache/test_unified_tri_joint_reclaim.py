@@ -35,6 +35,8 @@ from sglang.test.unified_allocator_fixtures import (
     build_tri_cache,
     chain_snapshot,
     float_chain,
+    hold_band,
+    release_band,
     setup_allocator_context,
 )
 
@@ -397,7 +399,7 @@ class TestTriJointReclaim(CustomTestCase):
                     c.insert(InsertParams(key=key, value=slots))
                     records = [(key, slots.clone())]
                 for member in a._flush_targets():
-                    member.pin_sources = (lambda: True,)
+                    hold_band(member)
                 if grouped:
                     a.free_group_begin()
                 self.assertGreaterEqual(a.available_size(), page_size)
@@ -437,7 +439,7 @@ class TestTriJointReclaim(CustomTestCase):
         # Close every movement gate. The finite request quotas may still reclaim
         # cache bytes; actual allocation and each phase remain separately visible.
         for member in a._flush_targets():
-            member.pin_sources = (lambda: True,)
+            hold_band(member)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
             patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
@@ -814,7 +816,7 @@ class TestTriJointReclaim(CustomTestCase):
                 # Admitted before the pin: a take that reused that answer would
                 # move the pinned band. It must plan again from what is pinned.
                 self.assertTrue(a.ensure_capacity(4, 4))
-                member.add_pin_source(lambda: True)
+                hold_band(member)
                 bound = member.ids.virtual_to_physical.clone()
                 with patch(
                     "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
@@ -834,7 +836,7 @@ class TestTriJointReclaim(CustomTestCase):
                 if got is not None:
                     a.free(got)
                 self.check_payload(b, a, slots[1:], states[1:], states)
-                member.pin_sources = ()
+                release_band(member)
                 self.assertTrue(a.ensure_capacity(4, 4))
                 self.assertIsNotNone(a.alloc(4))
                 self.check_payload(b, a, slots[1:], states[1:], states)
@@ -1078,7 +1080,7 @@ class TestTriGeometry(CustomTestCase):
                 self.check_saved(a, saved)
         self.assertEqual(recognized, {1, 4, 16})
 
-    def test_gate_change_invalidates_end_certificate(self):
+    def test_held_pages_bound_the_take_without_freezing_the_chain(self):
         for pd_open, host_open in ((True, False), (False, True), (False, False)):
             with self.subTest(pd_open=pd_open, host_open=host_open):
                 a, kv, mk = build_geometry(1, (1, 4), True, "swa_edges", False)
@@ -1088,20 +1090,36 @@ class TestTriGeometry(CustomTestCase):
                 )
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
-                    member.pin_sources = (lambda: not pd_open, lambda: not host_open)
-                before = snapshot(a)
+                    # Two holders; the band stays while either holds it.
+                    for key, opened in (("pd", pd_open), ("host", host_open)):
+                        if not opened:
+                            hold_band(member, key)
                 self.assertFalse(
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
                 )
-                with patch.object(
-                    a.arena, "move_units", wraps=a.arena.move_units
-                ) as copies:
-                    self.assertFalse(a.ensure_capacity(5, 5))
-                self.assertEqual(copies.call_count, 0)
-                # Zero-copy FLOAT boundary absorption is legal even with movement gated.
-                self.check_saved(a, saved)
+                # Held pages stay put; the planner may still lay the rest out
+                # around them, and its answer is the take's.
+                held = {
+                    member.sub_pool_name: {
+                        p: int(member.ids.physical_to_virtual[p])
+                        for p in member.fixed_pages()
+                    }
+                    for member in a._flush_targets()
+                }
+                fits = a.ensure_capacity(5, 5)
+                got = a.alloc(5)
+                self.assertEqual(fits, got is not None)
                 for member in a._flush_targets():
-                    member.pin_sources = ()
+                    for page, virtual in held[member.sub_pool_name].items():
+                        self.assertEqual(
+                            int(member.ids.physical_to_virtual[page]), virtual
+                        )
+                self.check_saved(a, saved)
+                if got is not None:
+                    a.free(got)
+                for member in a._flush_targets():
+                    release_band(member, "pd")
+                    release_band(member, "host")
                 self.assertTrue(a.ensure_capacity(5, 5))
                 self.assertIsNotNone(a.alloc(5))
                 self.check_saved(a, saved)
@@ -1135,7 +1153,7 @@ class TestTriGeometry(CustomTestCase):
                 self.assertGreater(len(fa.usage.pending_pages), 0)
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
-                    member.pin_sources = (lambda: True,)
+                    hold_band(member)
                 before = snapshot(a)
                 predictions = [
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), n * ps)
@@ -1153,7 +1171,7 @@ class TestTriGeometry(CustomTestCase):
                     )
                 self.assertEqual(snapshot(a), before)
                 for member in a._flush_targets():
-                    member.pin_sources = ()
+                    release_band(member)
                 if not urgent:
                     event.fired = True
                     fa.set_latest_forward_done_event(None)

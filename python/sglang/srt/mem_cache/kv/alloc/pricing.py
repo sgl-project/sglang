@@ -46,8 +46,6 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     num_virtual_pages: int
     low_page: int = 0  # float only
     high_page: int = 0  # float only
-    # A pin source is busy: the whole band stays where it is.
-    pinned: bool = False
     # Pages ``[first, end)`` holding every page that cannot move (a load
     # reservation); the band's extent must keep covering them. None when there
     # is none.
@@ -140,7 +138,6 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
-        band.pinned_by_source(),
         band.fixed_extent(),
     )
 
@@ -937,7 +934,7 @@ def _fixed_takes(
     b: BandSnapshot, pages: int, *, step: str, total_bytes: int
 ) -> Tuple[PlanTake, ...]:
     """The takes a band that stays in place can make, as extents on bytes. An
-    end compacted first (any step but NO_MOVE, when not pinned) holds just its
+    end compacted first (any step but NO_MOVE) holds just its
     live pages, reaching as far as its farthest fixed page with holes between;
     otherwise it keeps its span and reuses its holes. A float in place reuses
     holes and extends one side, either one."""
@@ -945,7 +942,7 @@ def _fixed_takes(
     if b.grow == "float":
         low, high = b.low_byte // e, b.high_byte // e
         holes = b.holes
-    elif step != NO_MOVE and not b.pinned and (b.lazy or b.fixed is None):
+    elif step != NO_MOVE and (b.lazy or b.fixed is None):
         if b.grow == "up":
             low, high = b.min_page, b.min_page + b.live
             if b.fixed is not None:
@@ -1095,8 +1092,8 @@ def plan(
     leftmost on every float's own grid decides whether it fits, and the fit
     only gets easier as the segment's low frontier falls, so of a fixed band's
     takes the one with the lowest high byte is kept: the walk is exact for
-    this world and linear in the number of bands. A pinned band is always in
-    place; a band's fixed pages only bound where it may be laid out: a
+    this world and linear in the number of bands. A band's fixed pages only
+    bound where it may be laid out: a
     compacted end reaches its farthest fixed page, a relocated float's block
     covers them.
     """
@@ -1114,9 +1111,7 @@ def plan(
         pages = demands.get(b.name, 0)
         if b.live + pages > b.num_pages - b.min_page:
             return None
-        placed = b.transparent or (
-            b.grow == "float" and step == RELAYOUT and not b.pinned
-        )
+        placed = b.transparent or (b.grow == "float" and step == RELAYOUT)
         if placed:
             if b.live or pages:
                 movers.append((b, pages))
@@ -1162,7 +1157,7 @@ def plan(
     flush = (
         ()
         if step == NO_MOVE
-        else tuple(b.name for b in snapshot.bands if b.grow != "float" and not b.pinned)
+        else tuple(b.name for b in snapshot.bands if b.grow != "float")
     )
     return TakePlan(step=step, flush=flush, targets=targets, takes=takes)
 
