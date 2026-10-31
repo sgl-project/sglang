@@ -276,25 +276,19 @@ def _mega_moe_buffer(moe: DeepseekV2MoE):
 
 
 def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
-    """Allocate the symmetric buffers of the model's MegaMoE layers up front.
-
-    A buffer lives for the whole run, so allocating it before the KV cache is sized
-    charges it like the weights. Left to the first forward, it comes out of the
-    runtime slack, where the caching allocator may already hold the free memory.
-    """
+    """Allocate the MegaMoE symmetric buffers before the KV cache is sized, so the
+    KV budget charges them like the weights rather than the runtime slack."""
     if not get_moe_a2a_backend().is_megamoe() or _use_amd_flydsl_mega_moe():
         return
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
-    buffers = {
-        id(buf): buf
-        for buf in (
-            _mega_moe_buffer(module)
-            for module in model.modules()
-            if isinstance(module, DeepseekV2MoE)
-            and is_mega_moe_experts_ready(module.experts)
-        )
-    }
+    buffers = {}
+    for module in model.modules():
+        if isinstance(module, DeepseekV2MoE) and is_mega_moe_experts_ready(
+            module.experts
+        ):
+            buf = _mega_moe_buffer(module)
+            buffers[id(buf)] = buf
     if buffers:
         logger.info(
             "MegaMoE symmetric buffers resident before KV cache sizing: "

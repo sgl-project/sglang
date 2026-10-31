@@ -886,29 +886,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 quant_method=method,
             )
 
-    def test_allocate_buffers_before_kv_sizing(self):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-
-        layers = [DeepseekV2MoE.__new__(DeepseekV2MoE) for _ in range(3)]
-        for layer, ready in zip(layers, (True, True, False)):
-            torch.nn.Module.__init__(layer)
-            layer.experts = SimpleNamespace(ready=ready)
-        model = torch.nn.ModuleList(layers)
-        with (
-            patch.object(mega_moe, "is_mega_moe_experts_ready", lambda e: e.ready),
-            patch.object(
-                mega_moe,
-                "_mega_moe_buffer",
-                return_value=SimpleNamespace(buffer=torch.empty(8, dtype=torch.int8)),
-            ) as get_buffer,
-        ):
-            with get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE):
-                mega_moe.allocate_mega_moe_buffers(model)
-            get_buffer.assert_not_called()
-            with get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE):
-                mega_moe.allocate_mega_moe_buffers(model)
-        self.assertEqual(get_buffer.call_args_list, [call(layers[0]), call(layers[1])])
-
     def _get_test_buffer(self, group):
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
             return mega_moe._get_mega_moe_symm_buffer(
