@@ -7,6 +7,10 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
+from sglang.srt.utils.common import (
+    get_cpu_ids_by_node,
+    get_physical_cpus_by_numa_or_block,
+)
 from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -27,6 +31,54 @@ class TestBinding(CustomTestCase):
         self.assertEqual(len(bindings), n_cpu)
 
         self.assertEqual(bindings, expected_cores)
+
+
+class TestCPUTopology(CustomTestCase):
+    @patch("sglang.srt.utils.common.psutil.Process")
+    @patch("sglang.srt.utils.common.parse_lscpu_topology")
+    def test_group_selection_and_affinity(self, mock_topology, mock_process):
+        cases = [
+            (
+                "numa_more_groups",
+                [(0, 0, 0, 2, 7), (1, 1, 0, 2, 7), (2, 0, 1, 5, 7)],
+                [0, 1, 2],
+                {2: {0, 1}, 5: {2}},
+                ["0,1", "2"],
+            ),
+            (
+                "numa_wins_tie",
+                [(0, 0, 0, 2, 7), (1, 1, 0, 5, 9)],
+                [0, 1],
+                {2: {0}, 5: {1}},
+                ["0", "1"],
+            ),
+            (
+                "cbb_smt_and_socket_identity",
+                [
+                    (0, 1, 0, 0, 7),
+                    (1, 0, 0, 0, 9),
+                    (2, 0, 1, 0, 9),
+                    (3, 1, 0, 0, 7),
+                ],
+                [0, 1, 2, 3],
+                {7: {0}, 9: {1, 2}},
+                ["0", "1,2"],
+            ),
+            (
+                "select_before_affinity_and_drop_empty_bindings",
+                [(0, 0, 0, 0, 7), (1, 1, 0, 0, 8), (2, 0, 1, 1, 9)],
+                [0, 2],
+                {7: {0}, 8: set(), 9: {2}},
+                ["0", "2"],
+            ),
+            ("empty_topology", [], [], {}, []),
+        ]
+        for name, topology, allowed_cpus, expected_groups, expected_bindings in cases:
+            with self.subTest(name=name):
+                mock_topology.return_value = topology
+                mock_process.return_value.cpu_affinity.return_value = allowed_cpus
+                self.assertEqual(get_physical_cpus_by_numa_or_block(), expected_groups)
+                self.assertEqual(get_cpu_ids_by_node.__wrapped__(), expected_bindings)
 
 
 class TestInitThreadsBinding(CustomTestCase):
