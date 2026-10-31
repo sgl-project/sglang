@@ -2173,6 +2173,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            if (
+                request is not None
+                and not obj.background
+                and await request.is_disconnected()
+            ):
+                # Abort the request for disconnected requests (running)
+                self.abort_request(obj.rid)
+                # Use exception to kill the whole call stack and asyncio task
+                raise ValueError(
+                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                )
+
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2181,18 +2193,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
                 yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
 
     async def _handle_batch_request(
         self,
