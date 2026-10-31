@@ -246,7 +246,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
     --build-arg SGL_BRANCH="main" \
     -t "${IMAGE}" \
     -f "${DOCKERFILE}" \
-    "${DOCKERFILE_DIR}"
+    "${DOCKERFILE_DIR}/.."
   echo "Successfully built image: ${IMAGE}"
 else
   # Find the latest pre-built image
