@@ -20,6 +20,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     canonical_minimax_h3_task,
     partition_for_task,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    MINIMAX_H3_SMD_SAMPLING_PRESET,
+    minimax_h3_smd_sigmas,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _MINIMAX_H3_QUALITY_WORKLOAD = {
@@ -58,6 +62,7 @@ class MiniMaxH3ReleaseMetadata:
     # PDD release: fused per-step output heads, relative to the model dir,
     # with pdd_config.json beside them
     pdd_fused_heads: str | None = None
+    sampling_preset: str | None = None
 
     @classmethod
     def from_model_index(
@@ -124,6 +129,23 @@ class MiniMaxH3ReleaseMetadata:
                 "model_index.json._minimax_h3.pdd_fused_heads must be a relative "
                 ".safetensors path inside the model directory"
             )
+        sampling_preset = raw.get("sampling_preset")
+        if sampling_preset is not None:
+            if sampling_preset != MINIMAX_H3_SMD_SAMPLING_PRESET:
+                raise ValueError(
+                    f"unsupported MiniMax H3 sampling_preset {sampling_preset!r}"
+                )
+            if (
+                partition != "ref2va"
+                or pdd_fused_heads is not None
+                or dmd_steps is not None
+            ):
+                raise ValueError(
+                    "SMD requires Ref2VA weights without PDD heads or a DMD schedule"
+                )
+            minimax_h3_smd_sigmas(
+                num_steps=4, video_shift=video_sigma, audio_shift=audio_sigma
+            )
         metadata = cls(
             schema_version=1,
             partition=partition,
@@ -133,6 +155,7 @@ class MiniMaxH3ReleaseMetadata:
             audio_sigma_shift=audio_sigma,
             dmd_denoising_steps=dmd_steps,
             pdd_fused_heads=pdd_fused_heads,
+            sampling_preset=sampling_preset,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
@@ -166,6 +189,8 @@ class MiniMaxH3ReleaseMetadata:
                 f"task {task!r} is not served by MiniMax H3 partition {self.partition!r}; "
                 f"supported tasks: {list(self.tasks)!r}"
             )
+        if self.sampling_preset is not None and canonical != "ref2va":
+            raise ValueError("SMD weights support only Ref2VA")
         if (
             self.partition != "hybrid"
             and partition_for_task(canonical) != self.partition
@@ -186,6 +211,22 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
+        if self.metadata.sampling_preset is not None:
+            plan = minimax_h3_plan_from_batch(batch)
+            minimax_h3_smd_sigmas(
+                num_steps=batch.num_inference_steps,
+                video_shift=(
+                    plan.flow_shift
+                    if plan is not None and plan.flow_shift is not None
+                    else self.metadata.video_sigma_shift
+                ),
+                audio_shift=(
+                    plan.audio_flow_shift
+                    if plan is not None and plan.audio_flow_shift is not None
+                    else self.metadata.audio_sigma_shift
+                ),
+                is_warmup=getattr(batch, "is_warmup", False),
+            )
         min_steps = MiniMaxH3SamplingParams.min_num_inference_steps
         if batch.num_inference_steps < min_steps:
             raise ValueError(f"MiniMax H3 requires num_inference_steps >= {min_steps}")

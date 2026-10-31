@@ -1,6 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+MINIMAX_H3_SMD_SAMPLING_PRESET = "smd-ref2va-4step"
+
+
+def minimax_h3_smd_sigmas(
+    *,
+    num_steps: int,
+    video_shift: float,
+    audio_shift: float,
+    is_warmup: bool = False,
+) -> dict[str, list[float]]:
+    """Build the released four-step SMD grid, or its warmup prefix."""
+    if type(num_steps) is not int or not (
+        1 <= num_steps <= 4 if is_warmup else num_steps == 4
+    ):
+        raise ValueError(
+            "MiniMax H3 SMD Ref2VA requires exactly 4 inference steps; "
+            "warmup may use 1 to 4 steps"
+        )
+    if (
+        isinstance(video_shift, bool)
+        or isinstance(audio_shift, bool)
+        or video_shift != 12.0
+        or audio_shift != 3.0
+    ):
+        raise ValueError("MiniMax H3 SMD Ref2VA requires video/audio shifts 12/3")
+
+    # The final raw interval is half-sized before either modality shift.
+    raw = [1.0 - step / 3.5 for step in range(4)] + [0.0]
+    return {
+        modality: [shift * sigma / (1 + (shift - 1) * sigma) for sigma in raw][
+            : num_steps + 1
+        ]
+        for modality, shift in (("video", video_shift), ("audio", audio_shift))
+    }
+
 
 def minimax_h3_align_frame_count(frame_count: int) -> int:
     """Snap ``frame_count`` up to the MiniMax H3 17n+5 frame boundary."""
