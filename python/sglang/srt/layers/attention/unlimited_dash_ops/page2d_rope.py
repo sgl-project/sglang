@@ -7,8 +7,6 @@ batched training coordinates in incremental flat inference steps.
 
 from __future__ import annotations
 
-import math
-
 import torch
 
 from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
@@ -92,19 +90,6 @@ class PageRope2D:
             self.tok_freq_mode,
             self.page_mod,
         )
-
-    @property
-    def page_mono_range(self) -> float:
-        """Monotone (unambiguous) page distance of the page axis."""
-        if self.page_mod > 0:
-            # Folded axis: report the fold period; "monotone range" is meaningless.
-            return float(self.page_mod)
-        return self.base_page ** ((self.page_pairs - 1) / self.page_pairs) * math.pi
-
-    @property
-    def tok_mono_range(self) -> float:
-        """Monotone (unambiguous) token distance of the token axis."""
-        return math.pi / float(self.inv_tok[-1])
 
     @torch.no_grad()
     def cos_sin(
