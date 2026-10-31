@@ -19,6 +19,7 @@ if _RUNNABLE:
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
     import sglang.srt.layers.attention.aiter_backend as aiter_backend
+    from sglang.kernels.ops.attention.kv_gather_repeat import gather_repeat_kv_heads
     from sglang.kernels.ops.quantization.fp8_kernel import (
         fp8_dtype,
         scaled_fp8_quant,
@@ -654,6 +655,47 @@ class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
             )
             expected = cache[tok_idx].repeat_interleave(repeat, dim=1)
             self.assertTrue(torch.equal(got.view(torch.uint8), expected))
+
+    def test_gather_repeat_kv_heads_is_byte_exact(self):
+        """The one-pass gather + repeat writes cache[idx] with each KV head
+        repeated, byte for byte, for any head count, row size and slot order."""
+        device = "cuda"
+        torch.manual_seed(0)
+        cases = (
+            (4, 3, 256, fp8_dtype),  # Qwen3.8-27B TP1
+            (2, 3, 256, fp8_dtype),  # TP2
+            (3, 2, 256, fp8_dtype),  # 96 words per row, not a power of two
+            (4, 2, 128, torch.bfloat16),
+        )
+        for num_kv_heads, repeat, head_dim, dtype in cases:
+            row_bytes = head_dim * torch.empty((), dtype=dtype).element_size()
+            for n in (0, 1, 17, 4099):
+                for idx_dtype in (torch.int32, torch.int64):
+                    with self.subTest(
+                        num_kv_heads=num_kv_heads,
+                        repeat=repeat,
+                        dtype=dtype,
+                        n=n,
+                        idx_dtype=idx_dtype,
+                    ):
+                        num_slots = n + 33
+                        cache_bytes = torch.randint(
+                            0,
+                            256,
+                            (num_slots, num_kv_heads, row_bytes),
+                            dtype=torch.uint8,
+                            device=device,
+                        )
+                        idx = torch.randperm(num_slots, device=device)[:n]
+                        got = gather_repeat_kv_heads(
+                            cache_bytes.view(dtype), idx.to(idx_dtype), repeat
+                        )
+                        self.assertEqual(got.dtype, dtype)
+                        self.assertEqual(
+                            tuple(got.shape), (n, num_kv_heads * repeat, head_dim)
+                        )
+                        expected = cache_bytes[idx].repeat_interleave(repeat, dim=1)
+                        self.assertTrue(torch.equal(got.view(torch.uint8), expected))
 
 
 if __name__ == "__main__":

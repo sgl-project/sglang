@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.aiter_unified_page_table import (
     scatter_ragged_to_page_table_kernel,
     scatter_req_to_token_to_page_table_kernel,
 )
+from sglang.kernels.ops.attention.kv_gather_repeat import gather_repeat_kv_heads
 from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
@@ -1406,18 +1407,10 @@ class AiterAttnBackend(AttentionBackend):
         head_dim = layer.qk_head_dim
 
         def gather_and_repeat(cache: torch.Tensor) -> torch.Tensor:
-            # Copy the already quantized cache as raw 8-byte words: index_select
-            # is not implemented for fp8, and on int64 elements the gather and
-            # the head-repeat copy run ~3x faster than on uint8 ones.
-            words = head_dim * cache.element_size() // 8
-            return (
-                cache.view(-1, num_kv_heads * head_dim)
-                .view(torch.int64)
-                .index_select(0, tok_idx)
-                .view(-1, num_kv_heads, 1, words)
-                .expand(-1, num_kv_heads, repeat, words)
-                .reshape(-1, num_kv_heads * repeat, words)
-                .view(cache.dtype)
+            # One pass over the already quantized cache: each context row is
+            # read once and written with its KV heads repeated.
+            return gather_repeat_kv_heads(
+                cache.view(-1, num_kv_heads, head_dim), tok_idx, repeat
             )
 
         q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
