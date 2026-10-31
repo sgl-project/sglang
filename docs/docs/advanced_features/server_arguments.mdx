@@ -1520,6 +1520,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (hardware-dependent)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_kv</code>, <code>flashmla_auto</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsv4-prefill-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 sparse prefill backend. The experimental <code>cutedsl_h16</code> path is specialized for BF16, 16 TP-local query heads, and SM90; speculative, CUDA-graph, TBO, CP and bounded-replay forwards retain their existing paths. DeepSeek-V4.1 is unsupported. Its first eligible shape triggers JIT compilation. Padded combined TOPK is limited to 16384, supporting the default 1M context. The existing sparse-prefill threshold and environment selection still apply.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>flashmla_sparse</code>, <code>flashmla_sparse_q8</code>, <code>cutedsl_h16</code></td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-topk-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the DSA indexer top-k backend for the target model. The `torch` backend currently requires `SGLANG_DSA_FUSE_TOPK=false`.</td>

@@ -313,6 +313,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.activation.softcap', "
         "'sglang.kernels.ops.attention.dllm_kv_pack', "
         "'sglang.kernels.ops.attention.flash_attention_v4', "
+        "'sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
         "'sglang.kernels.ops.speculative.row_argmax')) or any("
@@ -429,6 +430,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "attention.dsa.kpool_topk_transform",
         "attention.dsa.indexer_k",
         "attention.dsv4.wo_a",
+        "attention.dsv4.cute_sparse_mla_h16",
         "attention.helion.kda_replayssm",
         "attention.helion.kda_verify",
         "attention.minimax_sparse.common.index",
@@ -585,6 +587,20 @@ def test_registered_architecture_boundaries(op, sm, expected):
     )
     assert K.capabilities_satisfied(spec.capabilities, platform) is expected
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_native_h16_registry_is_sm90_only():
+    spec = K.select_kernel("attention.cute_sparse_mla_h16_fwd")
+    assert spec.backend is KernelBackend.CUTE_DSL
+    assert spec.is_available(_SM90)
+    for platform in (_CPU, _HIP, _MUSA, _SM100):
+        assert not spec.is_available(platform)
+    for major, minor in ((8, 9), (9, 1)):
+        assert not spec.is_available(
+            PlatformInfo(
+                device_type="cuda", cuda_arch_major=major, cuda_arch_minor=minor
+            )
+        )
 
 
 def test_convrot_int8_specs_match_wrapper_capabilities():

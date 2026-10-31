@@ -48,6 +48,7 @@ DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
 DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
+    SPARSE_PREFILL_TOPK_ALIGNMENT,
     build_swa_token_ids,
     combine_topk_swa_indices,
     combined_topk_width,
@@ -61,6 +62,10 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
     variable remains as a debug override while the runtime path is being
     hardened: truthy values force Q8 on, falsy values force it off.
     """
+    # An explicit native-H16 choice takes precedence over the legacy Q8 override.
+    if dsv4_prefill_backend == "cutedsl_h16":
+        return False
+
     env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
     if env_value is not None:
         return env_value.lower() in {
@@ -175,6 +180,8 @@ class SparsePrefillChunkCache:
     # Compressed caches keyed by compress ratio: c128 (every block, combined once
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
+    # C128 is chunk-invariant; reuse fixed-width H16 indices across its layers.
+    c128_padded_combined_indices: Optional[torch.Tensor] = None
     # Per-layer scratch only: combine overwrites all entries before attention.
     # c0/c128 are cached across layers and must retain separate storage.
     low_ratio_combined: dict = field(default_factory=dict)
@@ -373,6 +380,25 @@ class SparsePrefillChunkCache:
         )
         self.compressed[128] = gather
         return gather
+
+    def get_c128_combined(self, padded_width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cache a fixed C128 width so changing chunk lengths reuse the H16 JIT."""
+        gather = self.compressed[128]
+        indices, lengths = gather.combined_indices, gather.combined_lens
+        assert indices is not None and lengths is not None
+        padding = padded_width - indices.shape[1]
+        if padding < 0 or padded_width % SPARSE_PREFILL_TOPK_ALIGNMENT:
+            raise ValueError("C128 width must be aligned and at least the live width")
+        if padding == 0:
+            return indices, lengths
+        if (
+            self.c128_padded_combined_indices is None
+            or self.c128_padded_combined_indices.shape[1] != padded_width
+        ):
+            self.c128_padded_combined_indices = torch.nn.functional.pad(
+                indices, (0, padding), value=-1
+            )
+        return self.c128_padded_combined_indices, lengths
 
     def ensure_compressed(
         self,
