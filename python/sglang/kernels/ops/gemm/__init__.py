@@ -497,6 +497,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.sm120_mxfp8_skinny_gemm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm:mxfp8_skinny_gemm",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.gptq_marlin_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.gptq_marlin:gptq_marlin_gemm",
