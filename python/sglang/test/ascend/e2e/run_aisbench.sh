@@ -298,7 +298,14 @@ EOF
   echo "============== ${model_config_file} - End ================"
 }
 
+# $1 = config file name (default ${TMP_CFG}); $2 = batch size (default ${BATCH_SIZE}).
+# The PyPI ais_bench CLI (3.1.20260330 in the CI image) has no --batch-size
+# argument (the dev benchmark master build does), so the per-invocation
+# concurrency must come from the model config's batch_size field
+# (run 41190678541: "unrecognized arguments: --batch-size").
 function gen_model_config_file_vllm_api_raw() {
+  local raw_cfg_name=${1:-${TMP_CFG}}
+  local raw_cfg_batch=${2:-${BATCH_SIZE}}
   # Raw /v1/completions model config: the prompt row is sent verbatim with
   # no chat template. This mirrors the dev perf suite (Perf-1015-aisbench-fixed
   # fixed_decode.py builds on ais_bench VLLMCustomAPI, whose _get_url is
@@ -307,7 +314,7 @@ function gen_model_config_file_vllm_api_raw() {
   # natural-text continuation into an assistant QA task whose digit-heavy
   # output collapses the DSPARK draft acceptance (CI run 41029888702: accept
   # 4.9 -> 1.2-1.9, TPOT 44.4 ms vs dev 25.0 ms on the same server shape).
-  model_config_file=${MODEL_CONFIG_PATH}/${TMP_CFG}.py
+  model_config_file=${MODEL_CONFIG_PATH}/${raw_cfg_name}.py
   echo "Writing raw-completions model config into file: ${model_config_file}"
 
   final_generation_kwargs=$(get_generation_kwargs)
@@ -330,7 +337,7 @@ models = [
         host_port=$PORT,
         url="",
         max_out_len=${OUTPUT_LEN},
-        batch_size=$BATCH_SIZE,
+        batch_size=$raw_cfg_batch,
         trust_remote_code=True,
         generation_kwargs=${final_generation_kwargs},
     )
@@ -676,10 +683,14 @@ EOF
                 # num_warmups default), which would leak into the measured
                 # window; dev disables it (--num-warmups 0) and runs its
                 # own unscored warmup passes instead (see the tail of this
-                # script). --batch-size is passed on the CLI like the dev
-                # fixed_decode.py cli() does.
-                CMD_BASE="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-warmups 0"
-                CMD="${CMD_BASE} --num-prompts $NUM_PROMPTS --batch-size $BATCH_SIZE --work-dir $OUTPUT_PATH "
+                # script). The CLI of the PyPI ais_bench has no --batch-size,
+                # so concurrency lives in each model config's batch_size and
+                # every invocation selects its config via --models.
+                if [ "${WARMUP_DP:-0}" -gt 0 ];then
+                    gen_model_config_file_vllm_api_raw "${TMP_CFG}_warm" 1
+                fi
+                CMD_BASE="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --debug --summarizer default_perf --mode perf --num-warmups 0"
+                CMD="${CMD_BASE} --models $TMP_CFG --datasets ${DATASET_NAME} --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
             else
                 CMD="${CMD} --config-dir ${AISBENCH_CUSTOM_CONFIG_PATH} --models $TMP_CFG --datasets ${DATASET_NAME} --debug --summarizer default_perf --mode perf --num-prompts $NUM_PROMPTS --work-dir $OUTPUT_PATH "
             fi
@@ -722,11 +733,11 @@ if [ -n "${CMD_BASE:-}" ];then
     # sat before this source line).
     if [ "${WARMUP_DP:-0}" -gt 0 ];then
         echo "===== Warmup cache-fill: ${WARMUP_DP} request(s) x batch 1 (one per DP rank) ====="
-        eval "${CMD_BASE} --num-prompts ${WARMUP_DP} --batch-size 1 --work-dir ${OUTPUT_PATH}/warmup_cache_fill"
+        eval "${CMD_BASE} --models ${TMP_CFG}_warm --datasets ${DATASET_NAME} --num-prompts ${WARMUP_DP} --work-dir ${OUTPUT_PATH}/warmup_cache_fill"
     fi
     if [ "${WARMUP_SHAPE:-0}" == "1" ];then
         echo "===== Warmup shape: N=${NUM_PROMPTS} C=${BATCH_SIZE} ====="
-        eval "${CMD_BASE} --num-prompts ${NUM_PROMPTS} --batch-size ${BATCH_SIZE} --work-dir ${OUTPUT_PATH}/warmup_shape"
+        eval "${CMD_BASE} --models ${TMP_CFG} --datasets ${DATASET_NAME} --num-prompts ${NUM_PROMPTS} --work-dir ${OUTPUT_PATH}/warmup_shape"
     fi
 fi
 echo "Run command: ${CMD}"
