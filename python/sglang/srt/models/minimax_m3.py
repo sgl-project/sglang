@@ -998,10 +998,18 @@ class MiniMaxM3Attention(nn.Module):
         self.add_module("fused_qkv_index_proj", holder)
         self._fused_qkv_index = holder
 
-        # Free the dead originals and drop their quant_method so the loader's
-        # post-process loop ignores them (see ``_qm``).
+        # Drop the originals' quant_method so the loader's post-process loop
+        # ignores them (see ``_qm``). For bf16 they become views into the fused
+        # weight, so an online weight update through the regular loader writes it
+        # in place; the MXFP8 scales are re-laid out above, so those are freed.
+        if is_unquant:
+            qp.weight.data, ip.weight.data = holder.weight.data.split(
+                [qp.weight.shape[0], ip.weight.shape[0]]
+            )
         for m in (qp, ip):
             m.quant_method = None
+            if is_unquant:
+                continue
             for attr in ("weight", "weight_scale_inv"):
                 p = getattr(m, attr, None)
                 if isinstance(p, nn.Parameter):
