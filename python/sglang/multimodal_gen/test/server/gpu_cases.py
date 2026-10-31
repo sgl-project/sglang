@@ -16,6 +16,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
+    CONVROT_INT8_I2V_CI_sampling_params,
     COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -692,6 +693,7 @@ if not current_platform.is_hip():
 if current_platform.is_hip():
     ONE_GPU_MODELOPT_FP8_CASES = []
     ONE_GPU_MODELOPT_NVFP4_CASES = []
+    ONE_GPU_CONVROT_INT8_CASES = []
 else:
     ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
@@ -787,6 +789,31 @@ else:
             env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
             run_perf_check=True,
+        ),
+    ]
+    # ConvRot INT8 smoke cases; perf checks stay off until h100.json carries shard-measured entries.
+    _CONVROT_INT8_EXTRAS = [
+        "--quantization",
+        "convrot_int8",
+        "--quantization-ignored-layers",
+        "proj_out",
+    ]
+    ONE_GPU_CONVROT_INT8_CASES = [
+        _make_modelopt_ci_case(
+            "wan22_convrot_int8_t2v",
+            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=list(_CONVROT_INT8_EXTRAS),
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
+            "wan22_convrot_int8_i2v",
+            model_path=DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            sampling_params=CONVROT_INT8_I2V_CI_sampling_params,
+            extras=list(_CONVROT_INT8_EXTRAS),
+            run_consistency_check=True,
         ),
     ]
 
@@ -1420,6 +1447,7 @@ if not current_platform.is_hip():
     )
 
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
+ONE_GPU_CASES += ONE_GPU_CONVROT_INT8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
 
