@@ -11,6 +11,10 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
 
 logger = logging.getLogger(__name__)
 
+# O_DIRECT needs each transfer's address and length in whole blocks. 4 KiB covers
+# the logical block size of every filesystem in use (512 B or 4 KiB).
+O_DIRECT_ALIGN_BYTES = 4096
+
 _SGLANG_NIXL_CONFIG_KEYS = {
     "use_direct_io",
     "l3_cleaner_enabled",
@@ -45,6 +49,14 @@ class NixlBackendConfig:
         if "use_direct_io" in self.config:
             return bool(self.config["use_direct_io"])
         return envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
+
+    def needs_page_alignment(self) -> bool:
+        """Return True if transfers must be whole O_DIRECT blocks: O_DIRECT is on
+        and the plugin opens files (OBJ plugins open none)."""
+        return (
+            self.get_use_direct_io()
+            and self.get_specified_plugin() not in NixlBackendSelection.OBJ_PLUGINS
+        )
 
     def get_l3_cleaner_config(self) -> dict:
         """Return typed NIXL FILE L3 cleaner options from top-level config."""
@@ -113,6 +125,14 @@ class NixlBackendConfig:
             initparams[key] = str(value)
 
         return initparams
+
+
+def host_page_align(extra_config: Optional[dict]) -> int:
+    """Bytes a host pool rounds each page's stride up to, so that HiCacheNixl can
+    move its pages in place: O_DIRECT_ALIGN_BYTES under O_DIRECT, otherwise 1."""
+    if NixlBackendConfig(extra_config).needs_page_alignment():
+        return O_DIRECT_ALIGN_BYTES
+    return 1
 
 
 class NixlBackendSelection:

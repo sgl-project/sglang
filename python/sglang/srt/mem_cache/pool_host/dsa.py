@@ -29,7 +29,9 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
+    alloc_padded_pages,
     get_allocator_from_storage,
+    get_storage_page_align,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
@@ -199,6 +201,10 @@ class DSAIndexerPoolHost(HostKVCache):
         # uint8 storage, so element counts below are byte counts
         self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
+        self.page_bytes = self.indexer_layout_dim * self.indexer_dtype.itemsize
+        self.storage_page_align = get_storage_page_align(self.layout, allocator_type)
+        align = self.storage_page_align
+        self.page_stride_bytes = -(-self.page_bytes // align) * align
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = storage_info.bytes_per_token_per_layer * self.layer_num
 
@@ -307,6 +313,26 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.index_k_data_refs,
                 self.device_pool.device,
                 host_memory_registered=self.pin_memory,
+            )
+        elif self.page_stride_bytes != self.page_bytes:
+            logger.info(
+                "DSA indexer host pool: page stride %d bytes for %d-byte pages "
+                "(%.2f GB of padding) for the storage backend.",
+                self.page_stride_bytes,
+                self.page_bytes,
+                self.indexer_page_num
+                * (self.page_stride_bytes - self.page_bytes)
+                / 1e9,
+            )
+            self.index_k_with_scale_buffer = alloc_padded_pages(
+                alloc_func,
+                (self.layer_num, 1, self.indexer_page_stride_size),
+                self.indexer_page_num,
+                self.page_stride_bytes,
+                self.indexer_dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
             )
         elif self.layout in ["page_first", "page_first_direct"]:
             self.index_k_with_scale_buffer = alloc_func(
@@ -634,22 +660,16 @@ class DSAIndexerPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         ptr_list = []
         indices = indices.tolist()
-        page_stride_bytes = (
-            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
-        )
         base_ptr = self.index_k_with_scale_buffer.data_ptr()
         for i in range(0, len(indices), self.page_size):
             page_index = int(indices[i]) // self.page_size
-            ptr_list.append(base_ptr + page_index * page_stride_bytes)
-        return ptr_list, [page_stride_bytes] * len(ptr_list)
+            ptr_list.append(base_ptr + page_index * self.page_stride_bytes)
+        return ptr_list, [self.page_bytes] * len(ptr_list)
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
-        page_stride_bytes = (
-            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
-        )
         return (
             self.index_k_with_scale_buffer.data_ptr() % page_size_bytes == 0
-            and page_stride_bytes % page_size_bytes == 0
+            and self.page_stride_bytes % page_size_bytes == 0
         )

@@ -1,6 +1,8 @@
 """Unit tests for host-pool allocation and free-list bookkeeping."""
 
 import contextlib
+import json
+import os
 import threading
 import unittest
 import unittest.mock
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host import common as pool_host_common
 from sglang.srt.mem_cache.pool_host import mamba as mamba_pool_host
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
@@ -938,6 +941,207 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         self.assertFalse(mirror._is_device_layer_owned(stub, 1))
         # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
         self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
+
+
+class TestHostPagePadding(CustomTestCase):
+    """NIXL under O_DIRECT moves a page_first_direct page in place only if it
+    starts on a 4 KiB block and spans whole blocks, so the host pools then lay
+    their pages out at a 4 KiB-multiple stride."""
+
+    PAGE_TOKENS = 64
+    LAYERS = 3
+    KV_PAGE_BYTES = LAYERS * PAGE_TOKENS * 67 * 2  # bf16 rows of 61 + 6: 25,728 B
+    INDEX_PAGE_BYTES = LAYERS * PAGE_TOKENS * 132  # fp8 key + fp32 scale: 25,344 B
+    PADDED_PAGE_BYTES = 7 * 4096
+
+    def setUp(self):
+        env = unittest.mock.patch.dict(
+            os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": "1"}
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    @staticmethod
+    def _published(extra_config):
+        """Publish --hicache-storage-backend-extra-config for the pools built here."""
+        return get_context().override_server_args(
+            hicache_storage_backend_extra_config=(
+                None if extra_config is None else json.dumps(extra_config)
+            )
+        )
+
+    def _host_pools(self, allocator_type="nixl", extra_config=None):
+        """An MLA KV host pool in page_first_direct and its DSA indexer pool."""
+        device = MLATokenToKVPool(
+            size=self.PAGE_TOKENS * 4,
+            page_size=self.PAGE_TOKENS,
+            dtype=torch.bfloat16,
+            kv_lora_rank=61,
+            qk_rope_head_dim=6,
+            layer_num=self.LAYERS,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        index_device = SimpleNamespace(
+            layer_num=self.LAYERS,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=self.LAYERS,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=self.PAGE_TOKENS,
+            index_page_size=self.PAGE_TOKENS,
+            skip_topk_layers=[False] * self.LAYERS,
+            index_k_with_scale_buffer=[
+                torch.empty((4, self.PAGE_TOKENS * 132), dtype=torch.uint8)
+                for _ in range(self.LAYERS)
+            ],
+        )
+        with self._published(extra_config):
+            kv = MLATokenToKVPoolHost(
+                device.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=self.PAGE_TOKENS,
+                layout="page_first_direct",
+                pin_memory=False,
+                allocator_type=allocator_type,
+                device_capacity_tokens=device.size,
+                start_layer=device.start_layer,
+                end_layer=device.end_layer,
+                target_layer_num=self.LAYERS,
+            )
+            self.addCleanup(kv.destroy)
+            indexer = DSAIndexerPoolHost(
+                make_dsa_indexer_pool_decl(index_device),
+                kv,
+                pin_memory=False,
+                allocator_type=allocator_type,
+            )
+            self.addCleanup(indexer.destroy)
+        return kv, indexer
+
+    @staticmethod
+    def _raw_pages(buffer, stride_bytes):
+        """Every byte of a host buffer, padding included, one row per page."""
+        stride = stride_bytes // buffer.element_size()
+        return torch.as_strided(buffer, (buffer.shape[0], stride), (stride, 1)).view(
+            torch.uint8
+        )
+
+    def test_page_align_follows_nixl_o_direct(self):
+        posix = {"plugin": {"posix": {"active": True}}}
+        obj = {"plugin": {"obj": {"active": True}}}
+        cases = [
+            ("page_first_direct", "nixl", None, "1", 4096),
+            ("page_first_direct", "nixl", posix, "1", 4096),
+            ("page_first", "nixl", None, "1", 1),
+            ("layer_first", "nixl", None, "1", 1),
+            ("page_first_direct", "mooncake", None, "1", 1),
+            ("page_first_direct", "nixl", None, "0", 1),
+            ("page_first_direct", "nixl", {"use_direct_io": False}, "1", 1),
+            # extra_config overrides the environment, as in HiCacheNixl
+            ("page_first_direct", "nixl", {"use_direct_io": True}, "0", 4096),
+            ("page_first_direct", "nixl", obj, "1", 1),
+        ]
+        for layout, backend, extra_config, direct_io, expected in cases:
+            with (
+                self.subTest(
+                    layout=layout,
+                    backend=backend,
+                    extra_config=extra_config,
+                    direct_io=direct_io,
+                ),
+                unittest.mock.patch.dict(
+                    os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": direct_io}
+                ),
+                self._published(extra_config),
+            ):
+                self.assertEqual(
+                    pool_host_common.get_storage_page_align(layout, backend), expected
+                )
+
+    def test_alloc_padded_pages_spaces_pages_by_the_stride(self):
+        granularities = []
+
+        def alloc(dims, dtype, registration_granularity_bytes, **kwargs):
+            granularities.append(registration_granularity_bytes)
+            buffer = torch.zeros(dims, dtype=dtype)
+            setattr(
+                buffer,
+                pool_host_common._CUDA_HOST_REGISTERED_RANGES_ATTR,
+                [(buffer.data_ptr(), buffer.nbytes)],
+            )
+            return buffer
+
+        pages = pool_host_common.alloc_padded_pages(
+            alloc, (3, 5), page_num=4, page_stride_bytes=64, dtype=torch.float32
+        )
+        self.assertEqual(pages.shape, (4, 3, 5))
+        self.assertEqual(pages.stride(0) * pages.element_size(), 64)
+        self.assertEqual(granularities, [64])
+        # destroy() unregisters through the view.
+        self.assertEqual(
+            getattr(pages, pool_host_common._CUDA_HOST_REGISTERED_RANGES_ATTR),
+            [(pages.data_ptr(), 4 * 64)],
+        )
+
+    def test_padded_pages_report_their_bytes_at_the_stride(self):
+        kv, indexer = self._host_pools()
+        pools = (
+            ("kv", kv, kv.kv_buffer, self.KV_PAGE_BYTES),
+            (
+                "indexer",
+                indexer,
+                indexer.index_k_with_scale_buffer,
+                self.INDEX_PAGE_BYTES,
+            ),
+        )
+        for name, host, buffer, page_bytes in pools:
+            with self.subTest(pool=name):
+                self.assertEqual(host.storage_page_align, 4096)
+                self.assertEqual(host.page_stride_bytes, self.PADDED_PAGE_BYTES)
+                self.assertTrue(host.is_stride_page_aligned(4096))
+
+                ptrs, sizes = host.get_page_buffer_meta(
+                    torch.arange(self.PAGE_TOKENS, 4 * self.PAGE_TOKENS)
+                )
+                base_ptr = buffer.data_ptr()
+                self.assertEqual(
+                    ptrs, [base_ptr + p * self.PADDED_PAGE_BYTES for p in (1, 2, 3)]
+                )
+                self.assertEqual(sizes, [page_bytes] * 3)
+
+                page = host.get_dummy_flat_data_page()
+                page.view(torch.uint8).copy_(
+                    torch.arange(page_bytes).remainder(251).to(torch.uint8)
+                )
+                host.set_from_flat_data_page(2 * self.PAGE_TOKENS, page)
+                self.assertTrue(
+                    torch.equal(host.get_data_page(2 * self.PAGE_TOKENS), page)
+                )
+                raw = self._raw_pages(buffer, self.PADDED_PAGE_BYTES)
+                self.assertTrue(
+                    torch.equal(raw[2, :page_bytes], page.view(torch.uint8))
+                )
+                self.assertEqual(raw[2, page_bytes:].count_nonzero().item(), 0)
+                self.assertEqual(raw[[1, 3]].count_nonzero().item(), 0)
+
+    def test_pages_stay_packed_without_nixl_o_direct(self):
+        for allocator_type, extra_config in (
+            ("default", None),
+            ("nixl", {"use_direct_io": False}),
+        ):
+            with self.subTest(allocator_type=allocator_type, extra_config=extra_config):
+                kv, indexer = self._host_pools(allocator_type, extra_config)
+                self.assertTrue(kv.kv_buffer.is_contiguous())
+                self.assertTrue(indexer.index_k_with_scale_buffer.is_contiguous())
+                self.assertEqual(kv.page_stride_bytes, self.KV_PAGE_BYTES)
+                self.assertEqual(indexer.page_stride_bytes, self.INDEX_PAGE_BYTES)
+                self.assertFalse(kv.is_stride_page_aligned(4096))
+                self.assertFalse(indexer.is_stride_page_aligned(4096))
 
 
 class TestMambaHostPoolOnXpu(CustomTestCase):
