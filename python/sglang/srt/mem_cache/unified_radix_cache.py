@@ -146,6 +146,13 @@ from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
+# Arbitrary; one reminder a minute while L3 is degraded.
+_STORAGE_UNAVAILABLE_WARN_S = 60.0
+# Shared-memory row of the HiCache ready-count exchange: the two L2 ack counts,
+# the four storage queue sizes, the storage health bit and the folded digest's
+# two words. Extra host pools widen the row past it and take the gloo reduce.
+_HICACHE_SHM_ROW_WIDTH = 9
+
 
 def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) -> int:
     num_pages = 0
@@ -344,6 +351,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        # Rank-agreed: a rank's storage workers died or lost their sync groups;
+        # the "disable" policy then runs without L3 until the backend is re-attached.
+        self.storage_unavailable = False
+        self._storage_unavailable_warned_at = 0.0
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
         # constructs the pipeline collaborator (None = cache mode).
@@ -480,6 +491,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
+            if self.enable_storage and self.storage_unavailable:
+                # reset restarts the workers but keeps the sync groups; the
+                # degrade is rank-agreed, so only a re-attach may lift it.
+                logger.warning(
+                    "HiCache L3 stays disabled after reset (workers healthy: %s); "
+                    "detach and re-attach the storage backend to recover.",
+                    self.cache_controller.storage_workers_healthy(),
+                )
 
         self.tree_core.kv_events.record_all_cleared()
 
@@ -2086,7 +2105,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> None:
-        if not self.enable_storage or self.cache_controller is None:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.storage_unavailable
+        ):
             return
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
@@ -2147,6 +2170,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if (
             not self.enable_storage
             or self.cache_controller is None
+            or self.storage_unavailable
             or self.cache_controller.prefetch_rate_limited()
         ):
             return 0
@@ -2193,6 +2217,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
+        if self.storage_unavailable:
+            return
         wait = self._storage_prefetch_wait.get(request)
         if wait is not None and wait.expired:
             return
@@ -2422,11 +2448,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _check_pp_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         req_id = request.rid
-        ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
-        ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
-        self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
-        if ready_tensor.item() == 0:
+        # PP0 decides and the MAX along PP relays it: 0 pending, 1 ready,
+        # 2 retire (storage degraded, so the ticket may never be published).
+        verdict = 0
+        if self.pp_rank == 0:
+            if self.storage_unavailable:
+                verdict = 2
+            elif self.cache_controller.is_pp_prefetch_ready(req_id):
+                verdict = 1
+        verdict_tensor = torch.tensor(verdict, dtype=torch.int, device="cpu")
+        self._all_reduce(verdict_tensor, torch.distributed.ReduceOp.MAX)
+        verdict = verdict_tensor.item()
+        if verdict == 0:
             return False
+        if verdict == 2:
+            self.cache_controller.release_pp_prefetch(req_id)
+            return True
 
         state = self.cache_controller.take_ready_pp_prefetch(req_id)
         if state is None:
@@ -2500,22 +2537,36 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = self.ongoing_prefetch[request].operation
 
         if not operation.is_terminated():
-            if not self._can_terminate_prefetch(operation):
+            if self.storage_unavailable:
+                # Degraded (rank-agreed): a worker may never publish this
+                # prefetch, so cut it like a policy deadline: no retry, no
+                # belief learning, no miss accounting.
+                self._mark_prefetch_deadline_expired(operation)
+            elif not self._can_terminate_prefetch(operation):
                 self._start_storage_prefetch_wait(operation)
                 return False
-            if self.prefetch_stop_policy == "timeout":
+            elif self.prefetch_stop_policy == "timeout":
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             if operation.deadline_expired:
-                self._finish_storage_prefetch(request, 0, reason="deadline")
+                self._finish_storage_prefetch(
+                    request, 0, reason=self._prefetch_cut_reason(operation, "deadline")
+                )
             else:
                 self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
             self._handle_prefetch_result(operation)
         return True
+
+    def _prefetch_cut_reason(self, operation: PrefetchOperation, default: str) -> str:
+        """Metric reason for a prefetch that ended short: the rank-agreed
+        storage degrade, else the stop-policy deadline, else ``default``."""
+        if self.storage_unavailable:
+            return "storage_unavailable"
+        return "deadline" if operation.deadline_expired else default
 
     def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
         # This function **owns**:
@@ -2551,7 +2602,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="deadline" if operation.deadline_expired else "storage_transfer",
+                reason=self._prefetch_cut_reason(operation, "storage_transfer"),
             )
         if (
             completed_tokens > 0
@@ -2714,7 +2765,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            reason = "deadline" if operation.deadline_expired else "storage_transfer"
+            reason = self._prefetch_cut_reason(operation, "storage_transfer")
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
@@ -2942,8 +2993,14 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
-            # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
+        if (
+            self.host_memory_mode != "buffer_only"
+            or operation.deadline_expired
+            or self.storage_unavailable
+        ):
+            # A cut query's agreed hit may be a MIN over skipped lookups, not a
+            # verdict; degraded, a rank whose collective still completed holds
+            # a verdict its peers lack, so no rank may learn from the query.
             return
         chain = operation.all_hash_values
         if chain is None:
@@ -3259,11 +3316,19 @@ class UnifiedRadixCache(BasePrefixCache):
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
+                if self.storage_unavailable:
+                    # Degraded: a count published around the failure is not
+                    # rank-agreed, so every rank reads the query as a miss.
+                    operation.storage_hit_count = 0
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
+                    continue
+                if self.storage_unavailable:
+                    self._account_prefetch_outcome(operation, revoked=True)
+                    self.revoke_pending_prefetch(request)
                     continue
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
@@ -3306,16 +3371,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.buffer_pipeline.pending_hit_allocs.append(operation)
 
         def _drain_ack_prefetch():
+            # Degraded: progress acks drained from this round on are not
+            # rank-agreed, so none is applied; completion still releases the
+            # transfer at the progress every rank last agreed on.
+            apply_progress = not self.storage_unavailable
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
                 operation = ack.operation
                 info = self.ongoing_prefetch.get(operation.handle)
                 is_current = info is not None and info.operation is operation
                 if ack.completed_tokens is not None:
-                    if is_current:
+                    if is_current and apply_progress:
                         assert operation.completed_tokens <= ack.completed_tokens
                         operation.completed_tokens = ack.completed_tokens
                 if ack.pool_hits is not None:
-                    if is_current:
+                    if is_current and apply_progress:
                         operation.pool_storage_result.update_extra_pool_hit_pages(
                             ack.pool_hits
                         )
@@ -3406,6 +3475,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_queues[pool_name].qsize()
                 for pool_name in extra_pool_names
             ],
+            # Last: see storage_workers_healthy on the read order.
+            int(cc.storage_workers_healthy()),
         ]
         qsizes = torch.tensor(
             local_qsize_list,
@@ -3416,8 +3487,9 @@ class UnifiedRadixCache(BasePrefixCache):
         n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[4:-1])
         }
+        self._apply_storage_health(bool(qsize_list[-1]))
         self._drain_storage_control_queues_impl(
             n_storage_hit=n_storage_hit,
             n_ack_prefetch=n_ack_prefetch,
@@ -3509,7 +3581,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _sync_hicache_ready_counts(
         self,
-    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
+    ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...], bool]:
+        """Rank-agree the ready L2 ack counts, the storage queue sizes and,
+        with storage attached, the storage health bit (MIN: healthy only if
+        every reducing rank's workers are)."""
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
@@ -3520,7 +3595,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # received tensor back in place, so all ranks must build the same
             # length or PP1+ would recv into a mismatched buffer.
             storage_queue_sizes = (
-                (0,) * (4 + len(extra_pool_names)) if self.enable_storage else ()
+                (0,) * (5 + len(extra_pool_names)) if self.enable_storage else ()
             )
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
@@ -3532,6 +3607,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
                     *(extra_release_queues[name].qsize() for name in extra_pool_names),
+                    # Last: see storage_workers_healthy on the read order.
+                    int(cc.storage_workers_healthy()),
                 )
                 if self.enable_storage
                 else ()
@@ -3551,7 +3628,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     "write_back duplicate-reclaim victims diverged across TP ranks"
                 )
                 mins = [min(col) for col in zip(*rows)]
-                return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+                # The health bit is the last storage value; MIN over the rows
+                # agrees it exactly like the gloo reduce below.
+                storage_values = mins[2:-2]
+                storage_healthy = True
+                if storage_values:
+                    storage_healthy = bool(storage_values[-1])
+                    storage_values = storage_values[:-1]
+                return (
+                    mins[0],
+                    mins[1],
+                    tuple(storage_values),
+                    extra_pool_names,
+                    storage_healthy,
+                )
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3565,6 +3655,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
             self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+            if self.enable_storage and cc.pp_prefetch_command_group is None:
+                # Without PP tickets every stage issues its own prefetch and
+                # check_prefetch_progress must cut on one value, so PP0's
+                # verdict replaces the stage's own (one recv per tick on PP>0).
+                # With tickets PP0 decides per request, so stages keep theirs.
+                self._pp_sync(ready_counts[-3:-2])
         else:
             self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
@@ -3572,11 +3668,17 @@ class UnifiedRadixCache(BasePrefixCache):
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims diverged across PP/TP ranks"
         )
+        storage_values = count_values[2:-2]
+        storage_healthy = True
+        if storage_values:
+            storage_healthy = bool(storage_values[-1])
+            storage_values = storage_values[:-1]
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:-2]),
+            tuple(storage_values),
             extra_pool_names,
+            storage_healthy,
         )
 
     def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
@@ -3595,7 +3697,47 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
-        return get_shm_exchange(group, "hicache", multihost=True)
+        return get_shm_exchange(
+            group, "hicache", multihost=True, width=_HICACHE_SHM_ROW_WIDTH
+        )
+
+    def _apply_storage_health(self, storage_healthy: bool) -> None:
+        """Act on the rank-agreed health bit of this drain round, once."""
+        if storage_healthy or self.storage_unavailable:
+            return
+        cc = self.cache_controller
+        reason = cc.storage_health_reason()
+        if reason is None:
+            reason = "reported by a peer rank"
+        policy = cc.storage_failure_policy
+        logger.error(
+            "HiCache storage pipeline unhealthy (%s); storage_failure_policy=%s: %s",
+            reason,
+            policy,
+            (
+                "L3 prefetch and backup are disabled and in-flight prefetches "
+                "resolve as misses until the storage backend is re-attached."
+                if policy == "disable"
+                else "failing the scheduler."
+            ),
+        )
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_storage_healthy(False)
+        if policy == "raise":
+            raise RuntimeError(f"HiCache storage pipeline unhealthy: {reason}")
+        self.storage_unavailable = True
+        self._storage_unavailable_warned_at = time.monotonic()
+
+    def _warn_storage_unavailable(self) -> None:
+        """One WARNING per interval while degraded; the ERROR fired once."""
+        now = time.monotonic()
+        if now - self._storage_unavailable_warned_at < _STORAGE_UNAVAILABLE_WARN_S:
+            return
+        self._storage_unavailable_warned_at = now
+        logger.warning(
+            "HiCache L3 remains disabled (storage pipeline degraded); detach and "
+            "re-attach the storage backend to recover."
+        )
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
@@ -3830,11 +3972,15 @@ class UnifiedRadixCache(BasePrefixCache):
             load_finish_count,
             storage_queue_sizes,
             extra_pool_names,
+            storage_healthy,
         ) = self._sync_hicache_ready_counts()
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
 
         if self.enable_storage and storage_queue_sizes:
+            self._apply_storage_health(storage_healthy)
+            if self.storage_unavailable:
+                self._warn_storage_unavailable()
             n_storage_hit, n_ack_prefetch, n_backup, n_release = storage_queue_sizes[:4]
             extra_release_counts = {
                 pool_name: count

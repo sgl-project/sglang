@@ -61,6 +61,7 @@ def _hicache_tp_rank(rank: int, extra_pools: int) -> UnifiedRadixCache:
         extra_host_mem_release_queues={
             f"extra{i}": queue for i, queue in enumerate(queues[4:])
         },
+        storage_workers_healthy=lambda: True,
     )
     return cache
 
@@ -89,14 +90,15 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
             _sleep_on_idle(False),
             _shm_names(),
         ):
-            # A row holds 6 ready counts, one more per extra host pool, and the folded
-            # digest's 2 words: 8, 9 and 10 values here. The shm table holds 8.
+            # A row holds 6 ready counts, one more per extra host pool, the storage
+            # health bit and the folded digest's 2 words: 9, 10 and 11 values here.
+            # The shm table holds 9.
             for extra_pools in (0, 1, 2):
                 cache = _hicache_tp_rank(rank, extra_pools)
                 want = list(range(6 + extra_pools))
                 names = tuple(cache.cache_controller.extra_host_mem_release_queues)
                 got = cache._sync_hicache_ready_counts()
-                assert got == (want[0], want[1], tuple(want[2:]), names), (
+                assert got == (want[0], want[1], tuple(want[2:]), names, True), (
                     extra_pools,
                     got,
                 )

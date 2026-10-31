@@ -60,6 +60,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.pp_group, c.pp_prefetch_command_group = "pp", "command"
         c.pp_prefetch_command_thread = None
         c.prefetch_hits_sync_groups = c.prefetch_completion_sync_groups = ["pp", "tp"]
+        c.storage_sync_failed, c.storage_sync_failure = False, None
+        c._storage_sync_lock = threading.Lock()
+        c.storage_failure_policy = "raise"
         c.pp_prefetch_states, c.pp_prefetch_decisions = {}, {}
         c.pp_prefetch_state_lock = threading.Lock()
         c.pp_prefetch_command_queue = Queue()
@@ -96,6 +99,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c
         cache._all_reduce = Mock()
+        cache.storage_unavailable = False
         cache.ongoing_prefetch = {}
         cache.prefetch_loaded_tokens_by_reqid = {}
         cache.prefetch_loaded_storage_start_by_reqid = {}
@@ -243,21 +247,32 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 self.assertIs(c.prefetch_buffer.get_nowait(), second.operation)
 
     def test_file_attachment_enables_pp_tickets(self):
+        """Tickets are enabled for any backend; the broadcast group is built when
+        the storage workers start, once attach has applied the sync timeout."""
         c = self.c
         c.pp_prefetch_command_group = None
         c.storage_host_pool = Mock()
         c.host_memory_mode = "buffer_only"
         c.storage_backend_type = "file"
+        c.storage_sync_timeout = 7.5
+        c._init_extra_host_mem_release_queues = Mock()
         with (
-            patch.object(HiCacheController, "attach_storage_backend"),
+            patch.object(
+                HiCacheController,
+                "attach_storage_backend",
+                side_effect=lambda **_: c._start_storage_threads(),
+            ),
+            patch.object(HiCacheController, "_start_storage_threads"),
+            patch.object(threading, "Thread"),
             patch.object(torch.distributed, "get_world_size", return_value=4),
             patch(
                 "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
                 return_value="command",
-            ),
+            ) as create_group,
         ):
             c.attach_storage_backend("file", prefetch_threshold=4)
         self.assertEqual(c.pp_prefetch_command_group, "command")
+        self.assertEqual(create_group.call_args.kwargs["timeout"].total_seconds(), 7.5)
 
     def test_file_stage_hits_trim_buffers_after_local_allocation(self):
         """PP0's local files cannot reveal a shorter prefix on another stage."""
@@ -879,7 +894,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 self.assertIs(sidecar_frees[0].args[0], borrowed_indices)
 
     def test_command_failure_finishes_queue_task_and_is_reported_on_poll(self):
+        """A broken ticket broadcast is a storage sync failure: the pending
+        ticket fails loud on poll under the raise policy and stays not-ready
+        under the disable policy until the rank-agreed degrade retires it."""
         c = self.c
+        self.assertTrue(self.submit().decision)
         with (
             patch(
                 f"{HybridCacheController.__module__}.broadcast_pyobj",
@@ -892,15 +911,27 @@ class TestPPPrefetchTicket(unittest.TestCase):
             )
             c.pp_prefetch_command_thread = worker
             worker.start()
-            self.submit()
             worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(c.pp_prefetch_command_queue.unfinished_tasks, 0)
+        self.assertTrue(c.storage_sync_failed)
+        with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
+            c.is_pp_prefetch_ready("hit")
+        c.storage_failure_policy = "disable"
+        self.assertFalse(c.is_pp_prefetch_ready("hit"))
+        # The TP-local hit groups did not fail, so a later request is still
+        # ticketed; PP0's degraded verdict then retires every pending ticket,
+        # and a ticket PP0 declared ready never blocks a dead stage.
+        self.assertTrue(self.submit("next").decision)
+        self.cache.pp_rank = 0
+        self.cache.storage_unavailable = True
         for rid in ("hit", "next"):
-            if rid == "next":
-                self.submit(rid)
-            with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
-                c.is_pp_prefetch_ready(rid)
+            self.assertTrue(
+                self.cache.check_prefetch_progress(CacheRequestHandle(rid, 0))
+            )
+        self.assertEqual(c.pp_prefetch_decisions, {})
+        with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
+            c.take_ready_pp_prefetch("hit")
 
     def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
         c = self.c

@@ -275,7 +275,30 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
+    def _pp_prefetch_tickets_enabled(self) -> bool:
+        return (
+            self.host_memory_mode == "buffer_only"
+            and self.pp_group is not None
+            and torch.distributed.get_world_size(group=self.pp_group) > 1
+        )
+
     def _start_storage_threads(self):
+        if (
+            self._pp_prefetch_tickets_enabled()
+            and self.pp_prefetch_command_group is None
+        ):
+            # Built here, once attach has applied storage_sync_timeout, so the
+            # ticket broadcast is bounded like the other storage collectives;
+            # reset() restarts the threads but keeps the group.
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
+            )
+
+            self.pp_prefetch_command_group = create_custom_parallel_group(
+                group_ranks=torch.distributed.get_process_group_ranks(self.pp_group),
+                backend="gloo",
+                timeout=self._storage_sync_timedelta(),
+            )
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
         if self.pp_prefetch_command_group is not None:
@@ -299,6 +322,12 @@ class HybridCacheController(BaseHiCacheController):
     def _stop_storage_threads(self):
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
+
+    def _storage_worker_threads(self) -> list[threading.Thread]:
+        threads = super()._storage_worker_threads()
+        if self.pp_prefetch_command_thread is not None:
+            threads.append(self.pp_prefetch_command_thread)
+        return threads
 
     @staticmethod
     def supports_page_envelope_host(storage_backend: str | None) -> bool:
@@ -325,21 +354,6 @@ class HybridCacheController(BaseHiCacheController):
                 f"Storage backend {storage_backend!r} requires separate host pools. "
                 "Restart with this backend selected to create compatible host pools."
             )
-        enable_pp_ticket = (
-            self.host_memory_mode == "buffer_only"
-            and self.pp_group is not None
-            and torch.distributed.get_world_size(group=self.pp_group) > 1
-        )
-        if enable_pp_ticket and self.pp_prefetch_command_group is None:
-            from sglang.srt.distributed.parallel_state import (
-                create_custom_parallel_group,
-            )
-
-            self.pp_prefetch_command_group = create_custom_parallel_group(
-                group_ranks=torch.distributed.get_process_group_ranks(self.pp_group),
-                backend="gloo",
-            )
-
         try:
             super().attach_storage_backend(
                 storage_backend=storage_backend,
@@ -1259,7 +1273,10 @@ class HybridCacheController(BaseHiCacheController):
                 return False
             thread = self.pp_prefetch_command_thread
             if thread is not None and not thread.is_alive():
-                raise RuntimeError(f"PP HiCache ticket thread exited: req={rid}")
+                if self.storage_failure_policy == "raise":
+                    raise RuntimeError(f"PP HiCache ticket thread exited: req={rid}")
+                # Not ready: the rank-agreed health drop retires the ticket.
+                return False
             return state.ready_event.is_set()
 
     def take_ready_pp_prefetch(self, rid: str) -> Optional[PPPrefetchState]:
@@ -1267,7 +1284,12 @@ class HybridCacheController(BaseHiCacheController):
             state = self.pp_prefetch_states.get(rid)
         if state is None or state.consumed:
             return None
-        state.ready_event.wait()
+        # PP0 agreed the ticket is ready; a stage whose ticket thread died can
+        # never publish it and must fail loud rather than block the pipeline.
+        while not state.ready_event.wait(1.0):
+            thread = self.pp_prefetch_command_thread
+            if thread is None or not thread.is_alive():
+                raise RuntimeError(f"PP HiCache ticket thread exited: req={rid}")
         with self.pp_prefetch_state_lock:
             if self.pp_prefetch_states.get(rid) is not state or state.consumed:
                 return None
@@ -1397,10 +1419,13 @@ class HybridCacheController(BaseHiCacheController):
                 if operation.pool_transfers:
                     self._resolve_sidecar_kv_derived_pool_transfers(operation)
                 self.prefetch_buffer.put(operation)
-            except Exception:
+            except Exception as e:
                 logger.exception("PP HiCache ticket processing failed.")
                 # Query/allocation failures already follow the agreed ACK path.
-                # An unexpected failure cannot safely continue the collectives.
+                # An unexpected failure cannot safely continue the collectives:
+                # the broadcast is the PP agreement itself, so the thread exits
+                # and the rank-agreed health bit retires its tickets.
+                self._record_storage_sync_failure(e, "PP ticket thread")
                 return
             finally:
                 if is_source and objects:
@@ -1507,11 +1532,14 @@ class HybridCacheController(BaseHiCacheController):
             hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
             dtype=torch.int,
         )
-        self._all_reduce(
+        if not self._storage_sync_all_reduce(
             packed,
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
-        )
+        ):
+            # No agreed boundary: a miss that carries no verdict to learn from.
+            operation.query_pool_hit_pages = {}
+            return 0
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
@@ -1923,11 +1951,12 @@ class HybridCacheController(BaseHiCacheController):
                 [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
                 dtype=torch.int,
             )
-            self._all_reduce(
+            if not self._storage_sync_all_reduce(
                 packed,
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
-            )
+            ):
+                packed.zero_()
             for i, pool in enumerate(PoolName):
                 ack.pool_hits[pool.value] = packed[i].item()
 
