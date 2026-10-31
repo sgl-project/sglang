@@ -1113,15 +1113,26 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self,
         forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
+        state_slots_virtual: Optional[torch.Tensor] = None,
+        *,
+        token_writes_unknown: bool = False,
+        state_writes_unknown: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
-        write set through their own v2p, and the state band, written by state
-        kernels rather than through `out_cache_loc`, gets None."""
+        write set through their own v2p. The state band, written in place by
+        state kernels rather than through `out_cache_loc`, takes the virtual
+        state slots the forward writes. ``token_writes_unknown`` /
+        ``state_writes_unknown``: the token / state bands cannot read this
+        forward's write ids before it ends."""
         with record_function("ChainAllocator.set_inflight_forward"):
             for member in self.members:
+                is_state = member is self.mamba_allocator
                 member.set_inflight_forward(
                     forward_done,
-                    None if member is self.mamba_allocator else out_cache_loc_virtual,
+                    state_slots_virtual if is_state else out_cache_loc_virtual,
+                    writes_unknown=(
+                        state_writes_unknown if is_state else token_writes_unknown
+                    ),
                 )
 
     def flush_opportunistic(self) -> int:
