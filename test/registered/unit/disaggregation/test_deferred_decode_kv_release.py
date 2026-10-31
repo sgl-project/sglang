@@ -548,6 +548,21 @@ class TestResolveDeferredReleases(CustomTestCase):
         super().setUp()
         _run_as_single_rank(self)
 
+    def test_unpublished_rank_holds_for_peer_without_waiting_for_acks(self):
+        mgr = _make_manager()
+        queue = _make_queue()
+        entry = _make_decode_req(201, 7, mgr, n_prefill_ranks=2)
+        entry.pending_metadata = (SimpleNamespace(query=lambda: False), (), {})
+        # ABORT was sent before metadata, so this rank has no ack generation.
+        # A peer that already published still makes every rank retain capacity.
+        queue._defer_release(entry)
+        self.assertEqual(queue._deferred_releases[0][-1], 0)
+        with patch.object(decode_mod, "release_kv_cache") as release:
+            queue.resolve_deferred_releases()
+        release.assert_called_once_with(entry.req, queue.tree_cache, checkpoint=False)
+        self.assertEqual(queue._deferred_releases, [])
+        self.assertEqual(queue.req_to_metadata_buffer_idx_allocator.freed, [7])
+
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
         mgr = _make_manager()
         q = _make_queue(timeout=-1)
@@ -858,6 +873,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
         host_staged=False,
         awaiting_publish=False,
         pending_metadata=None,
+        is_rebootstrap=False,
     )
 
 
@@ -973,7 +989,9 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         }
         self.assertEqual(required_acks, {8: 2})
 
-    def test_pp_failure_keeps_destination_held_until_release_consensus(self):
+    def test_failed_held_destination_respects_delayed_conclusion(self):
+        # Defensive coverage: PP currently disables overlap, so it does not
+        # create held metadata, but a delayed conclusion must still respect it.
         mgr = _make_manager()
         q = _make_pop_queue(mgr)
         released = []

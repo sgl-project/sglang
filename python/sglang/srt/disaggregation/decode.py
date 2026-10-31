@@ -2032,7 +2032,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # flight, writing pages this request was just given. Prefill's RDMA
             # into them follows no stream, so send once that forward is done.
             # The deferred publish already waits on an allocation fenced behind
-            # that forward; this covers the inline publish (PP, staging,
+            # that forward; this covers the inline publish (staging,
             # HiSparse, no WAR barrier), where the destination is sent at once.
             ready = self.scheduler.device_module.Event()
             ready.record(stream=self.scheduler.forward_stream)
@@ -2042,6 +2042,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if (
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
+            and decode_req.pending_metadata is None
         ):
             self._submit_prefill_recompute(decode_req)
         self._num_published_destinations += 1
@@ -3079,6 +3080,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         transferred_reqs, _ = self.pop_transferred_with_outcomes(rids_to_check)
         return transferred_reqs
 
+    def publish_pending_metadata(self, polls: Optional[List[int]] = None) -> None:
+        pending = []
+        ready = []
+        for i, decode_req in enumerate(self.queue):
+            metadata = decode_req.pending_metadata
+            if metadata is None:
+                continue
+            poll = polls[i] if polls is not None else decode_req.kv_receiver.poll()
+            pending.append(decode_req)
+            ready.append(int(poll != KVPoll.Failed and metadata[0].query()))
+        # Publish on every rank together so an abort cannot leave only some
+        # ranks waiting for acknowledgements from a published destination.
+        ready = all_reduce_flags(
+            flags=ready, group=self.gloo_group, op=dist.ReduceOp.MIN
+        )
+        for decode_req, publish in zip(pending, ready):
+            if publish:
+                _, args, kwargs = decode_req.pending_metadata
+                decode_req.pending_metadata = None
+                decode_req.kv_receiver.send_metadata(*args, **kwargs)
+                if (
+                    decode_req.is_rebootstrap
+                    and get_disagg().disaggregation_decode_allocation_policy == "early"
+                ):
+                    self.scheduler.disagg_decode_prealloc_queue._submit_prefill_recompute(
+                        decode_req
+                    )
+
     def pop_transferred_with_outcomes(
         self, rids_to_check: Optional[Dict[str, bool]] = None
     ) -> Tuple[List[Req], Dict[str, bool]]:
@@ -3280,15 +3309,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ]
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
-        # PP can keep a failed request queued until release consensus arrives.
-        # Keep its destination held so cleanup needs no drain acknowledgements.
-        for decode_req, poll in zip(self.queue, polls):
-            if poll == KVPoll.Failed:
-                continue
-            pending = decode_req.pending_metadata
-            if pending is not None and pending[0].query():
-                decode_req.pending_metadata = None
-                decode_req.kv_receiver.send_metadata(*pending[1], **pending[2])
+        self.publish_pending_metadata(polls)
 
         if rids_to_check is not None:
             for rid, rid_failed in outcomes.items():
@@ -3308,6 +3329,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         required_acks = (
             0
             if self._is_host_destination(decode_req)
+            or decode_req.awaiting_publish
+            or decode_req.pending_metadata is not None
             or not decode_req.kv_receiver.abort_notified
             else len(decode_req.kv_receiver.bootstrap_infos)
         )
@@ -3850,6 +3873,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
         # Before the retraction gate below, so a deferred publish never waits on it.
         self.disagg_decode_prealloc_queue.publish_pending_destinations()
+        self.disagg_decode_transfer_queue.publish_pending_metadata()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

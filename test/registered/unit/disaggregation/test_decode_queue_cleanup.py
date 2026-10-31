@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    SchedulerDisaggregationDecodeMixin,
     _PendingPublish,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -106,6 +107,80 @@ class TestDecodeQueueCleanup(CustomTestCase):
         first.kv_receiver.init.assert_called_once_with(1)
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
+
+
+class TestHeldDestinationPublication(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        _run_as_single_rank(self)
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def make_queue(self):
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.gloo_group = object()
+        receiver = SimpleNamespace(
+            poll=MagicMock(return_value=KVPoll.WaitingForInput),
+            send_metadata=MagicMock(),
+        )
+        event = SimpleNamespace(query=MagicMock(return_value=True))
+        entry = SimpleNamespace(
+            kv_receiver=receiver,
+            pending_metadata=(event, ("pages", 3, None), {}),
+            is_rebootstrap=False,
+        )
+        queue.queue = [entry]
+        return queue, entry, event, receiver
+
+    def test_waits_for_every_rank_and_sends_once(self):
+        queue, entry, event, receiver = self.make_queue()
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            # This rank finished its forward; another rank is still writing.
+            reduce.side_effect = lambda flags, **_: flags.zero_()
+            queue.publish_pending_metadata()
+            receiver.send_metadata.assert_not_called()
+            self.assertIsNotNone(entry.pending_metadata)
+
+            # The local forward is now the one that still needs to finish.
+            reduce.side_effect = None
+            event.query.return_value = False
+            queue.publish_pending_metadata()
+            receiver.send_metadata.assert_not_called()
+
+            event.query.return_value = True
+            queue.publish_pending_metadata()
+            queue.publish_pending_metadata()
+            receiver.send_metadata.assert_called_once_with("pages", 3, None)
+            self.assertIsNone(entry.pending_metadata)
+
+    def test_failed_receiver_keeps_destination_unpublished(self):
+        queue, entry, _, receiver = self.make_queue()
+        receiver.poll.return_value = KVPoll.Failed
+        queue.publish_pending_metadata()
+        receiver.send_metadata.assert_not_called()
+        self.assertIsNotNone(entry.pending_metadata)
+
+    def test_publishes_while_retracted_requests_wait(self):
+        queue, _, _, receiver = self.make_queue()
+        queue.resolve_deferred_releases = MagicMock()
+        prealloc = SimpleNamespace(
+            publish_pending_destinations=MagicMock(),
+            resume_retracted_reqs=lambda: [],
+            retracted_queue=[object()],
+        )
+        scheduler = SimpleNamespace(
+            scheduler_stage_metrics=None,
+            enable_decode_hicache=False,
+            disagg_decode_prealloc_queue=prealloc,
+            disagg_decode_transfer_queue=queue,
+            waiting_queue=[],
+        )
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+        receiver.send_metadata.assert_called_once_with("pages", 3, None)
 
 
 class _GateReceiver:
@@ -369,7 +444,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(queue.has_published_destinations)
 
     def test_inline_publish_holds_the_send_until_the_forward_is_done(self):
-        """Where the deferred publish is off (PP, staging, HiSparse, no WAR
+        """Where the deferred publish is off (staging, HiSparse, no WAR
         barrier), overlap still reuses pages the in-flight forward may write, so
         the inline publish records an event on the forward stream and holds the
         send for the transfer queue."""
@@ -395,6 +470,37 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(kwargs, {"decode_prefix_len": 0})
         self.assertEqual(decode_req.metadata_buffer_index, 0)
         self.assertTrue(queue.has_published_destinations)
+
+    def test_recompute_waits_for_held_metadata_to_be_sent(self):
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        decode_req.is_rebootstrap = True
+        queue = self._deferring_queue([decode_req])
+        queue._defer_publish = False
+        ready = MagicMock()
+        ready.query.return_value = False
+        queue.scheduler.enable_overlap = True
+        queue.scheduler.device_module = SimpleNamespace(Event=lambda: ready)
+        queue.scheduler.disagg_decode_prealloc_queue = queue
+        queue._submit_prefill_recompute = MagicMock(
+            side_effect=lambda _: receiver.send_metadata.assert_called_once()
+        )
+
+        queue.pop_preallocated()
+        queue._submit_prefill_recompute.assert_not_called()
+        transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer.queue = [decode_req]
+        transfer.gloo_group = object()
+        transfer.scheduler = queue.scheduler
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            transfer.publish_pending_metadata()
+            queue._submit_prefill_recompute.assert_not_called()
+            ready.query.return_value = True
+            transfer.publish_pending_metadata()
+        queue._submit_prefill_recompute.assert_called_once_with(decode_req)
 
     def test_deferred_destination_closes_the_move_gate_until_queued(self):
         """A later allocation in the same pop must not let unified-memory compaction
