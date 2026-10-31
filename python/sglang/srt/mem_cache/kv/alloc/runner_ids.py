@@ -62,7 +62,7 @@ DCP index kernels select them.
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
@@ -150,6 +150,7 @@ class RunnerIds:
         # the pool does (`_call_spaces`): only an NPU DCP target's plan
         # localizes its writes.
         self._spaces: Dict[str, IdSpace] = {}
+        self.window_sub_pools: Tuple[str, ...] = ()
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
@@ -159,19 +160,12 @@ class RunnerIds:
                 if plan is None or plan.fused_draft is None
                 else set(plan.fused_draft.new_bands)
             )
-            windows = (
-                set()
-                if not is_unified_target or plan is None
-                else {s.name for s in plan.windows()} - drafts
-            )
-            if len(windows) > 1:
-                # Attention backends bind one window's write and read ids per
-                # runner; layers of another window would take that window's.
-                raise NotImplementedError(
-                    f"this runner's layers attend through window sub-pools "
-                    f"{sorted(windows)}; attention backends read one window per "
-                    "runner, so layers with windows of different lengths are "
-                    "not supported yet"
+            # The window sub-pools this runner's layers read, each through its
+            # own id space; a backend bound to the runner must serve them all
+            # (`bind_and_verify_backends`).
+            if is_unified_target and plan is not None:
+                self.window_sub_pools = tuple(
+                    sorted({s.name for s in plan.windows()} - drafts)
                 )
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
@@ -726,6 +720,15 @@ class RunnerIds:
         for backend in backends:
             if backend is None:
                 continue
+            if len(self.window_sub_pools) > backend.max_window_sub_pools:
+                # Layers of another window would take the bound window's ids.
+                raise NotImplementedError(
+                    f"this runner's layers attend through window sub-pools "
+                    f"{list(self.window_sub_pools)}, but {type(backend).__name__} "
+                    f"reads at most {backend.max_window_sub_pools} per runner; "
+                    "layers with windows of different lengths need a backend "
+                    "that builds window metadata per window sub-pool"
+                )
             if backend.runner_ids is None:
                 backend.runner_ids = self
                 continue
