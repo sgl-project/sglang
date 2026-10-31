@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers import io_struct
+from sglang.srt.managers.incremental_detokenize import DetokenizeState
 from sglang.srt.managers.io_struct import (
     DetokenizeReleaseReq,
     RequestOutputStats,
@@ -34,9 +35,11 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.session.uocr_doc_reuse import hide_forced_text, req_state
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -1133,10 +1136,6 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         self.assertIsNone(output())
 
     def test_skipped_output_prefix_becomes_detokenizer_context(self):
-        from sglang.srt.managers.incremental_detokenize import DetokenizeState
-        from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
-        from sglang.srt.session.uocr_doc_reuse import hide_forced_text, req_state
-
         outputs = []
         streamer = _streamer(outputs)
         streamer.uocr_doc_hooks = object.__new__(UocrDocHooks)

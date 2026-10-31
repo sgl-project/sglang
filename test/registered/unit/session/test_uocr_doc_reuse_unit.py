@@ -17,6 +17,10 @@ from sglang.srt.layers.attention.unlimited_dash_ops.page_state import (
 from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
     UnlimitedOCRV2AttnBackend,
 )
+from sglang.srt.managers.incremental_detokenize import (
+    DetokenizeState,
+    build_detokenize_header,
+)
 from sglang.srt.session import uocr_doc_reuse as r
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1003,11 +1007,6 @@ class TestForcedTextIsHidden(CustomTestCase):
 
     def test_the_first_generated_token_still_has_text(self):
         req = self._req(forced=8, generated=2)
-        from sglang.srt.managers.incremental_detokenize import (
-            DetokenizeState,
-            build_detokenize_header,
-        )
-
         header = build_detokenize_header(req, output_prefix_len=req.send_token_offset)
         state = DetokenizeState.from_header(header=header, vocab_size=1000)
         state.append_row(
