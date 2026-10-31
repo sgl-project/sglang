@@ -1066,12 +1066,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             )
 
             def tail_pages(out: torch.Tensor, new_pages: torch.Tensor) -> torch.Tensor:
-                if swa_tail_len == 0 or new_pages.numel() == 0:
-                    return new_pages[:0]
-                tail = torch.unique(out[-swa_tail_len:] // self.page_size)
                 # Only NEW pages need binding; a tail page carried in from the
-                # prefix is already bound on the window.
-                return new_pages[torch.isin(new_pages, tail)]
+                # prefix is already bound on the window. The extend kernel hands
+                # the new pages out in token order, so the tail's new pages are
+                # the last `num_swa_pages`: a slice, not a data-dependent filter
+                # that would block the host on the device.
+                return new_pages[new_pages.numel() - num_swa_pages :]
 
             return self._allocate(
                 full_tokens=num_new_pages * self.page_size,
