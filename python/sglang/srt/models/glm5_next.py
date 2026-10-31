@@ -1391,11 +1391,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "backend is enabled."
                 )
             parallel = get_parallel()
+            is_quark = quant_config is not None and quant_config.get_name() == "quark"
+            validated_tp = (2, 4, 8) if is_quark else (4, 8)
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in validated_tp
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return (
+                    "HIP shared experts fusion is validated only for "
+                    f"tp_size in {validated_tp}."
+                )
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096
@@ -1415,7 +1420,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "HIP shared experts fusion requires the validated "
                     "clamped SiLU G1U1 activation."
                 )
-            if quant_config is not None and quant_config.get_name() == "quark":
+            if is_quark:
                 return cls._quark_mxfp4_shared_fusion_disable_reason(
                     text_config, quant_config
                 )
