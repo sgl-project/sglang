@@ -168,6 +168,16 @@ def build_mega_moe_experts_weights(layer) -> None:
 
     w13_scale = scale_param("w13_weight_scale")
     w2_scale = scale_param("w2_weight_scale")
+    if (
+        tuple(layer.w13_weight.shape) == (48, 4096, 3072)
+        and tuple(layer.w2_weight.shape) == (48, 6144, 1024)
+    ):
+        layer._mega_w1 = layer.w13_weight.data.contiguous().view(torch.uint8)
+        layer._mega_w1_scale = w13_scale.data.contiguous().view(torch.uint8)
+        layer._mega_w2 = layer.w2_weight.data.contiguous().view(torch.uint8)
+        layer._mega_w2_scale = w2_scale.data.contiguous().view(torch.uint8)
+        layer._mega_moe_weights_built = True
+        return
     layer._mega_w1, layer._mega_w1_scale = shuffle_existing(
         layer.w13_weight.data, w13_scale.data, gate_up=True
     )
