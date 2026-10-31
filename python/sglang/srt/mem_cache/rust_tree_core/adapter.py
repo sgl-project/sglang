@@ -467,6 +467,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
         has_mamba = TREE_STATE in families
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            host_only_mamba_checkpoint,
+        )
+
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
@@ -497,6 +501,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     mamba_max_states_per_path
                     if mamba_max_states_per_path >= 0
                     else None
+                ),
+                mamba_host_only_checkpoint=(
+                    host_only_mamba_checkpoint() if has_mamba else False
                 ),
             ),
             # Each slot's id and family: the native core picks a slot's driver
@@ -834,6 +841,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_salt=key.cache_salt,
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
+                mamba_host_value=params.mamba_host_value,
+                allow_missing_mamba=params.allow_missing_mamba,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(self.slot_id(TREE_WINDOW)),
                 swa_branching_seqlen=params.swa_branching_seqlen,

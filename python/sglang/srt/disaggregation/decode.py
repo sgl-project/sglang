@@ -315,6 +315,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_request_ring: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -368,6 +369,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
+            replayssm_request_ring=replayssm_request_ring,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
         )
@@ -3086,6 +3088,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         deferred_indices = set()
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
+        device_admission_refused = False
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 if decode_req.req.rid not in rids_to_check:
@@ -3169,9 +3172,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         indices_to_remove.add(i)
                         outcomes[decode_req.req.rid] = True
                         continue
+                    # Like the prealloc and retraction loops, admit in queue order: once
+                    # a request does not fit, later ones wait for the next pass.
+                    if device_admission_refused:
+                        continue
                     if not self.scheduler.disagg_decode_prealloc_queue.allocate_host_staged(
                         decode_req
                     ):
+                        device_admission_refused = True
                         continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
@@ -3515,12 +3523,14 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                self.running_reqs.join(new_prebuilt_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch=None)
 
         # Schedule decode batch
         if running_batch.is_empty():
