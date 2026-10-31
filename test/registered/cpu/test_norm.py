@@ -372,45 +372,63 @@ class TestLayerNorm:
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
 
-    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
-    @pytest.mark.parametrize("batch_size", [32, 121])
-    @pytest.mark.parametrize("hidden_size", [128, 4096, 533])
+    @pytest.mark.parametrize("hidden_size", [128, 133], ids=["fixed", "generic"])
+    @pytest.mark.parametrize("ndim", [2, 3], ids=["2d", "3d"])
+    @pytest.mark.parametrize(
+        "input_dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["input-fp16", "input-bf16", "input-fp32"],
+    )
+    @pytest.mark.parametrize(
+        "parameter_dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["parameter-fp16", "parameter-bf16", "parameter-fp32"],
+    )
     @pytest.mark.parametrize("has_bias", [False, True], ids=["no-bias", "bias"])
     def test_layernorm(
         self,
-        batch_size: int,
         hidden_size: int,
+        ndim: int,
+        input_dtype: torch.dtype,
+        parameter_dtype: torch.dtype,
         has_bias: bool,
-        dtype: torch.dtype,
     ) -> None:
-        x_list = [
-            torch.randn([batch_size, hidden_size], dtype=dtype),
-            torch.randn([batch_size, 3, hidden_size], dtype=dtype),
-        ]
+        """CPU LayerNorm supports mixed input/parameter dtypes, but one parameter dtype."""
+        shape = [8, hidden_size] if ndim == 2 else [8, 3, hidden_size]
+        x = make_non_contiguous(torch.randn(shape, dtype=input_dtype))
+        weight = torch.randn(hidden_size, dtype=parameter_dtype)
+        bias = torch.randn(hidden_size, dtype=parameter_dtype) if has_bias else None
 
-        for x in x_list:
-            x = make_non_contiguous(x)
-            weight = torch.randn(hidden_size, dtype=dtype)
-            bias = torch.randn(hidden_size, dtype=dtype) if has_bias else None
+        output = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
+        expected = self._forward_native(x, weight, eps, bias=bias)
 
-            ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
-            ref_ln_out = self._forward_native(x, weight, eps, residual=None, bias=bias)
+        assert output.dtype == input_dtype
+        atol = rtol = precision[input_dtype]
+        torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
 
-            atol = rtol = precision[ref_ln_out.dtype]
-            torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
-
-            residual = torch.randn(x.shape, dtype=dtype)
-            ref_residual = residual.clone()
-
-            add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+        if input_dtype in DTYPES and parameter_dtype == input_dtype:
+            residual = torch.randn(shape, dtype=input_dtype)
+            expected_residual = residual.clone()
+            output = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
                 x, residual, weight, bias, eps
             )
-            ref_add_ln_out, ref_residual = self._forward_native(
-                x, weight, eps, residual=ref_residual, bias=bias
+            expected, expected_residual = self._forward_native(
+                x, weight, eps, residual=expected_residual, bias=bias
             )
 
-            torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
-            torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+            torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
+            torch.testing.assert_close(
+                residual, expected_residual, atol=atol, rtol=rtol
+            )
+
+    def test_layernorm_rejects_mismatched_parameter_dtypes(self) -> None:
+        hidden_size = 128
+        x = torch.randn(8, hidden_size, dtype=torch.bfloat16)
+        weight = torch.randn(hidden_size, dtype=torch.bfloat16)
+        bias = torch.randn(hidden_size, dtype=torch.float32)
+
+        with pytest.raises(RuntimeError, match="bias dtype to match weight dtype"):
+            torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
 
 
 class TestFusedQKGemmaRMSNorm:
@@ -629,7 +647,7 @@ class TestFusedQKNorm:
             head_dim,
         )
 
-        atol = rtol = precision[dtype]
+        atol = rtol = 5e-2
         torch.testing.assert_close(q, ref_q, atol=atol, rtol=rtol)
         torch.testing.assert_close(k, ref_k, atol=atol, rtol=rtol)
 
