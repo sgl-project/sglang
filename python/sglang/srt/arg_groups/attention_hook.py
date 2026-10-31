@@ -542,6 +542,12 @@ def validate_linear_lossless_verify(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_linear_lossless_verify:
         return
+    if not (get_platform().is_cuda or get_platform().is_hip):
+        raise ValueError(
+            "--enable-linear-lossless-verify is only supported on CUDA/HIP: "
+            "other platforms do not implement both tuple-writing verification "
+            "and tuple reconstruction."
+        )
     if cfg.speculative_algorithm is None:
         raise ValueError(
             "--enable-linear-lossless-verify only changes speculative "

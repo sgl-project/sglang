@@ -244,6 +244,21 @@ class TritonGDNKernel(LinearAttnKernelBase):
         g_states_buffer: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
+        tuple_args = {}
+        if (
+            u_states_buffer is not None
+            or k_states_buffer is not None
+            or g_states_buffer is not None
+        ):
+            if is_cpu() or is_npu() or is_xpu():
+                raise NotImplementedError(
+                    "Lossless GDN verification is not supported on CPU, NPU, or XPU"
+                )
+            tuple_args = {
+                "u_states_buffer": u_states_buffer,
+                "k_states_buffer": k_states_buffer,
+                "g_states_buffer": g_states_buffer,
+            }
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -265,7 +280,5 @@ class TritonGDNKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
-            u_states_buffer=u_states_buffer,
-            k_states_buffer=k_states_buffer,
-            g_states_buffer=g_states_buffer,
+            **tuple_args,
         )
