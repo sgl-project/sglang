@@ -138,7 +138,7 @@ def test_capture_and_replay_do_not_overwrite_inputs_or_retained_embeddings():
 
 
 def test_uncached_layout_fallback_preserves_deepstack_and_cached_graphs():
-    """New layouts at capacity must compute every output without growing graphs."""
+    """New layouts at capacity compute outputs without mutation or graph growth."""
     module = _load_npu_graph_runner_module()
 
     class Block(_Block):
@@ -149,7 +149,7 @@ def test_uncached_layout_fallback_preserves_deepstack_and_cached_graphs():
             torch.testing.assert_close(
                 kwargs["cu_seqlens"], torch.tensor([2, 4], dtype=torch.int32)
             )
-            return x + 1
+            return x.add_(1)
 
     vit = SimpleNamespace(
         blocks=[Block()],
@@ -160,19 +160,19 @@ def test_uncached_layout_fallback_preserves_deepstack_and_cached_graphs():
         dtype=torch.float32,
     )
     runner = module.ViTNpuGraphRunner(vit)
-    # No real graphs needed: reaching the limit must use the actual eager
-    # block/merger computation, including deepstack and output permutation.
+    # No real graphs needed: reaching the limit uses the eager block/merger
+    # computation, including deepstack and output permutation.
     runner._MAX_CACHED_GRAPHS = 1
     existing = object()
     runner.block_graphs["existing"] = existing
     x = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    x_before = x.clone()
     rotary = torch.zeros(4, 4)
     indices = torch.tensor([3, 1, 2, 0])
-    out = runner.run(
-        x, torch.tensor([0, 2, 4]), rotary, rotary, output_indices=indices
-    )
-    expected = torch.cat([(x + 1) * 2, (x + 1) * 3], dim=1)[indices]
+    out = runner.run(x, torch.tensor([0, 2, 4]), rotary, rotary, output_indices=indices)
+    expected = torch.cat([(x_before + 1) * 2, (x_before + 1) * 3], dim=1)[indices]
     torch.testing.assert_close(out, expected)
+    torch.testing.assert_close(x, x_before)
     assert runner.block_graphs == {"existing": existing}
     assert not runner.block_input
 

@@ -234,8 +234,10 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         )
         if graph_key not in self.block_graphs:
             if len(self.block_graphs) >= self._MAX_CACHED_GRAPHS:
+                # ViT blocks update hidden states in place, so preserve caller-owned
+                # input on the eager fallback just as capture/replay does.
                 out = self._forward_blocks(
-                    x_3d,
+                    x_3d.clone(),
                     cu_seqlens[1:].to("cpu", dtype=torch.int32),
                     rotary_pos_emb_cos,
                     rotary_pos_emb_sin,
