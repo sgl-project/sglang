@@ -4096,8 +4096,7 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            self.invariant_checker.check_running_reqs(running_batch, last_batch)
+        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)

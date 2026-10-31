@@ -97,6 +97,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
     s.running_reqs = RunningReqs()
+    s.invariant_checker = MagicMock()
     return s
 
 

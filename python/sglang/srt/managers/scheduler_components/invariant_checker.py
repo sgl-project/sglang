@@ -482,13 +482,15 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
-    def check_running_reqs(
+    def maybe_check_running_reqs(
         self,
         running_batch: Optional[ScheduleBatch],
         last_batch: Optional[ScheduleBatch],
     ) -> None:
-        """The running requests are exactly the unfinished ones the batches hold,
-        apart from the chunked request."""
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
+        the unfinished ones the batches hold, apart from the chunked request."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
         step_batches = [last_batch, *self.get_pp_mbs()]
         if self.prefill_joins_at_merge():
             step_batches = [

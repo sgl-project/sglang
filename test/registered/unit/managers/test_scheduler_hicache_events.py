@@ -34,6 +34,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.process_pending_chunked_abort = Mock()
         s.process_prefill_chunk = Mock()
         s.running_reqs = RunningReqs()
+        s.invariant_checker = Mock()
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
