@@ -297,36 +297,54 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         )
 
     def test_unfinished_checkpoint_skips_donation_when_all_states_locked(self):
-        component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
-        cache.enable_mamba_extra_buffer = True
-        req = SimpleNamespace(kv=SimpleNamespace(mamba_last_track_seqlen=8), lock=None)
-        params = InsertParams()
+        for extra_buffer, quantized in ((True, False), (True, True), (False, False)):
+            with self.subTest(extra_buffer=extra_buffer, quantized=quantized):
+                component, cache, owned = _build_peak(
+                    pool_size=2 * N, lock_prefixes=True
+                )
+                cache.enable_mamba_extra_buffer = extra_buffer
+                req = SimpleNamespace(
+                    kv=SimpleNamespace(
+                        mamba_last_track_seqlen=8, mamba_pool_idx=owned[0]
+                    ),
+                    lock=None,
+                )
+                params = InsertParams()
 
-        with (
-            patch.object(
-                MambaComponent, "quantizes_checkpoints", new_callable=PropertyMock
-            ) as quantizes,
-            patch(
-                "sglang.srt.mem_cache.unified_cache.components.mamba.get_exec",
-                return_value=SimpleNamespace(
-                    mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
-                ),
-            ),
-        ):
-            quantizes.return_value = False
-            self.assertEqual(
-                component.prepare_for_caching_req(req, params, 8, is_finished=False),
-                0,
-            )
+                with (
+                    patch.object(
+                        MambaComponent,
+                        "quantizes_checkpoints",
+                        new_callable=PropertyMock,
+                        return_value=quantized,
+                    ),
+                    patch(
+                        "sglang.srt.mem_cache.unified_cache.components.mamba.get_exec",
+                        return_value=SimpleNamespace(
+                            mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+                        ),
+                    ),
+                ):
+                    self.assertEqual(
+                        component.prepare_for_caching_req(
+                            req, params, 8, is_finished=False
+                        ),
+                        0,
+                    )
 
-        self.assertIsNone(params.mamba_value)
-        self.assertEqual(req.kv.mamba_last_track_seqlen, 8)
-        self.assertEqual(len(cache.prefix_nodes), N)
+                self.assertIsNone(params.mamba_value)
+                self.assertEqual(req.kv.mamba_last_track_seqlen, 8)
+                self.assertTrue(torch.equal(req.kv.mamba_pool_idx, owned[0]))
+                self.assertEqual(len(cache.prefix_nodes), N)
+                self.assertEqual(cache.allocator.free_ids, [])
+                self.assertEqual(
+                    cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+                )
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
         component, cache, _ = _build_peak(pool_size=3 * N, lock_prefixes=True)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(cache.component_protected_size_[ComponentType.MAMBA], N)
 
@@ -334,7 +352,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         # pool = 2N but the matched prefixes are evictable (skip_mamba on decode):
         # eviction reclaims a victim, so even ratio 2 serves the donated alloc.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=False)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
         self.assertEqual(
