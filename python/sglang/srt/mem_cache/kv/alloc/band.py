@@ -2502,6 +2502,34 @@ class FloatBand(Band):
         gap_low2, gap_high2 = self._gap_pages()
         return (gap_low2 if side == "low" else gap_high2) * epp
 
+    def relocate_into(self, first: int, end: int) -> int:
+        """Move this float into the page block ``[first, end)``: live pages
+        already inside stay, the others are copied to free pages of the block,
+        and the block's remaining pages become holes. The caller guarantees the
+        block holds every live page and meets no other band. Returns pages
+        moved."""
+        holes = set(self._free_phys_pages.tolist())
+        live = [p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes]
+        assert len(live) <= end - first, "the block cannot hold the live pages"
+        inside = {p for p in live if first <= p < end}
+        srcs = [p for p in live if p not in inside]
+        # Not live, so never a source: one batched, disjoint move.
+        dsts = [p for p in range(first, end) if p not in inside][: len(srcs)]
+        if srcs:
+            src_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
+            dst_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
+            # Settle right before the first copy -- see `make_room`.
+            self._settle_inflight_forward()
+            self._move_pages_and_rebind(src_t, dst_t)
+            self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
+        kept = inside | set(dsts)
+        self.low_wm_page, self.high_wm_page = first, end
+        new_holes = [p for p in range(first, end) if p not in kept]
+        self._free_phys_pages = torch.tensor(
+            new_holes, dtype=torch.int64, device=self.device
+        )
+        return len(srcs)
+
     def _relocate_to_positions(self, live_sorted: List[int], final: List[int]) -> int:
         """Order-preserving relocation of the live pages onto the ``final``
         positions (an ascending hole-free block). Batched disjoint move when
