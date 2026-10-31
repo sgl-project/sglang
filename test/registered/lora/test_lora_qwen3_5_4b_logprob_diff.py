@@ -34,7 +34,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import assert_lora_matches_trainer_logprobs
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=57, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=57, stage="nightly", runner_config="1-gpu-large")
 
 BASE_MODEL = "Qwen/Qwen3.5-4B"
 LORA_HF_REPO = "opherlie/lora-test-case-Qwen3.5-4B"

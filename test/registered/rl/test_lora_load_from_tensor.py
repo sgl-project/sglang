@@ -9,7 +9,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-large")
 # backend-specific: the HIP build of the Triton LoRA kernels serving an adapter
 # that arrived as serialized tensors, checked by the exact-text oracle.
 register_amd_ci(est_time=90, suite="extra-a-test-1-gpu-large-amd")

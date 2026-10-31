@@ -1,4 +1,5 @@
-"""Extra legacy Triton breakable-prefill checks; csgmv runs per PR."""
+"""Nightly legacy Triton breakable-prefill checks; the csgmv arm is
+test_bcg_with_lora.py."""
 
 import unittest
 
@@ -6,7 +7,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.bcg_lora_kit import BCGLoRAServerMixin
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=150, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=150, stage="nightly", runner_config="1-gpu-large")
 
 
 class TestBCGLoRATriton(BCGLoRAServerMixin, CustomTestCase):

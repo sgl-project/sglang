@@ -1,6 +1,7 @@
 """Compare MoE LoRA prefill and decode graph replay with eager.
 
-Base and Extra run independent configuration lists and eager references.
+The per-PR and nightly files run independent configuration lists and eager
+references.
 The triton_v2 arms run with SGLANG_ENABLE_LORA_DUAL_GRAPH, so adapter and
 base decode batches replay both decode graph variants of one batch size.
 """

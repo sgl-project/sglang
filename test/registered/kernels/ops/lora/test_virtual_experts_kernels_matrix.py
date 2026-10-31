@@ -1,6 +1,6 @@
 """Capacity, staged-routing and graph-replay matrices for the LoRA
-virtual-experts routing. The per-PR sentinel, remap and exact-placement checks
-are in test_virtual_experts_kernels.py."""
+virtual-experts routing, run nightly. The sentinel, remap and exact-placement
+checks on the kernel lane are in test_virtual_experts_kernels.py."""
 
 import unittest
 from itertools import product
@@ -13,7 +13,7 @@ from sglang.srt.utils import get_device, is_cuda, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="nightly", runner_config="1-gpu-large")
 
 
 class TestVirtualExpertsRoutingMatrix(CustomTestCase):

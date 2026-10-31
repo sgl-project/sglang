@@ -28,7 +28,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=65, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=65, stage="nightly", runner_config="2-gpu-large")
 
 # The TP=1 run stays within stats + 2e-4 of vLLM and TP=2 within 5e-4 of TP=1.
 LOGPROB_EPS = 7e-04

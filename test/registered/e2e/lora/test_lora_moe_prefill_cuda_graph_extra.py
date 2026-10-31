@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Extra legacy Triton and full-prefill-graph cases, with their own eager reference;
+"""Nightly legacy Triton and full-prefill-graph cases, with their own eager reference;
 the triton_v2 arm runs with the dual (lora/nolora) decode graph."""
 
 import unittest
@@ -23,7 +23,7 @@ from sglang.test.kits.lora_prefill_graph_kit import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=235, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=235, stage="nightly", runner_config="1-gpu-large")
 
 
 class TestMoELoRAPrefillCudaGraphMatrix(CustomTestCase):

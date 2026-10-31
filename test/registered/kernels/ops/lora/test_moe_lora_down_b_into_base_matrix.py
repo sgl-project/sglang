@@ -1,4 +1,4 @@
-"""Extra-tier fused-stage parity and unsafe-overlap rejection for the down-B fold.
+"""Nightly fused-stage parity and unsafe-overlap rejection for the down-B fold.
 Core parity and replay guards live in test_moe_lora_down_b_into_base.py.
 """
 
@@ -27,7 +27,7 @@ from sglang.test.kits.moe_lora_down_b_kit import (
     cutedsl_cuda_only,
 )
 
-register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="nightly", runner_config="1-gpu-large")
 
 
 class TestDownBIntoBasePlan:

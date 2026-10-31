@@ -36,7 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=110,
-    stage="extra-b",
+    stage="nightly",
     runner_config="4-gpu-h100",
 )
 
