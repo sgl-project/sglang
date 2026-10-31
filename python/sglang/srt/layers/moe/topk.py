@@ -100,6 +100,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+    topk_ids_logical_to_physical_and_record,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -126,6 +127,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
 )
 
@@ -145,6 +147,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -468,10 +471,15 @@ def _simulate_balanced_routing_kernel(
     stride_wm,
     stride_wk,
     num_non_padded_ptr,
+    to_physical_map_ptr,
+    logical_count_ptr,
+    num_duplicates,
+    ep_rank,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     RANDOM: tl.constexpr,
     HAS_NON_PADDED: tl.constexpr = False,
+    HAS_PHYSICAL_MAP: tl.constexpr = False,
 ):
     """One program per token: overwrite its top-k row with a balanced expert
     assignment and uniform ``1/k`` weights, in a single launch — so the
@@ -493,8 +501,10 @@ def _simulate_balanced_routing_kernel(
     so it is baked at CUDA-graph capture and replays stay balanced) spread by
     ``step``; it is the only path that reads ``token_shard_rank`` /
     ``num_token_shards``, to seed scattered DP shards differently. Both emit
-    global expert ids (any EP logical->physical remap happens later in
-    ``_post_process_topk_ids``)."""
+    global logical expert ids; ``HAS_PHYSICAL_MAP`` then maps them to physical
+    slots with the replica pick of DeepGEMM's MegaGate (``(ep_rank + t * 23333)
+    % logical_count``), otherwise the remap happens later in
+    ``_post_process_topk_ids``."""
     t = tl.program_id(0)
     j = tl.arange(0, BLOCK_K)
     mask = j < K
@@ -508,6 +518,14 @@ def _simulate_balanced_routing_kernel(
             deal // num_ranks
         ) % experts_per_rank
     w = tl.full((BLOCK_K,), inv_k, tl.float32)
+    if HAS_PHYSICAL_MAP:
+        count = tl.load(logical_count_ptr + gid, mask=mask, other=1)
+        dup = (ep_rank + t.to(tl.int64) * 23333) % count
+        gid = tl.load(
+            to_physical_map_ptr + gid.to(tl.int64) * num_duplicates + dup,
+            mask=mask,
+            other=0,
+        )
     if HAS_NON_PADDED:
         is_pad = t >= tl.load(num_non_padded_ptr)
         gid = tl.where(is_pad, -1, gid)
@@ -534,6 +552,9 @@ def _simulate_balanced_routing(
     seed: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     weight_scale: float = 1.0,
+    to_physical_map: Optional[torch.Tensor] = None,
+    logical_count: Optional[torch.Tensor] = None,
+    ep_rank: int = 0,
 ) -> None:
     """Benchmark-only fused override (in place): replace ``topk_ids`` with a
     balanced expert assignment and ``topk_weights`` with ``1/k`` using a single
@@ -558,7 +579,9 @@ def _simulate_balanced_routing(
     shard count is a multiple of ``num_ranks``, and otherwise differs by at
     most one slot per shard whose ``tokens * k`` leaves a remainder. Balance is
     over logical expert blocks ``num_experts // num_ranks``: a non-trivial
-    expert placement (EPLB, redundant experts) remaps it afterwards.
+    expert placement (EPLB, redundant experts) remaps it afterwards, or here
+    when ``to_physical_map`` (``[num_experts, dup]`` int32) and
+    ``logical_count`` (``[num_experts]`` int32) are given.
 
     ``seed`` is exposed for deterministic tests; production calls use a
     per-launch seed.
@@ -603,10 +626,15 @@ def _simulate_balanced_routing(
         topk_weights.stride(0),
         topk_weights.stride(1),
         num_token_non_padded if num_token_non_padded is not None else topk_ids,
+        to_physical_map if to_physical_map is not None else topk_ids,
+        logical_count if logical_count is not None else topk_ids,
+        to_physical_map.shape[1] if to_physical_map is not None else 1,
+        ep_rank,
         K=k,
         BLOCK_K=triton.next_power_of_2(k),
         RANDOM=random,
         HAS_NON_PADDED=num_token_non_padded is not None,
+        HAS_PHYSICAL_MAP=to_physical_map is not None,
     )
 
 
@@ -2024,6 +2052,9 @@ def biased_grouped_topk_gpu(
         # flashinfer always renormalizes the selected weights
         and renormalize
         and is_power_of_two(num_experts)
+        # SAIL's torch backend reports as CUDA, but flashinfer topk asserts
+        # sm >= 89, which SAIL Zhenwu 810E devices do not satisfy.
+        and not _is_sail
         # flashinfer constraints (applied to routed experts only)
         and topk_routed <= 8
         and topk_group <= num_expert_group
@@ -2108,8 +2139,15 @@ def biased_grouped_topk_gpu(
         assert hidden_states.shape[0] == gating_output.shape[0], (
             f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         )
-        bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+        # Preserve fp32 bias precision on both routers; dispatch must not change
+        # a token's routing when its batch crosses the radix4 size limit.
+        if correction_bias.dtype == torch.float32:
+            route_logits = gating_output.to(torch.float32)
+            route_bias = correction_bias
+        else:
+            route_logits = gating_output
+            route_bias = correction_bias.to(dtype=gating_output.dtype)
 
         if envs.SGLANG_K3_RADIX4_TOPK.get():
             from sglang.kernels.ops.moe import moe_route_radix4
@@ -2118,28 +2156,17 @@ def biased_grouped_topk_gpu(
             # ungrouped) is the only config covered for now; anything else
             # falls back to aiter.
             if moe_route_radix4.available() and moe_route_radix4.covered(
-                gating_output, bias, topk, num_expert_group, topk_group
+                route_logits, route_bias, topk, num_expert_group, topk_group
             ):
                 return moe_route_radix4.route_radix4(
-                    gating_output, bias, topk, renormalize, scaling
+                    route_logits, route_bias, topk, renormalize, scaling
                 )
 
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
-        # Don't re-downcast an fp32 correction bias at the aiter boundary: an
-        # offset bias loses too many levels in bf16 and reorders top-k. Cast the
-        # gating logits up instead. Gated on the bias dtype rather than the
-        # architecture, so a bias that arrives as bf16 is byte-identical to
-        # before, as is the radix4 path above.
-        if correction_bias.dtype == torch.float32:
-            aiter_gating_output = gating_output.to(torch.float32)
-            aiter_bias = correction_bias
-        else:
-            aiter_gating_output = gating_output
-            aiter_bias = bias
         aiter_biased_grouped_topk(
-            aiter_gating_output,
-            aiter_bias,
+            route_logits,
+            route_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
@@ -2410,6 +2437,8 @@ def apply_routing_simulation(
     layer_id: Optional[int],
     num_token_non_padded: Optional[torch.Tensor] = None,
     weight_scale: float = 1.0,
+    to_physical_map: Optional[torch.Tensor] = None,
+    logical_count: Optional[torch.Tensor] = None,
 ) -> None:
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     # Benchmark-only: override gating with a balanced expert assignment (so
@@ -2452,6 +2481,9 @@ def apply_routing_simulation(
         num_token_shards=num_token_shards,
         num_token_non_padded=num_token_non_padded,
         weight_scale=weight_scale,
+        to_physical_map=to_physical_map,
+        logical_count=logical_count,
+        ep_rank=parallel.moe_ep_rank if to_physical_map is not None else 0,
     )
 
 
@@ -2627,17 +2659,32 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
-            # A remap table indexed by -1 aliases its last entry, so only the
-            # identity-remap branch may drop the padded-row mask.
-            topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids,
-                expert_location_dispatch_info,
-                (
-                    None
-                    if padded_rows_masked and expert_location_dispatch_info is None
-                    else num_token_non_padded
-                ),
-            )
+            fused_topk_ids = None
+            recorder = get_global_expert_distribution_recorder()
+            load_buffer = recorder.get_current_pass_count_buffer()
+            if load_buffer is not None:
+                fused_topk_ids = topk_ids_logical_to_physical_and_record(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    load_buffer,
+                    num_token_non_padded,
+                )
+            if fused_topk_ids is not None:
+                topk_ids = fused_topk_ids
+                _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+                recorder_was_fused = True
+            else:
+                # A remap table indexed by -1 aliases its last entry, so only the
+                # identity-remap branch may drop the padded-row mask.
+                topk_ids = _biased_grouped_topk_postprocess(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    (
+                        None
+                        if padded_rows_masked and expert_location_dispatch_info is None
+                        else num_token_non_padded
+                    ),
+                )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Always fill the padded
@@ -2663,17 +2710,12 @@ def _post_process_topk_ids(
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
-            and layer_id is not None
         ):
-            from sglang.srt.eplb.eplb_map_record_fused import (
-                eplb_map_and_record_fused,
-            )
-
             if get_moe_a2a_backend().is_megamoe():
                 recorder = get_global_expert_distribution_recorder()
-                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
+                load_buffer = recorder.get_current_pass_count_buffer()
                 if load_buffer is not None:
-                    fused_topk_ids = eplb_map_and_record_fused(
+                    fused_topk_ids = topk_ids_logical_to_physical_and_record(
                         topk_ids,
                         expert_location_dispatch_info,
                         load_buffer,
@@ -2892,10 +2934,12 @@ def select_experts(
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
     # in-register, so downcasting here would only buy it a per-call cast back.
+    # An fp32 bias stays fp32: biased_grouped_topk_gpu then routes in fp32.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and correction_bias.dtype != torch.float32
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):

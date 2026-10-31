@@ -12,6 +12,10 @@ from enum import Enum
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 
 
@@ -60,6 +64,79 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
 
+class IndexKeyFormat(Enum):
+    # Each key has 128 fp8 elements. A page stores keys followed by fp32 scales.
+    DSA_FP8 = "dsa_fp8"
+
+    def page_bytes(self, key_count: int) -> int:
+        # Each physical format owns its sizing, including scales and padding.
+        if self is IndexKeyFormat.DSA_FP8:
+            key_data_bytes = key_count * 128
+            scale_bytes = key_count * 4
+            return key_data_bytes + scale_bytes
+        raise ValueError(f"unsupported index key format {self}")
+
+
+class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    page_size: int
+    buffers: tuple[torch.Tensor, ...]
+    compress_ratio: int
+    key_format: IndexKeyFormat
+    # Replicated DCP stores multiple kernel pages in each allocation row.
+    kernel_page_size: int | None = None
+
+    @property
+    def page_bytes(self) -> int:
+        return self.key_format.page_bytes(self.page_size // self.compress_ratio)
+
+    @property
+    def kernel_page_bytes(self) -> int:
+        return self.key_format.page_bytes(
+            self.page_size // self.compress_ratio
+            if self.kernel_page_size is None
+            else self.kernel_page_size
+        )
+
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        buffers = self.buffers
+        if layer_ids is not None and len(layer_ids) != len(buffers):
+            raise ValueError(
+                f"{len(layer_ids)} model layers must match {len(buffers)} buffers"
+            )
+        if (
+            self.page_size <= 0
+            or self.compress_ratio <= 0
+            or self.page_size % self.compress_ratio
+        ):
+            raise ValueError(
+                f"page coverage {self.page_size} must be divisible by "
+                f"compression ratio {self.compress_ratio}"
+            )
+        if not isinstance(self.key_format, IndexKeyFormat):
+            raise ValueError(f"unsupported index key format {self.key_format}")
+        if not buffers:
+            raise ValueError("index key input must contain at least one buffer")
+        page_bytes = self.page_bytes
+        if self.kernel_page_bytes <= 0 or page_bytes % self.kernel_page_bytes:
+            raise ValueError(
+                f"index row bytes {page_bytes} must contain whole kernel pages of {self.kernel_page_bytes} bytes"
+            )
+        for layer, buffer in enumerate(buffers):
+            if (
+                buffer.dtype != torch.uint8
+                or buffer.ndim != 2
+                or buffer.shape[0] == 0
+                or buffer.shape[1] != page_bytes
+                or not buffer.is_contiguous()
+                or buffer.device != buffers[0].device
+            ):
+                raise ValueError(
+                    f"index buffer[{layer}]: expected contiguous uint8 index pages of {page_bytes} bytes "
+                    f"on {buffers[0].device}, got {tuple(buffer.shape)} "
+                    f"{buffer.dtype} on {buffer.device}, stride={buffer.stride()}"
+                )
+
+
 class KVBufferLayout(Enum):
     NHD = "nhd"
     PAGED_NHD = "paged_nhd"
@@ -93,6 +170,41 @@ class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):
     layout: KVScaleLayout
 
 
+class PageEnvelopeBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Native shared allocation and one sub-pool's complete-page view.
+
+    Capture after final backing; reserved virtual bytes are not registrable.
+    """
+
+    allocation: torch.Tensor
+    registration_bytes: int
+    pages: torch.Tensor
+    page_size: int
+    grow_direction: str
+
+    def validate(self) -> None:
+        if (
+            self.allocation.dtype != torch.uint8
+            or self.allocation.ndim != 1
+            or not self.allocation.is_contiguous()
+            or not 0 < self.registration_bytes <= self.allocation.nbytes
+        ):
+            raise ValueError("Page-envelope allocation requires a backed uint8 region")
+        if (
+            self.pages.dtype != torch.uint8
+            or self.pages.ndim != 2
+            or not self.pages.is_contiguous()
+            or self.pages.device != self.allocation.device
+            or self.pages.data_ptr() != self.allocation.data_ptr()
+            or self.pages.nbytes > self.registration_bytes
+            or self.page_size <= 0
+            or self.pages.shape[1] <= 0
+            or self.pages.shape[1] % self.page_size
+            or self.grow_direction not in {"up", "down"}
+        ):
+            raise ValueError("Invalid zero-anchored page-envelope view or geometry")
+
+
 class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     """Physical MHA input for host construction; no capacity or allocation policy.
 
@@ -109,6 +221,7 @@ class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     dtype: torch.dtype
     device: torch.device
     scales: KVScaleBuffers | None = None
+    page_envelope: PageEnvelopeBufferInfo | None = None
     # Resolve current contiguous backing at transfer time for relocatable pools.
     transfer_buffers: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None
 
@@ -214,12 +327,52 @@ class MLABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
             )
 
 
+class PageRowBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Packed page rows: one ``row_bytes`` uint8 row per (layer, page).
+
+    ``slab`` is ``[layers, num_pages, row_bytes]`` and ``rows[i]`` is ``slab[i]``;
+    a row holds every component of that page, such as payloads and scales.
+    """
+
+    slab: torch.Tensor
+    rows: tuple[torch.Tensor, ...]
+    row_bytes: int
+    page_size: int
+    num_pages: int
+
+    def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
+        layers = len(self.rows)
+        expected = (layers, self.num_pages, self.row_bytes)
+        if (
+            tuple(self.slab.shape) != expected
+            or self.slab.dtype != torch.uint8
+            or not self.slab.is_contiguous()
+            or (layer_ids is not None and len(layer_ids) != layers)
+        ):
+            raise ValueError(
+                f"Page rows: slab shape={tuple(self.slab.shape)}, "
+                f"dtype={self.slab.dtype}, layer_ids={layer_ids}; "
+                f"expected contiguous uint8 {expected}"
+            )
+        for layer, row in enumerate(self.rows):
+            if row.data_ptr() != self.slab[layer].data_ptr():
+                raise ValueError(f"Page rows: rows[{layer}] is not slab[{layer}]")
+
+
 class DevicePoolInfo(msgspec.Struct, frozen=True, kw_only=True):
     pool_name: PoolName
     indices_from_pool: PoolName
     # Model layer IDs, including the PP stage offset, in buffer-axis order.
     layer_ids: tuple[int, ...]
-    buffer_info: MambaStateBufferInfo | MHABufferInfo | MLABufferInfo
+    buffer_info: (
+        MambaStateBufferInfo
+        | MHABufferInfo
+        | MLABufferInfo
+        | IndexKeyBufferInfo
+        | PageRowBufferInfo
+        | DSV4PagedBufferInfo
+        | DSV4CheckpointBufferInfo
+    )
 
     def __post_init__(self) -> None:
         # A PP stage may own no checkpoint layers. Buffer validation decides
