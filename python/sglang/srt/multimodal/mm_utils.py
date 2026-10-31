@@ -58,6 +58,13 @@ def has_valid_data(data) -> bool:
     return True
 
 
+def batch_single_media_input(value):
+    """Keep one request's flat media list together when promoting it to a batch."""
+    if isinstance(value, list) and value and not isinstance(value[0], list):
+        return [value]
+    return value
+
+
 def materialize_multimodal_features(
     features: Sequence[torch.Tensor],
     *,

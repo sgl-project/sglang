@@ -563,19 +563,98 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         flat = {
             "image_data": ["a.png", "b.png"],
             "video_data": ["v1.mp4", "v2.mp4"],
-            "audio_data": ["a1.wav"],
+            "audio_data": ["a1.wav", "a2.wav"],
             "mm_hashes": ["00aa", "00bb"],
+            "mm_content_hashes": ["sha256:" + "a" * 64, None],
         }
         nested = {name: [values] for name, values in flat.items()}
-        for media in (flat, nested):
-            with self.subTest(nested=media is nested):
+        for prompt in (
+            {"text": "Describe both images."},
+            {"input_ids": [1, 2, 3]},
+            {"input_embeds": [[0.1, 0.2], [0.3, 0.4]]},
+        ):
+            for media in (flat, nested):
+                for n in (2, 3):
+                    with self.subTest(prompt=prompt, nested=media is nested, n=n):
+                        original = copy.deepcopy(media)
+                        req = GenerateReqInput(
+                            sampling_params={"n": n}, **prompt, **media
+                        )
+                        req.normalize_batch_and_arguments()
+                        for index in range(n):
+                            sample = req[index]
+                            self.assertEqual(sample.image_data, flat["image_data"])
+                            self.assertEqual(sample.video_data, flat["video_data"])
+                            self.assertEqual(sample.audio_data, flat["audio_data"])
+                            self.assertEqual(sample.mm_hashes, flat["mm_hashes"])
+                            self.assertEqual(
+                                sample.mm_content_hashes, flat["mm_content_hashes"]
+                            )
+                        self.assertEqual(media, original)
+
+    def test_parallel_sampling_keeps_batched_media_order(self):
+        req = GenerateReqInput(
+            text=["first", "second"],
+            image_data=[["a.png", "b.png"], ["c.png"]],
+            video_data=[["a.mp4", "b.mp4"], ["c.mp4"]],
+            audio_data=[["a.wav", "b.wav"], ["c.wav"]],
+            mm_hashes=[["a", "b"], ["c"]],
+            mm_content_hashes=[[None, "sha256:" + "b" * 64], [None]],
+            sampling_params={"n": 3},
+        )
+        expected = copy.deepcopy(req)
+        req.normalize_batch_and_arguments()
+        for index in range(6):
+            sample = req[index]
+            source = index % 2
+            self.assertEqual(sample.text, expected.text[source])
+            self.assertEqual(sample.image_data, expected.image_data[source])
+            self.assertEqual(sample.video_data, expected.video_data[source])
+            self.assertEqual(sample.audio_data, expected.audio_data[source])
+            self.assertEqual(sample.mm_hashes, expected.mm_hashes[source])
+            self.assertEqual(
+                sample.mm_content_hashes, expected.mm_content_hashes[source]
+            )
+
+    def test_parallel_sampling_still_rejects_misaligned_hashes(self):
+        for hashes in ({"mm_hashes": ["a"]}, {"mm_content_hashes": [None]}):
+            with self.subTest(hashes=hashes):
                 req = GenerateReqInput(
-                    input_ids=[1, 2, 3], sampling_params={"n": 2}, **media
+                    input_ids=[1, 2],
+                    image_data=["a.png", "b.png"],
+                    sampling_params={"n": 2},
+                    **hashes,
+                )
+                with self.assertRaisesRegex(ValueError, "entries for 2 images"):
+                    req.normalize_batch_and_arguments()
+
+    def test_parallel_sampling_without_media_and_beam_search_are_unchanged(self):
+        for media in (None, []):
+            with self.subTest(media=media):
+                req = GenerateReqInput(
+                    text="hello",
+                    image_data=media,
+                    video_data=media,
+                    audio_data=media,
+                    sampling_params={"n": 2},
                 )
                 req.normalize_batch_and_arguments()
-                for sample in (req[0], req[1]):
-                    for name, values in flat.items():
-                        self.assertEqual(getattr(sample, name), values)
+                self.assertEqual(req.image_data, [None, None])
+                self.assertEqual(req.mm_content_hashes, [None, None])
+                for index in range(2):
+                    self.assertIsNone(req[index].image_data)
+                    self.assertIsNone(req[index].video_data)
+                    self.assertIsNone(req[index].audio_data)
+        for params in ({"n": 1}, {"n": 2, "beam_width": 2}):
+            with self.subTest(params=params):
+                req = GenerateReqInput(
+                    text="hello",
+                    image_data=["a.png", "b.png"],
+                    sampling_params=params,
+                )
+                req.normalize_batch_and_arguments()
+                self.assertTrue(req.is_single)
+                self.assertEqual(req.image_data, ["a.png", "b.png"])
 
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
