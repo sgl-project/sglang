@@ -231,7 +231,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
+        self._accumulator = self._create_accumulator(expert_location_metadata, rank)
         self._single_pass_gatherers = {
             k: self._create_gatherer(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -243,6 +243,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
+
+    def _create_accumulator(self, expert_location_metadata, rank):
+        return _Accumulator.init_new(expert_location_metadata, rank)
 
     def _create_gatherer(self, expert_location_metadata, rank):
         return _SinglePassGatherer.init_new(expert_location_metadata, rank)
@@ -738,6 +741,9 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 
 class _Accumulator(ABC):
+    # Backends may override this to select the statistics communication group.
+    _communication_group: Optional[torch.distributed.ProcessGroup] = None
+
     @staticmethod
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
@@ -835,7 +841,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=0,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         if self._rank == 0:
@@ -1003,7 +1012,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -1046,7 +1057,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 dtype=torch.float32,
                 device=get_device_namespace().device,
             )
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        torch.distributed.broadcast(
+            avg_rate_tensor, src=0, group=self._communication_group
+        )
         return avg_rate_tensor.item()
 
 

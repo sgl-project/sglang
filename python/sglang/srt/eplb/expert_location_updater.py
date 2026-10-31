@@ -213,6 +213,7 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -375,6 +376,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -425,6 +427,7 @@ def update_expert_weights_single_layer(
                             routed_experts_weights, i, src_expert_location
                         ),
                         peer=dst_rank,
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
