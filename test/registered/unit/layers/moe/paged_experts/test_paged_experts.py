@@ -945,16 +945,23 @@ class TestSizing(CustomTestCase):
                 torch.nn.ModuleList([built[0][1]]), kvc, 0
             )
 
-    def _mamba_slots(self, budget, **schedule):
+    def _mamba_slots(self, budget, context_length=None, kv_bytes=1, **schedule):
+        """Mamba slots of 1000 B, 2 per request; ``kv_bytes`` per KV token."""
         kvc = SimpleNamespace(
             mambaish_config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1000)
             ),
             extra_mamba_cache_bytes_per_req=0,
             _calculate_mamba_ratio=lambda: 2,
-            model_config=SimpleNamespace(context_len=4096),
+            model_config=SimpleNamespace(context_len=context_length or 4096),
         )
-        with self._patched(**schedule) as overrides:
+        with (
+            self._patched(context_length, **schedule) as overrides,
+            patch(
+                self._SIZING + "_kv_tokens",
+                side_effect=lambda kvc, nbytes: max(nbytes, 0) // kv_bytes,
+            ),
+        ):
             sizing.ExpertSlotSizing([], kvc, 0, budget)
         return [
             o["max_mamba_cache_size"] for o in overrides if "max_mamba_cache_size" in o
@@ -969,6 +976,25 @@ class TestSizing(CustomTestCase):
         self.assertEqual(self._mamba_slots(19_000, max_running_requests=8), [9])
         self.assertEqual(self._mamba_slots(100, max_running_requests=8), [2])
         self.assertEqual(self._mamba_slots(10**6, max_mamba_cache_size=5), [])
+
+    def test_one_full_request_comes_before_more_mamba_state(self):
+        """Near the limit, the Mamba state grows only as far as one full-length request still
+        fits next to it; more requests queue. 20,000 B, a share of 18 slots (ratio 9), 8
+        requests of 4096 tokens at 2 B: 16 slots would leave 4,000 B, short of the 8,192 one
+        request needs, so 10 (5 requests) leave 10,000 B. Control: in the old order, 16 slots
+        leave the KV cache short of one request, which startup rejects."""
+        args = dict(context_length=4096, kv_bytes=2, max_running_requests=8)
+        args["mamba_full_memory_ratio"] = 9
+        self.assertEqual(self._mamba_slots(20_000, **args), [10])
+        self.assertLess((20_000 - 16 * 1000) // 2, 4096)
+        # Room for all 8 requests: no change. No room even for one: one request's state,
+        # and startup names the context that does not fit.
+        self.assertEqual(self._mamba_slots(10**6, **args), [16])
+        self.assertEqual(self._mamba_slots(5_000, **args), [2])
+        # --max-total-tokens is the minimum when set.
+        args = dict(kv_bytes=2, max_running_requests=8, mamba_full_memory_ratio=9)
+        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [16])
+        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [10])
 
 
 if __name__ == "__main__":
