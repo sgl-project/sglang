@@ -38,6 +38,26 @@ The following server arguments are relevant for multi-LoRA serving:
 From client side, the user needs to provide a list of strings as input batch, and a list of adaptor names that each input sequence corresponds to.
 
 
+## PEFT rsLoRA and Qwen3.5-family adapters
+
+PEFT adapters with `use_rslora: true` use `lora_alpha / sqrt(r)` scaling.
+Adapters with the flag absent or false retain standard `lora_alpha / r` scaling.
+
+For Qwen3.5-family Gated DeltaNet layers, SGLang accepts PEFT's
+`in_proj_qkv`, `in_proj_z`, `in_proj_b`, and `in_proj_a` targets and packs them
+into the runtime projections. Include both QKV/Z and B/A partners when
+training those projection pairs. This does not add support for PEFT
+`target_parameters` / ParamWrapper routed-expert checkpoints.
+
+If all initial adapters target only dense projections or shared experts,
+SGLang leaves routed experts on the base backend and does not allocate their
+LoRA buffers. Shared-expert adapters use `--disable-shared-experts-fusion` for
+the dense shared-expert path. To load routed-expert adapters later, include a
+routed-expert adapter in `--lora-paths` at startup. Starting without initial
+adapters retains the routed-expert pool, subject to the configured targets
+and rank limits.
+
+
 ## Usage
 
 ### Serving Single Adaptor
