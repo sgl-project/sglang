@@ -29,20 +29,21 @@ class _FullKV:
         self.k[indices] = data
 
 
-def _pool() -> QSATokenToKVPool:
+def _pool(ring: int = RATIO) -> QSATokenToKVPool:
     # __init__ needs a Mamba pool and device buffers; only the QSA layout matters here.
     pool = object.__new__(QSATokenToKVPool)
     pool.full_kv_pool = _FullKV()
     pool.mamba_pool = None
     pool._mamba_translate = lambda ids: ids
     pool.qsa_compress_ratio = RATIO
+    pool.qsa_num_request_slots = REQ_ROWS
     pool.qsa_compressed_k_buffer_pool = [
         torch.zeros(SLOTS // RATIO, HEADS, HDIM) for _ in range(LAYERS)
     ]
     pool.qsa_key_state_buffer_pool = [
-        torch.zeros(REQ_ROWS * RATIO, HEADS, HDIM) for _ in range(LAYERS)
+        torch.zeros(REQ_ROWS * ring, HEADS, HDIM) for _ in range(LAYERS)
     ]
-    pool.qsa_rope_position_buffer = torch.zeros(REQ_ROWS * RATIO, 3, dtype=torch.int64)
+    pool.qsa_rope_position_buffer = torch.zeros(REQ_ROWS * ring, 3, dtype=torch.int64)
     return pool
 
 
@@ -129,6 +130,32 @@ class TestQSARetractionBackup(CustomTestCase):
             torch.equal(
                 pool.qsa_rope_position_buffer[ring_new],
                 torch.arange(RATIO * 3).view(RATIO, 3),
+            )
+        )
+
+    def test_ring_wider_than_one_group_moves_whole(self):
+        """A ring sized for speculative verify holds more than one group per
+        request; every row of it must come back, not just the first group."""
+        ring = 2 * RATIO
+        pool = _pool(ring=ring)
+        old_rows = torch.arange(1 * ring, 2 * ring)
+        new_rows = torch.arange(3 * ring, 4 * ring)
+        for layer, buf in enumerate(pool.qsa_key_state_buffer_pool):
+            buf[old_rows] = (torch.arange(ring) + 50 * layer + 1).view(-1, 1, 1).float()
+            buf[new_rows] = -1.0  # left by the previous owner of row 3
+        pool.qsa_rope_position_buffer[old_rows] = torch.arange(ring * 3).view(ring, 3)
+        pool.qsa_rope_position_buffer[new_rows] = -1
+
+        backup = pool.get_cpu_copy(_pages(1), req_pool_index=1)
+        pool.load_cpu_copy(backup, _pages(4), req_pool_index=3)
+
+        for layer, buf in enumerate(pool.qsa_key_state_buffer_pool):
+            want = (torch.arange(ring) + 50 * layer + 1).view(-1, 1, 1).float()
+            self.assertTrue(torch.equal(buf[new_rows], want.expand_as(buf[new_rows])))
+        self.assertTrue(
+            torch.equal(
+                pool.qsa_rope_position_buffer[new_rows],
+                torch.arange(ring * 3).view(ring, 3),
             )
         )
 

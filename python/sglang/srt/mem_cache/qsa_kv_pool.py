@@ -227,10 +227,12 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.mem_usage = (k_size + v_size) / GB
 
     def _qsa_ring_rows(self, req_pool_index) -> torch.Tensor:
-        r = self.qsa_compress_ratio
-        start = int(req_pool_index) * r
+        # The whole per-request ring, read off its allocation: speculative
+        # verify can keep more than one group pending.
+        ring = self.qsa_rope_position_buffer.shape[0] // self.qsa_num_request_slots
+        start = int(req_pool_index) * ring
         return torch.arange(
-            start, start + r, device=self.qsa_rope_position_buffer.device
+            start, start + ring, device=self.qsa_rope_position_buffer.device
         )
 
     def _qsa_compressed_slots(self, indices) -> torch.Tensor:
