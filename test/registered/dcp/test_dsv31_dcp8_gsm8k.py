@@ -19,8 +19,10 @@ What the CI test (TestDSV31DCP8TP8GSM8K) covers:
 What the CI test does NOT cover (and the manual tests address):
   - Exact parity with non-DCP outputs (TestDSV31DCP8LogprobParity)
   - DCP=4 code path (different all-gather pattern; TestDSV31DCP4TP8GSM8K)
-  - MHA extend path (all_gather_kv_cache_for_mha_extend / mha_chunk_extend)
-    — DeepSeek-V3.1 uses MLA, so these paths are never exercised
+  - MHA one-shot extend over a cached prefix (all_gather_kv_cache_for_mha_extend)
+    runs only when one extend batch holds >= SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
+    (8192) cached prefix tokens; nothing asserts that it ran. MHA chunked-KV
+    extend (sum seq_lens > SGLANG_MAX_KV_CHUNK_CAPACITY) is never exercised.
 
 Future improvements:
   - Add dcp_world_size to /server_info so tests can assert DCP is active without
