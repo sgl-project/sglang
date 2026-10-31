@@ -23,6 +23,8 @@ This module carries SGLang's own path for those checkpoints:
 
 * ``GGUF_NATIVE_CONFIG_BUILDERS`` maps a GGUF ``general.architecture`` to a
   builder returning a fully populated config.
+* Plain DFlash exports with F32/F16/BF16 weights are identified separately
+  by metadata and tensor types, leaving other DFlash layouts to their own builders.
 * ``build_gguf_tokenizer`` reuses transformers' own converters, which work fine
   once they are reached directly instead of through the gated loader.
 
@@ -35,6 +37,11 @@ from typing import Any, Callable, Dict, Optional
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
+from sglang.srt.utils.hf_transformers.dflash_gguf import (
+    build_plain_dflash_gguf_config,
+    is_plain_dflash_gguf,
+)
+from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,
@@ -44,9 +51,7 @@ GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
 def read_gguf_architecture(gguf_path: str) -> Optional[str]:
     """The ``general.architecture`` string, or None if it cannot be read."""
     try:
-        from gguf import GGUFReader
-
-        reader = GGUFReader(gguf_path)
+        reader = get_gguf_reader(gguf_path)
         field = reader.fields.get("general.architecture")
         if field is None:
             return None
@@ -57,11 +62,16 @@ def read_gguf_architecture(gguf_path: str) -> Optional[str]:
 
 
 def has_native_gguf_support(gguf_path: str) -> bool:
-    return read_gguf_architecture(gguf_path) in GGUF_NATIVE_CONFIG_BUILDERS
+    arch = read_gguf_architecture(gguf_path)
+    if arch in GGUF_NATIVE_CONFIG_BUILDERS:
+        return True
+    return arch == "dflash" and is_plain_dflash_gguf(gguf_path)
 
 
 def build_gguf_config(gguf_path: str) -> PretrainedConfig:
     arch = read_gguf_architecture(gguf_path)
+    if arch == "dflash" and is_plain_dflash_gguf(gguf_path):
+        return build_plain_dflash_gguf_config(gguf_path)
     return GGUF_NATIVE_CONFIG_BUILDERS[arch](gguf_path)
 
 

@@ -3019,7 +3019,9 @@ class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
     that are quantized with GGUF and saved in the GGUF format. This loader
-    supports loading both full models and sharded models.
+    supports loading both full models and sharded models. Plain DFlash drafts
+    with F32/F16/BF16 weights share the target embedding and output head and
+    are loaded without quantization.
     """
 
     def __init__(self, load_config: LoadConfig):
@@ -3104,22 +3106,34 @@ class GGUFModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
+        from sglang.srt.utils.hf_transformers.dflash_gguf import (
+            is_plain_dflash_gguf,
+            plain_dflash_gguf_weights,
+        )
+
         local_model_path = self._prepare_weights(model_config.model_path)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
-            model_config.hf_config.update({"tie_word_embeddings": True})
+        plain_dflash = model_config.hf_config.architectures == [
+            "DFlashDraftModel"
+        ] and is_plain_dflash_gguf(local_model_path)
+        if not plain_dflash:
+            gguf_weights_map = self._get_gguf_weights_map(model_config)
+            # we can only know if tie word embeddings after mapping weights
+            if "lm_head.weight" in get_gguf_extra_tensor_names(
+                local_model_path, gguf_weights_map
+            ):
+                model_config.hf_config.update({"tie_word_embeddings": True})
+            quant_config = _get_quantization_config(model_config, self.load_config)
+            weights = self._get_weights_iterator(local_model_path, gguf_weights_map)
+        else:
+            # Plain DFlash weights are F32/F16/BF16, so no quantization is needed.
+            quant_config = None
+            weights = plain_dflash_gguf_weights(local_model_path)
 
         target_device = torch.device(device_config.device)
-        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
-            )
+            model.load_weights(weights)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
