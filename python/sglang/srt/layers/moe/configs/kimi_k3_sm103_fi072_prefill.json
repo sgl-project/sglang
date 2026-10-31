@@ -1,0 +1,24 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.7.2",
+    "cuda_version": "13.0",
+    "cublas_version": "13.1.1",
+    "cudnn_version": "92400",
+    "cudnn_frontend_version": "1.31.0",
+    "cutlass_dsl_version": "nvidia-cutlass-dsl-libs-base==4.8.0;nvidia-cutlass-dsl-libs-core==4.8.0;nvidia-cutlass-dsl-libs-cu12==4.8.0;nvidia-cutlass-dsl-libs-cu13==4.8.0;nvidia-cutlass-dsl==4.8.0",
+    "gpu": "NVIDIA B30Z"
+  },
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((16384, 3584), (0,), (16384, 16), (16384, 16), (16384, 3584), (16384, 112), (0,), (0,)), ('Module', 16, 896, 896, 0, 17827853, 17826828, 0, 3584, 3584, 3072, 10, True, 0, False, False))": [
+    "MoERunner",
+    [
+      128,
+      4
+    ],
+    [
+      "cuda_graph_profile_replays",
+      1,
+      "l2_cache_policy",
+      "cold"
+    ]
+  ]
+}
