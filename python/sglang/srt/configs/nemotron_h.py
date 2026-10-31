@@ -422,6 +422,14 @@ class NemotronHConfig(PretrainedConfig):
         ]
 
     @property
+    def moe_layer_ids(self):
+        return [
+            i
+            for i in range(self.num_hidden_layers)
+            if self.hybrid_override_pattern[i] == MOE
+        ]
+
+    @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
 
         shape = Mamba2StateShape.create(
