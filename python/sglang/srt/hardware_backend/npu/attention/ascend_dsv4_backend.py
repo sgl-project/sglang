@@ -25,6 +25,10 @@ from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
@@ -83,6 +87,29 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
         "tile_size": _NPU_ARCH35_KV_TILE_SIZE,
         "rope_head_dim": _NPU_ARCH35_KV_ROPE_HEAD_DIM,
     }
+
+
+def _ensure_dsv41_static_verify_mode() -> None:
+    """Reject the COMPACT ragged-verify layout for DeepSeek-V4.1 on arch35.
+
+    The low-ratio verify metadata pipeline assumes the STATIC request-major
+    rectangle (``bs * (num_draft_tokens + 1)`` rows of contiguous positions
+    per request), which COMPACT's ragged variable-length layout breaks.
+    CAP_ACCEPT only changes the accept-length accounting, so it rides the
+    STATIC execution path for free.  Failing at startup -- instead of at the
+    first verify step -- keeps the misconfiguration visible before any
+    compressed state is written.
+    """
+    if not is_npu_arch35():
+        return
+    if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
+        return
+    raise RuntimeError(
+        "DeepSeek-V4.1 on NPU arch35 does not support "
+        "SGLANG_RAGGED_VERIFY_MODE=compact: the low-ratio verify metadata "
+        "requires the STATIC request-major verify layout. Unset "
+        "SGLANG_RAGGED_VERIFY_MODE (or set it to 'static' or 'cap-accept')."
+    )
 
 
 @functools.cache
@@ -1333,11 +1360,13 @@ class LowRatioCompressAscendBackendMixin:
         # QLI's seqused_k is the compressed history length and cmp_residual_k is
         # its unfinished-group remainder; recipes computes them as
         # ``actual_seq_k // ratio`` and ``actual_seq_k % ratio`` (indexer.py
-        # L359-L366 feeding attention_data.py L907-L918). Derive them from this
-        # batch's seq_lens rather than from a metadata tensor: seq_lens is a
-        # graph input (refreshed every replay), while a captured metadata buffer
-        # would keep the capture-time lengths for every later step.
-        seq_lens = forward_batch.seq_lens
+        # L359-L366 feeding attention_data.py L907-L918).  actual_seq_k must
+        # include the rows THIS block writes, so verify derives the lengths
+        # from the batch's final KV length instead of device seq_lens (which
+        # stays at the live/prefix length there); decode keeps reading
+        # seq_lens.  Both are graph inputs (refreshed every replay), never a
+        # captured metadata buffer that would keep the capture-time lengths.
+        kv_lens = self._dsv41_qli_kv_lens(forward_batch)
         # Same generation-agnostic `index_topk` the QLI metadata op and the graph
         # buffer are sized with (L1336 / L1761); the op both selects and reshapes
         # with it.
@@ -1363,8 +1392,8 @@ class LowRatioCompressAscendBackendMixin:
             quant_mode=1,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_q=None,
-            seqused_k=(seq_lens // ratio).to(torch.int32),
-            cmp_residual_k=(None if ratio == 1 else (seq_lens % ratio).to(torch.int32)),
+            seqused_k=(kv_lens // ratio).to(torch.int32),
+            cmp_residual_k=(None if ratio == 1 else (kv_lens % ratio).to(torch.int32)),
             block_table=page_table.to(torch.int32),
             max_seqlen_q=-1,
             mask_mode=3,
@@ -1476,7 +1505,9 @@ class LowRatioCompressAscendBackendMixin:
             descale_k=None,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_q=None,
-            seqused_k=(forward_batch.seq_lens // ratio).to(torch.int32),
+            seqused_k=(self._dsv41_qli_kv_lens(forward_batch) // ratio).to(
+                torch.int32
+            ),
             # Only mask_mode=3 with cmp_ratio != 1 needs it, and the consumers
             # are ratio-1 layers (README "公共可选参数").
             cmp_residual_k=None,
@@ -1529,17 +1560,50 @@ class LowRatioCompressAscendBackendMixin:
                 )
         return scored
 
+    def _dsv41_qli_kv_lens(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Per-request FINAL KV length for the QLI/QSLI ``seqused_k`` bound.
+
+        recipes computes the compressed K length as ``actual_seq_k // ratio``
+        (indexer.py L359-L366) where ``actual_seq_k`` counts every KV row the
+        forward can see, including the ones this block writes.  decode
+        satisfies that with device ``seq_lens`` (== pos + 1).  A verify window
+        does not: device ``seq_lens`` stays at the live/prefix length while the
+        block completes up to ``ceil(W / ratio)`` further groups, so the bound
+        must come from the final length.  ``seq_lens_cpu_int`` is that final
+        length for every algorithm -- the V4 verify builder already reads it
+        that way (``_build_npu_compress_metadata_verify``) -- on the eager path
+        and on graph replay alike (``_refresh_graph_seq_metadata`` writes it
+        before the kernel-metadata refresh), so preferring it keeps eager and
+        replay on one source.  decode keeps reading device ``seq_lens``
+        unchanged.
+        """
+        mode = getattr(forward_batch, "forward_mode", None)
+        if mode is None or not mode.is_target_verify():
+            return forward_batch.seq_lens.to(torch.int64)
+        bs = int(forward_batch.batch_size)
+        final_cpu = getattr(self.forward_metadata, "seq_lens_cpu_int", None)
+        if final_cpu is not None and 0 < bs <= int(final_cpu.numel()):
+            return final_cpu[:bs].to(
+                device=forward_batch.seq_lens.device, dtype=torch.int64
+            )
+        # No CPU mirror: fall back to the device-side final lengths the seq
+        # refresh writes on verify replay, then to seq_lens itself.
+        final = getattr(self.forward_metadata, "actual_seq_lengths_kv", None)
+        if final is not None and 0 < bs <= int(final.numel()):
+            return final[:bs].to(torch.int64)
+        return forward_batch.seq_lens.to(torch.int64)
+
     def _dsv41_index_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """QLI dispatch tables, one per low ratio (the ``[1024]`` int32 tensor the
         compute entry point requires; QLI README "Metadata 参数与返回值").
 
         Recipes: indexer.py L368-L394 reads
-        ``attn_metadata["kernel_metadata"][f"c{ratio}a_qli_metadata"]``. Built from
-        ``forward_batch.seq_lens`` directly so it does not depend on the
-        compress-metadata pass running first.
+        ``attn_metadata["kernel_metadata"][f"{ratio}a_qli_metadata"]``. Built from
+        the batch's final KV lengths (``_dsv41_qli_kv_lens``) so it does not
+        depend on the compress-metadata pass running first.
         """
         fm = self.forward_metadata
-        seq_lens = forward_batch.seq_lens.to(torch.int64)
+        kv_lens = self._dsv41_qli_kv_lens(forward_batch)
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
         if cu_seqlens_q is None:
             return {}
@@ -1556,7 +1620,7 @@ class LowRatioCompressAscendBackendMixin:
 
         batch_size = int(forward_batch.batch_size)
         for ratio in self._dsv41_low_ratios():
-            cmp_lens = (seq_lens // ratio).to(torch.int32)
+            cmp_lens = (kv_lens // ratio).to(torch.int32)
             keep(
                 f"c{ratio}a_qli_metadata",
                 ds41.quant_lightning_indexer_metadata(
@@ -1565,7 +1629,7 @@ class LowRatioCompressAscendBackendMixin:
                     seqused_k=cmp_lens,
                     # mask_mode=3 + cmp_ratio != 1 requires the residual (README).
                     cmp_residual_k=(
-                        None if ratio == 1 else (seq_lens % ratio).to(torch.int32)
+                        None if ratio == 1 else (kv_lens % ratio).to(torch.int32)
                     ),
                     batch_size=batch_size,
                     num_heads_q=self._dsv4_index_n_heads,
@@ -1587,7 +1651,7 @@ class LowRatioCompressAscendBackendMixin:
                     f"candidate_topk_blocks/candidate_block_size "
                     f"({self._dsv41_candidate_topk_blocks}/{block})."
                 )
-            cmp_lens = (seq_lens // candidate_ratio).to(torch.int32)
+            cmp_lens = (kv_lens // candidate_ratio).to(torch.int32)
             # Level one publishes blocks, so its dispatch table is a separate
             # instance from the plain per-ratio one (recipes indexer.py L388-L393).
             keep(
@@ -1599,7 +1663,7 @@ class LowRatioCompressAscendBackendMixin:
                     cmp_residual_k=(
                         None
                         if candidate_ratio == 1
-                        else (seq_lens % candidate_ratio).to(torch.int32)
+                        else (kv_lens % candidate_ratio).to(torch.int32)
                     ),
                     batch_size=batch_size,
                     num_heads_q=self._dsv4_index_n_heads,
@@ -1633,7 +1697,7 @@ class LowRatioCompressAscendBackendMixin:
                     visible_blocks.to(torch.int32).view(-1, 1),
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_q=None,
-                    seqused_k=(seq_lens // candidate_ratio).to(torch.int32),
+                    seqused_k=(kv_lens // candidate_ratio).to(torch.int32),
                     cmp_residual_k=None,
                     batch_size=batch_size,
                     num_heads_q=self._dsv4_index_n_heads,
@@ -1661,6 +1725,35 @@ class LowRatioCompressAscendBackendMixin:
     # ori 544B = FP8E4M3 group32 + BF16 scales, cmp 320B = FP4E2M1 group16 +
     # BF16 scales (README L185-L192).
 
+    @staticmethod
+    def _dsv41_live_row_mask(
+        forward_batch: ForwardBatch, t: int
+    ) -> Optional[torch.Tensor]:
+        """Per-flat-row liveness for the dead-row rule, or None when unknown.
+
+        Rows with no KV at all must read a zero length, not a stale captured
+        position: the operator skips a zero-length side (README L211) while an
+        in-prefix -1 would be a contract violation (mqsmla_golden.py L215).
+        decode-shaped metadata (seq_lens per row, ``t == numel``) resolves
+        directly; verify-shaped metadata (``t == bs * tokens_per_req``, seq_lens
+        per request) expands per row, which also covers the graph bucket's
+        padding rows (seq_lens == 0, stale captured positions) that the decode
+        rule's numel match never fits for W > 1.  Anything else (e.g.
+        variable-length extend) returns None and leaves the lengths untouched.
+        """
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is None:
+            return None
+        seq_lens = seq_lens.reshape(-1)
+        n = int(seq_lens.numel())
+        if n == t:
+            return seq_lens > 0
+        mode = getattr(forward_batch, "forward_mode", None)
+        if n > 0 and t % n == 0 and mode is not None and mode.is_target_verify():
+            # Verify rows repeat each request's window in request-major order.
+            return seq_lens.repeat_interleave(t // n) > 0
+        return None
+
     def _dsv41_window_indices(self, forward_batch: ForwardBatch):
         """Explicit causal sliding-window indices + lengths for the window side.
 
@@ -1684,19 +1777,13 @@ class LowRatioCompressAscendBackendMixin:
             setattr(fm, "dsv41_win_topk_length", lengths)
         offsets = torch.arange(topk, dtype=positions.dtype, device=positions.device)
         valid_len = torch.clamp(positions + 1, max=topk)
-        # Dead rows (batch padding / idle slots: seq_lens == 0, positions == 0)
-        # have no KV at all, but (positions + 1) claims one window token.  The
-        # indexer scores nothing for them and fills the row with -1, so the
-        # claimed prefix would feed MQSMLA an in-prefix -1 (contract violation,
-        # mqsmla_golden.py L215).  Zero the length instead: README L211 makes a
-        # zero length skip the side and emit 0.
-        seq_lens = forward_batch.seq_lens
-        if seq_lens is not None:
-            seq_lens = seq_lens.reshape(-1)
-            if seq_lens.numel() == t:
-                valid_len = torch.where(
-                    seq_lens > 0, valid_len, torch.zeros_like(valid_len)
-                )
+        # Dead rows (batch padding / idle slots / DP-idle): see
+        # _dsv41_live_row_mask.
+        live_rows = self._dsv41_live_row_mask(forward_batch, t)
+        if live_rows is not None:
+            valid_len = torch.where(
+                live_rows, valid_len, torch.zeros_like(valid_len)
+            )
         window_start = positions - valid_len + 1
         ids = window_start.unsqueeze(1) + offsets.unsqueeze(0)
         valid = offsets.unsqueeze(0) < valid_len.unsqueeze(1)
@@ -1718,13 +1805,12 @@ class LowRatioCompressAscendBackendMixin:
             buf = torch.empty((t, 1), dtype=torch.int32, device=positions.device)
             setattr(fm, f"dsv41_cmp_topk_length_c{ratio}", buf)
         lens = ((positions + 1) // ratio).clamp_max(int(self._dsv4_index_topk))
-        # Same dead-row rule as _dsv41_window_indices: a seq_lens == 0 row has
-        # no compressed tokens, so its length must be 0, not (0 + 1) // ratio.
-        seq_lens = forward_batch.seq_lens
-        if seq_lens is not None:
-            seq_lens = seq_lens.reshape(-1)
-            if seq_lens.numel() == t:
-                lens = torch.where(seq_lens > 0, lens, torch.zeros_like(lens))
+        # Same dead-row rule as _dsv41_window_indices: a row with no live KV
+        # (seq_lens == 0) has no compressed tokens, so its length must be 0,
+        # not (0 + 1) // ratio.
+        live_rows = self._dsv41_live_row_mask(forward_batch, t)
+        if live_rows is not None:
+            lens = torch.where(live_rows, lens, torch.zeros_like(lens))
         buf.copy_(lens.to(torch.int32).view(-1, 1))
         return buf
 
@@ -2326,15 +2412,56 @@ class LowRatioCompressAscendBackendMixin:
         """Eager half of the V4.1 metadata contract (V4 ``_compute_compress_locs``
         counterpart).  aclgraph allocates these buffers at capture
         (:meth:`_init_dsv41_graph_metadata`) and refreshes them in place on
-        replay (:meth:`_refresh_graph_dsv41_1d`), so this runs eager-only.
+        replay (:meth:`_refresh_graph_dsv41_1d` /
+        :meth:`_refresh_graph_dsv41_verify_1d`), so this runs eager-only.
+
+        Target verify is included: its window is the same request-major flat
+        row layout, and ``start_pos``/``seqused`` come from the shared V4
+        verify builder that runs just before this.  draft_extend is NOT
+        included on purpose: its ``start_pos``/``seqused`` producers never run
+        for it, so the locs would be built against a stale chunk start (a
+        silent misalignment) -- EAGLE-family support needs its own design.
         """
         ratios = self._dsv41_low_ratios()
         if not ratios:
             return
         forward_mode = forward_batch.forward_mode
-        if forward_mode.is_decode() or forward_mode.is_extend_without_speculative():
+        if (
+            forward_mode.is_decode()
+            or forward_mode.is_extend_without_speculative()
+            or forward_mode.is_target_verify()
+        ):
             for ratio in ratios:
                 self._build_dsv41_ratio_metadata(forward_batch, ratio)
+
+    @staticmethod
+    def _dsv41_ratio_row_values(
+        positions: torch.Tensor,
+        out_loc: torch.Tensor,
+        ratio: int,
+        page_size: int,
+        row_live: Optional[torch.Tensor] = None,
+    ):
+        """Shared eager/replay row selection for one low ratio.
+
+        Returns ``(keep, pos_values, slot_values)`` over the flat token rows:
+        ``keep`` marks rows that close a ``ratio``-token group AND own a real
+        slot (slots below one page are the reserved dummy page -- the same
+        criterion recipes uses, attention_data.py L878-L879), ``pos_values`` is
+        the group-start position the compressed KV applies RoPE at
+        (``(position // ratio) * ratio``) and ``slot_values`` the anchor-derived
+        compressed slot ``full_loc // ratio``.  ``row_live`` (> 0 per flat row)
+        optionally drops padding rows that a raw ``out_cache_loc`` cannot
+        express.  Callers compact (ratio > 1) or mask in place (ratio == 1, the
+        per-token native projection whose row order must not shift), so eager
+        and every replay variant share one formula.
+        """
+        keep = ((positions % ratio) == (ratio - 1)) & (out_loc >= page_size)
+        if row_live is not None:
+            keep = keep & (row_live > 0)
+        if ratio == 1:
+            return keep, positions, out_loc
+        return keep, (positions // ratio) * ratio, out_loc // ratio
 
     def _build_dsv41_ratio_metadata(
         self, forward_batch: ForwardBatch, ratio: int
@@ -2346,13 +2473,8 @@ class LowRatioCompressAscendBackendMixin:
         n = min(int(positions.numel()), int(out_loc.numel()))
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
-        # One compressed row per token that closes a `ratio`-token group, i.e.
-        # the token whose global position is `ratio - 1` (mod ratio).
-        # Slots below one page are the reserved dummy page, so filtering on
-        # `out_loc >= page_size` drops padding rows -- the same criterion recipes
-        # uses (`slots >= block_size`, attention_data.py L878-L879).
-        completes = ((positions % ratio) == (ratio - 1)) & (
-            out_loc >= int(self.page_size)
+        keep, pos_values, slot_values = self._dsv41_ratio_row_values(
+            positions, out_loc, ratio, int(self.page_size)
         )
         if ratio == 1:
             # Ratio 1 has no fused compressor: the latent is the plain `wkv`
@@ -2360,10 +2482,10 @@ class LowRatioCompressAscendBackendMixin:
             # slot row must keep that order -- mask in place (excluded rows get
             # -1 and the operator skips them) instead of compacting, exactly like
             # the graph refresh.  `pad == n` here (n // 1 + bs >= n).
-            pos_row = positions.clone()
-            pos_row.masked_fill_(~completes, 0)
-            slot_row = out_loc.to(torch.int32)
-            slot_row.masked_fill_(~completes, self._DSV41_SLOT_SKIP)
+            pos_row = pos_values.clone()
+            pos_row.masked_fill_(~keep, 0)
+            slot_row = slot_values.to(torch.int32)
+            slot_row.masked_fill_(~keep, self._DSV41_SLOT_SKIP)
         else:
             # The fused compressor emits exactly ``min(n, n // ratio + bs)``
             # rows, dense in (request, position) order with the pad rows last,
@@ -2371,11 +2493,9 @@ class LowRatioCompressAscendBackendMixin:
             pad = min(n, n // ratio + bs)
             pos_row = torch.empty(pad, dtype=torch.int64, device=device)
             slot_row = torch.empty(pad, dtype=torch.int32, device=device)
+            self._dsv41_compact_1d(pos_row, pos_values, keep, fill=0)
             self._dsv41_compact_1d(
-                pos_row, (positions // ratio) * ratio, completes, fill=0
-            )
-            self._dsv41_compact_1d(
-                slot_row, out_loc // ratio, completes, fill=self._DSV41_SLOT_SKIP
+                slot_row, slot_values, keep, fill=self._DSV41_SLOT_SKIP
             )
         setattr(fm, f"positions_cmp_padding_c{ratio}", pos_row)
         setattr(fm, f"c{ratio}_loc", slot_row)
@@ -2645,34 +2765,29 @@ class LowRatioCompressAscendBackendMixin:
         if raw_out_loc.numel() > 0:
             m = min(int(raw_out_loc.numel()), n)
             out_loc[:m] = raw_out_loc[:m]
-        completes = (live > 0) & (out_loc >= int(self.page_size))
         positions = torch.clamp(live - 1, min=0)
         for ratio in self._dsv41_low_ratios():
-            keep = completes & ((positions % ratio) == (ratio - 1))
+            keep, pos_values, slot_values = self._dsv41_ratio_row_values(
+                positions, out_loc, ratio, int(self.page_size), row_live=live
+            )
             pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
             slot_dst = getattr(fm, f"c{ratio}_loc")
             if ratio == 1:
                 # Per-token rows (native projection): identity, not compacted.
-                pos_dst.copy_(torch.where(keep, positions, torch.zeros_like(positions)))
+                pos_dst.copy_(
+                    torch.where(keep, pos_values, torch.zeros_like(pos_values))
+                )
                 slot_dst.copy_(
                     torch.where(
                         keep,
-                        out_loc,
-                        torch.full_like(out_loc, self._DSV41_SLOT_SKIP),
+                        slot_values,
+                        torch.full_like(slot_values, self._DSV41_SLOT_SKIP),
                     ).to(slot_dst.dtype)
                 )
             else:
+                self._dsv41_compact_1d(pos_dst, pos_values, keep, fill=0)
                 self._dsv41_compact_1d(
-                    pos_dst,
-                    (positions // ratio) * ratio,
-                    keep,
-                    fill=0,
-                )
-                self._dsv41_compact_1d(
-                    slot_dst,
-                    out_loc // ratio,
-                    keep,
-                    fill=self._DSV41_SLOT_SKIP,
+                    slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
                 )
             self._dsv41_debug_dump_1d(
                 "replay",
@@ -2683,10 +2798,17 @@ class LowRatioCompressAscendBackendMixin:
                 short_out_loc=short_out_loc,
             )
 
-        # The indexer-K block table is the FULL page table expanded to the index
-        # pool's page granularity (full page p -> index pages [k*p, k*p + k)).
-        # The shared ``block_tables`` view has already been refreshed by the
-        # parent, so re-derive the expansion into the captured buffers here.
+        self._refresh_graph_dsv41_index_page_tables(fm)
+
+    def _refresh_graph_dsv41_index_page_tables(self, fm) -> None:
+        """Re-derive the indexer-K page-table expansion into the captured buffers.
+
+        The indexer-K block table is the FULL page table expanded to the index
+        pool's page granularity (full page p -> index pages [k*p, k*p + k)).
+        The shared ``block_tables`` view is refreshed in place by the parent
+        before this runs, so the expansion must follow on every replay -- both
+        the decode and the verify refresh.
+        """
         block_tables = getattr(fm, "block_tables", None)
         if block_tables is None:
             return
@@ -2709,6 +2831,104 @@ class LowRatioCompressAscendBackendMixin:
                     index_page_size=DSV41_INDEX_PAGE_SIZE,
                 )
             )
+
+    def _refresh_graph_dsv41_verify_1d(self, ctx) -> None:
+        """Verify-shaped replay refresh for the V4.1 low-ratio metadata.
+
+        Decode's :meth:`_refresh_graph_dsv41_1d` hard-codes one row per request
+        (``positions = live - 1``, ``out_loc[:bs]``), which a request-major
+        verify window of ``bs * tokens_per_req`` rows would truncate and
+        misalign.  This variant feeds the whole window through the same shared
+        row formulas, so the values match what the eager verify path builds
+        through :meth:`_build_dsv41_ratio_metadata` element for element.
+        """
+        fm = ctx.fm
+        w = int(ctx.tokens_per_bs)
+        n = int(ctx.bs) * w
+        live = ctx.live_seq_lens[: ctx.bs].to(torch.int64)
+        positions = ctx.forward_batch.positions.reshape(-1).to(torch.int64)
+        if positions.numel() != n:
+            raise RuntimeError(
+                "V4.1 verify replay rows do not match the bucket width: "
+                f"positions={positions.numel()} vs bs*tokens_per_req={n}."
+            )
+        # The replay view's out_cache_loc is deliberately UNPADDED (raw rows;
+        # ``build_replay_fb_view`` passes the raw batch's), so scatter it into
+        # the padded window: padding rows keep 0 and the slot filter drops
+        # them, the same treatment the decode refresh applies.
+        raw_out_loc = ctx.forward_batch.out_cache_loc.reshape(-1).to(torch.int64)
+        out_loc = torch.zeros(n, dtype=torch.int64, device=ctx.device)
+        if raw_out_loc.numel() > 0:
+            m = min(int(raw_out_loc.numel()), n)
+            out_loc[:m] = raw_out_loc[:m]
+        # start_pos / seqused: the compressor's chunk start is the live prefix
+        # length and the window contributes all W rows -- the same values the
+        # eager verify path sets (V4 verify builder) and the V4 graph refresh
+        # writes for c4/c128.
+        fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
+        valid = ctx.live_seq_lens[: ctx.bs] > 0
+        fm.seqused.copy_(valid.to(torch.int32) * w)
+        row_live = live.repeat_interleave(w)
+        for ratio in self._dsv41_low_ratios():
+            keep, pos_values, slot_values = self._dsv41_ratio_row_values(
+                positions, out_loc, ratio, int(self.page_size), row_live=row_live
+            )
+            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
+            slot_dst = getattr(fm, f"c{ratio}_loc")
+            if ratio == 1:
+                # Per-token rows (native projection): identity, not compacted.
+                pos_dst.copy_(
+                    torch.where(keep, pos_values, torch.zeros_like(pos_values))
+                )
+                slot_dst.copy_(
+                    torch.where(
+                        keep,
+                        slot_values,
+                        torch.full_like(slot_values, self._DSV41_SLOT_SKIP),
+                    ).to(slot_dst.dtype)
+                )
+            else:
+                self._dsv41_compact_1d(pos_dst, pos_values, keep, fill=0)
+                self._dsv41_compact_1d(
+                    slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
+                )
+            self._dsv41_debug_dump_1d(
+                "replay-verify", positions, out_loc, ctx.forward_batch, ratio
+            )
+
+        self._refresh_graph_dsv41_index_page_tables(fm)
+
+    def _clear_graph_dsv41_verify_metadata(self, ctx) -> None:
+        """DP-idle verify replay: neutralize the V4.1 metadata.
+
+        Idle ranks replay the same target-verify graph with zero lengths, so
+        refreshing would keep everything at the skip sentinel anyway -- this
+        stays a separate method to mirror the V4 clear and keep the dispatch
+        branch readable.  Without it the idle replay would run with the
+        previous step's locs and scatter compressed rows into freed slots.
+        """
+        fm = ctx.fm
+        for ratio in self._dsv41_low_ratios():
+            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
+            if pos_dst is not None:
+                pos_dst.zero_()
+            slot_dst = getattr(fm, f"c{ratio}_loc", None)
+            if slot_dst is not None:
+                slot_dst.fill_(self._DSV41_SLOT_SKIP)
+            cmp_len = getattr(fm, f"dsv41_cmp_topk_length_c{ratio}", None)
+            if cmp_len is not None:
+                cmp_len.zero_()
+        win_indices = getattr(fm, "dsv41_win_sparse_indices", None)
+        if win_indices is not None:
+            # Zero length but a legal first index: the window side skips
+            # (README zero-length rule) instead of reading an in-prefix -1.
+            win_indices.fill_(-1)
+            win_indices[:, :, 0] = 0
+        win_len = getattr(fm, "dsv41_win_topk_length", None)
+        if win_len is not None:
+            win_len.zero_()
+        fm.start_pos.zero_()
+        fm.seqused.zero_()
 
 
 class DeepseekV4AscendAttnBackend(
@@ -2794,6 +3014,10 @@ class DeepseekV4AscendAttnBackend(
                 f"(got {self._dsv4_q_head_num}): check num_attention_heads and "
                 "the attention TP size."
             )
+            # COMPACT's ragged verify layout has no low-ratio metadata path;
+            # reject it before any state is written.  Draft workers emptied
+            # their ratio list above and never reach this.
+            _ensure_dsv41_static_verify_mode()
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
@@ -3693,23 +3917,32 @@ class DeepseekV4AscendAttnBackend(
         if ctx.graph_mode.is_decode():
             self._refresh_graph_decode_compress_1d_direct(ctx)
         elif ctx.graph_mode.is_target_verify():
-            if ctx.is_idle_replay and ctx.has_compress:
+            if self._dsv4_has_low_ratio and self._is_dspark_algorithm:
+                # DeepSeek-V4.1 DSpark: `active_target_verify` is gated on
+                # c4/c128 and can never fire here, so dispatch on the mode
+                # itself.  The draft-worker instance empties its ratio list and
+                # has _dsv4_has_low_ratio False, so it keeps taking the silent
+                # bypass below, served by _refresh_graph_dspark_sparse_metadata.
+                if ctx.is_idle_replay:
+                    self._clear_graph_dsv41_verify_metadata(ctx)
+                else:
+                    self._refresh_graph_dsv41_verify_1d(ctx)
+            elif ctx.is_idle_replay and ctx.has_compress:
                 self._clear_graph_target_verify_metadata(ctx)
             elif ctx.active_target_verify:
                 self._refresh_graph_target_verify_compress_1d_direct(ctx)
             elif self._dsv4_has_low_ratio and not ctx.is_idle_replay:
-                # DeepSeek-V4.1 has no low-ratio verify refresh: the branch above
-                # is gated on c4/c128 (`has_compress`), so `_refresh_graph_dsv41_1d`
-                # only ever runs from the decode arm.  A verify replay would then
-                # scatter the compressed rows of these tokens to the *previous*
-                # step's slots and silently corrupt the compressed / index pools
-                # (the eager path already fails loudly with a missing c{r}_loc).
-                # A5 DSV4.1 has no speculative decoding today; fail loudly rather
-                # than corrupt if one is ever enabled.
+                # DeepSeek-V4.1 has no low-ratio verify refresh for this
+                # speculative runner (only the DSpark arm above): a verify
+                # replay here would scatter the compressed rows of these tokens
+                # to the *previous* step's slots and silently corrupt the
+                # compressed / index pools (the eager path already fails loudly
+                # with a missing c{r}_loc).  Fail loudly rather than corrupt.
                 raise RuntimeError(
                     "DeepSeek-V4.1 low-ratio graphs have no target-verify "
-                    "metadata refresh (that arm is gated on c4/c128); "
-                    "speculative decoding is not supported for DSV4.1 on NPU."
+                    "metadata refresh for this speculative algorithm (the "
+                    "arm is gated on DSpark); use DSpark or disable "
+                    "speculative decoding for DSV4.1 on NPU."
                 )
 
         self._refresh_graph_explicit_state_block_tables(ctx)

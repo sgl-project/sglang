@@ -19,6 +19,11 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=8, suite="base-a-test-npu")
 
+# The backend imports ragged_verify at module level (the COMPACT verify-mode
+# guard).  It is dependency-light, so load the REAL module before the stub
+# block below shadows the speculative package parent.
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
 for mod in (
     "torch_npu",
     "torch_npu.contrib",
@@ -1882,6 +1887,477 @@ class TestKernelMetadataBuilders(unittest.TestCase):
         with patch.object(DS41, "quant_lightning_indexer_metadata", recorder):
             self.assertEqual(backend._dsv41_index_kernel_metadata(self._batch()), {})
         self.assertEqual(calls, [])
+
+
+class _Mode:
+    """ForwardMode stand-in with just the predicates the backend consults."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def is_decode(self):
+        return self._name == "decode"
+
+    def is_extend_without_speculative(self):
+        return self._name == "extend"
+
+    def is_target_verify(self):
+        return self._name == "target_verify"
+
+    def is_draft_extend_v2(self):
+        return self._name == "draft_extend_v2"
+
+
+def _verify_batch(
+    *,
+    positions,
+    out_cache_loc,
+    seq_lens,
+    batch_size,
+    draft_token_num,
+    mode="target_verify",
+):
+    """A verify-shaped batch: request-major rows, ``draft_token_num`` per request."""
+    batch = _batch(
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        seq_lens=seq_lens,
+        batch_size=batch_size,
+    )
+    batch.forward_mode = _Mode(mode)
+    batch.spec_info = SimpleNamespace(draft_token_num=draft_token_num)
+    return batch
+
+
+class TestVerifyMetadataGate(unittest.TestCase):
+    """The eager low-ratio builder must serve target verify (WP1) and nothing new."""
+
+    def _build(self, mode, ratios=(1, 2)):
+        backend = _low_ratio_backend(ratios=ratios)
+        backend.forward_metadata.block_tables = torch.zeros((1, 2), dtype=torch.int32)
+        batch = _verify_batch(
+            positions=[5, 6, 7],
+            out_cache_loc=[300, 301, 302],
+            seq_lens=[5],
+            batch_size=1,
+            draft_token_num=3,
+            mode=mode,
+        )
+        backend._build_low_ratio_compress_metadata(batch)
+        return backend.forward_metadata
+
+    def test_target_verify_builds_the_low_ratio_metadata(self):
+        fm = self._build("target_verify")
+        # pos 5 closes the CROSS-BLOCK pair (4,5) and pos 7 the in-block (6,7):
+        # every group closer in the window lands a row, not just the last one.
+        self.assertEqual(fm.c2_loc.tolist(), [150, 151])
+        self.assertEqual(fm.positions_cmp_padding_c2.tolist(), [4, 6])
+        # ratio 1 stays the per-token identity, in token order.
+        self.assertEqual(fm.c1_loc.tolist(), [300, 301, 302])
+        self.assertEqual(fm.positions_cmp_padding_c1.tolist(), [5, 6, 7])
+
+    def test_draft_extend_v2_is_deliberately_not_served(self):
+        # Its start_pos/seqused producers never run for it, so building the
+        # locs would anchor them on a stale chunk start -- a silent misalignment.
+        fm = self._build("draft_extend_v2")
+        self.assertFalse(hasattr(fm, "c1_loc"))
+        self.assertFalse(hasattr(fm, "c2_loc"))
+
+    def test_decode_is_still_served(self):
+        backend = _low_ratio_backend()
+        backend.forward_metadata.block_tables = torch.zeros((1, 2), dtype=torch.int32)
+        batch = _batch(positions=[3], out_cache_loc=[205], seq_lens=[4], batch_size=1)
+        batch.forward_mode = _Mode("decode")
+        backend._build_low_ratio_compress_metadata(batch)
+        self.assertEqual(backend.forward_metadata.c2_loc.tolist(), [102])
+
+    def test_draft_instance_without_ratios_is_a_no_op(self):
+        fm = self._build("target_verify", ratios=())
+        self.assertFalse(hasattr(fm, "c2_loc"))
+        self.assertFalse(hasattr(fm, "c1_loc"))
+
+
+class TestQliKvLens(unittest.TestCase):
+    """QLI/QSLI's ``seqused_k`` is the FINAL KV length (G1b).
+
+    recipes: ``actual_seq_k // ratio`` where actual_seq_k includes the rows
+    this block writes.  Device ``seq_lens`` satisfies that for decode (pos+1)
+    but stays at the live/prefix length for verify, undercounting the groups
+    the block completes by up to ceil(W / ratio).
+    """
+
+    def test_decode_keeps_reading_device_seq_lens(self):
+        backend = _low_ratio_backend()
+        for batch in (
+            SimpleNamespace(
+                seq_lens=torch.tensor([7], dtype=torch.int32), batch_size=1
+            ),  # legacy no-mode callers
+            SimpleNamespace(
+                seq_lens=torch.tensor([7], dtype=torch.int32),
+                batch_size=1,
+                forward_mode=_Mode("decode"),
+            ),
+        ):
+            self.assertEqual(backend._dsv41_qli_kv_lens(batch).tolist(), [7])
+
+    def test_verify_prefers_the_final_cpu_mirror(self):
+        backend = _low_ratio_backend()
+        backend.forward_metadata = SimpleNamespace(
+            seq_lens_cpu_int=torch.tensor([9], dtype=torch.int32),
+            actual_seq_lengths_kv=torch.tensor([3], dtype=torch.int32),
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([6], dtype=torch.int32),
+            batch_size=1,
+            forward_mode=_Mode("target_verify"),
+        )
+        self.assertEqual(backend._dsv41_qli_kv_lens(batch).tolist(), [9])
+
+    def test_verify_falls_back_to_the_device_final_lengths(self):
+        backend = _low_ratio_backend()
+        backend.forward_metadata = SimpleNamespace(
+            seq_lens_cpu_int=None,
+            actual_seq_lengths_kv=torch.tensor([9], dtype=torch.int32),
+        )
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([6], dtype=torch.int32),
+            batch_size=1,
+            forward_mode=_Mode("target_verify"),
+        )
+        self.assertEqual(backend._dsv41_qli_kv_lens(batch).tolist(), [9])
+
+    def test_verify_dispatch_tables_use_the_final_length(self):
+        backend = _low_ratio_backend()
+        seen = []
+        real = DS41.quant_lightning_indexer_metadata
+
+        def spy(**kwargs):
+            seen.append(kwargs)
+            return real(**kwargs)
+
+        backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_q_pa=torch.arange(0, 3, dtype=torch.int32),
+            seq_lens_cpu_int=torch.tensor([9, 8], dtype=torch.int32),
+            kernel_metadata={},
+        )
+        batch = _verify_batch(
+            positions=[6, 7, 8, 5, 6, 7],
+            out_cache_loc=[300, 301, 302, 400, 401, 402],
+            seq_lens=[6, 5],
+            batch_size=2,
+            draft_token_num=3,
+        )
+        backend._dsv41_index_kernel_metadata(batch)
+        # ratio 1 first, then ratio 2 (the _dsv41_low_ratios order).  The bound
+        # is the final length: 9//2 == 4 covers the group pos 7 closes, where
+        # the old seq_lens-derived 6//2 == 3 would miss it.
+        self.assertIsNone(seen[0]["cmp_residual_k"])
+        self.assertEqual(seen[0]["seqused_k"].tolist(), [9, 8])
+        self.assertEqual(seen[1]["seqused_k"].tolist(), [4, 4])
+        self.assertEqual(seen[1]["cmp_residual_k"].tolist(), [1, 0])
+
+    def test_decode_dispatch_tables_keep_reading_seq_lens(self):
+        backend = _low_ratio_backend()
+        seen = []
+        real = DS41.quant_lightning_indexer_metadata
+
+        def spy(**kwargs):
+            seen.append(kwargs)
+            return real(**kwargs)
+
+        backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_q_pa=torch.arange(0, 3, dtype=torch.int32),
+            seq_lens_cpu_int=torch.tensor([9, 8], dtype=torch.int32),
+            kernel_metadata={},
+        )
+        batch = _batch(positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2)
+        batch.forward_mode = _Mode("decode")
+        backend._dsv41_index_kernel_metadata(batch)
+        # Bit-identical to the pre-G1b decode values (final mirror ignored).
+        self.assertEqual(seen[1]["seqused_k"].tolist(), [3, 2])
+
+
+class TestVerifyPaddingRows(unittest.TestCase):
+    """The dead-row rule must cover verify-shaped buckets (t = bs * W).
+
+    A graph bucket's padding rows carry seq_lens == 0 and stale captured
+    positions; the decode rule's ``numel == t`` match never holds for W > 1,
+    so without the per-row expansion they would read a stale window.
+    """
+
+    def test_verify_window_zeroes_padding_rows(self):
+        backend = _low_ratio_backend(window=4)
+        backend._dsv4_index_topk = 3
+        batch = _verify_batch(
+            positions=[4, 5, 99, 99],
+            out_cache_loc=[300, 301, 0, 0],
+            seq_lens=[5, 0],
+            batch_size=2,
+            draft_token_num=2,
+        )
+        indices, lengths = backend._dsv41_window_indices(batch)
+        self.assertEqual(lengths[:, 0].tolist(), [2, 2, 0, 0])
+        # Live rows unchanged; padding rows emit no indices at all.
+        self.assertEqual(indices[0, 0].tolist(), [1, 2, 3, 4])
+        self.assertEqual(indices[1, 0].tolist(), [2, 3, 4, 5])
+        self.assertEqual(indices[2, 0].tolist(), [-1, -1, -1, -1])
+        self.assertEqual(
+            backend._dsv41_cmp_topk_length(batch, 2)[:, 0].tolist(), [2, 3, 0, 0]
+        )
+        self.assertEqual(
+            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [2, 3, 0, 0]
+        )
+
+    def test_decode_rows_keep_the_per_row_rule(self):
+        backend = _low_ratio_backend(window=4)
+        batch = _batch(
+            positions=[0, 1], out_cache_loc=[0, 0], seq_lens=[0, 2], batch_size=2
+        )
+        batch.forward_mode = _Mode("decode")
+        _, lengths = backend._dsv41_window_indices(batch)
+        self.assertEqual(lengths[:, 0].tolist(), [0, 2])
+
+    def test_variable_extend_rows_are_left_untouched(self):
+        mask = LowRatioCompressAscendBackendMixin._dsv41_live_row_mask(
+            SimpleNamespace(
+                seq_lens=torch.tensor([2, 3], dtype=torch.int32),
+                forward_mode=_Mode("extend"),
+            ),
+            t=5,
+        )
+        self.assertIsNone(mask)
+
+
+class TestVerifyGraphRefresh(unittest.TestCase):
+    """``_refresh_graph_dsv41_verify_1d`` writes the captured buffers with the
+    same values the eager builder derives -- element for element (WP4)."""
+
+    def _graph_metadata(self, backend, bs, tokens_per_req):
+        metadata = SimpleNamespace(
+            block_tables=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)[:bs],
+            kernel_metadata={},
+        )
+        backend._init_dsv41_graph_metadata(
+            metadata, bs=bs, tokens_per_req=tokens_per_req, device="cpu"
+        )
+        # The backend class allocates these shared buffers for every bucket
+        # (_init_dsv4_graph_metadata); mirror that here.
+        metadata.start_pos = torch.zeros(bs, dtype=torch.int32)
+        metadata.seqused = torch.zeros(bs, dtype=torch.int32)
+        backend.forward_metadata = metadata
+        return metadata
+
+    def _ctx(self, metadata, *, bs, live, positions, out_cache_loc, w=3):
+        return SimpleNamespace(
+            fm=metadata,
+            bs=bs,
+            raw_bs=sum(1 for v in live if v > 0),
+            tokens_per_bs=w,
+            device=torch.device("cpu"),
+            live_seq_lens=torch.tensor(live, dtype=torch.int32),
+            forward_batch=SimpleNamespace(
+                positions=torch.tensor(positions, dtype=torch.int64),
+                out_cache_loc=torch.tensor(out_cache_loc, dtype=torch.int64),
+                seq_lens=torch.tensor(live, dtype=torch.int32),
+            ),
+        )
+
+    _WINDOW = ([6, 7, 8, 5, 6, 7], [300, 301, 302, 400, 401, 402])
+
+    def test_replay_matches_eager_elementwise(self):
+        backend = _low_ratio_backend()
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=3)
+        captured = (
+            metadata.c1_loc,
+            metadata.c2_loc,
+            metadata.positions_cmp_padding_c1,
+            metadata.positions_cmp_padding_c2,
+        )
+        # Eager reference on the same (unpadded) window.
+        eager = SimpleNamespace(block_tables=metadata.block_tables)
+        backend.forward_metadata = eager
+        batch = _verify_batch(
+            positions=[6, 7, 8, 5, 6, 7],
+            out_cache_loc=[300, 301, 302, 400, 401, 402],
+            seq_lens=[6, 5],
+            batch_size=2,
+            draft_token_num=3,
+        )
+        for ratio in (1, 2):
+            backend._build_dsv41_ratio_metadata(batch, ratio)
+        # Replay into the captured buffers and compare.
+        positions, out_cache_loc = self._WINDOW
+        ctx = self._ctx(
+            metadata, bs=2, live=[6, 5], positions=positions, out_cache_loc=out_cache_loc
+        )
+        backend._refresh_graph_dsv41_verify_1d(ctx)
+        self.assertEqual(metadata.c1_loc.tolist(), eager.c1_loc.tolist())
+        self.assertEqual(metadata.c2_loc.tolist(), eager.c2_loc.tolist())
+        self.assertEqual(
+            metadata.positions_cmp_padding_c1.tolist(),
+            eager.positions_cmp_padding_c1.tolist(),
+        )
+        self.assertEqual(
+            metadata.positions_cmp_padding_c2.tolist(),
+            eager.positions_cmp_padding_c2.tolist(),
+        )
+        # Same objects: the captured graph holds these addresses.
+        for ref, now in zip(
+            captured,
+            (
+                metadata.c1_loc,
+                metadata.c2_loc,
+                metadata.positions_cmp_padding_c1,
+                metadata.positions_cmp_padding_c2,
+            ),
+        ):
+            self.assertIs(ref, now)
+        # Compressor chunk start = live prefix, usage = the whole window.
+        self.assertEqual(metadata.start_pos.tolist(), [6, 5])
+        self.assertEqual(metadata.seqused.tolist(), [3, 3])
+
+    def test_padding_rows_neutralize_stale_capture_values(self):
+        backend = _low_ratio_backend()
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=3)
+        # Request 1 is padding: stale captured positions, no raw window slots.
+        ctx = self._ctx(
+            metadata,
+            bs=2,
+            live=[6, 0],
+            positions=[6, 7, 8, 99, 99, 99],
+            out_cache_loc=[300, 301, 302],
+        )
+        backend._refresh_graph_dsv41_verify_1d(ctx)
+        self.assertEqual(metadata.c2_loc.tolist(), [150, -1, -1, -1, -1])
+        self.assertEqual(metadata.c1_loc.tolist(), [300, 301, 302, -1, -1, -1])
+        self.assertEqual(metadata.positions_cmp_padding_c2.tolist(), [6, 0, 0, 0, 0])
+        self.assertEqual(metadata.start_pos.tolist(), [6, 0])
+        self.assertEqual(metadata.seqused.tolist(), [3, 0])
+
+    def test_replay_refreshes_the_index_page_tables(self):
+        backend = _low_ratio_backend()
+        backend.page_size = 128
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=3)
+        metadata.block_tables[0, 0] = 11
+        positions, out_cache_loc = self._WINDOW
+        ctx = self._ctx(
+            metadata, bs=2, live=[6, 5], positions=positions, out_cache_loc=out_cache_loc
+        )
+        backend._refresh_graph_dsv41_verify_1d(ctx)
+        # ratio 2 pages 1:1 with the full table; ratio 1 doubles every full page.
+        self.assertEqual(metadata.c2_index_page_table.tolist(), [[11, 8], [9, 10]])
+        self.assertEqual(metadata.c1_index_page_table[0].tolist(), [22, 23, 16, 17])
+
+    def test_idle_clear_neutralizes_the_metadata(self):
+        backend = _low_ratio_backend()
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=3)
+        metadata.c2_loc.fill_(5)
+        metadata.positions_cmp_padding_c2.fill_(9)
+        metadata.c1_loc.fill_(5)
+        metadata.dsv41_cmp_topk_length_c2.fill_(3)
+        metadata.dsv41_win_sparse_indices.fill_(7)
+        metadata.dsv41_win_topk_length.fill_(4)
+        metadata.start_pos.fill_(6)
+        metadata.seqused.fill_(3)
+        backend._clear_graph_dsv41_verify_metadata(SimpleNamespace(fm=metadata))
+        self.assertEqual(metadata.c2_loc.tolist(), [-1] * 5)
+        self.assertEqual(metadata.c1_loc.tolist(), [-1] * 6)
+        self.assertEqual(metadata.positions_cmp_padding_c2.tolist(), [0] * 5)
+        self.assertEqual(metadata.dsv41_cmp_topk_length_c2.tolist(), [[0]] * 6)
+        # Zero length with a legal first index: the window side skips instead
+        # of feeding MQSMLA an in-prefix -1.
+        self.assertTrue((metadata.dsv41_win_sparse_indices == -1).all())
+        self.assertEqual(metadata.dsv41_win_sparse_indices[0, 0, 0].item(), 0)
+        self.assertEqual(metadata.dsv41_win_topk_length.tolist(), [[0]] * 6)
+        self.assertEqual(metadata.start_pos.tolist(), [0, 0])
+        self.assertEqual(metadata.seqused.tolist(), [0, 0])
+
+
+class TestDsv41VerifyDispatch(unittest.TestCase):
+    """The `_apply_dsv4_graph_metadata` verify arm: DSpark owns it, EAGLE fails
+    loudly, and the draft-worker instance keeps its silent bypass."""
+
+    def _backend(self, *, has_low_ratio=True, dspark=True):
+        backend = _low_ratio_backend()
+        backend._dsv4_has_low_ratio = has_low_ratio
+        backend._is_dspark_algorithm = dspark
+        backend.forward_metadata = SimpleNamespace()
+        return backend
+
+    def _run(self, backend, *, is_idle=False):
+        calls = []
+        for name in (
+            "_refresh_graph_seq_metadata",
+            "_refresh_graph_compress_page_tables_direct",
+            "_refresh_graph_explicit_state_block_tables",
+            "_refresh_graph_swa_metadata_direct",
+            "_refresh_graph_dspark_sparse_metadata",
+            "_refresh_graph_kernel_metadata",
+        ):
+            setattr(backend, name, (lambda ctx, _n=name: calls.append(_n)))
+        backend._build_dsv4_graph_replay_ctx = lambda fb: SimpleNamespace(
+            fm=SimpleNamespace(),
+            graph_mode=_Mode("target_verify"),
+            is_idle_replay=is_idle,
+            has_compress=False,
+            active_target_verify=False,
+        )
+        forward_batch = SimpleNamespace(forward_mode=_Mode("target_verify"))
+        with patch.object(dsv4_backend, "is_npu_arch35", lambda: False):
+            backend._apply_dsv4_graph_metadata(forward_batch)
+        return calls
+
+    def test_dspark_verify_replay_refreshes(self):
+        backend = self._backend()
+        seen = []
+        backend._refresh_graph_dsv41_verify_1d = lambda ctx: seen.append("verify")
+        self._run(backend)
+        self.assertEqual(seen, ["verify"])
+
+    def test_dspark_idle_replay_clears(self):
+        backend = self._backend()
+        seen = []
+        backend._clear_graph_dsv41_verify_metadata = lambda ctx: seen.append("clear")
+        self._run(backend, is_idle=True)
+        self.assertEqual(seen, ["clear"])
+
+    def test_draft_instance_keeps_the_silent_bypass(self):
+        # The draft worker's ratio list is emptied, so it has no low-ratio
+        # metadata to refresh; _refresh_graph_dspark_sparse_metadata serves it.
+        backend = self._backend(has_low_ratio=False)
+        seen = []
+        backend._refresh_graph_dsv41_verify_1d = lambda ctx: seen.append("verify")
+        self._run(backend)
+        self.assertEqual(seen, [])
+
+    def test_eagle_on_v41_still_fails_loudly(self):
+        backend = self._backend(dspark=False)
+        with self.assertRaises(RuntimeError):
+            self._run(backend)
+
+
+class TestCompactVerifyRejected(unittest.TestCase):
+    """COMPACT ragged verify is rejected at startup for V4.1 on arch35."""
+
+    def _ensure(self, mode, arch35=True):
+        with (
+            patch.object(dsv4_backend, "read_ragged_verify_mode", lambda: mode),
+            patch.object(dsv4_backend, "is_npu_arch35", lambda: arch35),
+        ):
+            dsv4_backend._ensure_dsv41_static_verify_mode()
+
+    def test_compact_on_arch35_raises_with_unset_guidance(self):
+        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
+            self._ensure(RaggedVerifyMode.COMPACT)
+
+    def test_static_and_cap_accept_pass(self):
+        # CAP_ACCEPT only changes the accept-length accounting, so it rides
+        # the STATIC execution path.
+        self._ensure(RaggedVerifyMode.STATIC)
+        self._ensure(RaggedVerifyMode.CAP_ACCEPT)
+
+    def test_compact_off_arch35_degrades_silently(self):
+        self._ensure(RaggedVerifyMode.COMPACT, arch35=False)
 
 
 if __name__ == "__main__":
