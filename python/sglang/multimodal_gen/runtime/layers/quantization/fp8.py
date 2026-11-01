@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
@@ -318,7 +319,32 @@ class Fp8LinearMethod(LinearMethodBase):
             # Rowwise FP8 checkpoints store weights in the conventional
             # (out_features, in_features) layout, while apply_fp8_linear expects
             # its column-major transposed view.
-            layer.weight.data = layer.weight.data.t()
+            weight = layer.weight.data
+            weight_scale = layer.weight_scale.data
+            # On ROCm, native FP8 is e4m3fnuz, not e4m3fn; mirror the block_quant
+            # branch above so hipBLASLt / aiter never see an e4m3fn x e4m3fnuz mix.
+            if _is_fp8_fnuz:
+                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=weight,
+                    weight_scale=weight_scale,
+                    input_scale=getattr(layer, "input_scale", None),
+                )
+                layer.weight_scale.data = weight_scale
+                if input_scale is not None:
+                    layer.input_scale.data = input_scale
+            # apply_fp8_linear routes dynamic rowwise to aiter's
+            # gemm_a8w8_bpreshuffle whenever use_aiter_bpreshuffle_gemm(N) holds,
+            # and that kernel reads a (16, 16)-shuffled weight. Use the same
+            # predicate so load-time layout and apply-time kernel always agree.
+            # Static-scale checkpoints (input_scale present) take the
+            # torch._scaled_mm path, which needs the unshuffled weight.
+            if getattr(layer, "input_scale", None) is None and (
+                use_aiter_bpreshuffle_gemm(weight.shape[0])
+            ):
+                from aiter.ops.shuffle import shuffle_weight
+
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
+            layer.weight.data = weight.t()
             return
 
         if self.block_quant:
@@ -484,7 +510,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
         # changing which GEMM kernel it picks. No-op when already contiguous.
-        if not x.is_contiguous():
+        if not isinstance(x, tuple) and not x.is_contiguous():
             x = x.contiguous()
 
         if self.use_gfx1250_triton_fp8:
@@ -550,9 +576,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        weight = layer.weight
+        if self.use_gfx1250_triton_fp8:
+            # The gfx1250 tile declined this shape. layer.weight was stored
+            # row-major [K, N] (contiguous) for that tile; torch._scaled_mm's
+            # mat2 requires column-major, so re-view it without copying.
+            weight = weight.t().contiguous().t()
         return apply_fp8_linear(
             input=x,
-            weight=layer.weight,
+            weight=weight,
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,

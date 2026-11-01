@@ -197,6 +197,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # apply_fp8_linear's activation quant kernels assert on row-major
+        # input; diffusion backbones routinely pass a permuted view.
+        if not x.is_contiguous():
+            x = x.contiguous()
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
