@@ -780,77 +780,80 @@ class LoRAMemoryPool:
         # Python hash seeds differ by TP process; slot and LRU updates must not.
         ordered_uids = sorted(cur_uids, key=lambda uid: (uid is not None, uid or ""))
 
-        def get_available_buffer_slot():
-            # 1. Prioritize empty slots
-            for buffer_id in range(self.max_loras_per_batch):
-                if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
-                    return buffer_id
-
-            # 2. Memory pool is full, need to evict using policy
-            candidates = set()
-
-            for buffer_id in range(self.max_loras_per_batch):
-                uid = self.buffer_id_to_uid[buffer_id]
-
-                # Skip if this adapter is needed by current batch
-                if uid in cur_uids:
-                    continue
-
-                # Skip if this adapter is pinned
-                if uid is not None:
-                    lora_ref = lora_refs.get(uid)
-                    if lora_ref and lora_ref.pinned:
-                        continue
-
-                candidates.add(uid)
-
-            if not candidates:
-                raise ValueError(
-                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
-                )
-
-            # Prefer evicting LoRA adapters over the base model (None).
-            # Only evict None when the batch consists entirely of LoRA requests
-            # and no other adapters can be evicted.
-            non_none_candidates = candidates - {None}
-            if non_none_candidates:
-                # Prioritize evicting actual LoRA adapters
-                candidates_to_use = non_none_candidates
-            else:
-                # Only None is available for eviction (batch is all LoRA requests)
-                candidates_to_use = candidates
-
-            # Select victim using eviction policy
-            victim_uid = self.eviction_policy.select_victim(candidates_to_use)
-
-            # Evict the selected victim
-            victim_buffer_id = self.uid_to_buffer_id[victim_uid]
-            self.uid_to_buffer_id.pop(victim_uid)
-            self.eviction_policy.remove(victim_uid)
-            self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-            logger.debug(
-                f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
-            )
-            return victim_buffer_id
-
         # Mark all adapters in current batch as used (for LRU tracking)
         for uid in ordered_uids:
             self.eviction_policy.mark_used(uid)
 
-        for uid in ordered_uids:
-            if uid not in self.uid_to_buffer_id:
-                buffer_id = get_available_buffer_slot()
-                lora_adapter = lora_adapters.get(uid, None)
-                self.load_lora_weight_to_buffer(
-                    uid,
-                    buffer_id,
-                    lora_adapter,
-                    lora_modules,
-                    lora_embed_tokens_module,
-                    lora_lm_head_module,
+        missing_uids = [uid for uid in ordered_uids if uid not in self.uid_to_buffer_id]
+        if not missing_uids:
+            return
+
+        empty_slots: List[int] = []
+        non_none_candidates: Set[Optional[str]] = set()
+        has_none_candidate = False
+
+        for buffer_id in range(self.max_loras_per_batch - 1, -1, -1):
+            uid = self.buffer_id_to_uid[buffer_id]
+            if uid == EMPTY_SLOT:
+                empty_slots.append(buffer_id)
+                continue
+
+            # Skip if this adapter is needed by current batch
+            if uid in cur_uids:
+                continue
+
+            # Skip if this adapter is pinned
+            if uid is not None:
+                lora_ref = lora_refs.get(uid)
+                if lora_ref and lora_ref.pinned:
+                    continue
+                non_none_candidates.add(uid)
+            else:
+                has_none_candidate = True
+
+        def get_available_buffer_slot():
+            nonlocal has_none_candidate
+            # 1. Prioritize empty slots
+            if empty_slots:
+                return empty_slots.pop()
+
+            # 2. Memory pool is full, need to evict using policy
+            # Prefer evicting LoRA adapters over the base model (None).
+            # Only evict None when the batch consists entirely of LoRA requests
+            # and no other adapters can be evicted.
+            if non_none_candidates:
+                victim_uid = self.eviction_policy.select_victim(non_none_candidates)
+                non_none_candidates.discard(victim_uid)
+            elif has_none_candidate:
+                victim_uid = self.eviction_policy.select_victim({None})
+                has_none_candidate = False
+            else:
+                raise ValueError(
+                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
                 )
-                self.uid_to_buffer_id[uid] = buffer_id
-                self.buffer_id_to_uid[buffer_id] = uid
+
+            # Evict the selected victim
+            victim_buffer_id = self.uid_to_buffer_id.pop(victim_uid)
+            self.eviction_policy.remove(victim_uid)
+            self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+            logger.debug(
+                "Evicting LoRA %s from buffer slot %s.", victim_uid, victim_buffer_id
+            )
+            return victim_buffer_id
+
+        for uid in missing_uids:
+            buffer_id = get_available_buffer_slot()
+            lora_adapter = lora_adapters.get(uid, None)
+            self.load_lora_weight_to_buffer(
+                uid,
+                buffer_id,
+                lora_adapter,
+                lora_modules,
+                lora_embed_tokens_module,
+                lora_lm_head_module,
+            )
+            self.uid_to_buffer_id[uid] = buffer_id
+            self.buffer_id_to_uid[buffer_id] = uid
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
