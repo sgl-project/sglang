@@ -338,15 +338,17 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
                 self.assertIsNone(attention.attn._k3_onorm_args)
 
     def test_verify_adapter_accepts_compact_and_k3_norm_arguments(self):
+        """MoE padding is trimmed from qkv, a and b, so the kernel must get the same gate rows."""
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
-        tokens, heads, head_dim = 3, 2, 4
+        tokens, heads, head_dim = 6, 2, 4
         raw = (
             torch.arange(1, tokens * heads * head_dim + 1)
             .float()
             .reshape(1, tokens, heads, head_dim)
         )
         gate = torch.linspace(-1, 1, raw.numel()).reshape(tokens, heads * head_dim)
+        padded_gate = torch.cat((gate, torch.full_like(gate[:2], 9.0)))
         attention, _ = self.make_attention(raw, gate)
         layer = attention.attn
         layer.lower_bound = -5.0
@@ -368,10 +370,12 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
                 )
             },
         ):
-            for handoff in ("compact", "k3", "none"):
+            for handoff in ("compact", "k3", "none", "padded"):
                 with self.subTest(handoff=handoff):
-                    layer._k3_onorm_gate = gate
-                    layer._k3_onorm_args = args if handoff == "compact" else None
+                    layer._k3_onorm_gate = padded_gate if handoff == "padded" else gate
+                    layer._k3_onorm_args = (
+                        args if handoff in ("compact", "padded") else None
+                    )
                     layer._k3_fused_decode_args = (
                         (torch.empty(0),) * 5 + args if handoff == "k3" else None
                     )

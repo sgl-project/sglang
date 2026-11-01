@@ -1888,7 +1888,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         apply_onorm = onorm_gate is not None and onorm_args is not None
         if apply_onorm:
             onorm_weight, onorm_eps = onorm_args
-            onorm_gate = onorm_gate.reshape(1, seq_len, h, layer.head_v_dim)
+            onorm_gate = onorm_gate[:seq_len].reshape(1, seq_len, h, layer.head_v_dim)
         else:
             onorm_weight = None
             onorm_eps = None
