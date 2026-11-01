@@ -31,7 +31,7 @@ HW_MAPPING = {
 # Per-commit test suites (run on every PR).
 # Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
-# pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
+# pr-test-extra.yml's `run-ci-nv-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
@@ -57,7 +57,7 @@ PER_COMMIT_SUITES = {
         "stage-c-test-large-8-gpu-amd-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
-        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # dispatch when the PR carries the `run-ci-amd-extra` label). 1-gpu-small
         # carries the mock-model / kv_canary unit + single-GPU canary e2e
         # tests; 1-gpu-large carries the subset of model e2e tests validated
         # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
@@ -475,6 +475,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fork_worker_preload=args.fork_worker_preload,
         timeout_overrides=dict(args.timeout_override),
     )
 
@@ -605,6 +606,15 @@ def main():
         help=(
             "Preload common modules, then run this many files in isolated fork "
             "children (default: 1, preserving one exec per file)."
+        ),
+    )
+    parser.add_argument(
+        "--fork-worker-preload",
+        nargs="*",
+        default=[],
+        help=(
+            "Extra modules the fork worker imports before forking, on top of "
+            "the common numpy/torch/triton stack."
         ),
     )
     args = parser.parse_args()

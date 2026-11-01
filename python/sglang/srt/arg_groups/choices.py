@@ -187,7 +187,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "joint_lru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -250,6 +250,12 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "trit
 add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )
+
+# --- Context parallelism ---
+
+CP_STRATEGY_CHOICES = ["zigzag", "interleave"]
+CP_KV_LAYOUT_CHOICES: list[str] = []
+add_cp_kv_layout_choices = CP_KV_LAYOUT_CHOICES.extend
 
 # --- Transport ---
 
