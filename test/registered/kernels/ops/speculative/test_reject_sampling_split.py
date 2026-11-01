@@ -75,7 +75,9 @@ def test_split_matches_stock_bitwise(batch, slots, vocab):
     inputs = _inputs(batch, slots, vocab, seed=batch * 1000 + slots * 10 + vocab % 7)
     stock = _run(inputs, split=False)
     split = _run(inputs, split=True)
-    for name, a, b in zip(("predicts", "accept_index", "accept_token_num"), stock, split):
+    for name, a, b in zip(
+        ("predicts", "accept_index", "accept_token_num"), stock, split
+    ):
         assert torch.equal(a, b), f"{name} differs between the stock and split paths"
 
 
@@ -95,5 +97,10 @@ def test_scratch_is_reused_and_counters_return_to_zero():
     second = _run(inputs, split=True)
     for a, b in zip(first, second):
         assert torch.equal(a, b)
-    for (_, stream, tiles), (_, _, _, arrived) in reject_sampling._SPLIT_SCRATCH.items():
+    for (_, stream, tiles), (
+        _,
+        _,
+        _,
+        arrived,
+    ) in reject_sampling._SPLIT_SCRATCH.items():
         assert int(arrived.max()) == 0

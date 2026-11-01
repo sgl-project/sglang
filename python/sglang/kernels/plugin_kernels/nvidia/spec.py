@@ -86,11 +86,11 @@ class Numerics(msgspec.Struct, frozen=True):
 class BuildContext(msgspec.Struct, frozen=True):
     widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
+    deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # prefill token counts to build, ascending: the captured prefill graph
     # buckets. Empty when prefill graphs are off or the spec declares no
     # prefill_graph_backends, and a spec that covers only decode ignores it.
     prefill_widths: tuple[int, ...] = ()
-    deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
 

@@ -601,8 +601,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # _start_ctx_projection. Created on first use so a server that never
         # verifies, or runs with the flag off, does not pay for a stream.
         self._overlap_ctx_projection = (
-            bool(getattr(server_args, "speculative_overlap_ctx_projection", False))
-            and is_cuda()
+            get_spec().speculative_overlap_ctx_projection and is_cuda()
         )
         self._ctx_proj_stream: Optional[torch.cuda.Stream] = None
         self._ctx_proj_pending: Optional[

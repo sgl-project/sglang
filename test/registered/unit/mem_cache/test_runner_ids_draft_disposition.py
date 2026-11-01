@@ -391,6 +391,8 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
             lilicorr=None,
             _use_fused_kv_materialize=False,
             _fused_kv_helper=None,
+            # No side-stream projection pending: the writer projects inline.
+            _take_ctx_projection=lambda target_hidden: None,
         )
         worker._append_target_hidden_sequential = lambda **kw: (
             DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)

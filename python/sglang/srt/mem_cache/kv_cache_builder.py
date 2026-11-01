@@ -44,18 +44,16 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    prepare_page_unified_write_back_staging,
-)
-from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
-from sglang.srt.mem_cache.pool_host.base import (
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     _host_memory_budget,
     host_memory_budget_scope,
+    prepare_page_unified_write_back_staging,
     ranks_per_host,
 )
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging

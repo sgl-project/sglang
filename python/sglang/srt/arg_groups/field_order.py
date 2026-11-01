@@ -101,7 +101,6 @@ POSITIONAL_FIELD_ORDER = (
     "shared_experts_tp_size",
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
-    "layernorm_sp_min_tokens",
     "disable_attn_tp_gather",
     "enable_p2p_check",
     "device",
@@ -305,7 +304,6 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_ngram_external_corpus_path",
     "speculative_ngram_external_sam_budget",
     "speculative_ngram_external_corpus_max_tokens",
-    "speculative_overlap_ctx_projection",
     "ep_size",
     "moe_a2a_backend",
     "enable_w4a4_mxfp4_megamoe",
@@ -512,7 +510,6 @@ POSITIONAL_FIELD_ORDER = (
     "dsv4_attn_backend",
     "otlp_service_name",
     "_radix_eviction_policy_explicitly_set",
-    "hicache_swa_host_ratio",
     "hicache_host_memory_fraction",
     "enable_linker_mla_dedup",
     "_swa_full_tokens_ratio_explicitly_set",
@@ -562,5 +559,8 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "hicache_swa_host_ratio",
+    "layernorm_sp_min_tokens",
+    "speculative_overlap_ctx_projection",
 )
 # fmt: on

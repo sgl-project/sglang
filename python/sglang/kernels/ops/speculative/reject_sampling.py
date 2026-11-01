@@ -352,7 +352,9 @@ def _split_residual_tile(
     if all_drafts_accepted:
         val = p_val
     else:
-        q_val = tl.load(dp_base_ptr_safe + v_offsets * stride_dp_v, mask=mask, other=0.0)
+        q_val = tl.load(
+            dp_base_ptr_safe + v_offsets * stride_dp_v, mask=mask, other=0.0
+        )
         q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
         diff = residual_scale * p_val - q_val
         val = tl.where(diff > 0.0, diff, 0.0)

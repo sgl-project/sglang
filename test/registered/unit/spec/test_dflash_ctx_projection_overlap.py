@@ -16,7 +16,7 @@ import torch
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -31,9 +31,7 @@ def _worker(project, *, enabled=True):
         draft_model=types.SimpleNamespace(project_target_hidden=project),
         draft_parallel_layout=None,
     )
-    w._start_ctx_projection = types.MethodType(
-        DFlashWorkerV2._start_ctx_projection, w
-    )
+    w._start_ctx_projection = types.MethodType(DFlashWorkerV2._start_ctx_projection, w)
     w._take_ctx_projection = types.MethodType(DFlashWorkerV2._take_ctx_projection, w)
     return w
 
@@ -44,9 +42,7 @@ def _noop_tp_context(_layout):
     return contextlib.nullcontext()
 
 
-@patch(
-    "sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context
-)
+@patch("sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context)
 def test_handover_returns_the_projection_of_that_tensor():
     hidden = torch.randn(64, 128, device="cuda")
     weight = torch.randn(96, 128, device="cuda")
@@ -60,9 +56,7 @@ def test_handover_returns_the_projection_of_that_tensor():
     assert w._ctx_proj_pending is None
 
 
-@patch(
-    "sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context
-)
+@patch("sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context)
 def test_a_different_tensor_gets_none_but_still_joins():
     """The join must happen even on a miss: the side stream is reading a buffer the
     next verify replay is free to overwrite."""
@@ -77,9 +71,7 @@ def test_a_different_tensor_gets_none_but_still_joins():
     assert w._ctx_proj_stream.query()
 
 
-@patch(
-    "sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context
-)
+@patch("sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context)
 def test_disabled_empty_and_none_leave_nothing_pending():
     weight = torch.randn(96, 128, device="cuda")
     project = lambda h: h @ weight.t()
@@ -93,9 +85,7 @@ def test_disabled_empty_and_none_leave_nothing_pending():
         assert w._take_ctx_projection(arg) is None
 
 
-@patch(
-    "sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context
-)
+@patch("sglang.srt.speculative.dflash_worker_v2.draft_tp_context", new=_noop_tp_context)
 def test_a_failing_projection_disables_the_overlap_for_good():
     def boom(_h):
         raise RuntimeError("no")

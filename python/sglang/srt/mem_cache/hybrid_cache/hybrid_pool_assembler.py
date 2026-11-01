@@ -611,7 +611,7 @@ def build_hybrid_swa_stack(
             memory.hicache_size,
             full_kv_pool,
             swa_kv_pool,
-            getattr(memory, "hicache_swa_host_ratio", 0.0),
+            memory.hicache_swa_host_ratio,
         )
         kv_host_size, swa_host_size = shares or _split_hicache_size(
             memory.hicache_size, (full_kv_pool, swa_kv_pool)
