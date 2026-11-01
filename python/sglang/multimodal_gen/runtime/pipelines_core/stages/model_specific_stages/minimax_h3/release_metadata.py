@@ -62,6 +62,11 @@ class MiniMaxH3ReleaseMetadata:
     # PDD release: fused per-step output heads, relative to the model dir,
     # with pdd_config.json beside them
     pdd_fused_heads: str | None = None
+    # few-step re-noising update (x0, then fresh noise to the next sigma)
+    # instead of the Euler blend; Pika H3 Flex adapters were trained for it
+    stochastic_sampling: bool = False
+    # LoRA adapter applied at load, relative to the model dir
+    lora_adapter: str | None = None
     sampling_preset: str | None = None
 
     @classmethod
@@ -129,6 +134,27 @@ class MiniMaxH3ReleaseMetadata:
                 "model_index.json._minimax_h3.pdd_fused_heads must be a relative "
                 ".safetensors path inside the model directory"
             )
+        stochastic_sampling = raw.get("stochastic_sampling", False)
+        if not isinstance(stochastic_sampling, bool):
+            raise ValueError(
+                "model_index.json._minimax_h3.stochastic_sampling must be a boolean"
+            )
+        if stochastic_sampling and dmd_steps is None:
+            raise ValueError(
+                "model_index.json._minimax_h3.stochastic_sampling requires "
+                "dmd_denoising_steps"
+            )
+        lora_adapter = raw.get("lora_adapter")
+        if lora_adapter is not None and (
+            not isinstance(lora_adapter, str)
+            or not lora_adapter.endswith(".safetensors")
+            or os.path.isabs(lora_adapter)
+            or ".." in lora_adapter.split("/")
+        ):
+            raise ValueError(
+                "model_index.json._minimax_h3.lora_adapter must be a relative "
+                ".safetensors path inside the model directory"
+            )
         sampling_preset = raw.get("sampling_preset")
         if sampling_preset is not None:
             if sampling_preset != MINIMAX_H3_SMD_SAMPLING_PRESET:
@@ -155,6 +181,8 @@ class MiniMaxH3ReleaseMetadata:
             audio_sigma_shift=audio_sigma,
             dmd_denoising_steps=dmd_steps,
             pdd_fused_heads=pdd_fused_heads,
+            stochastic_sampling=stochastic_sampling,
+            lora_adapter=lora_adapter,
             sampling_preset=sampling_preset,
         )
         for task in metadata.tasks:

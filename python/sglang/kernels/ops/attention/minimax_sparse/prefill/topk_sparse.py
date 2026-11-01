@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported
 
+from ..common.tile_ptr import tile_ptrs_2d, tile_ptrs_3d
 from ..common.utils import (
     check_sparse_kv_fp8,
     get_cu_seqblocks,
@@ -156,17 +157,18 @@ def _gqa_share_sparse_fwd_kernel(
         return
     real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
     if HAS_SINK:
-        sink_ptrs = tl.make_block_ptr(
-            base=sink_ptr + pid_h * stride_sh,
-            shape=(gqa_group_size, qk_head_dim),
-            strides=(stride_sh, stride_sd),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_KD),
-            order=(1, 0),
+        sink_ptrs, sink_ptrs_mask = tile_ptrs_2d(
+            sink_ptr + pid_h * stride_sh,
+            gqa_group_size,
+            qk_head_dim,
+            stride_sh,
+            stride_sd,
+            0,
+            0,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_KD,
         )
-        sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
-            tl.float32
-        )
+        sink = tl.load(sink_ptrs, mask=sink_ptrs_mask, other=0.0).to(tl.float32)
     # offsets for paged K/V load
     off_n = tl.arange(0, BLOCK_SIZE_K)
     off_kd = tl.arange(0, BLOCK_SIZE_KD)
@@ -183,16 +185,21 @@ def _gqa_share_sparse_fwd_kernel(
         valid_idx = tl.where(topk_idx >= 0, off_t, -1)
         real_topk = tl.sum(valid_idx != -1, axis=0)
         # init qkv pointer
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, qk_head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_KD),
-            order=(2, 1, 0),
+        q_ptrs, q_ptrs_mask = tile_ptrs_3d(
+            q_ptr + q_start * stride_qn + pid_h * stride_qh,
+            q_len,
+            gqa_group_size,
+            qk_head_dim,
+            stride_qn,
+            stride_qh,
+            stride_qd,
+            pid_q_j * BLOCK_SIZE_Q,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_KD,
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+        q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
         # init statistics
         off_q_k = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
@@ -359,15 +366,20 @@ def _gqa_share_sparse_fwd_kernel(
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_VD)
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=(q_len, gqa_group_size, v_head_dim),
-            strides=(stride_on, stride_oh, stride_od),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_VD),
-            order=(2, 1, 0),
+        o_ptrs, o_ptrs_mask = tile_ptrs_3d(
+            o_ptr + q_start * stride_on + pid_h * stride_oh,
+            q_len,
+            gqa_group_size,
+            v_head_dim,
+            stride_on,
+            stride_oh,
+            stride_od,
+            pid_q_j * BLOCK_SIZE_Q,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_VD,
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_ptrs_mask)
 
 
 @torch.no_grad()

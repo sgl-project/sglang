@@ -19,8 +19,6 @@ from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
-# DeepGEMM bf16_mega_gate scores one token block per launch.
-_MEGA_GATE_MAX_ROWS = 2048
 # Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
 _ROW_MASKS_ATTR = "_mega_gate_row_masks"
 
@@ -84,12 +82,14 @@ def mega_gate_supported(moe) -> bool:
 def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> bool:
     if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get() or forward_batch is None:
         return False
-    # Prefill graph capture clears is_extend_in_batch, so gate on the mode itself.
+    # Prefill, decode and verify; draft extend keeps the regular router.
     mode = forward_batch.forward_mode
+    # The routing and the Mega-mHC input go to MegaMoE's buffer, sized to its token cap.
+    max_rows = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     return (
-        (mode.is_decode() or mode.is_target_verify())
+        (mode.is_decode() or mode.is_extend())
         and moe.mega_gate_supported
-        and 0 < hidden_states.shape[0] <= _MEGA_GATE_MAX_ROWS
+        and 0 < hidden_states.shape[0] <= max_rows
         and not get_forward().sp_active
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
@@ -110,6 +110,8 @@ def _ones(num_experts: int, device: torch.device) -> torch.Tensor:
 
 
 def _physical_dispatch_maps(info) -> tuple[torch.Tensor, torch.Tensor]:
+    if info.mega_gate_maps is not None:
+        return info.mega_gate_maps
     if info.ep_dispatch_algorithm == "static":
         rank_map = info.partial_logical_to_rank_dispatch_physical_map
         return rank_map.to(torch.int32)[:, None], _ones(len(rank_map), rank_map.device)
@@ -201,12 +203,7 @@ def run_mega_gate(
 
     routed_scaling_factor = float(moe.routed_scaling_factor)
     fused_in_topk = moe.routed_scaling_factor_fused_in_topk
-    # The benchmark override writes logical ids, so with EPLB it must run before the remap.
-    in_buffer = (
-        buf is not None
-        and not _captures_routed_experts(moe)
-        and not (dispatch_info is not None and routing_simulation_enabled())
-    )
+    in_buffer = buf is not None and not _captures_routed_experts(moe)
     to_physical_map = logical_count = None
     if in_buffer and dispatch_info is not None:
         # NOTE(kpham-sgl): MegaMoE reads physical expert slots from this buffer, so
@@ -246,6 +243,8 @@ def run_mega_gate(
             weight_scale=(
                 routed_scaling_factor if in_buffer and not fused_in_topk else 1.0
             ),
+            to_physical_map=to_physical_map,
+            logical_count=logical_count,
         )
     if in_buffer:
         get_global_expert_distribution_recorder().on_select_experts(

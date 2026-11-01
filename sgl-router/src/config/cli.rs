@@ -333,6 +333,26 @@ pub struct CacheArgs {
     #[arg(long)]
     pub cache_pending_prefix_ttl_ms: Option<u64>,
 
+    /// Max requests one pending stake may attract within its TTL. Past the
+    /// cap the stake is ignored: the request is routed as if it did not
+    /// exist, by its confirmed KV-event matches or else by the load policy,
+    /// so a burst sharing a cold prefix stops piling onto one worker.
+    /// 0 (default) leaves it unbounded. Requires --cache-pending-prefix-ttl-ms.
+    #[arg(long)]
+    pub cache_pending_prefix_max_followers: Option<u64>,
+
+    /// Confirmed-first pending prefixes: a stake counts only where it is
+    /// strictly deeper than the confirmed KV-event match, and the pending
+    /// store is consulted and staked only while the confirmed match covers
+    /// less than this share of the prompt (above 0, at most 1; 1 = always
+    /// consult; to switch the tier off, unset the TTL instead). A
+    /// warm turn routes on its confirmed history and pays nothing for the
+    /// tier. Unset keeps the original behavior: pending depths merge with the
+    /// confirmed ones by maximum on every request. Requires
+    /// --cache-pending-prefix-ttl-ms; 0.5 is a good starting point.
+    #[arg(long)]
+    pub cache_pending_prefix_consult_below: Option<f64>,
+
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
@@ -892,6 +912,21 @@ impl CacheArgs {
                     && cache_prefix_provider == CachePrefixProvider::RadixTree),
             "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
         );
+        ensure!(
+            self.cache_pending_prefix_max_followers.is_none()
+                || self.cache_pending_prefix_ttl_ms.is_some(),
+            "--cache-pending-prefix-max-followers requires --cache-pending-prefix-ttl-ms"
+        );
+        ensure!(
+            self.cache_pending_prefix_consult_below.is_none()
+                || self.cache_pending_prefix_ttl_ms.is_some(),
+            "--cache-pending-prefix-consult-below requires --cache-pending-prefix-ttl-ms"
+        );
+        ensure!(
+            self.cache_pending_prefix_consult_below
+                .is_none_or(|r| r > 0.0 && r <= 1.0),
+            "--cache-pending-prefix-consult-below must be above 0 and at most 1 (0 would never consult the tier; unset --cache-pending-prefix-ttl-ms to switch it off)"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -930,6 +965,8 @@ impl CacheArgs {
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
             pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
+            pending_prefix_max_followers: self.cache_pending_prefix_max_followers.unwrap_or(0),
+            pending_prefix_consult_below: self.cache_pending_prefix_consult_below,
         }))
     }
 }
@@ -3003,6 +3040,66 @@ mod tests {
             .expect("native cache-aware needs its default configuration");
         assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
         assert!(cache.kv_indexer_endpoint.is_none());
+    }
+
+    #[test]
+    fn pending_prefix_consult_below_defaults_and_validates() {
+        let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(
+            cache.pending_prefix_consult_below, None,
+            "off unless asked for"
+        );
+        let cache = cfg_of(
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 \
+             --cache-pending-prefix-consult-below 1",
+        )
+        .unwrap()
+        .model
+        .cache_aware
+        .unwrap();
+        assert_eq!(cache.pending_prefix_consult_below, Some(1.0));
+        for args in [
+            "--policy cache_aware --cache-pending-prefix-consult-below 0.5",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below 1.5",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below 0",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below NaN",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--cache-pending-prefix-consult-below"), "{args}: {err}");
+        }
+    }
+
+    #[test]
+    fn pending_prefix_max_followers_rides_on_the_ttl() {
+        let cache = cfg_of(
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 \
+             --cache-pending-prefix-max-followers 8",
+        )
+        .unwrap()
+        .model
+        .cache_aware
+        .unwrap();
+        assert_eq!(cache.pending_prefix_max_followers, 8);
+        let unset = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(
+            unset.pending_prefix_max_followers, 0,
+            "unbounded by default"
+        );
+        let err = cfg_of("--policy cache_aware --cache-pending-prefix-max-followers 8")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--cache-pending-prefix-max-followers"),
+            "{err}"
+        );
     }
 
     #[test]

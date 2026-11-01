@@ -4,6 +4,7 @@ from .batch_invariant_ops import (
     AttentionBlockSize,
     disable_batch_invariant_mode,
     enable_batch_invariant_mode,
+    fused_add_rms_norm_batch_invariant,
     get_batch_invariant_attention_block_size,
     is_batch_invariant_mode_enabled,
     log_softmax,
@@ -26,4 +27,5 @@ __all__ = [
     "get_batch_invariant_attention_block_size",
     "AttentionBlockSize",
     "rms_norm_batch_invariant",
+    "fused_add_rms_norm_batch_invariant",
 ]
