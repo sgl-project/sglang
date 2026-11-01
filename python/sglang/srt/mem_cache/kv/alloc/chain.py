@@ -17,7 +17,6 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.allocator import batch_scan_width
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -696,7 +695,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     free_pages,
                     out_indices,
-                    batch_scan_width(bs),
                     self.full_attn_allocator.page_size,
                 )
             return out_indices
@@ -842,7 +840,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         last_loc,
                         free_pages,
                         out_indices,
-                        batch_scan_width(bs),
                         self.full_attn_allocator.page_size,
                     )
                 return out_indices

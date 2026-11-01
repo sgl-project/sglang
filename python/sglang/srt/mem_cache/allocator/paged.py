@@ -22,7 +22,6 @@ import torch
 from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
-    batch_scan_width,
 )
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.platforms import current_platform
@@ -249,7 +248,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
-                batch_scan_width(bs),
                 self.page_size,
             )
         else:
@@ -306,7 +304,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
-                batch_scan_width(bs),
                 self.page_size,
             )
         else:

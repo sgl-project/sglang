@@ -2,10 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-# Batch-scan width (``bs_upper``) of the allocation kernels. It is a constexpr,
-# so every new power of two compiled another kernel the first time the running
-# batch outgrew the warmup's batches: ~0.2 s mid-serving under host profiling.
-# One width serves every batch up to 64 requests; the extra lanes are masked.
+# The request-to-token assignment scan still specializes on this width.
+# Paged extend/decode allocation below uses fixed blocks for every batch size.
 _MIN_BATCH_SCAN_WIDTH = 64
 
 
@@ -129,15 +127,27 @@ def alloc_extend_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
+    # A fixed-width scan avoids recompilation as the running batch grows.
+    BLOCK_BS: tl.constexpr = 256
+    load_offset = tl.arange(0, BLOCK_BS)
     seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     extend_lens = seq_lens - pre_lens
+    num_new_pages = (seq_lens + page_size - 1) // page_size - (
+        pre_lens + page_size - 1
+    ) // page_size
+    for block_start in range(BLOCK_BS, pid + 1, BLOCK_BS):
+        load_offset = block_start + tl.arange(0, BLOCK_BS)
+        seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+        pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+        extend_lens += seq_lens - pre_lens
+        num_new_pages += (seq_lens + page_size - 1) // page_size - (
+            pre_lens + page_size - 1
+        ) // page_size
 
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = tl.load(pre_lens_ptr + pid)
@@ -145,10 +155,6 @@ def alloc_extend_kernel(
 
     sum_extend_lens = tl.sum(extend_lens)
     output_start_loc = sum_extend_lens - extend_len
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
@@ -215,21 +221,29 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
-    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
+    BLOCK_BS: tl.constexpr = 256
+    load_offset = tl.arange(0, BLOCK_BS)
+    mask = load_offset <= pid
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=mask, other=0)
+    pre_lens = tl.where(mask, seq_lens - 1, seq_lens)
+    num_new_pages = (seq_lens + page_size - 1) // page_size - (
+        pre_lens + page_size - 1
+    ) // page_size
+    for block_start in range(BLOCK_BS, pid + 1, BLOCK_BS):
+        load_offset = block_start + tl.arange(0, BLOCK_BS)
+        mask = load_offset <= pid
+        seq_lens = tl.load(seq_lens_ptr + load_offset, mask=mask, other=0)
+        pre_lens = tl.where(mask, seq_lens - 1, seq_lens)
+        num_new_pages += (seq_lens + page_size - 1) // page_size - (
+            pre_lens + page_size - 1
+        ) // page_size
 
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = seq_len - 1
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1

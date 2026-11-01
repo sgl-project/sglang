@@ -6,7 +6,6 @@ import torch
 from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
-    batch_scan_width,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -20,7 +19,7 @@ class TestPagedAllocator(CustomTestCase):
     def test_masked_batch_scan_matches_reference(self):
         # Include batches below, at, and above the shared scan-width boundary.
         for batch_size, page_size, dtype, offset in itertools.product(
-            (1, 3, 16, 63, 64, 65),
+            (1, 3, 16, 63, 64, 65, 255, 256, 257, 513),
             (1, 16),
             (torch.int32, torch.int64),
             (0, 1),
@@ -34,6 +33,25 @@ class TestPagedAllocator(CustomTestCase):
                 self._check_allocation(
                     prefixes, [1] * batch_size, page_size, dtype, offset, decode=True
                 )
+
+    def test_batch_growth_does_not_compile_new_variants(self):
+        """Growing batches must not compile a new scan width while serving."""
+        for decode in (False, True):
+            variants = set()
+            for batch_size in range(1, 301):
+                prefixes = [i % 33 for i in range(batch_size)]
+                extensions = [1 if decode else 1 + i % 35 for i in range(batch_size)]
+                variants.add(
+                    self._check_allocation(
+                        prefixes,
+                        extensions,
+                        16,
+                        torch.int64,
+                        batch_size % 2,
+                        decode=decode,
+                    )
+                )
+            self.assertEqual(len(variants), 1, (decode, variants))
 
     def _check_allocation(
         self, prefixes, extensions, page_size, dtype, offset, decode=False
@@ -75,26 +93,25 @@ class TestPagedAllocator(CustomTestCase):
         )
         batch_size = len(prefixes)
         if decode:
-            alloc_decode_kernel[(batch_size,)](
+            compiled = alloc_decode_kernel[(batch_size,)](
                 seq,
                 last,
                 free_pages,
                 output[1:-1],
-                batch_scan_width(batch_size),
                 page_size,
             )
         else:
-            alloc_extend_kernel[(batch_size,)](
+            compiled = alloc_extend_kernel[(batch_size,)](
                 pre,
                 seq,
                 last,
                 free_pages,
                 output[1:-1],
-                batch_scan_width(batch_size),
                 page_size,
             )
         self.assertEqual(output.cpu().tolist(), [-777, *expected, -777])
         self.assertEqual(page_cursor, needed_pages)
+        return compiled.hash
 
 
 if __name__ == "__main__":
