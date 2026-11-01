@@ -6077,7 +6077,7 @@ class Scheduler(
         if self._deferred_responses:
             self._abort_deferred_responses(recv_req)
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or chunked_req.rid == recv_req.rid:
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
