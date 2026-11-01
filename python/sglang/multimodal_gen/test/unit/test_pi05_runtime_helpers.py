@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05CoreModel,
     Pi05SiglipVisionModel,
+    PiGemmaRMSNorm,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
 )
@@ -27,6 +29,7 @@ from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
     VLADenoiseGraphSignature,
     VLAPrefixGraphRunner,
+    VLATensorGraphRunner,
     _BoundedCaptureCache,
     _CapturedDenoiseGraph,
 )
@@ -79,7 +82,6 @@ def test_denoise_graph_skips_prefix_copy_for_same_digest(monkeypatch):
         static_x_t=torch.empty(1, 2, 4),
         static_timestep=torch.empty(1),
         static_output=torch.empty(1, 2, 4),
-        current_context_id=123,
         current_context_digest="same",
     )
 
@@ -105,7 +107,6 @@ def test_denoise_graph_copies_mutable_prefix_graph_output():
         static_x_t=torch.empty(1, 2, 4),
         static_timestep=torch.empty(1),
         static_output=torch.empty(1, 2, 4),
-        current_context_id=123,
     )
     current_context = _prefix_context(2.0, None)
     current_context.layout["mutable_graph_output"] = True
@@ -493,6 +494,43 @@ def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
     assert model._should_stream_weights_to_gpu(target_state, {})
 
 
+def test_pi05_checkpoint_excludes_declared_processor_state(tmp_path):
+    from safetensors.torch import save_file
+
+    model_file = tmp_path / "model.safetensors"
+    save_file({"action_in_proj.weight": torch.ones(2, 2)}, model_file)
+    for kind in ("pre", "post"):
+        state_file = f"policy_{kind}processor_step_0.safetensors"
+        save_file({"action.mean": torch.zeros(7)}, tmp_path / state_file)
+        (tmp_path / f"policy_{kind}processor.json").write_text(
+            json.dumps({"steps": [{"state_file": state_file}, {"config": {}}]})
+        )
+
+    manifest = Pi05PolicyModel._inspect_checkpoint(str(tmp_path), Pi05PipelineConfig())
+
+    assert manifest.safetensor_files == [str(model_file)]
+    assert "action_in_proj.weight" in manifest.component_keys["action_heads"]
+
+
+@pytest.mark.parametrize("declared_empty_camera", [False, True])
+def test_pi05_checkpoint_does_not_duplicate_empty_cameras(
+    tmp_path, declared_empty_camera
+):
+    features = {"observation.images.image": {"type": "VISUAL", "shape": [3, 224, 224]}}
+    if declared_empty_camera:
+        features["observation.images.empty_camera_0"] = {
+            "type": "VISUAL",
+            "shape": [3, 224, 224],
+        }
+    (tmp_path / "config.json").write_text(
+        json.dumps({"input_features": features, "empty_cameras": 1})
+    )
+    config = Pi05PipelineConfig()
+    for _ in range(2):
+        Pi05PolicyModel._apply_checkpoint_config(str(tmp_path), config)
+        assert config.image_keys == ("image", "empty_camera_0")
+
+
 def test_pi05_loader_maps_unfused_prefix_weights_to_parallel_targets():
     q_key = (
         "paligemma_with_expert.paligemma.model.language_model.layers.0."
@@ -638,9 +676,11 @@ def test_cached_pi05_sinusoidal_scaling_is_bit_exact():
     assert torch.equal(actual, expected)
 
 
-def test_prepare_denoise_layout_matches_per_step_construction():
+@pytest.mark.parametrize("backend", ["auto", "triton_split_kv"])
+def test_prepare_denoise_layout_matches_per_step_construction(backend):
     model = Pi05CoreModel.__new__(Pi05CoreModel)
     nn.Module.__init__(model)
+    model.config = Pi05PipelineConfig(action_attention_backend=backend)
     prefix_pad_masks = torch.tensor(
         [[True, True, False], [True, False, False]], dtype=torch.bool
     )
@@ -665,7 +705,7 @@ def test_prepare_denoise_layout_matches_per_step_construction():
     expected_mask = model.prepare_attention_masks_4d(expected_2d_mask)
     expected_positions = torch.tensor([[5, 6, 7, 8], [4, 5, 6, 7]])
 
-    assert torch.equal(attention_mask, expected_mask)
+    assert torch.equal(attention_mask.expand_as(expected_mask), expected_mask)
     assert torch.equal(position_ids, expected_positions)
     full_attention_mask, full_attention_positions = model.prepare_denoise_layout(
         prefix_pad_masks,
@@ -683,6 +723,7 @@ def test_sample_actions_only_hoists_denoise_layout_for_eager():
     model.config = SimpleNamespace(action_horizon=2, action_dim=3)
     model.device = torch.device("cpu")
     model.graph_runner = SimpleNamespace(enabled=True)
+    model.loop_graph_runner = SimpleNamespace(enabled=False)
     model._offload_action_expert_between_requests = lambda: False
     model._can_use_action_sequence_parallel = lambda *_args: False
     model.denoise_step = lambda _ctx, x_t, _t, **_kwargs: torch.zeros_like(x_t)
@@ -739,6 +780,94 @@ def test_sample_actions_only_hoists_denoise_layout_for_eager():
     assert len(layout_calls) == 1
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_action_loop_graph_refreshes_inputs_and_owns_output(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    num_steps = 7
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.config = Pi05PipelineConfig()
+    model.loop_graph_runner = VLATensorGraphRunner(
+        "test_action_loop", enabled=True, max_entries=2, evict_on_miss=False
+    )
+    model.core_model = SimpleNamespace(prepare_denoise_layout=lambda *_: None)
+
+    def velocity(context, x_t, timestep, **kwargs):
+        keys, values, _ = context.past_key_values[0]
+        return (
+            x_t * timestep[:, None, None]
+            + keys.sum()
+            + values.sum()
+            + context.prefix_pad_masks.sum()
+        )
+
+    model.action_expert = velocity
+    context = _prefix_context(0.01, None)
+    context.prefix_pad_masks = context.prefix_pad_masks.to(device)
+    context.past_key_values = VLADensePrefixCache(
+        (k.to(device), v.to(device), w) for k, v, w in context.past_key_values
+    )
+    context.layout["mutable_graph_output"] = True
+    noise = torch.ones(1, 2, 4, device=device)
+    original_noise = noise.clone()
+    previous_output = previous_copy = None
+    for _ in range(3):
+        expected = noise.clone()
+        for value in torch.linspace(1.0, 1.0 / num_steps, num_steps, device=device):
+            expected.add_(
+                velocity(context, expected, value.expand(1)), alpha=-1.0 / num_steps
+            )
+        actual = model._sample_actions_loop_graph(context, noise, num_steps)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(noise, original_noise, rtol=0, atol=0)
+        if previous_output is not None:
+            torch.testing.assert_close(previous_output, previous_copy, rtol=0, atol=0)
+        previous_output, previous_copy = actual, actual.clone()
+        context.past_key_values[0][0].add_(0.02)
+        context.past_key_values[0][1].sub_(0.01)
+        context.prefix_pad_masks.logical_not_()
+    if device == "cuda":
+        assert model.loop_graph_runner.cache_info().captures == 1
+        assert model.loop_graph_runner.cache_info().failures == 0
+
+
+def test_adaptive_norm_precomputed_modulation_is_exact():
+    torch.manual_seed(12)
+    dtype = torch.bfloat16
+    norm = PiGemmaRMSNorm(16, cond_dim=16).to(dtype=dtype)
+    nn.init.normal_(norm.dense.weight)
+    x = torch.randn(2, 5, 16, dtype=dtype)
+    cond = torch.randn(2, 16, dtype=dtype)
+    expected = norm(x, cond)
+    actual = norm(x, modulation=norm.dense(cond))
+    for before, after in zip(expected, actual, strict=True):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("operation", ["train", "apply", "load_state_dict"])
+def test_action_time_cache_is_invalidated_before_weight_changes(operation):
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.register_parameter("weight", nn.Parameter(torch.ones(2)))
+    cleared = []
+    for name in ("prefix_graph_runner", "graph_runner", "loop_graph_runner"):
+        setattr(
+            model, name, SimpleNamespace(clear=lambda name=name: cleared.append(name))
+        )
+    model._action_loop_schedule_key = (10, 1)
+    model._action_loop_schedule = (torch.ones(2),)
+    if operation == "train":
+        model.train()
+    elif operation == "apply":
+        model.to(dtype=torch.float64)
+    else:
+        model.load_state_dict({"weight": torch.zeros(2)})
+    assert len(cleared) == 3
+    assert model._action_loop_schedule_key is None
+    assert model._action_loop_schedule is None
+
+
 def test_uint8_resize_rounds_before_normalization():
     image = torch.tensor([[[0.0, 1.0], [2.0, 3.0]]]) / 255.0
 
@@ -774,3 +903,69 @@ def test_normalized_float_image_is_not_normalized_twice():
         preprocessed[:, (0, 3)],
         torch.full((3, 2, 4), -1.0),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA model kernels")
+def test_prefix_kv_only_matches_full_forward(monkeypatch):
+    """Every cached layer must match even though the final hidden state is unused."""
+    from transformers import GemmaConfig
+
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.vlas.pi05_core import PiGemmaModel
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_args.server_args._global_server_args",
+        SimpleNamespace(attention_backend="torch_sdpa", attention_backend_config=None),
+    )
+    config = GemmaConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        vocab_size=32,
+        max_position_embeddings=64,
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(42)
+    model = PiGemmaModel(config).cuda().bfloat16().eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.05)
+    inputs = torch.randn(2, 7, 128, device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(2, 1, 7, 7, device="cuda", dtype=torch.bool)
+    mask[0, :, :, -2:] = False
+    with torch.inference_mode(), set_forward_context(0, None):
+        expected = model(inputs_embeds=inputs, attention_mask=mask, use_cache=True)
+
+        def unused(*args):
+            raise AssertionError("KV-only prefix must skip final attention/MLP/norm")
+
+        hooks = [
+            module.register_forward_pre_hook(unused)
+            for module in (
+                model.layers[-1].self_attn.o_proj,
+                model.layers[-1].mlp,
+                model.norm,
+            )
+        ]
+        try:
+            actual = model(
+                inputs_embeds=inputs,
+                attention_mask=mask,
+                use_cache=True,
+                prefix_kv_only=True,
+            )
+        finally:
+            for hook in hooks:
+                hook.remove()
+    assert actual.last_hidden_state is None
+    assert expected.last_hidden_state.shape == inputs.shape
+    for (keys, values, _), (expected_keys, expected_values, _) in zip(
+        actual.past_key_values, expected.past_key_values, strict=True
+    ):
+        torch.testing.assert_close(keys, expected_keys, rtol=0, atol=0)
+        torch.testing.assert_close(values, expected_values, rtol=0, atol=0)

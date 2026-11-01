@@ -134,6 +134,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
+| `rmsnorm_modulate_preserve_reduction` | Triton + aten | native FP32 mean, FP32 `1 + weight` or scale/shift, final dtype cast; packed modulation also returns an owned gate | contiguous CUDA FP16/BF16 `[B,T,D]`, inference only; caller verifies against its eager chain |
 | `rmsnorm_cast_before_weight_modulate_bitexact` | Triton | ATen-ordered FP32 reduction and exact BF16 modulation | MOSS-Image BSC, width 3072 |
 | `fuse_scale_shift_kernel` | Triton | close | contiguous BLC; scalar/row/token modulation plus causal-video `[B, F, 1, C]`, using a static capped power-of-two tile to avoid request-time autotuning |
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |

@@ -52,6 +52,14 @@ class Pi05PipelineConfig(PipelineConfig):
     prompt_token_buckets: list[int] = field(default_factory=list)
     prefix_cuda_graph_max_entries: int = 1
     enable_action_cuda_graph: bool = True
+    # Opt-in full denoising loop capture for resident single-GPU inference.
+    enable_action_loop_cuda_graph: bool = False
+    # Reuse timestep-only conditioning within the full-loop graph path.
+    enable_action_time_cache: bool = False
+    # Fuse pointwise normalization while retaining Torch's FP32 mean reduction.
+    enable_fused_norm: bool = False
+    # Experimental inference-only attention over separate prefix/action K/V.
+    action_attention_backend: str = "auto"
     action_cuda_graph_max_entries: int = 4
     prefix_cache_max_entries: int = 1
     prefix_cache_layout_version: str = "pi05-prefix-v1"
@@ -94,6 +102,8 @@ class Pi05PipelineConfig(PipelineConfig):
         self._validate_cuda_graph_config()
 
     def _validate_cuda_graph_config(self) -> None:
+        if self.action_attention_backend not in ("auto", "triton_split_kv"):
+            raise ValueError("action_attention_backend must be auto or triton_split_kv")
         try:
             buckets = list(self.prompt_token_buckets)
         except TypeError as exc:

@@ -34,7 +34,10 @@ from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
-from sglang.multimodal_gen.runtime.models.vlas.pi05_core import Pi05CoreModel
+from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
+    Pi05CoreModel,
+    Pi05DenoiseCondition,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -44,6 +47,7 @@ from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphSignature,
     VLAPrefixGraphRunner,
     VLAPrefixGraphSignature,
+    VLATensorGraphRunner,
 )
 from sglang.multimodal_gen.runtime.vla.observation import (
     VLAObservationBatch,
@@ -89,6 +93,7 @@ class Pi05ActionExpert(nn.Module):
         *,
         action_position_offset: int = 0,
         denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
+        condition: Pi05DenoiseCondition | None = None,
     ) -> torch.Tensor:
         return self.core_model.denoise_step(
             prefix_context.prefix_pad_masks,
@@ -98,6 +103,7 @@ class Pi05ActionExpert(nn.Module):
             bool(prefix_context.layout.get("full_attention", False)),
             action_position_offset=action_position_offset,
             denoise_layout=denoise_layout,
+            condition=condition,
         )
 
 
@@ -219,6 +225,39 @@ class Pi05PolicyModel(nn.Module):
             max_entries=config.action_cuda_graph_max_entries,
             evict_on_miss=evict_graphs_on_miss,
         )
+        self.loop_graph_runner = VLATensorGraphRunner(
+            "action_loop",
+            enabled=(
+                config.enable_action_loop_cuda_graph
+                and config.action_cuda_graph_available()
+            ),
+            max_entries=config.action_cuda_graph_max_entries,
+            evict_on_miss=evict_graphs_on_miss,
+        )
+        self._action_loop_schedule_key = None
+        self._action_loop_schedule = None
+
+    def clear_inference_caches(self) -> None:
+        """Invalidate captured addresses and timestep conditioning before refit."""
+        for name in ("prefix_graph_runner", "graph_runner", "loop_graph_runner"):
+            runner = getattr(self, name, None)
+            if runner is not None:
+                runner.clear()
+        self._action_loop_schedule_key = None
+        self._action_loop_schedule = None
+
+    def _apply(self, fn, recurse=True):
+        self.clear_inference_caches()
+        return super()._apply(fn, recurse=recurse)
+
+    def train(self, mode=True):
+        if mode:
+            self.clear_inference_caches()
+        return super().train(mode)
+
+    def load_state_dict(self, *args, **kwargs):
+        self.clear_inference_caches()
+        return super().load_state_dict(*args, **kwargs)
 
     def _should_use_prefix_tensor_parallel(self) -> bool:
         if self.runtime_role not in ("all", "prefix"):
@@ -564,7 +603,10 @@ class Pi05PolicyModel(nn.Module):
                 if shape:
                     config.state_dim = int(shape[0])
         config.empty_cameras = int(payload.get("empty_cameras", 0) or 0)
-        image_keys.extend(f"empty_camera_{i}" for i in range(config.empty_cameras))
+        for index in range(config.empty_cameras):
+            key = f"empty_camera_{index}"
+            if key not in image_keys:
+                image_keys.append(key)
         if image_keys:
             config.image_keys = tuple(image_keys)
 
@@ -580,7 +622,24 @@ class Pi05PolicyModel(nn.Module):
         config: Pi05PipelineConfig,
     ) -> Pi05CheckpointManifest:
         path = Path(model_path)
-        safetensor_files = sorted(str(p) for p in path.glob("*.safetensors"))
+        processor_state_files = set()
+        for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
+            processor_path = path / name
+            if processor_path.is_file():
+                with processor_path.open(encoding="utf-8") as f:
+                    processor = json.load(f)
+                processor_state_files.update(
+                    (path / step["state_file"]).resolve()
+                    for step in processor.get("steps", [])
+                    if step.get("state_file")
+                )
+        # LeRobot stores normalization state beside the neural network weights.
+        # Its pre/postprocessor files can contain the same tensor names.
+        safetensor_files = sorted(
+            str(p)
+            for p in path.glob("*.safetensors")
+            if p.resolve() not in processor_state_files
+        )
         component_keys = {name: [] for name in config.loader_component_map}
         skipped_lm_head_keys: list[str] = []
 
@@ -781,6 +840,7 @@ class Pi05PolicyModel(nn.Module):
                         yield source_key, f.get_tensor(source_key)
 
     def _load_weights(self) -> None:
+        self.clear_inference_caches()
         target_state = self.core_model.state_dict()
         target_params = dict(self.core_model.named_parameters())
         loaded_keys: set[str] = set()
@@ -1221,6 +1281,86 @@ class Pi05PolicyModel(nn.Module):
         end = start + local_len
         return x_t[:, start:end].contiguous(), start
 
+    def _sample_actions_loop_graph(
+        self, prefix_context: PrefixContext, noise: torch.Tensor, num_steps: int
+    ) -> torch.Tensor:
+        # Copy mutable prefix K/V and masks once per loop to avoid stale observations.
+        layers = tuple(prefix_context.past_key_values)
+        sliding_windows = tuple(layer[2] for layer in layers)
+        full_attention = bool(prefix_context.layout.get("full_attention", False))
+        prefix_len = prefix_context.prefix_len
+        schedule = None
+        if self.config.enable_action_time_cache:
+            schedule_key = (num_steps, noise.shape[0], noise.device, noise.dtype)
+            if schedule_key != self._action_loop_schedule_key:
+                # Clear graphs before replacing the schedule they captured.
+                self.loop_graph_runner.clear()
+                timesteps = torch.linspace(
+                    1.0,
+                    1.0 / num_steps,
+                    num_steps,
+                    dtype=torch.float32,
+                    device=noise.device,
+                )
+                self._action_loop_schedule = tuple(
+                    self.core_model.prepare_denoise_condition(
+                        value.expand(noise.shape[0])
+                    )
+                    for value in timesteps
+                )
+                self._action_loop_schedule_key = schedule_key
+            schedule = self._action_loop_schedule
+        inputs = (noise, prefix_context.prefix_pad_masks) + tuple(
+            tensor for keys, values, _ in layers for tensor in (keys, values)
+        )
+
+        def integrate(initial_noise, prefix_masks, *kv):
+            context = PrefixContext(
+                past_key_values=VLADensePrefixCache(
+                    (kv[2 * i], kv[2 * i + 1], window)
+                    for i, window in enumerate(sliding_windows)
+                ),
+                prefix_pad_masks=prefix_masks,
+                prefix_len=prefix_len,
+                layout={"full_attention": full_attention},
+            )
+            x_t = initial_noise.clone()
+            denoise_layout = self.core_model.prepare_denoise_layout(
+                prefix_masks, x_t, full_attention
+            )
+            # Match the step runner's FP32 linspace and in-place alpha update.
+            timesteps = torch.linspace(
+                1.0,
+                1.0 / num_steps,
+                num_steps,
+                dtype=torch.float32,
+                device=x_t.device,
+            )
+            for index, value in enumerate(timesteps):
+                velocity = self.action_expert(
+                    context,
+                    x_t,
+                    value.expand(x_t.shape[0]),
+                    denoise_layout=denoise_layout,
+                    condition=None if schedule is None else schedule[index],
+                )
+                x_t.add_(velocity, alpha=-1.0 / num_steps)
+            return (x_t,)
+
+        (output,) = self.loop_graph_runner.run(
+            integrate,
+            inputs,
+            key=(
+                num_steps,
+                prefix_len,
+                full_attention,
+                sliding_windows,
+                schedule is not None,
+            ),
+        )
+        # A caller may retain this action chunk across subsequent graph replays.
+        return output.clone()
+
     def sample_actions(
         self,
         observation: VLAObservationBatch,
@@ -1263,6 +1403,17 @@ class Pi05PolicyModel(nn.Module):
             and self.graph_runner.enabled
             and prefix_context.layout.get("cuda_graph_eligible", True)
         )
+        if (
+            graph_enabled
+            and self.loop_graph_runner.enabled
+            and split is None
+            and not action_sp_enabled
+            and not (
+                model_parallel_is_initialized()
+                and (get_tp_world_size() > 1 or get_sequence_parallel_world_size() > 1)
+            )
+        ):
+            return self._sample_actions_loop_graph(prefix_context, x_t, num_steps)
         denoise_layout = None
         if not graph_enabled:
             denoise_layout = self.core_model.prepare_denoise_layout(

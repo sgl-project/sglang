@@ -261,7 +261,7 @@ asyncio.run(main())
 ## 5. Configuration Tips
 
 - Request-local `PrefixContext` is always reused across all denoise steps in one request. The prefix K/V is not cloned per step.
-- The optional global prefix cache is a bounded exact-match LRU. It is disabled by default because changing robot frames rarely hit it and enabling it prevents unrelated misses from entering grouped prefix execution. Set `enable_global_prefix_cache=true` for repeated observations, retries, or multiple policy calls over the same camera/state sample; `runtime.prefix_cache` can then disable lookup per request.
+- The optional global prefix cache is a bounded exact-match LRU. It is disabled by default because changing robot frames rarely hit it and enabling it prevents unrelated misses from entering grouped prefix execution. Set `enable_global_prefix_cache=true` for repeated observations, retries, or multiple policy calls over the same camera/state sample; `runtime.prefix_cache` can then disable lookup per request. Cache misses can also replay prefix CUDA graphs.
 - Partial-prefix reuse is not supported because Pi0.5 combines image and tokenized task/state inputs under full attention. Changing any input can change every deeper-layer prefix K/V tensor. The exact key hashes resized and normalized pixels before SigLIP, plus effective token IDs, token masks, camera masks, model revision, dtype, and parallel layout. Tensor content hashing reuses SRT's CPU/CUDA implementation; hashing the pre-SigLIP input lets an exact hit skip both the vision encoder and prefix transformer.
 - CUDA graph capture targets single-request prefix encoding and one action-denoise step. The lossless default keeps exact prompt lengths and one resident prefix graph. Prefix and action graph residency are independently bounded by `prefix_cuda_graph_max_entries` (default `1`) and `action_cuda_graph_max_entries` (default `4`). Without prompt buckets, unseen signatures run eagerly after the cache reaches capacity, avoiding capture churn. The denoise signature includes whether prefix attention is full or masked, plus batch size, prefix length, action horizon, action dim, dtype, and parallel layout. Mask-aware action graphs rebuild position IDs from the current request mask inside the captured graph. With action SP enabled, the denoise bucket uses the local action shard length and rank-specific position offset.
 - `prompt_token_buckets` optionally right-pads prompt tokens to fixed sizes such as `[32, 64, 128, 200]`, allowing nearby prompt lengths to reuse both graphs. In this mode the bounded graph caches use LRU replacement and reset evicted CUDA graphs; prompts beyond the largest configured bucket stay exact-length and eager. This is opt-in because padding changes GPU reduction shapes: an H200 sweep over lengths around all four boundaries was structurally correct and bounded to four prefix/action graphs, but non-boundary prompts differed from the exact-length path by up to `0.09589` in normalized action space over five denoise steps. Validate closed-loop policy quality before enabling it; empty buckets preserve the numerically lossless path.
@@ -280,6 +280,15 @@ An opt-in four-bucket serving config is:
 - Prefix TP uses native SGLang parallel linear layers for the PaliGemma language prefix model when model parallel TP is initialized and the VLA split broadcast group is not active. The action expert does not share that TP layout. The v1 split prefix/action path instead uses the SP group: prefix root computes/broadcasts `PrefixContext`, while action ranks run the SP action path.
 - The split path uses the SP group as the action group: prefix root computes/broadcasts `PrefixContext`, all action ranks broadcast the initial action noise once, shard the action horizon, and run the action expert through Ulysses attention when the prefix is full-attention, ring degree is one, heads are divisible by SP size, and the horizon is evenly shardable. Otherwise it falls back to action-root execution.
 - `lerobot/pi05_libero_base` returns 7 action dimensions even though the internal padded action tensor uses 32 dimensions.
+
+For resident single-GPU NVIDIA CUDA inference, set these options in the JSON passed to `--pipeline-config-path`:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enable_action_loop_cuda_graph` | `false` | Capture the full denoising loop; requires `enable_action_cuda_graph=true`. |
+| `enable_action_time_cache` | `false` | Cache timestep conditioning; requires `enable_action_loop_cuda_graph=true`. |
+| `enable_fused_norm` | `false` | Fuse normalization pointwise operations with bitwise verification and Torch fallback. |
+| `action_attention_backend` | `"auto"` | Set to `"triton_split_kv"` for experimental BF16/FP16 inference. It is **not bitwise equivalent**; validate policy quality before use. Keep `"auto"` for training. |
 
 ## 6. VRAM Tuning
 
