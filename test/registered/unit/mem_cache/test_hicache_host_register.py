@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import memory_pool_host
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -295,12 +296,11 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
             with self.subTest(pool="state", layout=layout):
                 alloc = mock.Mock(return_value=torch.empty(1, dtype=torch.uint8))
-                state_pools = [
-                    SimpleNamespace(
+                state_infos = [
+                    DSV4StateBufferInfo(
+                        pages=torch.empty((2, 6), dtype=torch.uint8),
                         ring_size=2,
-                        kv_score_buffer=SimpleNamespace(
-                            kv_score=torch.empty((4, 3), dtype=torch.uint8)
-                        ),
+                        dtype=torch.uint8,
                     )
                     for _ in range(2)
                 ]
@@ -314,7 +314,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 ):
                     DeepSeekV4StateHostPool(
                         pool_name="test",
-                        state_pools=state_pools,
+                        state_infos=state_infos,
                         num_host_pages=4,
                         swa_page_size=2,
                         layout=layout,
