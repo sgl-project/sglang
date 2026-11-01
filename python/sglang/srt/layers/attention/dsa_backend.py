@@ -706,6 +706,11 @@ class DeepseekSparseAttnBackend(
         else:
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.flashmla_sparse_head_padding = self._flashmla_sparse_head_padding(
+            device_sm_major=self.device_sm_major,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_heads=self.num_q_heads,
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
@@ -2885,6 +2890,15 @@ class DeepseekSparseAttnBackend(
         )
         return o  # type: ignore
 
+    @staticmethod
+    def _flashmla_sparse_head_padding(
+        device_sm_major: int, head_dim: int, num_heads: int
+    ) -> int:
+        # TODO: Validate head64 at d_qk=512 before widening this guard.
+        if device_sm_major == 10 and head_dim == 576 and num_heads <= 64:
+            return 64
+        return 128 if device_sm_major >= 10 else 64
+
     def _forward_flashmla_sparse(
         self,
         q_all: torch.Tensor,
@@ -2895,13 +2909,10 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
-        # When using TP, num_heads might be smaller (e.g., 256//8=32)
+        # FlashMLA requires a supported query-head tile; TP can leave fewer heads.
         num_tokens, num_heads, head_dim = q_all.shape
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
-
+        required_padding = self.flashmla_sparse_head_padding
         need_padding = num_heads % required_padding != 0
 
         if need_padding:

@@ -16,6 +16,7 @@ def test_sparse_flashmla_sink_padding_refreshes_reused_buffer(monkeypatch):
     backend.device_sm_major = 10
     backend.dsa_index_topk = 2
     backend._sink_pad_cache = {}
+    backend.flashmla_sparse_head_padding = 128
     captured_sinks = []
 
     def capture_flash_mla_sparse_fwd(**kwargs):
