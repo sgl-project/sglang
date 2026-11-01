@@ -156,6 +156,22 @@ def register_memory_region_v2(model, transfer_engine):
     # Blocks in each segment have continuous physical addresses,
     # so they can be merged for memory registration.
     for segment in memory_snapshot:
+        # HIP IPC maps an exported handle at the hipMalloc allocation base.
+        # Registering an interior block loses its allocation offset in older
+        # Mooncake builds. Register the native allocation once, while keeping
+        # per-tensor addresses in weight_mr_dict for the actual transfers.
+        # Expandable VMM segments can span multiple physical allocations.
+        if torch.version.hip and not segment.get("is_expandable", False):
+            if any(
+                block.get("state") == "active_allocated"
+                and block.get("address") in weight_addr_set
+                for block in segment.get("blocks", [])
+            ):
+                weight_blocks_for_reg_mr.append(
+                    (segment["address"], segment["total_size"])
+                )
+            continue
+
         current_weight_block = None
         blocks = segment.get("blocks", [])
         for block in blocks:
