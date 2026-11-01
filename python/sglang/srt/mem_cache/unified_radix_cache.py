@@ -11,6 +11,7 @@ from http import HTTPStatus
 from queue import Queue
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Iterator,
     NamedTuple,
@@ -178,6 +179,12 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# A storage write whose rank-agreed written prefix stops short of the request
+# is re-enqueued for the unwritten tail this many times before the tail is
+# given up; the same bound applies to a write-through backup whose host
+# staging allocation failed under capacity pressure.
+STORAGE_BACKUP_MAX_RETRIES = 2
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -185,6 +192,30 @@ class _OngoingWriteThrough(NamedTuple):
     node_id: NodeId
     lock_params: Optional[DecLockRefParams]
     publish_node_ids: list[NodeId]
+
+
+class _StorageWriteSpec(NamedTuple):
+    """The scheduler-side inputs of an in-flight storage write: what its
+    write_storage call was given, kept so an unwritten tail can be re-enqueued
+    identically on every rank. ``riders`` are the sidecars that ride the KV
+    pages; ``written_pages`` leading pages were acked as written by earlier
+    attempts; ``attempts`` tail re-enqueues are spent."""
+
+    host_indices: torch.Tensor
+    token_ids: Sequence[int]
+    hash_value: list[str]
+    prefix_keys: Any
+    riders: list[PoolTransfer]
+    written_pages: int = 0
+    attempts: int = 0
+
+
+class _ParkedBackup(NamedTuple):
+    """A write-through backup parked on host capacity: the tick retries
+    already spent and the device lock that keeps the node alive meanwhile."""
+
+    attempts: int
+    lock_params: DecLockRefParams
 
 
 class _OngoingLoadBack(NamedTuple):
@@ -495,6 +526,13 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        # The write_storage inputs of each cache-mode backup in ongoing_backup,
+        # for re-enqueueing an unwritten tail (buffer mode keeps them on its
+        # own entries).
+        self._backup_write_specs: dict[int, _StorageWriteSpec] = {}
+        # Write-through nodes whose host staging allocation failed; re-run
+        # from the tick (cache mode only).
+        self._host_capacity_backup_retries: dict[NodeId, _ParkedBackup] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -1874,9 +1912,15 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _execute_and_commit_kv_backup(
-        self, action: BackupKV, write_back: bool = False
+        self,
+        action: BackupKV,
+        write_back: bool = False,
+        host_capacity_attempts: int = 0,
     ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+        """Run a backup action top-down, stopping at the first failed backup.
+
+        ``host_capacity_attempts`` counts the tick retries already spent on
+        this action's trigger node (see _retry_host_capacity_backups)."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -1897,6 +1941,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                if not write_back and not self.is_write_back:
+                    # Host staging is short (_execute_kv_backup returned None
+                    # after evicting what it could): park the trigger node
+                    # for a tick retry instead of dropping the backup.
+                    self._defer_backup_for_host_capacity(
+                        action.node_ids[-1], host_capacity_attempts
+                    )
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
@@ -1908,6 +1959,57 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             written = len(host_indices)
         return written
+
+    def _defer_backup_for_host_capacity(self, node_id: NodeId, attempts: int) -> None:
+        """Park a write-through trigger node whose host staging could not be
+        allocated, for a retry from the tick, under a device lock so the node
+        outlives the wait. This inherits the write-through decision point as
+        it is: the park follows the same host-pool reads (available_size,
+        evict_host, the controller's staging alloc) that decide the backup
+        today, so it is rank-identical whenever host frees are lockstep. The
+        hybrid controller frees prefetch staging from worker threads, the
+        divergence writing_check already tolerates for ongoing_write_through;
+        a rank that parks alone retries alone, without any collective."""
+        if node_id in self._host_capacity_backup_retries:
+            # A later insert hit the node while it was parked (it is still not
+            # backuped, so the hit fires its own BackupKV) and that attempt
+            # failed again: the park already holds the device lock and the
+            # tick-retry count; a second park would leak the first lock.
+            return
+        if attempts >= STORAGE_BACKUP_MAX_RETRIES:
+            logger.error(
+                "HiCache write-through backup of node %s gave up after %d host "
+                "capacity retries; the node stays device-only until its next hit.",
+                node_id,
+                attempts,
+            )
+            return
+        self._host_capacity_backup_retries[node_id] = _ParkedBackup(
+            attempts, self.inc_lock_ref(node_id).to_dec_params()
+        )
+
+    def _retry_host_capacity_backups(self) -> None:
+        """Re-run the parked write-through backups now that the previous
+        tick's acks and releases may have returned host capacity."""
+        if not self._host_capacity_backup_retries:
+            return
+        pending = self._host_capacity_backup_retries
+        self._host_capacity_backup_retries = {}
+        tree_core = self.tree_core
+        for node_id, parked in pending.items():
+            self.dec_lock_ref(node_id, parked.lock_params)
+            # A later hit backed the node up meanwhile: nothing left to do.
+            if tree_core.is_backuped(node_id):
+                continue
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
+                self.storage_metrics_collector.log_storage_backup_host_capacity_retry()
+            self._execute_and_commit_kv_backup(
+                tree_core.build_backup_kv_action(node_id),
+                host_capacity_attempts=parked.attempts + 1,
+            )
 
     @staticmethod
     def _backup_publish_node_ids(
@@ -2210,6 +2312,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        self._backup_write_specs[operation_id] = _StorageWriteSpec(
+            host_indices=spec.host_value,
+            token_ids=spec.token_ids,
+            hash_value=spec.hash_value,
+            prefix_keys=spec.prefix_keys,
+            riders=[x for x in aux_xfers if x.indices_from_pool == PoolName.KV],
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -3431,26 +3540,57 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
-                if buffer_mode:
-                    # Storage write acked: free the staging.
-                    self.buffer_pipeline.finish_storage_write_ack(operation.id)
-                else:
-                    entry = self.ongoing_backup.pop(operation.id, None)
-                    if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
-                if (
-                    log_metrics
-                    and self.enable_storage_metrics
-                    and self.storage_metrics_collector is not None
-                ):
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+            acked = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not acked:
+                return 0
+            page_size = self.page_size
+            # The requested KV span comes from the scheduler-side record, not
+            # the operation: a native controller's operation exposes only its
+            # id and completed_tokens.
+            specs = [self._backup_write_spec(op.id) for op in acked]
+            requested = [
+                (
+                    0
+                    if spec is None
+                    else (len(spec.hash_value) - spec.written_pages) * page_size
+                )
+                for spec in specs
+            ]
+            if cc.backup_skip:
+                # Not the KV writer (replicated MLA KV): this rank's
+                # completed_tokens carries no KV evidence, so it vouches for
+                # the whole span; its own rank-sharded sidecars are written
+                # whole or logged by the controller, never retried here.
+                written = list(requested)
+            else:
+                written = [
+                    min(op.completed_tokens, req) for op, req in zip(acked, requested)
+                ]
+            if n_backup is not None:
+                # n_backup is the rank-agreed count, so this tensor has the
+                # same shape on every rank. One MIN gives every rank the same
+                # written prefix per operation: backup submission and acks
+                # have no other collective, and the acks pair by position, so
+                # a rank-local verdict could not re-enqueue a tail safely. The
+                # local detach drain passes None and enters no collective.
+                votes = torch.tensor(written, dtype=torch.int64)
+                self._all_reduce_storage_drain(votes)
+                written = votes.tolist()
+            for operation, spec, req, done in zip(acked, specs, requested, written):
+                if not (0 <= done <= req and done % page_size == 0):
+                    raise RuntimeError(
+                        f"HiCache storage backup operation {operation.id} reported "
+                        f"{done} written tokens of {req} (page size {page_size})"
                     )
-            return drained
+                self._finish_backup_ack(
+                    operation,
+                    spec,
+                    agreed_tokens=done,
+                    requested_tokens=req,
+                    rank_agreed=n_backup is not None,
+                    log_metrics=log_metrics,
+                )
+            return len(acked)
 
         def _drain_release():
             host_indices_list = []
@@ -3487,6 +3627,145 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_backup()
         _drain_release()
         _drain_extra_release()
+
+    def _all_reduce_storage_drain(self, data: torch.Tensor) -> None:
+        """MIN-reduce a per-drain tensor over the ranks whose storage drain
+        runs in lockstep, as _sync_hicache_ready_counts reduces the counts:
+        every TP rank of each PP stage in buffer_only mode (each stage drains
+        its own completions), else PP0's TP verdict propagated along PP."""
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        else:
+            self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+
+    def _backup_write_spec(self, operation_id: int) -> Optional[_StorageWriteSpec]:
+        """The scheduler-side inputs of an acked storage write; None for a
+        write no longer tracked (dropped by reset or detach) and for a
+        buffer-mode write of another pool, which carries no KV pages and
+        settles whole."""
+        if self.buffer_pipeline is None:
+            return self._backup_write_specs.get(operation_id)
+        entry = self.buffer_pipeline.ongoing_backup.get(operation_id)
+        if entry is None or entry.intent.pool != PoolName.KV:
+            return None
+        snapshot = entry.intent.snapshot
+        return _StorageWriteSpec(
+            host_indices=entry.host_indices,
+            token_ids=snapshot.key.token_ids,
+            hash_value=entry.keys_by_pool[PoolName.KV],
+            prefix_keys=snapshot.prefix_keys,
+            riders=[x for x in entry.aux_xfers if x.indices_from_pool == PoolName.KV],
+            written_pages=entry.written_pages,
+            attempts=entry.attempts,
+        )
+
+    def _finish_backup_ack(
+        self,
+        operation,
+        spec: Optional[_StorageWriteSpec],
+        *,
+        agreed_tokens: int,
+        requested_tokens: int,
+        rank_agreed: bool,
+        log_metrics: bool,
+    ) -> None:
+        """Settle one acked storage write at its agreed written prefix.
+
+        A shortfall re-enqueues the tail ``[agreed_tokens:requested_tokens]``
+        as a new operation, identically on every rank, up to
+        STORAGE_BACKUP_MAX_RETRIES times per node span; the staging (buffer
+        mode) or the host lock (cache mode) is kept meanwhile. Past the bound
+        the tail is given up: counted, logged once and left un-backed, so
+        beliefs never cover it and a later insert writes it again. A drain
+        without an agreed count (detach) settles locally and never retries.
+        """
+        page_size = self.page_size
+        attempts = STORAGE_BACKUP_MAX_RETRIES if spec is None else spec.attempts
+        tail_tokens = requested_tokens - agreed_tokens
+        retry_id = None
+        if tail_tokens > 0 and rank_agreed and attempts < STORAGE_BACKUP_MAX_RETRIES:
+            retry_id = self._enqueue_backup_tail(spec, agreed_tokens)
+            logger.info(
+                "HiCache storage backup operation %d wrote %d of %d tokens; "
+                "retrying the tail as operation %d (%d/%d).",
+                operation.id,
+                agreed_tokens,
+                requested_tokens,
+                retry_id,
+                attempts + 1,
+                STORAGE_BACKUP_MAX_RETRIES,
+            )
+        gave_up = (
+            tail_tokens > 0 and retry_id is None and rank_agreed and spec is not None
+        )
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.finish_storage_write_ack(
+                operation.id,
+                written_pages=None if spec is None else agreed_tokens // page_size,
+                retry_operation_id=retry_id,
+            )
+        else:
+            entry = self.ongoing_backup.pop(operation.id, None)
+            self._backup_write_specs.pop(operation.id, None)
+            if retry_id is not None:
+                # The host lock stays with the tail.
+                self.ongoing_backup[retry_id] = entry
+                self._backup_write_specs[retry_id] = spec._replace(
+                    written_pages=spec.written_pages + agreed_tokens // page_size,
+                    attempts=attempts + 1,
+                )
+            elif entry is not None:
+                node_id, lock_params = entry
+                self.dec_host_lock_ref(node_id, lock_params)
+        if gave_up:
+            logger.error(
+                "HiCache storage backup operation %d gave up %d of %d tokens "
+                "after %d tail retries; the span stays un-backed.",
+                operation.id,
+                tail_tokens,
+                requested_tokens,
+                attempts,
+            )
+        if (
+            log_metrics
+            and self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+        ):
+            collector = self.storage_metrics_collector
+            # What this rank wrote of the agreed prefix; a retried tail is
+            # logged by its own ack.
+            collector.log_backuped_tokens(
+                min(operation.completed_tokens, agreed_tokens)
+            )
+            if gave_up:
+                collector.log_storage_backup_failed_tokens(tail_tokens)
+
+    def _enqueue_backup_tail(self, spec: _StorageWriteSpec, agreed_tokens: int) -> int:
+        """Re-enqueue the unwritten tail of a storage write as a new
+        operation. Every input is the write's own scheduler-side spec (built
+        from the lockstep tree) plus the agreed count, so each rank enqueues
+        the same tail in the same order and the positional ack pairing stays
+        aligned. Sidecars riding the KV pages are rebuilt bare and re-resolved
+        against the tail by the controller; transfers with their own staging
+        were written whole by the first attempt and are not carried."""
+        cc = self.cache_controller
+        pages = spec.written_pages + agreed_tokens // self.page_size
+        tokens = pages * self.page_size
+        riders = [
+            PoolTransfer(
+                name=transfer.name,
+                hit_policy=transfer.hit_policy,
+                indices_from_pool=transfer.indices_from_pool,
+            )
+            for transfer in spec.riders
+        ]
+        return cc.write_storage(
+            spec.host_indices[tokens:],
+            spec.token_ids[tokens:],
+            spec.hash_value[pages:],
+            cc.extend_storage_prefix(spec.prefix_keys, spec.hash_value[:pages]),
+            extra_pools=riders or None,
+        )
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -3916,6 +4195,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        # Write-through backups parked on host capacity go first, so the flush
+        # below submits their D2H with the rest.
+        self._retry_host_capacity_backups()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()

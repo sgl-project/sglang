@@ -2298,6 +2298,22 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.storage_backup_failed_tokens_total = Counter(
+            name="sglang:hicache_storage_backup_failed_tokens_total",
+            documentation="Backup tokens whose L3 write still failed after the "
+            "bounded tail retries. The span is left un-backed: buffer-mode "
+            "beliefs never cover it, so a later insert writes it again.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_backup_host_capacity_retries_total = Counter(
+            name="sglang:hicache_storage_backup_host_capacity_retries_total",
+            documentation="Write-through backups re-attempted from the "
+            "scheduler tick after their host staging allocation failed under "
+            "host capacity pressure.",
+            labelnames=labels.keys(),
+        )
+
         bucket_io = [
             1,
             5,
@@ -2386,6 +2402,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
+
+    def log_storage_backup_failed_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.storage_backup_failed_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
+
+    def log_storage_backup_host_capacity_retry(self) -> None:
+        self.storage_backup_host_capacity_retries_total.labels(**self.labels).inc()
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
