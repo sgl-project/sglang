@@ -2097,7 +2097,9 @@ class CommonKVManager(BaseKVManager):
         """Handle failure of a prefill node."""
         with self.connection_lock:
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                k
+                for k in self.connection_pool
+                if k.startswith(f"{failed_bootstrap_addr}_")
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
