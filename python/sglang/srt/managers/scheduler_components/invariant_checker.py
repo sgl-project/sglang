@@ -504,10 +504,18 @@ class SchedulerInvariantChecker:
         )
 
     def maybe_check_inflight_steps(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, every request of a step being
-        processed was counted in flight when the step launched."""
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed with the
+        requests it was launched with, each counted in flight."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
+        launched = batch.launched_reqs or ()
+        if len(batch.reqs) != len(launched) or any(
+            req is not launched_req for req, launched_req in zip(batch.reqs, launched)
+        ):
+            raise RuntimeError(
+                f"Step processed with requests {[req.rid for req in batch.reqs]}, "
+                f"launched with {[req.rid for req in launched]}"
+            )
         uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
         if uncounted:
             raise RuntimeError(

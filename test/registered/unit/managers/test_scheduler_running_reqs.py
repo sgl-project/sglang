@@ -375,7 +375,7 @@ class TestInflightSteps(CustomTestCase):
         s = self._scheduler()
         with (
             envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
-            self.assertRaisesRegex(RuntimeError, "not launched"),
+            self.assertRaisesRegex(RuntimeError, "launched with \[\]"),
         ):
             s.process_batch_result(_batch([_req("a")], ForwardMode.DECODE), MagicMock())
 

@@ -2642,6 +2642,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
 
+    # The requests this batch carried at its launch. A launched step's requests
+    # do not change, so its processing sees the same ones.
+    launched_reqs: Optional[Tuple[Req, ...]] = None
+
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
@@ -2861,11 +2865,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return len(self.reqs) == 0
 
     def add_inflight_step(self) -> None:
-        for req in self.reqs:
+        self.launched_reqs = tuple(self.reqs)
+        for req in self.launched_reqs:
             req.inflight_steps += 1
 
     def drop_inflight_step(self) -> None:
-        for req in self.reqs:
+        for req in self.launched_reqs:
             req.inflight_steps -= 1
 
     def is_dllm(self):
@@ -4148,6 +4153,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            launched_reqs=self.launched_reqs,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
