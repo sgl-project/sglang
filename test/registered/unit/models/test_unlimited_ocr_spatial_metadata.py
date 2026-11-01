@@ -188,6 +188,7 @@ class TestUnlimitedOCRPageSlices(CustomTestCase):
         self.assertEqual(len(items), pages)
 
         processor = object.__new__(UnlimitedOCRV2Processor)
+        processor.processor_fingerprint = "test-unlimited-ocr-page-slices"
         items = processor._postprocess_mm_items_before_transport(items, images=None)
 
         page_bytes = 2 * 3 * 64 * 64 * 4
