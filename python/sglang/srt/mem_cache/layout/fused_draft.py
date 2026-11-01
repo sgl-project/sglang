@@ -413,8 +413,8 @@ class WindowHostKind(DenseHostKind):
         return window_sub_pool_name(layers.window)
 
 
-SWA_HOST = register_host_kind(
-    WindowHostKind(name="swa", serves=LAYER_WINDOW, family="dense")
+WINDOW_HOST = register_host_kind(
+    WindowHostKind(name="window", serves=LAYER_WINDOW, family="dense")
 )
 
 
@@ -479,7 +479,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
     regions: Dict[str, DraftRegion] = {}
     new_bands: Dict[str, DraftBand] = {}
     # Target sub-pools that carry draft lanes under a name other than their
-    # host kind's (a window other than the target's longest), by host kind.
+    # host kind's (a window named by its length), by host kind.
     hosted: Dict[str, str] = {}
     source: Optional[Tuple[str, Optional[str]]] = None
 

@@ -213,7 +213,12 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
         placement = (
-            FusedDraftPlacement.from_counts(counts={host: [1]}, regions={host: region})
+            FusedDraftPlacement.from_counts(
+                counts={host: [1]},
+                regions={host: region},
+                # These pools name their window sub-pool `swa`.
+                hosted={"swa": "window"} if host == "swa" else None,
+            )
             if region is not None
             else None
         )

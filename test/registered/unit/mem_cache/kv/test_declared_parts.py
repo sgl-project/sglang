@@ -2758,7 +2758,7 @@ class TestDeclaredParts(CustomTestCase):
             counts={"full": [1], "window_16": [1]},
             regions={"full": region, "window_16": region},
             # The target's window sub-pool hosts as a window.
-            hosted={"window_16": "swa"},
+            hosted={"window_16": "window"},
         )
         storage, _, _ = _build(fused_draft=placement)
         with TemporaryDirectory() as directory:

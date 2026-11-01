@@ -684,7 +684,7 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
                 FusedDraftPlacement(
                     runners=(RunnerLanes(ranges={"window_128": (0, 1)}),),
                     regions={"window_128": region},
-                    hosted={"window_128": "swa"},
+                    hosted={"window_128": "window"},
                 ),
                 "window_128",
             )
