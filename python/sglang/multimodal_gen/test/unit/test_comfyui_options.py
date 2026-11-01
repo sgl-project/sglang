@@ -35,7 +35,9 @@ def test_cache_mode_reaches_the_h3_request() -> None:
 
     executor = object.__new__(MiniMaxH3Executor)
     torch.nn.Module.__init__(executor)
-    packed = SimpleNamespace(guidance_scale=1.0, height=512, width=512)
+    packed = SimpleNamespace(
+        guidance_scale=1.0, height=512, width=512, cache_options={}
+    )
     for values, cache_dit, spectrum in (
         ({"cache_mode": "cache_dit", "cache_dit_tuning": "manual"}, True, False),
         ({"cache_mode": "spectrum"}, False, True),
@@ -83,7 +85,7 @@ _GRAPH = {"execution_mode": "cuda_graph"}
         ("qwen_image21", {"quantization": "mxfp8"}, False, "pre-quantized"),
         ("qwen_image21", {"quantization": "fp8"}, False, "pre-quantized"),
         ("lumina2", {"int8_gemm": "comfy_kitchen"}, False, "no effect"),
-        ("qwen_image", {"cache_mode": "cache_dit"}, False, "cache_dit is not"),
+        ("qwen_image", {"cache_mode": "spectrum"}, False, "spectrum is not"),
         ("minimax_h3", {"cache_mode": "teacache"}, False, "teacache is not"),
         ("minimax_h3", {"num_gpus": 2, "cache_mode": "spectrum"}, False, "degree 1"),
     ],
@@ -103,6 +105,7 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ("minimax_h3", {"int8_gemm": "comfy_kitchen", "cache_mode": "spectrum"}, False),
         ("fast_h3", {"attention_backend": "video_sparse_attn_h3"}, True),
         ("vdn_h3", {"quantization": "fp8", "cache_mode": "cache_dit"}, True),
+        ("flux", {"cache_mode": "cache_dit", "cache_dit_tuning": "manual"}, False),
         ("qwen_image21", {"quantization": "convrot_int8"}, False),
         ("qwen_image21", {"int8_gemm": "sglang_jit"}, False),
     ],
