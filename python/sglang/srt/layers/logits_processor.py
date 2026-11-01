@@ -83,7 +83,11 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 # On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
-_use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
+_use_aiter_lm_head = (
+    is_hip()
+    and envs.SGLANG_USE_AITER.get()
+    and (is_gfx1250_supported() or envs.SGLANG_OPT_AITER_LM_HEAD_GEMM.get())
+)
 if _use_aiter_lm_head:
     from aiter.tuned_gemm import tgemm
 
