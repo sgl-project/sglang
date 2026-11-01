@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -500,7 +500,7 @@ class FullComponent(TreeComponent):
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
             if storage.available_units(sub_pool) < num_tokens:
-                self.cache.evict_for_alloc(EvictParams(num_tokens=num_tokens))
+                self.cache.evict_for_alloc(AllocDemand(num_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None

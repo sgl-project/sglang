@@ -37,9 +37,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRACTION
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     CacheRequestHandle,
     DecLockRefParams,
-    EvictParams,
     InitLoadBackParams,
     InsertParams,
     InsertResult,
@@ -1893,7 +1893,7 @@ class BufferModePipeline:
             return allocator.available_size()
 
         if available() < load_tokens:
-            cache.evict_for_alloc(EvictParams(num_tokens=load_tokens))
+            cache.evict_for_alloc(AllocDemand(num_tokens=load_tokens))
             if available() < load_tokens:
                 return False
         return True

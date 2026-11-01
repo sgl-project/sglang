@@ -7,6 +7,7 @@ import logging
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,15 @@ class PureSWARadixCache(RadixCache):
         split to cross-check."""
         pass
 
+    def all_windows(self, tokens: int) -> dict[ComponentType, int]:
+        """The tree keeps no window slot, but its one pool is the window: a
+        window demand names it, so the demand reaches that pool."""
+        return {ComponentType.SWA: tokens}
+
     def evict(self, params: EvictParams) -> EvictResult:
-        """For all-SWA models, evict_from_tree_cache passes swa_num_tokens
-        (with num_tokens=0). Use whichever is non-zero."""
-        num_tokens = max(params.num_tokens, params.swa_num_tokens)
+        """An all-SWA model keeps one pool: window tokens and tokens are
+        evicted from it alike."""
+        num_tokens = max(params.num_tokens, *params.window_num_tokens.values(), 0)
         return super().evict(EvictParams(num_tokens=num_tokens))
 
     def available_and_evictable_str(self) -> str:

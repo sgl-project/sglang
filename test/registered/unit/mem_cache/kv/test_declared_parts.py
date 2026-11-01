@@ -348,7 +348,7 @@ class TestDeclaredParts(CustomTestCase):
                     batch.maybe_evict_swa()
                     cache.evict(
                         EvictParams(
-                            swa_num_tokens=80, window_num_tokens={DRAFT_WINDOW: 80}
+                            window_num_tokens={ComponentType.SWA: 80, DRAFT_WINDOW: 80}
                         )
                     )
                     for ct, window in (
@@ -371,8 +371,7 @@ class TestDeclaredParts(CustomTestCase):
                 cache.evict(
                     EvictParams(
                         num_tokens=80,
-                        swa_num_tokens=80,
-                        window_num_tokens={DRAFT_WINDOW: 80},
+                        window_num_tokens={ComponentType.SWA: 80, DRAFT_WINDOW: 80},
                     )
                 )
                 self.assertEqual(storage.accounting_violations(), [])
@@ -1999,7 +1998,9 @@ class TestDeclaredParts(CustomTestCase):
 
                     def walk(params, **kwargs):
                         result = original(params, **kwargs)
-                        evicted.append(result.swa_num_tokens_evicted)
+                        evicted.append(
+                            result.window_num_tokens_evicted.get(ComponentType.SWA, 0)
+                        )
                         return result
 
                     with patch.object(cache, "evict_until", side_effect=walk):
@@ -2473,9 +2474,7 @@ class TestDeclaredParts(CustomTestCase):
         self.assertTrue(budget._fits(8, dict.fromkeys(budget.window_offsets, 8)))
         cache.evict(
             EvictParams(
-                num_tokens=80,
-                swa_num_tokens=8,
-                window_num_tokens={DRAFT_WINDOW: 4},
+                num_tokens=80, window_num_tokens={ComponentType.SWA: 8, DRAFT_WINDOW: 4}
             )
         )
         # The evicted end holes are credited before any flush: the planned
@@ -2667,7 +2666,8 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(storage.accounting_violations(), [])
         cache.evict(
             EvictParams(
-                num_tokens=64, swa_num_tokens=64, window_num_tokens={DRAFT_WINDOW: 64}
+                num_tokens=64,
+                window_num_tokens={ComponentType.SWA: 64, DRAFT_WINDOW: 64},
             )
         )
         self.assertEqual(

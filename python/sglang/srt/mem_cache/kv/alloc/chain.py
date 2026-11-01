@@ -71,7 +71,10 @@ from sglang.srt.utils.invariants import expect, resolve_level
 _NETWORK_ROWS = "network-rows"
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        AllocDemand,
+        EvictResult,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -842,20 +845,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._reclaim(tree_cache, demands)
         return self._units_fit({n: d for n, d in demands.items() if d > 0})
 
-    def reclaim_for_demand(self, tree_cache, demand: EvictParams) -> EvictResult:
+    def reclaim_for_demand(self, tree_cache, demand: AllocDemand) -> EvictResult:
         """An allocation's demand as the prefix tree states it, reclaimed as
         one demand (`_reclaim`): the sub-pools share bytes."""
         page = self.page_size
         owner = self.full_attn_allocator
-        swa = self.swa_attn_allocator
         state = self.mamba_allocator
         demands = {owner.sub_pool_name: -(-demand.num_tokens // page)}
         for window in self._windows:
-            tokens = (
-                demand.swa_num_tokens
-                if window is swa
-                else demand.window_num_tokens.get(self.window_component(window), 0)
-            )
+            tokens = demand.window_num_tokens.get(self.window_component(window), 0)
             demands[window.sub_pool_name] = -(-tokens // page)
         if state is not None:
             demands[state.sub_pool_name] = demand.mamba_num
@@ -931,34 +929,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         page = self.page_size
-        swa = self.swa_attn_allocator
         state = self.mamba_allocator
         params = EvictParams(
             num_tokens=units.get(self.full_attn_allocator.sub_pool_name, 0) * page,
-            swa_num_tokens=0 if swa is None else units.get(swa.sub_pool_name, 0) * page,
             window_num_tokens={
                 self.window_component(w): units[w.sub_pool_name] * page
                 for w in self._windows
-                if w is not swa and units.get(w.sub_pool_name, 0)
+                if units.get(w.sub_pool_name, 0)
             },
             mamba_num=0 if state is None else units.get(state.sub_pool_name, 0),
         )
-        if (
-            params.num_tokens
-            or params.swa_num_tokens
-            or params.window_num_tokens
-            or params.mamba_num
-        ):
+        if params.num_tokens or params.window_num_tokens or params.mamba_num:
             step = tree_cache.evict_until(
                 params, satisfied=lambda: self._fits_after_frees(demands)
             )
-            result.num_tokens_evicted += step.num_tokens_evicted
-            result.swa_num_tokens_evicted += step.swa_num_tokens_evicted
-            for component, tokens in step.window_num_tokens_evicted.items():
-                result.window_num_tokens_evicted[component] = (
-                    result.window_num_tokens_evicted.get(component, 0) + tokens
-                )
-            result.mamba_num_evicted += step.mamba_num_evicted
+            result.add(step)
 
     def _fits_after_frees(self, demands: Dict[str, int]) -> bool:
         """The reclaim walks' stop: the frees a walk queued in the caller's

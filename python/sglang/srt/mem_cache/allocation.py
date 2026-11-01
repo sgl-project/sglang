@@ -25,7 +25,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import AllocDemand, BasePrefixCache
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
@@ -269,7 +269,7 @@ def ensure_mamba_capacity(
     allocator = state.slots
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
     if allocator.schedulable_available_size() < needed and supports_mamba:
-        tree_cache.evict_for_alloc(EvictParams(mamba_num=needed))
+        tree_cache.evict_for_alloc(AllocDemand(mamba_num=needed))
     return allocator.schedulable_available_size() >= needed
 
 

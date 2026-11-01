@@ -407,7 +407,7 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
                 batch.maybe_evict_swa()
                 short = cache.window_slots()[1]
                 cache.evict(
-                    EvictParams(swa_num_tokens=80, window_num_tokens={short: 80})
+                    EvictParams(window_num_tokens={ComponentType.SWA: 80, short: 80})
                 )
                 for ct, window in (
                     (ComponentType.SWA, long_window),
@@ -428,8 +428,10 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
             cache.evict(
                 EvictParams(
                     num_tokens=80,
-                    swa_num_tokens=80,
-                    window_num_tokens={cache.window_slots()[1]: 80},
+                    window_num_tokens={
+                        ComponentType.SWA: 80,
+                        cache.window_slots()[1]: 80,
+                    },
                 )
             )
             self.assertEqual(storage.accounting_violations(), [])
@@ -501,10 +503,10 @@ class TestThreeWindowTree(CustomTestCase):
         )
         # Each further window evicts what lies before its own window, alone.
         result = cache.evict(EvictParams(window_num_tokens={swa_8: 16, swa_4: 16}))
-        self.assertEqual(result.window_num_tokens_evicted, {swa_8: 8, swa_4: 12})
         self.assertEqual(
-            (result.num_tokens_evicted, result.swa_num_tokens_evicted), (0, 0)
+            result.window_num_tokens_evicted, {swa: 0, swa_8: 8, swa_4: 12}
         )
+        self.assertEqual(result.num_tokens_evicted, 0)
         self.assertEqual(
             {b.sub_pool_name: b.allocated_count() for b in a.bands},
             {"full": 16, "window_16": 16, "window_8": 8, "window_4": 4},
@@ -518,8 +520,7 @@ class TestThreeWindowTree(CustomTestCase):
         cache.evict(
             EvictParams(
                 num_tokens=64,
-                swa_num_tokens=64,
-                window_num_tokens={swa_8: 64, swa_4: 64},
+                window_num_tokens={ComponentType.SWA: 64, swa_8: 64, swa_4: 64},
             )
         )
         self.assertTrue(all(b.allocated_count() == 0 for b in a.members))

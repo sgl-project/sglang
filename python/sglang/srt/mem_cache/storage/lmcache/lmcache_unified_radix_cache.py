@@ -494,7 +494,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if full_allocator.available_size() < num_tokens:
             self.evict(EvictParams(num_tokens=num_tokens))
         if swa_allocator.available_size() < swa_tail_tokens:
-            self.evict(EvictParams(swa_num_tokens=swa_tail_tokens))
+            self.evict(EvictParams(window_num_tokens=self.all_windows(swa_tail_tokens)))
 
         full_indices = full_allocator.alloc(num_tokens)
         if full_indices is None:

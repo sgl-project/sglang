@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Dict, Hashable, Optional
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
+    from sglang.srt.mem_cache.base_prefix_cache import AllocDemand, EvictResult
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -185,13 +185,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         Return whether capacity was realized, or None if it still needs checking.
         """
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
         from sglang.srt.mem_cache.common import _evict_until_allocatable
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
         if self.available_size() < num_tokens:
-            tree_cache.evict_for_alloc(EvictParams(num_tokens=num_tokens))
+            tree_cache.evict_for_alloc(AllocDemand(num_tokens=num_tokens))
             _evict_until_allocatable(tree_cache, self, num_tokens)
 
     def check_decode_capacity(
@@ -215,9 +215,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
-    def reclaim_for_demand(self, tree_cache, demand: EvictParams) -> EvictResult | None:
-        """Evict until ``demand`` (an `EvictParams` of what an allocation will
-        take) can be served, when this allocator's pools share their memory;
+    def reclaim_for_demand(self, tree_cache, demand: AllocDemand) -> EvictResult | None:
+        """Evict until ``demand`` (what an allocation will take) can be served, when this allocator's pools share their memory;
         None when each pool is its own, so the prefix tree evicts each pool's
         shortfall."""
         return None

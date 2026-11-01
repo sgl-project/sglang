@@ -7,6 +7,7 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
@@ -97,12 +98,8 @@ class TestReclaimVictimLoop(CustomTestCase):
                 first = walks[0][0]
                 self.assertGreater(first.num_tokens, 0)
                 self.assertEqual(
-                    (
-                        first.swa_num_tokens,
-                        sum(first.window_num_tokens.values()),
-                        first.mamba_num,
-                    ),
-                    (0, 0, 0),
+                    (sum(first.window_num_tokens.values()), first.mamba_num),
+                    (0, 0),
                 )
                 self.assertEqual(len(walks), 1)
                 self.assertLess(walks[0][1].num_tokens_evicted, first.num_tokens)
@@ -185,9 +182,11 @@ class TestReclaimVictimLoop(CustomTestCase):
                     need = rng.randint(1, 48)
                     name = owner if component == "owner" else window
                     if component == "owner":
-                        params = EvictParams(num_tokens=need)
+                        params = AllocDemand(num_tokens=need)
                     else:
-                        params = EvictParams(swa_num_tokens=need)
+                        params = AllocDemand(
+                            window_num_tokens={cache.window_slots()[0]: need}
+                        )
                     demand = {name: -(-need // page)}
                     admitted = allocator.admits(
                         need if component == "owner" else 0,

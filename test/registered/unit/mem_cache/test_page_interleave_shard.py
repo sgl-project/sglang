@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     EvictParams,
     EvictResult,
     InsertParams,
@@ -1098,7 +1099,7 @@ class TestShardedAllocationEviction(CustomTestCase):
 
         # A demand one page past the free capacity: the min-class capacity
         # rises only once the tight class gets a page back.
-        result = tree.evict_for_alloc(EvictParams(num_tokens=initial_available + PS))
+        result = tree.evict_for_alloc(AllocDemand(num_tokens=initial_available + PS))
 
         self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
         self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
@@ -1109,7 +1110,7 @@ class TestShardedAllocationEviction(CustomTestCase):
         tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
 
         result = tree.evict_for_alloc(
-            EvictParams(num_tokens=allocator.available_size() + PS)
+            AllocDemand(num_tokens=allocator.available_size() + PS)
         )
 
         self.assertEqual(allocator.available_size(), GS)

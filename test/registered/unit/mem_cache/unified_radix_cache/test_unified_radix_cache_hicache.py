@@ -586,7 +586,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self._init_hicache(cache, write_policy="write_back")
         cache.evict(EvictParams(mamba_num=3))
         cache.evict_host(page, ComponentType.FULL)
-        cache.evict(EvictParams(swa_num_tokens=3 * page))
+        cache.evict(EvictParams(window_num_tokens={ComponentType.SWA: 3 * page}))
         cache.evict_host(3 * page, ComponentType.SWA)
 
         # The backed parent stops the Full backup chain, while the SWA window
@@ -642,8 +642,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self.assertEqual(cache._tree_core_backend, selected_tree_core_test_backend())
 
-        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
-        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
+        result = cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: len(seq_b)})
+        )
+        self.assertGreaterEqual(
+            result.window_num_tokens_evicted.get(ComponentType.SWA, 0), len(seq_a)
+        )
 
         m = match_prefix(cache, seq_a)
         node = m.best_match_node

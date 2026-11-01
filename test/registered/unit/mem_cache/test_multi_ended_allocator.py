@@ -20,6 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from types import SimpleNamespace
 
+from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import index_slots, tree_slots_of
@@ -1178,6 +1179,12 @@ class TestJointLRUEviction(unittest.TestCase):
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.unfix_pages("blocked")
 
+    def _params(self, allocator, num_tokens=0, window_tokens=0):
+        return EvictParams(
+            num_tokens=num_tokens,
+            window_num_tokens={self.SWA: window_tokens} if window_tokens else {},
+        )
+
     @staticmethod
     def _record_victims(cache):
         core, victims = cache.tree_core, []
@@ -1205,7 +1212,7 @@ class TestJointLRUEviction(unittest.TestCase):
     def test_victims_follow_access_time_across_components(self):
         cache, allocator = self._tree()
         victims = self._record_victims(cache)
-        cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        cache.evict(self._params(allocator, 12, 12))
         self.assertEqual(
             victims,
             [
@@ -1227,7 +1234,7 @@ class TestJointLRUEviction(unittest.TestCase):
         cache, allocator = self._tree()
         victims = self._record_victims(cache)
         # 2 Full + 12 SWA tokens of room ends the walk at [7..10]'s SWA.
-        cache.evict(EvictParams(num_tokens=2, swa_num_tokens=12))
+        cache.evict(self._params(allocator, 2, 12))
         self.assertEqual(victims[-1], (self.SWA, [7, 8, 9, 10]))
         leaf = self._node(cache, [7, 8, 9, 10])
         self.assertIn(leaf, cache.tree_core.evictable_device_leaves)
@@ -1236,7 +1243,7 @@ class TestJointLRUEviction(unittest.TestCase):
 
         self._insert(cache, allocator, [30, 31])
         self._block_compaction(allocator)
-        cache.evict(EvictParams(swa_num_tokens=2))
+        cache.evict(self._params(allocator, window_tokens=2))
         self.assertEqual(len(victims), 4, "no joint walk with compaction blocked")
         # The legacy SWA walk evicts the whole SWA leaf, Full included.
         self.assertIsNone(self._node(cache, [30, 31]))
@@ -1288,10 +1295,10 @@ class TestJointLRUEviction(unittest.TestCase):
         # match ran with the gate open.
         self._unblock_compaction(allocator)
         victims = self._record_victims(cache)
-        cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
-        open_cache, _ = self._tree()
+        cache.evict(self._params(allocator, 12, 12))
+        open_cache, open_allocator = self._tree()
         open_victims = self._record_victims(open_cache)
-        open_cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        open_cache.evict(self._params(open_allocator, 12, 12))
         self.assertEqual(victims, open_victims)
 
     def test_swa_access_times_follow_device_swa(self):
@@ -1329,7 +1336,7 @@ class TestJointLRUEviction(unittest.TestCase):
         )
 
         victims = self._record_victims(cache)
-        cache.evict(EvictParams(num_tokens=2, swa_num_tokens=8))
+        cache.evict(self._params(allocator, 2, 8))
         self.assertEqual(
             victims, [(self.FULL, [9, 10]), (self.SWA, [1, 2, 3, 4, 5, 6])]
         )
@@ -3526,7 +3533,7 @@ class TestDcpWidening(unittest.TestCase):
                 if grouped_free:
                     allocator.free_group_begin()
 
-                result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+                result = cache.evict_for_alloc(AllocDemand(mamba_num=1))
 
                 self.assertEqual(walk["freed_leaves"], expected_leaves)
                 self.assertEqual(
@@ -3573,7 +3580,7 @@ class TestDcpWidening(unittest.TestCase):
             full.flush_for_allocation = MagicMock(wraps=original_flush)
             allocator.free_group_begin()
 
-            result = cache.evict_for_alloc(EvictParams(mamba_num=4))
+            result = cache.evict_for_alloc(AllocDemand(mamba_num=4))
 
             self.assertGreater(walk["freed_leaves"], 1)
             self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])

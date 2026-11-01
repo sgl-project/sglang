@@ -305,7 +305,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                     self.assertEqual(result.num_tokens_evicted, 0)
                     self.assertEqual(drain_count, 1)
                     evicted = (
-                        result.swa_num_tokens_evicted
+                        result.window_num_tokens_evicted.get(ComponentType.SWA, 0)
                         if component_type is ComponentType.SWA
                         else result.mamba_num_evicted
                     )
@@ -327,7 +327,9 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                         for node_id in (first, second)
                     )
                     params = (
-                        EvictParams(swa_num_tokens=request_count)
+                        EvictParams(
+                            window_num_tokens={ComponentType.SWA: request_count}
+                        )
                         if component_type is ComponentType.SWA
                         else EvictParams(mamba_num=request_count)
                     )
@@ -341,7 +343,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                         node_device_value(cache, leaf, ComponentType.FULL)
                     )
                     evicted = (
-                        result.swa_num_tokens_evicted
+                        result.window_num_tokens_evicted.get(ComponentType.SWA, 0)
                         if component_type is ComponentType.SWA
                         else result.mamba_num_evicted
                     )
@@ -977,7 +979,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
 
         # SWA eviction skips A's Full lock and cascades the unlocked lower-tier Mamba.
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_a)))
+        cache.evict(EvictParams(window_num_tokens={ComponentType.SWA: len(seq_a)}))
         self.assertGreaterEqual(
             node_device_lock_ref(cache, node_a, ComponentType.FULL),
             1,
@@ -1286,7 +1288,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         m_side_before = match_prefix(cache, seq_side)
         self.assertEqual(m_side_before.device_prefix_len, len(seq_side))
 
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=self.cfg.page_size))
+        cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: self.cfg.page_size})
+        )
 
         m_side_after = match_prefix(cache, seq_side)
         self.assertEqual(
@@ -1434,14 +1438,16 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         evict_params = EvictParams(num_tokens=0)
         if aux == ComponentType.SWA:
-            evict_params.swa_num_tokens = aux_len
+            evict_params.window_num_tokens = {aux: aux_len}
         else:
             evict_params.mamba_num = aux_len
         result = cache.evict(evict_params)
 
         self.assertEqual(result.num_tokens_evicted, 0)
         if aux == ComponentType.SWA:
-            self.assertEqual(result.swa_num_tokens_evicted, aux_len)
+            self.assertEqual(
+                result.window_num_tokens_evicted.get(ComponentType.SWA, 0), aux_len
+            )
         else:
             self.assertEqual(result.mamba_num_evicted, aux_len)
         self.assertIsNotNone(node_device_value(cache, node, ComponentType.FULL))
@@ -1565,7 +1571,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._insert(cache, allocator, req_to_token_pool, leaf)
 
         swa_before = cache.swa_evictable_size()
-        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
+        result = cache.evict(
+            EvictParams(window_num_tokens={ComponentType.SWA: swa_before * 2})
+        )
         self.assertEqual(cache.swa_evictable_size(), 0)
         cache.sanity_check()
 
@@ -2205,7 +2213,7 @@ class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):
         mapping = allocator.full_to_swa_index_mapping
         before = mapping[needed].clone()
         self.assertTrue(bool((before > 0).all()))
-        cache.evict(EvictParams(swa_num_tokens=1))
+        cache.evict(EvictParams(window_num_tokens={ComponentType.SWA: 1}))
         torch.testing.assert_close(mapping[needed], before)
         match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(req.origin_input_ids))

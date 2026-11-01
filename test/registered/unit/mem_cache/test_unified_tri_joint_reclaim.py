@@ -775,7 +775,7 @@ class TestTriJointReclaim(CustomTestCase):
                     results.append(
                         (
                             result.num_tokens_evicted,
-                            result.swa_num_tokens_evicted,
+                            result.window_num_tokens_evicted.get(ComponentType.SWA, 0),
                             result.mamba_num_evicted,
                         )
                     )

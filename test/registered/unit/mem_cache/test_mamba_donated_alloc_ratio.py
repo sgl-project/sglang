@@ -19,8 +19,8 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
+    AllocDemand,
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
@@ -77,7 +77,7 @@ class _RatioCache:
         # Static pools: the component's slot takes reach the bounded allocator.
         return kv_storage_of(None, self.token_to_kv_pool_allocator)
 
-    def evict_for_alloc(self, params: EvictParams):
+    def evict_for_alloc(self, params: AllocDemand):
         self.alloc_evict_params.append(params)
         need = params.mamba_num
         for node in list(self.prefix_nodes):
@@ -356,10 +356,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         self.assertIsNone(component._try_alloc_mamba_slot())
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
-        self.assertEqual(
-            cache.alloc_evict_params,
-            [EvictParams(num_tokens=0, mamba_num=1)] * 2,
-        )
+        self.assertEqual(cache.alloc_evict_params, [AllocDemand(mamba_num=1)] * 2)
 
     def test_unfinished_checkpoint_skips_donation_when_all_states_locked(self):
         for extra_buffer, quantized in ((True, False), (True, True), (False, False)):
@@ -403,7 +400,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
                 self.assertEqual(len(cache.prefix_nodes), N)
                 self.assertEqual(cache.allocator.free_ids, [])
                 self.assertEqual(
-                    cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
+                    cache.alloc_evict_params, [AllocDemand(mamba_num=1)]
                 )
 
     def test_prefill_peak_ratio3_has_headroom(self):
@@ -420,9 +417,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
-        self.assertEqual(
-            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
-        )
+        self.assertEqual(cache.alloc_evict_params, [AllocDemand(mamba_num=1)])
 
 
 class TestMambaDonationCheckpointIntegration(CustomTestCase):

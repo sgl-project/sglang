@@ -144,13 +144,13 @@ Insert a key-value pair into the tree.
 
 ### `evict(params: EvictParams) → EvictResult`
 
-Free cached tokens to reclaim memory.
+Free cached tokens to reclaim memory. `evict_for_alloc(demand: AllocDemand)` takes what an allocation will take instead, and evicts whatever lets it be served.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Each component drives eviction from its own LRU list until its target is met |
-| **Inputs** | `params.num_tokens` (full), `params.swa_num_tokens` (SWA), `params.mamba_num` (Mamba) |
-| **Output** | `EvictResult(num_tokens_evicted, swa_num_tokens_evicted, mamba_num_evicted)` |
+| **Inputs** | `params.num_tokens` (full), `params.window_num_tokens` (tokens per window slot, by component id), `params.mamba_num` (Mamba) |
+| **Output** | `EvictResult(num_tokens_evicted, window_num_tokens_evicted, mamba_num_evicted)` |
 | **Mutation** | Frees pool indices; removes nodes from LRU lists; deletes leaf nodes from tree; cascades to lower-priority components; walks up parent chain to delete tombstone ancestors |
 | **Complexity** | **O(E·H + L)** — E = nodes evicted, H = tombstone chain height, L = locked nodes skipped in LRU scan. |
 
