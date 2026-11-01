@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
+from sglang.kernels.ops.moe.moe_align_small_numel import SMALL_NUMEL_LIMIT
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
@@ -265,6 +266,20 @@ def fused_marlin_moe(
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
             topk_ids, block_size_m, return_inactive_prefix_count=True
+        )
+    elif is_mxfp4_marlin and topk_ids.numel() > SMALL_NUMEL_LIMIT:
+        # Expert-internal permutations change Marlin's reduction grouping.
+        # Preserve token/slot order so repeated prefill has identical inputs
+        # for each expert block. Tiny batches already use stable alignment.
+        from sglang.kernels.ops.moe.moe_align_stable import moe_align_block_size_stable
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size_stable(
+                topk_ids,
+                block_size_m,
+                global_num_experts,
+                return_inactive_prefix_count=expert_map is None,
+            )
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
