@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -13,10 +14,12 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -705,6 +708,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+
+        self.indexer_kv_store_int8 = (
+            envs.SGLANG_NPU_INDEXER_INT8.get()
+            and not get_memory().enable_hierarchical_cache
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+        )
+        if self.indexer_kv_store_int8:
+            self.index_k_store_dtype = torch.int8
+            self.index_k_scale_dtype = torch.float16
+        else:
+            self.index_k_store_dtype = self.store_dtype
+            self.index_k_scale_dtype = (
+                torch.float32 if self.dsa_kv_cache_store_fp8 else None
+            )
+        logger.info(
+            f"Indexer K Cache type {self.index_k_store_dtype} scale type {self.index_k_scale_dtype}"
+        )
+
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -767,17 +789,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if (
+                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
+                ) and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
 
                     self.index_k_scale_buffer = torch.zeros(
                         (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
+                        dtype=self.index_k_scale_dtype,
                         device=self.device,
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
@@ -922,6 +946,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
+        assert scale.dtype == self.index_k_scale_dtype, (
+            f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
+        )
         torch_npu.npu_scatter_nd_update_(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
@@ -1087,11 +1114,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        if self.indexer_kv_store_int8:
+            assert index_k.dtype == self.index_k_store_dtype, (
+                f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
+            )
+        else:
+            if index_k.dtype != self.dtype:
+                index_k = index_k.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+            if self.store_dtype != self.dtype:
+                index_k = index_k.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
