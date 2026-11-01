@@ -131,8 +131,10 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return "decision-"
 
     def _validate_request(self, request: DecisionRequest) -> Optional[str]:
-        error = self._validate_server(request.model) or self._validate_images(
-            request.images
+        error = (
+            self._validate_server(request.model)
+            or self._validate_images(request.images)
+            or self._request_chat_template_error(request.chat_template_kwargs)
         )
         if error is not None:
             return error
