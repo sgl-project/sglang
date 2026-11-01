@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    should_zero_prefill_padding,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -28,7 +31,7 @@ if TYPE_CHECKING:
 
 
 def _zero_padded_tokens(output, actual_tokens):
-    if actual_tokens is not None:
+    if actual_tokens is not None and should_zero_prefill_padding():
         output[actual_tokens:].zero_()
 
 
@@ -88,7 +91,8 @@ def allocate_attention_outputs(layer, query, value, index_query):
     """Allocate graph-owned buffers before entering the eager attention region."""
     rows = query.shape[0]
     sparse = index_query is not None
-    dtype = query.dtype if sparse or value is None else value.dtype
+    # Follow v, not q: qk-norm may emit q in FP8 while the backend writes bf16.
+    dtype = query.dtype if value is None else value.dtype
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         dtype = torch.bfloat16
     shape = (
@@ -98,7 +102,9 @@ def allocate_attention_outputs(layer, query, value, index_query):
     )
     output = torch.empty(shape, dtype=dtype, device=query.device)
     index_output = (
-        query.new_empty((rows, index_query.shape[1] * index_query.shape[2]))
+        query.new_empty(
+            (rows, index_query.shape[1] * index_query.shape[2]), dtype=dtype
+        )
         if sparse
         else None
     )

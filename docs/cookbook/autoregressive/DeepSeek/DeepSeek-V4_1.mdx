@@ -103,7 +103,7 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 **Sparse retrieval.** KV source layers and index source layers are different lists — four of the former, eight of the latter. The four extra index layers produce no keys at all; they re-score layer 20's keys with their own query, so retrieval decisions are made twice as often as keys are stored. Each retrieving layer picks a top-512 candidate set.
 
-**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group, which costs an all-reduce per engram layer. `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1` (**opt-in**) moves them to host memory instead: the freed HBM goes to the KV pool and output is bitwise unchanged — at the cost of host RAM, a longer load, and needing huge-page backing to keep the gather cheap. `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` trades the two all-reduces for page size: `shared` (the default) maps a single copy all ranks read and needs no reduce; `per_rank` splits that same table into one shard per rank and keeps the reduce, but is the only one the kernel reliably backs with 2 MiB pages.
+**Engram.** An additive n-gram hash memory at two layers. Token ids are normalized *before* hashing, so `" The"`, `"the"` and `"THE"` cannot fork into separate rows. Its two fp8 tables are the largest single block of weight in the checkpoint, and by default they load row-sharded across the TP group in GPU memory, which costs a collective per engram layer. `--engram-config` chooses where they live: `'{"placement": "cpu"}'` moves them to host memory, one huge-page-backed shard per rank, so the freed HBM goes to the KV pool, at the cost of host RAM and a longer load; `'{"lookup": "peer_read"}'` keeps them on the GPUs and reads each row from the GPU that holds it, with no collective. Output is bitwise unchanged either way; see [Engram tables](/docs/advanced_features/engram) for the trade-offs and the deprecated environment variables this replaces.
 
 **SWA bounded replay.** Decoder SWA bounded replay runs the early layers over the whole extend and the late layers over only each request’s last 128 tokens, sharing late-layer KV from source layer 20. It defaults on for supported CUDA/HIP configurations without context parallelism, including both PD roles on CUDA. Encoder SWA replay can be combined with decoder replay, subject to encoder-specific validation. Eager and breakable prefill are supported; full prefill graphs keep it disabled. With DP attention, automatic enablement requires attention TP 1 and the `none` or `megamoe` MoE backend on CUDA, or `none` on HIP. Use `--enable-decoder-swa-bounded-replay` to explicitly enable replay, subject to compatibility validation. Bounded replay is not numerically equivalent to full prefill. A request for prompt logprobs or for every hidden state runs its whole prompt through the late layers with full sliding windows; other requests, including their output-token logprobs, use the bounded computation. Use `--no-enable-decoder-swa-bounded-replay` to retain full prefill, for example for RL rollouts whose logprobs must match the trainer.
 
@@ -202,7 +202,7 @@ What to expect:
 
 Prefill/decode disaggregation is validated token-identical against a single server across 32 greedy prompts, with GSM8K matching through the router. Use the **PD Disaggregation** card in the Playground to generate the prefill role, the decode role and the router command.
 
-Both roles run MegaAttention (`--dsv4-attn-backend flashmla_mega`) by default on SM100/SM103, as a single server does. Prefill and decode must store KV in the same layout, so they must agree on `--dsv4-attn-backend` and `SGLANG_DSV4_KV_LAYOUT`; a decode server paired with a prefill whose layout differs fails its first request with a `KV layout mismatch` error. A decode on a GPU other than SM100/SM103 therefore needs `--dsv4-attn-backend flashmla` on the prefill too.
+Both roles run MegaAttention (`--dsv4-attn-backend flashmla_mega`) by default on SM100/SM103, whatever their attention TP size. Prefill and decode must store KV in the same layout, so they must agree on `--dsv4-attn-backend` and `SGLANG_DSV4_KV_LAYOUT`; a decode server paired with a prefill whose layout differs fails its first request with a `KV layout mismatch` error. A decode on a GPU other than SM100/SM103 therefore needs `--dsv4-attn-backend flashmla` on the prefill too.
 
 One deployment note: Mooncake needs the RDMA fabric visible inside the container, so launch with `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`. Without it Mooncake selects its NVLink transport, which only serves buffers from its own allocator and fails with `Requested address ... not found`. If you hit that, force TCP with `MOONCAKE_PROTOCOL=tcp` and `MC_FORCE_TCP=1` — the Playground's Mooncake option sets both.
 
@@ -247,8 +247,6 @@ The braced values in the command follow concurrency:
 ```bash Command
 SGLANG_DEFAULT_THINKING=1 \
 SGLANG_DSV41_REASONING_EFFORT=high \
-SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
-SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 SGLANG_USE_AITER=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
@@ -262,6 +260,7 @@ GPU_MAX_HW_QUEUES=2 \
 sglang serve \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --trust-remote-code \
+  --engram-config '{"placement": "cpu"}' \
   --tp {2 or 4} \
   --ep-size 1 \
   --speculative-algorithm DSPARK \
@@ -296,8 +295,6 @@ sglang serve \
 ```bash Command
 SGLANG_DEFAULT_THINKING=1 \
 SGLANG_DSV41_REASONING_EFFORT=high \
-SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 \
-SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 SGLANG_USE_AITER=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
@@ -316,6 +313,7 @@ SGLANG_AITER_CAPTURE_COPY_IN=1 \
 sglang serve \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --trust-remote-code \
+  --engram-config '{"placement": "cpu"}' \
   --tp 2 \
   --attn-dp-size 2 \
   --ep-size 1 \

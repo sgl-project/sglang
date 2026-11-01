@@ -218,6 +218,23 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 [{"role": "user", "content": "hi"}, {"role": "user", "content": "Hel"}]
             ),
         )
+        # A null content is "", and the trailing turn's tool calls are discarded.
+        hi, empty = (
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": ""},
+        )
+        call = {"id": "a", "type": "function", "function": {"name": "f"}}
+        calling = {"role": "assistant", "content": None, "tool_calls": [call]}
+        for fields in ({}, {"continue_final_message": True}):
+            self.assertEqual(
+                prompt([hi, calling], **fields), prompt([hi, empty], **fields)
+            )
+        call["function"]["arguments"] = "{}"
+        result = {"role": "tool", "tool_call_id": "a"}
+        self.assertEqual(
+            prompt([hi, calling, {**result, "content": None}]),
+            prompt([hi, calling, {**result, "content": ""}]),
+        )
         # A task renders its own tail; the continued prefix follows it.
         self.assertEqual(
             prompt(
@@ -292,6 +309,12 @@ class TestHandlerRequestSemantics(CustomTestCase):
             "Reasoning Effort: 30 (range 1-100",
             self.tokenizer.decode(adapted.input_ids),
         )
+        # A numeric string budget is the number it spells.
+        for effort in ("30", "0.3"):
+            request.chat_template_kwargs["reasoning_effort"] = effort
+            adapted, _ = chat._convert_to_internal_request(request)
+            text = self.tokenizer.decode(adapted.input_ids)
+            self.assertIn("Reasoning Effort: 30 (range 1-100", text)
         titled = self._prompt(chat, task="title").prompt_ids
         self.assertEqual(titled[-1], self._token("<｜title｜>"))
 

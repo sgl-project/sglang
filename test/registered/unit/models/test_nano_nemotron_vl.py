@@ -23,7 +23,7 @@ from sglang.srt.multimodal.evs import EVS, EVSEmbeddingResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 TOKENS_PER_TUBELET = 4
 HIDDEN_SIZE = 8
