@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.dsa.kpool_metadata.scan import bounded_scan_nu
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
+        "bs",
         "max_len",
         "num_splits",
     ]

@@ -9,6 +9,7 @@ import triton.language as tl
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
+        "bs",
         "max_len",
     ]
 )
@@ -206,6 +207,7 @@ def fused_dsa_decode_metadata(
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
+        "bs",
         "max_seqlen_k",
     ]
 )
@@ -448,6 +450,7 @@ def fused_dsa_target_verify_metadata(
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
+        "bs",
         "total_len",
         "max_seqlen_k",
     ]

@@ -33,15 +33,16 @@ class TestKPoolMetadataFusion(CustomTestCase):
         ):
             with self.subTest(mode=mode):
                 kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
-                for bs in (5, 6, 7):
+                # 16 catches Triton's specialization on divisibility by 16.
+                for bs in (9, 12, 16):
                     self._check_batch_metadata(mode, bs)
-                    if bs == 5:
+                    if bs == 9:
                         compiled_after_first = len(kernel_cache)
                     self.assertEqual(len(kernel_cache), compiled_after_first)
 
     def _check_batch_metadata(self, mode, bs):
         device, width, next_n, topk, kpool = "cuda", 256, 4, 64, 4
-        seq_values = [1, 64, 65, 68, 127, 128, 131][:bs]
+        seq_values = [(1, 64, 65, 68, 127, 128, 131)[i % 7] for i in range(bs)]
         seq = torch.tensor(seq_values, device=device, dtype=torch.int64)
         req = torch.arange(bs - 1, -1, -1, device=device, dtype=torch.int64)
         table = torch.arange(bs * width, device=device, dtype=torch.int32).view(
