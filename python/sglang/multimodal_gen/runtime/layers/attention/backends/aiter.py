@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
@@ -278,6 +279,11 @@ class AITerImpl(AttentionImpl):
         self.causal = causal
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
+        # Packed callers whose trailing rows are padding; the grouped kernel
+        # is then given the live prefix as a single segment.
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
 
     @torch.compiler.disable
     def _forward_fp8(
@@ -402,10 +408,44 @@ class AITerImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
         attention_func = aiter.flash_attn_varlen_func
 
+        used = (
+            trailing_padding_used_len(
+                total_tokens=query.shape[0],
+                max_seqlen=max_seqlen,
+                bounds=cu_seqlens_host,
+            )
+            if self.packed_trailing_padding and cu_seqlens_host is not None
+            else None
+        )
+
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        if used is not None:
+            # The padding tail is a second segment the grouped kernel would
+            # schedule over; attend the live prefix alone and zero the rest.
+            live_cu_seqlens = cu_seqlens[:2]
+            live_output = attention_func(
+                q=query[:used].contiguous(),
+                k=key[:used].contiguous(),
+                v=value[:used].contiguous(),
+                cu_seqlens_q=live_cu_seqlens,
+                cu_seqlens_k=live_cu_seqlens,
+                max_seqlen_q=used,
+                max_seqlen_k=used,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+            )
+            live_output = (
+                live_output[0] if isinstance(live_output, tuple) else live_output
+            )
+            output = live_output.new_zeros(
+                query.shape[0], query.shape[1], value.shape[2]
+            )
+            output[:used] = live_output
+            return output
+
         output = attention_func(
             q=query.contiguous(),
             k=key.contiguous(),
