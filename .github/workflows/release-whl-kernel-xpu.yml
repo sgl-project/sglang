@@ -86,14 +86,7 @@ jobs:
             sgl_kernel_xpu_release_build \
             /bin/bash -lc '
               set -exo pipefail
-              # Release branches cut after sgl-kernel-xpu#593 build a uv image (/opt/venv);
-              # older ones still build the conda image.
-              if [ -f /opt/venv/bin/activate ]; then
-                . /opt/venv/bin/activate
-              else
-                . /miniforge3/bin/activate
-                conda activate py${{ matrix.python-version }}
-              fi
+              . /opt/venv/bin/activate
               python -c "import sys; assert sys.version.startswith(\"${{ matrix.python-version }}.\"), sys.version"
               source /opt/intel/oneapi/setvars.sh --force
               command -v patchelf || (apt-get update && apt-get install -y patchelf)
