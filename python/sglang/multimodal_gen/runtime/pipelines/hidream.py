@@ -1,0 +1,149 @@
+"""HiDream-O1-Image unified VLM diffusion pipeline.
+
+HiDream is a unified model: the Qwen3VL backbone handles text encoding,
+vision encoding, and diffusion denoising in a single forward pass.
+No separate text encoder, VAE, or scheduler modules are needed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
+import torch
+from safetensors.torch import load_file
+from transformers import AutoProcessor
+
+from sglang.multimodal_gen.configs.models.dits.hidream import HiDreamDitConfig
+from sglang.multimodal_gen.configs.pipeline_configs.hidream import (
+    HiDreamPipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.hidream import (
+    _VARIANT_DEFAULTS,
+    HiDreamSamplingParams,
+    _resolve_variant,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    load_llm_encoder_weights as load_weights,
+)
+from sglang.multimodal_gen.runtime.models.dits.hidream import HiDreamForCausalLM
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream import (
+    HiDreamGenerationStage,
+)
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
+
+class HiDreamPipeline(ComposedPipelineBase):
+    """Pipeline for HiDream-O1-Image unified VLM diffusion model."""
+
+    pipeline_name = "HiDreamPipeline"
+    pipeline_config_cls = HiDreamPipelineConfig
+    sampling_params_cls = HiDreamSamplingParams
+    _required_config_modules: list[str] = []
+
+    def validate_disagg_role(self, role: RoleType) -> None:
+        if role != RoleType.MONOLITHIC:
+            raise ValueError(
+                "HiDreamPipeline only supports monolithic deployment; "
+                f"disaggregation role {role.value!r} is not supported"
+            )
+
+    def load_modules(
+        self,
+        server_args: ServerArgs,
+        loaded_modules: dict[str, torch.nn.Module] | None = None,
+    ) -> dict[str, Any]:
+        if loaded_modules is not None and {"model", "processor"} <= set(loaded_modules):
+            return loaded_modules
+
+        model_path = self.model_path
+        logger.info("Loading HiDream model from %s", model_path)
+
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
+        config_path = os.path.join(model_path, "config.json")
+        with open(config_path, "r") as f:
+            hf_config = json.load(f)
+
+        dit_config = HiDreamDitConfig()
+        model = HiDreamForCausalLM(dit_config, hf_config)
+
+        # TP linears shard via param.weight_loader, not load_state_dict
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        with open(index_path, "r") as f:
+            index = json.load(f)
+        weight_files = sorted(set(index["weight_map"].values()))
+
+        params_dict = dict(model.named_parameters())
+        # SRT fused layers: (target param name, checkpoint name, shard_id)
+        stacked_params_mapping = [
+            ("self_attn.qkv_proj.", "self_attn.q_proj.", "q"),
+            ("self_attn.qkv_proj.", "self_attn.k_proj.", "k"),
+            ("self_attn.qkv_proj.", "self_attn.v_proj.", "v"),
+            ("mlp.gate_up_proj.", "mlp.gate_proj.", 0),
+            ("mlp.gate_up_proj.", "mlp.up_proj.", 1),
+        ]
+
+        def checkpoint_weights():
+            for wf in weight_files:
+                for key, value in load_file(os.path.join(model_path, wf)).items():
+                    if key.startswith("model."):
+                        key = key[6:]
+                    # reused SRT VisionAttention names the fused layer qkv_proj
+                    if ".attn.qkv." in key:
+                        key = key.replace(".attn.qkv.", ".attn.qkv_proj.")
+                    yield key, value
+
+        loaded_keys = load_weights(
+            checkpoint_weights(), params_dict, stacked_params_mapping
+        )
+
+        missing_keys = set(params_dict.keys()) - loaded_keys
+        if missing_keys:
+            missing_list = sorted(missing_keys)
+            logger.warning(
+                "Missing keys when loading HiDream (%d): %s",
+                len(missing_list),
+                missing_list[:10],
+            )
+        logger.info(
+            "HiDream model loaded successfully (%d/%d params loaded)",
+            len(loaded_keys),
+            len(params_dict),
+        )
+
+        # Variant dtype policy (deliberate deployment mapping, mirrored in
+        # _VARIANT_DEFAULTS)
+        variant = _resolve_variant(model_path)
+        w_dtype = getattr(torch, _VARIANT_DEFAULTS[variant]["torch_dtype"])
+        model = model.to(w_dtype).eval()
+        logger.info("HiDream %s weights cast to %s", variant, w_dtype)
+        device = get_local_torch_device()
+        model = model.to(device)
+        logger.info("HiDream model moved to %s", device)
+
+        return {"model": model, "processor": processor}
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        del server_args
+        self.add_stage(InputValidationStage())
+        self.add_stage(
+            HiDreamGenerationStage(
+                model=self.get_module("model"),
+                processor=self.get_module("processor"),
+            ),
+            "hidream_generation_stage",
+        )
+
+
+EntryClass = HiDreamPipeline

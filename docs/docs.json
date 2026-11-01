@@ -1698,6 +1698,12 @@
                     ]
                   },
                   {
+                    "group": "HiDream",
+                    "pages": [
+                      "cookbook/diffusion/HiDream/HiDream-O1-Image"
+                    ]
+                  },
+                  {
                     "group": "HY-Nomas",
                     "pages": [
                       "cookbook/diffusion/HY-Nomas/HY-Nomas"

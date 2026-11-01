@@ -2,6 +2,7 @@
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
+from sglang.multimodal_gen.configs.models.dits.hidream import HiDreamDitConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.models.dits.ideogram import (
@@ -31,6 +32,7 @@ from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
 __all__ = [
     "Cosmos3VideoConfig",
+    "HiDreamDitConfig",
     "HeliosConfig",
     "HunyuanVideoConfig",
     "Ideogram4DiTConfig",
