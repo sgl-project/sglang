@@ -5305,13 +5305,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         from sglang.srt.mem_cache.device_pool_info import (
             DevicePoolInfo,
             IndexKeyBufferInfo,
-            IndexKeyFormat,
+            IndexKeyLayout,
         )
         from sglang.srt.mem_cache.hicache_storage import PoolName
 
         if (self.index_head_dim, self.quant_block_size) != (128, 128):
             raise ValueError(
-                f"DSA_FP8 index key format requires index_head_dim=128 and "
+                f"PAGED_FP8_KEYS_WITH_SCALES index key layout requires index_head_dim=128 and "
                 f"quant_block_size=128, got {self.index_head_dim} and {self.quant_block_size}"
             )
 
@@ -5337,7 +5337,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 buffers=tuple(
                     self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
                 ),
-                key_format=IndexKeyFormat.DSA_FP8,
+                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
             ),
         )
         return (*kv_infos, index_info)
