@@ -2496,6 +2496,12 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class ReleaseUocrDocReqInput(BaseReq, kw_only=True):
+    """Free the KV a split document retained for its next window."""
+
+    doc_id: str
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

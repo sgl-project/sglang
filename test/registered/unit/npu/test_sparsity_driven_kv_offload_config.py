@@ -24,6 +24,7 @@ def _make_glm51_model_config():
         architectures=["GlmMoeDsaForCausalLM"],
         index_head_dim=128,
         index_topk=1536,
+        indexer_types=["full", "full"],
     )
     hf_config.get_text_config = lambda: hf_config
     return SimpleNamespace(
@@ -33,6 +34,11 @@ def _make_glm51_model_config():
         qk_rope_head_dim=64,
         context_len=4092,
     )
+
+
+def _glm_indexer_types():
+    full_layers = {0, 1, *range(2, 78, 4)}
+    return ["full" if layer_id in full_layers else "shared" for layer_id in range(78)]
 
 
 class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
@@ -112,9 +118,79 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_disagg",
                 return_value=self.disagg,
             ),
+            patch("sglang.srt.mem_cache.kv_cache_configurator._is_npu", True),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_memory",
+                return_value=SimpleNamespace(
+                    enable_hierarchical_cache=False,
+                    enable_hisparse=False,
+                    enable_unified_cache_external_linker=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_disagg",
+                return_value=self.disagg,
+            ),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_sparse_offload_cell_size_matches_compact_owner_count(self):
+        self.model_config.hf_config.indexer_types = _glm_indexer_types()
+        for start_layer, num_layers, owner_layers in (
+            (0, 78, 21),
+            (20, 20, 5),
+            (3, 3, 0),
+        ):
+            with self.subTest(start_layer=start_layer, num_layers=num_layers):
+                self.assertEqual(
+                    get_sparsity_driven_kv_offload_cell_size(
+                        model_config=self.model_config,
+                        use_mla_backend=True,
+                        num_layers=num_layers,
+                        element_size=2,
+                        start_layer=start_layer,
+                    ),
+                    128 * owner_layers * 2,
+                )
+        self.assertEqual(
+            get_sparsity_driven_kv_offload_cell_size(
+                model_config=self.model_config,
+                use_mla_backend=True,
+                num_layers=78,
+                element_size=2,
+                is_draft_worker=True,
+            ),
+            128 * 78 * 2,
+        )
+
+    def test_shared_indexer_layers_keep_full_kv_budget(self):
+        self.model_config.hf_config.indexer_types = _glm_indexer_types()
+        for role, index_layers in (("null", 21), ("prefill", None), ("decode", 78)):
+            with self.subTest(role=role):
+                self.disagg.disaggregation_mode = role
+                self.assertEqual(
+                    get_sparsity_driven_kv_offload_cell_size(
+                        model_config=self.model_config,
+                        use_mla_backend=True,
+                        num_layers=78,
+                        element_size=2,
+                    ),
+                    None if index_layers is None else 128 * index_layers * 2,
+                )
+                device_tokens = (8 + 1) * 1536
+                if role == "decode":
+                    device_tokens += 4096
+                self.assertEqual(
+                    get_sparsity_driven_kv_offload_fixed_memory_size(
+                        model_config=self.model_config,
+                        use_mla_backend=True,
+                        num_layers=78,
+                        element_size=2,
+                        max_running_requests_per_worker=8,
+                    ),
+                    None if role == "prefill" else device_tokens * 576 * 78 * 2,
+                )
 
     def resolve(self):
         return resolve_sparse_kv_offload_mode(
