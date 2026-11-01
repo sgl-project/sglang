@@ -81,6 +81,7 @@ class TestFlashAttentionGraphMetadata(CustomTestCase):
         backend._maybe_init_local_attn_metadata = lambda *_: None
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             seq_lens=torch.empty(0, dtype=torch.int64),
             batch_size=0,
             seq_lens_cpu=torch.empty(0, dtype=torch.int64),
@@ -210,11 +211,12 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
             )
         fb = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
             batch_size=bs,
             req_pool_indices=torch.tensor([2, 1, 0], device=device),
             seq_lens=torch.tensor([ps + 1, 2 * ps - 1, 1], device=device),
             encoder_lens=None,
-            spec_info=SimpleNamespace(ragged_verify_layout=None),
+            spec_info=SimpleNamespace(),
             positions=torch.arange(bs * delta, device=device),
             out_cache_loc=None,
         )

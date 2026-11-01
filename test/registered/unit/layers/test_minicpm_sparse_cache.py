@@ -255,6 +255,7 @@ def test_streaming_session_release_frees_compressed_slots():
     cache = SimpleNamespace(
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
+        logical_page_size=allocator.page_size,
         page_size=1,
         unlock=lambda lock: None,
     )

@@ -10,13 +10,12 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.fla import fused_recurrent as fr
-from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm90_supported(),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="SM90-only value-tile selection",
 )
 
@@ -62,7 +61,7 @@ def _run(monkeypatch, case, state_dtype, sm90):
     monkeypatch.setattr(
         fr, "fused_recurrent_gated_delta_rule_packed_decode_kernel", spy
     )
-    monkeypatch.setattr(fr, "is_sm90_supported", lambda: sm90)
+    monkeypatch.setattr(fr, "_is_sm90", lambda device: sm90)
     fr.fused_recurrent_gated_delta_rule_packed_decode(
         mixed_qkv, a, b, A_log, dt_bias, _K**-0.5, state, out, indices, True
     )

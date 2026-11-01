@@ -595,18 +595,18 @@ void inkling_gate_topk_renorm_v2(
 
   SymbolicSize M{"tokens"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({M, kInklingTotalExperts})
       .with_strides({-1, 1})
       .with_dtype<fp32_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(logits);
-  TensorMatcher({kInklingRoutedExperts}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(bias);
-  TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(global_scale);
-  TensorMatcher({M, kInklingTopK}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(routed_w);
-  TensorMatcher({M, kInklingSharedExperts}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(shared_w);
-  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(indices);
+  TensorMatcher({kInklingRoutedExperts}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(bias);
+  TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(global_scale);
+  TensorMatcher({M, kInklingTopK}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(routed_w);
+  TensorMatcher({M, kInklingSharedExperts}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(shared_w);
+  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(indices);
 
   RuntimeCheck(logits.stride(1) == 1, "logits must be contiguous along the expert dimension");
   RuntimeCheck(bias.stride(0) == 1, "bias must be contiguous");
@@ -648,17 +648,17 @@ void inkling_gate_topk_renorm_v2_packed(
 
   SymbolicSize M{"tokens"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({M, kInklingTotalExperts})
       .with_strides({-1, 1})
       .with_dtype<fp32_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(logits);
-  TensorMatcher({kInklingRoutedExperts}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(bias);
-  TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(global_scale);
-  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(packed);
-  TensorMatcher({M, kInklingSharedExperts}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(shared_w);
+  TensorMatcher({kInklingRoutedExperts}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(bias);
+  TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(global_scale);
+  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(packed);
+  TensorMatcher({M, kInklingSharedExperts}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(shared_w);
 
   RuntimeCheck(logits.stride(1) == 1, "logits must be contiguous along the expert dimension");
   RuntimeCheck(bias.stride(0) == 1, "bias must be contiguous");
@@ -699,11 +699,11 @@ void inkling_gate_gemv(
 
   SymbolicSize M{"tokens"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
-  TensorMatcher({M, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLCUDA>(device_).verify(x);
-  TensorMatcher({-1, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLCUDA>(device_).verify(weight);
-  TensorMatcher({M, kInklingLogitsPad}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(logits);
+  TensorMatcher({M, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLGPU>(device_).verify(x);
+  TensorMatcher({-1, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLGPU>(device_).verify(weight);
+  TensorMatcher({M, kInklingLogitsPad}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(logits);
 
   RuntimeCheck(weight.size(0) >= kInklingTotalExperts, "gate weight must cover 258 experts");
   RuntimeCheck(x.stride(1) == 1 && x.stride(0) == kInklingHidden, "x must be contiguous");
@@ -746,13 +746,13 @@ int64_t verify_inkling_gate_gemv_fused_common(
     host::SymbolicDevice& device_) {
   using namespace host;
 
-  TensorMatcher({M, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLCUDA>(device_).verify(x);
-  TensorMatcher({-1, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLCUDA>(device_).verify(weight);
-  TensorMatcher({kInklingRoutedExperts}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(bias);
-  TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(global_scale);
-  TensorMatcher({-1, kInklingLogitsPad}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(workspace);
-  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(ticket);
-  TensorMatcher({M, kInklingSharedExperts}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(shared_w);
+  TensorMatcher({M, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLGPU>(device_).verify(x);
+  TensorMatcher({-1, kInklingHidden}).with_dtype<bf16_t>().with_device<kDLGPU>(device_).verify(weight);
+  TensorMatcher({kInklingRoutedExperts}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(bias);
+  TensorMatcher({1}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(global_scale);
+  TensorMatcher({-1, kInklingLogitsPad}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(workspace);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(ticket);
+  TensorMatcher({M, kInklingSharedExperts}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(shared_w);
 
   const int64_t tokens = M.unwrap();
   RuntimeCheck(weight.size(0) >= kInklingTotalExperts, "gate weight must cover 258 experts");
@@ -786,12 +786,12 @@ void inkling_gate_gemv_fused(
 
   SymbolicSize M{"tokens"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   const int64_t tokens =
       verify_inkling_gate_gemv_fused_common(x, weight, bias, global_scale, workspace, ticket, shared_w, M, device_);
-  TensorMatcher({M, kInklingTopK}).with_dtype<fp32_t>().with_device<kDLCUDA>(device_).verify(routed_w);
-  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(indices);
+  TensorMatcher({M, kInklingTopK}).with_dtype<fp32_t>().with_device<kDLGPU>(device_).verify(routed_w);
+  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(indices);
   RuntimeCheck(routed_w.stride(1) == 1 && indices.stride(1) == 1, "outputs must be contiguous");
   if (tokens == 0) {
     return;
@@ -831,11 +831,11 @@ void inkling_gate_gemv_fused_packed(
 
   SymbolicSize M{"tokens"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   const int64_t tokens =
       verify_inkling_gate_gemv_fused_common(x, weight, bias, global_scale, workspace, ticket, shared_w, M, device_);
-  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(packed);
+  TensorMatcher({M, kInklingTopK}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(packed);
   RuntimeCheck(packed.stride(1) == 1, "packed must be contiguous");
   if (tokens == 0) {
     return;
