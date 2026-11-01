@@ -66,6 +66,7 @@ class SchedulerInvariantChecker:
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     # The lists that hold the live requests, by name (`Scheduler.request_lists`).
     get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
+    get_chunked_req: Callable = field(default=lambda: None)
     get_running_reqs: Callable = field(default=lambda: None)
     # Under PP, the micro-batches' running batches and step batches.
     get_pp_running_mbs: Callable = field(default=lambda: ())
@@ -488,9 +489,8 @@ class SchedulerInvariantChecker:
         apart from the chunked request."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
-        request_lists = self.get_request_lists()
         owners: Dict[Req, str] = {}
-        for name, reqs in request_lists.items():
+        for name, reqs in self.get_request_lists().items():
             for req in reqs:
                 if req in owners:
                     raise RuntimeError(
@@ -506,7 +506,7 @@ class SchedulerInvariantChecker:
             ]
         self.get_running_reqs().check(
             [running_batch, *self.get_pp_running_mbs(), *step_batches],
-            chunked_reqs=request_lists["chunked"],
+            chunked_req=self.get_chunked_req(),
         )
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:

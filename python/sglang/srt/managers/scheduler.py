@@ -2662,6 +2662,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_request_lists=self.request_lists,
+            get_chunked_req=lambda: self.chunked_req,
             get_running_reqs=lambda: self.running_reqs,
             get_pp_running_mbs=lambda: (
                 self.running_mbs if get_parallel().pp_size > 1 else ()
@@ -4767,12 +4768,19 @@ class Scheduler(
             lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
         if self.disagg_prefill_inflight_queue is not None:
             lists["prefill_transfer"] = self.disagg_prefill_inflight_queue
+        owners = []
         if self.disagg_decode_prealloc_queue is not None:
-            lists.update(self.disagg_decode_prealloc_queue.request_lists())
+            owners.append(self.disagg_decode_prealloc_queue)
         if self.disagg_decode_transfer_queue is not None:
-            lists.update(self.disagg_decode_transfer_queue.request_lists())
+            owners.append(self.disagg_decode_transfer_queue)
         if self.dllm_config is not None:
-            lists.update(self.dllm_manager.request_lists())
+            owners.append(self.dllm_manager)
+        for owner in owners:
+            owner_lists = owner.request_lists()
+            assert lists.keys().isdisjoint(owner_lists), sorted(
+                lists.keys() & owner_lists.keys()
+            )
+            lists.update(owner_lists)
         if self.enable_hisparse:
             lists["hisparse_staging"] = [
                 act.req for act in self.hisparse_coordinator.ack_staging_queue

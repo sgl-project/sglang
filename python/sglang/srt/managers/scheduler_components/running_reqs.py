@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Collection, Dict, Iterable, Iterator, Optional, Set
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, Optional, Set
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -47,16 +47,16 @@ class RunningReqs:
     def check(
         self,
         batches: Iterable[Optional[ScheduleBatch]],
-        chunked_reqs: Collection[Req],
+        chunked_req: Optional[Req],
     ) -> None:
         """Raise unless the running requests are exactly the unfinished ones the
-        batches hold, apart from the chunked requests."""
+        batches hold, apart from the chunked request."""
         expected = {
             req
             for batch in batches
             if batch is not None
             for req in batch.reqs
-            if not req.finished() and req not in chunked_reqs
+            if not req.finished() and req is not chunked_req
         }
         running = self._reqs.keys()
         if expected == running:

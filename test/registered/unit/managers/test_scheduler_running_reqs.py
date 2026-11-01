@@ -85,6 +85,7 @@ def _invariant_checker(s):
         get_running_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
+        get_chunked_req=lambda: s.chunked_req,
         get_running_reqs=lambda: s.running_reqs,
     )
 
@@ -166,11 +167,11 @@ class TestRunningReqs(CustomTestCase):
         with self.assertRaisesRegex(
             RuntimeError, r"not running: \['b'\].*no batch: \['s'\]"
         ):
-            running.check([batch, None], chunked_reqs=[chunk])
+            running.check([batch, None], chunked_req=chunk)
 
         running.leave([stray])
         running.join([b])
-        running.check([batch, None], chunked_reqs=[chunk])
+        running.check([batch, None], chunked_req=chunk)
 
 
 class TestRunningReqsHooks(CustomTestCase):
