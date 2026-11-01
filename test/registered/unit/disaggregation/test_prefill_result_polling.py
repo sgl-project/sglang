@@ -171,6 +171,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = RunningReqs()
+        self.uocr_doc_hooks = None
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
@@ -195,7 +196,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self._relay_forward_payload = Mock()
         self.tree_cache = Mock(spec=["flush_pending_backups", "finish"])
         self.batch_result_processor = Mock(
-            spec=["snapshot_auxiliary_output_starts", "move_logprobs_to_cpu"]
+            spec=[
+                "snapshot_auxiliary_output_starts",
+                "move_logprobs_to_cpu",
+                "_maybe_collect_customized_info",
+            ]
         )
         self.metrics_reporter = Mock(
             spec=[
