@@ -36,6 +36,22 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def wan_text_encoder_extra_args() -> list[dict]:
+    """Tokenizer overrides for the Wan UMT5 encoder, chosen by
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING. t5_postprocess_text zero-pads the
+    embeddings back to 512, so the encoder itself can run on fewer tokens."""
+    mode = envs.SGLANG_DIFFUSION_WAN_TEXT_PADDING
+    if mode == "max":
+        return [{}]
+    if mode == "longest":
+        return [dict(padding="longest")]
+    if mode == "bucket":
+        return [dict(padding="longest", pad_to_multiple_of=64)]
+    raise ValueError(
+        f"SGLANG_DIFFUSION_WAN_TEXT_PADDING must be max, longest or bucket, got {mode!r}"
+    )
+
+
 def t5_postprocess_text(
     outputs: BaseEncoderOutput, _text_inputs
 ) -> TextConditioningOutput:
@@ -102,9 +118,10 @@ class WanT2V480PConfig(PipelineConfig):
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (t5_postprocess_text,))
     )
-    # t5_postprocess_text zero-pads back to 512, so encode only the real tokens
+    # Off by default ("max"): a shorter padding changes the bf16 rounding, so the
+    # video is a different valid sample. See wan_text_encoder_extra_args.
     text_encoder_extra_args: list[dict] = field(
-        default_factory=lambda: [dict(padding="longest")]
+        default_factory=wan_text_encoder_extra_args
     )
 
     # Precision for each component

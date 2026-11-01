@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -22,10 +23,31 @@ def test_wan_prompt_embed_accessors_return_transformer_tensor():
     assert config.get_neg_prompt_embeds(batch) is negative_prompt_embeds
 
 
-def test_wan_text_encoder_trims_padding_and_embeds_stay_512():
-    config = WanT2V480PConfig()
-    assert config.text_encoder_extra_args[0]["padding"] == "longest"
+def test_wan_text_padding_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("SGLANG_DIFFUSION_WAN_TEXT_PADDING", raising=False)
+    assert WanT2V480PConfig().text_encoder_extra_args == [{}]
 
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("max", [{}]),
+        ("longest", [{"padding": "longest"}]),
+        ("bucket", [{"padding": "longest", "pad_to_multiple_of": 64}]),
+    ],
+)
+def test_wan_text_padding_modes(monkeypatch, mode, expected):
+    monkeypatch.setenv("SGLANG_DIFFUSION_WAN_TEXT_PADDING", mode)
+    assert WanT2V480PConfig().text_encoder_extra_args == expected
+
+
+def test_wan_text_padding_rejects_unknown_mode(monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_WAN_TEXT_PADDING", "tiny")
+    with pytest.raises(ValueError):
+        WanT2V480PConfig()
+
+
+def test_wan_postprocess_keeps_embeds_512_and_mask_matches():
     hidden = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
     mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
     outputs = SimpleNamespace(last_hidden_state=hidden, attention_mask=mask)
