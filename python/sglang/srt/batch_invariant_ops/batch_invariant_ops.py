@@ -474,6 +474,9 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return output.reshape(original_shape)
 
 
+_MEAN_MAX_PROGRAMS = 1 << 20
+
+
 @triton.jit
 def mean_kernel(
     input_ptr,
@@ -492,36 +495,35 @@ def mean_kernel(
     Kernel for computing mean along a single dimension.
     Input is viewed as (M, N, K) where N is the dimension being reduced.
     """
-    # Program ID gives us which output element we're computing
-    pid = tl.program_id(0)
+    # Each program computes output elements pid, pid + num_programs, ...; the grid is
+    # capped (see mean_dim), and every element is reduced the same way whichever
+    # program computes it.
+    for pid in range(tl.program_id(0), M * K, tl.num_programs(0)):
+        # Compute output indices
+        m_idx = pid // K
+        k_idx = pid % K
 
-    # Compute output indices
-    m_idx = pid // K
-    k_idx = pid % K
+        # Accumulate sum across reduction dimension
+        acc = 0.0
+        for n_start in range(0, N, BLOCK_SIZE):
+            n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
+            mask = n_offsets < N
 
-    # Bounds check
-    if m_idx >= M or k_idx >= K:
-        return
+            # Calculate input indices
+            input_idx = (
+                m_idx * input_stride0
+                + n_offsets * input_stride1
+                + k_idx * input_stride2
+            )
 
-    # Accumulate sum across reduction dimension
-    acc = 0.0
-    for n_start in range(0, N, BLOCK_SIZE):
-        n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
-        mask = n_offsets < N
+            # Load and accumulate
+            vals = tl.load(input_ptr + input_idx, mask=mask, other=0.0)
+            acc += tl.sum(vals)
 
-        # Calculate input indices
-        input_idx = (
-            m_idx * input_stride0 + n_offsets * input_stride1 + k_idx * input_stride2
-        )
-
-        # Load and accumulate
-        vals = tl.load(input_ptr + input_idx, mask=mask, other=0.0)
-        acc += tl.sum(vals)
-
-    # Compute mean and store
-    mean_val = acc / N
-    output_idx = m_idx * output_stride0 + k_idx * output_stride1
-    tl.store(output_ptr + output_idx, mean_val)
+        # Compute mean and store
+        mean_val = acc / N
+        output_idx = m_idx * output_stride0 + k_idx * output_stride1
+        tl.store(output_ptr + output_idx, mean_val)
 
 
 def mean_dim(
@@ -596,8 +598,10 @@ def mean_dim(
     else:
         output_2d = output.reshape(M, K)
 
-    # Launch kernel
-    grid = (M * K,)
+    # Launch kernel. One program per output element, up to a cap: HIP rejects a
+    # launch of more than 2**32 threads in total (e.g. the mean over 4 of a
+    # [8192, 4, 4096] tensor), so beyond the cap programs loop over elements.
+    grid = (min(M * K, _MEAN_MAX_PROGRAMS),)
     BLOCK_SIZE = 1024
 
     mean_kernel[grid](
