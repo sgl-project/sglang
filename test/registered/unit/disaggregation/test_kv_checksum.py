@@ -118,6 +118,11 @@ class TestKvLayoutSignature(unittest.TestCase):
         self.assertNotEqual(same, make(kv_cache_dtype_str="fp16"))
         self.assertNotEqual(same, make(kv_layout="bucketed"))
         self.assertNotEqual(same, make(state_types=[StateType.DSA]))
+        # A prefill keeping a longer window tail than its decode, a pairing
+        # the PD bootstrap accepts, digests more pages of that window.
+        tails = make(state_window_tails=[128])
+        self.assertEqual(tails, make(state_window_tails=[128]))
+        self.assertNotEqual(tails, make(state_window_tails=[192]))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):

@@ -144,6 +144,7 @@ class StaticKVStorage:
         token_start: int,
         token_boundary: int,
         window: Optional[int] = None,
+        retain: Optional[int] = None,
     ) -> ResumeUnits:
         if not 0 <= token_start <= token_boundary:
             raise ValueError("invalid continuation token span")
@@ -168,6 +169,9 @@ class StaticKVStorage:
             retained = pool.sliding_window if request_window is not None else window
             if retained is None:
                 raise ValueError("window handoff requires its retention length")
+            if request_window is None:
+                # A per-request window ring holds the window alone.
+                retained = max(retained, retain or 0)
             begin = max(begin, token_boundary - retained)
         begin = begin // page_size * page_size
         if request_window is not None:

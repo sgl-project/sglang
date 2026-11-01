@@ -57,16 +57,28 @@ def _window_rows(scheduler, req: Req, ids, window, seq_len, start_idx):
     return _to_page_indices_gpu(ids.ids(window_full), page_size)
 
 
+def _kept_tails(scheduler) -> dict:
+    """Each window's tail the peers send, by sub-pool: its length widened by
+    readers reaching further back."""
+    from sglang.srt.disaggregation.utils import retained_window_lengths
+
+    return retained_window_lengths(
+        scheduler.token_to_kv_pool_allocator,
+        getattr(getattr(scheduler, "tree_cache", None), "draft_window_reaches", None),
+        scheduler.sliding_window_size,
+    )
+
+
 def state_indices_for_request(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
 ) -> Union[None, torch.Tensor, List[torch.Tensor]]:
     """The state rows the transfer of ``req`` digests: one tensor for every
     state entry, or, for a unified pool of several windows, one per state
-    entry in entry order, each window's from its own sub-pool and length."""
+    entry in entry order, each window's from its own sub-pool and kept tail."""
     allocator = scheduler.token_to_kv_pool_allocator
     storage = getattr(allocator, "storage", None)
     if storage is not None:
-        lengths = storage.window_lengths(scheduler.sliding_window_size)
+        lengths = _kept_tails(scheduler)
         if len(lengths) > 1:
             shared = _state_indices(scheduler, req, seq_len, start_idx)
             id_spaces = storage.allocator.id_spaces()
@@ -104,13 +116,14 @@ def _state_indices(
             .reshape(-1)
         )
     if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        tails = _kept_tails(scheduler)
         return _window_rows(
             scheduler,
             req,
             scheduler.token_to_kv_pool_allocator.id_spaces()[
                 IdSpaceKind.SLIDING_WINDOW
             ],
-            scheduler.sliding_window_size,
+            max(tails.values(), default=scheduler.sliding_window_size),
             seq_len,
             start_idx,
         )

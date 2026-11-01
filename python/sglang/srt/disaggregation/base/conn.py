@@ -78,6 +78,9 @@ class KVArgs:
     # The sub-pool each state entry carries, parallel to state_types: entries
     # of one state type (every window travels as SWA) are told apart by it.
     state_sub_pools: List[Optional[str]]
+    # The tail a window entry carries (its window widened by readers reaching
+    # further back), parallel to state_types; None for other entries.
+    state_window_tails: List[Optional[int]]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
