@@ -23,6 +23,9 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux import (
     FluxAdapter,
     FluxExecutor,
 )
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.flux2 import (
+    Flux2Adapter,
+)
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
     ZImageAdapter,
 )
@@ -72,6 +75,35 @@ def test_flux_pack_and_unpack_roundtrip() -> None:
 
     default = adapter.pack(x, timestep, context, y=y)
     assert default.guidance_scale == 3.5
+
+
+def test_flux2_pack_flattens_latents_and_keeps_every_row() -> None:
+    """ComfyUI stacks cond and uncond (B=2); each row needs its own seq len."""
+    adapter = Flux2Adapter()
+    x = torch.randn(2, 128, 4, 6)
+    packed = adapter.pack(
+        x,
+        torch.tensor([0.5, 0.5]),
+        torch.randn(2, 512, 7680),
+        guidance=torch.tensor([4.0]),
+    )
+    assert packed.latents.shape == (2, 24, 128)
+    assert packed.timesteps.tolist() == [500.0]
+    assert packed.prompt_seq_lens == [[512, 512]]
+    assert (packed.height, packed.width) == (64, 96)
+    assert packed.guidance_scale == 4.0
+    assert "image_latent" not in packed.extra_req
+
+    pred = packed.latents.clone()
+    out = adapter.unpack(pred, packed, x)
+    assert out.shape == x.shape
+    assert torch.equal(out, x)
+
+    # FluxDisableGuidance omits guidance; it must not fall back to a default.
+    assert (
+        adapter.pack(x, torch.tensor([0.5]), torch.randn(2, 512, 7680)).guidance_scale
+        is None
+    )
 
 
 def test_flux_pack_zero_fills_missing_pooled() -> None:
@@ -135,6 +167,52 @@ def test_flux_pack_and_unpack_roundtrip_odd_latent_size() -> None:
     out = adapter.unpack(packed.latents, packed, x)
     assert out.shape == x.shape
     assert torch.equal(out, x)
+
+
+def test_flux2_reference_latents_are_appended_with_distinct_ids() -> None:
+    adapter = Flux2Adapter()
+    x = torch.randn(1, 128, 4, 4)
+    refs = [torch.randn(1, 128, 2, 2), torch.randn(1, 128, 2, 3)]
+    packed = adapter.pack(
+        x, torch.tensor([0.5]), torch.randn(1, 512, 7680), ref_latents=refs
+    )
+    assert packed.extra_req["image_latent"].shape == (1, 4 + 6, 128)
+    ids = packed.extra_req["condition_image_latent_ids"][0]
+    # One time coordinate per reference image: 10 then 20.
+    assert ids[:4, 0].unique().tolist() == [10] and ids[4:, 0].unique().tolist() == [20]
+
+    adapter.drop_cached_fields(packed)
+    assert not packed.prompt_embeds
+    # Dropped together, so the worker cache restores them as a pair.
+    assert "image_latent" not in packed.extra_req
+    assert "condition_image_latent_ids" not in packed.extra_req
+
+
+def test_embedded_guidance_comes_from_the_request_only_for_flux2() -> None:
+    """FluxGuidance must reach FLUX.2; other models send a placeholder 1.0."""
+    from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+        Flux2PipelineConfig,
+        FluxPipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+        DenoisingStage,
+    )
+
+    def guidance(config, comfyui_mode=True, scale=7.0):
+        stage = SimpleNamespace(
+            server_args=SimpleNamespace(
+                comfyui_mode=comfyui_mode, pipeline_config=config
+            ),
+            _build_guidance=lambda bsz, dtype, device, val: val,
+        )
+        batch = SimpleNamespace(guidance_scale=scale)
+        return DenoisingStage.get_or_build_guidance(stage, 1, None, None, batch)
+
+    flux2 = Flux2PipelineConfig()
+    assert guidance(flux2) == 7.0
+    assert guidance(flux2, scale=None) is None
+    assert guidance(flux2, comfyui_mode=False) == flux2.embedded_cfg_scale
+    assert guidance(FluxPipelineConfig()) == FluxPipelineConfig().embedded_cfg_scale
 
 
 def test_worker_error_is_raised_not_unpacked() -> None:
