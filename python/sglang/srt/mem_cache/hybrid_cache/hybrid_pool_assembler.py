@@ -49,8 +49,6 @@ from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    import torch
-
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
     from sglang.srt.mem_cache.device_pool_info import (
@@ -271,6 +269,40 @@ def build_pool_entry(
         device_free_fn=device_free_fn,
         packed_draft_device_pools=packed_draft_device_pools,
         device_translate=device_translate,
+    )
+
+
+def _build_cache_controller(
+    *,
+    params: CacheInitParams,
+    host_pool_group: HostPoolGroup,
+    transfer_layer_id_max: int,
+    load_cache_event,
+    storage_backend: Optional[str],
+    prefetch_threshold: int,
+    model_name: Optional[str],
+    storage_backend_extra_config: Optional[dict],
+    enable_storage_metrics: bool,
+) -> HybridCacheController:
+    memory = get_memory()
+    return HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=memory.hicache_write_policy,
+        io_backend=memory.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        transfer_layer_id_max=transfer_layer_id_max,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=memory.hicache_host_memory_mode,
     )
 
 
@@ -516,24 +548,16 @@ def build_kv_only_stack(
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=params.mtp_draft_device_pools,
     )
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -590,24 +614,16 @@ def build_hybrid_swa_stack(
         mtp_swa_device_pools=mtp_swa_device_pools,
         mtp_swa_full_device_pools=_mtp_swa_device_pools(params, full_indices=True),
     )
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -1077,24 +1093,16 @@ def build_deepseek_v4_hicache_stack(
     )
 
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        page_size,
-        params.tp_cache_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -1219,24 +1227,16 @@ def build_hybrid_mamba_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller, config
 
@@ -1250,12 +1250,7 @@ def build_hybrid_mamba_swa_stack(
     full_layer_mapping: dict[int, int],
     swa_layer_mapping: dict[int, int],
     start_layer: int,
-    page_size: int,
-    tp_group,
     load_cache_event,
-    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -1288,7 +1283,7 @@ def build_hybrid_mamba_swa_stack(
             get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
         )
     host_pool_group = build_hybrid_swa_group(
-        page_size=page_size,
+        page_size=params.page_size,
         full_kv_pool=full_kv_pool,
         swa_kv_pool=swa_kv_pool,
         full_layer_mapping=full_layer_mapping,
@@ -1336,24 +1331,16 @@ def build_hybrid_mamba_swa_stack(
             packed_draft_device_pools=params.mtp_draft_mamba_pools,
         ),
     )
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        page_size,
-        tp_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=attn_cp_group,
-        attn_tp_group=attn_tp_group,
-        pp_group=pp_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -1566,24 +1553,16 @@ def build_unified_host_stack(
         component_host_pools[component] = host_pools[s.name]
 
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        page_size,
-        params.tp_cache_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=memory.hicache_write_policy,
-        io_backend=memory.hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=memory.hicache_host_memory_mode,
     )
     return StackBuildResult(
         host_pool_group=host_pool_group,
@@ -2318,12 +2297,7 @@ class _MambaSwaStrategy(StackStrategy):
             full_layer_mapping=full_layer_mapping,
             swa_layer_mapping=swa_layer_mapping,
             start_layer=kvcache.start_layer,
-            page_size=cache.page_size,
-            tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
-            pp_group=params.pp_cache_group,
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
@@ -2500,25 +2474,16 @@ class _DsaStrategy(StackStrategy):
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
         host_pool_group = build_host_pool_group(config=config)
-        cache_controller = HybridCacheController(
-            params.token_to_kv_pool_allocator,
-            host_pool_group,
-            config.transfer_page_size,
-            params.tp_cache_group,
+        cache_controller = _build_cache_controller(
+            params=params,
+            host_pool_group=host_pool_group,
+            transfer_layer_id_max=kvcache.layer_num,
             load_cache_event=load_cache_event,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
-            pp_group=params.pp_cache_group,
-            write_policy=get_memory().hicache_write_policy,
-            io_backend=get_memory().hicache_io_backend,
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
-            # The controller adds packed draft transfers after target layers.
-            transfer_layer_id_max=kvcache.layer_num,
             enable_storage_metrics=enable_storage_metrics,
-            host_memory_mode=get_memory().hicache_host_memory_mode,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -2828,22 +2793,15 @@ def build_minimax_sparse_hicache_stack(
         )
 
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_cache_controller(
+        params=params,
+        host_pool_group=host_pool_group,
+        transfer_layer_id_max=transfer_layer_id_max,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
-        pp_group=params.pp_cache_group,
-        transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
