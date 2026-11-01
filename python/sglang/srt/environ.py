@@ -1583,6 +1583,12 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # DeepSeek-V4 sparse top-k (dsv4/topk.py and DeepSelect): pick the same
+    # indices in the same order on every run, through DeepSelect's single-CTA
+    # kernel or an exact torch selection. The default kernels emit in thread-arrival
+    # order and on tied scores may keep a different set; sparse attention sums in
+    # index order, so identical greedy requests can then diverge. Slower.
+    SGLANG_ENABLE_DETERMINISTIC_SPARSE_TOPK = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)
