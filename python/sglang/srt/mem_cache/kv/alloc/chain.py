@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     chain_byte_accounting_violations,
     flush_deferred_free_group,
 )
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     NO_MOVE,
     ChainSnapshot,
@@ -1238,6 +1238,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 (window.sub_pool_name, id(self)),
                 widened_writes=True,
                 defer_reads=defer_reads,
+            )
+        if self.swa_attn_allocator is not None:
+            # Backends ask for the sliding-window layers' ids by their role:
+            # the target's window.
+            spaces.setdefault(
+                IdSpaceKind.SLIDING_WINDOW,
+                spaces[self.swa_attn_allocator.sub_pool_name],
             )
         return spaces
 

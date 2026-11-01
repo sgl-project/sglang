@@ -84,20 +84,20 @@ class TestPlanNames(CustomTestCase):
 
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
-            "swa": (("full", "kv", "FULL"), ("swa", "swa", "SWA")),
+            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "SWA")),
             "mamba": (("full", "kv", "FULL"), ("mamba", "mamba", "MAMBA")),
             "tri": (
                 ("full", "kv", "FULL"),
-                ("swa", "swa", "SWA"),
+                ("window_32", "swa", "SWA"),
                 ("mamba", "mamba", "MAMBA"),
             ),
         }
         wires = {
-            "swa": [("swa", "kv", "swa")],
+            "swa": [("window_32", "kv", "swa")],
             "mamba": [("mamba", "state", "mamba")],
-            "tri": [("swa", "kv", "swa"), ("mamba", "state", "mamba")],
+            "tri": [("window_32", "kv", "swa"), ("mamba", "state", "mamba")],
         }
-        envelopes = {"swa": ("full", "swa"), "mamba": None, "tri": None}
+        envelopes = {"swa": ("full", "window_32"), "mamba": None, "tri": None}
         for name in ("swa", "mamba", "tri"):
             with self.subTest(chain=name):
                 storage = _bundle(name).token_to_kv_pool_allocator.storage
@@ -309,7 +309,7 @@ class TestHostStack(CustomTestCase):
         storage = cache.token_to_kv_pool_allocator.storage
         kv, swa = result.host_pool_group.entry_map.values()
         self.assertEqual((kv.name, swa.name), (PoolName.KV, PoolName.SWA))
-        for entry, sub_pool in ((kv, "full"), (swa, "swa")):
+        for entry, sub_pool in ((kv, "full"), (swa, "window_32")):
             self.assertEqual(entry.host_pool.kind, "envelope")
             self.assertEqual(entry.host_pool.name, sub_pool)
             self.assertIs(entry.host_pool.device_pool, storage.view(sub_pool))
@@ -350,11 +350,11 @@ class TestHostStack(CustomTestCase):
                 for entry in result.host_pool_group.entry_map.values():
                     sub_pool = by_view[id(entry.device_pool)]
                     seen.add(sub_pool)
-                    if sub_pool == "swa":
+                    if sub_pool == "window_32":
                         self.assertTrue(
                             torch.equal(
                                 entry.device_translate(owner_ids),
-                                storage.window_ids("swa", owner_ids),
+                                storage.window_ids("window_32", owner_ids),
                             )
                         )
                         continue

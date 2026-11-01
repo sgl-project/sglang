@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.kv.decl import MHAGeometry, WindowLayers, kv_layer_dec
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods import (
@@ -84,7 +84,9 @@ class _Model:
     """A unified pool over one full layer and one layer per window, a Triton
     backend bound to its runner, and the K/V every layer has written so far."""
 
-    def __init__(self, windows, *, spec_algorithm=SpeculativeAlgorithm.NONE):
+    def __init__(
+        self, windows, *, spec_algorithm=SpeculativeAlgorithm.NONE, deterministic=False
+    ):
         setup_allocator_context()
         storage = _storage(windows)
         case = DenseAttentionCase(
@@ -121,6 +123,13 @@ class _Model:
         runner.spec_algorithm = spec_algorithm
         runner.init_runner_ids()
         self.runner = runner
+        # Restored by the test (`restore_config`).
+        self.config = None
+        if deterministic:
+            self.config = get_context().override_server_args(
+                enable_deterministic_inference=True
+            )
+            self.config.install()
         self.backend = TritonAttnBackend(runner)
         self.layers = [
             RadixAttention(
@@ -358,6 +367,29 @@ class TestTritonSeveralWindows(CustomTestCase):
                     ForwardMode.DECODE, rows, replay_seq, ones, inputs
                 )
                 self._check([o.clone() for o in outputs], expected, "graph decode")
+
+    def test_deterministic_extend_reads_the_window_ids(self):
+        """Deterministic inference extends through one kernel that reads the
+        new tokens' K/V back from the cache: a window layer reads them at its
+        window sub-pool's ids, not the request's token ids."""
+        model = _Model((8,), deterministic=True)
+        self.addCleanup(model.config.restore)
+        self.assertTrue(model.backend.enable_deterministic)
+        model.bind()
+        generator = torch.Generator(device="cuda").manual_seed(5)
+        rows = [1, 2, 3]
+        prefix_lens, extend_lens = [5, 19, 2], [3, 4, 9]
+        for row, p, n in zip(rows, prefix_lens, extend_lens):
+            model.add_request(row, p + n + 1, generator)
+        self._prefill(model, rows, prefix_lens, extend_lens, generator)
+
+    def test_deterministic_extend_refuses_several_windows(self):
+        """The deterministic extend reads one window rail: binding a runner
+        over several window sub-pools names the backend."""
+        model = _Model((8, 4), deterministic=True)
+        self.addCleanup(model.config.restore)
+        with self.assertRaisesRegex(NotImplementedError, "TritonAttnBackend"):
+            model.bind()
 
     def test_unconverted_modes_refuse_several_windows(self):
         """Speculative modes still build one window rail: binding a runner over

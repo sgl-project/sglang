@@ -138,7 +138,7 @@ def _capacities(bundle) -> dict:
         ("full", allocator.full_attn_allocator, kvcache.layer_router.view("full")),
         ("swa", allocator.swa_attn_allocator, kvcache.layer_router.view("swa")),
     ):
-        out[f"{name}.max_slots"] = shared.num_entries(name)
+        out[f"{name}.max_slots"] = shared.num_entries(sub.sub_pool_name)
         out[f"{name}.sub.max_slots"] = sub.max_slots
         out[f"{name}.sub.num_pages"] = sub.num_pages
         out[f"{name}.sub.ids.num_virtual_ids"] = sub.ids.num_virtual_ids
@@ -659,7 +659,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 cache.restore_kv_cache(req, backup)
                 cache._finish_restore(req.kv)
                 for band in a.members:
-                    window = {"full": 132, "swa": 64, "draft_swa": draft_window}[
+                    window = {"full": 132, "window_64": 64, "draft_swa": draft_window}[
                         band.sub_pool_name
                     ]
                     start = max(0, 129 - window) // 4 * 4

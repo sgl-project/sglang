@@ -152,6 +152,9 @@ class RunnerIds:
         # localizes its writes.
         self._spaces: Dict[str, IdSpace] = {}
         self.window_sub_pools: Tuple[str, ...] = ()
+        # The sub-pool playing each attention role this runner's pool names
+        # by role (a unified target's window).
+        self._role_sub_pools: Dict[str, str] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             if is_cp_sharded_padded():
@@ -173,6 +176,10 @@ class RunnerIds:
                 self.window_sub_pools = tuple(
                     sorted({s.name for s in plan.windows()} - drafts)
                 )
+                if plan.primary_window() is not None:
+                    self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = (
+                        plan.primary_window().name
+                    )
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
@@ -316,6 +323,12 @@ class RunnerIds:
             if IdSpaceKind.SLIDING_WINDOW in self._spaces
             else IdSpaceKind.FULL
         )
+
+    @property
+    def window_kv_sub_pool(self) -> str:
+        """The sub-pool `window_kv_kind` reads, by its name."""
+        kind = self.window_kv_kind
+        return self._role_sub_pools.get(kind, kind)
 
     def write_ids(
         self, forward_batch, kind: IdSpaceKind = IdSpaceKind.FULL

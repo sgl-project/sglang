@@ -2,9 +2,9 @@
 
 The nesting, outermost first:
 
-  sub-pool  a named pool inside the unified pool ("full", "swa", "mamba"),
-            with its own grow direction and frontier. HOST is the role it
-            plays when its entries also carry draft bytes.
+  sub-pool  a named pool inside the unified pool ("full", "window_4096",
+            "mamba"), with its own grow direction and frontier. HOST is the
+            role it plays when its entries also carry draft bytes.
   slot      one token entry of that sub-pool. The draft's KV is extra parts of
             every slot, after the host's own parts, so ONE slot id per token
             covers target and draft: one allocation, one free, one whole-page
@@ -410,7 +410,7 @@ class WindowHostKind(DenseHostKind):
         return super().admits(layers=layers, ctx=ctx)
 
     def host_name(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> str:
-        return window_sub_pool_name(layers.window, ctx.target_windows)
+        return window_sub_pool_name(layers.window)
 
 
 SWA_HOST = register_host_kind(
@@ -743,7 +743,7 @@ def place_fused_draft(
             # their row geometry happens to match: a band of its own, named by
             # its lifetime as the plan names a target's.
             if kind == LAYER_WINDOW:
-                name = window_sub_pool_name(layers.window, ctx.target_windows)
+                name = window_sub_pool_name(layers.window)
             else:
                 name = (
                     f"draft_{host.name}" if host.name in ctx.host_names else host.name

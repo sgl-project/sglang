@@ -137,26 +137,10 @@ class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
     window: Optional[int] = None
 
 
-# The name a model's window sub-pool goes by when it has one window.
-WINDOW_SUB_POOL = "swa"
-
-
-def window_sub_pool_name(
-    window: Optional[int], target_windows: Sequence[Optional[int]]
-) -> str:
-    """The sub-pool name of a window, from window lengths only. The longest
-    window the target's layers declare (an unstated window is longest; with no
-    target window, the window itself) keeps the name a single-window model has
-    always used; any other window is named by its length."""
-    if target_windows:
-        longest = max(
-            target_windows, key=lambda w: WindowLifetime(window=w).retention()
-        )
-    else:
-        longest = window
-    if window == longest:
-        return WINDOW_SUB_POOL
-    return f"{WINDOW_SUB_POOL}_{window}"
+def window_sub_pool_name(window: Optional[int]) -> str:
+    """The sub-pool name of a window, from its own length alone: a window the
+    model does not state the length of is ``window``."""
+    return "window" if window is None else f"window_{window}"
 
 
 def kv_layer_decls(

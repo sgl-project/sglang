@@ -267,7 +267,7 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
                 sliding_window_size=4096,
             )
         self.assertIn("bs=1 floor", str(ctx.exception))
-        self.assertIn("swa_window_kv", str(ctx.exception))
+        self.assertIn("window_4096_window_kv", str(ctx.exception))
 
     def test_feasible_floor_inputs_are_not_rejected(self):
         """Floor inputs that must NOT raise: charging the full-attention token
