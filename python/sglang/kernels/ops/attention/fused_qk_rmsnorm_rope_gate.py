@@ -73,6 +73,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     ENABLE_PDL: tl.constexpr,
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
+    COPY_GATE: tl.constexpr = True,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -144,7 +145,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     tl.store(out_base + HALF_ROTARY + rot_offs, second, mask=rot_mask)
 
     # Gate copy (Q heads only)
-    if HAS_GATE and not is_k:
+    if HAS_GATE and COPY_GATE and not is_k:
         gate_in = in_base + HEAD_DIM
         gate_out = gate_out_ptr + token * stride_gate_t + local_head * HEAD_DIM
         g = tl.load(gate_in + head_offs, mask=head_mask, other=0.0)
@@ -170,6 +171,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rotary_dim: int,
     has_gate: bool = True,
     mrope_axis_map: Optional[torch.Tensor] = None,
+    copy_gate: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave.
 
@@ -181,6 +183,8 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         positions: [T] token positions, or [3, T] mrope rows (temporal, height, width)
         mrope_axis_map: [rotary_dim // 2] — the axis owning each rotary lane, from
             MRotaryEmbedding
+        copy_gate: if False, the returned gate is a [T, num_q_heads, head_dim]
+            strided view of q_gate instead of a contiguous copy
     """
     assert positions.dim() in (1, 2), f"want [T] or [3, T], got {positions.shape}"
     mrope = positions.dim() == 2
@@ -200,7 +204,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     k_out = torch.empty(T, kv_size, dtype=k.dtype, device=k.device)
     gate_out = (
         torch.empty(T, num_q_heads, head_dim, dtype=q_gate.dtype, device=q_gate.device)
-        if has_gate
+        if has_gate and copy_gate
         else q_out
     )
 
@@ -240,9 +244,14 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
+        COPY_GATE=copy_gate,
         # One 64-lane wavefront per (token, head) on ROCm: twice as fast as the
         # default 4 warps at prefill sizes on MI355X.
         **({"num_warps": 1} if torch.version.hip else {}),
     )
 
-    return q_out, k_out, gate_out if has_gate else None
+    if not has_gate:
+        return q_out, k_out, None
+    if not copy_gate:
+        gate_out = q_gate.unflatten(-1, (num_q_heads, 2 * head_dim))[..., head_dim:]
+    return q_out, k_out, gate_out
