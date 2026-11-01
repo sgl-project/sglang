@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     set_weight_attrs,
+    use_gfx1151_kernels,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -611,6 +612,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_hip and use_gfx1151_kernels() and not is_batch_invariant_mode_enabled():
+            from sglang.srt.layers.quantization.gfx1151_small_m import small_m_linear
+
+            out = small_m_linear(x, layer.weight, bias)
+            if out is not None:
+                return out
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

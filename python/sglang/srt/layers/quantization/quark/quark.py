@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
     QuarkW4A8MXFp4MoE,
+    QuarkW4A16Int4,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -831,6 +832,27 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
 
+    def _is_int4_w4a16(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Weight-only int4 runs on ROCm only (Triton skinny GEMM); activations stay
+        # fp16/bf16.
+        if not is_hip() or weight_quant is None or input_quant is not None:
+            return False
+        if weight_quant.get("dtype") != "int4":
+            return False
+        if weight_quant.get("qscheme") != "per_group":
+            return False
+        if weight_quant.get("group_size") not in (32, 64, 128):
+            logger.debug(
+                "Quark INT4 W4A16 has unsupported group_size %s",
+                weight_quant.get("group_size"),
+            )
+            return False
+        return weight_quant.get("is_dynamic") is not True
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -1015,6 +1037,8 @@ class QuarkConfig(QuantizationConfig):
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
                 dequantization_config=self.dequantization_config,
             )
+        if self._is_int4_w4a16(weight_config, input_config):
+            return QuarkW4A16Int4(weight_config, input_config)
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False

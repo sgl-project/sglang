@@ -75,10 +75,18 @@ from sglang.srt.utils.common import (
     is_hip,
     is_npu,
     is_pin_memory_available,
+    use_gfx1151_kernels,
     use_intel_amx_backend,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _gfx1151_small_m_linear(x: torch.Tensor, weight: torch.Tensor):
+    from sglang.srt.layers.quantization.gfx1151_small_m import small_m_linear
+
+    return small_m_linear(x, weight)
+
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1252,6 +1260,12 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif (
+                use_gfx1151_kernels()
+                and (small_m := _gfx1151_small_m_linear(hidden_states, lm_head.weight))
+                is not None
+            ):
+                logits = small_m
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

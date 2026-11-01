@@ -58,6 +58,7 @@ def _gemma_fused_add_rmsnorm_kernel(
     stride_rcol,
     eps,
     BLOCK_N: tl.constexpr,
+    ROUND_SUM: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
@@ -69,6 +70,9 @@ def _gemma_fused_add_rmsnorm_kernel(
         res_ptr + row * stride_rrow + cols * stride_rcol, mask=mask, other=0.0
     ).to(tl.float32)
     s = x + r
+    if ROUND_SUM:
+        # normalize the sum as stored (the eager path adds in the activation dtype)
+        s = s.to(res_out_ptr.dtype.element_ty).to(tl.float32)
     # residual_out is the pre-norm sum (consumed by the next layer's add).
     tl.store(
         res_out_ptr + row * n_cols + cols,
@@ -121,8 +125,10 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    round_sum: bool = False,
 ):
-    """Fused (x + residual) then Gemma RMSNorm; returns (normed, pre-norm sum)."""
+    """Fused (x + residual) then Gemma RMSNorm; returns (normed, pre-norm sum).
+    ``round_sum`` normalizes the sum rounded to the activation dtype, as the eager path does."""
     orig_shape = x.shape
     n = orig_shape[-1]
     x2 = x.reshape(-1, n)
@@ -144,6 +150,7 @@ def gemma_fused_add_rmsnorm(
         r2.stride(1),
         eps,
         BLOCK_N=block_n,
+        ROUND_SUM=round_sum,
         num_warps=_num_warps(block_n),
     )
     return out.reshape(orig_shape), res_out.reshape(orig_shape)

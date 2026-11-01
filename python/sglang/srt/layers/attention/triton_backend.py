@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
     next_power_of_2,
+    use_gfx1151_kernels,
 )
 
 _is_cuda = is_cuda()
@@ -250,6 +251,12 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # gfx1151 verify attention reads full-space slot ids straight from req_to_token
+        self.use_verify_gfx1151 = (
+            use_gfx1151_kernels()
+            and self.page_size == 1
+            and not self.runner_ids.is_translating
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1666,6 +1673,44 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    def _gfx1151_verify_attention(self, q, o, layer, forward_batch) -> bool:
+        """Target-verify attention on gfx1151 that reads the cached prefix once for the
+        whole draft block (the block's K/V are already in the cache). Returns whether it
+        ran."""
+        from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
+
+        num_tokens_per_req = int(
+            getattr(forward_batch.spec_info, "draft_token_num", 0) or 0
+        )
+        k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
+        qv = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if not (
+            num_tokens_per_req > 0
+            and qv.shape[0] % num_tokens_per_req == 0
+            and layer.qk_head_dim == layer.v_head_dim
+            and va.covered(
+                qv,
+                k_buffer,
+                num_tokens_per_req,
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                layer.qk_head_dim,
+            )
+        ):
+            return False
+        va.verify_attention_gfx1151(
+            qv,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k_buffer,
+            v_buffer,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            num_tokens_per_req,
+            layer.scaling,
+        )
+        return True
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1845,6 +1890,29 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        if (
+            self.use_verify_gfx1151
+            and forward_batch.forward_mode.is_target_verify()
+            and save_kv_cache
+            and k is not None
+            and causal
+            and score_mod is None
+            and sinks is None
+            and sliding_window_size == -1
+            # bf16 KV checkpoints may still load unit k/v scales
+            and k_descale == 1.0
+            and v_descale == 1.0
+            and not logits_soft_cap
+            and self.forward_metadata.custom_mask is None
+            and not (
+                self.use_sliding_window_kv_pool
+                and self.kv_layers.route(layer.layer_id).sub_pool
+                == IdSpaceKind.SLIDING_WINDOW
+            )
+            and self._gfx1151_verify_attention(q, o, layer, forward_batch)
+        ):
+            return o
 
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
