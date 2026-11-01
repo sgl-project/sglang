@@ -1775,7 +1775,9 @@ class RowParallelLinear(LinearBase):
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
 
-        if self.use_dp_attention_reduce:
+        if self.use_decode_attn_tp:
+            symm_ctx = use_symmetric_memory(get_parallel().attn_cp_group)
+        elif self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
@@ -1805,7 +1807,12 @@ class RowParallelLinear(LinearBase):
             and not skip_all_reduce
             and not should_skip_mlp_all_reduce()
         ):
-            if self.use_dp_attention_reduce:
+            if self.use_decode_attn_tp:
+                # Prefill-only CP slices replicated attention weights over CP
+                # partners for decode/draft/verify. Sum those partial heads,
+                # never the full TP group (which also contains other DP rows).
+                output = get_parallel().attn_cp_group.all_reduce(output_parallel)
+            elif self.use_dp_attention_reduce:
                 output = get_parallel().attn_tp_group.all_reduce(output_parallel)
             else:
                 quantize_communications = (

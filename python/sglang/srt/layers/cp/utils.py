@@ -352,9 +352,14 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
-    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    metadata = forward_batch.attn_cp_metadata
+    physical_tokens = sum(metadata.per_rank_actual_token)
+    # Reorder only the real prompt rows, exactly as `shard_hidden_states`
+    # does: a DP-padded tail (MAX_LEN padding) is in no CP shard, so letting it
+    # set the block width would misalign these IDs with the CP hidden gather.
+    real_rows = input_ids[: metadata.total_seq_lens]
     padded_input_ids = input_ids.new_zeros(physical_tokens)
-    padded_input_ids[: input_ids.shape[0]] = input_ids
+    padded_input_ids[: real_rows.shape[0]] = real_rows
     return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
 
 

@@ -2221,6 +2221,20 @@ class Scheduler(
             and last_batch_is_extend
         )
 
+        # A bounded CP prefill performs host collectives as well as GPU
+        # collectives. Drain its result before the next forward can enter a
+        # different DP/CP collective schedule. Use the GLOBAL extend vote: idle
+        # DP peers and both CP partners must take the same boundary. Decode-only
+        # overlap and CUDA graph replay remain unchanged.
+        if (
+            self.require_mlp_sync
+            and get_parallel().attn_cp_size > 1
+            and get_exec().features.enable_decoder_swa_bounded_replay
+            and (batch_is_extend or last_batch_is_extend)
+            and self.result_queue
+        ):
+            disable_overlap_for_batch = True
+
         # Sync so the FSM advance lands before the next batch's bitmask. Permanent
         # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (

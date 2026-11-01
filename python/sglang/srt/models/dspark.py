@@ -121,7 +121,14 @@ _CONFIDENCE = Invariant(
 def gather_and_crop_vocab(
     local_logits: torch.Tensor, lm_head: nn.Module
 ) -> torch.Tensor:
-    full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
+    # Follow the *head's* weight partition, not the draft's execution scope.
+    # With DP LM heads, full TP includes unrelated requests (and CP replicas).
+    # Prefill-only CP keeps an attention-TP=1 head even when decode attention
+    # temporarily slices its weights across the CP group.
+    if getattr(lm_head, "use_attn_tp_group", False):
+        full_logits = get_parallel().attn_tp_group.all_gather(local_logits, dim=-1)
+    else:
+        full_logits = tensor_model_parallel_all_gather(local_logits, dim=-1)
     return full_logits[..., : int(lm_head.org_vocab_size)]
 
 

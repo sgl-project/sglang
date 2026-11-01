@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -930,6 +931,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        del get_embedding, pp_proxy_tensors
+        # Context is injected from the gathered target hidden states; the draft
+        # block must never inherit the target prefill's token-sharded CP layout.
+        # A static CP group is fine: maybe_use_decode_attn_tp slices attention
+        # heads while every CP partner retains the same DP-local draft rows.
+        if is_cp_active(forward_batch):
+            raise ValueError(
+                "DSpark draft blocks do not support active context parallelism."
+            )
         if not _is_cuda:
             return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
         from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
