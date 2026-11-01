@@ -624,7 +624,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
-    # Unlimited-OCR v2: the decode CUDA graph loads input_ids and positions itself.
+    # the decode graph owns input_ids and positions until replay or eager fallback
     input_ids_from_graph: bool = False
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===

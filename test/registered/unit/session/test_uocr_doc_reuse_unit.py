@@ -453,7 +453,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
             kept=[(0, 32), (128, 192)],
         )
         owner = object.__new__(UnifiedRadixCache)
-        owner.page_size = 32
+        owner.tree_core = SimpleNamespace(page_size=32)
         owner.session = SimpleNamespace(slots={})
         owner.uocr_doc_reuse = cache.reuse
         observer = SchedulerPoolStatsObserver(
