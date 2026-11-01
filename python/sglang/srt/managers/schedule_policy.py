@@ -1383,6 +1383,19 @@ class PrefillAdder:
         if self.tree_cache.buffer_pipeline is not None:
             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
 
+    @staticmethod
+    def release_request_slot(tree_cache, waiting_queue) -> bool:
+        """reclaim a cache-owned request row when admission has no free row"""
+        return False
+
+    def should_defer(self, req: Req) -> bool:
+        """whether admission must wait before staging cache transfers for this candidate"""
+        return False
+
+    def batch_is_full_after_rejection(self, req: Req) -> bool:
+        """whether running work must finish before another admission attempt"""
+        return bool(self.can_run_list) or not self.running_batch.is_empty()
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):

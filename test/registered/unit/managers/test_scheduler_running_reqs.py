@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
@@ -292,7 +292,7 @@ class TestRunningReqsHooks(CustomTestCase):
             kv=SimpleNamespace(holds_mamba=False),
         )
 
-        class _Adder:
+        class _Adder(PrefillAdder):
             def __init__(self, page_size, tree_cache, allocator, batch, *_, **__):
                 self.running_batch = batch
                 self.can_run_list = []

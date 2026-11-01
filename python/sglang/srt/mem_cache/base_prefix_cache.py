@@ -720,6 +720,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
+    def retained_window_tokens(self) -> int:
+        """KV tokens held outside the prefix tree and streaming-session records"""
+        return 0
+
+    def retained_window_req_count(self) -> int:
+        """request rows retained outside streaming-session records"""
+        return 0
+
     def session_records(self) -> dict[str, ReqKvInfo]:
         """The KV records sessions own, by session id. Pool accounting counts them
         as session-held, including while a request runs on one."""

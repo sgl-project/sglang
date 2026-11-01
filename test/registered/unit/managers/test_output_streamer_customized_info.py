@@ -39,7 +39,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     hide_forced_text,
     req_state,
 )
-from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+    UocrSchedulerRuntime,
+)
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -1141,7 +1143,7 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
     def test_skipped_output_prefix_becomes_detokenizer_context(self):
         outputs = []
         streamer = _streamer(outputs)
-        streamer.uocr_doc_hooks = object.__new__(UocrDocHooks)
+        streamer.uocr_runtime = object.__new__(UocrSchedulerRuntime)
         req = self._req()
         req.output_ids.extend(array("q", [900, 901]))
         req_state(req).forced_len = 2

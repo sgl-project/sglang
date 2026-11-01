@@ -14,7 +14,9 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 )
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
-from sglang.srt.models.unlimited_ocr_v2_support.scheduler_hooks import UocrDocHooks
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+    UocrSchedulerRuntime,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,7 +45,7 @@ def _decode_batch():
     batch.return_logprob = False
     batch.sampling_info = sampling
     batch.prefill_input_ids_cpu = None
-    batch.uocr_graph_io_deferred = False
+    batch.input_ids_from_graph = False
     return batch
 
 
@@ -55,7 +57,7 @@ def _graph_io():
 
 def _hooks(current_io):
     """Hooks whose decode-graph I/O is whatever ``current_io()`` returns."""
-    return UocrDocHooks(
+    return UocrSchedulerRuntime(
         tree_cache=Mock(),
         attn_backend=object(),
         early_embeddings=None,
@@ -63,6 +65,8 @@ def _hooks(current_io):
         forward_stream=None,
         tp_size=1,
         decode_graph_io=current_io,
+        crop_transfer=Mock(),
+        enable_overlap=False,
     )
 
 
@@ -130,7 +134,7 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.future_map = _future_map()
         scheduler.future_map.output_tokens_buf.zero_()
-        scheduler.uocr_doc_hooks = _hooks(lambda: graph_io)
+        scheduler.uocr_runtime = _hooks(lambda: graph_io)
         scheduler.beam_coordinator = Mock()
         scheduler.chunked_req = None
 
@@ -186,11 +190,11 @@ class TestDecodeGraphRecapture(CustomTestCase):
         future_map = _future_map()
         future_map.output_tokens_buf.copy_(torch.arange(ROWS) + 100)
         batch = _decode_batch()
-        self.assertTrue(hooks.prepare_forward_inputs(batch, future_map))
+        self.assertTrue(hooks.resolve_forward_inputs(batch, future_map))
 
         ios.append(_graph_io())
         hooks._reuse._input_overrides[3] = 7
-        self.assertTrue(hooks.prepare_forward_inputs(batch, future_map))
+        self.assertTrue(hooks.resolve_forward_inputs(batch, future_map))
         want = (torch.arange(ROWS) + 100).tolist()
         want[3] = 7
         self.assertEqual(ios[-1].relay.tolist(), want)
@@ -241,12 +245,8 @@ class TestUocrCollaboratorsStayOffForOtherModels(CustomTestCase):
                 scheduler = _scheduler_for(arch, stage)
                 scheduler.tree_cache = Mock()
                 scheduler._target_model_runner = Mock()
-                scheduler.maybe_init_uocr_doc_hooks()
-                scheduler.maybe_init_uocr_crop_transfer()
-                scheduler.maybe_init_deferred_overlap_release()
-                self.assertIsNone(scheduler.uocr_doc_hooks)
-                self.assertIsNone(scheduler.uocr_crop_transfer)
-                self.assertIsNone(scheduler.deferred_overlap_release)
+                scheduler.maybe_init_uocr_runtime()
+                self.assertIsNone(scheduler.uocr_runtime)
                 scheduler.tree_cache.enable_uocr_doc_reuse.assert_not_called()
                 scheduler._target_model_runner.assert_not_called()
                 self.assertIsNone(
@@ -271,14 +271,14 @@ class TestUocrCollaboratorsStayOffForOtherModels(CustomTestCase):
         scheduler._target_model_runner = Mock(
             return_value=SimpleNamespace(
                 attn_backend=backend,
-                model=SimpleNamespace(early_embeddings=None),
+                model=SimpleNamespace(early_embeddings=None, crop_transfer=Mock()),
                 device="cpu",
                 forward_stream=None,
                 decode_cuda_graph_runner=None,
             )
         )
         with get_parallel().override(tp_size=1):
-            scheduler.maybe_init_uocr_doc_hooks()
+            scheduler.maybe_init_uocr_runtime()
         reuse = tree_cache.uocr_doc_reuse
         self.assertIsNotNone(reuse)
         self.assertIs(backend.doc_reuse, reuse)
@@ -313,7 +313,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         hooks._reuse.docs["doc"] = object()
         seen = []
         scheduler = object.__new__(Scheduler)
-        scheduler.uocr_doc_hooks = hooks
+        scheduler.uocr_runtime = hooks
         scheduler._engine_paused = False
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()

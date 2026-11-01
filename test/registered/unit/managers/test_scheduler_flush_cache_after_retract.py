@@ -9,6 +9,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -34,6 +37,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None
