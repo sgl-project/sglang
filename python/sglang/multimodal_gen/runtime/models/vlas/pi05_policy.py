@@ -53,6 +53,9 @@ from sglang.multimodal_gen.runtime.vla.parallel import (
     broadcast_tensor_from_rank,
     get_vla_split_group,
 )
+from sglang.multimodal_gen.runtime.vla.pi05_camera_layout import (
+    prune_fully_masked_cameras,
+)
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
@@ -852,13 +855,19 @@ class Pi05PolicyModel(nn.Module):
         else:
             logger.info("Pi05 weights loaded successfully")
 
+    def _prefix_camera_order(self, observation: VLAObservationBatch) -> tuple[str, ...]:
+        camera_order = tuple(observation.metadata.get("camera_order", ()))
+        if self.config.drop_masked_cameras:
+            return prune_fully_masked_cameras(camera_order, observation.image_masks)
+        return camera_order
+
     def build_prefix_cache_key(
         self,
         observation: VLAObservationBatch,
         *,
         bucket_prompt: bool = False,
     ) -> str:
-        camera_order = tuple(observation.metadata.get("camera_order", ()))
+        camera_order = self._prefix_camera_order(observation)
         image_hashes = {
             name: tensor_fingerprint(observation.images[name]) for name in camera_order
         }
@@ -946,7 +955,7 @@ class Pi05PolicyModel(nn.Module):
         use_cuda_graph: bool = True,
         bucket_prompt: bool | None = None,
     ) -> PrefixContext:
-        camera_order = tuple(observation.metadata.get("camera_order", ()))
+        camera_order = self._prefix_camera_order(observation)
         images = [
             observation.images[name].to(self.device, dtype=torch.float32)
             for name in camera_order

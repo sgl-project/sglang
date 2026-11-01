@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.vla.cuda_graph import (
 )
 from sglang.multimodal_gen.runtime.vla.observation import VLAObservationBatch
 from sglang.multimodal_gen.runtime.vla.parallel import VLASplitGroup
+from sglang.multimodal_gen.runtime.vla.pi05_camera_layout import (
+    prune_fully_masked_cameras,
+)
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
@@ -401,6 +404,113 @@ def _recording_policy(config: Pi05PipelineConfig) -> Pi05PolicyModel:
     model.prefix_graph_runner = _RecordingPrefixRunner()
     model._prompt_token_bucketing_enabled = lambda: bool(config.prompt_token_buckets)
     return model
+
+
+def _observation_with_camera_masks(masks) -> VLAObservationBatch:
+    observation = _observation_with_token_len(9)
+    observation.images = {
+        name: torch.zeros(1, 3, 4, 4) for name in ("front", "empty", "wrist")
+    }
+    observation.image_masks = {
+        name: torch.tensor([present], dtype=torch.bool)
+        for name, present in zip(observation.images, masks, strict=True)
+    }
+    observation.metadata["camera_order"] = tuple(observation.images)
+    return observation
+
+
+def test_masked_camera_pruning_is_opt_in_and_preserves_camera_protocol():
+    observation = _observation_with_camera_masks((True, False, True))
+    baseline = _recording_policy(Pi05PipelineConfig())
+    optimized = _recording_policy(Pi05PipelineConfig(drop_masked_cameras=True))
+
+    baseline_signature = baseline.encode_prefix(observation)
+    optimized_signature = optimized.encode_prefix(observation)
+
+    assert baseline_signature.static_layout[0] == 3
+    assert optimized_signature.static_layout[0] == 2
+    assert baseline_signature != optimized_signature
+    assert optimized_signature.static_layout[1] is True
+    assert tuple(observation.images) == ("front", "empty", "wrist")
+    assert observation.metadata["camera_order"] == ("front", "empty", "wrist")
+    assert optimized.config.image_keys == baseline.config.image_keys
+
+
+def test_masked_camera_presence_change_gets_a_different_graph_signature():
+    optimized = _recording_policy(Pi05PipelineConfig(drop_masked_cameras=True))
+
+    missing = optimized.encode_prefix(
+        _observation_with_camera_masks((True, False, True))
+    )
+    present = optimized.encode_prefix(
+        _observation_with_camera_masks((True, True, True))
+    )
+
+    assert missing != present
+    assert (missing.static_layout[0], present.static_layout[0]) == (2, 3)
+
+
+def test_masked_camera_pruning_changes_the_prefix_cache_layout_key():
+    observation = _observation_with_camera_masks((True, False, True))
+    baseline = _recording_policy(Pi05PipelineConfig())
+    optimized = _recording_policy(Pi05PipelineConfig(drop_masked_cameras=True))
+    for model in (baseline, optimized):
+        model.dtype = torch.bfloat16
+        model.model_path = "lerobot/pi05_libero_base"
+
+    assert baseline.build_prefix_cache_key(
+        observation
+    ) != optimized.build_prefix_cache_key(observation)
+
+
+def test_camera_pruning_keeps_mixed_batch_masks_and_camera_order():
+    masks = {
+        "front": torch.tensor([True, True]),
+        "empty": torch.tensor([False, False]),
+        "wrist": torch.tensor([False, True]),
+    }
+
+    assert prune_fully_masked_cameras(tuple(masks), masks) == ("front", "wrist")
+
+
+def test_camera_pruning_preserves_the_all_masked_fallback():
+    masks = {name: torch.zeros(2, dtype=torch.bool) for name in ("front", "wrist")}
+
+    assert prune_fully_masked_cameras(tuple(masks), masks) == tuple(masks)
+
+
+def test_camera_pruning_does_not_read_device_mask_values():
+    class UnreadableDeviceMask:
+        device = SimpleNamespace(type="cuda")
+
+        def any(self):
+            pytest.fail("Pruning must not synchronize a device mask to the host")
+
+    masks = {"front": UnreadableDeviceMask(), "empty": torch.tensor([False])}
+
+    assert prune_fully_masked_cameras(tuple(masks), masks) == ("front",)
+
+
+def test_camera_pruning_preserves_effective_positions():
+    camera_masks = {
+        "front": torch.tensor([True, True]),
+        "empty": torch.tensor([False, False]),
+        "wrist": torch.tensor([False, True]),
+    }
+    retained = prune_fully_masked_cameras(tuple(camera_masks), camera_masks)
+    text_masks = torch.tensor([[True, True, False], [True, True, True]])
+    original = torch.cat(
+        [*[mask[:, None].expand(2, 2) for mask in camera_masks.values()], text_masks],
+        dim=1,
+    )
+    pruned = torch.cat(
+        [*[camera_masks[name][:, None].expand(2, 2) for name in retained], text_masks],
+        dim=1,
+    )
+    keep = torch.tensor([0, 1, 4, 5, 6, 7, 8])
+
+    assert torch.equal(original.cumsum(1)[:, keep] - 1, pruned.cumsum(1) - 1)
+    assert torch.equal(original.sum(1), pruned.sum(1))
 
 
 def test_default_prefix_graph_keeps_exact_prompt_signatures():

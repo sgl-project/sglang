@@ -46,6 +46,8 @@ class Pi05PipelineConfig(PipelineConfig):
     enable_segmented_actions: bool = False
 
     enable_global_prefix_cache: bool = False
+    # Opt-in: pruning changes reduction shapes and requires policy-quality validation.
+    drop_masked_cameras: bool = False
     enable_prefix_cuda_graph: bool = True
     # Opt-in prompt buckets shared by prefix and action CUDA graphs. Padding
     # changes reduction shapes, so exact prompt lengths remain the default.
