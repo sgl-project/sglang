@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 import re
 from array import array
 from functools import partial
@@ -109,11 +110,13 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     ceil_align,
+    is_gfx95_supported,
     is_non_idle_and_non_empty,
     make_pp_layers,
 )
@@ -121,6 +124,38 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+
+def _is_target_mimo_megamoe_eligible(config, tp_size: int, ep_size: int) -> bool:
+    return (
+        envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+        and os.getenv("AITER_MEGA_SMALL_M") == "1"
+        and get_platform().is_hip
+        and is_gfx95_supported()
+        and not get_flags().moe.in_speculative_scope
+        and tp_size == 8
+        and ep_size == 8
+        and config.hidden_size == 6144
+        and config.moe_intermediate_size == 2048
+        and config.n_routed_experts == 384
+        and config.num_experts_per_tok == 8
+        and config.n_routed_experts % ep_size == 0
+        and config.n_routed_experts // ep_size <= 64
+    )
+
+
+def _mimo_megamoe_layer_enabled(layer_id: int) -> bool:
+    specification = os.getenv("SGLANG_MIMO_MEGA_LAYERS", "all")
+    if specification == "all":
+        return True
+    for item in specification.split(","):
+        if "-" in item:
+            start, stop = (int(value) for value in item.split("-", 1))
+            if start <= layer_id <= stop:
+                return True
+        elif item and int(item) == layer_id:
+            return True
+    return False
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -423,6 +458,11 @@ class MiMoV2MoE(nn.Module):
 
         self.config = config
         self.layer_id = layer_id
+        self._use_target_mega_moe = _is_target_mimo_megamoe_eligible(
+            config,
+            self.tp_size,
+            get_parallel().moe_ep_size,
+        )
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -538,11 +578,35 @@ class MiMoV2MoE(nn.Module):
             if name not in ["correction_bias"]
         ]
 
+    def _mega_moe_router_logits(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ) -> torch.Tensor:
+        return self.gate(hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor | MoeDeferredFinalize:
+        if (
+            self._use_target_mega_moe
+            and _mimo_megamoe_layer_enabled(self.layer_id)
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+                forward_mega_moe,
+                should_use_mega_moe,
+            )
+
+            if not getattr(self.experts, "_mega_moe_weights_built", False):
+                build_mega_moe_experts_weights(self.experts)
+            if should_use_mega_moe(self, hidden_states):
+                return forward_mega_moe(self, hidden_states, forward_batch)
+
         if not self._enable_a2a_moe:
             return self.forward_normal(hidden_states)
         else:
