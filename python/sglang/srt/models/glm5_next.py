@@ -1,3 +1,4 @@
+import functools
 import logging
 from array import array
 from contextlib import nullcontext
@@ -7,10 +8,17 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.fused_op import get_fused_op_backend
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.gemm import fp8_scaled_mm
+from sglang.kernels.ops.gemm.fp8_kernel import (
+    get_w8a8_channelwise_fp8_config,
+    triton_scaled_mm,
+)
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
@@ -57,6 +65,11 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    cutlass_fp8_supported,
+    use_triton_w8a8_fp8_kernel,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -114,9 +127,12 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_exec,
     get_lora,
     get_mm,
+    get_model,
     get_parallel,
     get_spec,
     linear_attn_parallel_group,
@@ -127,6 +143,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_device_capability,
     log_info_on_rank0,
     make_pp_layers,
     set_weight_attrs,
@@ -147,6 +164,203 @@ _MHC_POST_MULT_VALUE = 2.0
 # hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
 # 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+
+# The fused input projection runs qkv_proj, f_a_proj and g_a_proj (with b_proj) as
+# one GEMM, so they switch to FP8 together.
+_KDA_FP8_INPUT_MODULES = frozenset({"qkv_proj", "f_a_proj", "g_a_proj"})
+_KDA_FP8_MODULES = _KDA_FP8_INPUT_MODULES | {"o_proj"}
+_KDA_FP8_UNSUPPORTED_LOAD_FORMATS = (
+    "remote_instance",
+    "sharded_state",
+    "presharded",
+    "remote",
+)
+
+
+def _kda_fp8_modules() -> frozenset:
+    modules = frozenset(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+    if not modules:
+        return modules
+    if unknown := modules - _KDA_FP8_MODULES:
+        raise ValueError(
+            f"Unknown SGLANG_OPT_GLM53_KDA_PTPC_MODULES modules {sorted(unknown)}; "
+            f"supported: {sorted(_KDA_FP8_MODULES)}"
+        )
+    if modules & _KDA_FP8_INPUT_MODULES not in (frozenset(), _KDA_FP8_INPUT_MODULES):
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES must select qkv_proj, f_a_proj "
+            "and g_a_proj together"
+        )
+    # Measured on H200 and H20; the GPU test runs on H100, H200 and H20.
+    if not cutlass_fp8_supported() or get_device_capability()[0] != 9:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires a Hopper GPU (SM90)"
+        )
+    if envs.SGLANG_FORCE_FP8_MARLIN.get():
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES runs FP8 GEMMs; unset SGLANG_FORCE_FP8_MARLIN"
+        )
+    # LoRA wraps the projections in layers this path is not tested with.
+    if get_lora().enable_lora or get_lora().lora_paths:
+        raise ValueError("SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with LoRA")
+    # These formats copy a seed's or a saved model's processed tensors into parameters
+    # built from the checkpoint; a transfer-engine seed serves its FP8 tensors to them.
+    load_format = get_model().load_format
+    if load_format in _KDA_FP8_UNSUPPORTED_LOAD_FORMATS:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            f"--load-format {load_format}: the KDA projections are quantized at load"
+        )
+    if get_model().remote_instance_weight_loader_start_seed_via_transfer_engine:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine: "
+            "the KDA projections are quantized at load"
+        )
+    # Without an expert backup, elastic EP reloads lost experts with
+    # update_weights_from_disk, which these projections refuse, and it does not check
+    # the refusal.
+    if get_exec().moe.elastic_ep_backend is not None:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--elastic-ep-backend: the KDA projections are quantized at load"
+        )
+    # The FP8 path picks its kernel by token count, so outputs change with the batch.
+    if get_exec().deterministic.enable_deterministic_inference:
+        raise ValueError(
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
+            "--enable-deterministic-inference: the FP8 kernel depends on the batch size"
+        )
+    _warn_kda_fp8_experimental()
+    return modules
+
+
+@functools.cache  # once per process (each rank logs it); the check runs for every KDA layer
+def _warn_kda_fp8_experimental() -> None:
+    logger.warning(
+        "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is experimental: "
+        "accuracy is not validated across workloads."
+    )
+
+
+class _KdaFp8Config(Fp8Config):
+    def get_quant_method(self, layer: nn.Module, prefix: str) -> Fp8LinearMethod:
+        return _KdaFp8LinearMethod(self)
+
+
+class _KdaFp8LinearMethod(Fp8LinearMethod):
+    """Online FP8 for a BF16 KDA projection."""
+
+    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
+        # The BF16 weight gets a pool of its own: a tensor sharing its allocator
+        # segment would keep the segment from being released after quantization.
+        self._bf16_pool = torch.cuda.MemPool() if torch.cuda.is_available() else None
+        self._quantized = False
+        with self._use_bf16_pool():
+            super().create_weights(layer, *args, **kwargs)
+
+    def _use_bf16_pool(self):
+        if self._bf16_pool is None:
+            return nullcontext()
+        return torch.cuda.use_mem_pool(self._bf16_pool)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        # end_weight_update runs post-load processing again; the weights are FP8 already,
+        # and updates through sglang are refused before they write.
+        if self._quantized:
+            return
+        weight = layer.weight.data
+        # apply_fp8_linear takes the CUTLASS GEMM only when N % 16 == 0.
+        if pad := -weight.shape[0] % 16:
+            with self._use_bf16_pool():
+                layer.weight.data = F.pad(weight, (0, 0, 0, pad))
+        del weight
+        # With no reference left, empty_cache() releases the pool once the loader
+        # drops the BF16 tensors, which happens after this method returns.
+        self._bf16_pool = None
+        super().process_weights_after_loading(layer)
+        # Releases the previous projection's pool now rather than at the end of loading.
+        torch.cuda.empty_cache()
+        layer._derived_weight_cache_error = (
+            "Online weight updates are not supported with "
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load. "
+            "Unset it and restart to update weights."
+        )
+        layer._weight_export_error = (
+            "Weight export is not supported with "
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load. "
+            "Unset it and restart to export weights."
+        )
+        # The cases where apply_fp8_linear takes its dynamic per-token CUTLASS path;
+        # it also needs K % 16 == 0 (N is padded above).
+        self._dynamic_per_token = not (
+            self.use_marlin
+            or use_triton_w8a8_fp8_kernel
+            or layer.input_scale is not None
+            or layer.weight.shape[0] % 16
+        )
+        self._use_tuned_tiles = envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+        # An out-of-tree platform may replace the kernel fp8_scaled_mm selects.
+        self._in_tree_platform = not current_platform.is_out_of_tree()
+        self._quantized = True
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._dynamic_per_token and bias is None:
+            out = self._apply_dynamic_per_token(layer=layer, x=x)
+        else:
+            out = super().apply(layer, x, bias)
+        return out[..., : layer.output_size_per_partition]
+
+    def _apply_dynamic_per_token(
+        self, layer: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor:
+        # The kernels apply_fp8_linear picks here, minus its per-call branching,
+        # whose host time eager prefill pays on every projection.
+        weight, weight_scale = layer.weight, layer.weight_scale
+        x_2d = x.view(-1, x.shape[-1])
+        num_tokens = x_2d.shape[0]
+        x_q, x_scale = sglang_per_token_quant_fp8(x_2d)
+        tile = (
+            get_w8a8_channelwise_fp8_config(
+                N=weight.shape[1], K=weight.shape[0], M=num_tokens
+            )
+            if self._use_tuned_tiles
+            else None
+        )
+        if tile is not None:
+            out = triton_scaled_mm(
+                x_q,
+                weight,
+                x_scale,
+                weight_scale,
+                x.dtype,
+                None,
+                block_size_m=tile["BLOCK_SIZE_M"],
+                block_size_n=tile["BLOCK_SIZE_N"],
+                block_size_k=tile["BLOCK_SIZE_K"],
+                use_heuristic=False,
+                num_warps=tile["num_warps"],
+                num_stages=tile["num_stages"],
+            )
+        elif (
+            num_tokens < 8192
+            and self._in_tree_platform
+            and get_fused_op_backend() is None
+        ):
+            import sgl_kernel
+
+            # fp8_scaled_mm selects this kernel below 8192 rows unless a backend is forced.
+            out = sgl_kernel.fp8_scaled_mm(
+                x_q, weight, x_scale, weight_scale, x.dtype, None
+            )
+        else:
+            out = fp8_scaled_mm(x_q, weight, x_scale, weight_scale, out_dtype=x.dtype)
+        return out.view(*x.shape[:-1], weight.shape[1])
 
 
 @torch.compile
@@ -424,6 +638,26 @@ class Glm5NextLinearAttention(nn.Module):
         self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
             quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
         )
+        fp8_modules = _kda_fp8_modules()
+        fp8_input_proj = _KDA_FP8_INPUT_MODULES <= fp8_modules
+        if fp8_input_proj and not self.do_fuse_qkvbfg:
+            raise ValueError(
+                "SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj needs "
+                "the fused [q|k|v|b|f_a|g_a] projection; the quant config must support "
+                "the fusion and leave these projections in BF16"
+            )
+        if (
+            "o_proj" in fp8_modules
+            and quant_config is not None
+            and not quant_config.is_linear_unquantized(f"{prefix}.o_proj")
+        ):
+            raise ValueError(
+                "SGLANG_OPT_GLM53_KDA_PTPC_MODULES=o_proj needs a BF16 o_proj in the checkpoint"
+            )
+        # The checkpoint keeps these projections BF16; quantize them on load.
+        fp8_online_config = (
+            _KdaFp8Config(is_checkpoint_fp8_serialized=False) if fp8_modules else None
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -437,7 +671,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=None,
+                quant_config=fp8_online_config if fp8_input_proj else None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 parallel_group=head_parallel_group,
             )
@@ -569,7 +803,9 @@ class Glm5NextLinearAttention(nn.Module):
             projection_size,
             self.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=(
+                fp8_online_config if "o_proj" in fp8_modules else quant_config
+            ),
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
             parallel_group=head_parallel_group,
