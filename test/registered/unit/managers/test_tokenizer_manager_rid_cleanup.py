@@ -35,12 +35,15 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortBroadcastReq,
     AbortReq,
     BatchStrOutput,
+    BatchTokenizedGenerateReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     RequestOutputStats,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (  # noqa: E402
     MultiTokenizerRouter,
+    PendingAbortTable,
     TokenizerWorker,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
@@ -1564,6 +1567,7 @@ class TestAbortForwardBroadcast(CustomTestCase):
         router.send_to_scheduler = object()
         router.all_worker_ipcs = {"ipc_a", "ipc_b"}
         router.socket_mapping = Mock()
+        router.pending_aborts = PendingAbortTable()
         return router
 
     def test_non_owner_abort_is_marked_forward(self):
@@ -1666,6 +1670,171 @@ class TestAbortForwardBroadcast(CustomTestCase):
         tm._dispatch_to_scheduler = Mock()
         TokenizerWorker._handle_abort_broadcast(tm, AbortBroadcastReq(rid="nobody"))
         tm._dispatch_to_scheduler.assert_not_called()
+
+
+def _tokenized(rid):
+    return TokenizedGenerateReqInput(
+        rid=rid,
+        input_text="",
+        input_ids=[],
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=None,
+        return_logprob=False,
+        logprob_start_len=0,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+    )
+
+
+class TestPendingAbortRefire(CustomTestCase):
+    """An abort for a rid no worker holds yet must still take effect.
+
+    Under load the owner's generate_request can start seconds after the abort
+    arrives, so the broadcast finds no owner and the forwarded abort is dropped
+    by the scheduler; the request then runs (and on a PD decode server holds
+    its preallocated KV until the transfer timeout). The router records such a
+    rid and aborts its generate when it finally passes.
+    """
+
+    @staticmethod
+    def _make_router():
+        router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+        router.send_to_scheduler = object()
+        router.all_worker_ipcs = {"ipc_a", "ipc_b"}
+        router.socket_mapping = Mock()
+        router.pending_aborts = PendingAbortTable()
+        return router
+
+    @staticmethod
+    def _sched_patch():
+        return patch(
+            "sglang.srt.managers.multi_tokenizer_mixin.async_sock_send",
+            new=AsyncMock(),
+        )
+
+    @staticmethod
+    def _sched_msgs(send):
+        return [c.args[1] for c in send.await_args_list]
+
+    def test_claim_clears_entry_but_duplicate_forward_does_not(self):
+        router = self._make_router()
+        with self._sched_patch():
+
+            async def drive():
+                await router._route_worker_obj(AbortReq(rid="early", forward=True))
+                await router._route_worker_obj(AbortReq(rid="early", forward=True))
+                self.assertIn("early", router.pending_aborts)
+                self.assertEqual(router.pending_aborts.counters["refreshed"], 1)
+                await router._route_worker_obj(AbortReq(rid="early"))
+                self.assertNotIn("early", router.pending_aborts)
+                self.assertEqual(router.pending_aborts.counters["claimed"], 1)
+
+            asyncio.run(drive())
+
+    def test_refire_kills_the_late_generate_once(self):
+        router = self._make_router()
+        with self._sched_patch() as send:
+
+            async def drive():
+                await router._route_worker_obj(AbortReq(rid="early", forward=True))
+                await router._route_worker_obj(_tokenized("early"))
+                await router._route_worker_obj(_tokenized("early"))
+
+            asyncio.run(drive())
+        kinds = [
+            (type(m).__name__, getattr(m, "rid", None)) for m in self._sched_msgs(send)
+        ]
+        # forward abort, generate, refired abort, then the second generate clean.
+        self.assertEqual(
+            kinds,
+            [
+                ("AbortReq", "early"),
+                ("TokenizedGenerateReqInput", "early"),
+                ("AbortReq", "early"),
+                ("TokenizedGenerateReqInput", "early"),
+            ],
+        )
+        self.assertFalse(self._sched_msgs(send)[2].forward)
+        self.assertEqual(router.pending_aborts.counters["refired"], 1)
+
+    def test_batch_refire_forwards_whole_batch_then_one_abort(self):
+        router = self._make_router()
+        batch = BatchTokenizedGenerateReqInput(
+            batch=[_tokenized("hit"), _tokenized("miss")]
+        )
+        with self._sched_patch() as send:
+
+            async def drive():
+                await router._route_worker_obj(AbortReq(rid="hit", forward=True))
+                await router._route_worker_obj(batch)
+
+            asyncio.run(drive())
+        msgs = self._sched_msgs(send)
+        self.assertIs(msgs[1], batch)
+        self.assertEqual(
+            [(type(m).__name__, getattr(m, "rid", None)) for m in msgs[2:]],
+            [("AbortReq", "hit")],
+        )
+
+    def test_rebroadcast_until_claimed_and_expiry_pops(self):
+        router = self._make_router()
+        router.pending_aborts.REBROADCAST_DELAYS = (0.02,)
+        router.pending_aborts.TTL = 0.08
+
+        with self._sched_patch():
+
+            async def drive():
+                await router._route_worker_obj(AbortReq(rid="early", forward=True))
+                first = router.socket_mapping.send_output.call_count
+                await asyncio.sleep(0.05)
+                rebroadcast = router.socket_mapping.send_output.call_count - first
+                await asyncio.sleep(0.08)
+                return first, rebroadcast
+
+            first, rebroadcast = asyncio.run(drive())
+        self.assertEqual(first, 2)  # the initial broadcast, both workers
+        self.assertEqual(rebroadcast, 2)  # one rebroadcast, both workers
+        self.assertNotIn("early", router.pending_aborts)
+        self.assertEqual(router.pending_aborts.counters["expired"], 1)
+
+    def test_any_output_clears_the_entry(self):
+        router = self._make_router()
+        with self._sched_patch() as send:
+
+            async def drive():
+                await router._route_worker_obj(AbortReq(rid="racing", forward=True))
+                # A streamed chunk for the rid: the scheduler knows it.
+                out = AbortReq(rid="racing", http_worker_ipc="ipc_a")
+                await router._distribute_result_to_workers(out)
+                await router._route_worker_obj(_tokenized("racing"))
+
+            asyncio.run(drive())
+        self.assertEqual(router.pending_aborts.counters["output_cleared"], 1)
+        # No refire: the entry was cleared before the generate passed.
+        kinds = [type(m).__name__ for m in self._sched_msgs(send)]
+        self.assertEqual(kinds.count("AbortReq"), 1)
+
+    def test_abort_all_is_not_recorded(self):
+        router = self._make_router()
+        with self._sched_patch():
+            asyncio.run(router._route_worker_obj(AbortReq(rid="", abort_all=True)))
+        self.assertEqual(len(router.pending_aborts), 0)
+
+    def test_owner_claims_even_when_abort_already_sent(self):
+        # abort_request dedups on abort_sent; the broadcast handler must still
+        # send a visible claim or the router's entry stays for the full TTL.
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        state = _make_req_state("dup_abort")
+        state.abort_sent = True
+        tm.rid_to_state["dup_abort"] = state
+        TokenizerWorker._handle_abort_broadcast(tm, AbortBroadcastReq(rid="dup_abort"))
+        (sent,) = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertIsInstance(sent, AbortReq)
+        self.assertEqual((sent.rid, sent.forward), ("dup_abort", False))
 
 
 class TestLoRARequestLifecycle(CustomTestCase):
