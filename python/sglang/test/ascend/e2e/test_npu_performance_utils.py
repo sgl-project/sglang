@@ -185,7 +185,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
 )
 # DeepSeek-V4-Flash default model for a5 testcase
 DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash"
+    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
@@ -1002,7 +1002,7 @@ def assert_metrics(self, metrics):
             "--speculative-num-draft-tokens not found in other_args "
             "while accept_rate baseline is set",
         )
-        self.assertGreaterEqual(
+        self.assertGreater(
             float(metrics["accept_length"]) / spec_num_draft_tokens,
             self.accept_rate,
         )
