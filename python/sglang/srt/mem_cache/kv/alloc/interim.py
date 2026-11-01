@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.band import (
     FloatBand,
     _float_open_short_side,
-    flush_deferred_free_group,
     relieve_for_alloc,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
@@ -26,18 +25,15 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     ends_can_reserve,
     ends_fit,
     ends_realization,
-    ends_reclaim_plan,
     float_available_tokens,
     float_byte_shortfall,
     float_can_reserve,
     float_end_certificate,
     float_high_target,
-    float_reclaim_satisfied,
     float_token_id_capacity,
 )
-from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages
-from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
@@ -70,25 +66,10 @@ class _InterimPolicy:
             c, *args, **kwargs
         )
 
-    def evict_to_free_tokens(self, c: ChainAllocator, tree_cache, num_tokens: int):
-        return BaseTokenToKVPoolAllocator.evict_to_free_tokens(
-            c, tree_cache, num_tokens
-        )
-
     def prealloc_fits_assumes_reclaim(self, c: ChainAllocator) -> bool:
         """Whether decode-node preallocation reclaims the evictable entries its
         admission credits (`reclaim_for_prealloc`) before it takes."""
         return False
-
-    def reclaim_for_load_back(
-        self, c: ChainAllocator, tree_cache, full_tokens, swa_tokens, **demand
-    ) -> str | None:
-        """Reclaim before a host load pins its rows; None means ready. Chains
-        whose eviction has no named-demand protocol reclaim at the take."""
-        return None
-
-    def mamba_full_cache_donor(self, c: ChainAllocator):
-        return None
 
     def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
         """Each sub-pool's (capacity, available units) as observers report
@@ -128,22 +109,11 @@ class _OwnerEndPolicy(_InterimPolicy):
         # Widened like `size`: a logical token capacity, not a row count.
         return (c.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
-    def mamba_full_cache_donor(self, c: ChainAllocator):
-        return c if c.roles.state is not None else None
-
     def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
         return {
             c.roles.owner: (c.size, c.available_size()),
             **(_state_usage(c) if c.roles.state is not None else {}),
         }
-
-    def prepare_mamba_allocation(self, c: ChainAllocator, target_size: int) -> None:
-        """Make deferred Full reclaim visible to the Mamba capacity view."""
-        c.flush_deferred_full_frees()
-        if target_size > c.mamba_allocator.schedulable_available_size():
-            return
-        if target_size > c.mamba_allocator.available_size():
-            relieve_for_alloc(c.mamba_allocator, target_size)
 
 
 class _WindowPolicy(_InterimPolicy):
@@ -308,51 +278,6 @@ class _TokenEndsPolicy(_WindowPolicy):
     def prealloc_fits_assumes_reclaim(self, c):
         return True
 
-    def reclaim_for_load_back(self, c, tree_cache, full_tokens, swa_tokens, **demand):
-        return self.reclaim_for_prealloc(c, tree_cache, full_tokens, swa_tokens)
-
-    def reclaim_for_prealloc(
-        self, c: ChainAllocator, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
-        """Reclaim both sides together: freeing FULL pages can open SWA room
-        and the reverse, so the shared envelope is the only gate worth
-        re-checking."""
-        ready = c.evict_to_free_tokens(
-            tree_cache, full_tokens, swa_num_tokens=swa_tokens
-        )
-        if ready is None:
-            ready = c.ensure_capacity(full_tokens, swa_tokens)
-        if ready:
-            return None
-        return (
-            "Unified FULL/SWA byte reclamation insufficient: "
-            f"needed=({full_tokens}, {swa_tokens})"
-        )
-
-    def reclaim_plan(
-        self,
-        c: ChainAllocator,
-        full_tokens: int | float,
-        swa_tokens: int | float,
-        *,
-        full_evictable_tokens: int = 0,
-        swa_evictable_tokens: int = 0,
-        auxiliary_swa_evictable_tokens: int = 0,
-        empty_pool: bool = False,
-        prefer_swa: bool = False,
-    ) -> Optional[Tuple[int, int]]:
-        """Return cumulative FULL/SWA eviction targets, or None if impossible."""
-        return ends_reclaim_plan(
-            _snapshot(c),
-            self._ends(c),
-            full_tokens,
-            swa_tokens,
-            full_evictable_tokens=full_evictable_tokens,
-            swa_evictable_tokens=swa_evictable_tokens,
-            empty_pool=empty_pool,
-            prefer_swa=prefer_swa,
-        )
-
     def can_reserve(
         self,
         c: ChainAllocator,
@@ -415,55 +340,6 @@ class _TokenEndsPolicy(_WindowPolicy):
             c.roles.window: (c.current_swa_capacity, c.swa_available_size()),
         }
 
-    @rank_consensus(same_params=["num_tokens", "swa_num_tokens"], same_results=True)
-    def evict_to_free_tokens(
-        self,
-        c: ChainAllocator,
-        tree_cache,
-        num_tokens: int,
-        *,
-        swa_num_tokens: Optional[int] = None,
-    ) -> bool | None:
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-        if tree_cache is None or not tree_cache.supports_prefix_sharing():
-            return
-        # Read per call: storage attach/detach and PD role switches move both leaves.
-        memory = get_memory()
-        prefer_swa = (
-            memory.enable_hierarchical_cache
-            and memory.hicache_storage_backend is not None
-        ) or get_disagg().disaggregation_mode == "decode"
-        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        flush_deferred_free_group(
-            c,
-            (
-                c.free_group,
-                c.free_page_reps_group,
-                c.full_free_group,
-                c.full_page_reps_group,
-            ),
-        )
-        reclaim_plan = c.reclaim_plan(
-            num_tokens,
-            required_swa,
-            full_evictable_tokens=tree_cache.full_evictable_size(),
-            swa_evictable_tokens=tree_cache.swa_evictable_size(),
-            prefer_swa=prefer_swa,
-        )
-        if reclaim_plan is None:
-            return
-        full_reclaim, swa_reclaim = reclaim_plan
-        if full_reclaim or swa_reclaim:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim),
-                allocation_reclaim_satisfied=lambda: (
-                    c.reclaim_plan(num_tokens, required_swa) == (0, 0)
-                ),
-            )
-        # A zero-reclaim plan can still depend on compaction before allocation.
-        return c.ensure_capacity(num_tokens, required_swa)
-
 
 class _FloatChainPolicy(_WindowPolicy):
     """A slot end, the window floating in the middle, and the owner end:
@@ -518,28 +394,6 @@ class _FloatChainPolicy(_WindowPolicy):
             swa_evictable_tokens=swa_evictable_tokens,
             empty_pool=empty_pool,
         )
-
-    def reclaim_for_prealloc(
-        self, c: ChainAllocator, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
-        """Free room for a decode-node preallocation; None means it is ready.
-
-        Only the sliding-window side is reclaimed here; the full side is priced
-        by the caller's budget.
-        """
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-        available = c.swa_available_size()
-        if available < swa_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=swa_tokens - available)
-            )
-            available = c.swa_available_size()
-        if available < swa_tokens:
-            return (
-                f"SWA eviction insufficient: needed={swa_tokens}, available={available}"
-            )
-        return None
 
     def ensure_capacity(
         self, c: ChainAllocator, full_tokens: int, swa_tokens: int
@@ -630,17 +484,6 @@ class _FloatChainPolicy(_WindowPolicy):
                 flt = b
         _float_open_short_side(flt, demand)
 
-    def mamba_full_cache_donor(self, c: ChainAllocator):
-        return c
-
-    def prepare_mamba_allocation(self, c: ChainAllocator, target_size: int) -> None:
-        """Expose Full reclaim, then move the SWA float away from Mamba."""
-        c.flush_deferred_full_frees()
-        if target_size <= c.mamba_allocator.available_size():
-            return
-        c.full_attn_allocator.flush_for_allocation()
-        relieve_for_alloc(c.mamba_allocator, target_size)
-
     def swa_capacity_and_available(
         self, c: ChainAllocator, *, full_capacity, swa_capacity
     ):
@@ -662,103 +505,6 @@ class _FloatChainPolicy(_WindowPolicy):
             ),
             **_state_usage(c),
         }
-
-    @rank_consensus(same_params=["num_tokens"], same_results=True)
-    def evict_to_free_tokens(
-        self, c: ChainAllocator, tree_cache, num_tokens: int
-    ) -> bool | None:
-        if tree_cache is None or not tree_cache.supports_prefix_sharing():
-            return
-        if num_tokens <= 0:
-            return True
-        if c.free_group is not None:
-            c.flush_deferred_full_frees()
-        num_tokens = -(-num_tokens // c.page_size) * c.page_size
-        chain = self._chain(c)
-        # Immediate capacity needs no reclaim plan or layout preparation.
-        if (
-            float_token_id_capacity(_snapshot(c), chain, num_tokens)
-            and num_tokens <= c.available_size()
-        ):
-            return True
-
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-        full_reclaim = tree_cache.full_evictable_size()
-        if c._full_cap_reclaim(num_tokens) > full_reclaim:
-            return False
-        swa_reclaim = tree_cache.swa_evictable_size()
-        state_reclaim = tree_cache.mamba_evictable_size()
-        fa, sa, ma = (
-            c.full_attn_allocator,
-            c.swa_attn_allocator,
-            c.mamba_allocator,
-        )
-        if (
-            num_tokens // c.page_size
-            > fa.free_virtual_ids.numel() + full_reclaim // c.page_size
-            or num_tokens // c.page_size
-            > sa.num_pages
-            - sa.min_page_index
-            - sa._live_pages()
-            + swa_reclaim // c.page_size
-            or float_byte_shortfall(
-                _snapshot(c),
-                chain,
-                num_tokens,
-                full_reclaim=full_reclaim,
-                swa_reclaim=swa_reclaim,
-                state_reclaim=state_reclaim,
-            )
-            > 0
-        ):
-            return False
-        if c.ensure_capacity(num_tokens, num_tokens):
-            return True
-
-        # Quotas are cumulative logical counts within each phase. Token reclaim
-        # precedes state reclaim so Mamba-first tree ordering cannot skip it.
-        state_freed = 0
-        if full_reclaim or swa_reclaim:
-            result = tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens),
-                allocation_reclaim_satisfied=lambda: (
-                    not c._full_cap_reclaim(num_tokens)
-                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
-                ),
-            )
-            state_freed = result.mamba_num_evicted
-            if (
-                result.num_tokens_evicted
-                or result.swa_num_tokens_evicted
-                or state_freed
-            ) and c.ensure_capacity(num_tokens, num_tokens):
-                return True
-
-        pair_bytes = (
-            num_tokens
-            // c.page_size
-            * (fa.entry_bytes_per_page + sa.entry_bytes_per_page)
-        )
-        state_quota = max(0, -(-pair_bytes // ma.entry_bytes) - state_freed)
-        if state_quota and tree_cache.mamba_evictable_size():
-            result = tree_cache.evict_for_alloc(
-                EvictParams(mamba_num=state_quota),
-                allocation_reclaim_satisfied=lambda: (
-                    not c._full_cap_reclaim(num_tokens)
-                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
-                ),
-            )
-            if (
-                result.num_tokens_evicted
-                or result.swa_num_tokens_evicted
-                or result.mamba_num_evicted
-            ):
-                return c.ensure_capacity(num_tokens, num_tokens)
-        return (
-            float_token_id_capacity(_snapshot(c), chain, num_tokens)
-            and num_tokens <= c.available_size()
-        )
 
 
 class _MultiWindowPolicy(_WindowPolicy):
@@ -947,145 +693,8 @@ class _MultiWindowPolicy(_WindowPolicy):
             for b in c.bands
         }
 
-    def mamba_full_cache_donor(self, c):
-        return c if c.mamba_allocator is not None else None
-
-    def prepare_mamba_allocation(self, c, target_size):
-        c.flush_deferred_full_frees()
-        if target_size > c.mamba_allocator.available_size():
-            relieve_for_alloc(c.mamba_allocator, target_size)
-
-    def reclaim_plan(self, c, full_tokens, swa_tokens, **kwargs):
-        # A two-token quota cannot describe independent state/window donors.
-        # Report readiness only; eviction uses the named demands below.
-        return (
-            (0, 0) if self.can_reserve(c, full_tokens, swa_tokens, **kwargs) else None
-        )
-
     def prealloc_fits_assumes_reclaim(self, c):
         return True
-
-    def reclaim_for_load_back(self, c, tree_cache, full_tokens, swa_tokens, **demand):
-        return self.reclaim_for_prealloc(
-            c, tree_cache, full_tokens, swa_tokens, **demand
-        )
-
-    def reclaim_for_prealloc(
-        self,
-        c,
-        tree_cache,
-        full_tokens,
-        swa_tokens,
-        *,
-        auxiliary_swa_tokens=None,
-        state_slots=0,
-    ):
-        if self.evict_to_free_tokens(
-            c,
-            tree_cache,
-            full_tokens,
-            swa_num_tokens=swa_tokens,
-            auxiliary_swa_tokens=auxiliary_swa_tokens,
-            state_slots=state_slots,
-        ):
-            return None
-        return "insufficient capacity for independently retained windows"
-
-    def evict_to_free_tokens(
-        self,
-        c,
-        tree_cache,
-        num_tokens,
-        *,
-        swa_num_tokens=None,
-        auxiliary_swa_tokens=None,
-        state_slots=0,
-    ):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        if c.ensure_capacity(
-            num_tokens,
-            required_swa,
-            auxiliary_swa_tokens=auxiliary_swa_tokens,
-            state_slots=state_slots,
-        ):
-            return True
-        demands = dict(
-            self._demands(
-                c, num_tokens, required_swa, auxiliary_swa_tokens, state_slots
-            )
-        )
-        byte_demand = sum(
-            demands[b.sub_pool_name] * b.entry_bytes_per_page for b in c.bands
-        )
-        # Retention orders the physical bands; it does not define their roles.
-        quotas = {
-            b.sub_pool_name: -(-byte_demand // b.entry_bytes_per_page) * c.page_size
-            for b in (c.full_attn_allocator, *c._windows)
-        }
-        auxiliary_quota = sum(
-            quotas[b.sub_pool_name] for b in c._windows if b is not c.swa_attn_allocator
-        )
-        state_reclaimed = 0
-        while True:
-            # One band can donate bytes for every consumer. Between bounded
-            # walks, apply relief so a conservative predicate cannot drain the cache.
-            result = tree_cache.evict_for_alloc(
-                EvictParams(
-                    num_tokens=min(
-                        quotas[c.roles.owner], tree_cache.full_evictable_size()
-                    ),
-                    swa_num_tokens=min(
-                        quotas[c.swa_attn_allocator.sub_pool_name],
-                        tree_cache.swa_evictable_size(),
-                    ),
-                    auxiliary_swa_num_tokens=min(
-                        auxiliary_quota, tree_cache.auxiliary_swa_evictable_size()
-                    ),
-                ),
-                allocation_reclaim_satisfied=lambda: c.can_reserve(
-                    num_tokens,
-                    required_swa,
-                    auxiliary_swa_tokens=auxiliary_swa_tokens,
-                    state_slots=state_slots,
-                ),
-            )
-            state_reclaimed += result.mamba_num_evicted
-            if c.ensure_capacity(
-                num_tokens,
-                required_swa,
-                auxiliary_swa_tokens=auxiliary_swa_tokens,
-                state_slots=state_slots,
-            ):
-                return True
-            if not (
-                result.num_tokens_evicted
-                or result.swa_num_tokens_evicted
-                or result.auxiliary_swa_num_tokens_evicted
-            ):
-                break
-        state = c.mamba_allocator
-        if state is None or not tree_cache.mamba_evictable_size():
-            return False
-        # Token eviction can also free attached state; charge it against this phase.
-        state_quota = max(0, -(-byte_demand // state.entry_bytes) - state_reclaimed)
-        if state_quota:
-            tree_cache.evict_for_alloc(
-                EvictParams(mamba_num=state_quota),
-                allocation_reclaim_satisfied=lambda: c.can_reserve(
-                    num_tokens,
-                    required_swa,
-                    auxiliary_swa_tokens=auxiliary_swa_tokens,
-                    state_slots=state_slots,
-                ),
-            )
-        return c.ensure_capacity(
-            num_tokens,
-            required_swa,
-            auxiliary_swa_tokens=auxiliary_swa_tokens,
-            state_slots=state_slots,
-        )
 
 
 def interim_policy_for(

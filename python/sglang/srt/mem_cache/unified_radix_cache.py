@@ -743,65 +743,24 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         request_by_type = self._evict_request_by_type(params)
-        available_size_targets = {
-            ct: (ct, self._component_available_size(ct) + request_cnt)
+        targets = {
+            ct: self._component_available_size(ct) + request_cnt
             for ct, request_cnt in request_by_type.items()
             if request_cnt > 0
         }
-        allocator = self.token_to_kv_pool_allocator
-        mamba_full_donor = allocator.mamba_full_cache_donor()
-        mamba_target = available_size_targets.get(self.slot_id(TREE_STATE))
-        initial_params = params
-        if mamba_target is not None and mamba_full_donor is not None:
-            # Full KV can supply bytes but cannot recycle Mamba virtual IDs.
-            mamba_id_shortfall = max(
-                0,
-                mamba_target[1]
-                - self.token_to_kv_pool_allocator.state_slots.available_size(),
-            )
-            initial_params = EvictParams(
-                num_tokens=params.num_tokens,
-                swa_num_tokens=params.swa_num_tokens,
-                mamba_num=mamba_id_shortfall,
-            )
-        result = self._evict(initial_params, available_size_targets)
-
-        if mamba_target is not None and mamba_full_donor is not None:
-            mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
-            mamba_free_ids = (
-                self.token_to_kv_pool_allocator.state_slots.available_size()
-            )
-            mamba_capacity = self._component_available_size(self.slot_id(TREE_STATE))
-
-            if mamba_free_ids >= mamba_target[1] and mamba_capacity < mamba_target[1]:
-                full_evictable = self.full_evictable_size()
-                if full_evictable > 0:
-                    donor_result = self._evict(
-                        EvictParams(num_tokens=full_evictable),
-                        {self.slot_id(TREE_TOKEN): mamba_target},
-                    )
-                    result.num_tokens_evicted += donor_result.num_tokens_evicted
-                    result.swa_num_tokens_evicted += donor_result.swa_num_tokens_evicted
-                    result.mamba_num_evicted += donor_result.mamba_num_evicted
-
-                # Preserve Mamba-victim recovery if Full cannot fund the target.
-                if (
-                    self._component_available_size(self.slot_id(TREE_STATE))
-                    < mamba_target[1]
-                ):
-                    mamba_evictable = self.mamba_evictable_size()
-                    if mamba_evictable > 0:
-                        fallback_result = self._evict(
-                            EvictParams(mamba_num=mamba_evictable),
-                            {self.slot_id(TREE_STATE): mamba_target},
-                        )
-                        result.num_tokens_evicted += fallback_result.num_tokens_evicted
-                        result.swa_num_tokens_evicted += (
-                            fallback_result.swa_num_tokens_evicted
-                        )
-                        result.mamba_num_evicted += fallback_result.mamba_num_evicted
-
-        return result
+        # Pools sharing their memory serve every target from one layout.
+        reclaimed = self.token_to_kv_pool_allocator.reclaim_to_availability(
+            self,
+            EvictParams(
+                num_tokens=targets.get(ComponentType.FULL, 0),
+                swa_num_tokens=targets.get(ComponentType.SWA, 0),
+                auxiliary_swa_num_tokens=targets.get(ComponentType.AUXILIARY_SWA, 0),
+                mamba_num=targets.get(ComponentType.MAMBA, 0),
+            ),
+        )
+        if reclaimed is not None:
+            return reclaimed
+        return self._evict(params, {ct: (ct, t) for ct, t in targets.items()})
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
@@ -999,11 +958,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
         # after its recompute.
-        last_mamba_donor_check = 0
-        mamba_donor_prepared = False
-
         def target_reached(component_type: ComponentType) -> bool:
-            nonlocal last_mamba_donor_check, mamba_donor_prepared
             if allocation_reclaim_satisfied is not None:
                 return allocation_reclaim_satisfied()
             if available_size_targets is None:
@@ -1013,24 +968,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 return False
             target_component, target_size = target
             # A Full-leaf cascade can release Mamba or SWA state directly.
-            if self._component_available_size(target_component) >= target_size:
-                return True
-            if component_type == self.slot_id(
-                TREE_TOKEN
-            ) and target_component == self.slot_id(TREE_STATE):
-                donor = self.token_to_kv_pool_allocator.mamba_full_cache_donor()
-                assert donor is not None, "Mamba target requires a Full donor"
-                recheck_after = (
-                    1
-                    if mamba_donor_prepared
-                    else donor.full_tokens_before_mamba_recheck(target_size)
-                )
-                if tracker[component_type] - last_mamba_donor_check < recheck_after:
-                    return False
-                donor.prepare_mamba_allocation(target_size)
-                last_mamba_donor_check = tracker[component_type]
-                mamba_donor_prepared = True
-            # Schedulable capacity includes donor holes that allocation can compact.
             return self._component_available_size(target_component) >= target_size
 
         for ct in self.tree_components:

@@ -13,7 +13,17 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -34,7 +44,6 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     FloatBand,
     chain_byte_accounting_violations,
     flush_deferred_free_group,
-    full_tokens_before_mamba_recheck,
     relieve_for_alloc,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
@@ -58,6 +67,9 @@ from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 from sglang.srt.utils.invariants import expect, resolve_level
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
 
 logger = logging.getLogger(__name__)
 
@@ -715,15 +727,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             empty_pool=empty_pool,
         )
 
-    def reclaim_plan(self, full_tokens, swa_tokens, **kwargs):
-        cap_reclaim = self._full_cap_reclaim(full_tokens)
-        if cap_reclaim > kwargs.get("full_evictable_tokens", 0):
-            return None
-        plan = self._policy.reclaim_plan(self, full_tokens, swa_tokens, **kwargs)
-        if plan is None:
-            return None
-        return max(plan[0], cap_reclaim), plan[1]
-
     def prealloc_fits_assumes_reclaim(self) -> bool:
         """Whether decode-node preallocation reclaims the evictable entries its
         admission credits before it takes: chains with a window do."""
@@ -773,16 +776,177 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def reclaim_for_load_back(
         self, tree_cache, full_tokens: int, swa_tokens: int, **demand
     ) -> str | None:
-        return self._policy.reclaim_for_load_back(
-            self, tree_cache, full_tokens, swa_tokens, **demand
-        )
+        """Reclaim before a host load takes its rows; None means ready."""
+        return self.reclaim_for_prealloc(tree_cache, full_tokens, swa_tokens, **demand)
 
     def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int, **kwargs
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        auxiliary_swa_tokens: Optional[int] = None,
+        state_slots: int = 0,
     ) -> str | None:
-        return self._policy.reclaim_for_prealloc(
-            self, tree_cache, full_tokens, swa_tokens, **kwargs
+        """Free room for a preallocation; None means it is ready, else a
+        description of the shortfall for the caller to attach to its request."""
+        demand = dict(
+            auxiliary_swa_tokens=auxiliary_swa_tokens, state_slots=state_slots
         )
+        self.evict_to_free_tokens(
+            tree_cache, full_tokens, swa_num_tokens=swa_tokens, **demand
+        )
+        if self.ensure_capacity(full_tokens, swa_tokens, **demand):
+            return None
+        return (
+            "Unified memory reclamation insufficient: "
+            f"needed=(full={full_tokens}, swa={swa_tokens}, "
+            f"auxiliary_swa={auxiliary_swa_tokens}, state_slots={state_slots})"
+        )
+
+    def _reclaimable_units(self, tree_cache) -> Dict[str, int]:
+        """What the prefix tree could free per sub-pool, in pages (slots for
+        the state sub-pool)."""
+        units = {}
+        state = self.mamba_allocator
+        for name, n in self.admission_evictable(tree_cache).items():
+            units[name] = (
+                n
+                if state is not None and name == state.sub_pool_name
+                else n // self.page_size
+            )
+        return units
+
+    def reclaim(self, tree_cache, demands: Dict[str, int]) -> bool:
+        """Evict cached entries until ``demands`` (pages per sub-pool, slots
+        for state) can be taken (`_reclaim`); return whether they can."""
+        self._reclaim(tree_cache, demands)
+        return self._units_fit({n: d for n, d in demands.items() if d > 0})
+
+    def reclaim_to_availability(self, tree_cache, targets: EvictParams) -> EvictResult:
+        """The prefix tree's availability targets as one demand: every
+        sub-pool's target taken at once, since the sub-pools share bytes."""
+        page = self.page_size
+        owner = self.full_attn_allocator
+        swa = self.swa_attn_allocator
+        state = self.mamba_allocator
+        demands = {owner.sub_pool_name: -(-targets.num_tokens // page)}
+        for window in self._windows:
+            tokens = (
+                targets.swa_num_tokens
+                if window is swa
+                else targets.auxiliary_swa_num_tokens
+            )
+            demands[window.sub_pool_name] = -(-tokens // page)
+        if state is not None:
+            demands[state.sub_pool_name] = targets.mamba_num
+        return self._reclaim(tree_cache, demands)
+
+    def _reclaim(self, tree_cache, demands: Dict[str, int]) -> EvictResult:
+        """Evict cached entries until ``demands`` can be taken, and report what
+        was evicted.
+
+        A demand that fits now, rearranged if need be, evicts nothing; nor does
+        one that would not fit with every evictable entry gone, since eviction
+        would only lose cache: the caller refuses it or retracts. Otherwise
+        victims go one at a time in the cache's order, and every walk stops at
+        the first victim after which the demand fits (`_fits_after_frees`), so
+        the order is a heuristic only: first the entries of each sub-pool whose
+        own demand does not fit now, whose freed pages it then takes in place;
+        then token entries by LRU, whose eviction frees their whole node; then
+        the state checkpoints left; then window entries. Admission credits the
+        same evictable entries (`admits`), so an admitted demand is one this
+        reclaim makes room for."""
+        from sglang.srt.mem_cache.base_prefix_cache import EvictResult
+
+        result = EvictResult()
+        demands = {n: d for n, d in demands.items() if d > 0}
+        if self._units_fit(demands):
+            return result
+        if not self._admits_pages(demands, self._reclaimable_units(tree_cache)):
+            return result
+        state = self.mamba_allocator
+        order = [
+            {n for n, d in demands.items() if not self._units_fit({n: d})},
+            {self.full_attn_allocator.sub_pool_name},
+            set() if state is None else {state.sub_pool_name},
+            {w.sub_pool_name for w in self._windows},
+        ]
+        for names in order:
+            if self._fits_after_frees(demands):
+                break
+            reclaimable = self._reclaimable_units(tree_cache)
+            self._evict(
+                tree_cache, {n: reclaimable.get(n, 0) for n in names}, demands, result
+            )
+        return result
+
+    def _admits_pages(
+        self, demands: Dict[str, int], reclaimable: Dict[str, int]
+    ) -> bool:
+        """`admits` for a demand already in pages (slots for state)."""
+        owner = self.full_attn_allocator
+        page = self.page_size
+        state = self.mamba_allocator
+        windows = {
+            w.sub_pool_name: demands.get(w.sub_pool_name, 0) * page
+            for w in self._windows
+        }
+        evictable = {
+            name: n if state is not None and name == state.sub_pool_name else n * page
+            for name, n in reclaimable.items()
+        }
+        return self.admits(
+            demands.get(owner.sub_pool_name, 0) * page,
+            windows,
+            0 if state is None else demands.get(state.sub_pool_name, 0),
+            evictable=evictable,
+        )
+
+    def _evict(
+        self, tree_cache, units: Dict[str, int], demands: Dict[str, int], result
+    ) -> None:
+        """Ask the prefix tree for ``units`` (pages, slots for state) per
+        sub-pool, the walks stopping once ``demands`` can be taken; add what it
+        evicted to ``result``."""
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        page = self.page_size
+        swa = self.swa_attn_allocator
+        state = self.mamba_allocator
+        params = EvictParams(
+            num_tokens=units.get(self.full_attn_allocator.sub_pool_name, 0) * page,
+            swa_num_tokens=0 if swa is None else units.get(swa.sub_pool_name, 0) * page,
+            auxiliary_swa_num_tokens=sum(
+                units.get(w.sub_pool_name, 0) * page
+                for w in self._windows
+                if w is not swa
+            ),
+            mamba_num=0 if state is None else units.get(state.sub_pool_name, 0),
+        )
+        if (
+            params.num_tokens
+            or params.swa_num_tokens
+            or params.auxiliary_swa_num_tokens
+            or params.mamba_num
+        ):
+            step = tree_cache.evict_for_alloc(
+                params,
+                allocation_reclaim_satisfied=lambda: self._fits_after_frees(demands),
+            )
+            result.num_tokens_evicted += step.num_tokens_evicted
+            result.swa_num_tokens_evicted += step.swa_num_tokens_evicted
+            result.auxiliary_swa_num_tokens_evicted += (
+                step.auxiliary_swa_num_tokens_evicted
+            )
+            result.mamba_num_evicted += step.mamba_num_evicted
+
+    def _fits_after_frees(self, demands: Dict[str, int]) -> bool:
+        """The reclaim walks' stop: the frees a walk queued in the caller's
+        free group are applied first, or the walk would not see the room it
+        made and would evict on."""
+        self.flush_deferred_full_frees()
+        return self._units_fit(demands)
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
@@ -877,8 +1041,31 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self, prefix_lens_cpu, seq_lens_cpu, **kwargs
         )
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int, **kwargs):
-        return self._policy.evict_to_free_tokens(self, tree_cache, num_tokens, **kwargs)
+    def evict_to_free_tokens(
+        self,
+        tree_cache,
+        num_tokens: int,
+        *,
+        swa_num_tokens: Optional[int] = None,
+        auxiliary_swa_tokens: Optional[int] = None,
+        state_slots: int = 0,
+    ) -> bool | None:
+        """Evict cached entries until this token demand (every window taking
+        ``swa_num_tokens``, else the same tokens) can be taken, the way static
+        pools would (`reclaim`). Return whether it can, or None without
+        a prefix cache."""
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
+            return None
+        self.flush_deferred_full_frees()
+        return self.reclaim(
+            tree_cache,
+            self.page_demands(
+                num_tokens,
+                num_tokens if swa_num_tokens is None else swa_num_tokens,
+                auxiliary_swa_tokens=auxiliary_swa_tokens,
+                state_slots=state_slots,
+            ),
+        )
 
     def check_decode_capacity(
         self, *, num_tokens: int, tree_cache, requests=None, spec_algorithm=None
@@ -956,9 +1143,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- state slots --
 
-    def mamba_full_cache_donor(self):
-        return self._policy.mamba_full_cache_donor(self)
-
     def flush_deferred_full_frees(self) -> None:
         """Expose grouped owner frees without ending the caller's free group."""
         flush_deferred_free_group(
@@ -970,14 +1154,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 self.full_free_group,
             ),
         )
-
-    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
-        return full_tokens_before_mamba_recheck(
-            self.full_attn_allocator, self.mamba_allocator, target_size
-        )
-
-    def prepare_mamba_allocation(self, target_size: int) -> None:
-        self._policy.prepare_mamba_allocation(self, target_size)
 
     # -- translation --
 

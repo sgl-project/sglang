@@ -25,11 +25,9 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import index_slots
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
-    chain_snapshot,
     hold_band,
     release_band,
     stand_in_views,
-    token_ends,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -50,7 +48,6 @@ from sglang.srt.mem_cache.kv.alloc.band import (
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -61,8 +58,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import (
-    get_disagg,
-    get_memory,
     get_parallel,
     publish,
     reset_context,
@@ -663,117 +658,12 @@ class TestWindowChainAllocator(unittest.TestCase):
         )
         return pool, allocator, kvcache
 
-    def test_reclaim_plan_matches_exhaustive_page_targets(self):
-        page_size = 4
-        _, allocator, _ = self._build(
-            n_full_slots=40, n_swa_slots=24, page_size=page_size
-        )
-        allocator.lazy_compaction = True
-        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-            sub_pool.lazy_compaction = True
-        live = allocator.alloc(16)
-        self.assertIsNotNone(live)
-        allocator.free(live[4:8])
-        allocator.free_swa(live[8:12])
-
-        for compacted in (False, True):
-            for sub_pool in (
-                allocator.full_attn_allocator,
-                allocator.swa_attn_allocator,
-            ):
-                release_band(sub_pool)
-                if not compacted:
-                    hold_band(sub_pool)
-            for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
-                max_full = min(12, full_evictable) // page_size
-                max_swa = min(8, swa_evictable) // page_size
-                for full_pages in range(9):
-                    for swa_pages in range(9):
-                        feasible = [
-                            (full * page_size, swa * page_size)
-                            for swa in range(max_swa + 1)
-                            for full in range(max_full + 1)
-                            if ends_fit(
-                                chain_snapshot(allocator),
-                                token_ends(allocator),
-                                full_pages,
-                                swa_pages,
-                                full_reclaim_pages=full,
-                                swa_reclaim_pages=swa,
-                                compacted=compacted,
-                            )
-                        ]
-                        with self.subTest(
-                            compacted=compacted,
-                            evictable=(full_evictable, swa_evictable),
-                            pages=(full_pages, swa_pages),
-                        ):
-                            self.assertEqual(
-                                allocator.reclaim_plan(
-                                    full_pages * page_size,
-                                    swa_pages * page_size,
-                                    full_evictable_tokens=full_evictable,
-                                    swa_evictable_tokens=swa_evictable,
-                                ),
-                                feasible[0] if feasible else None,
-                            )
-                            # ``prefer_swa`` flips the lexicographic order:
-                            # least FULL reclaim first, then least SWA.
-                            self.assertEqual(
-                                allocator.reclaim_plan(
-                                    full_pages * page_size,
-                                    swa_pages * page_size,
-                                    full_evictable_tokens=full_evictable,
-                                    swa_evictable_tokens=swa_evictable,
-                                    prefer_swa=True,
-                                ),
-                                min(feasible) if feasible else None,
-                            )
-
-    def test_evict_to_free_tokens_prefers_swa_reclaim_on_storage_or_decode(self):
-        """The default quota order spends FULL prefix to keep the sliding
-        window. With a HiCache storage backend attached, or while serving as
-        the decode side of a PD pair, the FULL prefix is the one worth keeping,
-        so the allocator asks the planner for SWA-first quotas. Hierarchical
-        cache alone (no storage backend) keeps the default. Pins the planner
-        argument per configuration, so a predicate that degrades to one branch
-        is caught."""
-        _, allocator, _ = self._build(page_size=4)
-        tree_cache = MagicMock()
-        tree_cache.supports_prefix_sharing.return_value = True
-        tree_cache.full_evictable_size.return_value = 8
-        tree_cache.swa_evictable_size.return_value = 8
-        allocator.reclaim_plan = MagicMock(return_value=(0, 0))
-        cases = (
-            ({}, None, False),
-            ({"enable_hierarchical_cache": True}, None, False),
-            (
-                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
-                None,
-                True,
-            ),
-            ({}, "decode", True),
-        )
-        for memory, role, prefer_swa in cases:
-            with self.subTest(memory=memory, role=role):
-                with contextlib.ExitStack() as stack:
-                    stack.enter_context(get_memory().override(**memory))
-                    if role is not None:
-                        stack.enter_context(
-                            get_disagg().override(disaggregation_mode=role)
-                        )
-                    allocator.evict_to_free_tokens(tree_cache, 4)
-                self.assertEqual(
-                    allocator.reclaim_plan.call_args.kwargs["prefer_swa"], prefer_swa
-                )
-
     def test_restore_swa_without_allocating_more_full(self):
         _, allocator, _ = self._build(page_size=4)
         indices = allocator.alloc(8)
         full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
         allocator.free_swa(indices)
 
-        self.assertEqual(allocator.reclaim_plan(0, 8), (0, 0))
         self.assertTrue(allocator.can_reserve(0, 8))
         self.assertTrue(allocator.ensure_capacity(0, 8))
         allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
@@ -3360,6 +3250,7 @@ class TestDcpWidening(unittest.TestCase):
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
+        cache.is_mamba_enabled = True
         cache.cache_controller = None
         cache.metrics_collector = None
         allocator.state = SimpleNamespace(slots=mamba_slot_allocator)
@@ -3414,23 +3305,6 @@ class TestDcpWidening(unittest.TestCase):
                         self.assertIsNotNone(a.alloc_state_slots(admitted))
                         self.assertFalse(a.admits(0, {}, 1))
 
-    def test_mamba_donor_recheck_bound_is_aggregate_and_dcp_widened(self):
-        missing_slots = 7
-        for dcp_size in (1, 2, 4):
-            with self.subTest(dcp_size=dcp_size), self._dcp(dcp_size):
-                allocator = self._build_composite(page_size=1)
-                allocator.mamba_allocator.schedulable_available_size = MagicMock(
-                    return_value=3
-                )
-
-                bound = allocator.full_tokens_before_mamba_recheck(3 + missing_slots)
-
-                mamba_bytes = allocator.mamba_allocator.entry_bytes_per_page
-                full_bytes = allocator.full_attn_allocator.entry_bytes
-                minimum_missing_bytes = (missing_slots - 1) * mamba_bytes + 1
-                expected = -(-minimum_missing_bytes * dcp_size // full_bytes)
-                self.assertEqual(bound, expected)
-
     def test_allocation_flush_public_wrapper_is_urgent(self):
         with self._dcp(1):
             allocator = self._build_composite(page_size=1)
@@ -3440,7 +3314,7 @@ class TestDcpWidening(unittest.TestCase):
             self.assertEqual(full.flush_for_allocation(), 3)
             full._flush.assert_called_once_with(urgent=True)
 
-    def test_full_donor_flushes_paged_free_group_without_closing_it(self):
+    def test_deferred_full_frees_flush_without_closing_the_group(self):
         with self._dcp(2):
             allocator = self._build_composite(page_size=2)
             full_indices = allocator.alloc(8)
@@ -3451,9 +3325,7 @@ class TestDcpWidening(unittest.TestCase):
             allocator.free_segment(full_indices, start_pos=0)
             self.assertTrue(allocator.free_page_reps_group)
 
-            donor = allocator.mamba_full_cache_donor()
-            self.assertIsNotNone(donor)
-            donor.flush_deferred_full_frees()
+            allocator.flush_deferred_full_frees()
 
             self.assertEqual(allocator.free_group, [])
             self.assertEqual(allocator.free_page_reps_group, [])
@@ -3463,7 +3335,7 @@ class TestDcpWidening(unittest.TestCase):
             self.assertEqual(allocator.verify_byte_accounting(), [])
             allocator.free_group_end()
 
-    def test_full_donor_reaches_real_capacity_across_supported_layouts(self):
+    def test_state_target_is_funded_by_full_cache_across_layouts(self):
         cases = (
             # Baseline eager layout.
             (1, 1, False, False),
@@ -3487,9 +3359,12 @@ class TestDcpWidening(unittest.TestCase):
                     page_size=page_size,
                     lazy_compaction=lazy_compaction,
                 )
+                # Wired as production wires it: the chain takes and prices slots.
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
                     device=_DEV,
+                    take=allocator.alloc_state_slots,
+                    capacity=allocator.state_slots_available,
                 )
 
                 # Fill Full to its page-granular frontier, then consume any
@@ -3539,15 +3414,18 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertEqual(allocator.free_page_reps_group, [])
                     allocator.free_group_end()
 
-    def test_full_donor_batches_urgent_compaction_for_large_shortfall(self):
+    def test_state_target_batches_urgent_compaction_for_large_shortfall(self):
         with self._dcp(1):
             allocator = self._build_composite(
                 page_size=1,
                 lazy_compaction=True,
             )
+            # Wired as production wires it: the chain takes and prices slots.
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
                 device=_DEV,
+                take=allocator.alloc_state_slots,
+                capacity=allocator.state_slots_available,
             )
 
             full_leaves = []
@@ -3570,9 +3448,12 @@ class TestDcpWidening(unittest.TestCase):
 
             self.assertGreater(walk["freed_leaves"], 1)
             self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])
-            self.assertEqual(full.flush_for_allocation.call_count, 1)
+            # The walk's stop is a layout search: no victim compacts the band.
+            self.assertEqual(full.flush_for_allocation.call_count, 0)
             self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 4)
             self.assertIsNotNone(mamba_slots.alloc(4))
+            # The take lays the chain out once for every freed leaf.
+            self.assertLessEqual(full.flush_for_allocation.call_count, 1)
             self.assertEqual(allocator.verify_byte_accounting(), [])
             allocator.free_group_end()
 

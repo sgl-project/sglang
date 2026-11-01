@@ -1144,22 +1144,26 @@ class TestDeclaredParts(CustomTestCase):
                     original = cache.evict_for_alloc
 
                     def walk(params, **kwargs):
-                        phases.append(params)
-                        return original(params, **kwargs)
+                        result = original(params, **kwargs)
+                        phases.append((params, result))
+                        return result
 
                     with patch.object(cache, "evict_for_alloc", side_effect=walk):
                         self.assertTrue(a.evict_to_free_tokens(cache, demand))
                     self.assertIsNotNone(a.alloc(demand))
-                    self.assertEqual(len(phases), 2)
-                    self.assertEqual(phases[0].mamba_num, 0)
+                    # Every token entry is locked, so the tokens are funded
+                    # from state checkpoints alone, and no more of them than
+                    # the bytes the tokens need.
+                    self.assertTrue(phases)
+                    self.assertTrue(all(p.num_tokens == 0 for p, _ in phases))
                     token_bytes = demand * sum(
                         b.entry_bytes for b in (a.full_attn_allocator, *a._windows)
                     )
+                    evicted = sum(r.mamba_num_evicted for _, r in phases)
                     self.assertEqual(
-                        phases[1].mamba_num,
-                        -(-token_bytes // a.mamba_allocator.entry_bytes),
+                        evicted, -(-token_bytes // a.mamba_allocator.entry_bytes)
                     )
-                    self.assertEqual(phases[1].num_tokens, 0)
+                    self.assertEqual(cache.mamba_evictable_size(), 16 - evicted)
                     for (node, _), prior in zip(receipts, chunks):
                         torch.testing.assert_close(
                             cache.tree_core.get_component_device_value(
@@ -1972,19 +1976,22 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(cache.swa_evictable_size(), 144)
                     self.assertFalse(a.ensure_capacity(4, 4))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
-                    with patch.object(
-                        cache, "evict_for_alloc", wraps=cache.evict_for_alloc
-                    ) as evict:
+                    original = cache.evict_for_alloc
+                    evicted = []
+
+                    def walk(params, **kwargs):
+                        result = original(params, **kwargs)
+                        evicted.append(result.swa_num_tokens_evicted)
+                        return result
+
+                    with patch.object(cache, "evict_for_alloc", side_effect=walk):
                         self.assertTrue(
                             a.check_decode_capacity(num_tokens=4, tree_cache=cache)
                         )
                     # FULL/target cost 32 bytes per token; draft costs 64 or 128.
                     # A four-token request therefore needs 16 or 24 target
                     # donor tokens, regardless of physical retention order.
-                    expected_quota = 16 if draft_dim == 16 else 24
-                    self.assertEqual(
-                        evict.call_args_list[0].args[0].swa_num_tokens, expected_quota
-                    )
+                    self.assertEqual(sum(evicted), 16 if draft_dim == 16 else 24)
                     self.assertGreater(cache.swa_evictable_size(), 0)
                     fresh = a.alloc(4)
                     self.assertIsNotNone(fresh)
@@ -2151,6 +2158,7 @@ class TestDeclaredParts(CustomTestCase):
             swa_evictable_size=lambda: 0,
             auxiliary_swa_evictable_size=lambda: 0,
             supports_mamba=lambda: False,
+            supports_prefix_sharing=lambda: True,
             evict_for_alloc=lambda *args, **kwargs: EvictResult(),
         )
         budget = a.create_prefill_budget(cache)

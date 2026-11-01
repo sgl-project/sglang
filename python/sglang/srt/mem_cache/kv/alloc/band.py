@@ -264,27 +264,6 @@ def flush_deferred_free_group(
     allocator.free_group_begin()
 
 
-def full_tokens_before_mamba_recheck(
-    full_allocator: Band,
-    mamba_allocator: Band,
-    target_size: int,
-) -> int:
-    """Conservative Full-token lower bound for the next Mamba capacity check.
-
-    The current Mamba slot count can hide at most one slot minus one byte of
-    residual room. Subtract that possible residue so this estimate only skips
-    checks that cannot succeed from Full bytes alone. Allocator capacity remains
-    the stop condition after the bound is crossed.
-    """
-    missing_slots = max(0, target_size - mamba_allocator.schedulable_available_size())
-    if missing_slots == 0:
-        return 0
-    mamba_page_bytes = mamba_allocator.entry_bytes_per_page
-    minimum_missing_bytes = (missing_slots - 1) * mamba_page_bytes + 1
-    dcp_size = get_parallel().attn_dcp_size if full_allocator.shards_under_dcp else 1
-    return -(-minimum_missing_bytes * dcp_size // full_allocator.entry_bytes)
-
-
 class Band:
     """One sub-pool's units in a `KVArena`: an end of the chain.
 
