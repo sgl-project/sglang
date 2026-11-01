@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -68,7 +69,7 @@ class SWAComponent(TreeComponent):
     value stays intact.
     """
 
-    from sglang.srt.mem_cache.kv.plan import TREE_WINDOW as family
+    family = TREE_WINDOW
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -346,7 +347,8 @@ class SWAComponent(TreeComponent):
             node = node.parent
 
         window_host_hit_lengths = {**result.window_host_hit_lengths, ct: swa_host_hit}
-        if ct != ComponentType.SWA:
+        if ct != self.tree_core.slot_id(TREE_WINDOW):
+            # The request's branch point is the native window slot's.
             return result._replace(window_host_hit_lengths=window_host_hit_lengths)
         return result._replace(
             window_host_hit_lengths=window_host_hit_lengths,
@@ -775,10 +777,10 @@ class SWAComponent(TreeComponent):
                 for node in self._collect_unbacked_swa_nodes(x)
             )
             if needed:
-                if ct == ComponentType.SWA:
+                if ct == self.tree_core.slot_id(TREE_WINDOW):
                     return InternalStateBackup(node_id=x.id, num_tokens=needed)
-                # Custom SWA component types use Python's inherited inline
-                # path; the shared finish hook is for built-in SWA only.
+                # Other window slots use Python's inherited inline path; the
+                # shared finish hook resumes the native window slot only.
                 if (
                     self._swa_kv_pool_host is not None
                     and self._swa_kv_pool_host.available_size() < needed

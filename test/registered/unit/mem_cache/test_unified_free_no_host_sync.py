@@ -413,7 +413,7 @@ class TestIndependentWindowFree(unittest.TestCase):
                     storage.requests.req_to_token[0, :32] = ids
                     for name, ct, end in zip(
                         ("window_16", "draft_swa"),
-                        (ComponentType.SWA, ComponentType.of("DRAFT_SWA")),
+                        (ComponentType.of("WINDOW_16"), ComponentType.of("DRAFT_SWA")),
                         cursors,
                     ):
                         # Every window frees from the request's shield up.
@@ -509,7 +509,7 @@ class TestIndependentWindowFree(unittest.TestCase):
                         key=RadixKey(array("q", range(64))),
                         value=ids,
                         component_evicted_seqlens={
-                            ComponentType.SWA: primary,
+                            ComponentType.of("WINDOW_16"): primary,
                             ComponentType.of("DRAFT_SWA"): auxiliary,
                         },
                     )
@@ -523,7 +523,7 @@ class TestIndependentWindowFree(unittest.TestCase):
                 EvictParams(
                     num_tokens=64,
                     window_num_tokens={
-                        ComponentType.SWA: 64,
+                        ComponentType.of("WINDOW_16"): 64,
                         ComponentType.of("DRAFT_SWA"): 64,
                     },
                 )

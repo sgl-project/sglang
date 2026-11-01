@@ -596,10 +596,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def window_component(self, window: Band) -> ComponentType:
-        """The prefix tree slot a window sub-pool goes by: the target's window
-        is the tree's first window slot; every further window is named by its
-        sub-pool."""
-        if window is self.swa_attn_allocator:
+        """The prefix tree slot a window sub-pool goes by, as `tree_slot_ids`
+        names it: the window role for a pool's only window, else its own
+        name."""
+        if len(self._windows) == 1:
             return ComponentType.SWA
         return ComponentType.of(window_tree_component(window.sub_pool_name))
 

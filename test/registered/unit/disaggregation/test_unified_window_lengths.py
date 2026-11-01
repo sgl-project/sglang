@@ -240,6 +240,15 @@ class TestUnifiedWindowLengths(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "shorter window tail"):
             check_state_wire(narrow, widened)
 
+    def test_window_retirement_names_its_window(self):
+        """A pool of several windows has no default window to retire."""
+        storage = _storage()
+        req = SimpleNamespace(kv=ReqKvInfo())
+        storage.acquire([req])
+        with self.assertRaisesRegex(ValueError, "tree component"):
+            storage.advance(req, 20, window=_TARGET_WINDOW)
+        storage.requests.free(req)
+
     def test_checksum_digests_each_window_entry_by_its_own_rows(self):
         storage = _storage()
         allocator = storage.allocator

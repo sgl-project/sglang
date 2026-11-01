@@ -323,10 +323,11 @@ class KVStorage:
         if frontier is None:
             raise ValueError("window retirement needs a token frontier")
 
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        if component_type is None:
+            raise ValueError("window retirement names the window's tree component")
 
-        component_type = ComponentType.SWA if component_type is None else component_type
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+
         slot_ids = self._tree_slot_ids
         sub_pool = next(
             s.name

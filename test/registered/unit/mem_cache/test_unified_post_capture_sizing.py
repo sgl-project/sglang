@@ -743,11 +743,13 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             )
         windows = cache.window_slots()
         self.assertEqual(len(windows), 3)
-        self.assertEqual(windows[0], ComponentType.SWA)
+        self.assertNotIn(ComponentType.SWA, windows)
         pools = [cache.components[ct]._swa_kv_pool_host for ct in windows]
         for pool in (cache.full_kv_pool_host, *pools):
             self.addCleanup(pool.destroy)
-        self.assertIs(cache.swa_kv_pool_host, pools[0])
+        # Each window's host pool lives on its own component; none is the
+        # cache's single-window pool.
+        self.assertFalse(hasattr(cache, "swa_kv_pool_host"))
         self.assertEqual(len({id(pool) for pool in pools}), 3)
         self.assertEqual(
             [cache.components[ct].pool_name for ct in windows],

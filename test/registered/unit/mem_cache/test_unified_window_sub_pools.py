@@ -138,10 +138,15 @@ class TestWindowNames(CustomTestCase):
             [slot.host_pool for slot in slots], ["kv", "window_64", "window_16"]
         )
         self.assertEqual([slot.window for slot in slots][1:], [64, 16])
-        # The tree's first window slot plays the window role.
+        # With several windows every window slot goes by its own name; only a
+        # tree's single window plays the window role.
         self.assertEqual(
             [ct.name for ct in tree_slot_ids(slots).values()],
-            ["FULL", "SWA", "WINDOW_16"],
+            ["FULL", "WINDOW_64", "WINDOW_16"],
+        )
+        self.assertEqual(
+            [ct.name for ct in tree_slot_ids(_plan((64,)).tree_slots()).values()],
+            ["FULL", "SWA"],
         )
         self.assertEqual(
             [(e.sub_pool, e.state_type) for e in two.wire_entries()],
@@ -354,7 +359,6 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
         )
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -405,12 +409,10 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
                 req.seqlen = frontier + 1
                 req.decode_batch_idx = frontier - 16
                 batch.maybe_evict_swa()
-                short = cache.window_slots()[1]
-                cache.evict(
-                    EvictParams(window_num_tokens={ComponentType.SWA: 80, short: 80})
-                )
+                long, short = cache.window_slots()
+                cache.evict(EvictParams(window_num_tokens={long: 80, short: 80}))
                 for ct, window in (
-                    (ComponentType.SWA, long_window),
+                    (long, long_window),
                     (short, short_window),
                 ):
                     self.assertEqual(
@@ -429,7 +431,7 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
                 EvictParams(
                     num_tokens=80,
                     window_num_tokens={
-                        ComponentType.SWA: 80,
+                        long: 80,
                         cache.window_slots()[1]: 80,
                     },
                 )
@@ -467,15 +469,15 @@ class TestThreeWindowTree(CustomTestCase):
             MatchPrefixParams,
         )
         from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
         storage, cache = self._cache()
         a = storage.allocator
         swa, swa_8, swa_4 = cache.window_slots()
+        # No window plays a role: each slot goes by its own name.
         self.assertEqual(
-            [ct.name for ct in (swa, swa_8, swa_4)], ["SWA", "WINDOW_8", "WINDOW_4"]
+            [ct.name for ct in (swa, swa_8, swa_4)],
+            ["WINDOW_16", "WINDOW_8", "WINDOW_4"],
         )
-        self.assertIs(swa, ComponentType.SWA)
         self.assertEqual(
             [(name, ct) for name, ct, _, _ in a.admission_windows(cache)],
             [("window_16", swa), ("window_8", swa_8), ("window_4", swa_4)],
@@ -520,7 +522,7 @@ class TestThreeWindowTree(CustomTestCase):
         cache.evict(
             EvictParams(
                 num_tokens=64,
-                window_num_tokens={ComponentType.SWA: 64, swa_8: 64, swa_4: 64},
+                window_num_tokens={swa: 64, swa_8: 64, swa_4: 64},
             )
         )
         self.assertTrue(all(b.allocated_count() == 0 for b in a.members))

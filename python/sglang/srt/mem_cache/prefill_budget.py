@@ -454,7 +454,7 @@ class ChainPrefillBudget(PrefillBudget):
         # target window's reachable tokens less what is pending on it.
         if not self.windows:
             return 0
-        name = next(name for name, component, _ in self.windows if component.is_swa)
+        name = self.allocator.swa_attn_allocator.sub_pool_name
         return (
             self.allocator.swa_available_size()
             + self.tree_cache.swa_evictable_size()
