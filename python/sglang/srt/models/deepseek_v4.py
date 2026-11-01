@@ -538,7 +538,7 @@ def _apply_wo_a_bf16_matmul(
                 )
                 or (
                     is_target_verify
-                    and 0 < o.shape[0] <= 384
+                    and 0 < o.shape[0] <= 1024
                     and get_platform().is_blackwell
                 )
                 or (
@@ -5095,7 +5095,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 register_fused_all_reduce_comm,
             )
 
-            register_fused_all_reduce_comm()
+            if self.config.model_type == "deepseek_v41" and get_parallel().tp_size == 4:
+                register_fused_all_reduce_comm(
+                    max_push_size=12 * 1024 * 1024, max_push_blocks=1024
+                )
+            else:
+                register_fused_all_reduce_comm()
 
         for module in self.modules():
             if isinstance(
