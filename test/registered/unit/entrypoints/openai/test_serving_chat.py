@@ -21,6 +21,7 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from fastapi.responses import StreamingResponse
 from tokenizers import Tokenizer as BackendTokenizer
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
@@ -4083,13 +4084,29 @@ class ServingChatTestCase(CustomTestCase):
             )
 
     def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        """Test that an abort finish reason after streaming has started yields an
+        in-band error and stops."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort():
+            # A normal chunk first, so HTTP 200 is committed before the abort.
             yield {
-                "text": "Partial ",
+                "text": "Hello",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Hello partial ",
                 "meta_info": {
                     "id": "chatcmpl-test",
                     "prompt_tokens": 10,
@@ -4145,31 +4162,107 @@ class ServingChatTestCase(CustomTestCase):
         loop = get_or_create_event_loop()
         chunks = loop.run_until_complete(run_stream())
 
-        error_chunk_data = None
-        for c in chunks:
-            if "error" in c:
-                error_chunk_data = json.loads(c[len("data: ") :])
-                break
-        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
+        error_idx = next((i for i, c in enumerate(chunks) if "error" in c), None)
+        self.assertIsNotNone(error_idx, "Error chunk not found in stream")
+        error_chunk_data = json.loads(chunks[error_idx][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
-        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        # The error follows the chunks already streamed, and only [DONE] follows it.
+        self.assertGreater(error_idx, 0)
+        self.assertEqual(chunks[error_idx + 1 :], ["data: [DONE]\n\n"])
 
-        # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+    def test_streaming_abort_before_first_chunk_returns_http_error(self):
+        """An abort that arrives before any chunk is streamed (e.g. an admission
+        rejection) is returned as a real HTTP error, not in-band under a 200,
+        with the status and error type handle_request gives a non-stream abort."""
+        cases = [
+            # (status_code as sent by the engine, expected status, expected type)
+            (HTTPStatus.SERVICE_UNAVAILABLE, 503, "503"),
+            (HTTPStatus.BAD_REQUEST, 400, "BadRequestError"),
+            (HTTPStatus.INTERNAL_SERVER_ERROR, 500, "500"),
+            (HTTPStatus.TOO_MANY_REQUESTS, 429, "429"),
+            (HTTPStatus.BAD_GATEWAY, 502, "502"),
+            (HTTPStatus.GATEWAY_TIMEOUT, 504, "504"),
+            # msgpack IPC decodes HTTPStatus to a plain int.
+            (400, 400, "BadRequestError"),
+            (503, 503, "503"),
+            # Non-standard 4xx/5xx statuses match the non-streaming path too.
+            (499, 499, "499"),
+            (599, 599, "599"),
+        ]
+        for sent_code, want_status, want_type in cases:
+            with self.subTest(sent_code=sent_code):
+                err_msg = "The request queue is full."
+
+                async def _mock_generate_abort():
+                    # Shape of a scheduler admission abort: no prompt_tokens.
+                    yield {
+                        "text": "",
+                        "meta_info": {
+                            "id": "chatcmpl-test",
+                            "completion_tokens": 0,
+                            "finish_reason": {
+                                "type": "abort",
+                                "status_code": sent_code,
+                                "message": err_msg,
+                            },
+                        },
+                        "index": 0,
+                    }
+
+                self.tm.generate_request.return_value = _mock_generate_abort()
+
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    max_tokens=100,
+                    stream=True,
+                )
+
+                loop = get_or_create_event_loop()
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                ) as conv_mock:
+                    conv_ins = Mock()
+                    conv_ins.get_prompt.return_value = "Test prompt"
+                    conv_mock.return_value = conv_ins
+                    response = loop.run_until_complete(
+                        self.chat.handle_request(req, self.fastapi_request)
+                    )
+
+                self.assertNotIsInstance(response, StreamingResponse)
+                self.assertEqual(response.status_code, want_status)
+                body = json.loads(response.body)
+                self.assertEqual(body["message"], err_msg)
+                self.assertEqual(body["type"], want_type)
+                self.assertEqual(body["code"], want_status)
 
     def test_streaming_abort_with_ids_enabled(self):
-        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
+        """Test that a mid-stream abort with input/output ids enabled ends with only
+        an error and [DONE]."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort():
+            # A normal chunk first, so HTTP 200 is committed before the abort.
             yield {
-                "text": "Partial ",
+                "text": "Hello",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1],
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Hello partial ",
                 "prompt_token_ids": [4, 5, 6],
                 "output_ids": [1, 2, 3],
                 "meta_info": {
@@ -4225,15 +4318,16 @@ class ServingChatTestCase(CustomTestCase):
         loop = get_or_create_event_loop()
         chunks = loop.run_until_complete(run_stream())
 
-        # Exactly one error chunk followed by [DONE]; no sglext ids leak.
-        self.assertIn("error", chunks[0])
-        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        # The stream ends with exactly one error chunk and [DONE]; no sglext ids leak.
+        self.assertIn("error", chunks[-2])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertEqual(sum("error" in c for c in chunks), 1)
         self.assertFalse(
             any("input_ids" in c or "output_ids" in c for c in chunks),
             "sglext ids event leaked after abort error",
         )
 
-        error_chunk_data = json.loads(chunks[0][len("data: ") :])
+        error_chunk_data = json.loads(chunks[-2][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 

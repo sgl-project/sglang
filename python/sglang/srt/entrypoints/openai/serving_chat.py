@@ -8,16 +8,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
-from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    AsyncGenerator,
-    Callable,
-    Dict,
-    List,
-    Optional,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -84,7 +75,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    error_abort_status,
+    raise_pre_stream_abort,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -2588,19 +2583,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Track finish_reason for each index
                 if finish_reason_type:
                     # Abort with an explicit error status_code is a system error
-                    # (timeout, OOM, validation): emit a streaming error chunk.
-                    # A graceful abort (no status_code, e.g. user-initiated via
-                    # /abort_request or session lifecycle cleanup) falls through
-                    # to the normal chunk path, matching the non-stream behavior
-                    # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
-                    ):
-                        code = finish_reason["status_code"]
+                    # (queue full, timeout, OOM, validation). Before the first
+                    # chunk, raise_pre_stream_abort turns it into a real HTTP
+                    # error when a non-stream request would get one; otherwise
+                    # it is streamed as an in-band error chunk. A graceful abort
+                    # (no status_code, e.g. user-initiated via /abort_request or
+                    # session lifecycle cleanup) falls through to the normal
+                    # chunk path, matching the non-stream behavior in
+                    # tokenizer_manager._handle_abort_finish_reason.
+                    abort_status = error_abort_status(finish_reason)
+                    if abort_status is not None:
+                        message = finish_reason.get("message", "Generation aborted.")
+                        if not stream_started:
+                            raise_pre_stream_abort(abort_status, message)
                         error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            message,
+                            getattr(abort_status, "name", str(abort_status)),
+                            int(abort_status),
                         )
                         yield f"data: {error}\n\n"
                         error_aborted = True
