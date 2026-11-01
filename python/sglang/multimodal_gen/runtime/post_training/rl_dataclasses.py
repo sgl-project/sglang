@@ -61,11 +61,7 @@ def _map_env_tensors(value: Any, fn) -> Any:
         return fn(value)
     if isinstance(value, dict):
         return {
-            key: (
-                item
-                if key in _SEQUENCE_CACHE_KEYS
-                else _map_env_tensors(item, fn)
-            )
+            key: (item if key in _SEQUENCE_CACHE_KEYS else _map_env_tensors(item, fn))
             for key, item in value.items()
         }
     if isinstance(value, tuple):
