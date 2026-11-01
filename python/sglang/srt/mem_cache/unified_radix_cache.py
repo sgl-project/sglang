@@ -151,6 +151,11 @@ from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 T = TypeVar("T")
 
+# One per-tick count row through the shm table: write acks, load acks, the
+# storage-workers-alive word, the four storage queue sizes and the two folded
+# digest words. Extra host pools widen the row past this; it takes the gloo reduce.
+_HICACHE_COUNT_ROW_WIDTH = 9
+
 
 def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) -> int:
     num_pages = 0
@@ -3608,6 +3613,13 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
+        # A storage worker that raised out of its loop no longer drains or acks,
+        # and the counts above it would wait forever. The MIN of this word
+        # tells every rank that reduces these counts, in the same tick, that
+        # one died somewhere: all TP ranks; per PP stage in buffer_only (the
+        # other stages then hang in the next PP collective); PP0's view only in
+        # cache mode, where the broadcast below overwrites PP1+'s word.
+        workers_alive = int(cc is None or cc.storage_workers_alive())
         if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
             write_acks = 0
             load_acks = 0
@@ -3631,48 +3643,43 @@ class UnifiedRadixCache(BasePrefixCache):
                 if self.enable_storage
                 else ()
             )
+        values = [write_acks, load_acks, workers_alive, *storage_queue_sizes]
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order matched on every rank.
         digest = self.tree_core.write_back_duplicate_reclaim_digest
         exchange = self._shm_count_exchange()
-        if exchange is not None:
-            values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
-            # Storage adds a count per extra host pool; a row wider than the table
-            # takes the gloo reduce below.
-            if len(values) <= exchange.width:
-                rows = exchange.allgather(values)
-                assert all(row[-2:] == rows[0][-2:] for row in rows), (
-                    "write_back duplicate-reclaim victims diverged across TP ranks"
-                )
-                mins = [min(col) for col in zip(*rows)]
-                return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
-        ready_counts = torch.tensor(
-            [
-                write_acks,
-                load_acks,
-                *storage_queue_sizes,
-                digest,
-                -digest,
-            ],
-            dtype=torch.int64,
-            device="cpu",
-        )
-        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
-            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
+        # Storage adds a count per extra host pool; a row wider than the table
+        # takes the gloo reduce instead.
+        if exchange is not None and len(values) + 2 <= exchange.width:
+            rows = exchange.allgather([*values, *fold_u64(digest)])
+            assert all(row[-2:] == rows[0][-2:] for row in rows), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
+            agreed = [min(col) for col in zip(*rows)][:-2]
         else:
-            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+            ready_counts = torch.tensor(
+                [*values, digest, -digest], dtype=torch.int64, device="cpu"
+            )
+            if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+                self._all_reduce_attn_groups(
+                    ready_counts, torch.distributed.ReduceOp.MIN
+                )
+            else:
+                self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+            count_values = list(map(int, ready_counts.tolist()))
+            assert digest == count_values[-2] and digest == -count_values[-1], (
+                "write_back duplicate-reclaim victims diverged across PP/TP ranks"
+            )
+            agreed = count_values[:-2]
 
-        count_values = list(map(int, ready_counts.tolist()))
-        assert digest == count_values[-2] and digest == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across PP/TP ranks"
-        )
-        return (
-            count_values[0],
-            count_values[1],
-            tuple(count_values[2:-2]),
-            extra_pool_names,
-        )
+        if not agreed[2]:
+            dead = cc.dead_storage_workers() if cc is not None else []
+            raise RuntimeError(
+                "HiCache storage worker thread(s) exited on "
+                + (f"this rank: {', '.join(dead)}" if dead else "a peer rank")
+            )
+        return agreed[0], agreed[1], tuple(agreed[3:]), extra_pool_names
 
     def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
         # Only the single-group, single-stage layout; anything else keeps the gloo reduce.
@@ -3690,7 +3697,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
-        return get_shm_exchange(group, "hicache", multihost=True)
+        return get_shm_exchange(
+            group, "hicache", multihost=True, width=_HICACHE_COUNT_ROW_WIDTH
+        )
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
