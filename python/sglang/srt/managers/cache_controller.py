@@ -15,9 +15,11 @@ limitations under the License.
 
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
@@ -263,6 +265,17 @@ class StorageOperation:
         return self.id < other.id
 
 
+# What the scheduler does once the rank-agreed storage health bit drops:
+# "disable" degrades to no-L3 until the backend is re-attached, "raise"
+# fails the scheduler loudly.
+STORAGE_FAILURE_POLICIES = ("disable", "raise")
+# Default timeout of the storage sync collectives (the worker threads' hit and
+# ack reductions, the PP ticket broadcast). Tripping it degrades L3 until the
+# backend is re-attached, so it sits far above any healthy batch call and the
+# 60 s idle ticket broadcast, while a hung peer is noticed in minutes rather
+# than after torch's 30-minute gloo default.
+STORAGE_SYNC_TIMEOUT_DEFAULT_S = 300.0
+
 # Buffer-mode staging budgets. Prefetch staging is latency-critical
 # (wait_complete gates TTFT), so loads may fill the pool up to this fraction
 # before new prefetches are declined.
@@ -352,6 +365,21 @@ class HiCacheController:
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
 
+        # Set by a storage worker whose sync collective raised; the scheduler
+        # drain folds it into the rank-agreed health bit. Attach clears it.
+        self.storage_sync_failed = False
+        self.storage_sync_failure: Optional[str] = None
+        self._storage_sync_lock = threading.Lock()
+        self.storage_failure_policy = "disable"
+        # Seconds; attach applies the configured value.
+        self.storage_sync_timeout: float = STORAGE_SYNC_TIMEOUT_DEFAULT_S
+
+        # Storage worker threads, started by _start_storage_threads and reset.
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.prefetch_sync_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
+
         # Storage control queues, (re)created whenever the storage threads start.
         self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
         self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
@@ -420,6 +448,7 @@ class HiCacheController:
         if self.pp_group is not None:
             base_groups.append(self.pp_group)
 
+        timeout = self._storage_sync_timedelta()
         for group in base_groups:
             if group is None or torch.distributed.get_world_size(group=group) == 1:
                 continue
@@ -429,7 +458,7 @@ class HiCacheController:
             seen_rank_sets.add(group_ranks)
             groups.append(
                 create_custom_parallel_group(
-                    group_ranks=list(group_ranks), backend="gloo"
+                    group_ranks=list(group_ranks), backend="gloo", timeout=timeout
                 )
             )
         return groups
@@ -451,6 +480,78 @@ class HiCacheController:
     ) -> None:
         for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _record_storage_sync_failure(self, exc: BaseException, what: str) -> None:
+        """Mark this rank's storage pipeline degraded; logs the first failure only."""
+        with self._storage_sync_lock:
+            if self.storage_sync_failed:
+                return
+            self.storage_sync_failed = True
+            self.storage_sync_failure = f"{what}: {exc!r}"
+        logger.error(
+            "HiCache storage sync failed (%s); the scheduler degrades L3 on "
+            "every rank at its next drain.",
+            self.storage_sync_failure,
+            exc_info=exc,
+        )
+
+    def _storage_sync_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op,
+        groups: List[torch.distributed.ProcessGroup],
+    ) -> bool:
+        """Rank-reduce from a storage worker; False means `tensor` holds no
+        agreed value and the caller publishes the operation as failed.
+
+        Always entered, even after a failure: gloo keeps a timed-out pair
+        closed, so a broken group raises at once on every rank, while
+        skipping would strand a peer on a group that did not fail."""
+        try:
+            self._all_reduce(tensor, op, groups)
+        except RuntimeError as e:
+            self._record_storage_sync_failure(e, "storage sync collective")
+            return False
+        return True
+
+    def _storage_worker_threads(self) -> List[threading.Thread]:
+        """The Python storage workers this controller started. A controller
+        whose storage I/O runs outside these threads has none to watch and
+        reports healthy on their account."""
+        return [
+            thread
+            for thread in (
+                self.prefetch_thread,
+                self.prefetch_io_aux_thread,
+                self.prefetch_sync_thread,
+                self.backup_thread,
+            )
+            if thread is not None
+        ]
+
+    def storage_workers_healthy(self) -> bool:
+        """Rank-local liveness of the storage pipeline, MIN-reduced by the
+        scheduler drain. Read it after the storage queue sizes: a worker sets
+        the failure flag before it publishes the failed item, so a counted
+        item implies a 0 bit in the same round."""
+        if self.storage_sync_failed:
+            return False
+        return all(thread.is_alive() for thread in self._storage_worker_threads())
+
+    def storage_health_reason(self) -> Optional[str]:
+        if self.storage_sync_failure is not None:
+            return self.storage_sync_failure
+        dead = [
+            thread.name
+            for thread in self._storage_worker_threads()
+            if not thread.is_alive()
+        ]
+        if dead:
+            return f"storage worker thread(s) exited: {dead}"
+        return None
+
+    def _storage_sync_timedelta(self) -> timedelta:
+        return timedelta(seconds=self.storage_sync_timeout)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -554,6 +655,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
+        # Validated before any side effect, so a bad value leaves the
+        # controller exactly as it was.
+        self._apply_storage_sync_config(storage_backend_extra_config)
         key_scheme = get_memory().hicache_storage_key_scheme
         if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
             raise ValueError(
@@ -761,6 +867,33 @@ class HiCacheController:
     @property
     def backup_skip(self) -> bool:
         return not self.storage_config.is_storage_writer
+
+    def _apply_storage_sync_config(self, storage_backend_extra_config: dict) -> None:
+        """Pop the controller's own sync knobs so backends never see them, and
+        clear the failure state: attach creates fresh sync groups."""
+        policy = storage_backend_extra_config.pop("storage_failure_policy", "disable")
+        if policy not in STORAGE_FAILURE_POLICIES:
+            raise ValueError(
+                f"storage_failure_policy must be one of {STORAGE_FAILURE_POLICIES}, "
+                f"got {policy!r}"
+            )
+        timeout = storage_backend_extra_config.pop("storage_sync_timeout", None)
+        if timeout is None:
+            timeout = STORAGE_SYNC_TIMEOUT_DEFAULT_S
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(
+                f"storage_sync_timeout must be a positive number of seconds, "
+                f"got {timeout!r}"
+            )
+        self.storage_failure_policy = policy
+        self.storage_sync_timeout = float(timeout)
+        self.storage_sync_failed = False
+        self.storage_sync_failure = None
 
     def _generate_storage_config(
         self,
@@ -1467,13 +1600,15 @@ class HiCacheController:
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
-        prefix. Runs for every operation, hit or miss."""
+        prefix. Runs for every operation, hit or miss; a failed collective
+        publishes the query as a miss."""
         hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce(
+        if not self._storage_sync_all_reduce(
             hit_count,
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
-        )
+        ):
+            return 0
         return int(hit_count.item())
 
     def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
@@ -1570,15 +1705,19 @@ class HiCacheController:
                 continue
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
-        """Synchronize all ranks to agree on a PrefetchAck."""
+        """Synchronize all ranks to agree on a PrefetchAck. A failed collective
+        publishes the ack with no progress; the ack itself is still published
+        so every rank keeps one ack per transfer batch."""
         if ack.completed_tokens is not None:
             # Determine the minimal successful prefix of tokens.
             completed_tokens_tensor = torch.tensor(
                 ack.completed_tokens, dtype=torch.int
             )
-            self._all_reduce(
+            if self._storage_sync_all_reduce(
                 completed_tokens_tensor,
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
-            )
-            ack.completed_tokens = completed_tokens_tensor.item()
+            ):
+                ack.completed_tokens = completed_tokens_tensor.item()
+            else:
+                ack.completed_tokens = 0

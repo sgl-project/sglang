@@ -2249,7 +2249,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
             "reusable when cache-mode admission ran; deadline means the "
-            "storage prefetch stop policy ended the read before it completed.",
+            "storage prefetch stop policy ended the read before it completed; "
+            "storage_unavailable means the rank-agreed storage health bit "
+            "dropped and the degraded pipeline cut the read.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2259,6 +2261,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_covered",
             "storage_transfer",
             "deadline",
+            "storage_unavailable",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",
@@ -2296,6 +2299,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "(e.g. the SWA trailing window) could not allocate host staging "
             "— the whole storage fetch is forfeited, not just the aux part.",
             labelnames=labels.keys(),
+        )
+
+        self.hicache_storage_healthy = Gauge(
+            name="sglang:hicache_storage_healthy",
+            documentation="1 while the L3 storage workers of every rank are "
+            "alive and their rank-sync collectives complete; 0 once the "
+            "scheduler degraded to no-L3 (storage_failure_policy=disable), "
+            "until the storage backend is re-attached.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         bucket_io = [
@@ -2380,6 +2393,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+
+    def log_storage_healthy(self, healthy: bool) -> None:
+        self.hicache_storage_healthy.labels(**self.labels).set(int(healthy))
 
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:

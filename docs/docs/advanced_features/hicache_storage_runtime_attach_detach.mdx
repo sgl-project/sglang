@@ -110,6 +110,7 @@ Notes:
 - `hicache_storage_backend_extra_config_json` can include both:
   - **Backend configuration** (e.g., Mooncake master/metadata/protocol, etc.)
   - **Prefetch configuration** (`prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, `prefetch_timeout_max`, `hicache_storage_pass_prefix_keys`)
+  - **Storage worker liveness** (`storage_failure_policy`, `storage_sync_timeout`; see the HiCache design page). Re-attaching is also how a backend degraded to no-L3 under `storage_failure_policy: "disable"` is brought back.
 
 ### 3.3 Detach (disable) the storage backend
 
