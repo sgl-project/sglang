@@ -3,7 +3,12 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.sampling.argmax_jit import argmax, create_argmax_workspace
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.sampling.argmax_jit import (
+    argmax,
+    can_argmax,
+    create_argmax_workspace,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -79,7 +84,11 @@ def test_argmax_signed_zero_ties_across_splits(dtype) -> None:
 
 
 def test_argmax_misaligned_view_falls_back() -> None:
-    _check(torch.randn(2, 1032, device="cuda")[:, 1:1025])
+    # Row stride and vocab size are vector multiples, but the base address is not.
+    logits = torch.randn(2, 1032, device="cuda")[:, 1:1025]
+    assert not can_argmax(logits)
+    got = sampling_argmax(logits)
+    torch.testing.assert_close(got.cpu().to(torch.int32), _reference(logits))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
