@@ -178,6 +178,10 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
     staging: Optional[StagingRegisterInfo] = None
+    # The receiver's registered draft-entry count. None when the peer predates
+    # the field; a PP>1 sender stage without a draft runner cannot derive the
+    # host-backed/device-only boundary from its own registration.
+    num_draft_entries: Optional[int] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -229,6 +233,11 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
                 if len(msg) > 20 and msg[20]
                 else []
+            ),
+            num_draft_entries=(
+                int(msg[21].decode("ascii"))
+                if len(msg) > 21 and msg[21] != b""
+                else None
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
@@ -1466,6 +1475,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_num_draft_entries: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1482,8 +1492,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 host_backed_kv_count = sum(ratio == 4 for ratio in compression_ratios)
             else:
                 # The remote target prefix is host-backed, even across PP stages;
-                # only the draft suffix uses logical device page IDs.
-                num_draft_entries = self.kv_args.num_draft_entries
+                # only the draft suffix uses logical device page IDs. Only the
+                # last prefill PP stage owns a draft runner, so a non-last stage
+                # registers no local draft entries and must take the boundary
+                # from the destination's registration.
+                num_draft_entries = (
+                    dst_num_draft_entries
+                    if dst_num_draft_entries is not None
+                    else self.kv_args.num_draft_entries
+                )
                 if not 0 < num_draft_entries < len(dst_kv_ptrs):
                     raise ValueError(
                         "HiSparse spec PD transfer requires an appended device-only "
@@ -2832,6 +2849,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_num_draft_entries=target_rank_registration_info.num_draft_entries,
                             )
                         elif (
                             self.enable_staging
@@ -3414,6 +3432,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            str(getattr(self.kv_args, "num_draft_entries", 0)).encode("ascii"),
         ]
 
     def build_receiver_metadata_message(
