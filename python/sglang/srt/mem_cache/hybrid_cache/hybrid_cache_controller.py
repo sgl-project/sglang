@@ -1740,6 +1740,15 @@ class HybridCacheController(BaseHiCacheController):
                     ):
                         sidecar_ok = False
                         break
+                if not sidecar_ok:
+                    # The ack drain settles the KV span on the writer rank's
+                    # evidence; a rank-sharded sidecar is not retried.
+                    logger.warning(
+                        "Write sidecar pages to storage failed (operation %d, "
+                        "%s); the sidecar span stays un-backed.",
+                        operation.id,
+                        [transfer.name for transfer in backup_transfers],
+                    )
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
