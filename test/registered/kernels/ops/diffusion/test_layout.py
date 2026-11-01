@@ -45,11 +45,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends import (
 from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=110, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=55, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
-register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
 register_amd_ci(est_time=15, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
@@ -758,6 +758,83 @@ def test_wan_cached_conv_chunk_loop_bitwise(pads_temporal_only):
         assert got_payload is not None and got_payload.shape[2] == CACHE_T
         # Reference cache holds the last CACHE_T unpadded frames.
         assert torch.equal(got_payload, ref_cache[:, :, -CACHE_T:])
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="VSA layout fast path is CUDA-only")
+@pytest.mark.parametrize(
+    "shape,batch,heads,head_dim,dtype,strided",
+    [
+        ((1, 1, 1), 1, 1, 64, torch.bfloat16, False),
+        ((4, 4, 4), 2, 3, 128, torch.bfloat16, False),
+        ((5, 7, 9), 4, 3, 64, torch.float16, True),
+        ((3, 5, 7), 1, 2, 128, torch.float32, True),
+        ((5, 4, 4), 2, 3, 128, torch.bfloat16, False),
+        ((4, 5, 4), 2, 3, 64, torch.bfloat16, True),
+        ((4, 4, 5), 2, 3, 128, torch.bfloat16, False),
+        ((16, 30, 52), 4, 12, 128, torch.bfloat16, False),
+    ],
+)
+@torch.inference_mode()
+def test_vsa_tile_to_bhsd(shape, batch, heads, head_dim, dtype, strided):
+    """Partial tiles compact valid voxels before padding, preserving every bit."""
+    from sglang.kernels.ops.diffusion import vsa_tile_to_bhsd
+
+    t, h, w = shape
+    step = 2 if strided else 1
+    x = torch.randn(
+        batch, t * h * w, heads, head_dim * step, device=DEVICE, dtype=dtype
+    )[..., ::step]
+    x[0, 0, 0, :4] = torch.tensor(
+        [-0.0, float("inf"), -float("inf"), float("nan")],
+        device=DEVICE,
+        dtype=dtype,
+    )
+    spatial = x.reshape(batch, t, h, w, heads, head_dim)
+    tiles = []
+    for t0 in range(0, t, 4):
+        for h0 in range(0, h, 4):
+            for w0 in range(0, w, 4):
+                valid = spatial[:, t0 : t0 + 4, h0 : h0 + 4, w0 : w0 + 4]
+                valid = valid.reshape(batch, -1, heads, head_dim)
+                tile = x.new_zeros(batch, 64, heads, head_dim)
+                tile[:, : valid.shape[1]] = valid
+                tiles.append(tile)
+    expected = torch.cat(tiles, dim=1).transpose(1, 2).contiguous()
+    actual = vsa_tile_to_bhsd(x=x, dit_seq_shape=shape)
+    bits = torch.int32 if dtype == torch.float32 else torch.int16
+    assert torch.equal(actual.view(bits), expected.view(bits))
+    pointer = actual.data_ptr()
+    actual.fill_(123)
+    actual = vsa_tile_to_bhsd(x=x, dit_seq_shape=shape, out=actual)
+    assert actual.data_ptr() == pointer
+    assert torch.equal(actual.view(bits), expected.view(bits))
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="VSA layout fast path is CUDA-only")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 6 * 2**30,
+    reason="needs a CUDA GPU with 6 GiB free",
+)
+@pytest.mark.parametrize(
+    "shape,strides",
+    [
+        ((1, 1, 3, 64), (1, 1, 1_200_000_000, 1)),
+        ((1, 1, 1, 64), (1, 1, 1, 40_000_000)),
+    ],
+)
+@torch.inference_mode()
+def test_vsa_tile_to_bhsd_large_strides(shape, strides):
+    """Head and feature offsets must not overflow before int64 address addition."""
+    from sglang.kernels.ops.diffusion import vsa_tile_to_bhsd
+
+    x = torch.empty_strided(shape, strides, device=DEVICE, dtype=torch.bfloat16)
+    values = torch.arange(x.numel(), device=DEVICE, dtype=x.dtype).reshape(shape)
+    x.copy_(values)
+    expected = x.new_zeros((1, shape[2], 64, 64))
+    expected[:, :, 0, :] = values[:, 0, :, :]
+
+    actual = vsa_tile_to_bhsd(x=x, dit_seq_shape=(1, 1, 1))
+    assert torch.equal(actual, expected)
 
 
 if __name__ == "__main__":
