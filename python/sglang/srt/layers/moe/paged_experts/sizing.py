@@ -80,6 +80,18 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     return int((free_gb - slack_gb - mm_gb) * _GIB)
 
 
+def _mamba_charge(slots: int, per_slot: int) -> int:
+    """Bytes a Mamba pool of ``slots`` takes: one padding slot beyond its size, as SGLang
+    charges it (``KVCacheConfigurator._handle_max_mamba_cache``)."""
+    return (slots + 1) * per_slot
+
+
+def _mamba_share(budget_bytes: int, ratio: float, per_slot: int) -> int:
+    """The slots SGLang's own share of ``budget_bytes`` holds (``--mamba-full-memory-ratio``),
+    less the padding slot, as its ratio branch solves it."""
+    return int((budget_bytes * ratio / (1 + ratio) - per_slot) // per_slot)
+
+
 def _kv_tokens(kv_configurator, budget_bytes: int) -> int:
     """The tokens the KV cache holds in ``budget_bytes``, as SGLang's pool configurator sizes
     it."""
@@ -164,20 +176,20 @@ class ExpertSlotSizing:
             kvc.mambaish_config.mamba2_cache_params.mamba_cache_per_req
             + kvc.extra_mamba_cache_bytes_per_req
         )
-        # The pool allocates one padding slot beyond its size (SGLang charges size + 1).
-        share = int(
-            (self.budget_before_kv * ratio / (1 + ratio) - per_slot) // per_slot
-        )
+        share = _mamba_share(self.budget_before_kv, ratio, per_slot)
         per_request = kvc._calculate_mamba_ratio()  # state slots one request needs
         requests = _requests_set()
         self.mamba_source = (
             f"--max-running-requests {requests}" if requests else "one request"
         )
         slots = max(per_request, min((requests or 1) * per_request, share))
-        # One request fewer at a time until the KV cache's minimum fits next to them.
+        # One request fewer at a time until the KV cache's minimum fits next to them, by
+        # size()'s rule (the KV cache rounds down to whole pages).
+        page = get_schedule().page_size
         while slots > per_request and (
-            _kv_tokens(kvc, self.budget_before_kv - (slots + 1) * per_slot)
-            < self.floor.minimum
+            _kv_tokens(kvc, self.budget_before_kv - _mamba_charge(slots, per_slot))
+            + page
+            <= self.floor.minimum
         ):
             slots = max(per_request, slots - per_request)
         get_context().override("paged_experts.sizing", max_mamba_cache_size=slots)

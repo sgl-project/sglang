@@ -946,7 +946,9 @@ class TestSizing(CustomTestCase):
             )
 
     def _mamba_slots(self, budget, context_length=None, kv_bytes=1, **schedule):
-        """Mamba slots of 1000 B, 2 per request; ``kv_bytes`` per KV token."""
+        """Mamba slots of 1000 B, 2 per request; ``kv_bytes`` per KV token, rounded down to
+        whole pages like the KV cache."""
+        page = schedule.get("page_size", 1)
         kvc = SimpleNamespace(
             mambaish_config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1000)
@@ -959,13 +961,81 @@ class TestSizing(CustomTestCase):
             self._patched(context_length, **schedule) as overrides,
             patch(
                 self._SIZING + "_kv_tokens",
-                side_effect=lambda kvc, nbytes: max(nbytes, 0) // kv_bytes,
+                side_effect=lambda kvc, nbytes: (
+                    max(nbytes, 0) // kv_bytes // page * page
+                ),
             ),
         ):
             sizing.ExpertSlotSizing([], kvc, 0, budget)
         return [
             o["max_mamba_cache_size"] for o in overrides if "max_mamba_cache_size" in o
         ]
+
+    def _sglang_mamba(self, rest_bytes, per_slot, **schedule):
+        """SGLang's own Mamba accounting (``KVCacheConfigurator._handle_max_mamba_cache``) on
+        a configurator of one GPU without speculative decoding: the bytes it deducts and the
+        Mamba pool size it settles on."""
+        from sglang.srt.mem_cache import kv_cache_configurator as kvc_mod
+
+        sched = self._schedule(**schedule)
+        context = SimpleNamespace(
+            override=lambda source, **f: [setattr(sched, k, v) for k, v in f.items()]
+        )
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1], mamba_cache_per_req=per_slot
+                )
+            ),
+            pp_size=1,
+            fused_entry_bytes=lambda name: None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            hybrid_gdn_config=None,
+            hybrid_kda_config=None,
+            extra_mamba_cache_bytes_per_req=0,
+            attn_dp_size=1,
+        )
+        exec_ = SimpleNamespace(
+            mamba=SimpleNamespace(enable_linear_replayssm_spec=False)
+        )
+        with (
+            patch.object(kvc_mod, "get_schedule", return_value=sched),
+            patch.object(kvc_mod, "get_context", return_value=context),
+            patch.object(kvc_mod, "get_exec", return_value=exec_),
+            patch.object(
+                kvc_mod,
+                "get_memory",
+                return_value=SimpleNamespace(disable_radix_cache=False),
+            ),
+        ):
+            rest = kvc_mod.KVCacheConfigurator._handle_max_mamba_cache(
+                fake, rest_bytes / sizing._GIB
+            )
+        return round(
+            (rest_bytes / sizing._GIB - rest) * sizing._GIB
+        ), sched.max_mamba_cache_size
+
+    def test_mamba_charge_and_share_match_sglang(self):
+        """Our Mamba charge and share are SGLang's own: with --max-mamba-cache-size set (as
+        auto sets it) SGLang deducts exactly ``_mamba_charge``, and with it unset its ratio
+        branch settles on ``_mamba_share``. Control: a charge without the padding slot does
+        not match."""
+        per_slot = 1_000_000
+        for slots in (1, 3, 16):
+            charged, _ = self._sglang_mamba(
+                10 * sizing._GIB, per_slot, max_mamba_cache_size=slots
+            )
+            self.assertEqual(charged, sizing._mamba_charge(slots, per_slot))
+            self.assertNotEqual(charged, slots * per_slot)
+        for budget, ratio in (
+            (10 * sizing._GIB, 0.9),
+            (3 * sizing._GIB, 9),
+            (sizing._GIB, 0.5),
+        ):
+            _, size = self._sglang_mamba(
+                budget, per_slot, mamba_full_memory_ratio=ratio
+            )
+            self.assertEqual(size, sizing._mamba_share(budget, ratio, per_slot))
 
     def test_mamba_state_holds_the_requests_the_kv_cache_aims_for(self):
         """2 state slots per request: one request by default, the --max-running-requests set
@@ -998,6 +1068,18 @@ class TestSizing(CustomTestCase):
         args = dict(kv_bytes=2, max_running_requests=8, mamba_full_memory_ratio=9)
         self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [14])
         self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [8])
+
+    def test_kv_minimum_by_size_rule_in_whole_pages(self):
+        """A --max-total-tokens that is no page multiple: the KV cache can hold at most
+        9,984 of 10,000 tokens at page size 64, which size() accepts, so the Mamba state
+        keeps all 8 requests when 9,984 fit (26,990 B less 17 slots of 1000 B = 9,990 B).
+        Control: "fewer tokens than asked" would call 9,984 short and drop one request."""
+        args = dict(max_running_requests=8, mamba_full_memory_ratio=9, page_size=64)
+        self.assertEqual(
+            self._mamba_slots(26_990, max_total_tokens=10_000, **args), [16]
+        )
+        self.assertLess(9_984, 10_000)
+        self.assertGreater(9_984 + 64, 10_000)
 
 
 if __name__ == "__main__":
