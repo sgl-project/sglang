@@ -20,6 +20,7 @@ class BatchedPenalizerOrchestrator:
         self.vocab_size = vocab_size
         self._batch_ref = weakref.ref(batch)
         self.device = batch.device
+        self._device_module = torch.get_device_module(self.device)
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
         # Recorded after a forward-stream token feed; None when there is none to wait for.
         self._forward_write_done = None
@@ -63,15 +64,13 @@ class BatchedPenalizerOrchestrator:
         # merge run on the schedule stream; they wait for this write before copying.
         self.cumulate_output_tokens(output_ids=output_ids, row_start=row_start)
         if self.is_required:
-            self._forward_write_done = torch.get_device_module(self.device).Event()
+            self._forward_write_done = self._device_module.Event()
             self._forward_write_done.record()
 
     def _wait_for_forward_write(self):
         if self._forward_write_done is None:
             return
-        torch.get_device_module(self.device).current_stream().wait_event(
-            self._forward_write_done
-        )
+        self._device_module.current_stream().wait_event(self._forward_write_done)
         self._forward_write_done = None
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):

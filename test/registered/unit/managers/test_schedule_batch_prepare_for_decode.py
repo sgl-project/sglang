@@ -262,12 +262,12 @@ class TestOverlapPenaltyStreamOrder(unittest.TestCase):
 
     def setUp(self):
         self.log = []
-        patcher = patch(
-            "sglang.srt.sampling.penaltylib.orchestrator.torch.get_device_module",
-            return_value=_LoggedDeviceModule(self.log),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+
+    def _logged_batch(self):
+        batch, penalizer = _make_penalized_decode_batch(enable_overlap=True)
+        orchestrator = batch.sampling_info.penalizer_orchestrator
+        orchestrator._device_module = _LoggedDeviceModule(self.log)
+        return batch, penalizer
 
     def _resolve(self, batch):
         self._prepare_for_decode(batch)
@@ -289,7 +289,7 @@ class TestOverlapPenaltyStreamOrder(unittest.TestCase):
         setattr(penalizer, method, logged)
 
     def test_filter_waits_for_the_forward_token_write(self):
-        batch, penalizer = _make_penalized_decode_batch(enable_overlap=True)
+        batch, penalizer = self._logged_batch()
         event = self._resolve(batch)
         self._log_buffer_copies(penalizer, "_filter")
 
@@ -299,7 +299,7 @@ class TestOverlapPenaltyStreamOrder(unittest.TestCase):
         self.assertEqual(penalizer.cumulated_frequency_penalties[0, RELAYED_TOKEN], 1)
 
     def test_merge_waits_for_the_forward_token_write(self):
-        batch, penalizer = _make_penalized_decode_batch(enable_overlap=True)
+        batch, penalizer = self._logged_batch()
         event = self._resolve(batch)
         self._log_buffer_copies(penalizer, "_merge")
         other, _ = _make_penalized_decode_batch(enable_overlap=True)
