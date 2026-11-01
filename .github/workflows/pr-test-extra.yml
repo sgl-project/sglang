@@ -190,6 +190,7 @@ jobs:
           - { stage: extra-b, runner_config: 8-gpu-h20, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 8-gpu-b300, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 2-gpu-gb300, timeout_per_file: '1800', arch: aarch64 }
+          - { stage: extra-b, runner_config: 4-gpu-gb300, timeout_per_file: '1800', arch: aarch64 }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
