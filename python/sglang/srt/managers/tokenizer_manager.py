@@ -57,6 +57,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
@@ -592,7 +593,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
-        # Keep regular tokenization off the event loop and serialized.
+        # Give regular fast tokenization a backend the event loop never uses.
         self.init_tokenizer_executor()
 
         # Init inter-process communication
@@ -715,7 +716,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def init_tokenizer_executor(self):
-        self._tokenizer_executor = ThreadPoolExecutor(max_workers=1)
+        self._tokenizer_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sglang-tokenizer"
+        )
+        self._tokenizer_backend_source = None
+        self._tokenizer_backend = None
+        if isinstance(self.tokenizer, PreTrainedTokenizerFast):
+            # Copy once at startup: copying a real vocabulary on the request
+            # path can itself stall the loop. Other tokenizer implementations
+            # retain their synchronous path until they have an isolation contract.
+            self._tokenizer_backend_source = self.tokenizer.backend_tokenizer
+            self._tokenizer_backend = copy.deepcopy(self._tokenizer_backend_source)
+
+    def _regular_tokenizer_for_worker(self):
+        tokenizer = self.tokenizer
+        if (
+            not isinstance(tokenizer, PreTrainedTokenizerFast)
+            or tokenizer.backend_tokenizer is not self._tokenizer_backend_source
+        ):
+            # A replaced tokenizer must not use a stale backend or copy it
+            # during a request. Preserve the existing synchronous behavior.
+            return None
+        # Wrapper attributes (e.g. padding_side) may be configured after init.
+        # Pass this view explicitly; never swap the event loop's tokenizer.
+        worker_tokenizer = copy.copy(tokenizer)
+        worker_tokenizer._tokenizer = self._tokenizer_backend
+        return worker_tokenizer
 
     async def run_in_tokenizer_executor(self, func, *args, **kwargs):
         func_call = partial(copy_context().run, func, *args, **kwargs)
@@ -1118,21 +1144,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            def tokenize_sync():
-                if not is_cross_encoder and (
-                    not getattr(self.tokenizer, "is_fast", False)
-                ):
-                    return [self.tokenizer.encode(t) for t in tokenizer_input], None
+            def tokenize_sync(tokenizer):
+                if not is_cross_encoder and (not getattr(tokenizer, "is_fast", False)):
+                    return [tokenizer.encode(t) for t in tokenizer_input], None
 
-                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+                encoded = tokenizer(tokenizer_input, **tokenizer_kwargs)
                 return (
                     encoded["input_ids"],
                     encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
 
-            input_ids, token_type_ids = await self.run_in_tokenizer_executor(
-                tokenize_sync
-            )
+            worker_tokenizer = self._regular_tokenizer_for_worker()
+            if worker_tokenizer is None:
+                input_ids, token_type_ids = tokenize_sync(self.tokenizer)
+            else:
+                input_ids, token_type_ids = await self.run_in_tokenizer_executor(
+                    tokenize_sync, worker_tokenizer
+                )
 
         # vLLM's OpenAI embeddings endpoint includes special tokens for
         # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS

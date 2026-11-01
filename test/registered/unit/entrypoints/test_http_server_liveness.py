@@ -7,6 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -22,10 +25,10 @@ from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class _BlockingTokenizer:
-    is_fast = True
-
+class _BlockingTokenizer(PreTrainedTokenizerFast):
     def __init__(self, started, release):
+        backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+        super().__init__(tokenizer_object=backend, unk_token="[UNK]")
         self.started = started
         self.release = release
 
@@ -33,7 +36,7 @@ class _BlockingTokenizer:
         self.started.set()
         if not self.release.wait(timeout=5):
             raise TimeoutError("test did not release tokenization")
-        return {"input_ids": [[1] for _ in texts]}
+        return super().__call__(texts, **kwargs)
 
 
 class _TokenizingManager(TokenizerManager):
