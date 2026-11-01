@@ -121,7 +121,6 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     override.install()
     case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
-    # _init_tokenizer defines this attribute even when no tokenizer is loaded.
     tm.tokenizer = None
     tm.server_args = MagicMock()
     tm._config_updates = []
