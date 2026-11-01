@@ -143,6 +143,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_device_capability,
     log_info_on_rank0,
     make_pp_layers,
     set_weight_attrs,
@@ -190,9 +191,10 @@ def _kda_fp8_modules() -> frozenset:
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES must select qkv_proj, f_a_proj "
             "and g_a_proj together"
         )
-    if not cutlass_fp8_supported():
+    # Measured on H200 and H20; the GPU test runs on H100, H200 and H20.
+    if not cutlass_fp8_supported() or get_device_capability()[0] != 9:
         raise ValueError(
-            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires a CUDA GPU with FP8 GEMMs (SM89+)"
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires a Hopper GPU (SM90)"
         )
     if envs.SGLANG_FORCE_FP8_MARLIN.get():
         raise ValueError(

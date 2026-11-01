@@ -256,10 +256,11 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
                             )
 
 
-def kda_fp8_modules(value, fp8_gemm=True):
+def kda_fp8_modules(value, fp8_gemm=True, capability=(9, 0)):
     with (
         envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(value),
         patch.object(glm5_next, "cutlass_fp8_supported", return_value=fp8_gemm),
+        patch.object(glm5_next, "get_device_capability", return_value=capability),
     ):
         return glm5_next._kda_fp8_modules()
 
@@ -294,6 +295,7 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
         with (
             envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(modules),
             patch.object(glm5_next, "cutlass_fp8_supported", return_value=True),
+            patch.object(glm5_next, "get_device_capability", return_value=(9, 0)),
         ):
             return glm5_next.Glm5NextLinearAttention(
                 layer_idx=0,
@@ -331,11 +333,17 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
         self.assertEqual(len(logs.records), 1)
         self.assertIn("experimental", logs.output[0])
 
-    def test_rejects_unknown_module_and_missing_fp8_gemm(self):
+    def test_rejects_unknown_module_and_gpus_other_than_hopper(self):
         with self.assertRaisesRegex(ValueError, "Unknown"):
             kda_fp8_modules("in_proj")
-        with self.assertRaisesRegex(ValueError, "SM89"):
+        with self.assertRaisesRegex(ValueError, "Hopper"):
             kda_fp8_modules("o_proj", fp8_gemm=False)
+        for capability in ((8, 9), (10, 0), (12, 0)):
+            with (
+                self.subTest(capability=capability),
+                self.assertRaisesRegex(ValueError, "Hopper"),
+            ):
+                kda_fp8_modules("o_proj", capability=capability)
         with (
             envs.SGLANG_FORCE_FP8_MARLIN.override(True),
             self.assertRaisesRegex(ValueError, "SGLANG_FORCE_FP8_MARLIN"),
