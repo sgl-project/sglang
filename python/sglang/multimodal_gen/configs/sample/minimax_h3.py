@@ -173,6 +173,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 server_args.warmup_num_frames / MINIMAX_H3_SUPPORTED_FPS
             )
         if server_args.warmup_resolutions is not None:
+            # Warm up at the canvas the flag names, short edge included.
+            target["short_edge"] = min(int(req.width), int(req.height))
             ratio = req.width / req.height
 
             def distance(name: str) -> float:
