@@ -78,6 +78,37 @@ def unit_scale(scale: Optional[float]) -> float:
     return 1.0 if scale is None else scale
 
 
+# The decode kernels size their split-K grids (and the gfx950 score tile) from the
+# batch size, so a request's reduction order depends on how many requests share its
+# batch. --enable-deterministic-inference sizes them for this batch size instead,
+# whatever the real one.
+DETERMINISTIC_GRID_BATCH_SIZE = 16
+
+_deterministic_inference = None
+
+
+def _is_deterministic_inference() -> bool:
+    global _deterministic_inference
+    if _deterministic_inference is None:
+        from sglang.srt.runtime_context import get_exec
+
+        try:
+            exec_cfg = get_exec()
+        except ValueError:
+            return False  # not published yet, ask again on the next call
+        _deterministic_inference = bool(
+            exec_cfg.deterministic.enable_deterministic_inference
+        )
+    return _deterministic_inference
+
+
+def grid_batch_size(batch_size: int) -> int:
+    """The batch size the decode kernels size their grids and tiles for."""
+    if _is_deterministic_inference():
+        return DETERMINISTIC_GRID_BATCH_SIZE
+    return batch_size
+
+
 try:
     make_tensor_descriptor = tl.make_tensor_descriptor
 except Exception:
