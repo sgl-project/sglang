@@ -27,6 +27,10 @@ from sglang.srt.managers.schedule_batch import (
     ReqKvInfo,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    SchedulerPoolStatsObserver,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.models.unlimited_ocr_v2_support import document_reuse as r
 from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -436,6 +440,41 @@ class _FakeCache:
     def req_to_token_pool(self):
         cache = self
         return SimpleNamespace(free=lambda holder: cache.freed_req_slots.append(holder))
+
+
+class TestRetainedWindowAccounting(CustomTestCase):
+    def test_trimmed_and_consumed_windows_stay_visible_to_pool_accounting(self):
+        """off-tree windows hold partial rows, including while a follow-up consumes them"""
+        cache = _FakeCache()
+        cache.reuse.docs["doc"] = r.DocEntry(
+            holder=_FakeHolder(allocated=256),
+            input_ids=[1],
+            output_ids=[],
+            kept=[(0, 32), (128, 192)],
+        )
+        owner = object.__new__(UnifiedRadixCache)
+        owner.page_size = 32
+        owner.session = SimpleNamespace(slots={})
+        owner.uocr_doc_reuse = cache.reuse
+        observer = SchedulerPoolStatsObserver(
+            tree_cache=owner,
+            storage=None,
+            token_to_kv_pool_allocator=None,
+            session_controller=None,
+            hisparse_coordinator=None,
+            enable_hisparse=False,
+        )
+        for consumed in (False, True):
+            with self.subTest(consumed=consumed):
+                if consumed:
+                    entry = cache.reuse.docs.pop("doc")
+                    cache.reuse.sources[id(entry)] = entry
+                self.assertEqual(observer.session_held_tokens(), 96)
+                self.assertEqual(observer.session_held_swa_tokens(), 96)
+                self.assertEqual(observer.session_held_req_count(), 1)
+        cache.reuse.reset()
+        self.assertEqual(observer.session_held_tokens(), 0)
+        self.assertEqual(observer.session_held_req_count(), 0)
 
 
 class TestDroppedRequest(CustomTestCase):
