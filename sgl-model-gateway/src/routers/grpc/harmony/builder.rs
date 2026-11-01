@@ -398,9 +398,22 @@ impl HarmonyBuilder {
                         .iter()
                         .map(|tool| match tool.r#type {
                             ResponseToolType::Function => "function",
+                            ResponseToolType::WebSearch => "web_search",
                             ResponseToolType::WebSearchPreview => "web_search_preview",
                             ResponseToolType::CodeInterpreter => "code_interpreter",
+                            ResponseToolType::FileSearch => "file_search",
+                            ResponseToolType::ImageGeneration => "image_generation",
+                            ResponseToolType::ComputerUsePreview => "computer_use_preview",
+                            ResponseToolType::LocalShell => "local_shell",
                             ResponseToolType::Mcp => "mcp",
+                            ResponseToolType::Custom => "custom",
+                            ResponseToolType::Namespace => "namespace",
+                            ResponseToolType::ToolSearch => "tool_search",
+                            // sglang#30781: any tool type the Python server
+                            // accepts that this router doesn't recognize by
+                            // name yet. Not one of Harmony's builtin tools,
+                            // so it must be treated as a custom tool.
+                            ResponseToolType::Unknown => "unknown",
                         })
                         .collect()
                 })
