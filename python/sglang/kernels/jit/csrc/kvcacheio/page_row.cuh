@@ -6,11 +6,10 @@ namespace sglang {
 
 // Opaque page-row copies between pinned host memory and device pools: one row of
 // row_bytes per (layer, page). A 64-lane worker moves one segment of a row with up
-// to kVecsPerLane independent 16 B loads per lane in flight, so two CTAs saturate
-// PCIe and leave every other SM to compute.
+// to kVecsPerLane independent 16 B loads per lane in flight, so kBlockQuota CTAs
+// saturate PCIe and leave every other SM to compute.
 constexpr uint32_t kPageRowLanes = 64;
 constexpr int64_t kPageRowLineVecs = 128 / 16;
-constexpr uint32_t kPageRowBlockQuota = 2;
 
 struct PageRowParams {
   const uint64_t* __restrict__ host_ptrs;
@@ -61,7 +60,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void page_row_copy(const __grid_cons
   }
 }
 
-template <bool kLoad, uint32_t kVecsPerLane, uint32_t kBlockSize>
+template <bool kLoad, uint32_t kVecsPerLane, uint32_t kBlockSize, uint32_t kBlockQuota>
 struct PageRowKernel {
   static_assert(kBlockSize % kPageRowLanes == 0, "block must hold whole workers");
 
@@ -93,7 +92,7 @@ struct PageRowKernel {
     const auto row_lines = row_bytes / 128;
     const auto segments = div_ceil(row_lines, kSegmentLines);
     const auto work = layers.unwrap() * pages.unwrap() * segments;
-    const auto blocks = std::min<int64_t>(div_ceil(work, kWorkersPerBlock), kPageRowBlockQuota);
+    const auto blocks = std::min<int64_t>(div_ceil(work, kWorkersPerBlock), kBlockQuota);
     const auto params = PageRowParams{
         .host_ptrs = static_cast<const uint64_t*>(host_ptrs.data_ptr()),
         .device_ptrs = static_cast<const uint64_t*>(device_ptrs.data_ptr()),

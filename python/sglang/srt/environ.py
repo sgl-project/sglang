@@ -721,7 +721,10 @@ class Envs:
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
-    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Process a prefill step's result before scheduling the next step, for TTFT.
+    SGLANG_DISABLE_OVERLAP_AFTER_PREFILL = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP"
+    )
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -1018,6 +1021,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
+    # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
+    # INT4 at every size.
+    SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB = EnvInt(64)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
