@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.gemm import _prefer_torch_rowwise_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -270,29 +269,26 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
     GPU in test/registered/kernels/ops/gemm/test_glm53_kda_fp8_projection.py."""
 
     def setUp(self):
-        # EnvField.override skips its restore when the body raises (the rejection cases);
-        # this outer override exits normally and restores the variable.
-        switch = envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override("")
-        switch.__enter__()
-        self.addCleanup(switch.__exit__, None, None, None)
+        super().setUp()
+        self.enterContext(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""))
         override = get_context().override_server_args(
             device="cpu", enable_lora=False, lora_paths=None
         )
         override.install()
         self.addCleanup(override.restore)
-        parallel = get_parallel().override(
-            tp_size=1,
-            tp_rank=0,
-            attn_tp_size=1,
-            attn_tp_rank=0,
-            attn_dp_size=1,
-            attn_dp_rank=0,
-            attn_cp_size=1,
-            attn_cp_rank=0,
-            moe_tp_size=1,
+        self.enterContext(
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                moe_tp_size=1,
+            )
         )
-        parallel.__enter__()
-        self.addCleanup(parallel.__exit__, None, None, None)
 
     def build(self, modules, quant_config=None):
         with (
@@ -326,6 +322,14 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
                 self.assertRaisesRegex(ValueError, "together"),
             ):
                 kda_fp8_modules(partial)
+
+    def test_switch_logs_once_that_it_is_experimental(self):
+        glm5_next._warn_kda_fp8_experimental.cache_clear()
+        with self.assertLogs(glm5_next.logger, "WARNING") as logs:
+            for _ in range(2):  # the check runs for every KDA layer
+                kda_fp8_modules("o_proj")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("experimental", logs.output[0])
 
     def test_rejects_unknown_module_and_missing_fp8_gemm(self):
         with self.assertRaisesRegex(ValueError, "Unknown"):
@@ -400,13 +404,25 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
                 self.assertEqual(kda_fp8_modules(""), frozenset())
 
     def test_unfused_input_projection_is_rejected(self):
-        # LoRA turns the projection fusion off.
-        override = get_context().override_server_args(enable_lora=True)
-        override.install()
-        self.addCleanup(override.restore)
-        self.assertIsInstance(self.build("o_proj").o_proj.quant_method, Fp8LinearMethod)
+        # A quant config that quantizes the input projections turns the fusion off.
         with self.assertRaisesRegex(ValueError, "fused"):
-            self.build(KDA_FP8_ALL_MODULES)
+            self.build(KDA_FP8_ALL_MODULES, MockFp8Config(("o_proj",)))
+
+    def test_lora_is_rejected(self):
+        for enable_lora, paths in ((True, None), (False, ["adapter"])):
+            with (
+                self.subTest(enable_lora=enable_lora, paths=paths),
+                patch.object(
+                    glm5_next,
+                    "get_lora",
+                    return_value=SimpleNamespace(
+                        enable_lora=enable_lora, lora_paths=paths
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "LoRA"):
+                    kda_fp8_modules("o_proj")
+                self.assertEqual(kda_fp8_modules(""), frozenset())
 
     def test_fp8_scaled_mm_keeps_the_aot_kernel_below_8192_rows(self):
         # _apply_dynamic_per_token calls the AOT kernel directly below 8192 rows, where

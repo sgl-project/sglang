@@ -178,6 +178,8 @@ _KDA_FP8_UNSUPPORTED_LOAD_FORMATS = (
 
 def _kda_fp8_modules() -> frozenset:
     modules = frozenset(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+    if not modules:
+        return modules
     if unknown := modules - _KDA_FP8_MODULES:
         raise ValueError(
             f"Unknown SGLANG_OPT_GLM53_KDA_PTPC_MODULES modules {sorted(unknown)}; "
@@ -188,26 +190,26 @@ def _kda_fp8_modules() -> frozenset:
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES must select qkv_proj, f_a_proj "
             "and g_a_proj together"
         )
-    if modules and not cutlass_fp8_supported():
+    if not cutlass_fp8_supported():
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires a CUDA GPU with FP8 GEMMs (SM89+)"
         )
-    if modules and envs.SGLANG_FORCE_FP8_MARLIN.get():
+    if envs.SGLANG_FORCE_FP8_MARLIN.get():
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES runs FP8 GEMMs; unset SGLANG_FORCE_FP8_MARLIN"
         )
+    # LoRA wraps the projections in layers this path is not tested with.
+    if get_lora().enable_lora or get_lora().lora_paths:
+        raise ValueError("SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with LoRA")
     # These formats copy a seed's or a saved model's processed tensors into parameters
     # built from the checkpoint; a transfer-engine seed serves its FP8 tensors to them.
     load_format = get_model().load_format
-    if modules and load_format in _KDA_FP8_UNSUPPORTED_LOAD_FORMATS:
+    if load_format in _KDA_FP8_UNSUPPORTED_LOAD_FORMATS:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
             f"--load-format {load_format}: the KDA projections are quantized at load"
         )
-    if (
-        modules
-        and get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
-    ):
+    if get_model().remote_instance_weight_loader_start_seed_via_transfer_engine:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
             "--remote-instance-weight-loader-start-seed-via-transfer-engine: "
@@ -215,19 +217,18 @@ def _kda_fp8_modules() -> frozenset:
         )
     # Elastic EP reloads lost experts with update_weights_from_disk, which these
     # projections refuse, and it does not check the refusal.
-    if modules and get_exec().moe.elastic_ep_backend is not None:
+    if get_exec().moe.elastic_ep_backend is not None:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
             "--elastic-ep-backend: the KDA projections are quantized at load"
         )
     # The FP8 path picks its kernel by token count, so outputs change with the batch.
-    if modules and get_exec().deterministic.enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
             "--enable-deterministic-inference: the FP8 kernel depends on the batch size"
         )
-    if modules:
-        _warn_kda_fp8_experimental()
+    _warn_kda_fp8_experimental()
     return modules
 
 
@@ -279,11 +280,13 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
         torch.cuda.empty_cache()
         layer._derived_weight_cache_error = (
             "Online weight updates are not supported with "
-            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load."
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load. "
+            "Unset it and restart to update weights."
         )
         layer._weight_export_error = (
             "Weight export is not supported with "
-            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load."
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load. "
+            "Unset it and restart to export weights."
         )
         # The cases where apply_fp8_linear takes its dynamic per-token CUTLASS path;
         # it also needs K % 16 == 0 (N is padded above).
@@ -637,7 +640,8 @@ class Glm5NextLinearAttention(nn.Module):
         if fp8_input_proj and not self.do_fuse_qkvbfg:
             raise ValueError(
                 "SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj needs "
-                "the fused [q|k|v|b|f_a|g_a] projection (BF16 checkpoint projections, no LoRA)"
+                "the fused [q|k|v|b|f_a|g_a] projection, which the quant config does not "
+                "allow here (it must leave these projections in BF16)"
             )
         if (
             "o_proj" in fp8_modules

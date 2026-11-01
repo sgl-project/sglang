@@ -36,10 +36,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # base-b and base-c, not the kernel stage, whose path filter misses srt/ changes;
-# H100 runs the path of a Hopper GPU without tuned tables.
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-c", runner_config="8-gpu-h200")
-register_cuda_ci(est_time=60, stage="base-c", runner_config="8-gpu-h20")
+# H100 runs the path of a Hopper GPU without tuned tables. The test uses one GPU,
+# but H200 and H20 runners come only as 8-GPU pools.
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=30, stage="base-c", runner_config="8-gpu-h20")
 
 HIDDEN, HEADS, HEAD_DIM = 4096, 64, 128
 PREFIX = "model.layers.0.self_attn"
@@ -53,14 +54,18 @@ SHAPES = {
     "o_proj_tp4": (4096, 2048),
     "o_proj_tp8": (4096, 1024),
 }
-TUNED = torch.cuda.is_available() and torch.cuda.get_device_name() in (
-    "NVIDIA H200",
-    "NVIDIA H20",
-)
+TABLE_GPUS = ("NVIDIA H200", "NVIDIA H20")
 
 
 def padded(n):
     return n + -n % 16
+
+
+# Whether this GPU has the tuned tables, looked up as the runtime does (by the exact
+# device name), so the tile checks run wherever the tables apply.
+TUNED = torch.cuda.is_available() and all(
+    get_w8a8_channelwise_fp8_configs(padded(n), k) for n, k in SHAPES.values()
+)
 
 
 def magnitudes(rows, generator):
@@ -154,14 +159,9 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         print(f"{torch.cuda.get_device_name()}: tuned KDA tables checked: {TUNED}")
 
     def setUp(self):
-        # EnvField.override skips its restore when the body raises;
-        # this outer override exits normally and restores the variable.
-        for override in (
-            envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(True),
-            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""),
-        ):
-            override.__enter__()
-            self.addCleanup(override.__exit__, None, None, None)
+        super().setUp()
+        self.enterContext(envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(True))
+        self.enterContext(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""))
 
     def test_load_pads_and_quantizes_per_channel(self):
         for name, (n, k) in SHAPES.items():
@@ -180,6 +180,8 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                     self.assertIsNotNone(get_w8a8_channelwise_fp8_configs(padded(n), k))
 
     def test_output_matches_dequantized_gemm(self):
+        if torch.cuda.get_device_name() in TABLE_GPUS:
+            self.assertTrue(TUNED, "the tuned tables did not load on their GPU")
         tiles_seen = 0
         for name, (n, k) in SHAPES.items():
             tiles, cutlass = table_tokens(n, k)
@@ -314,7 +316,12 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                     num_stages=tile["num_stages"],
                 )
 
-            with self.subTest(case="tuned tile", shape=name, m=tiles[0]):
+            with (
+                self.subTest(case="tuned tile", shape=name, m=tiles[0]),
+                patch.object(
+                    glm5_next, "triton_scaled_mm", wraps=triton_scaled_mm
+                ) as spy,
+            ):
                 check(
                     tune_method,
                     tune_layer,
@@ -322,6 +329,9 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                     tiled,
                     other=lambda g: aot(None, g),
                 )
+                # Every tile runs the same kernel name, so check the launch parameters.
+                launch = spy.call_args.kwargs
+                self.assertEqual({key: launch[key.lower()] for key in tile}, tile)
 
     @torch.no_grad()
     def test_model_projections_match_bf16_reference(self):
