@@ -352,6 +352,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         lora_path = (
             self._resolve_lora_path(request.model, None) if request.model else None
         )
+        if lora_path is None and request.model:
+            lora_registry = getattr(self.tokenizer_manager, "lora_registry", None)
+            if (
+                lora_registry is not None
+                and request.model in lora_registry.get_all_adapters()
+            ):
+                lora_path = request.model
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
