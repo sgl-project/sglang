@@ -1,6 +1,7 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
 import tempfile
+import threading
 import unittest
 from array import array
 from collections import defaultdict, deque
@@ -69,6 +70,9 @@ def _staged_fixture(full_match=2):
     cache.storage_metrics_collector = None
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
+    # Backup retry state reset() sets; the tick reads it.
+    cache._host_capacity_backup_retries = {}
+    cache._backup_write_specs = {}
     cache.tree_components = []
     cache.components = {}
     index_slots(cache, cache.components)
@@ -80,6 +84,10 @@ def _staged_fixture(full_match=2):
         full_available_size=Mock(return_value=100)
     )
     cc = HybridCacheController.__new__(HybridCacheController)
+    # Worker-thread state __init__ sets; the tick reads it (no workers started here).
+    cc.storage_stop_event = threading.Event()
+    cc.prefetch_thread = cc.prefetch_io_aux_thread = None
+    cc.prefetch_sync_thread = cc.backup_thread = None
     cc.pp_prefetch_command_group = None
     cc.page_size = 2
     cc.get_hash_str = get_hash_str
@@ -150,11 +158,15 @@ def _hit_drain_fixture():
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._storage_prefetch_wait = {}
     cache._prefetch_outcome_stats = defaultdict(int)
+    # Backup retry state reset() sets; the tick reads it.
+    cache._host_capacity_backup_retries = {}
+    cache._backup_write_specs = {}
     cache._storage_prefetch_hit_remaining_by_reqid = {}
     cache._record_storage_prefetch_hit = Mock()
     cache.revoke_pending_prefetch = Mock()
     cache.buffer_pipeline = SimpleNamespace(pending_hit_allocs=deque())
     cache.cache_controller = SimpleNamespace(
+        storage_workers_alive=lambda: True,
         prefetch_hit_queue=Queue(),
         ack_prefetch_queue=Queue(),
         ack_backup_queue=Queue(),
@@ -201,6 +213,52 @@ def _timeout_fixture(mode="buffer_only", policy="timeout"):
     return cache, cache.ongoing_prefetch[_REQ].operation
 
 
+def _arm_tick(cache, sync_counts=False):
+    """Let check_hicache_events run on the CPU fixture: the drains are
+    stubbed, the deadline vote and the polls are real. With sync_counts the
+    ready-count sync is real too (gloo path, empty queues), so its piggybacked
+    live-prefetch digest check runs."""
+    cache.pp_size = 1
+    cache.enable_storage = True
+    cache._drain_async_work = Mock()
+    cache.flush_pending_backups = Mock()
+    if sync_counts:
+        cc = cache.cache_controller
+        cache.tree_core.write_back_duplicate_reclaim_digest = 0
+        cache._shm_count_exchange = lambda: None
+        cc.ack_write_queue = []
+        cc.ack_load_queue = []
+        for name in (
+            "prefetch_hit_queue",
+            "ack_prefetch_queue",
+            "ack_backup_queue",
+            "host_mem_release_queue",
+        ):
+            setattr(cc, name, Queue())
+        cc.extra_host_mem_release_queues = {}
+    else:
+        cache._sync_hicache_ready_counts = Mock(return_value=(0, 0, (0, 0, 0, 0), ()))
+    cache.writing_check = Mock()
+    cache.loading_check = Mock()
+    cache._drain_storage_control_queues_impl = Mock()
+
+
+def _counting_all_reduce(reduces):
+    """Records each collective's agreed (post-reduce) value and op."""
+
+    def all_reduce(tensor, op):
+        torch.distributed.all_reduce(tensor, op=op)
+        reduces.append((tensor.tolist(), op))
+
+    return all_reduce
+
+
+def _assert_ranks_agree(snapshot):
+    snapshots = [None, None]
+    torch.distributed.all_gather_object(snapshots, snapshot)
+    assert snapshots[0] == snapshots[1], snapshots
+
+
 def _two_rank_prefetch_deadline(rank, rendezvous):
     torch.distributed.init_process_group(
         "gloo",
@@ -211,18 +269,113 @@ def _two_rank_prefetch_deadline(rank, rendezvous):
     )
     try:
         cache, operation = _timeout_fixture()
-        cache._all_reduce = torch.distributed.all_reduce
-        # Only one rank has reached admission; its expiry must close both budgets.
+        _arm_tick(cache)
+        reduces = []
+        cache._all_reduce = _counting_all_reduce(reduces)
+        # Only rank 0 has reached admission, and only its clock has run out.
         if rank == 0:
             with patch("time.perf_counter", return_value=100.0):
                 cache._start_storage_prefetch_wait(operation)
         with patch("time.perf_counter", return_value=103.0):
-            assert cache.check_prefetch_progress(_REQ)
-        assert operation.deadline_expired
-        assert cache._storage_prefetch_wait[_REQ].expired
+            if rank == 0:
+                # A poll reads the verdict; it cannot expire a request alone,
+                # and the peer that never polled issues nothing to match.
+                assert not cache.check_prefetch_progress(_REQ)
+            assert reduces == []
+            cache.check_hicache_events()
+            assert reduces == [([1], torch.distributed.ReduceOp.MAX)], reduces
+            assert operation.deadline_expired
+            assert cache._storage_prefetch_wait[_REQ].expired
+            verdict = cache.check_prefetch_progress(_REQ)
+        _assert_ranks_agree((verdict, operation.deadline_expired, len(reduces)))
+        assert verdict
         cache.prefetch_from_storage(_REQ, 0, list(range(8)))
         assert not cache.ongoing_prefetch
         assert not cache.storage_prefetch_retries._pending
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _two_rank_uneven_polls(rank, rendezvous):
+    """The #30760 shape before any verdict: ranks leave the admission loop at
+    different points, so rank 0 polls two waiting requests and rank 1 polls
+    one; a False poll is rank-local state only, so nothing diverges."""
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        cache, _ = _timeout_fixture()
+        _arm_tick(cache)
+        reduces = []
+        cache._all_reduce = _counting_all_reduce(reduces)
+        other = CacheRequestHandle("r1", 0)
+        cache.prefetch_from_storage(other, 0, list(range(8)))
+        handles = [_REQ, other]
+        with patch("time.perf_counter", return_value=100.0):
+            for handle in handles:
+                assert not cache.check_prefetch_progress(handle)
+        with patch("time.perf_counter", return_value=103.0):
+            polled = handles[: 2 - rank]
+            for handle in polled:
+                assert not cache.check_prefetch_progress(handle)
+            assert reduces == []
+            cache.check_hicache_events()
+            assert reduces == [([1, 1], torch.distributed.ReduceOp.MAX)], reduces
+            verdicts = [cache.check_prefetch_progress(handle) for handle in handles]
+        _assert_ranks_agree((verdicts, len(reduces), list(cache.ongoing_prefetch)))
+        assert verdicts == [True, True]
+        assert not cache.ongoing_prefetch
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _two_rank_divergent_live_sets(rank, rendezvous):
+    """The #30760 shape after a verdict: a True poll retires per rank, so a
+    rank that left the admission loop early holds one more live prefetch than
+    its peer. The next tick must raise on both ranks at the ready-count sync
+    instead of voting on tensors of different length (a hang until the gloo
+    timeout)."""
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        cache, _ = _timeout_fixture()
+        _arm_tick(cache, sync_counts=True)
+        reduces = []
+        cache._all_reduce = _counting_all_reduce(reduces)
+        other = CacheRequestHandle("r1", 0)
+        cache.prefetch_from_storage(other, 0, list(range(8)))
+        handles = [_REQ, other]
+        min_op, max_op = torch.distributed.ReduceOp.MIN, torch.distributed.ReduceOp.MAX
+        with patch("time.perf_counter", return_value=100.0):
+            for handle in handles:
+                assert not cache.check_prefetch_progress(handle)
+        with patch("time.perf_counter", return_value=103.0):
+            cache.check_hicache_events()
+            assert [op for _, op in reduces] == [min_op, max_op], reduces
+            assert reduces[1][0] == [1, 1], reduces
+            # Rank 1 trips batch_is_full after one request; rank 0 polls both.
+            for handle in handles[: 2 - rank]:
+                assert cache.check_prefetch_progress(handle)
+            assert len(cache.ongoing_prefetch) == rank
+            try:
+                cache.check_hicache_events()
+            except AssertionError as error:
+                outcome = "diverged" in str(error)
+            else:
+                outcome = "no raise"
+        # Same tick, every rank: the sync raised before any vote was issued.
+        _assert_ranks_agree((outcome, [op for _, op in reduces]))
+        assert outcome is True
+        assert [op for _, op in reduces] == [min_op, max_op, min_op]
     finally:
         torch.distributed.destroy_process_group()
 
@@ -301,12 +454,90 @@ class TestWaitingStorageSpan(unittest.TestCase):
 
 
 class TestStoragePrefetchTimeout(unittest.TestCase):
+    def test_polls_never_reduce_and_the_tick_votes_once(self):
+        """N waiting requests polled in one pass issue no collective; the tick
+        issues exactly one MAX vote packed over every live prefetch, and only
+        that vote can expire a request, however late its poll."""
+        cache, _ = _timeout_fixture()
+        polled = [_REQ] + [CacheRequestHandle(f"r{i}", 0) for i in range(1, 4)]
+        never_polled = CacheRequestHandle("parked", 0)
+        for handle in polled[1:] + [never_polled]:
+            cache.prefetch_from_storage(handle, 0, list(range(8)))
+        _arm_tick(cache)
+        reduces = []
+        cache._all_reduce = lambda tensor, op: reduces.append((tensor.tolist(), op))
+        max_op = torch.distributed.ReduceOp.MAX
+
+        with patch("time.perf_counter", return_value=100.0):
+            for handle in polled:
+                self.assertFalse(cache.check_prefetch_progress(handle))
+        self.assertEqual(reduces, [])
+        with patch("time.perf_counter", return_value=100.5):
+            cache.check_hicache_events()
+        self.assertEqual(reduces, [([0, 0, 0, 0, 0], max_op)])
+
+        # Budget 1.0 + 4 pages * 0.25 is long spent, yet a poll cannot cut.
+        with patch("time.perf_counter", return_value=200.0):
+            for handle in polled:
+                self.assertFalse(cache.check_prefetch_progress(handle))
+            self.assertEqual(len(reduces), 1)
+            cache.check_hicache_events()
+            # A wait that never started (no blocked poll) contributes 0.
+            self.assertEqual(reduces[1], ([1, 1, 1, 1, 0], max_op))
+            # The vote terminates (the worker and the hit drain stop spending
+            # on the span); the poll retires, with the deadline reason.
+            self.assertFalse(
+                cache.ongoing_prefetch[never_polled].operation.is_terminated()
+            )
+            for handle in polled:
+                self.assertTrue(cache._storage_prefetch_wait[handle].expired)
+                self.assertTrue(
+                    cache.ongoing_prefetch[handle].operation.is_terminated()
+                )
+                self.assertTrue(cache.check_prefetch_progress(handle))
+        self.assertEqual(list(cache.ongoing_prefetch), [never_polled])
+        self.assertEqual(cache.storage_prefetch_retries._pending, {})
+        self.assertEqual(len(reduces), 2)
+
+        # The other policies never vote, and no live prefetch means no collective.
+        for policy in ("best_effort", "wait_complete"):
+            cache.prefetch_stop_policy = policy
+            cache.check_hicache_events()
+        cache.prefetch_stop_policy = "timeout"
+        cache.ongoing_prefetch.clear()
+        cache.check_hicache_events()
+        self.assertEqual(len(reduces), 2)
+
     def test_expiry_is_agreed_even_before_a_peer_starts_waiting(self):
         """A rank that has not reached its admission poll must still adopt
-        the agreed expiry, or it would re-issue the prefetch alone."""
+        the agreed expiry in the same tick, or it would re-issue the prefetch
+        alone; the poll on both ranks then returns the same verdict."""
         with tempfile.TemporaryDirectory() as tmpdir:
             torch.multiprocessing.spawn(
                 _two_rank_prefetch_deadline,
+                args=(f"{tmpdir}/gloo",),
+                nprocs=2,
+            )
+
+    def test_uneven_polls_before_a_verdict_issue_no_collective(self):
+        """sgl-project/sglang#30760's trigger: a rank that polls more waiting
+        requests than its peer must not enter more collectives."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch.multiprocessing.spawn(
+                _two_rank_uneven_polls,
+                args=(f"{tmpdir}/gloo",),
+                nprocs=2,
+            )
+
+    def test_divergent_live_prefetch_sets_raise_on_every_rank_in_the_same_tick(
+        self,
+    ):
+        """Uneven polls after a verdict leave the ranks with different live
+        prefetch sets; the next tick's ready-count sync fails loud on both
+        ranks before the vote could be issued with mismatched lengths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch.multiprocessing.spawn(
+                _two_rank_divergent_live_sets,
                 args=(f"{tmpdir}/gloo",),
                 nprocs=2,
             )

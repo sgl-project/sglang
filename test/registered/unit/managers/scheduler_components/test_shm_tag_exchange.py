@@ -49,6 +49,9 @@ def _hicache_tp_rank(rank: int, extra_pools: int) -> UnifiedRadixCache:
     )
     cache.pp_rank, cache.pp_size, cache.pp_group = 0, 1, None
     cache.host_memory_mode = "cache"
+    # The tick reads the stop policy and the live prefetch set (deadline vote).
+    cache.prefetch_stop_policy = "wait_complete"
+    cache.ongoing_prefetch = {}
     cache.attn_cp_group = cache.attn_tp_group = None
     cache.tp_group, cache.tp_world_size = torch.distributed.group.WORLD, 2
     cache.cache_controller = SimpleNamespace(
