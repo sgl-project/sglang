@@ -301,6 +301,39 @@ def test_ipc_lora_sync_updates_pipeline_state():
     torch.testing.assert_close(layer.base_layer.weight, base_weight)
 
 
+def test_ipc_lora_sync_reconciles_layers_omitted_from_payload():
+    """A partial IPC sync must not leave omitted layers merged and untracked."""
+    layer, other = _make_layer(), _make_layer()
+    base_weight = other.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer)
+    pipeline.lora_layers["other"] = other
+    pipeline.lora_adapters["adapter"]["other.lora_A"] = torch.ones(1, 2)
+    pipeline.lora_adapters["adapter"]["other.lora_B"] = torch.ones(2, 1)
+    pipeline.server_args.lora_merge_mode = "merge"
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter", "/adapter", target="transformer", merge_mode="merge"
+        )
+    assert layer.merged and other.merged
+
+    synced = [
+        ("linear.lora_A", torch.full((1, 2), 3.0)),
+        ("linear.lora_B", torch.ones(2, 1)),
+    ]
+    ok, message = WeightsUpdater(pipeline).update_weights_from_tensor(
+        {"transformer": synced}, weight_update_mode="lora_merge"
+    )
+    assert ok, message
+    assert not other.merged
+    torch.testing.assert_close(other.base_layer.weight, base_weight)
+    assert pipeline.is_lora_merged["transformer"] == layer.merged
+
+    pipeline.unmerge_lora_weights()
+    torch.testing.assert_close(other.base_layer.weight, base_weight)
+
+
 def test_lora_alpha_override_updates_cached_adapter_scale():
     layer = _make_layer()
     pipeline = _make_pipeline(layer)
