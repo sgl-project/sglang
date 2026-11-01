@@ -865,5 +865,78 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         )
 
 
+class TestNgramCorpusRequestCorpusIds(CustomTestCase):
+    """Verify per-request corpus selection via batch_get(corpus_ids=...)."""
+
+    def _make_two_corpora(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        for corpus_id, doc in (("a", [1, 2, 3, 10, 11]), ("b", [1, 2, 3, 20, 21])):
+            loaded = corpus.load_external_corpus_named(corpus_id, [doc])
+            corpus.commit_external_corpus_load(corpus_id, loaded)
+        return corpus
+
+    def _leaf_paths(self, corpus, rid, corpus_ids):
+        ids, masks = corpus.batch_get([rid], [[1, 2, 3]], [3], [corpus_ids])
+        return corpus.leaf_paths_from_mask(ids.tolist(), masks.reshape(6, 6).tolist())
+
+    def test_none_uses_all_corpora(self):
+        paths = self._leaf_paths(self._make_two_corpora(), "r", None)
+        self.assertIn([3, 10, 11], paths)
+        self.assertIn([3, 20, 21], paths)
+
+    def test_selects_listed_corpus_only(self):
+        paths = self._leaf_paths(self._make_two_corpora(), "r", ["b"])
+        self.assertNotIn([3, 10, 11], paths)
+        self.assertIn([3, 20, 21], paths)
+
+    def test_empty_list_uses_trie_only(self):
+        paths = self._leaf_paths(self._make_two_corpora(), "r", [])
+        self.assertNotIn([3, 10, 11], paths)
+        self.assertNotIn([3, 20, 21], paths)
+
+    def test_unknown_id_is_ignored(self):
+        paths = self._leaf_paths(self._make_two_corpora(), "r", ["a", "missing"])
+        self.assertIn([3, 10, 11], paths)
+        self.assertNotIn([3, 20, 21], paths)
+
+    def test_selection_matches_single_corpus_budget(self):
+        """Selecting one of two corpora gives it the whole SAM budget, the
+        same drafts as a server with only that corpus loaded."""
+        selected = self._make_two_corpora().batch_get(["r"], [[1, 2, 3]], [3], [["a"]])
+        only_a = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        loaded = only_a.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
+        only_a.commit_external_corpus_load("a", loaded)
+        expected = only_a.batch_get(["r"], [[1, 2, 3]], [3])
+        np.testing.assert_array_equal(selected[0], expected[0])
+        np.testing.assert_array_equal(selected[1], expected[1])
+
+    def test_batch_mixes_selections(self):
+        corpus = self._make_two_corpora()
+        ids, masks = corpus.batch_get(
+            ["ra", "rb"], [[1, 2, 3], [1, 2, 3]], [3, 3], [["a"], ["b"]]
+        )
+        ids, masks = ids.reshape(2, 6), masks.reshape(2, 6, 6)
+        paths_a = corpus.leaf_paths_from_mask(ids[0].tolist(), masks[0].tolist())
+        paths_b = corpus.leaf_paths_from_mask(ids[1].tolist(), masks[1].tolist())
+        self.assertIn([3, 10, 11], paths_a)
+        self.assertNotIn([3, 20, 21], paths_a)
+        self.assertIn([3, 20, 21], paths_b)
+        self.assertNotIn([3, 10, 11], paths_b)
+
+    def test_selection_is_fixed_at_first_match(self):
+        corpus = self._make_two_corpora()
+        self._leaf_paths(corpus, "r", ["a"])
+        # Later calls for the same request keep the first selection.
+        paths = self._leaf_paths(corpus, "r", None)
+        self.assertNotIn([3, 20, 21], paths)
+
+    def test_erase_drops_selection(self):
+        corpus = self._make_two_corpora()
+        self._leaf_paths(corpus, "r", ["a"])
+        corpus.erase_match_state(["r"])
+        paths = self._leaf_paths(corpus, "r", None)
+        self.assertIn([3, 20, 21], paths)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)
