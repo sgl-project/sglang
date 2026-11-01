@@ -22,7 +22,13 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 class TestPrebuiltLLGuidance(unittest.TestCase):
     def test_reentry_does_not_accept_transferred_token_twice(self):
-        grammar = GuidanceGrammar(LLTokenizer("byte"), grammar_from("regex", "ab"))
+        self._check_reentry(decode_before_reentry=False)
+
+    def test_reentry_after_decode_does_not_accept_last_output_twice(self):
+        self._check_reentry(decode_before_reentry=True)
+
+    def _check_reentry(self, decode_before_reentry):
+        grammar = GuidanceGrammar(LLTokenizer("byte"), grammar_from("regex", "abc"))
         request = SimpleNamespace(
             output_ids=[ord("a")],
             swa_branching_seqlen=None,
@@ -48,12 +54,18 @@ class TestPrebuiltLLGuidance(unittest.TestCase):
         ):
             ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, future_map)
             request.request_finish.assert_not_called()
+            if decode_before_reentry:
+                # Normal decode accepts each sampled token and appends it to
+                # the request before memory-pressure retraction preserves it.
+                grammar.accept_token(ord("b"))
+                request.output_ids.append(ord("b"))
             ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, future_map)
 
         request.request_finish.assert_not_called()
-        self.assertEqual(grammar.current_token, ord("a"))
-        # The native matcher must still be after a single 'a', ready for 'b'.
-        grammar.accept_token(ord("b"))
+        self.assertEqual(grammar.current_token, request.output_ids[-1])
+        # Reentry must preserve the matcher position, including decode progress.
+        for token in "c" if decode_before_reentry else "bc":
+            grammar.accept_token(ord(token))
         self.assertFalse(grammar.ll_matcher.is_error())
 
 
