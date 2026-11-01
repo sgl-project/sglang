@@ -156,6 +156,22 @@ def _activation_row_filter(
     )
 
 
+def _skip_nonlocal_routes(
+    *, filter_expert: bool, no_combine: bool, defer_sum: bool, topk_ids: torch.Tensor
+) -> bool:
+    # Dropped routes leave their intermediate slots unwritten, so only the combine
+    # that skips them may read the buffer; no_combine and defer_sum expose it.
+    return (
+        _is_cuda
+        and filter_expert
+        and not no_combine
+        and not defer_sum
+        and topk_ids.shape[1] > 1
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+    )
+
+
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
@@ -451,6 +467,7 @@ def _prepare_fused_moe_run(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
+    ignore_invalid_expert: bool = False,
 ):
     """Resolve config, down_config, TMA flag, and aligned expert routing ids.
 
@@ -503,7 +520,10 @@ def _prepare_fused_moe_run(
         )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E
+        topk_ids,
+        config["BLOCK_SIZE_M"],
+        E,
+        ignore_invalid_expert=ignore_invalid_expert,
     )
 
     return (
@@ -561,6 +581,7 @@ def _fused_moe_kernel_sequence(
     fuse_swiglu_interleaved: bool = False,
     defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
+    skip_nonlocal_routes: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -575,11 +596,15 @@ def _fused_moe_kernel_sequence(
     quant, ``a1_scale`` holds the matching scales, rows may exceed
     ``num_tokens`` due to 4-row padding). ``hidden_states`` stays bf16 and is
     still used for output dtype/shape and the inplace combine.
+
+    ``skip_nonlocal_routes``: the alignment dropped routes with expert id -1, so
+    their rows are never computed and the combine skips their slots.
     """
     if defer_sum:
         assert not (no_combine or inplace or apply_router_weight_on_input)
         assert hooks is None
         assert not any((use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16))
+    assert not skip_nonlocal_routes or not (hooks or no_combine or defer_sum)
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
@@ -908,6 +933,24 @@ def _fused_moe_kernel_sequence(
             num_tokens_post_padded=num_tokens_post_padded,
             num_valid_tokens=topk_ids.numel(),
         )
+    elif (
+        skip_nonlocal_routes
+        and use_fp8_w8a8
+        and block_shape is not None
+        and a2_scale is None
+        and intermediate_cache2.shape[-1] != block_shape[1]
+    ):
+        # The sorted-row quant skips row r when ids[r] as uint32 >= num_valid_tokens,
+        # so route-major topk ids with num_valid_tokens=E skip exactly the -1 rows.
+        intermediate_cache2, a2_scale = per_token_group_quant(
+            intermediate_cache2,
+            group_size=block_shape[1],
+            sorted_token_ids=topk_ids.view(-1),
+            num_tokens_post_padded=torch.full(
+                (1,), topk_ids.numel(), dtype=torch.int32, device=topk_ids.device
+            ),
+            num_valid_tokens=E,
+        )
 
     invoke_fused_moe_kernel(
         intermediate_cache2,
@@ -968,6 +1011,7 @@ def _fused_moe_kernel_sequence(
         use_fused_moe_sum_all_reduce=use_fused_moe_sum_all_reduce,
         out_slice=out_slice,
         _use_intermediate=_use_intermediate,
+        topk_ids=topk_ids if skip_nonlocal_routes else None,
     )
 
 
@@ -979,9 +1023,12 @@ def moe_combine_topk(
     use_fused_moe_sum_all_reduce: bool = False,
     out_slice: Optional[torch.Tensor] = None,
     _use_intermediate: bool = True,
+    topk_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sum the routed-weighted ``[num_tokens, topk, hidden]`` expert outputs into
-    ``out_hidden_states`` (the tail of ``_fused_moe_kernel_sequence``)."""
+    ``out_hidden_states`` (the tail of ``_fused_moe_kernel_sequence``).
+
+    ``topk_ids`` (CUDA only): skip slots whose id is -1 instead of reading them."""
     num_tokens, topk = intermediate_cache3.shape[:2]
 
     if routed_scaling_factor is None:
@@ -994,7 +1041,14 @@ def moe_combine_topk(
             assert out_slice is not None
             out_slice.mul_(routed_scaling_factor)
     elif _is_cuda or _is_musa:
-        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+        if topk_ids is not None:
+            moe_sum_reduce_triton(
+                intermediate_cache3,
+                out_hidden_states,
+                routed_scaling_factor,
+                topk_ids=topk_ids,
+            )
+        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
             pass  # we wrote directly into out_hidden_states
         elif topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
@@ -1126,6 +1180,12 @@ def fused_experts_impl(
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
+    skip_nonlocal_routes = _skip_nonlocal_routes(
+        filter_expert=filter_expert,
+        no_combine=no_combine,
+        defer_sum=defer_sum,
+        topk_ids=topk_ids,
+    )
     (
         config,
         down_config,
@@ -1145,6 +1205,7 @@ def fused_experts_impl(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
+        ignore_invalid_expert=skip_nonlocal_routes,
     )
 
     return _fused_moe_kernel_sequence(
@@ -1190,6 +1251,7 @@ def fused_experts_impl(
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         defer_sum=defer_sum,
         no_combine_keep_router_weight=no_combine_keep_router_weight,
+        skip_nonlocal_routes=skip_nonlocal_routes,
     )
 
 
