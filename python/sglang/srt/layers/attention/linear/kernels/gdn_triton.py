@@ -206,6 +206,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        # The offsets on the host spare the chunk kernel reading them back.
+        host_args = {"cu_seqlens_cpu": kwargs.get("query_start_loc_cpu")}
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -213,6 +215,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 )
             inplace_update_args = {}
             output_args = {}
+            host_args = {}
         elif is_npu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -224,6 +227,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
             output_args = {}
+            host_args = {}
 
         return chunk_gated_delta_rule(
             q=q,
@@ -239,6 +243,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **inplace_update_args,
             **graph_table_args,
             **output_args,
+            **host_args,
         )
 
     def target_verify(

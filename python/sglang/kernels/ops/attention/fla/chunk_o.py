@@ -271,7 +271,11 @@ def chunk_fwd_o(
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    if chunk_indices is None and cu_seqlens is not None:
+    # chunk_indices: the caller's, for chunk_size; a short input uses smaller
+    # chunks and needs its own.
+    if cu_seqlens is None:
+        chunk_indices = None
+    elif chunk_indices is None or BT != chunk_size:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:

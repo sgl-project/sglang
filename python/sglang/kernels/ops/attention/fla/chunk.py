@@ -47,12 +47,20 @@ def _cu_seqlens_host(cu_seqlens: torch.Tensor) -> list:
     return cu_seqlens.tolist()
 
 
-def _pipeline_plan(q, cu_seqlens, initial_state, initial_state_indices, inplace_update):
+def _pipeline_plan(
+    q,
+    cu_seqlens,
+    initial_state,
+    initial_state_indices,
+    inplace_update,
+    cu_seqlens_cpu=None,
+):
     """(parts, sequence length) for a pipelined scan, or (0, 0) to run one pass.
 
     Only a single sequence whose state goes through the pool in place qualifies:
     the parts hand the state over through the pool slot. Not while a CUDA graph
-    is captured (the plan needs the length on the host).
+    is captured (the plan needs the length on the host; without cu_seqlens_cpu
+    it is read back from cu_seqlens).
     """
     if (
         not envs.SGLANG_GDN_CHUNK_PIPELINE.get()
@@ -65,7 +73,10 @@ def _pipeline_plan(q, cu_seqlens, initial_state, initial_state_indices, inplace_
         or torch.cuda.is_current_stream_capturing()
     ):
         return 0, 0
-    seq_len = _cu_seqlens_host(cu_seqlens)[1]
+    if cu_seqlens_cpu is not None:
+        seq_len = int(cu_seqlens_cpu[1])
+    else:
+        seq_len = _cu_seqlens_host(cu_seqlens)[1]
     parts = min(PIPELINE_MAX_PARTS, seq_len // PIPELINE_PART_TOKENS)
     return (parts, seq_len) if parts >= 2 else (0, 0)
 
@@ -195,9 +206,15 @@ def chunk_gated_delta_rule_fwd(
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
     parts, seq_len = _pipeline_plan(
-        q, cu_seqlens, initial_state, initial_state_indices, inplace_update
+        q,
+        cu_seqlens,
+        initial_state,
+        initial_state_indices,
+        inplace_update,
+        cu_seqlens_cpu,
     )
     if parts:
         return chunk_gated_delta_rule_fwd_pipelined(
@@ -247,7 +264,8 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        chunk_indices=o_chunk_indices,
+        # The caller's tables, else the ones built above (same chunk size).
+        chunk_indices=o_chunk_indices if o_chunk_indices is not None else chunk_indices,
         out=out,
         output_indices=output_indices,
         output=output,
@@ -280,6 +298,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         out: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -289,10 +308,13 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             k = l2norm_fwd(k)
 
         # Caller-built tables (CUDA-graph capture) also serve chunk_fwd_o; without
-        # them chunk_fwd_o derives its own for its token-count dependent chunk size.
+        # them it reuses the ones built below (and derives its own only for a short
+        # input, whose chunk size depends on the token count).
         o_chunk_indices = chunk_indices
         if chunk_indices is None and cu_seqlens is not None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, CHUNK_SIZE, cu_seqlens_cpu
+            )
         g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -310,6 +332,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             out=out,
             output_indices=output_indices,
             output=output,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
         return o.to(q.dtype), h
 
@@ -333,6 +356,7 @@ def chunk_gated_delta_rule(
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
     r"""
     Args:
@@ -370,6 +394,9 @@ def chunk_gated_delta_rule(
         output (Optional[torch.Tensor]):
             Contiguous buffer of `v`'s shape and dtype to write the output into (`head_first=False`); `o` is then
             this tensor. Default: `None` (a new tensor).
+        cu_seqlens_cpu (Optional[torch.LongTensor]):
+            `cu_seqlens` on the host. The kernels then plan from it instead of reading `cu_seqlens` back, which
+            waits for the device. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -485,6 +512,7 @@ def chunk_gated_delta_rule(
         out,
         output_indices,
         output,
+        cu_seqlens_cpu,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
