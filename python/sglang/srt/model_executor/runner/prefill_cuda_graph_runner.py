@@ -345,6 +345,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
+        # Image-input replay is validated only for allowlisted architectures.
+        self._eager_mm_prefill = (
+            self.is_multimodal
+            and not model_runner.model_config.is_multimodal_breakable_cuda_graph_supported
+        )
         self.is_dsv41_model = (
             model_runner.model_config.hf_config.model_type == "deepseek_v41"
         )
@@ -1425,7 +1430,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or self._eager_mm_prefill
         ):
             return False
         # Full replay bypasses forward_extend's Python image-mask guard.
