@@ -38,7 +38,11 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaCircularRef,
+    JSONSchemaDepthExceeded,
+    JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
+    validate_schema_bounds,
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
@@ -337,6 +341,25 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             )
 
     @staticmethod
+    def _structural_format_children(structural_format):
+        """Yield nested formats for every structural-format combinator."""
+        fmt_type = structural_format.get("type")
+        if fmt_type in {"tag", "optional", "plus", "star", "repeat"}:
+            yield structural_format.get("content")
+        elif fmt_type in {"sequence", "or"}:
+            yield from structural_format.get("elements", [])
+        elif fmt_type in {
+            "triggered_tags",
+            "token_triggered_tags",
+            "tags_with_separator",
+        }:
+            yield from structural_format.get("tags", [])
+        elif fmt_type in {"dispatch", "token_dispatch"}:
+            for rule in structural_format.get("rules", []):
+                if isinstance(rule, (list, tuple)) and len(rule) == 2:
+                    yield rule[1]
+
+    @staticmethod
     def _sanitize_structural_format(structural_format):
         """Recursively replace missing json_schema fields with an empty schema."""
         if not isinstance(structural_format, dict):
@@ -347,16 +370,28 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             if structural_format.get("json_schema") is None:
                 structural_format["json_schema"] = {}
 
-        if fmt_type == "tag":
-            XGrammarGrammarBackend._sanitize_structural_format(
-                structural_format.get("content")
-            )
-        elif fmt_type in {"sequence", "or"}:
-            for element in structural_format.get("elements", []):
-                XGrammarGrammarBackend._sanitize_structural_format(element)
-        elif fmt_type in {"triggered_tags", "tags_with_separator"}:
-            for tag in structural_format.get("tags", []):
-                XGrammarGrammarBackend._sanitize_structural_format(tag)
+        for child in XGrammarGrammarBackend._structural_format_children(
+            structural_format
+        ):
+            XGrammarGrammarBackend._sanitize_structural_format(child)
+
+    @staticmethod
+    def _validate_structural_format_schemas(structural_format):
+        """Validate all JSON schemas in a structural format tree."""
+        if not isinstance(structural_format, dict):
+            return
+
+        fmt_type = structural_format.get("type")
+        if fmt_type in {"json_schema", "qwen_xml_parameter"}:
+            schema = structural_format.get("json_schema")
+            if schema is not None:
+                validate_xgrammar_json_schema(schema)
+                validate_schema_bounds(schema)
+
+        for child in XGrammarGrammarBackend._structural_format_children(
+            structural_format
+        ):
+            XGrammarGrammarBackend._validate_structural_format_schemas(child)
 
     @staticmethod
     def _sanitize_structural_tag_structures(structural_tag: Dict) -> None:
@@ -391,6 +426,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # original string to XGrammar to preserve its parser behavior.
                 schema = json.loads(key_string)
                 validate_xgrammar_json_schema(schema)
+                validate_schema_bounds(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
                     schema=key_string,
                     any_whitespace=self.any_whitespace,
@@ -400,6 +436,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except (
             RuntimeError,
             UnsupportedJSONSchemaFeature,
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
             json.decoder.JSONDecodeError,
             UnicodeDecodeError,
         ) as e:
@@ -429,6 +467,15 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             structural_tag = json.loads(key_string)
             if is_legacy_structural_tag(structural_tag):
                 self._sanitize_structural_tag_structures(structural_tag)
+                # Validate each schema in legacy structural tag
+                for structure in structural_tag["structures"]:
+                    schema = structure.get("schema")
+                    if schema is not None:
+                        # Schema might be a JSON string (double-encoded) or already a dict
+                        if isinstance(schema, str):
+                            schema = json.loads(schema)
+                        validate_xgrammar_json_schema(schema)
+                        validate_schema_bounds(schema)
                 tags = [
                     StructuralTagItem(
                         begin=structure["begin"],
@@ -446,10 +493,20 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
                     self._sanitize_structural_format(format_dict)
+                    # Validate schemas in new format tree
+                    self._validate_structural_format_schemas(format_dict)
                     structural_tag["format"] = format_dict
                     key_string = json.dumps(structural_tag)
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+        except (
+            RuntimeError,
+            UnsupportedJSONSchemaFeature,
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
+            JSONSchemaCircularRef,
+            json.decoder.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(
