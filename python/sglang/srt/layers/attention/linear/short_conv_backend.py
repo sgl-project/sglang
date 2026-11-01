@@ -75,6 +75,9 @@ class ShortConvMetadata(NamedTuple):
     slot_ids_cpu: Optional[List[int]] = None
     # Host mirror of has_initial_state for extend host loops. None on decode.
     has_prefix_cpu: Optional[List[bool]] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+    retrieve_parent_token: Optional[torch.Tensor] = None
 
 
 class ShortConvAttnBackend(MambaAttnBackendBase):
@@ -213,6 +216,9 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             has_initial_state=self._has_initial_state,
             slot_ids_cpu=self._slot_ids_cpu,
             has_prefix_cpu=self._has_prefix_cpu,
+            retrieve_next_token=md.retrieve_next_token,
+            retrieve_next_sibling=md.retrieve_next_sibling,
+            retrieve_parent_token=md.retrieve_parent_token,
         )
 
     # The short-conv layers are invoked via conv_state_metadata + the model's own
