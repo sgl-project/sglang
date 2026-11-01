@@ -338,6 +338,7 @@ async fn pd_generate_carries_each_rank_in_its_body() {
         p["routed_dp_rank"],
         p["bootstrap_room"].as_u64().unwrap() % 4
     );
+    assert_eq!(p["disagg_prefill_dp_rank"], p["routed_dp_rank"]);
     assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
     assert_eq!(d["disagg_prefill_dp_rank"], p["routed_dp_rank"]);
 }
@@ -360,7 +361,9 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
         body["data_parallel_rank"] = 3.into();
         let (p, d) = send_pd(path, body).await;
         assert!(
-            p["routed_dp_rank"].is_null() && p["data_parallel_rank"].is_null(),
+            p["routed_dp_rank"].is_null()
+                && p["data_parallel_rank"].is_null()
+                && p.get("disagg_prefill_dp_rank").is_none(),
             "{path}"
         );
         assert!(
