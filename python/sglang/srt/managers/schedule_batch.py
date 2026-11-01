@@ -1394,6 +1394,10 @@ class Req(ReqDllmMixin):
         # processed.
         self.inflight_middle_chunks = 0
 
+        # The launched steps carrying this request whose results are not
+        # processed yet.
+        self.inflight_steps = 0
+
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
@@ -2651,6 +2655,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tracks process_prefill_chunk() on the original scheduler batch only.
     prefill_chunk_processed: bool = False
 
+    # The requests this batch was launched with; the in-flight counts are kept
+    # over these.
+    launched_reqs: Optional[Tuple[Req, ...]] = None
+
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
@@ -2868,6 +2876,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def add_inflight_step(self) -> None:
+        self.launched_reqs = tuple(self.reqs)
+        for req in self.launched_reqs:
+            req.inflight_steps += 1
+
+    def drop_inflight_step(self) -> None:
+        for req in self.launched_reqs:
+            req.inflight_steps -= 1
 
     def is_dllm(self):
         return self.dllm_config is not None
@@ -4149,6 +4166,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            launched_reqs=self.launched_reqs,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,

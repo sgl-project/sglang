@@ -1,4 +1,5 @@
-"""The scheduler's running-request owner and the hooks that keep it."""
+"""The scheduler's running-request owner, the launched-step count, and the
+hooks that keep them."""
 
 import unittest
 from array import array
@@ -89,6 +90,18 @@ def _scheduler():
     s.profiler_manager = MagicMock()
     s.forward_sleep_time = None
     s.enable_staging = False
+    # process_batch_result, with the mode-specific processing mocked
+    s._deferred_responses = None
+    s.publish_load_snapshot = Mock()
+    s.load_publisher = MagicMock()
+    s.load_inquirer = MagicMock()
+    s.batch_result_processor = MagicMock()
+    s.tree_cache = MagicMock()
+    s._record_step_counters = Mock()
+    s.enable_fpm = False
+    s._maybe_clear_mm_inputs = Mock()
+    s.maybe_send_health_check_signal = Mock()
+    s.invariant_checker = SchedulerInvariantChecker.__new__(SchedulerInvariantChecker)
     return s
 
 
@@ -330,6 +343,23 @@ class TestRunningReqsHooks(CustomTestCase):
         self.assertIsNone(new_batch)
         s._add_request_to_queue.assert_called_once_with(victim)
         self.assertEqual(list(s.running_reqs), [other])
+
+    def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
+        s = _scheduler()
+        a, b = _req("a"), _req("b")
+        first = _batch([a, b], ForwardMode.DECODE)
+        second = _batch([a], ForwardMode.DECODE)
+        _launch(s, first)
+        _launch(s, second)
+        self.assertEqual((a.inflight_steps, b.inflight_steps), (2, 1))
+
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            s.process_batch_result(first, MagicMock())
+            s.process_batch_result(second, MagicMock())
+            self.assertEqual((a.inflight_steps, b.inflight_steps), (0, 0))
+            with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
+                never_launched = _batch([_req("c")], ForwardMode.DECODE)
+                s.process_batch_result(never_launched, MagicMock())
 
 
 if __name__ == "__main__":
