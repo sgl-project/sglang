@@ -148,8 +148,9 @@ class MiniCPMV4_6ImageProcessor:
     """Per-image preprocessing.
 
     Pipeline: pick a slice grid (rows x cols, up to ``max_slice_nums``); resize
-    source and (optionally) tiles to multiples of ``patch_size * 4`` (factor 4
-    = the two successive 2x2 spatial merges: mid-ViT merger + DownsampleMLP);
+    source and (optionally) tiles to multiples of ``patch_size`` times the
+    spatial merge factor (2 for ``downsample_mode="4x"``, 4 for ``"16x"``,
+    the two successive 2x2 merges: mid-ViT merger + DownsampleMLP);
     rescale, normalize, and NaViT-pack each tile into ``(C, P, H*W/P)``.
     """
 
@@ -182,8 +183,10 @@ class MiniCPMV4_6ImageProcessor:
     ) -> Tuple[int, int]:
         height, width = image_size
         scale = self.scale_resolution
-        # factor 4 = two successive 2x2 spatial merges (mid-ViT + DownsampleMLP)
-        divisor = self.patch_size * 4
+        # "4x" merges one 2x2 block, "16x" merges twice (mid-ViT + DownsampleMLP);
+        # transformers >= 5.21 sizes by the same factor.
+        merge_factor = 2 if self.downsample_mode == "4x" else 4
+        divisor = self.patch_size * merge_factor
         if (height * width > scale * scale) or allow_upscale:
             aspect_ratio = width / height
             height = int(scale / math.sqrt(aspect_ratio))
