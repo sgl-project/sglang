@@ -97,6 +97,10 @@ class UocrDocHooks:
         """Parked windows whose predecessor finished, to queue in this order."""
         return self._prefetch.take_released()
 
+    def held_reqs(self) -> List[Req]:
+        """Windows held off the waiting queue."""
+        return self._prefetch.held_reqs()
+
     def on_retracted(self, req: Req) -> None:
         """Restore a retracted window's original prompt before it is re-queued."""
         self._reuse.on_retracted(req)

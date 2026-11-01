@@ -679,6 +679,7 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch is not None:
                 last_batch.prefill_chunk_processed = True
 
+        self.invariant_checker.maybe_check_request_lists(running_batch, last_batch)
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch

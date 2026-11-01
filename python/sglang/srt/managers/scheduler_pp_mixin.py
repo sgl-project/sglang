@@ -287,6 +287,9 @@ class SchedulerPPMixin:
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
                 self._process_hicache_events()
+                self.invariant_checker.maybe_check_request_lists(
+                    self.running_batch, self.last_batch
+                )
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch

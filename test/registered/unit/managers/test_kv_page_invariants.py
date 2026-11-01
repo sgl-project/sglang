@@ -36,7 +36,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         tree_cache = _tc
         get_last_batch = lambda self: None
         get_running_batch = lambda self: None
-        get_chunked_req = lambda self: None
+        get_request_lists = lambda self: {}
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -100,7 +100,7 @@ class TestKVPageInvariants(CustomTestCase):
                 if where == "running":
                     chk.get_running_batch = lambda: SimpleNamespace(reqs=[owner])
                 else:
-                    chk.get_chunked_req = lambda: owner
+                    chk.get_request_lists = lambda: {"chunked": [owner]}
                 with self.assertRaises(ValueError):
                     chk._check_kv_page_invariants()
 
