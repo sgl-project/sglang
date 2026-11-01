@@ -7,7 +7,7 @@ import torch
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 1, 2
