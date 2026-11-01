@@ -24,7 +24,8 @@ class TestM31Router(CustomTestCase):
         from sglang.kernels.ops.moe import moe_sorting_small
         from sglang.kernels.ops.moe.smallm_router_gfx950 import m31_router
 
-        moe_sorting_small.apply_aiter_small_moe_sort_patch()
+        if not moe_sorting_small.apply_aiter_small_moe_sort_patch():
+            raise unittest.SkipTest("the pinned aiter keeps its own MoE sort")
         cls.fm = fm
         cls.S = moe_sorting_small
         cls.R = m31_router

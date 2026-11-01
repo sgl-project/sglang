@@ -22,7 +22,10 @@ class TestAiterMoeAddend(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        from aiter.ops.flydsl.moe_common import GateMode
+        try:
+            from aiter.ops.flydsl.moe_common import GateMode
+        except ImportError:
+            raise unittest.SkipTest("the pinned aiter has no FlyDSL MoE")
         from aiter.ops.shuffle import shuffle_weight
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.utility.fp4_utils import e8m0_shuffle
@@ -38,7 +41,8 @@ class TestAiterMoeAddend(CustomTestCase):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         # the model's MoE layer applies it; AiterRunnerCore applies only the sort patch
-        apply_aiter_moe_addend_patch()
+        if not apply_aiter_moe_addend_patch():
+            raise unittest.SkipTest("the pinned aiter keeps its own stage2 reduction")
         torch.manual_seed(0)
         dev = torch.device("cuda", 0)
         E, DIM, INTER = cls.E, cls.DIM, cls.INTER

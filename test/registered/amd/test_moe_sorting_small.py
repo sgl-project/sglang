@@ -33,7 +33,8 @@ class TestMoeSortingSmall(CustomTestCase):
         cls.fm = fm
         orig_sort = fm._moe_sorting_impl
         orig_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
-        S.apply_aiter_small_moe_sort_patch()
+        if not S.apply_aiter_small_moe_sort_patch():
+            raise unittest.SkipTest("the pinned aiter keeps its own MoE sort")
         if fm._moe_sorting_impl is orig_sort:
             # an earlier import already patched aiter; recover the originals
             orig_sort = fm._moe_sorting_impl.__wrapped__
@@ -195,7 +196,12 @@ class TestMoeSortQuant(CustomTestCase):
 
         from sglang.kernels.ops.moe import moe_sorting_small as S
 
-        S.apply_aiter_small_moe_sort_patch()
+        if not S.apply_aiter_small_moe_sort_patch():
+            raise unittest.SkipTest("the pinned aiter keeps its own MoE sort")
+        if not hasattr(fm.fused_dynamic_mxfp4_quant_moe_sort, "__wrapped__"):
+            raise unittest.SkipTest(
+                "the pinned aiter has no MXFP4 stage1 quant to emit"
+            )
         cls.S = S
         cls.fm = fm
         cls.orig_sort = staticmethod(fm._moe_sorting_impl.__wrapped__)
