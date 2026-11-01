@@ -190,6 +190,13 @@ class EncoderTensorParallelMixin:
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group
 
+    def _layerwise_store_shard(self) -> int:
+        """The fold rank: a folded encoder holds a different slice per rank."""
+        group = self._encoder_tp_group
+        if group is None or group.world_size == 1:
+            return 0
+        return group.rank_in_group
+
     def __call__(self, *args, **kwargs):
         tp_group = self._encoder_tp_group
         forward = super().__call__
