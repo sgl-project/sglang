@@ -153,7 +153,7 @@ def _resolve_default_warmup_resolution(
             or server_args.enable_breakable_cuda_graph is True
         )
     ):
-        return width, height
+        return _two_stage_request_resolution(server_args, width, height)
 
     if server_based_warmup:
         return _resolve_representative_warmup_resolution(server_args, sampling_defaults)
@@ -247,6 +247,24 @@ def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
         alignment = max(alignment, 64, int(vae_scale_factor) * 2)
 
     return alignment
+
+
+def _two_stage_request_resolution(
+    server_args: ServerArgs, width: int, height: int
+) -> tuple[int, int]:
+    """Return the request resolution a sampling default maps to.
+
+    LTX-2 two-stage requests carry the output resolution and stage 1 runs at
+    half of it, so a default the halving rejects (LTX-2.5's 960x544) is the
+    stage-1 size and its request is twice that (1920x1088).
+    """
+    if not is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
+        return width, height
+    alignment = _warmup_resolution_alignment(server_args)
+    if _is_resolution_aligned((width, height), alignment):
+        return width, height
+    doubled = (width * 2, height * 2)
+    return doubled if _is_resolution_aligned(doubled, alignment) else (width, height)
 
 
 def _select_supported_warmup_resolution(

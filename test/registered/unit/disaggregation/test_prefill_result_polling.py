@@ -123,6 +123,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
+    _on_step_processed = Scheduler._on_step_processed
 
     def __init__(
         self,
@@ -168,6 +169,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.decode_offload_manager = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = RunningReqs()
+        self.invariant_checker = Mock()
         self.uocr_doc_hooks = None
         self.waiting_queue = []
         self.cur_batch_for_debug = None
@@ -306,6 +308,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def run_batch(self, batch):
         assert len(self.result_queue) < 2, "Overwrote a live forward's keep-alive slot"
         self.actions.append((self.iteration, "launch", batch.forward_iter))
+        batch.add_inflight_step()
         result = self.results[batch.forward_iter]
         if result.delay_sample_func is not None:
 
@@ -1236,6 +1239,7 @@ class _ForwardLaunched(Exception):
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
+    _on_step_launch = Scheduler._on_step_launch
     _join_launched_reqs = Scheduler._join_launched_reqs
     _prefill_launch_starts_running = Scheduler._prefill_launch_starts_running
 
@@ -1274,6 +1278,7 @@ class TestCachedPrefixEarlySend(CustomTestCase):
             )
             batch = SimpleNamespace(
                 reqs=[req],
+                add_inflight_step=Mock(),
                 hicache_consumer_index=consumer_index,
                 extend_num_tokens=32,
                 forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
