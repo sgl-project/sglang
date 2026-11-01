@@ -136,11 +136,6 @@ class StaticKVStorage:
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
 
-    def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
-        """No static window states its retention: its length is the
-        model's."""
-        return {}
-
     def resume_units(
         self,
         sub_pool: str,
@@ -225,10 +220,7 @@ class StaticKVStorage:
         num_tokens: int,
         make_room: Callable[[int], Any],
         window_tail: Optional[int] = None,
-        stated_window_tails: Optional[Dict[str, int]] = None,
     ) -> Optional[torch.Tensor]:
-        # Static pools have no window with a stated retention.
-        assert not stated_window_tails
         # Over estimate the number of tokens: assume each request needs a new
         # page (one page per CLASS per request under sharding — the min-class
         # availability floor must cover every request's ceil(K_i/N) rounding,

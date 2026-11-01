@@ -775,10 +775,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_budget_tokens: int,
         swa_budget_tokens: int | None = None,
         state_slots: int = 0,
+        window_tokens: Optional[Mapping[str, int]] = None,
     ) -> bool:
         """A decode-node preallocation on the admission rule: its tokens and
         the ``state_slots`` it takes with them, priced together since they
-        share bytes. The budgets are the scheduler's per-side token views
+        share bytes; ``window_tokens`` names any window's own tail tokens
+        (`_window_demand`). The budgets are the scheduler's per-side token views
         after decode headroom and retraction: the request stays within them,
         and what they hold back from this side's reachable tokens is pending
         demand, charged alongside the request."""
@@ -794,7 +796,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_tokens += max(
             0, self.full_available_size() + evictable[owner] - full_budget_tokens
         )
-        windows = self._window_demand(full_tokens, swa_tokens)
+        windows = self._window_demand(full_tokens, swa_tokens, window_tokens)
         if swa_budget_tokens is not None and self.swa_attn_allocator is not None:
             name = self.swa_attn_allocator.sub_pool_name
             windows[name] += max(
@@ -1458,26 +1460,29 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         swa_tokens: int,
         num_owner_pages: int,
         owner_take: Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]],
-        window_pages: Callable[
-            [torch.Tensor, torch.Tensor], torch.Tensor
-        ] = lambda out, new_pages: new_pages,
         window_tail_pages: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         """Take the owner's new pages and every window's pages in one planned
         layout, then bind the windows to the owner's new virtual pages. None
         exactly when no reachable layout serves the demand.
 
-        With ``window_tail_pages`` (by window sub-pool), each named window
-        binds only the last that many of the new pages, its live tail."""
+        With ``window_tail_pages``, each window binds only the last that many
+        of the new pages (its live tail); otherwise the target's window binds
+        ``swa_tokens`` worth of them and every further window all of them."""
         owner = self.full_attn_allocator
         if self._full_cap_reclaim(full_tokens) or num_owner_pages > len(
             owner.free_virtual_ids
         ):
             return None
-        demands = {
-            owner.sub_pool_name: num_owner_pages,
-            **self._window_page_counts(num_owner_pages, swa_tokens, window_tail_pages),
-        }
+        demands = {owner.sub_pool_name: num_owner_pages}
+        for window in self._windows:
+            if window_tail_pages is not None:
+                pages = window_tail_pages[window.sub_pool_name]
+            elif window is self.swa_attn_allocator:
+                pages = -(-swa_tokens // self.page_size)
+            else:
+                pages = num_owner_pages
+            demands[window.sub_pool_name] = pages
         physical = self._plan_and_take(demands, bind_at_frontier=True)
         if physical is None:
             return None
@@ -1495,44 +1500,22 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             if window.sub_pool_name not in physical:
                 continue
             pages = physical[window.sub_pool_name]
+            num_pages = demands[window.sub_pool_name]
             # The extend kernel hands the new pages out in token order, so a
-            # tail's new pages are the last ones.
-            count = demands[window.sub_pool_name]
-            bind = (
-                window_pages(out, new_virtual_pages)
-                if window is self.swa_attn_allocator
-                else new_virtual_pages[new_virtual_pages.numel() - count :]
-            )
+            # tail's new pages are the last ones: a slice, not a data-dependent
+            # filter that would block the host on the device.
+            bind = new_virtual_pages[new_virtual_pages.numel() - num_pages :]
             if pages is None:
-                if window.place_pages(bind, int(bind.numel())) is None:
+                if window.place_pages(bind, num_pages) is None:
                     raise RuntimeError(
                         f"{window.sub_pool_name}: the planned frontier take of "
-                        f"{bind.numel()} pages was refused"
+                        f"{num_pages} pages was refused"
                     )
                 continue
             assert bind.numel() == pages.numel()
             window.ids.bind(bind, pages)
             window._maybe_zero_pages(pages)
         return out
-
-    def _window_page_counts(
-        self,
-        owner_pages: int,
-        swa_tokens: int,
-        window_tail_pages: Optional[Mapping[str, int]],
-    ) -> Dict[str, int]:
-        """New pages each window binds: a named window its own tail, the
-        primary window ``swa_tokens`` worth, any other window every new page."""
-        counts = {}
-        for window in self._windows:
-            name = window.sub_pool_name
-            if window_tail_pages is not None and name in window_tail_pages:
-                counts[name] = window_tail_pages[name]
-            elif window is self.swa_attn_allocator:
-                counts[name] = -(-swa_tokens // self.page_size)
-            else:
-                counts[name] = owner_pages
-        return counts
 
     def _plan_and_take(
         self, demands: Dict[str, int], *, bind_at_frontier: bool = False
@@ -1834,9 +1817,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         window_tail_lens: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         """Decode-node prealloc: owner KV for the whole sequence, window KV for
-        the live window tail only. ``swa_tail_len`` is the primary window's
-        tail; ``window_tail_lens`` names the tail of every other window that
-        keeps its own retention (a fused draft's band).
+        the live window tail only. ``swa_tail_len`` is the target window's
+        tail; ``window_tail_lens`` names any window's own tail by sub-pool (a
+        window it does not name keeps the whole sequence).
 
         The owner and the window SHARE one virtual id space (a virtual page names
         an owner-physical page and, if bound, a window-physical one), so the tail
@@ -1849,12 +1832,18 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """
         assert len(prefix_lens_cpu) == 1
         tails = dict(window_tail_lens or {})
-        tails[self.swa_attn_allocator.sub_pool_name] = swa_tail_len
+        if self.swa_attn_allocator is not None:
+            tails.setdefault(self.swa_attn_allocator.sub_pool_name, swa_tail_len)
         assert all(0 <= tail <= extend_num_tokens for tail in tails.values())
         with record_function("ChainAllocator.alloc_extend_swa_tail"):
             prefix_len = int(prefix_lens_cpu[0])
             seq_len = int(seq_lens_cpu[0])
             first_new_page = (prefix_len + self.page_size - 1) // self.page_size
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
 
             def new_tail_pages(tail_len: int) -> int:
                 # Only NEW pages need binding; a tail page carried in from the
@@ -1866,27 +1855,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     first_new_page, first_tail_page
                 )
 
-            num_swa_pages = new_tail_pages(swa_tail_len)
-            window_tail_pages = {
-                name: new_tail_pages(tail) for name, tail in tails.items()
+            tail_pages = {
+                window.sub_pool_name: (
+                    new_tail_pages(tails[window.sub_pool_name])
+                    if window.sub_pool_name in tails
+                    else num_new_pages
+                )
+                for window in self._windows
             }
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
+            num_swa_pages = (
+                0
+                if self.swa_attn_allocator is None
+                else tail_pages[self.swa_attn_allocator.sub_pool_name]
             )
-
-            # Only NEW pages need binding; a tail page carried in from the prefix
-            # is already bound on the swa side. The extend kernel gives the j-th
-            # new page to sequence page first_new_page + j, so the tail's new
-            # pages are the last num_swa_pages of them. Slicing them on the host
-            # keeps admission free of host syncs: a device-side match
-            # (torch.unique) blocks the scheduler behind the in-flight forward.
-            def tail_pages(out: torch.Tensor, new_pages: torch.Tensor) -> torch.Tensor:
-                if num_swa_pages > 0:
-                    return new_pages[-num_swa_pages:]
-                return new_pages[:0]
-
             return self._allocate(
                 full_tokens=num_new_pages * self.page_size,
                 swa_tokens=num_swa_pages * self.page_size,
@@ -1900,8 +1881,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     extend_num_tokens,
                     num_new_pages,
                 ),
-                window_pages=tail_pages,
-                window_tail_pages=window_tail_pages,
+                window_tail_pages=tail_pages,
             )
 
     def alloc_decode(

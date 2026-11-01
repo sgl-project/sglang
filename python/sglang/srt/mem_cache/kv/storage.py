@@ -16,6 +16,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Sequence,
     Set,
@@ -250,14 +251,14 @@ class KVStorage:
         num_tokens: int,
         make_room: Callable[[int], Any],
         window_tail: Optional[int] = None,
-        stated_window_tails: Optional[Dict[str, int]] = None,
+        window_tails: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         """Owner token ids for ``[prefix_len, seq_len)`` of each request's
         ``rows`` entry, by page, continuing each request's last page from
         ``last_loc``; None when they do not fit. With ``window_tail`` (one
-        request whose KV a peer sends), the target window binds pages for its
-        last ``window_tail`` tokens only, and each window of
-        `stated_window_lengths` for its own tail in ``stated_window_tails``."""
+        request whose KV a peer sends), the target's window binds pages for
+        its last ``window_tail`` tokens only, and each window ``window_tails``
+        names (by sub-pool) for its own last tokens."""
         demand = self._allocator.get_extend_allocation_demand(
             prefix_lens_cpu,
             seq_lens_cpu,
@@ -275,7 +276,7 @@ class KVStorage:
                 last_loc=last_loc,
                 extend_num_tokens=num_tokens,
                 swa_tail_len=window_tail,
-                window_tail_lens=stated_window_tails,
+                window_tail_lens=window_tails,
             )
         return self._allocator.alloc_extend(
             prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, num_tokens
@@ -712,14 +713,20 @@ class KVStorage:
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
 
-    def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
-        """Window sub-pools whose lifetime states the tokens they retain, by
-        name: (retained tokens, tree component)."""
-        return {
-            s.name: (s.lifetime.window, s.external.tree_component)
-            for s in self._plan.sub_pools
-            if isinstance(s.lifetime, WindowLifetime) and s.lifetime.window is not None
-        }
+    def window_lengths(self, unstated: Optional[int] = None) -> Dict[str, int]:
+        """Each window sub-pool's retention length, by name: the window its
+        layers declare, or ``unstated`` for a window the model does not state.
+        What a peer sends of a window (`resume_units`) is this long."""
+        lengths = {}
+        for s in self._plan.sub_pools:
+            if isinstance(s.lifetime, WindowLifetime):
+                window = (
+                    s.lifetime.window if s.lifetime.window is not None else unstated
+                )
+                if window is None:
+                    raise ValueError(f"window {s.name!r} states no retention length")
+                lengths[s.name] = window
+        return lengths
 
     def resume_units(
         self,
