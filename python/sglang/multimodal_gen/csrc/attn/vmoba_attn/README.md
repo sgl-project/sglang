@@ -28,12 +28,8 @@ Spatial and spatiotemporal chunk dimensions must divide the corresponding
 video patch dimensions. The denoising stage builds VMoBA metadata from this
 configuration, the current step, and the model's latent shape and patch size.
 Explicit VMoBA selection rejects unsupported dtypes or missing XPU attention
-dependencies instead of silently selecting dense attention.
-
-Wan 2.1 T2V-1.3B has been generated end to end on this path at 77x448x832.
-Other pipelines and resolutions are unvalidated; peak memory is far above
-dense attention's, and the spatiotemporal layer exhausts a 24 GiB card at
-480x832, so validate the target pipeline before relying on it.
+dependencies instead of silently selecting dense attention. Peak memory is
+well above dense attention's, so size the card for the chosen resolution.
 
 ### Usage
 
