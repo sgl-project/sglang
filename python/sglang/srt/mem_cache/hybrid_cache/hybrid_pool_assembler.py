@@ -148,8 +148,9 @@ def build_kv_host_pool(
     use_mla = isinstance(host_input, MLABufferInfo)
     if use_mla:
         kv_host_pool_cls, mha_kwargs = MLATokenToKVPoolHost, {}
-        # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim.
-        override_kv_cache_dim = host_input.kv_cache_dim
+        # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. NPU bf16
+        # pools report kv_lora_rank here and keep rope rows in a separate buffer.
+        override_kv_cache_dim = kv_pool.kv_cache_dim
     else:
         kv_host_pool_cls, mha_kwargs = _mha_host_inputs(
             kv_pool, host_input, mtp_draft_device_pools
@@ -1620,7 +1621,7 @@ def _build_mha_mla_host_pool(
         start_layer=pool.start_layer,
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
-        override_kv_cache_dim=buffer_info.kv_cache_dim,
+        override_kv_cache_dim=pool.kv_cache_dim,
         write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )

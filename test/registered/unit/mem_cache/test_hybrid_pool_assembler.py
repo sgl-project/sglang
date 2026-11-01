@@ -1008,8 +1008,7 @@ class TestDeclaredStackStructure(CustomTestCase):
         )
 
     def test_plain_mla_target(self):
-        # A pool that declares KV only builds the anchor-only group the removed
-        # build_kv_only_stack built, packed draft included.
+        # A pool that declares KV only builds an anchor-only group, packed draft included.
         for drafts in (0, 1):
             with self.subTest(drafts=drafts):
                 pool = _kv_pool_stub(layer_num=3)
