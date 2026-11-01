@@ -4,11 +4,13 @@ import json
 import threading
 import unittest
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import msgspec
 import torch
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers import tokenizer_manager
@@ -24,6 +26,7 @@ from sglang.srt.multimodal.transport.admission import (
 )
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -258,6 +261,54 @@ class TestVmmAtomicReservation(CustomTestCase):
         pool.available_chunks = [_CudaVmmMemoryChunk(0, 2048)]
         pool.occupied_chunks = []
         return pool
+
+    def test_lifecycle_metrics_count_each_release_once(self):
+        registry = CollectorRegistry()
+
+        class Collector(TokenizerMetricsCollector):
+            _counter_cls = staticmethod(partial(Counter, registry=registry))
+            _gauge_cls = staticmethod(partial(Gauge, registry=registry))
+            _histogram_cls = staticmethod(partial(Histogram, registry=registry))
+
+        with get_context().override_server_args():
+            collector = Collector(labels={"model_name": "test"})
+        collector.init_mm_publication_metrics()
+        pool = self.make_pool()
+        chunks = pool.try_reserve_batch([256])
+        # published chunks become visible to the recycler and age gauge
+        pool.occupied_chunks.extend(chunks)
+        start = chunks[0].reserved_at
+        labels = {"model_name": "test", "transport": "cuda_vmm"}
+        with patch(
+            "sglang.srt.utils.cuda_vmm_transport_utils.time.monotonic",
+            return_value=start + 2,
+        ):
+            collector.observe_mm_publication("cuda_vmm", pool, None, None, 0, 0)
+            self.assertEqual(
+                registry.get_sample_value(
+                    "sglang:mm_publication_oldest_lease_seconds", labels
+                ),
+                2,
+            )
+            pool.release_reserved_batch(chunks)
+            for _ in range(2):
+                collector.observe_mm_publication("cuda_vmm", pool, None, None, 0, 0)
+        self.assertEqual(
+            registry.get_sample_value(
+                "sglang:mm_publication_oldest_lease_seconds", labels
+            ),
+            0,
+        )
+        self.assertEqual(
+            registry.get_sample_value("sglang:mm_publication_reclaimed_total", labels),
+            1,
+        )
+        self.assertEqual(
+            registry.get_sample_value(
+                "sglang:mm_publication_reclaimed_lifetime_seconds_total", labels
+            ),
+            2,
+        )
 
     def test_fragmentation_rolls_back_batch_and_publisher_count(self):
         pool = self.make_pool()

@@ -629,6 +629,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ]
             if self.mm_processor is not None:
                 publishers.append(("cuda_ipc", self.mm_processor.cuda_ipc_publisher))
+            if any(publisher is not None for _, publisher in publishers):
+                self.metrics_collector.init_mm_publication_metrics()
             for transport, publisher in publishers:
                 if publisher is not None:
                     publisher.admission.observer = partial(

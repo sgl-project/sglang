@@ -7,8 +7,9 @@ import os
 import secrets
 import socket
 import threading
+import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -126,6 +127,7 @@ def _receive_posix_fd(socket_path: str) -> int:
 class _CudaVmmMemoryChunk:
     start: int
     end: int
+    reserved_at: float = field(default=0.0, compare=False)
 
     @property
     def size(self) -> int:
@@ -202,6 +204,9 @@ class CudaVmmMemoryPool:
     """Bounded CUDA VMM pool shared through FABRIC or a local POSIX FD."""
 
     on_capacity_change = None
+    reclaimed_count = 0
+    reclaimed_seconds = 0.0
+    cpu_spills = 0
 
     def __init__(
         self,
@@ -422,6 +427,16 @@ class CudaVmmMemoryPool:
                 "largest_free_bytes": max(
                     (chunk.size for chunk in self.available_chunks), default=0
                 ),
+                "oldest_lease_seconds": max(
+                    (
+                        time.monotonic() - chunk.reserved_at
+                        for chunk in self.occupied_chunks
+                    ),
+                    default=0.0,
+                ),
+                "reclaimed_count": self.reclaimed_count,
+                "reclaimed_seconds": self.reclaimed_seconds,
+                "cpu_spills": self.cpu_spills,
             }
 
     def try_reserve_batch(self, sizes: list[int]):
@@ -665,6 +680,7 @@ class CudaVmmMemoryPool:
         occupied = _CudaVmmMemoryChunk(
             start=available.start,
             end=available.start + required_size,
+            reserved_at=time.monotonic(),
         )
         if occupied.end < available.end:
             self.available_chunks.append(
@@ -673,6 +689,8 @@ class CudaVmmMemoryPool:
         return occupied
 
     def _release_reserved_chunk(self, chunk: _CudaVmmMemoryChunk) -> None:
+        self.reclaimed_count += 1
+        self.reclaimed_seconds += time.monotonic() - chunk.reserved_at
         if chunk in self.occupied_chunks:
             self.occupied_chunks.remove(chunk)
         self.available_chunks.append(_CudaVmmMemoryChunk(chunk.start, chunk.end))
@@ -705,6 +723,8 @@ class CudaVmmMemoryPool:
         self._cancel_control_offset(proxy.control_offset)
 
     def _warn_pool_full_once(self, data_nbytes: int) -> None:
+        with self._lock:
+            self.cpu_spills += 1
         if self._pool_full_warned:
             return
         self._pool_full_warned = True
@@ -755,6 +775,8 @@ class CudaVmmMemoryPool:
                 # cancellation may have freed and republished the same offset
                 if count == self.consumer_count and live.get(chunk.start) is chunk:
                     self.occupied_chunks.remove(chunk)
+                    self.reclaimed_count += 1
+                    self.reclaimed_seconds += time.monotonic() - chunk.reserved_at
                     self.available_chunks.append(
                         _CudaVmmMemoryChunk(chunk.start, chunk.end)
                     )

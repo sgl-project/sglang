@@ -95,6 +95,8 @@ def _pool_handle_cache_clear():
 
 
 class MmItemMemoryPool:
+    cpu_spills = 0
+
     def __init__(
         self,
         memory_size: int,
@@ -153,7 +155,7 @@ class MmItemMemoryPool:
         self._pool.on_capacity_change = callback
 
     def capacity_snapshot(self):
-        return self._pool.capacity_snapshot()
+        return {**self._pool.capacity_snapshot(), "cpu_spills": self.cpu_spills}
 
     def try_reserve_batch(self, sizes):
         return self._pool.try_reserve_batch(sizes)
@@ -219,6 +221,8 @@ class MmItemMemoryPool:
         )
 
     def _warn_pool_full_once(self, nbytes: int):
+        with self._pool._lock:
+            self.cpu_spills += 1
         if self._pool_full_warned:
             return
         self._pool_full_warned = True

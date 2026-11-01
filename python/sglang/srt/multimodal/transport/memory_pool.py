@@ -2,7 +2,8 @@
 
 import logging
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -159,12 +160,15 @@ class PoolLease:
     generation: int
     ready_byte_offset: int
     ack_byte_offset: int
+    reserved_at: float = field(default_factory=time.monotonic, compare=False)
 
 
 class StreamOrderedMmFeaturePool:
     """Bounded GPU pool with generation-safe producer/consumer leases."""
 
     on_capacity_change = None
+    reclaimed_count = 0
+    reclaimed_seconds = 0.0
 
     def __init__(
         self,
@@ -257,6 +261,15 @@ class StreamOrderedMmFeaturePool:
                     (end - start for start, end in self._available_ranges), default=0
                 ),
                 "free_slots": len(self._available_slots),
+                "oldest_lease_seconds": max(
+                    (
+                        time.monotonic() - lease.reserved_at
+                        for lease in self._occupied.values()
+                    ),
+                    default=0.0,
+                ),
+                "reclaimed_count": self.reclaimed_count,
+                "reclaimed_seconds": self.reclaimed_seconds,
             }
 
     @property
@@ -363,6 +376,8 @@ class StreamOrderedMmFeaturePool:
                 f"(slot={lease.slot}, generation={lease.generation})"
             )
         del self._occupied[lease.slot]
+        self.reclaimed_count += 1
+        self.reclaimed_seconds += time.monotonic() - lease.reserved_at
         self._available_slots.append(lease.slot)
         self._available_ranges.append((lease.start, lease.end))
 
@@ -396,7 +411,6 @@ class StreamOrderedMmFeaturePool:
             .cpu()
             .tolist()
         )
-        reclaimed = False
         with self._lock:
             for lease, is_complete in zip(leases, completed):
                 if (
@@ -405,9 +419,8 @@ class StreamOrderedMmFeaturePool:
                     and lease.slot not in self._cancelling
                 ):
                     self._release_locked(lease)
-                    reclaimed = True
             self._merge_ranges_locked()
-        if reclaimed and self.on_capacity_change is not None:
+        if self.on_capacity_change is not None:
             self.on_capacity_change()
 
     def _recycle_loop(self) -> None:

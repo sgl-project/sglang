@@ -447,6 +447,13 @@ With `--enable-metrics`, inspect `sglang:mm_publication_requests_total`,
 count/bytes, occupied/free bytes, largest free range, and IPC free slots).
 Largest-free-range values are per-worker diagnostics; summing them does not
 describe a single allocation that can fit across workers.
+`sglang:mm_publication_oldest_lease_seconds` shows the oldest unreclaimed slice.
+The `mm_publication_reclaimed_total` and
+`mm_publication_reclaimed_lifetime_seconds_total` counters give the count and
+total lifetime of reclaimed slices (including rollback), not GPU copy time.
+`sglang:mm_publication_cpu_spills_total` stays zero on the guarded path: pressure
+waits or rejects rather than spilling. These observations use CPU bookkeeping;
+they do not add GPU synchronization to a metrics scrape.
 
 ### Multimodal Inputs Limitation
 

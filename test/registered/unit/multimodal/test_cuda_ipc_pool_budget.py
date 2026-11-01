@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.multimodal.transport.admission import (
     FeaturePublicationAdmission,
@@ -58,6 +59,21 @@ class TestAtomicPoolReservation(CustomTestCase):
         pool._pool_error = None
         pool._recycler_stop_event = threading.Event()
         return pool
+
+    def test_lease_age_and_reclamation_use_cpu_bookkeeping(self):
+        pool = self.make_pool()
+        leases = pool.try_reserve_batch([100])
+        start = leases[0].reserved_at
+        with patch(
+            "sglang.srt.multimodal.transport.memory_pool.time.monotonic",
+            return_value=start + 2,
+        ):
+            self.assertEqual(pool.capacity_snapshot()["oldest_lease_seconds"], 2)
+            pool.release_reserved_batch(leases)
+            snapshot = pool.capacity_snapshot()
+        self.assertEqual(snapshot["oldest_lease_seconds"], 0)
+        self.assertEqual(snapshot["reclaimed_count"], 1)
+        self.assertEqual(snapshot["reclaimed_seconds"], 2)
 
     def test_fragmented_batch_has_no_partial_reservation(self):
         pool = self.make_pool()
