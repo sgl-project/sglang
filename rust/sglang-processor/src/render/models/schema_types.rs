@@ -68,7 +68,7 @@ const SCHEMA_VALUES: &[&str] = &[
     "unevaluatedProperties",
 ];
 
-pub(super) fn normalize_json_schema_types(schema: &mut Value) {
+pub(crate) fn normalize_json_schema_types(schema: &mut Value) {
     match schema {
         Value::Array(items) => items.iter_mut().for_each(normalize_json_schema_types),
         Value::Object(schema) => {

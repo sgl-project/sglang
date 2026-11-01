@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -16,6 +17,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
 )
@@ -1926,13 +1928,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         return_dict: bool = True,
         on_frames: Callable[[torch.Tensor], None] | None = None,
     ) -> Union[DecoderOutput, torch.Tensor]:
-        batch_size, num_channels, num_frames, height, width = z.shape
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
+        num_frames = z.shape[2]
         tile_latent_min_num_frames = (
             self.tile_sample_min_num_frames // self.temporal_compression_ratio
         )
@@ -1942,12 +1938,35 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 z, temb, causal=causal, return_dict=return_dict, on_frames=on_frames
             )
 
-        if self.use_tiling and (
-            width > tile_latent_min_width or height > tile_latent_min_height
-        ):
-            return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
+        dec = self._decode_spatial(z, temb, causal=causal)
 
-        if self._should_use_spatial_parallel_decode(z):
+        if not return_dict:
+            return (dec,)
+
+        return DecoderOutput(sample=dec)
+
+    def _decode_spatial(
+        self,
+        z: torch.Tensor,
+        temb: Optional[torch.Tensor],
+        causal: Optional[bool] = None,
+    ) -> torch.Tensor:
+        tile_latent_min_height = (
+            self.tile_sample_min_height // self.spatial_compression_ratio
+        )
+        tile_latent_min_width = (
+            self.tile_sample_min_width // self.spatial_compression_ratio
+        )
+        use_tiles = self.use_tiling and (
+            z.shape[-1] > tile_latent_min_width or z.shape[-2] > tile_latent_min_height
+        )
+        # tiling caps a rank at one tile's area at a time, so the height split
+        # replaces it only when each rank's rows fit in one tile
+        if self._should_use_spatial_parallel_decode(z) and (
+            not use_tiles
+            or math.ceil(z.shape[-2] / get_decode_parallel_world_size()) * z.shape[-1]
+            <= tile_latent_min_height * tile_latent_min_width
+        ):
             expected_height = (
                 z.shape[-2] * self.config.arch_config.spatial_compression_ratio
             )
@@ -1957,19 +1976,15 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 world_size=get_decode_parallel_world_size(),
                 rank=get_decode_parallel_rank(),
             )
-            dec = gather_and_trim_height(
+            return gather_and_trim_height(
                 self.decoder(z, temb, causal=causal), expected_height
             )
-        elif self._spatial_parallel_decode_enabled:
-            with disable_spatial_parallel_decode():
-                dec = self.decoder(z, temb, causal=causal)
-        else:
-            dec = self.decoder(z, temb, causal=causal)
-
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
+        # sharded convs exchange halo rows with the neighbour rank, so an unsplit
+        # tensor must bypass them
+        with disable_spatial_parallel_decode():
+            if use_tiles:
+                return self.tiled_decode(z, temb, causal=causal).sample
+            return self.decoder(z, temb, causal=causal)
 
     def decode(
         self,
@@ -2126,24 +2141,44 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
-        rows = []
-        for i in range(0, height, tile_latent_stride_height):
-            row = []
-            for j in range(0, width, tile_latent_stride_width):
-                time = self.decoder(
-                    z[
-                        :,
-                        :,
-                        :,
-                        i : i + tile_latent_min_height,
-                        j : j + tile_latent_min_width,
-                    ],
-                    temb,
-                    causal=causal,
-                )
-
-                row.append(time)
-            rows.append(row)
+        row_starts = range(0, height, tile_latent_stride_height)
+        col_starts = range(0, width, tile_latent_stride_width)
+        starts = [(i, j) for i in row_starts for j in col_starts]
+        rank, world_size = self._tile_shard(len(starts))
+        # rank r decodes tiles r, r + world_size, ...; each tile is decoded alone,
+        # so the gathered set equals the one a single rank would decode
+        tiles = [
+            self.decoder(
+                z[
+                    :,
+                    :,
+                    :,
+                    i : i + tile_latent_min_height,
+                    j : j + tile_latent_min_width,
+                ],
+                temb,
+                causal=causal,
+            )
+            for i, j in starts[rank::world_size]
+        ]
+        if world_size > 1:
+            tiles = self._gather_tiles(
+                tiles,
+                [
+                    (
+                        min(tile_latent_min_height, height - i)
+                        * self.spatial_compression_ratio,
+                        min(tile_latent_min_width, width - j)
+                        * self.spatial_compression_ratio,
+                    )
+                    for i, j in starts
+                ],
+                world_size,
+            )
+        rows = [
+            tiles[r * len(col_starts) : (r + 1) * len(col_starts)]
+            for r in range(len(row_starts))
+        ]
 
         dec = self._merge_spatial_tiles(
             rows,
@@ -2157,6 +2192,42 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             return (dec,)
 
         return DecoderOutput(sample=dec)
+
+    def _tile_shard(self, num_tiles: int) -> tuple[int, int]:
+        """`(rank, world_size)` the spatial tiles are split over, or `(0, 1)`.
+
+        Every decode-parallel rank runs the decode once spatial parallel decode
+        is installed, so without the split each of them decodes every tile.
+        """
+        if not self._spatial_parallel_decode_enabled:
+            return 0, 1
+        world_size = get_decode_parallel_world_size()
+        if num_tiles < world_size:
+            return 0, 1
+        return get_decode_parallel_rank(), world_size
+
+    @staticmethod
+    def _gather_tiles(
+        local: list[torch.Tensor],
+        sizes: list[tuple[int, int]],
+        world_size: int,
+    ) -> list[torch.Tensor]:
+        """All-gather the round-robin tile shards back into tile order.
+
+        `sizes` holds every tile's (height, width); shards are padded to the
+        largest so one all-gather moves them, then cropped back.
+        """
+        per_rank = -(-len(sizes) // world_size)
+        height = max(h for h, _ in sizes)
+        width = max(w for _, w in sizes)
+        send = local[0].new_zeros((per_rank, *local[0].shape[:3], height, width))
+        for k, tile in enumerate(local):
+            send[k, ..., : tile.shape[-2], : tile.shape[-1]] = tile
+        recv = get_decode_parallel_group_coordinator().all_gather(send, dim=0)
+        return [
+            recv[(idx % world_size) * per_rank + idx // world_size][..., :h, :w]
+            for idx, (h, w) in enumerate(sizes)
+        ]
 
     def _temporal_tiled_encode(
         self, x: torch.Tensor, causal: Optional[bool] = None
@@ -2208,12 +2279,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         batch_size, num_channels, num_frames, height, width = z.shape
         num_sample_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
 
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
         tile_latent_min_num_frames = (
             self.tile_sample_min_num_frames // self.temporal_compression_ratio
         )
@@ -2229,15 +2294,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         emitted = 0
         for i in range(0, num_frames, tile_latent_stride_num_frames):
             tile = z[:, :, i : i + tile_latent_min_num_frames + 1, :, :]
-            if self.use_tiling and (
-                tile.shape[-1] > tile_latent_min_width
-                or tile.shape[-2] > tile_latent_min_height
-            ):
-                decoded = self.tiled_decode(
-                    tile, temb, causal=causal, return_dict=True
-                ).sample
-            else:
-                decoded = self.decoder(tile, temb, causal=causal)
+            decoded = self._decode_spatial(tile, temb, causal=causal)
             if i > 0:
                 decoded = decoded[:, :, :-1, :, :]
                 decoded = self.blend_t(previous, decoded, blend_num_frames)
@@ -2310,7 +2367,9 @@ class AutoencoderKLCausalLTX2Video(AutoencoderKLLTX2Video):
         pixel chunk ``(B, 3, T_out, h*sf, w*sf)`` and mutates ``conv_cache`` in
         place. Bypasses the tiled/framewise ``decode`` dispatch on purpose.
         """
-        return self.decoder(z_chunk, temb, causal=True, conv_cache=conv_cache)
+        # every rank decodes the whole chunk, so sharded convs must not exchange halos
+        with disable_spatial_parallel_decode():
+            return self.decoder(z_chunk, temb, causal=True, conv_cache=conv_cache)
 
 
 EntryClass = [AutoencoderKLLTX2Video, AutoencoderKLCausalLTX2Video]

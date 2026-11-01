@@ -427,6 +427,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
 
         def fake_retract_all(reqs, **_kwargs):
             events.append(("retract", [r.rid for r in reqs]))
+            return []
 
         with (
             patch("sglang.srt.managers.scheduler.retract_all", fake_retract_all),
