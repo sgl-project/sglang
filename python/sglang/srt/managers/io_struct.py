@@ -556,6 +556,7 @@ class GenerateReqInput:
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
             # A single request's media list holds all of its items; batch fields hold one entry per request.
+            # A list that is already one entry per request (e.g. [["a.png", "b.png"]]) is kept as is.
             for field_name in (
                 "image_data",
                 "video_data",
@@ -564,7 +565,7 @@ class GenerateReqInput:
                 "mm_content_hashes",
             ):
                 value = getattr(self, field_name)
-                if isinstance(value, list) and value:
+                if isinstance(value, list) and value and not isinstance(value[0], list):
                     setattr(self, field_name, [value])
 
     def _normalize_single_inputs(self):
