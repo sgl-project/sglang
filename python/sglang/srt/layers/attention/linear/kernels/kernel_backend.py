@@ -26,6 +26,12 @@ class LinearAttnKernelBase(ABC):
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
 
+    # True when extend() calls its `epilogue` kwarg as epilogue(o, start, end)
+    # on output rows once they are final, covering all rows (see
+    # chunk_gated_delta_rule), so a caller can quantize finished rows for the
+    # next GEMM while the scan continues.
+    supports_extend_epilogue: bool = False
+
     @abstractmethod
     def decode(
         self,

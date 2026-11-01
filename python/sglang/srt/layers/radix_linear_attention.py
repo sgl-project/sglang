@@ -15,7 +15,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+import functools
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -79,6 +80,13 @@ class RadixLinearAttention(nn.Module):
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
 
+        # Set by the owning layer: output_epilogue(*epilogue_inputs, o, start,
+        # end) consumes extend output rows [start, end) of o once they are
+        # final (see chunk_gated_delta_rule's `epilogue`). The tensors a call
+        # passes as `epilogue_inputs` go through a breakable CUDA graph's
+        # eager break as arguments, like the attention inputs.
+        self.output_epilogue: Optional[Callable[..., None]] = None
+
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:
         """Rebuild the cached convolution view after replacing its parameter."""
         if weight.dim() == 3 and weight.size(1) == 1:
@@ -92,7 +100,10 @@ class RadixLinearAttention(nn.Module):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        epilogue_inputs: Tuple[torch.Tensor, ...] = (),
     ) -> torch.Tensor:
+        """With `epilogue_inputs` (extend only, on a backend that supports
+        `linear_attn_epilogue`), output_epilogue runs over all output rows."""
         is_extend = forward_batch.forward_mode.is_extend()
         if (
             is_in_prefill_graph_scope()
@@ -114,10 +125,10 @@ class RadixLinearAttention(nn.Module):
             )
             if is_in_breakable_cuda_graph() and _linear_extend_in_graph():
                 _linear_attention_with_output_impl(
-                    mixed_qkv, a, b, output, self, forward_batch
+                    mixed_qkv, a, b, output, self, forward_batch, epilogue_inputs
                 )
             else:
-                self._eager_linear_attention(mixed_qkv, a, b, output)
+                self._eager_linear_attention(mixed_qkv, a, b, output, *epilogue_inputs)
             return output
 
         # Target verify rebuilds query_start_loc from the physical padded input,
@@ -145,6 +156,7 @@ class RadixLinearAttention(nn.Module):
                 output=output,
                 attention_layer=self,
                 forward_batch=forward_batch,
+                epilogue_inputs=epilogue_inputs,
             )
             return output
 
@@ -154,15 +166,32 @@ class RadixLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **_epilogue_kwargs(self, epilogue_inputs),
         )
 
-    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output):
+    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output, *epilogue_inputs):
         output.zero_()
 
     @eager_on_graph(capture_stub=_capture_stub_linear_attention)
-    def _eager_linear_attention(self, mixed_qkv, a, b, output):
+    def _eager_linear_attention(self, mixed_qkv, a, b, output, *epilogue_inputs):
         forward_batch = get_forward_batch()
-        _linear_attention_with_output_impl(mixed_qkv, a, b, output, self, forward_batch)
+        _linear_attention_with_output_impl(
+            mixed_qkv, a, b, output, self, forward_batch, epilogue_inputs
+        )
+
+
+def _epilogue_kwargs(
+    attention_layer: RadixLinearAttention, epilogue_inputs: Tuple[torch.Tensor, ...]
+) -> dict:
+    """The backend's `linear_attn_epilogue`: the layer's output_epilogue bound
+    to this call's epilogue_inputs (none without inputs)."""
+    if not epilogue_inputs:
+        return {}
+    return {
+        "linear_attn_epilogue": functools.partial(
+            attention_layer.output_epilogue, *epilogue_inputs
+        )
+    }
 
 
 def _linear_attention_with_output_impl(
@@ -172,15 +201,19 @@ def _linear_attention_with_output_impl(
     output: torch.Tensor,
     attention_layer: RadixLinearAttention,
     forward_batch: ForwardBatch,
+    epilogue_inputs: Tuple[torch.Tensor, ...] = (),
 ) -> None:
     """Run linear attention on the real prefix and initialize physical padding."""
     real_num_tokens = min(
         forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
     )
+    epilogue_kwargs = _epilogue_kwargs(attention_layer, epilogue_inputs)
     if real_num_tokens == 0:
         # A fully masked batch (an idle DP rank) needs no attention or state
         # update, and GDN prefill kernels reject an empty varlen batch.
         output.zero_()
+        if epilogue_kwargs:
+            epilogue_kwargs["linear_attn_epilogue"](output, 0, output.shape[1])
         return
 
     original_out_cache_loc = forward_batch.out_cache_loc
@@ -196,6 +229,7 @@ def _linear_attention_with_output_impl(
             a=a.narrow(0 if a.ndim == 2 else 1, 0, real_num_tokens),
             b=b.narrow(0 if b.ndim == 2 else 1, 0, real_num_tokens),
             linear_attn_output=logical_output,
+            **epilogue_kwargs,
         )
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
@@ -207,6 +241,10 @@ def _linear_attention_with_output_impl(
     # Physical padding participates in following residual, router, expert/MoE,
     # and collective operations. Keep those inputs finite and deterministic.
     output[:, real_num_tokens:].zero_()
+    if epilogue_kwargs and real_num_tokens < output.shape[1]:
+        epilogue_kwargs["linear_attn_epilogue"](
+            output, real_num_tokens, output.shape[1]
+        )
 
 
 def _linear_extend_in_graph() -> bool:

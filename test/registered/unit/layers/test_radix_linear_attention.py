@@ -67,6 +67,31 @@ class _PhysicalAttentionBackend:
         return torch.full((1, 5, 2, 4), 9.0)
 
 
+class _EpilogueAttentionBackend:
+    """Writes the rows it gets and hands them to linear_attn_epilogue, like the
+    GDN chunked extend."""
+
+    def forward(
+        self,
+        *,
+        layer,
+        forward_batch,
+        mixed_qkv,
+        a,
+        b,
+        linear_attn_output=None,
+        linear_attn_epilogue=None,
+    ):
+        del layer, forward_batch, a, b
+        rows = mixed_qkv.shape[0]
+        out = linear_attn_output
+        if out is None:
+            out = torch.empty((1, rows, 2, 4))
+        out.fill_(5.0)
+        linear_attn_epilogue(out, 0, rows)
+        return out
+
+
 class TestRadixLinearAttentionPadding(CustomTestCase):
     def test_graph_dispatch_distinguishes_prefill_decode_and_verify(self):
         layer = radix_linear_attention.RadixLinearAttention(
@@ -186,6 +211,67 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
             out = layer(batch, torch.zeros(3, 8), torch.zeros(3, 2), torch.zeros(3, 2))
         eager.assert_not_called()
         torch.testing.assert_close(out, torch.full((1, 3, 2, 4), 5.0))
+
+    def test_epilogue_inputs_reach_the_epilogue_for_every_row(self):
+        """output_epilogue gets the call's epilogue_inputs and every output row
+        once: the backend's rows, then the zeroed padding rows."""
+        layer = radix_linear_attention.RadixLinearAttention(0, 1, 1, 2, 4, 4, 4)
+        for rows, breakable in ((3, False), (5, False), (5, True)):
+            calls = []
+            sink = torch.full((rows,), float("nan"))
+
+            def epilogue(tag, sink, o, start, end):
+                calls.append((int(tag), start, end))
+                sink[start:end] = o[0, start:end, 0, 0]
+
+            layer.output_epilogue = epilogue
+            batch = SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_extend=lambda: True,
+                    is_target_verify=lambda: False,
+                    is_extend_without_speculative=lambda: True,
+                ),
+                global_num_token_non_padded_cpu=3,
+                out_cache_loc=torch.arange(rows),
+            )
+            with (
+                self.subTest(rows=rows, breakable=breakable),
+                prefill_graph_scope(full_graph=False),
+                patch.object(
+                    radix_linear_attention,
+                    "is_in_breakable_cuda_graph",
+                    return_value=breakable,
+                ),
+                patch.object(
+                    radix_linear_attention,
+                    "is_in_full_prefill_graph",
+                    return_value=False,
+                ),
+                patch.object(
+                    radix_linear_attention,
+                    "_linear_extend_in_graph",
+                    return_value=False,
+                ),
+                patch.object(
+                    radix_linear_attention,
+                    "get_attn_backend",
+                    return_value=_EpilogueAttentionBackend(),
+                ),
+                patch.object(
+                    radix_linear_attention, "get_forward_batch", return_value=batch
+                ),
+            ):
+                out = layer(
+                    batch,
+                    torch.zeros(rows, 8),
+                    torch.zeros(rows, 2),
+                    torch.zeros(rows, 2),
+                    epilogue_inputs=(torch.tensor(7), sink),
+                )
+                expected = [(7, 0, 3)] + ([(7, 3, rows)] if rows > 3 else [])
+                self.assertEqual(calls, expected)
+                torch.testing.assert_close(sink, out[0, :, 0, 0])
+                torch.testing.assert_close(sink[3:], torch.zeros(rows - 3))
 
     def test_eager_padded_input_is_sliced_and_output_shape_is_restored(self):
         layer = radix_linear_attention.RadixLinearAttention(
