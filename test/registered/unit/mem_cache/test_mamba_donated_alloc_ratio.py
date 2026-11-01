@@ -25,7 +25,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     TreeLock,
 )
-from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
@@ -430,7 +429,17 @@ class TestMambaDonationCheckpointIntegration(CustomTestCase):
             held.append(slot)
         ping_pong = req.kv.mamba_ping_pong_track_buffer.clone()
 
-        checkpoint_kv_cache(req, cache)
+        # The scheduler stashes a running chunk through the same path used
+        # after prefill, without launching a model or CUDA kernels.
+        from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+        maybe_stub_sgl_kernel()
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = None
+        scheduler.tree_cache = cache
+        scheduler.stash_chunked_request(req)
 
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(match.device_prefix_len, 0)
