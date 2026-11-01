@@ -1012,6 +1012,30 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
         raise ValueError("decision_layout is set only by /v1/systemone")
 
 
+@app.post("/prefetch")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prefetch(request: Request):
+    """Restore a stored token prefix to L1 without running inference."""
+    try:
+        result = await _global_state.tokenizer_manager.prefetch(
+            **(await request.json())
+        )
+    except (TypeError, ValueError) as error:
+        return ORJSONResponse(
+            {"success": False, "message": str(error)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "message": result.message,
+            "prefetched_tokens": result.prefetched_tokens,
+            "cached_tokens": result.cached_tokens,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
