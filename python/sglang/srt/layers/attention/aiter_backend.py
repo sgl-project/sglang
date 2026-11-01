@@ -376,6 +376,24 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    """q as unified_attention's (tokens, heads, head_dim) input, without a copy when possible.
+
+    unified_attention reads q through its token stride (query_stride_0) and needs the heads x
+    head_dim of a token dense (unit dim stride, head stride = head_dim). A q that is a column
+    slice of the fused QKV output (RoPE writes it in place) is such a view and is returned as
+    is; q.contiguous() copied the whole q of every prefill/extend batch. Any other layout,
+    or one view() rejects, is made contiguous as before.
+    """
+    try:
+        q_v = q.view(-1, num_heads, head_dim)
+        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:
+            return q_v
+    except RuntimeError:
+        pass
+    return q.contiguous().view(-1, num_heads, head_dim)
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -1265,7 +1283,7 @@ class AiterAttnBackend(AttentionBackend):
                 pt = swa_page_table
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
-        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
         o = q_u.new_empty(
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
