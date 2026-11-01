@@ -972,6 +972,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+        from sglang.srt.layers.moe.token_dispatcher.base import (
+            build_dispatcher_quant_config,
+        )
+
         if _use_triton_w4a16:
             self._process_weights_triton_w4a16(layer)
             return
@@ -1005,7 +1010,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             self._shuffle_gu_interleaved(layer)
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
-                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                    build_dispatcher_quant_config(
+                        layer,
+                        torch.float4_e2m1fn_x2,
+                        AiterQuantType.PER_1X32,
+                        gate_up_interleaved=_is_gfx1250,
+                    )
                 )
             return
 
@@ -1055,7 +1065,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         if hasattr(layer, "dispatcher"):
             # Weights are stored as torch.uint8 but semantically MXFP4
-            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+            layer.dispatcher.set_quant_config(
+                build_dispatcher_quant_config(
+                    layer,
+                    torch.float4_e2m1fn_x2,
+                    AiterQuantType.PER_1X32,
+                    gate_up_interleaved=_is_gfx1250,
+                )
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

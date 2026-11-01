@@ -735,6 +735,13 @@ class Envs:
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
+    # Write the forward's small metadata (DP token counts, extend lengths, the
+    # non-padded token count) with one kernel launch per array instead of pinned
+    # host-to-device copies. Where other host-to-device DMA can be queued ahead of
+    # these small copies on the copy engine, they wait behind it and stall the
+    # forward; typically KV-cache transfers that use DMA instead of a 2-block SM
+    # copy kernel, so as not to disturb persistent kernels.
+    SGLANG_ENABLE_MLP_SYNC_METADATA_FILL = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -788,6 +795,7 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES = EnvInt(0)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.
@@ -1074,6 +1082,9 @@ class Envs:
     # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
     SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
+    # instead of `topk_gating`.
+    SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
@@ -1710,6 +1721,24 @@ class Envs:
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
     # ===================================================================
+    # Unlimited-OCR v2
+    # ===================================================================
+    # Send a split document's next window while the current one decodes.
+    SGLANG_ENABLE_UOCR_DOC_PREFETCH = EnvBool(True)
+    # GPU memory for early-encoded follow-up pages; past it they encode at prefill.
+    SGLANG_UOCR_DOC_PREFETCH_MAX_MB = EnvInt(1024)
+    # Stage Unlimited-OCR crops in pinned host memory ahead of the forward.
+    SGLANG_ENABLE_UOCR_CROP_PREFETCH = EnvBool(True)
+    # Pinned host memory for prefetched crops; past it crops stage inline.
+    SGLANG_UOCR_CROP_PREFETCH_MAX_MB = EnvInt(1024)
+    # Materialize multimodal SHM segments off the scheduler thread.
+    SGLANG_ENABLE_UOCR_ASYNC_SHM_MATERIALIZATION = EnvBool(True)
+    # SHM bytes materializing at once; past it a request materializes inline.
+    SGLANG_UOCR_ASYNC_SHM_MAX_MB = EnvInt(4096)
+    # Send processor-owned model_specific_data tensors (crops) through SHM.
+    SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA = EnvBool(True)
+
+    # ===================================================================
     # Multimodal CUDA IPC transport
     # ===================================================================
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
@@ -2235,7 +2264,7 @@ class Envs:
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
-    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
