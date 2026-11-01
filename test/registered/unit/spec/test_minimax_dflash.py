@@ -77,8 +77,8 @@ def test_dflash_preserves_target_backends_and_defers_draft_backend(draft_backend
 )
 def test_dflash_draft_backend_uses_generic_attention_policy(explicit_backend, expected):
     if expected == "generic_default":
-        # A non-causal draft falls back to fa4 on SM100 and to flashinfer elsewhere.
-        expected = "fa4" if get_platform().is_sm100 else "flashinfer"
+        # A non-causal draft falls back to fa4 on SM100/SM110 and to flashinfer elsewhere.
+        expected = "fa4" if get_platform().is_sm100_or_sm110 else "flashinfer"
     draft_config = PretrainedConfig(
         num_hidden_layers=2, is_causal=False, layer_types=["full_attention"] * 2
     )
