@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import List, Optional, Sequence, Tuple
 
@@ -7,7 +8,10 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import (
+    copy_mla_rows_into_pack,
+    copy_pack_into_mla_rows,
+)
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.utils import device_stream_context
 
@@ -89,6 +93,94 @@ def try_pack_dcp_src(
         packed_ptrs.append(base + offset)
         offset += n * int(item_len)
     return packed_ptrs, np.arange(n, dtype=np.int64)
+
+
+@dataclasses.dataclass(frozen=True)
+class RowSegment:
+    """Rows taken from a set of per-layer buffers that share one row index list."""
+
+    ptrs: Sequence[int]
+    item_lens: Sequence[int]
+    rows: npt.NDArray[np.int64]
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.rows.size) * sum(int(n) for n in self.item_lens)
+
+
+def row_segment(
+    label: str,
+    rows: npt.ArrayLike,
+    ptrs: Sequence[int],
+    lengths: Sequence[int],
+    item_lens: Sequence[int],
+) -> RowSegment:
+    """Build a segment after checking every row lies inside its allocation."""
+    if not (len(ptrs) == len(lengths) == len(item_lens)):
+        raise ValueError(
+            f"{label} allocation metadata mismatch: "
+            f"{len(ptrs)}, {len(lengths)}, {len(item_lens)}"
+        )
+    rows = np.asarray(rows, dtype=np.int64).ravel()
+    if rows.size:
+        low, high = int(rows.min()), int(rows.max())
+        if low < 0:
+            raise ValueError(f"{label} has negative row index {low}")
+        for ptr, length, item_len in zip(ptrs, lengths, item_lens):
+            ptr, length, item_len = int(ptr), int(length), int(item_len)
+            if ptr <= 0 or length <= 0 or item_len <= 0:
+                raise ValueError(
+                    f"{label} invalid allocation: ptr={ptr}, length={length}, "
+                    f"item_len={item_len}"
+                )
+            if (high + 1) * item_len > length:
+                raise ValueError(
+                    f"{label} source overflow: max_row={high}, item_len={item_len}, "
+                    f"need={(high + 1) * item_len}, allocation={length}, "
+                    f"ptr=0x{ptr:x}"
+                )
+    return RowSegment(list(ptrs), list(item_lens), rows)
+
+
+def pack_row_segments(
+    pack: torch.Tensor, segments: Sequence[RowSegment], stream: torch.cuda.Stream
+) -> int:
+    """Copy segments back to back into ``pack``; returns the packed byte count."""
+    stream.wait_stream(torch.cuda.default_stream(pack.device))
+    offset = 0
+    with torch.cuda.stream(stream):
+        for segment in segments:
+            if segment.rows.size:
+                copy_mla_rows_into_pack(
+                    segment.ptrs,
+                    torch.as_tensor(segment.rows, device=pack.device),
+                    pack,
+                    segment.item_lens,
+                    pack_offset_bytes=offset,
+                )
+            offset += segment.nbytes
+    stream.synchronize()
+    return offset
+
+
+def unpack_row_segments(
+    pack: torch.Tensor, segments: Sequence[RowSegment], stream: torch.cuda.Stream
+) -> int:
+    """Inverse of :func:`pack_row_segments`."""
+    offset = 0
+    with torch.cuda.stream(stream):
+        for segment in segments:
+            if segment.rows.size:
+                copy_pack_into_mla_rows(
+                    pack,
+                    segment.ptrs,
+                    torch.as_tensor(segment.rows, device=pack.device),
+                    segment.item_lens,
+                    pack_offset_bytes=offset,
+                )
+            offset += segment.nbytes
+    stream.synchronize()
+    return offset
 
 
 def init_dcp_pack_buffers(
