@@ -1095,15 +1095,13 @@ class OpenAIServingChat(OpenAIServingBase):
         return request.tool_choice != "none"
 
     def _parses_tool_calls(self, request: ChatCompletionRequest) -> bool:
-        """Whether this request's output is read for tool calls: by the tool-call
-        parser, or, with none configured, as the JSON array that required and named
-        choices constrain it to."""
         if self.tool_call_parser:
             return self._tool_call_parsing_active(request)
-        return (
-            request.tool_choice == "required"
-            or isinstance(request.tool_choice, ToolChoice)
-        ) and bool(self._effective_tools(request))
+        # Required and named choices still get the JSON array constraint here,
+        # and both response paths read that array without a parser.
+        return request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
 
     @staticmethod
     def _answer_started(reasoning_parser: ReasoningParser | None) -> bool:
