@@ -79,10 +79,27 @@ _RECIPES: dict[str, dict] = {
         args=lambda: (_t(4, 4), _t(4, 4)),
         extra=[lambda: ((_t(4, 4), _t(1, 4)), {})],
     ),
-    "concatenate": dict(args=lambda: ([_t(3, 4), _t(3, 4)],), pools={"dim": [1]}),
-    "stack": dict(args=lambda: ([_t(3, 4), _t(3, 4)],), pools={"dim": [1]}),
-    "chunk": dict(args=lambda: (_t(5, 6), 3), pools={"dim": [1]}),
-    "split": dict(args=lambda: (_t(6, 4), 2), pools={"dim": [1]}),
+    # Negative dims are hand-written: the generic pool only steps a default.
+    "concatenate": dict(
+        args=lambda: ([_t(3, 4), _t(3, 4)],),
+        pools={"dim": [1]},
+        extra=[lambda: (([_t(3, 4), _t(3, 4)],), {"dim": -1})],
+    ),
+    "stack": dict(
+        args=lambda: ([_t(3, 4), _t(3, 4)],),
+        pools={"dim": [1]},
+        extra=[lambda: (([_t(3, 4), _t(3, 4)],), {"dim": -1})],
+    ),
+    "chunk": dict(
+        args=lambda: (_t(5, 6), 3),
+        pools={"dim": [1]},
+        extra=[lambda: ((_t(5, 6), 3), {"dim": -1})],
+    ),
+    "split": dict(
+        args=lambda: (_t(6, 4), 2),
+        pools={"dim": [1]},
+        extra=[lambda: ((_t(6, 4), 2), {"dim": -1})],
+    ),
     "split_with_sizes": dict(args=lambda: (_t(6, 4), [2, 4])),
     "embedding": dict(args=lambda: (_t(10, 4), _indices(6, 10))),
     "empty_like": dict(args=lambda: (_t(4, 6),), compare="shape"),
@@ -107,7 +124,14 @@ _RECIPES: dict[str, dict] = {
     ),
     "linear": dict(args=lambda: (_t(3, 8), _t(5, 8)), pools={"bias": [_t(5)]}),
     "matmul": dict(args=lambda: (_t(3, 4), _t(4, 5))),
-    "mean": dict(args=lambda: (_t(3, 4, 5), [1]), exclude={"dtype"}),
+    "mean": dict(
+        args=lambda: (_t(3, 4, 5), [1]),
+        exclude={"dtype"},
+        extra=[
+            lambda: ((_t(3, 4, 5), [0, 2]), {}),  # several axes
+            lambda: ((_t(3, 4, 5), [-1]), {"keepdim": True}),  # negative axis
+        ],
+    ),
     "numpy_transpose": dict(args=lambda: (_t(3, 4),)),
     "power": dict(
         args=lambda: (_positive(4, 4), 2.0),
@@ -119,7 +143,15 @@ _RECIPES: dict[str, dict] = {
         pools={"is_causal": [True], "scale": [0.5]},
         exclude={"dropout_p", "attn_mask", "enable_gqa"},
     ),
-    "slice": dict(args=lambda: (_t(4, 8), 1, 1, -1), pools={"step": [2]}),
+    "slice": dict(
+        args=lambda: (_t(4, 8), 1, 1, -1),
+        pools={"step": [2]},
+        extra=[
+            lambda: ((_t(4, 8), 1, -3, None), {}),  # negative start, open end
+            lambda: ((_t(4, 8), 0, 1, 100), {}),  # end past the axis
+            lambda: ((_t(4, 8), -1, 2, 6), {"step": 2}),  # negative axis
+        ],
+    ),
     "to_dtype": dict(args=lambda: (_t(4, 4), torch.float16), exclude={"non_blocking"}),
     "unsqueeze": dict(args=lambda: (_t(3, 4), 1)),
 }

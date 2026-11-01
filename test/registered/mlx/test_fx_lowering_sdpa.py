@@ -145,6 +145,49 @@ def test_sdpa_exported_executor_matches_torch(mask_kind, query_len, key_len, cau
     torch.testing.assert_close(actual.cpu(), expected, atol=5e-3, rtol=5e-3)
 
 
+# Torch forbids an explicit mask together with is_causal, so the switches that
+# can meet are grouped heads with each of causal, boolean and additive masks.
+@pytest.mark.parametrize(
+    "heads,query_len,key_len,mask_kind,causal",
+    [
+        ((4, 2, 2), 2, 5, None, True),  # gqa + rectangular causal
+        ((4, 1, 2), 2, 5, None, True),  # unequal key/value heads + causal
+        ((4, 2, 2), 5, 5, "boolean", False),  # gqa + bool mask
+        ((4, 4, 2), 3, 3, "additive", False),  # unequal heads + additive mask
+    ],
+)
+def test_sdpa_gqa_interacts_with_causal_and_masks(
+    heads, query_len, key_len, mask_kind, causal
+):
+    inputs = _inputs(query_len, key_len, heads=heads)
+    mask = None
+    if mask_kind is not None:
+        mask = torch.ones(query_len, key_len, dtype=torch.bool)
+        mask[:, -1] = False
+        if mask_kind == "additive":
+            mask = torch.where(mask, 0.25, -float("inf"))
+    _check_lowering(inputs, attn_mask=mask, is_causal=causal, enable_gqa=True)
+
+
+@pytest.mark.parametrize("mask_kind", [None, "boolean", "additive"])
+def test_sdpa_without_a_batch_axis_matches_torch(mask_kind):
+    # [H, L, D] inputs carry no batch axis; the lowering must agree with
+    # Torch on the same semantics there too.
+    generator = torch.Generator().manual_seed(7)
+    inputs = tuple(
+        torch.randn(3, length, 8, generator=generator) for length in (4, 6, 6)
+    )
+    mask = None
+    if mask_kind is not None:
+        mask = torch.ones(4, 6, dtype=torch.bool)
+        mask[0] = False
+        if mask_kind == "additive":
+            mask = torch.where(mask, 0.0, -float("inf"))
+    actual = _check_lowering(inputs, attn_mask=mask, is_causal=mask is None)
+    if mask_kind is not None:
+        assert torch.count_nonzero(actual[:, 0, :]) == 0
+
+
 if __name__ == "__main__":
     import sys
 
