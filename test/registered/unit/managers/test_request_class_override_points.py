@@ -97,6 +97,12 @@ def _recv(rid, session_params=None):
 
 
 class TestRequestClassOverridePoints(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        config = get_context().override_server_args(enable_cache_report=False)
+        config.install()
+        self.addCleanup(config.restore)
+
     def test_scheduler_builds_every_generation_request_through_the_factory(self):
         """Plain, session, and unknown-session paths all yield the subclass."""
         live = Session(capacity_of_str_len=0, session_id="live", streaming=True)

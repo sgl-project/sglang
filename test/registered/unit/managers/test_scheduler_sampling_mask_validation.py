@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -47,9 +48,11 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     input_embeds=None,
                     bootstrap_port=1,
                     bootstrap_room=9,
+                    cache_write_reporting_suffix_tokens=0,
                 )
                 req = MagicMock(return_sampling_mask=True, return_logprob=False)
                 with (
+                    get_context().override_server_args(enable_cache_report=False),
                     patch(
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
                         return_value=1,
