@@ -203,6 +203,15 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 self.assertEqual(metadata.logical_num_tokens, expected)
                 self.assertEqual(len(reads), scalar_reads)
                 self.assertEqual(metadata.query_start_loc[-1].item(), expected)
+                # The host copy of the offsets exists exactly when the lengths
+                # are trusted, and then equals query_start_loc.
+                if scalar_reads == 0:
+                    host = metadata.query_start_loc_cpu
+                    self.assertEqual(host.device.type, "cpu")
+                    self.assertEqual(host.dtype, metadata.query_start_loc.dtype)
+                    self.assertTrue(torch.equal(host, metadata.query_start_loc.cpu()))
+                else:
+                    self.assertIsNone(metadata.query_start_loc_cpu)
 
     def test_verify_decode_and_idle_ignore_stale_cpu_token_lengths(self):
         backend = make_metadata_backend()
@@ -226,6 +235,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 ):
                     metadata = backend._forward_metadata(batch)
                 self.assertIsNone(metadata.logical_num_tokens)
+                self.assertIsNone(metadata.query_start_loc_cpu)
                 torch.testing.assert_close(
                     metadata.query_start_loc,
                     torch.tensor(expected_starts, dtype=torch.int32),
