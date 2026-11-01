@@ -149,9 +149,18 @@ def candidate_topk(
         if tp
         else int(lm_head.shard_indices.num_org_elements)
     )
-    logits = _project_candidate_logits(
-        hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
-    )
+    logits = None
+    if tp and not with_partition and not use_quant_head:
+        # gfx1151 small-M GEMM
+        from sglang.srt.layers.quantization.gfx1151_small_m import small_m_linear
+
+        logits = small_m_linear(
+            hidden.to(lm_head.weight.dtype), lm_head.weight[:num_org]
+        )
+    if logits is None:
+        logits = _project_candidate_logits(
+            hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
+        )
     lse = None
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
