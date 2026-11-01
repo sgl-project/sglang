@@ -450,8 +450,10 @@ def get_available_gpu_memory(
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
-            # memory metric instead.
-            free_gpu_memory = psutil.virtual_memory().available
+            # memory metric instead. Host available memory can in turn exceed the device
+            # pool itself (e.g. an APU whose GTT cap is below the host RAM), which would
+            # size KV cache beyond what the device can hold, so bound it by the total.
+            free_gpu_memory = min(psutil.virtual_memory().available, props.total_memory)
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
@@ -533,8 +535,9 @@ def get_available_gpu_memory(
             # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
-            # memory metric instead.
-            free_gpu_memory = psutil.virtual_memory().available
+            # memory metric instead, bounded by the device total for the same reason as
+            # in the CUDA branch above.
+            free_gpu_memory = min(psutil.virtual_memory().available, props.total_memory)
         else:
             free_gpu_memory, _ = torch.musa.mem_get_info(gpu_id)
     elif device == "mps":

@@ -13,6 +13,7 @@ from sglang.srt.utils.common import (
     _load_image,
     flatten_arrays_to_int64_tensor,
     freeze_gc,
+    get_available_gpu_memory,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
 )
@@ -261,6 +262,70 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+
+class TestIntegratedDeviceAvailableMemory(CustomTestCase):
+    """Reported available memory must stay inside the device's own pool.
+
+    On unified-memory APUs (e.g. gfx1151 behind a GTT cap) the host can have
+    more RAM available than the device pool, so the raw psutil figure is e.g.
+    122 GiB on a 108 GiB device. That value feeds the KV cache budget, so it
+    is bounded by the device total instead.
+    """
+
+    TOTAL = 108 * (1 << 30)
+    HOST_AVAILABLE = 122 * (1 << 30)
+
+    def _call(self, *, available, total, is_integrated, mem_free):
+        props = mock.Mock(total_memory=total, is_integrated=is_integrated)
+        with (
+            mock.patch.object(torch.cuda, "device_count", return_value=1),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+            mock.patch.object(torch.cuda, "get_device_properties", return_value=props),
+            mock.patch.object(
+                torch.cuda, "mem_get_info", return_value=(mem_free, total)
+            ),
+            mock.patch(
+                "sglang.srt.utils.common.psutil.virtual_memory",
+                return_value=mock.Mock(available=available),
+            ),
+        ):
+            return get_available_gpu_memory("cuda", 0, empty_cache=False)
+
+    def test_host_availability_above_device_total_is_capped(self):
+        self.assertEqual(
+            self._call(
+                available=self.HOST_AVAILABLE,
+                total=self.TOTAL,
+                is_integrated=True,
+                mem_free=self.TOTAL,
+            ),
+            self.TOTAL / (1 << 30),
+        )
+
+    def test_host_availability_below_device_total_is_unchanged(self):
+        available = 40 * (1 << 30)
+        self.assertEqual(
+            self._call(
+                available=available,
+                total=self.TOTAL,
+                is_integrated=True,
+                mem_free=available,
+            ),
+            available / (1 << 30),
+        )
+
+    def test_discrete_device_ignores_host_availability(self):
+        free = 50 * (1 << 30)
+        self.assertEqual(
+            self._call(
+                available=self.HOST_AVAILABLE,
+                total=self.TOTAL,
+                is_integrated=False,
+                mem_free=free,
+            ),
+            free / (1 << 30),
+        )
 
 
 if __name__ == "__main__":
