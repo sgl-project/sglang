@@ -795,12 +795,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
-        DP rank drafts independently with no cross-DP collective, so its
-        hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
+        """The DFlash draft and the DSpark dense draft run attn-TP-local
+        (draft_tp_context): each DP rank drafts independently with no cross-DP
+        collective, so their hand-built batches carry no dp-global metadata and
+        must key graphs by local batch size. Everything else keeps the
+        dp-global padding path."""
         if not model_runner.is_draft_worker:
             return False
+        if model_runner.spec_algorithm.is_dflash():
+            return True
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
