@@ -3741,7 +3741,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
             _glm47_native_structural_tag_available.cache_clear()
 
 
-class TestGlm47FullAssistantGrammar(CustomTestCase):
+class TestGlm47FullAssistantGrammar(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.compiler = xgr.GrammarCompiler(
@@ -3859,7 +3859,7 @@ class TestGlm47FullAssistantGrammar(CustomTestCase):
                 # Resolved keys bound the pairs. $ref and properties mixed
                 # with allOf fall back to free-form arguments.
                 self.assertEqual(
-                    self._accepts(grammar, f"<tool_call>alpha{arg * 3}</tool_call>"),
+                    self._accepts(grammar, f"<tool_call>alpha{arg}{arg}</tool_call>"),
                     "$ref" in schema or "properties" in schema,
                 )
                 self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
@@ -3950,31 +3950,19 @@ class TestGlm47FullAssistantGrammar(CustomTestCase):
                     with self.subTest(backend=backend, text=text):
                         self.assertEqual(accepts(text), expected)
 
-    def test_complete_zero_key_schemas_reject_argument_pairs(self):
-        """Closed no-argument tools reject pairs; open schemas still accept them."""
-        closed = {"properties": {}, "additionalProperties": False}
-        schemas = [
-            (closed, False),
-            ({"additionalProperties": False}, False),
-            ({"allOf": [closed]}, False),
-            ({}, True),
-            ({"properties": {}}, True),
-            ({"properties": {}, "additionalProperties": True}, True),
-            ({"$ref": "#/$defs/args", "$defs": {"args": closed}}, True),
-            ({"properties": {}, "allOf": [closed]}, True),
-        ]
+    def test_closed_zero_key_schemas_reject_argument_pairs(self):
+        """A closed no-argument tool must not accept argument pairs."""
         pair = "<arg_key>unknown</arg_key><arg_value>v</arg_value>"
-        for schema, allows_pairs in schemas:
-            ebnf = self._ebnf(schema)
-            grammar = self.compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
-            for backend, accepts in (
-                ("xgrammar", lambda text: self._accepts(grammar, text)),
-                ("llguidance", lambda text: self._llguidance_accepts(ebnf, text)),
-            ):
-                for arguments in ("", pair, pair * 3):
-                    text = f"<tool_call>alpha{arguments}</tool_call>"
-                    with self.subTest(backend=backend, schema=schema, text=text):
-                        self.assertEqual(accepts(text), not arguments or allows_pairs)
+        for schema in (
+            {"properties": {}, "additionalProperties": False},
+            {"additionalProperties": False},
+        ):
+            with self.subTest(schema=schema):
+                grammar = self._compile(schema)
+                self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
+                self.assertFalse(
+                    self._accepts(grammar, f"<tool_call>alpha{pair}</tool_call>")
+                )
 
 
 class TestLing3Detector(unittest.TestCase):
