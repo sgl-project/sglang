@@ -19,7 +19,9 @@ try:
         return merge_with_config_defaults(capture_outputs(func))
 
 except ImportError:  # Transformers 4.x
-    pass
+
+    def model_input_compat(func: Callable[..., Any]) -> Callable[..., Any]:
+        return func
 
 
 @lru_cache(maxsize=None)
