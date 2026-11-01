@@ -17,6 +17,10 @@ from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.multimodal.transport.admission import (
+    MmMemoryOverloaded,
+    MmMemoryRequestTooLarge,
+)
 from sglang.srt.runtime_context import get_lora, get_serving
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.common import build_server_info
@@ -114,9 +118,17 @@ class RuntimeHandle:
             logger.warning("gRPC chunk_callback failed: %s", e)
             return None
 
-    def _send_native_error(self, chunk_callback, message: str):
+    def _send_native_error(self, chunk_callback, error: Exception):
         # ChunkCallback extracts the PyDict arg before reading error=.
-        return self._safe_callback(chunk_callback, {}, finished=True, error=message)
+        if isinstance(error, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+            return self._safe_callback(
+                chunk_callback,
+                {},
+                finished=True,
+                error=str(error),
+                status_code=error.status_code,
+            )
+        return self._safe_callback(chunk_callback, {}, finished=True, error=str(error))
 
     _BACKPRESSURE_TIMEOUT_S = 300.0
 
@@ -360,7 +372,7 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
+            self._send_native_error(chunk_callback, e)
         finally:
             if gen is not None:
                 await gen.aclose()
@@ -375,7 +387,7 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
+            self._send_native_error(chunk_callback, e)
 
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
     # called abort. abort_request only enqueues a message on the ZMQ socket,
