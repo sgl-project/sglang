@@ -74,6 +74,10 @@ def _derive_tree_links(
 
 
 class NGRAMWorker(BaseSpecWorker):
+    # eagle_sample's renorm ops run in this worker's verify path; the
+    # scheduler prewarms them at startup (sglang#43412).
+    verify_uses_eagle_sample = True
+
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
