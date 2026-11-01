@@ -48,6 +48,7 @@ class RoutedKVCache(KVCache):
         head_num: int,
         head_dim: int,
         bs1_floor_terms: Sequence[Tuple[str, int]] = (),
+        roles: Optional[Dict[str, str]] = None,
     ):
         # KVCache.__init__ allocates buffers; these views alias the arena,
         # which owns the memory.
@@ -56,6 +57,7 @@ class RoutedKVCache(KVCache):
         # capture; a draft over the target's arena leaves it to the target.
         self._bs1_floor_terms = tuple(bs1_floor_terms)
         self._owner = owner
+        self._roles = dict(roles or {})
         self._layer_maps = tuple(layer_maps)
         views = {name: view for name, view, _ in self._layer_maps}
         self._owner_view = views.get(owner, self._layer_maps[0][1])
@@ -82,7 +84,9 @@ class RoutedKVCache(KVCache):
         self.mem_usage = 0.0  # the arena logs the real size
 
     def _build_layer_router(self) -> KVLayerRouter:
-        return KVLayerRouter.from_layer_maps(self, self._layer_maps, owner=self._owner)
+        return KVLayerRouter.from_layer_maps(
+            self, self._layer_maps, owner=self._owner, roles=self._roles
+        )
 
     def id_spaces(self):
         raise NotImplementedError(

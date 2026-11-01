@@ -1909,7 +1909,10 @@ class TestFusedDraftPricing(unittest.TestCase):
         charged twice (once inside the entry, once as a private pool)."""
         mr, cfg = self._make(fused_entry=None, draft_layers=2)
         mr.spec_aux_config.eagle_draft_swa_num_layers = 2
-        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        mr.target_window_sub_pool.return_value = "window_4096"
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            4_321 if name == "window_4096" else None
+        )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 HybridSWAPoolConfigurator,

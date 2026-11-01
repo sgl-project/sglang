@@ -237,7 +237,7 @@ class TestPhysicalReservation(_ConfigCase):
             # Queued: compaction waits on the copy, then relocates rows.
             self.assertGreater(swa._flush(urgent=True), 0)
         self.assertEqual(waits[0], ("wait", load_done))
-        self.assertIn(("move", "swa"), moves)
+        self.assertIn(("move", swa.sub_pool_name), moves)
         _, target_swa = rows.read(target)
         self.assertTrue(torch.equal(target_swa, rows.markers(300, 2 * PAGE)))
         self.assertTrue(torch.equal(rows.read(head)[1], expected_head[1]))
@@ -702,7 +702,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _record_moves(self.allocator, moves)
         with _recorded_stream():
             self.assertGreater(swa._flush(urgent=True), 0)
-        self.assertIn(("move", "swa"), moves)
+        self.assertIn(("move", swa.sub_pool_name), moves)
         after = self.rows.swa_rows(ids)
         vacated = before[~torch.isin(before, after)]
         self.assertGreater(vacated.numel(), 0)
@@ -765,7 +765,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _record_moves(self.allocator, moves)
         with _recorded_stream():
             self.assertGreater(swa._flush(urgent=True), 0)
-        self.assertIn(("move", "swa"), moves)
+        self.assertIn(("move", swa.sub_pool_name), moves)
         after = self.rows.swa_rows(owner)
         self.assertFalse(torch.equal(before, after))
         self.cache.ready_to_load_host_cache()

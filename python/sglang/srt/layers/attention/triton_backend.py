@@ -463,7 +463,7 @@ class TritonAttnBackend(AttentionBackend):
         names = [
             name
             for name in self.runner_ids.window_sub_pools
-            if name != self.runner_ids.window_kv_kind
+            if name != self.runner_ids.window_kv_sub_pool
         ]
         if not names:
             return {}
@@ -497,7 +497,7 @@ class TritonAttnBackend(AttentionBackend):
         plan = model_runner.token_to_kv_pool_allocator.storage.plan
         widths = {
             plan.sub_pool(name).geometry.v_head_dim
-            for name in (self.runner_ids.window_kv_kind, *self.other_windows)
+            for name in (self.runner_ids.window_kv_sub_pool, *self.other_windows)
         }
         return len(widths) == 1 and None not in self.other_windows.values()
 

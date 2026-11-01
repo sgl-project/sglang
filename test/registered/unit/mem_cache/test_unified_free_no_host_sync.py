@@ -411,7 +411,7 @@ class TestIndependentWindowFree(unittest.TestCase):
                     kv = ReqKvInfo(req_pool_idx=0, swa_evict_floor=8)
                     storage.requests.req_to_token[0, :32] = ids
                     for name, ct, end in zip(
-                        ("swa", "draft_swa"),
+                        ("window_16", "draft_swa"),
                         (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
                         cursors,
                     ):
@@ -500,7 +500,7 @@ class TestIndependentWindowFree(unittest.TestCase):
         ):
             for primary, auxiliary in ((48, 40), (32, 16)):
                 ids = a.alloc(64)
-                a.free_window_segment("swa", ids[:primary], start_pos=0)
+                a.free_window_segment("window_16", ids[:primary], start_pos=0)
                 a.free_window_segment("draft_swa", ids[:auxiliary], start_pos=0)
                 cache.insert(
                     InsertParams(
@@ -515,7 +515,7 @@ class TestIndependentWindowFree(unittest.TestCase):
             self.assertEqual(recorder.hits, [])
             self.assertEqual(
                 {b.sub_pool_name: b.allocated_count() for b in a.bands},
-                {"full": 64, "swa": 32, "draft_swa": 48},
+                {"full": 64, "window_16": 32, "draft_swa": 48},
             )
             cache.evict(
                 EvictParams(

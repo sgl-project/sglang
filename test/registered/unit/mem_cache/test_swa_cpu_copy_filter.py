@@ -94,7 +94,10 @@ class TestUnifiedSWATransfers(CustomTestCase):
                 expected_pages = allocator.swa_v2p_page_table[
                     indices[tombstone_tokens::4] // 4
                 ]
-                rows = allocator.storage.window_ids("swa", transfers[0].device_indices)
+                rows = allocator.storage.window_ids(
+                    allocator.swa_attn_allocator.sub_pool_name,
+                    transfers[0].device_indices,
+                )
                 pages = rows[::4] // 4
                 buffer = manager.kv_cache.layer_router.view(
                     "swa"

@@ -2,12 +2,12 @@
  "source": "test/manual/mem_cache/gen_unified_layout_golden.py with aligned temporal-state rows and entry pitches",
  "layouts": {
   "swa_p1": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 8256,
    "reserved_floor": 64,
    "active_allocation_bytes": 8256,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -37,7 +37,7 @@
     }
    },
    "members": {
-    "swa": ["up", 129, 1, 129, 64],
+    "window_32": ["up", 129, 1, 129, 64],
     "full": ["down", 129, 1, 129, 64]
    },
    "pools": {
@@ -46,7 +46,7 @@
      "host_capacity": [128, 8192],
      "page_envelope": [129, 64]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 8256, 64]],
      "host_capacity": [128, 8192],
      "page_envelope": [129, 64]
@@ -61,15 +61,15 @@
     "draft_virtual_id_space": 128,
     "size_swa": 128
    },
-   "bs1_floor_terms": [["swa_window_kv", 2112], ["sink", 64]]
+   "bs1_floor_terms": [["window_32_window_kv", 2112], ["sink", 64]]
   },
   "swa_p16": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 132096,
    "reserved_floor": 1024,
    "active_allocation_bytes": 132096,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -99,7 +99,7 @@
     }
    },
    "members": {
-    "swa": ["up", 129, 1, 129, 1024],
+    "window_32": ["up", 129, 1, 129, 1024],
     "full": ["down", 129, 1, 129, 1024]
    },
    "pools": {
@@ -108,7 +108,7 @@
      "host_capacity": [2048, 131072],
      "page_envelope": [129, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 132096, 1024]],
      "host_capacity": [2048, 131072],
      "page_envelope": [129, 1024]
@@ -123,15 +123,15 @@
     "draft_virtual_id_space": 2063,
     "size_swa": 2048
    },
-   "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1024]]
+   "bs1_floor_terms": [["window_32_window_kv", 3072], ["sink", 1024]]
   },
   "swa_p64": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 528384,
    "reserved_floor": 4096,
    "active_allocation_bytes": 528384,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -161,7 +161,7 @@
     }
    },
    "members": {
-    "swa": ["up", 129, 1, 129, 4096],
+    "window_32": ["up", 129, 1, 129, 4096],
     "full": ["down", 129, 1, 129, 4096]
    },
    "pools": {
@@ -170,7 +170,7 @@
      "host_capacity": [8192, 524288],
      "page_envelope": [129, 4096]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 528384, 4096]],
      "host_capacity": [8192, 524288],
      "page_envelope": [129, 4096]
@@ -185,15 +185,15 @@
     "draft_virtual_id_space": 8255,
     "size_swa": 8192
    },
-   "bs1_floor_terms": [["swa_window_kv", 8192], ["sink", 4096]]
+   "bs1_floor_terms": [["window_32_window_kv", 8192], ["sink", 4096]]
   },
   "swa_p16_asym": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 297472,
    "reserved_floor": 2560,
    "active_allocation_bytes": 297472,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 128,
@@ -223,7 +223,7 @@
     }
    },
    "members": {
-    "swa": ["up", 145, 2, 116, 2048],
+    "window_32": ["up", 145, 2, 116, 2048],
     "full": ["down", 116, 1, 116, 2560]
    },
    "pools": {
@@ -232,7 +232,7 @@
      "host_capacity": [1824, 291840],
      "page_envelope": [116, 2560]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 297472, 2048]],
      "host_capacity": [1840, 235520],
      "page_envelope": [145, 2048]
@@ -247,15 +247,15 @@
     "draft_virtual_id_space": 1858,
     "size_swa": 1840
    },
-   "bs1_floor_terms": [["swa_window_kv", 6144], ["sink", 2560]]
+   "bs1_floor_terms": [["window_32_window_kv", 6144], ["sink", 2560]]
   },
   "swa_p16_fp8": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 132096,
    "reserved_floor": 1024,
    "active_allocation_bytes": 132096,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -285,7 +285,7 @@
     }
    },
    "members": {
-    "swa": ["up", 129, 1, 129, 1024],
+    "window_32": ["up", 129, 1, 129, 1024],
     "full": ["down", 129, 1, 129, 1024]
    },
    "pools": {
@@ -294,7 +294,7 @@
      "host_capacity": [2048, 131072],
      "page_envelope": [129, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 132096, 1024]],
      "host_capacity": [2048, 131072],
      "page_envelope": [129, 1024]
@@ -309,15 +309,15 @@
     "draft_virtual_id_space": 2063,
     "size_swa": 2048
    },
-   "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1024]]
+   "bs1_floor_terms": [["window_32_window_kv", 3072], ["sink", 1024]]
   },
   "swa_p16_draft_full": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 165376,
    "reserved_floor": 1536,
    "active_allocation_bytes": 165376,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -349,7 +349,7 @@
     }
    },
    "members": {
-    "swa": ["up", 161, 2, 107, 1024],
+    "window_32": ["up", 161, 2, 107, 1024],
     "full": ["down", 107, 1, 107, 1536]
    },
    "pools": {
@@ -358,7 +358,7 @@
      "host_capacity": [1680, 161280],
      "page_envelope": [107, 1536]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 165376, 1024]],
      "host_capacity": [1696, 108544],
      "page_envelope": [161, 1024]
@@ -373,15 +373,15 @@
     "draft_virtual_id_space": 1721,
     "size_swa": 1696
    },
-   "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1536]]
+   "bs1_floor_terms": [["window_32_window_kv", 3072], ["sink", 1536]]
   },
   "swa_p16_draft_full_swa": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 198144,
    "reserved_floor": 1536,
    "active_allocation_bytes": 198144,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 96,
@@ -415,7 +415,7 @@
     }
    },
    "members": {
-    "swa": ["up", 129, 1, 129, 1536],
+    "window_32": ["up", 129, 1, 129, 1536],
     "full": ["down", 129, 1, 129, 1536]
    },
    "pools": {
@@ -424,7 +424,7 @@
      "host_capacity": [2048, 196608],
      "page_envelope": [129, 1536]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 198144, 1536]],
      "host_capacity": [2048, 196608],
      "page_envelope": [129, 1536]
@@ -439,15 +439,15 @@
     "draft_virtual_id_space": 2063,
     "size_swa": 2048
    },
-   "bs1_floor_terms": [["swa_window_kv", 4608], ["sink", 1536]]
+   "bs1_floor_terms": [["window_32_window_kv", 4608], ["sink", 1536]]
   },
   "swa_p16_bytes": {
-   "chain": [["swa", "up"], ["full", "down"]],
+   "chain": [["window_32", "up"], ["full", "down"]],
    "total_bytes": 1043436,
    "reserved_floor": 1024,
    "active_allocation_bytes": 1043436,
    "sub_pools": {
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -477,7 +477,7 @@
     }
    },
    "members": {
-    "swa": ["up", 1018, 1, 1018, 1024],
+    "window_32": ["up", 1018, 1, 1018, 1024],
     "full": ["down", 1018, 1, 1018, 1024]
    },
    "pools": {
@@ -486,7 +486,7 @@
      "host_capacity": [16272, 1041408],
      "page_envelope": [1018, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 1043436, 1024]],
      "host_capacity": [16272, 1041408],
      "page_envelope": [1018, 1024]
@@ -501,7 +501,7 @@
     "draft_virtual_id_space": 16302,
     "size_swa": 16272
    },
-   "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1024]]
+   "bs1_floor_terms": [["window_32_window_kv", 3072], ["sink", 1024]]
   },
   "mamba_p1": {
    "chain": [["mamba", "up"], ["full", "down"]],
@@ -1173,7 +1173,7 @@
    }
   },
   "tri_p1": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 11648,
    "reserved_floor": 384,
    "active_allocation_bytes": 11648,
@@ -1192,7 +1192,7 @@
       "temporal": [128, [2, 30, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -1223,7 +1223,7 @@
    },
    "members": {
     "mamba": ["up", 30, 1, 30, 384],
-    "swa": ["float", 182, 6, 182, 64],
+    "window_32": ["float", 182, 6, 182, 64],
     "full": ["down", 182, 6, 182, 64]
    },
    "pools": {
@@ -1232,7 +1232,7 @@
      "host_capacity": [64, 4096],
      "page_envelope": [182, 64]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 11648, 64]],
      "host_capacity": [64, 4096],
      "page_envelope": [182, 64]
@@ -1255,7 +1255,7 @@
    }
   },
   "tri_p16": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 135168,
    "reserved_floor": 1024,
    "active_allocation_bytes": 135168,
@@ -1274,7 +1274,7 @@
       "temporal": [128, [2, 352, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -1305,7 +1305,7 @@
    },
    "members": {
     "mamba": ["up", 352, 3, 352, 384],
-    "swa": ["float", 132, 1, 132, 1024],
+    "window_32": ["float", 132, 1, 132, 1024],
     "full": ["down", 132, 1, 132, 1024]
    },
    "pools": {
@@ -1314,7 +1314,7 @@
      "host_capacity": [1024, 65536],
      "page_envelope": [132, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 135168, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [132, 1024]
@@ -1337,7 +1337,7 @@
    }
   },
   "tri_p64": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 531456,
    "reserved_floor": 4096,
    "active_allocation_bytes": 531456,
@@ -1356,7 +1356,7 @@
       "temporal": [128, [2, 1384, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -1387,7 +1387,7 @@
    },
    "members": {
     "mamba": ["up", 1384, 11, 1384, 384],
-    "swa": ["float", 129, 1, 129, 4096],
+    "window_32": ["float", 129, 1, 129, 4096],
     "full": ["down", 129, 1, 129, 4096]
    },
    "pools": {
@@ -1396,7 +1396,7 @@
      "host_capacity": [4096, 262144],
      "page_envelope": [129, 4096]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 531456, 4096]],
      "host_capacity": [4096, 262144],
      "page_envelope": [129, 4096]
@@ -1419,7 +1419,7 @@
    }
   },
   "tri_p16_asym": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 234496,
    "reserved_floor": 2048,
    "active_allocation_bytes": 234496,
@@ -1438,7 +1438,7 @@
       "temporal": [128, [2, 610, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 128,
@@ -1469,7 +1469,7 @@
    },
    "members": {
     "mamba": ["up", 610, 6, 610, 384],
-    "swa": ["float", 114, 1, 152, 2048],
+    "window_32": ["float", 114, 1, 152, 2048],
     "full": ["down", 152, 2, 152, 1536]
    },
    "pools": {
@@ -1478,7 +1478,7 @@
      "host_capacity": [1024, 98304],
      "page_envelope": [152, 1536]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 234496, 2048]],
      "host_capacity": [1024, 131072],
      "page_envelope": [114, 2048]
@@ -1501,7 +1501,7 @@
    }
   },
   "tri_p16_draft_full": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 168448,
    "reserved_floor": 1536,
    "active_allocation_bytes": 168448,
@@ -1520,7 +1520,7 @@
       "temporal": [128, [2, 438, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -1553,7 +1553,7 @@
    },
    "members": {
     "mamba": ["up", 438, 4, 438, 384],
-    "swa": ["float", 164, 2, 109, 1024],
+    "window_32": ["float", 164, 2, 109, 1024],
     "full": ["down", 109, 1, 109, 1536]
    },
    "pools": {
@@ -1562,7 +1562,7 @@
      "host_capacity": [1024, 98304],
      "page_envelope": [109, 1536]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 168448, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [164, 1024]
@@ -1585,7 +1585,7 @@
    }
   },
   "tri_p16_draft_swa": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 168448,
    "reserved_floor": 1536,
    "active_allocation_bytes": 168448,
@@ -1604,7 +1604,7 @@
       "temporal": [128, [2, 438, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 96,
@@ -1637,7 +1637,7 @@
    },
    "members": {
     "mamba": ["up", 438, 4, 438, 384],
-    "swa": ["float", 109, 1, 164, 1536],
+    "window_32": ["float", 109, 1, 164, 1536],
     "full": ["down", 164, 2, 164, 1024]
    },
    "pools": {
@@ -1646,7 +1646,7 @@
      "host_capacity": [1024, 65536],
      "page_envelope": [164, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 168448, 1536]],
      "host_capacity": [1024, 98304],
      "page_envelope": [109, 1536]
@@ -1669,7 +1669,7 @@
    }
   },
   "tri_p16_draft_state": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 136704,
    "reserved_floor": 1024,
    "active_allocation_bytes": 136704,
@@ -1690,7 +1690,7 @@
       "draft_temporal": [448, [1, 237, 1, 4, 8], [32, 144, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -1721,7 +1721,7 @@
    },
    "members": {
     "mamba": ["up", 237, 2, 237, 576],
-    "swa": ["float", 133, 1, 133, 1024],
+    "window_32": ["float", 133, 1, 133, 1024],
     "full": ["down", 133, 1, 133, 1024]
    },
    "pools": {
@@ -1730,7 +1730,7 @@
      "host_capacity": [1024, 65536],
      "page_envelope": [133, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 136704, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [133, 1024]
@@ -1753,7 +1753,7 @@
    }
   },
   "tri_p16_slice_axis": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 135168,
    "reserved_floor": 1024,
    "active_allocation_bytes": 135168,
@@ -1772,7 +1772,7 @@
       "temporal": [128, [2, 352, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 2,
      "entry_bytes": 64,
@@ -1803,7 +1803,7 @@
    },
    "members": {
     "mamba": ["up", 352, 3, 352, 384],
-    "swa": ["float", 132, 1, 132, 1024],
+    "window_32": ["float", 132, 1, 132, 1024],
     "full": ["down", 132, 1, 132, 1024]
    },
    "pools": {
@@ -1812,7 +1812,7 @@
      "host_capacity": [1024, 65536],
      "page_envelope": [132, 1024]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 135168, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [132, 1024]
@@ -1835,7 +1835,7 @@
    }
   },
   "tri_pp_stage": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "chain": [["mamba", "up"], ["window_32", "float"], ["full", "down"]],
    "total_bytes": 67584,
    "reserved_floor": 512,
    "active_allocation_bytes": 67584,
@@ -1854,7 +1854,7 @@
       "temporal": [64, [1, 352, 1, 4, 8], [32, 48, 32, 8, 1], "torch.float32"]
      }
     },
-    "swa": {
+    "window_32": {
      "kind": "MHASubPoolSpec",
      "layer_num": 1,
      "entry_bytes": 32,
@@ -1885,7 +1885,7 @@
    },
    "members": {
     "mamba": ["up", 352, 3, 352, 192],
-    "swa": ["float", 132, 1, 132, 512],
+    "window_32": ["float", 132, 1, 132, 512],
     "full": ["down", 132, 1, 132, 512]
    },
    "pools": {
@@ -1894,7 +1894,7 @@
      "host_capacity": [1024, 32768],
      "page_envelope": [132, 512]
     },
-    "swa": {
+    "window_32": {
      "buf_infos": [[0, 67584, 512]],
      "host_capacity": [1024, 32768],
      "page_envelope": [132, 512]
@@ -1919,7 +1919,7 @@
  },
  "bs1_floors": {
   "swa_p16": {
-   "terms": [["swa_window_kv", 3072], ["sink", 1024]],
+   "terms": [["window_32_window_kv", 3072], ["sink", 1024]],
    "budget_at_floor": 6152,
    "minimum_usable_budget": 6152
   },
@@ -1929,7 +1929,7 @@
    "minimum_usable_budget": 5264
   },
   "tri_p16": {
-   "terms": [["mamba_bs1_state_slots", 1152], ["swa_window_kv", 3072], ["sink", 1024]],
+   "terms": [["mamba_bs1_state_slots", 1152], ["window_32_window_kv", 3072], ["sink", 1024]],
    "budget_at_floor": 7312,
    "minimum_usable_budget": 8208
   }

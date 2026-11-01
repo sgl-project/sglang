@@ -90,6 +90,11 @@ class CacheInitParams:
         # The model's attention window remains sliding_window_size.
         if self.sliding_window_size is None:
             return None
+        from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+
         return max(
-            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+            self.sliding_window_size,
+            (self.draft_window_reaches or {}).get(
+                window_sub_pool_of(self.token_to_kv_pool_allocator), 0
+            ),
         )

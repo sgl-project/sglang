@@ -1344,10 +1344,14 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
         region = DenseDraftRegion(
             lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
         )
-        for host in ("full", "swa"):
+        # The pool's window states no length: its sub-pool is "window", which
+        # hosts as a window.
+        for host in ("full", "window"):
             with self.subTest(host=host):
                 placement = FusedDraftPlacement.from_counts(
-                    counts={host: [1]}, regions={host: region}
+                    counts={host: [1]},
+                    regions={host: region},
+                    hosted={"window": "swa"} if host == "window" else None,
                 )
                 bundle = _build_unified_swa_pool(fused_draft=placement)
                 draft = DraftMHAView(

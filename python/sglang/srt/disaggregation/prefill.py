@@ -77,7 +77,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    window_sub_pool_of,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     kv_to_page_indices,
@@ -1596,10 +1599,12 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload(sub_pool="swa", window=self.sliding_window_size):
+            def _swa_payload(sub_pool=None, window=self.sliding_window_size):
                 storage = kv_storage_of(
                     self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
+                if sub_pool is None:
+                    sub_pool = window_sub_pool_of(self.token_to_kv_pool_allocator)
                 resume = storage.resume_units(
                     sub_pool,
                     req,

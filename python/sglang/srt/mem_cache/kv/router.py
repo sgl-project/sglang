@@ -184,10 +184,14 @@ class KVLayerRouter:
         sub_pools: Tuple[PublicSubPool, ...],
         views: Dict[str, Any],
         layers: Dict[int, KVLayer],
+        roles: Optional[Dict[str, str]] = None,
     ):
         self._pool = pool
         self._sub_pools = sub_pools
         self._by_name = {sub_pool.name: sub_pool for sub_pool in sub_pools}
+        # Attention roles consumers ask for (the sliding-window layers' role)
+        # and the sub-pool that plays each.
+        self._roles = dict(roles or {})
         self._views = views
         self._layers = layers
         self._part_layers: Dict[Tuple[int, str], KVLayer] = {}
@@ -202,6 +206,7 @@ class KVLayerRouter:
         layer_maps: Sequence[Tuple[str, Any, Dict[int, int]]],
         *,
         owner: Optional[str] = None,
+        roles: Optional[Dict[str, str]] = None,
     ) -> KVLayerRouter:
         """A composite's router: per sub-pool, in plan order, its name, its
         view, and each routed model layer's index in that view, which is also
@@ -226,6 +231,7 @@ class KVLayerRouter:
             ),
             views={name: view for name, view, _ in layer_maps},
             layers=layers,
+            roles=roles,
         )
 
     def bind_part(
@@ -304,8 +310,9 @@ class KVLayerRouter:
         return self._sub_pools
 
     def sub_pool(self, name: str) -> Optional[PublicSubPool]:
-        """The named sub-pool, or None when the pool has none by that name."""
-        return self._by_name.get(name)
+        """The named sub-pool (or the one playing the named role), or None
+        when the pool has none by that name."""
+        return self._by_name.get(self._roles.get(name, name))
 
     def routes_to(self, sub_pool: str) -> bool:
         """Whether some layer's KV lives in the named sub-pool."""
@@ -316,10 +323,10 @@ class KVLayerRouter:
         """Backing sub-pool for an attention role, including routed drafts."""
         if self._pool.requires_physical_write_loc:
             return self.view(sub_pool)._sub_pool_name
-        return sub_pool
+        return self._roles.get(sub_pool, sub_pool)
 
     def view(self, sub_pool: str) -> Any:
-        return self._views[sub_pool]
+        return self._views[self._roles.get(sub_pool, sub_pool)]
 
     def wrapped_view(self) -> Optional[Any]:
         """The one token KV view the pool wraps, when all its token KV lives in

@@ -81,7 +81,7 @@ def _load_back(allocator, rng, full, swa, auxiliary_swa, state_slots):
     sub-pool (or None) and the window rows reserved, which only a prefix tree
     binds."""
     storage = allocator.storage
-    takes = [("full", full), ("swa", swa), ("draft_swa", auxiliary_swa)]
+    takes = [("full", full), ("window_16", swa), ("draft_swa", auxiliary_swa)]
     if state_slots:
         takes.append(("mamba", state_slots))
     rng.shuffle(takes)

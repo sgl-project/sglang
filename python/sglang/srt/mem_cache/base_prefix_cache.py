@@ -151,6 +151,14 @@ class InsertResult:
             ranges.append((start, end))
 
 
+def window_sub_pool_of(allocator) -> str:
+    """The sub-pool the model's sliding-window layers write: a unified
+    pool's target window, else the static pools' window pool."""
+    storage = getattr(allocator, "storage", None)
+    window = None if storage is None else storage.plan.primary_window()
+    return "swa" if window is None else window.name
+
+
 @dataclasses.dataclass
 class EvictParams:
     """Unified parameters for evict across different cache types"""
@@ -694,7 +702,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if self.sliding_window_size is None:
             return None
         return max(
-            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+            self.sliding_window_size,
+            (self.draft_window_reaches or {}).get(
+                window_sub_pool_of(self.token_to_kv_pool_allocator), 0
+            ),
         )
 
     def swa_retain_floor(self, req) -> int | None:

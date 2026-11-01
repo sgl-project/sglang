@@ -764,7 +764,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
         self._fused_full_entry = kvc.fused_entry_bytes("full")
-        self._fused_swa_entry = kvc.fused_entry_bytes("swa")
+        window = kvc.target_window_sub_pool()
+        self._fused_swa_entry = (
+            None if window is None else kvc.fused_entry_bytes(window)
+        )
         if self._fused_full_entry is not None or self._fused_swa_entry is not None:
             self._draft_full_layers_num = 0
             self._draft_swa_layers_num = 0

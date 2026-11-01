@@ -1310,6 +1310,14 @@ class KVCacheConfigurator:
         )
         return plan.sub_pool(sub_pool_name).spec.entry_bytes()
 
+    def target_window_sub_pool(self) -> Optional[str]:
+        """The sub-pool of the longest window the target's layers declare: the
+        window the single-window sizing prices."""
+        from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
+
+        windows = self._unified_target_windows()
+        return window_sub_pool_name(windows[-1]) if windows else None
+
     def _fused_draft_for_pool_factory(self, decision):
         """The placement a pool factory is handed. It logs the decision it
         returns, so the boot log shows whether fusion engaged or why not."""

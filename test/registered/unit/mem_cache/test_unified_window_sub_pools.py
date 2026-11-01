@@ -80,20 +80,22 @@ def _storage(windows, *, geometry=_MHA, device="cpu", lazy=True):
 
 
 class TestWindowNames(CustomTestCase):
-    def test_the_longest_window_keeps_the_single_window_name(self):
-        self.assertEqual(window_sub_pool_name(16, (16,)), "swa")
-        self.assertEqual(window_sub_pool_name(16, (16, 64)), "swa_16")
-        self.assertEqual(window_sub_pool_name(64, (16, 64)), "swa")
-        # An unstated window is the longest; with no target window, a window
-        # is its own longest.
-        self.assertEqual(window_sub_pool_name(64, (None, 64)), "swa_64")
-        self.assertEqual(window_sub_pool_name(8, ()), "swa")
+    def test_each_window_is_named_by_its_own_length(self):
+        self.assertEqual(window_sub_pool_name(16), "window_16")
+        self.assertEqual(window_sub_pool_name(4096), "window_4096")
+        # A window whose length the model does not state.
+        self.assertEqual(window_sub_pool_name(None), "window")
         plan = _plan((64, 16, 8))
         self.assertEqual(
-            {s.name for s in plan.sub_pools}, {"full", "swa", "swa_16", "swa_8"}
+            {s.name for s in plan.sub_pools},
+            {"full", "window_64", "window_16", "window_8"},
         )
-        self.assertEqual([s.name for s in plan.windows()], ["swa", "swa_16", "swa_8"])
-        self.assertEqual(plan.primary_window().name, "swa")
+        self.assertEqual(
+            [s.name for s in plan.windows()], ["window_64", "window_16", "window_8"]
+        )
+        self.assertEqual(plan.primary_window().name, "window_64")
+        # A window's name does not depend on the other windows.
+        self.assertEqual(_plan((16,)).primary_window().name, "window_16")
 
     def test_external_names_follow_window_slots(self):
         swa = SubPoolExternal(
@@ -106,10 +108,10 @@ class TestWindowNames(CustomTestCase):
             wire="auxiliary_swa",
         )
         # One window: the names every single-window peer and host store use.
-        self.assertEqual(_plan((16,)).sub_pool("swa").external, swa)
+        self.assertEqual(_plan((16,)).sub_pool("window_16").external, swa)
         two = _plan((16, 64))
-        self.assertEqual(two.sub_pool("swa").external, swa)
-        self.assertEqual(two.sub_pool("swa_16").external, auxiliary)
+        self.assertEqual(two.sub_pool("window_64").external, swa)
+        self.assertEqual(two.sub_pool("window_16").external, auxiliary)
         self.assertEqual(
             [slot.component for slot in two.tree_slots()],
             ["FULL", "SWA", "AUXILIARY_SWA"],
@@ -142,9 +144,9 @@ class TestDraftWindowFusesByLifetime(CustomTestCase):
         target_windows = (64, 16)
         decls = _decls(target_windows)
         for draft_window, host, new_band in (
-            (64, "swa", False),
-            (16, "swa_16", False),
-            (8, "swa_8", True),
+            (64, "window_64", False),
+            (16, "window_16", False),
+            (8, "window_8", True),
         ):
             with self.subTest(draft_window=draft_window):
                 placement = place_fused_draft(
@@ -210,7 +212,7 @@ class TestRunnerAddressesEveryWindow(CustomTestCase):
             with self.subTest(windows=windows):
                 storage = _storage(windows)
                 allocator = storage.allocator
-                names = sorted(window_sub_pool_name(w, windows) for w in windows)
+                names = sorted(window_sub_pool_name(w) for w in windows)
                 held = allocator.alloc(8)
                 virt = allocator.alloc(8)
                 req_to_token = torch.zeros((3, 64), dtype=torch.int32)
@@ -249,7 +251,7 @@ class TestRunnerAddressesEveryWindow(CustomTestCase):
                 backend = _Backend(max_window_sub_pools=1)
                 if refused:
                     with self.assertRaisesRegex(
-                        NotImplementedError, "_Backend.*swa_16|swa_16.*_Backend"
+                        NotImplementedError, "_Backend.*window_16|window_16.*_Backend"
                     ):
                         runner.bind_and_verify_backends([backend])
                     self.assertIsNone(backend.runner_ids)
@@ -272,7 +274,7 @@ class TestSeveralWindowsAllocate(CustomTestCase):
             allocator = storage.allocator
             self.assertEqual(
                 set(allocator.window_allocators),
-                {window_sub_pool_name(w, windows) for w in windows},
+                {window_sub_pool_name(w) for w in windows},
             )
             raw = allocator.arena.raw
             raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
@@ -377,7 +379,10 @@ class TestTwoTargetWindowsRetire(CustomTestCase):
                         int(req.decode_batch_idx < window),
                         (frontier, ct),
                     )
-            for name, window in (("swa", long_window), ("swa_8", short_window)):
+            for name, window in (
+                ("window_16", long_window),
+                ("window_8", short_window),
+            ):
                 self.assertEqual(a.window_allocators[name].allocated_count(), window)
             cache.free_kv_row(req.kv, [(16, 48)])
             cache.unlock(lock)
