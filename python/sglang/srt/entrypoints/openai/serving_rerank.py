@@ -1,3 +1,4 @@
+import asyncio
 import heapq
 import logging
 import math
@@ -409,10 +410,9 @@ class OpenAIServingRerank(OpenAIServingBase):
             )
 
         try:
-            scores = []
             instruct = getattr(request, "instruct", None)
 
-            for doc in request.documents:
+            async def _score_one(doc):
                 # Build multimodal content lists and render prompt using jinja template
                 query_content, doc_content, image_data, video_data = (
                     self._build_vl_reranker_content(
@@ -440,7 +440,8 @@ class OpenAIServingRerank(OpenAIServingBase):
                     },
                     return_logprob=True,
                     top_logprobs_num=50,  # Get enough logprobs to find yes/no tokens
-                    logprob_start_len=0,
+                    # Only the first output token is scored; skip prompt logprobs.
+                    logprob_start_len=-1,
                 )
 
                 # Execute generation request
@@ -449,8 +450,13 @@ class OpenAIServingRerank(OpenAIServingBase):
                 ).__anext__()
 
                 # Extract yes/no probabilities from logprobs
-                score = self._extract_score_from_logprobs(ret)
-                scores.append(score)
+                return self._extract_score_from_logprobs(ret)
+
+            # Submit all documents at once so the scheduler can batch them.
+            # asyncio.gather preserves input order.
+            scores = await asyncio.gather(
+                *(_score_one(doc) for doc in request.documents)
+            )
 
             responses = self._build_rerank_response(scores, request)
             return responses
