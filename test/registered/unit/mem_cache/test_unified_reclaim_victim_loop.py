@@ -6,7 +6,11 @@ import unittest
 from array import array
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.kv.alloc.pricing import first_plan
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -147,6 +151,61 @@ class TestReclaimVictimLoop(CustomTestCase):
                     if slots:
                         self.assertIsNotNone(allocator.alloc_state_slots(slots))
                     self.assertIsNotNone(allocator.alloc(tokens))
+                self.assertFalse(allocator.verify_byte_accounting())
+                for node, receipt in receipts:
+                    cache.dec_lock_ref(node, receipt.to_dec_params())
+        self.assertEqual(outcomes, {False, True})
+
+    def test_component_shortfall_reclaims_the_demand(self):
+        # Callers that make room for one component's take name its shortfall
+        # against that component's capacity read (the state slot check before
+        # binding a request, a host load's device rows). On unified memory the
+        # shortfall is the component's demand less its read, so the reclaim
+        # answers exactly as the demand's own admission and reclaim do.
+        rng = random.Random(20261101)
+        outcomes = set()
+        for seed in range(150):
+            with self.subTest(seed=seed):
+                allocator, cache, receipts = self._history(rng)
+                owner = allocator.full_attn_allocator.sub_pool_name
+                window = allocator.swa_attn_allocator.sub_pool_name
+                state = allocator.mamba_allocator.sub_pool_name
+                component = rng.choice(("owner", "window", "state"))
+                if component == "state":
+                    need = rng.randint(1, 3)
+                    read = allocator.state_slots_available()
+                    params = EvictParams(mamba_num=need - read)
+                    demand = {state: need}
+                    admitted = allocator.admits(
+                        0,
+                        {},
+                        need,
+                        evictable=allocator.admission_evictable(cache),
+                    )
+                else:
+                    page = allocator.page_size
+                    need = rng.randint(1, 48)
+                    name = owner if component == "owner" else window
+                    read = allocator.units_available(name)
+                    if component == "owner":
+                        params = EvictParams(num_tokens=need - read)
+                    else:
+                        params = EvictParams(swa_num_tokens=need - read)
+                    demand = {name: -(-need // page)}
+                    admitted = allocator.admits(
+                        need if component == "owner" else 0,
+                        {} if component == "owner" else {window: need},
+                        evictable=allocator.admission_evictable(cache),
+                    )
+                before = _evictable(cache)
+                if need > read:
+                    cache.evict_for_alloc(params)
+                self.assertEqual(allocator._units_fit(demand), admitted)
+                outcomes.add(admitted)
+                if not admitted:
+                    self.assertEqual(_evictable(cache), before)
+                elif component == "state":
+                    self.assertIsNotNone(allocator.alloc_state_slots(need))
                 self.assertFalse(allocator.verify_byte_accounting())
                 for node, receipt in receipts:
                     cache.dec_lock_ref(node, receipt.to_dec_params())
