@@ -57,6 +57,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
+from sglang.srt.layers.attention.trtllm_mla_decode_cache import cached_trtllm_mla_decode
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -1039,6 +1040,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        if (
+            envs.SGLANG_TRTLLM_MLA_CACHE_DECODE_RUNNER.get()
+            and envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get() is None
+        ):
+            return cached_trtllm_mla_decode(
+                query=query,
+                kv_cache=kv_cache,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                workspace_buffer=self.workspace_buffer,
+                multi_ctas_kv_counter_buffer=(
+                    self._multi_ctas_kv_counter_buffer
+                    if self.backend == "trtllm-gen"
+                    else None
+                ),
+                return_lse=return_lse,
+                enable_pdl=_ENABLE_PDL,
+                backend=self.backend,
+            )
+
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
         if self.backend == "trtllm-gen":
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
