@@ -29,7 +29,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
     is_hip,
-    next_power_of_2,
 )
 
 _is_hip = is_hip()
@@ -249,7 +248,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
-                next_power_of_2(bs),
                 self.page_size,
             )
         else:
@@ -306,7 +304,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc,
                 self.free_pages,
                 out_indices,
-                next_power_of_2(bs),
                 self.page_size,
             )
         else:

@@ -30,7 +30,10 @@ if TYPE_CHECKING:
         CustomAllReduceV2,
     )
 
+from sglang.srt.environ import envs
+
 SMALL_PROJECTION_MAX_TOKENS = 8
+B200_PROJECTION_MAX_TOKENS = 128
 MAX_TOKENS = 512
 _VEC = 8
 
@@ -73,6 +76,13 @@ def gemm_ag_supported(
                 comm.world_size in (4, 8)
                 and n in (4096, 8192)
                 and torch.cuda.get_device_capability(x.device) == (10, 3)
+            )
+            or (
+                envs.SGLANG_MUSE_B200_OPTIMIZATIONS.get()
+                and comm.world_size == 8
+                and n in (4096, 8192)
+                and m <= B200_PROJECTION_MAX_TOKENS
+                and torch.cuda.get_device_capability(x.device) == (10, 0)
             )
         )
         and weight.shape[1] == k
