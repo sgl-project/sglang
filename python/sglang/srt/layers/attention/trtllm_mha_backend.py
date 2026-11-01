@@ -1358,24 +1358,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         if kv_view.is_translated:
             # No fill kernel: the kernels bound their reads by cache_seqlens.
-            metadata.page_table = kv_view.ids
+            # XQA and fmha_v2 take a page table's row length from its width and
+            # ignore its strides. A captured reader that built the plan's table
+            # first left it as a view into its own wider buffer, so pack it.
+            metadata.page_table = kv_view.ids.contiguous()
             metadata.swa_page_table = (
                 self.runner_ids.read_table(
                     forward_batch.iteration_ids,
                     kind=IdSpaceKind.SLIDING_WINDOW,
                     rows=forward_batch.batch_size,
-                ).ids
+                ).ids.contiguous()
                 if self.runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None
                 else None
-            )
-            # XQA and fmha_v2 take a page table's row length from its width and
-            # ignore its strides, so a view into a wider table would be misread.
-            assert metadata.page_table.is_contiguous() and (
-                metadata.swa_page_table is None
-                or metadata.swa_page_table.is_contiguous()
-            ), (
-                "trtllm_mha reads its page tables as packed rows, but the plan's "
-                "table is a strided view of a wider buffer"
             )
         else:
             has_swa = self._swa_kv_pool is not None
