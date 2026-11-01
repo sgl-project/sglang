@@ -419,7 +419,10 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA CUDA",
+)
 def test_group_attend_skips_only_the_trailing_alignment_rows():
     """The pipelined Ulysses group attention gives the real rows the bytes of
     forward_varlen and leaves the packing's alignment rows zero."""

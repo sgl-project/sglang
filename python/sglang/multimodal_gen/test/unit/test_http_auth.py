@@ -142,6 +142,7 @@ def test_websocket_auth_handshake_on_the_wire(token, status):
             uvicorn.Config(
                 app,
                 loop="asyncio",
+                http="h11",
                 ws="websockets-sansio",
                 lifespan="off",
                 log_level="critical",
