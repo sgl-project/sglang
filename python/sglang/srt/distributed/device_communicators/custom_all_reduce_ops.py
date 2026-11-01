@@ -155,6 +155,7 @@ elif _uses_jit_quick_all_reduce():
         qr_get_handle,
         qr_max_size,
         qr_open_handles,
+        qr_supports,
     )
 
 elif _is_hip:
@@ -185,6 +186,9 @@ elif _is_hip:
 
     def qr_max_size() -> int:
         return _custom_ar.qr_max_size()
+
+    def qr_supports(fa: int, dtype: torch.dtype) -> bool:
+        return True
 
 
 # endregion
