@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    CAUSAL_CONV1D_FWD_BLOCK_M,
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -433,6 +434,72 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("use_block_table", [False, True])
+@pytest.mark.parametrize(
+    "width,has_bias,activation",
+    [(2, False, None), (3, True, "silu"), (4, False, "silu")],
+)
+@pytest.mark.parametrize(
+    "lengths,split_size",
+    [([1], 513), ([7, 1, 19], 513), ([257, 3], 1536), ([65536], 1536)],
+)
+def test_causal_conv1d_contiguous_output_groups(
+    lengths, split_size, width, has_bias, activation, use_block_table
+):
+    device, dtype = get_device(), torch.bfloat16
+    torch.manual_seed(17)
+    tokens, dim = sum(lengths), 3 * split_size
+    # Padded graph buckets and sliced packed projections both have strides
+    # that differ from the logical sequence/feature lengths.
+    x = torch.randn(tokens + 5, dim + 17, device=device, dtype=dtype)[:, :dim].T
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype) if has_bias else None
+    original = torch.randn(len(lengths) + 2, width - 1, dim, device=device, dtype=dtype)
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    blocks = None
+    if use_block_table:
+        blocks = torch.tensor(
+            [
+                (seq, chunk)
+                for seq, length in enumerate(lengths)
+                for chunk in range(
+                    (length + CAUSAL_CONV1D_FWD_BLOCK_M - 1)
+                    // CAUSAL_CONV1D_FWD_BLOCK_M
+                )
+            ]
+            + [(PAD_SLOT_ID, 0)] * 3,
+            dtype=torch.int32,
+            device=device,
+        )
+    kwargs = dict(
+        x=x,
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        query_start_loc=torch.tensor(starts, dtype=torch.int32, device=device),
+        cache_indices=torch.arange(len(lengths), dtype=torch.int32, device=device) + 1,
+        has_initial_state=torch.tensor(
+            [i % 2 == 0 for i in range(len(lengths))], device=device
+        ),
+        seq_lens_cpu=None if use_block_table else lengths,
+        block_table=blocks,
+    )
+    states = original.clone()
+    reference_states = original.clone()
+    reference = causal_conv1d_fn(
+        **kwargs, conv_states=reference_states.transpose(1, 2)
+    ).T
+    grouped = causal_conv1d_fn(
+        **kwargs, conv_states=states.transpose(1, 2), output_split_size=split_size
+    )
+    for actual, expected in zip(grouped.unbind(0), reference.split(split_size, dim=-1)):
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual[:tokens], expected[:tokens], rtol=0, atol=0)
+    torch.testing.assert_close(states, reference_states, rtol=0, atol=0)
 
 
 def test_causal_conv1d_varlen_mixed_input_and_state_dtype():

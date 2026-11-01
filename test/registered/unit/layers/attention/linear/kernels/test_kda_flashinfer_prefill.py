@@ -8,11 +8,16 @@ token, and the grouped recurrent kernel otherwise. The grouped kernel binds
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+from sglang.srt.layers.attention.linear import kda_backend, kda_prefill_graph
+from sglang.srt.layers.attention.linear.kda_backend import (
+    KDAAttnBackend,
+    KDAKernelDispatcher,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
     FlashInferKDAPrefillKernel,
 )
@@ -169,6 +174,172 @@ class TestFlashInferKDAPrefillDispatch(CustomTestCase):
 
         self.assertEqual(flashinfer_kernel.calls, 1)
         self.assertEqual(triton_kernel.calls, 0)
+
+    def test_convolution_layout_follows_the_selected_prefill_kernel(self):
+        cases = (
+            (
+                "flashinfer",
+                [2, 1],
+                H * V,
+                True,
+                LinearAttnKernelBackend.FLASHINFER,
+                H * K,
+            ),
+            (
+                "single_tokens",
+                [1, 1, 1],
+                H * V,
+                True,
+                LinearAttnKernelBackend.FLASHINFER,
+                0,
+            ),
+            (
+                "safe_gate_fallback",
+                [2, 1],
+                H * V,
+                False,
+                LinearAttnKernelBackend.FLASHINFER,
+                0,
+            ),
+            (
+                "unequal_widths",
+                [2, 1],
+                H * V // 2,
+                True,
+                LinearAttnKernelBackend.FLASHINFER,
+                0,
+            ),
+            ("triton", [2, 1], H * V, True, LinearAttnKernelBackend.TRITON, 0),
+        )
+        for name, lengths, v_dim, safe_gate, prefill_backend, expected_split in cases:
+            with self.subTest(case=name):
+                dispatcher, kernel, _ = self._make_dispatcher()
+                dispatcher.prefill_backend = prefill_backend
+                kernel.supports_safe_gate = safe_gate
+                layer = SimpleNamespace(
+                    q_dim=H * K,
+                    k_dim=H * K,
+                    v_dim=v_dim,
+                    conv_weights=None,
+                    bias=None,
+                    lower_bound=-5.0,
+                )
+                backend = object.__new__(KDAAttnBackend)
+                backend.kernel_dispatcher = dispatcher
+                inputs = _make_inputs(sum(lengths), lengths)
+                backend.forward_metadata = SimpleNamespace(
+                    query_start_loc=inputs["query_start_loc"]
+                )
+                x = torch.randn(sum(lengths), layer.q_dim + layer.k_dim + layer.v_dim)
+
+                # Only the GPU convolution is replaced. Its output contract
+                # feeds the production backend's Q/K/V unpacking.
+                def convolve(x, *args, output_split_size, **kwargs):
+                    self.assertEqual(output_split_size, expected_split)
+                    if output_split_size:
+                        return torch.stack(x.T.split(output_split_size, dim=-1))
+                    return x.clone()
+
+                with patch.object(
+                    kda_backend, "causal_conv1d_fn", side_effect=convolve
+                ):
+                    outputs = backend._convolve_prefill(
+                        layer,
+                        SimpleNamespace(
+                            extend_prefix_lens=torch.zeros(len(lengths)),
+                            extend_seq_lens_cpu=lengths,
+                        ),
+                        x,
+                        None,
+                        inputs["cache_indices"],
+                    )
+                torch.testing.assert_close(torch.cat(outputs, dim=-1), x)
+                self.assertEqual(
+                    [t.shape[-1] for t in outputs],
+                    [layer.q_dim, layer.k_dim, layer.v_dim],
+                )
+                if expected_split:
+                    self.assertTrue(all(t.is_contiguous() for t in outputs))
+
+    def test_graph_keeps_unequal_qkv_widths_in_split_layout(self):
+        """The graph path must use the legacy split layout for unequal Q/K/V.
+
+        Grouped convolution is only valid when every Q/K/V group has the same
+        width.  ``meta.flashinfer`` selects the graph wrapper, but it must not
+        by itself enable grouped output for models with asymmetric projections.
+        """
+
+        class _RecordingGraph:
+            def __init__(self):
+                self.inputs = None
+
+            def run(self, **kwargs):
+                self.inputs = kwargs
+                return torch.zeros_like(kwargs["v"])
+
+        total_tokens = 3
+        layer = SimpleNamespace(
+            q_dim=2,
+            k_dim=2,
+            v_dim=3,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=3,
+            conv_weights=None,
+            bias=None,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
+            lower_bound=-5.0,
+        )
+        graph = _RecordingGraph()
+        meta = SimpleNamespace(
+            track=False,
+            flashinfer=graph,
+            cu_seqlens=torch.tensor([0, total_tokens], dtype=torch.int32),
+            has_initial_state=torch.zeros(1, dtype=torch.bool),
+            cache_indices=torch.zeros(1, dtype=torch.int32),
+            conv_block_table=torch.zeros(1, 2, dtype=torch.int32),
+            num_logical_tokens=torch.tensor([total_tokens], dtype=torch.int32),
+            token_index=torch.arange(total_tokens, dtype=torch.int32),
+        )
+        mixed_qkv = torch.arange(total_tokens * 7, dtype=torch.float32).view(
+            total_tokens, 7
+        )
+
+        def convolve(x, *args, output_split_size, **kwargs):
+            self.assertEqual(output_split_size, 0)
+            return x.clone()
+
+        with patch.object(kda_prefill_graph, "causal_conv1d_fn", side_effect=convolve):
+            output = kda_prefill_graph.kda_extend_in_graph(
+                layer=layer,
+                meta=meta,
+                conv_pool=torch.zeros(1, 1, 7),
+                ssm_states=torch.zeros(1, 1, 3, 3),
+                kernel_dispatcher=SimpleNamespace(),
+                mixed_qkv=mixed_qkv,
+                a=torch.zeros(1, total_tokens, 1, 2),
+                b=torch.zeros(1, total_tokens, 1),
+            )
+
+        self.assertEqual(output.shape, (1, total_tokens, 1, 3))
+        self.assertEqual(
+            [
+                tensor.shape[-1]
+                for tensor in (
+                    graph.inputs["q"],
+                    graph.inputs["k"],
+                    graph.inputs["v"],
+                )
+            ],
+            [2, 2, 3],
+        )
+        torch.testing.assert_close(
+            torch.cat([graph.inputs["q"], graph.inputs["k"], graph.inputs["v"]], dim=-1)
+            .squeeze(0)
+            .squeeze(1),
+            mixed_qkv,
+        )
 
 
 if __name__ == "__main__":
