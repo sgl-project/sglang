@@ -323,6 +323,27 @@ def get_schema_properties(schema: Any) -> Dict[str, Any]:
     return merged
 
 
+def schema_allows_null(schema: Any) -> bool:
+    """True when the JSON schema explicitly accepts a null value."""
+    if not isinstance(schema, dict):
+        return False
+    type_value = schema.get("type")
+    if type_value == "null":
+        return True
+    if isinstance(type_value, list) and "null" in type_value:
+        return True
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and None in enum_values:
+        return True
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list) and any(
+            schema_allows_null(variant) for variant in variants
+        ):
+            return True
+    return False
+
+
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.
