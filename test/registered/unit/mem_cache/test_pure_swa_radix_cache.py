@@ -88,7 +88,7 @@ class TestPureSWARadixCache(CustomTestCase):
             priority=0,
             kv=ReqKvInfo(
                 req_pool_idx=0,
-                swa_evict_floor=4,
+                window_evict_floor=4,
                 component_evicted_seqlens={ComponentType.SWA: 6},
             ),
         )
@@ -122,7 +122,7 @@ class TestDisabledPureSWARadixCache(CustomTestCase):
             kv=ReqKvInfo(
                 req_pool_idx=0,
                 cache_protected_len=2,
-                swa_evict_floor=3,
+                window_evict_floor=3,
                 component_evicted_seqlens={ComponentType.SWA: 6},
             ),
         )
