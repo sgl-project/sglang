@@ -2,33 +2,9 @@
 """MiniMax-M3 checkpoint names and layouts of the Quark and llm-compressor exports, shared by
 the text and the multimodal model's loaders."""
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
-
-
-def quark_shared_experts_fusion_disable_reason(quant_config) -> Optional[str]:
-    """Why a Quark checkpoint cannot fuse its shared expert into the routed MoE, or None."""
-    if quant_config is None or quant_config.get_name() != "quark":
-        return None
-    # online MXFP4 requantization keeps the shared experts in the source's FP8 / MXFP8
-    if quant_config.excluded_fp8_config is not None:
-        return (
-            "Shared experts stay in the checkpoint's FP8 precision while "
-            "routed experts are requantized to MXFP4."
-        )
-    # a pre-quantized checkpoint may give its shared experts their own layer_quant_config
-    layer_quant_config = quant_config.quant_config.get("layer_quant_config")
-    for name, spec in (layer_quant_config or {}).items():
-        if "shared_experts" not in name or not isinstance(spec, dict):
-            continue
-        weight_spec = spec.get("weight") or {}
-        if weight_spec.get("dtype") != "fp4":
-            return (
-                f"Shared experts are serialized as {weight_spec.get('dtype')} "
-                "while routed experts are MXFP4."
-            )
-    return None
 
 
 def mxfp8_linear_scale_alias(name: str, params_dict: dict) -> str:

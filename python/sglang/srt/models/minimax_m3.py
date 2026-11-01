@@ -105,10 +105,12 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
+from sglang.srt.models.deepseek_common.utils import (
+    quant_blocks_shared_experts_fusion,
+    tiny_router_gemm_max_tokens,
+)
 from sglang.srt.models.minimax_common.minimax_weight_loader import (
     mxfp8_linear_scale_alias,
-    quark_shared_experts_fusion_disable_reason,
     remap_llm_compressor_nvfp4_expert,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
@@ -2074,9 +2076,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in mixed-precision checkpoints."
             )
-        quark_reason = quark_shared_experts_fusion_disable_reason(quant_config)
-        if quark_reason is not None:
-            return quark_reason
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):

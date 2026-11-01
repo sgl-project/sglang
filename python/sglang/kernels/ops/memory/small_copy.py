@@ -134,3 +134,40 @@ def try_small_copy(dsts, srcs):
             BLOCK=256,
         )
     return True
+
+
+@triton.jit
+def _write_host_ints_kernel(destinations, encoded):
+    for i in tl.static_range(len(encoded)):
+        for j in tl.static_range(len(encoded[i])):
+            tl.store(destinations[i] + j, encoded[i][j] >> 4)
+
+
+def write_host_ints(dsts, values):
+    """Write host integer lists into small 1-D CUDA tensors with one launch.
+
+    The values travel as kernel arguments, so unlike a host-to-device copy the
+    write never waits on a copy engine behind other transfers.
+    """
+    if len(dsts) != len(values):
+        raise ValueError(
+            f"write_host_ints got {len(dsts)} tensors and {len(values)} value lists"
+        )
+    for dst, row in zip(dsts, values):
+        if (
+            dst.device.type != "cuda"
+            or dst.dtype not in (torch.int32, torch.int64)
+            or dst.ndim != 1
+            or not dst.is_contiguous()
+            or dst.numel() != len(row)
+        ):
+            raise ValueError(
+                "write_host_ints needs contiguous 1-D int32/int64 CUDA tensors "
+                f"matching the value counts; got {dst.dtype} {tuple(dst.shape)} "
+                f"on {dst.device} for {len(row)} values"
+            )
+    # Triton keys a compiled kernel on every int inside a tuple argument (equal to
+    # 1, divisible by 16) even under do_not_specialize. 16 * v + 3 is odd and never
+    # 1, so one compiled kernel serves all values of a given shape.
+    encoded = tuple(tuple(16 * int(v) + 3 for v in row) for row in values)
+    _write_host_ints_kernel[(1,)](tuple(dsts), encoded, num_warps=1)
