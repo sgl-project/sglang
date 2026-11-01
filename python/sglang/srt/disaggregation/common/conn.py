@@ -3086,6 +3086,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -3366,8 +3368,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
+            if self._loop is not None:
+                if self._runner is not None:
+                    self._loop.run_until_complete(self._runner.cleanup())
+                self._loop.close()
 
     def close(self):
         """Shutdown"""
