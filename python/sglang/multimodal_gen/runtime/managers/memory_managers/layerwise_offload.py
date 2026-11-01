@@ -161,6 +161,14 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
             # output feeds an all-reduce that expects a device tensor.
             if getattr(table, "tp_size", 1) != 1:
                 continue
+            # A tied output head shares this weight and needs it on the device.
+            if any(
+                param is weight
+                for other in model.modules()
+                if other is not table
+                for param in other.parameters(recurse=False)
+            ):
+                continue
             if weight.numel() * weight.element_size() < HOST_RESIDENT_TABLE_MIN_BYTES:
                 continue
             if table not in tables:
