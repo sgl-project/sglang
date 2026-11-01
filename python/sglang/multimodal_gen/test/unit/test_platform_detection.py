@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -47,6 +48,22 @@ class TestCudaPlatformDetection(unittest.TestCase):
                 patch.object(torch.cuda, "device_count", return_value=1),
             ):
                 self.assertEqual(platforms.cuda_platform_plugin(), expected)
+
+
+class TestRocmPlatformDetection(unittest.TestCase):
+    def test_torch_fallback_without_amdsmi(self):
+        rocm = "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform"
+        cases = (("6.0", True, rocm), ("6.0", False, None), (None, True, None))
+
+        for hip_version, gpu_available, expected in cases:
+            with (
+                self.subTest(hip_version=hip_version, gpu_available=gpu_available),
+                # A None entry makes `import amdsmi` raise ImportError.
+                patch.dict(sys.modules, {"amdsmi": None}),
+                patch.object(torch.version, "hip", hip_version, create=True),
+                patch.object(torch.cuda, "is_available", return_value=gpu_available),
+            ):
+                self.assertEqual(platforms.rocm_platform_plugin(), expected)
 
 
 class TestDiffusionPlatformPlugins(unittest.TestCase):
