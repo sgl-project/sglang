@@ -116,6 +116,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
         *,
         mla,
         target_backend="fa3",
+        sm100=True,
         resolver=_resolve_dflash_draft_attention_backend,
     ):
         args = _make_dflash_args(draft_backend)
@@ -130,7 +131,9 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
-                return_value=SimpleNamespace(is_xpu=False, is_hip=False, is_sm100=True),
+                return_value=SimpleNamespace(
+                    is_xpu=False, is_hip=False, is_sm100_or_sm110=sm100
+                ),
             ),
             patch(
                 f"{HOOK_MODULE}.attention_backends_of",
@@ -152,6 +155,13 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             self._resolve(None, mla=True, target_backend="trtllm_mla"), "flashinfer"
         )
         self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
+
+    def test_gqa_drafts_fall_back_to_fa4_on_sm100_or_sm110_only(self):
+        self.assertEqual(self._resolve(None, mla=False, target_backend="dsa"), "fa4")
+        self.assertEqual(
+            self._resolve(None, mla=False, target_backend="dsa", sm100=False),
+            "flashinfer",
+        )
 
     def test_mla_dspark_draft_publishes_its_fallback(self):
         """The KV planners read the published draft backend, so an MLA DSpark

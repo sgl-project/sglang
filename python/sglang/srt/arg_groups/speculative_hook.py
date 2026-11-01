@@ -932,6 +932,20 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             )
         return backend in supported_draft_backends
 
+    def load_draft_hf_config():
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        kwargs = {}
+        if cfg.decrypted_draft_config_file:
+            kwargs["_configuration_file"] = cfg.decrypted_draft_config_file
+        return get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+            **kwargs,
+        )
+
     def get_fallback_backend() -> str:
         if current_platform.is_out_of_tree():
             try:
@@ -953,11 +967,18 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 )
             return fallback_backend
         # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
-        return (
-            "triton"
-            if (get_platform().is_xpu or get_platform().is_hip)
-            else "flashinfer"
-        )
+        if get_platform().is_xpu or get_platform().is_hip:
+            return "triton"
+        # FA4 is faster than FlashInfer for GQA drafts (measured on B200). MLA drafts
+        # keep FlashInfer because FA4 only accepts kv_lora_rank 512.
+        if get_platform().is_sm100_or_sm110:
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+            if not parse_dflash_draft_config(
+                draft_hf_config=load_draft_hf_config()
+            ).is_mla:
+                return "fa4"
+        return "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
@@ -979,14 +1000,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             get_dflash_layer_types,
             parse_dflash_draft_config,
         )
-        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-        )
+        draft_hf_config = load_draft_hf_config()
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
@@ -1004,9 +1019,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         if draft_backend == "trtllm_mha" and not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
-            # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
-            if not current_platform.is_out_of_tree() and get_platform().is_sm100:
-                fallback_backend = "fa4"
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "
