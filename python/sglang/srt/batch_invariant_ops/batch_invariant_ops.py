@@ -67,6 +67,14 @@ def _matmul_launch_metadata(
     return ret
 
 
+def _dot_precision(dtype: torch.dtype) -> Optional[str]:
+    # tl.dot runs fp32 operands in TF32 by default; like aten::mm, use TF32 only
+    # when torch allows it (e.g. --enable-tf32-matmul).
+    if dtype == torch.float32 and torch.backends.cuda.matmul.fp32_precision != "tf32":
+        return "ieee"
+    return None
+
+
 @triton.jit
 def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     group_id = tile_id // num_pid_in_group
@@ -101,6 +109,7 @@ def matmul_kernel_persistent(
     B_LARGE: tl.constexpr,
     C_LARGE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -147,7 +156,7 @@ def matmul_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            accumulator = tl.dot(a, b, accumulator, input_precision=DOT_PRECISION)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -263,6 +272,7 @@ def _matmul_persistent_triton(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
+        DOT_PRECISION=_dot_precision(a.dtype),
         **configs[a.dtype],
     )
     return c
@@ -678,6 +688,7 @@ def bmm_kernel_persistent(
     A_LARGE: tl.constexpr,
     B_LARGE: tl.constexpr,
     C_LARGE: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     """
     Batched matrix multiplication kernel that processes batches in parallel.
@@ -745,7 +756,7 @@ def bmm_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            accumulator = tl.dot(a, b, accumulator, input_precision=DOT_PRECISION)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -857,6 +868,7 @@ def bmm_batch_invariant(a, b, *, out=None):
             A_LARGE=a.numel() > 2**31,
             B_LARGE=b.numel() > 2**31,
             C_LARGE=c.numel() > 2**31,
+            DOT_PRECISION=_dot_precision(dtype),
             **config,
         )
 
