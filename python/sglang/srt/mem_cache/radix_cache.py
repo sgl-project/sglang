@@ -567,7 +567,21 @@ class RadixCache(BasePrefixCache):
         # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
         # checkpoint or release_kv_cache frees the rest.
-        req.kv.protect_prefix(len(new_indices))
+        if (
+            getattr(req, "system_prefix_boundary", None) is not None
+            and len(new_indices) < req.kv.cache_protected_len
+        ):
+            # Fixed system prompt: the donated key is capped at the chunk-aligned
+            # system boundary, which can sit BELOW the extent the request matched
+            # at admission (deep keys inserted by boundary-less requests extend
+            # the shared system node). Pages in [len(new_indices),
+            # cache_protected_len) belong to that matched node —
+            # release_kv_cache frees [cache_protected_len, up_to), so shrinking
+            # here would hand tree-referenced pages back to the allocator
+            # (silent KV corruption on later matches). Keep the matched extent.
+            pass
+        else:
+            req.kv.protect_prefix(len(new_indices))
 
         self.unlock(req.lock)
         req.lock = self.lock(new_last_node)

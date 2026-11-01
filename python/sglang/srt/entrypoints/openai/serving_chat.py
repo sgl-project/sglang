@@ -2080,25 +2080,31 @@ class OpenAIServingChat(OpenAIServingBase):
             else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
-        _injected_system = False
         if self._system_prefix is not None and not any(
             m.get("role") == "system" for m in messages
         ):
             messages.insert(0, self._system_prefix.inject_message())
-            _injected_system = True
-        # Radix KV / mamba truncation boundary, valid only when we actually
-        # inject the fixed system prefix as the first message and the standard
-        # chat-template pipeline renders it (not a custom encoder). The boundary
-        # is chunk-aligned by construction (truncate-down in SystemPrefix).
-        # Works for both text-only and multimodal requests (the injected system
-        # block is pure text and sits before any media).
+        # Radix KV / mamba truncation boundary, valid only when the LEADING
+        # system block IS the fixed prompt — injected by us (the client sent
+        # no system message) or supplied by the client with byte-identical
+        # content (the rendered tokens are identical either way, so capping its
+        # donated key at the boundary re-donates nothing per-request and no
+        # deep key extends the shared system node). A DIFFERENT client system
+        # keeps the boundary None: its key must not be capped at the fixed
+        # prompt's boundary. Requires the standard chat-template pipeline (not
+        # a custom encoder); the boundary is chunk-aligned by construction
+        # (truncate-down in SystemPrefix) and works for both text-only and
+        # multimodal requests (the system block is pure text and sits before
+        # any media).
         _system_boundary = (
             self._system_prefix.boundary_len
             if (
-                _injected_system
-                and self._system_prefix is not None
+                self._system_prefix is not None
                 and self._system_prefix.enabled
                 and self.chat_encoding_spec is None
+                and messages
+                and messages[0].get("role") == "system"
+                and messages[0].get("content") == self._system_prefix.system_text
             )
             else None
         )
