@@ -80,6 +80,7 @@ class TestGuardedDispatchCleanup(CustomTestCase):
                 manager._dispatch_to_scheduler = fail_dispatch
                 with (
                     get_context().override_server_args(mm_admission_timeout_ms=0),
+                    patch("sglang.srt.managers.io_struct._USE_PICKLE_IPC", False),
                     patch.object(
                         tokenizer_manager, "wrap_shm_features", lambda obj: obj
                     ),
