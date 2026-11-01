@@ -473,15 +473,19 @@ def moe_fused_gate(
 
     # One-warp-per-token CUDA router: same selection, order and padding contract
     # as the Triton kernel below.
-    if moe_softcapping == 0.0 and moe_route_warp.covered(
-        scores.dtype,
-        scores.shape[1],
-        topk,
-        scoring_func,
-        num_fused_shared_experts,
-        num_expert_group,
-        topk_group,
-        scores.device.index,
+    if (
+        moe_softcapping == 0.0
+        and moe_route_warp.covered(
+            scores.dtype,
+            scores.shape[1],
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            num_expert_group,
+            topk_group,
+            scores.device.index,
+        )
+        and moe_route_warp.bias_layout_ok(bias, bias_alt)
     ):
         return moe_route_warp.moe_route_warp(
             scores,

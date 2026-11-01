@@ -2062,7 +2062,7 @@ def biased_grouped_topk_gpu(
             num_expert_group,
             topk_group,
             gating_output.device.index,
-        ):
+        ) and moe_route_warp.bias_layout_ok(correction_bias):
             return moe_route_warp.moe_route_warp(
                 gating_output,
                 correction_bias,

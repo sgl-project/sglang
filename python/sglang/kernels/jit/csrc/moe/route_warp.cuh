@@ -109,18 +109,17 @@ SGL_DEVICE float softmax_exp(float x, float mx) {
 // sqrt(max(x, 0) + log1p(exp(-|x|))), branch-free: w = exp(-|x| / 2) = 2^n * 2^f with
 // a degree-7 polynomial for 2^f, z = w^2, log1p(z) = 2 atanh(z / (2 + z)) as an odd
 // series. For x <= 0 the result is w * sqrt(log1p(z) / z), which stays normal down to
-// x = -174 where z itself underflows.
+// x = -174 where z itself underflows; below about -176, where w underflows, it is 0.
 SGL_DEVICE float sqrtsoftplus(float x) {
   constexpr float kHalfL2e = 0.5f * kLog2e;
   constexpr float kHalfL2eLo = 0.5f * 1.925963033500011e-08f;  // (log2(e) - kLog2e) / 2
-  // Below -174 the result exp(x / 2) is subnormal; the clamp also keeps 2^n normal.
-  const auto nx = fmaxf(-fabsf(x), -174.0f);
-  const auto t_hi = nx * kHalfL2e;
-  const auto t_lo = fmaf(nx, kHalfL2e, -t_hi) + nx * kHalfL2eLo;
-  // n = rint(t_hi) via 1.5 * 2^23, whose low mantissa bits then hold n.
-  const auto n_shift = t_hi + 12582912.0f;
+  // Bounds n for the exponent add below (also maps -inf and NaN to finite values).
+  const auto nx = fmaxf(-fabsf(x), -500.0f);
+  // n = rint(nx * kHalfL2e) via 1.5 * 2^23, whose low mantissa bits then hold n.
+  const auto n_shift = nx * kHalfL2e + 12582912.0f;
   const auto n = n_shift - 12582912.0f;
-  const auto f = (t_hi - n) + t_lo;
+  // f = nx * log2(e) / 2 - n: the fma rounds once, |f| <= 1/2.
+  const auto f = fmaf(nx, kHalfL2eLo, fmaf(nx, kHalfL2e, -n));
   // 2^f = e^(f ln2), Taylor to degree 7 (error < 5e-9 for |f| <= 1/2).
   auto e = 1.0f / 5040.0f;
   e = fmaf(e, f * kLn2, 1.0f / 720.0f);
@@ -130,8 +129,10 @@ SGL_DEVICE float sqrtsoftplus(float x) {
   e = fmaf(e, f * kLn2, 0.5f);
   e = fmaf(e, f * kLn2, 1.0f);
   e = fmaf(e, f * kLn2, 1.0f);
-  // w = e * 2^n by an exponent add: 1.5 * 2^23 << 23 wraps to 0, and w stays normal.
-  const auto w = __int_as_float(__float_as_int(e) + (__float_as_int(n_shift) << 23));
+  // w = e * 2^n by an exponent add (1.5 * 2^23 << 23 wraps to 0). When 2^n underflows
+  // (n >= -181 here), the exponent borrows into the sign: a negative value or NaN, which
+  // fmaxf turns into 0.
+  const auto w = fmaxf(__int_as_float(__float_as_int(e) + (__float_as_int(n_shift) << 23)), 0.0f);
   const auto z = w * w;
   // 1 / (2 + z): rcp.approx and one Newton step, ~0.5 ulp.
   const auto d = 2.0f + z;
