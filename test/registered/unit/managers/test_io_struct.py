@@ -1086,6 +1086,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 session_params={"id": "legacy"},
             ).normalize_batch_and_arguments()
 
+    def test_getitem_preserves_routing_key(self):
+        for text, sampling_params in [
+            (["Hello", "World"], {"temperature": 0}),
+            ("Hello", {"n": 2, "temperature": 0}),
+        ]:
+            for routing_key in (None, "", "tenant-a"):
+                with self.subTest(text=text, routing_key=routing_key):
+                    req = GenerateReqInput(
+                        text=text,
+                        sampling_params=sampling_params,
+                        routing_key=routing_key,
+                        require_reasoning=True,
+                    )
+                    req.normalize_batch_and_arguments()
+                    for index in range(len(req.text)):
+                        self.assertEqual(req[index].routing_key, routing_key)
+                        self.assertTrue(req[index].require_reasoning)
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
