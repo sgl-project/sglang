@@ -21,12 +21,26 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _RecordingMoeAlltoAll:
-    def dispatch(self, token_selected_experts, payloads, *_args, **kwargs):
-        self.token_selected_experts = token_selected_experts
-        self.payloads = payloads
-        self.expert_id_payload_index = kwargs["expert_id_payload_index"]
-        return payloads
+class _RecordingCommunication:
+    def dispatch(
+        self,
+        hidden_states,
+        topk_ids,
+        topk_weights=None,
+        *,
+        hidden_states_scale=None,
+        **_kwargs,
+    ):
+        self.hidden_states = hidden_states
+        self.hidden_states_scale = hidden_states_scale
+        self.topk_ids = topk_ids
+        self.topk_weights = topk_weights
+        return SimpleNamespace(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
 
 def _make_dispatcher(*, dispatch_type, max_num_tokens, quant_config):
@@ -39,7 +53,7 @@ def _make_dispatcher(*, dispatch_type, max_num_tokens, quant_config):
     dispatcher.invalid_token_expert_id = 8
     dispatcher.payload_in_workspace = False
     dispatcher.quant_config = quant_config
-    dispatcher.moe_a2a = _RecordingMoeAlltoAll()
+    dispatcher.moe_a2a = _RecordingCommunication()
     dispatcher.decode_a2a_namespace = _WorkspaceNamespace.DECODE
     dispatcher.sp_prefill_moe_a2a = None
     return dispatcher
@@ -78,16 +92,22 @@ class TestFlashinferDispatcher(CustomTestCase):
             topk_output=topk_output,
         )
 
+        moe_a2a = dispatcher.moe_a2a
         self.assertEqual(
-            [payload.dtype for payload in dispatcher.moe_a2a.payloads],
+            [
+                moe_a2a.hidden_states.dtype,
+                moe_a2a.hidden_states_scale.dtype,
+                moe_a2a.topk_ids.dtype,
+                moe_a2a.topk_weights.dtype,
+            ],
             [torch.float8_e4m3fn, torch.uint8, torch.int32, torch.float32],
         )
         self.assertEqual(output.hidden_states.dtype, torch.float8_e4m3fn)
         self.assertEqual(output.hidden_states_scale.dtype, torch.uint8)
 
     def test_int64_expert_ids_reach_moe_a2a_as_int32(self):
-        """Expert IDs reach MoeAlltoAll as int32 even when routing emits int64,
-        as static EP dispatch does; MoeAlltoAll rejects any other dtype."""
+        """Expert IDs reach the A2A as int32 even when routing emits int64,
+        as static EP dispatch does; FlashInfer's kernel rejects any other dtype."""
         dispatcher = _make_dispatcher(
             dispatch_type=FlashinferA2ADispatchType.BF16,
             max_num_tokens=4,
@@ -107,16 +127,11 @@ class TestFlashinferDispatcher(CustomTestCase):
         )
 
         moe_a2a = dispatcher.moe_a2a
-        self.assertEqual(moe_a2a.token_selected_experts.dtype, torch.int32)
-        self.assertEqual(
-            moe_a2a.payloads[moe_a2a.expert_id_payload_index].dtype, torch.int32
-        )
-        self.assertTrue(
-            torch.equal(moe_a2a.token_selected_experts, topk_ids.to(torch.int32))
-        )
+        self.assertEqual(moe_a2a.topk_ids.dtype, torch.int32)
+        self.assertTrue(torch.equal(moe_a2a.topk_ids, topk_ids.to(torch.int32)))
 
     def test_bypassed_topk_is_routed_before_moe_a2a(self):
-        """Runners that fuse routing hand over bypassed top-k; MoeAlltoAll still
+        """Runners that fuse routing hand over bypassed top-k; the A2A still
         needs explicit expert IDs and weights, so routing must run first."""
         dispatcher = _make_dispatcher(
             dispatch_type=FlashinferA2ADispatchType.BF16,
@@ -150,13 +165,12 @@ class TestFlashinferDispatcher(CustomTestCase):
         )
 
         moe_a2a = dispatcher.moe_a2a
-        expert_ids = moe_a2a.token_selected_experts
+        expert_ids = moe_a2a.topk_ids
         self.assertEqual(expert_ids.dtype, torch.int32)
         self.assertEqual(
             expert_ids.sort(dim=-1).values.tolist(), [[0, 1], [2, 3], [1, 3]]
         )
-        topk_weights = moe_a2a.payloads[moe_a2a.expert_id_payload_index + 1]
-        self.assertEqual(topk_weights.shape, (3, 2))
+        self.assertEqual(moe_a2a.topk_weights.shape, (3, 2))
 
 
 class TestFlashinferRunnerDispatchFormats(CustomTestCase):
