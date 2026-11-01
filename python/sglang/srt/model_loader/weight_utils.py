@@ -6,6 +6,7 @@
 
 import collections
 import concurrent.futures
+import contextlib
 import fnmatch
 import glob
 import hashlib
@@ -1244,9 +1245,42 @@ def instanttensor_weights_iterator(
         if load_group is not None and load_group.world_size > 1
         else None
     )
+    # InstantTensor all-gathers over the group's NCCL communicator. Nothing else uses
+    # the world device group's communicator, so the first collective would create it
+    # just for loading, and its buffers (0.5-2 GB per GPU; more with NVLS) would stay
+    # resident and shrink the KV cache. Load over a temporary communicator instead and
+    # destroy it afterwards. new_group must be called by every rank, so only do this
+    # when loading over the world group (the default).
+    load_comm_group = None
+    if process_group is not None and load_group is get_parallel().world_group:
+        load_comm_group = torch.distributed.new_group(backend="nccl")
+        process_group = load_comm_group
 
+    try:
+        yield from _instanttensor_tensors(
+            instanttensor, hf_weights_files, kwargs, process_group, distributed
+        )
+    finally:
+        if load_comm_group is not None:
+            torch.cuda.current_stream().synchronize()
+            torch.distributed.destroy_process_group(load_comm_group)
+
+
+def _instanttensor_tensors(
+    instanttensor, hf_weights_files, kwargs, process_group, distributed
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
     device = current_platform.get_device(torch.cuda.current_device())
     enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    # With copy=True every tensor is cloned, unsharded, out of InstantTensor's ring
+    # buffer. Allocate the clones from a private pool. In the shared allocator cache,
+    # long-lived allocations made while or after loading (e.g. post_load_weights'
+    # w_kc/w_vc) are carved out of the freed clones, pinning segments as large as the
+    # largest tensor (~1.8 GB for GLM-5's embedding) that empty_cache cannot return.
+    pool = (
+        torch.cuda.MemPool()
+        if hasattr(torch.cuda, "use_mem_pool") and torch.cuda.is_available()
+        else None
+    )
     with instanttensor.safe_open(
         hf_weights_files,
         framework="pt",
@@ -1255,15 +1289,29 @@ def instanttensor_weights_iterator(
         copy=True,
         **kwargs,
     ) as f:
-        yield from tqdm(
-            f.tensors(),
-            total=len(f.keys()),
-            desc="Loading safetensors using InstantTensor",
-            disable=not enable_tqdm,
-            mininterval=1,
-            bar_format=BAR_FORMAT,
-            position=tqdm._get_free_pos(),
+        tensors = iter(
+            tqdm(
+                f.tensors(),
+                total=len(f.keys()),
+                desc="Loading safetensors using InstantTensor",
+                disable=not enable_tqdm,
+                mininterval=1,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+            )
         )
+        while True:
+            # Route only InstantTensor's allocations to the pool, not the consumer's.
+            with (
+                torch.cuda.use_mem_pool(pool)
+                if pool is not None
+                else contextlib.nullcontext()
+            ):
+                item = next(tensors, None)
+            if item is None:
+                return
+            yield item
+            del item
 
 
 def fastsafetensors_weights_iterator(
