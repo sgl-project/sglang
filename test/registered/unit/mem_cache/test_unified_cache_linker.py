@@ -14,6 +14,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -30,6 +31,8 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import UMBPDirectLinker
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     UpdatePendingBackupOnNodeSplit,
 )
@@ -728,6 +731,104 @@ class TestUnifiedCacheLinkerPythonBackend(
             )
             self.assertEqual(unpublished.device_prefix_len, 3)
         consumer.sanity_check()
+
+    def test_sub_window_tail_reuses_device_head_and_rematches_after_eviction(self):
+        """A remote short tail needs its local SWA head, even when FULL survives.
+
+        Store only the continuation, as a decode writer can do when prefill
+        owns the prompt. A fresh admission match must stop reusing that tail
+        after SWA eviction, although the FULL prefix is still resident.
+        """
+        self.cfg = CacheConfig(
+            page_size=2,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=8,
+            kv_size=64,
+            max_context_len=64,
+        )
+        tokens = list(range(1, 13))
+        prefix = tokens[:8]
+        for evict_head in (False, True):
+            with self.subTest(evict_head=evict_head):
+                cache, allocator, req_pool = build_fixture(self.cfg)
+                backend = _InMemoryUnifiedCacheLinker()
+                cache.init_cache_linker(backend)
+                cache.write_through_threshold = sys.maxsize
+                inserted = self._insert(cache, allocator, req_pool, prefix)
+                anchor = inserted.last_device_node
+                head = cache.path_device_indices(anchor).clone()
+                head_swa = (
+                    allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(head).clone()
+                )
+                req = self._make_req(req_pool)
+                key = RadixKey(array("q", tokens))
+                params = MatchPrefixParams(key=key, req=req)
+
+                # First obtain the real chained hashes; publish only the tail.
+                miss = cache.match_prefix(params)
+                self.assertEqual(miss.device_prefix_len, len(prefix))
+                self.assertEqual(miss.host_hit_length, 0)
+                for transfer in backend.lookup_calls[-1][1]:
+                    backend.stored_keys[transfer.name].update(transfer.keys)
+                matched = cache.match_prefix(params)
+                self.assertEqual(matched.device_prefix_len, 8)
+                self.assertEqual(matched.host_hit_length, 4)
+                self.assertEqual(matched.swa_host_hit_length, 4)
+
+                if evict_head:
+                    cache.tree_core.inc_full_pin(anchor)
+                    try:
+                        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=8))
+                    finally:
+                        cache.tree_core.dec_full_pin(anchor)
+                    full_len, _, _ = cache.tree_core.match_full_device_prefix(key)
+                    self.assertEqual(full_len, 8)
+                    # Admission re-matches instead of trusting an earlier hit.
+                    rematched = cache.match_prefix(params)
+                    self.assertEqual(rematched.device_prefix_len, 0)
+                    self.assertEqual(rematched.host_hit_length, 0)
+                    cache.sanity_check()
+                    continue
+
+                self._apply_match_to_req(req, matched)
+                # Match and load run in one scheduler pass; the adder locks the
+                # device prefix before load allocations can evict other nodes.
+                prefix_lock = cache.lock(anchor)
+                try:
+                    loaded_len, _ = cache.init_load_back(
+                        InitLoadBackParams(
+                            best_match_node=matched.best_match_node,
+                            host_hit_length=matched.host_hit_length,
+                            req=req,
+                        )
+                    )
+                finally:
+                    cache.unlock(prefix_lock)
+                self.assertEqual(loaded_len, 4)
+                loaded = cache.linker.private_load_indices[req.rid]
+                transfers = {t.name: t for t in backend.queued_loads[req.rid]}
+                self.assertEqual(len(transfers[PoolName.SWA].keys), 2)
+                self.assertTrue(
+                    torch.equal(
+                        allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(head),
+                        head_swa,
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(loaded),
+                        transfers[PoolName.SWA].device_indices,
+                    )
+                )
+                self.assertGreaterEqual(cache.ready_to_load_host_cache(), 0)
+                self._bind_loaded_request(cache, req_pool, req, tokens, loaded)
+                self.assertEqual(cache.finish_external_linker_loads([req]), [])
+                cache.checkpoint(req, up_to=req.extend_end)
+                cache.unlock(req.lock)
+                req.lock = None
+                final = cache.match_prefix(MatchPrefixParams(key=key))
+                self.assertEqual(final.device_prefix_len, len(tokens))
+                cache.sanity_check()
 
     def _mamba_linker_consumer(self, tokens):
         self.cfg = CacheConfig(
@@ -1634,6 +1735,63 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+class TestSubWindowLinkerLookup(CustomTestCase):
+    def test_short_tail_and_shortened_hit_use_tail_relative_windows(self):
+        """The device owns the head; a shorter remote hit needs only its tail.
+
+        Query both a short continuation and a longer span whose stored prefix
+        stops inside one SWA window. Missing SWA at that stop must reject it,
+        while missing pages beyond it must not discard the shorter hit.
+        """
+        swa = SWAComponent.__new__(SWAComponent)
+        swa.cache = SimpleNamespace(page_size=128)
+        swa.sliding_window_size = 512
+        for requested_pages in (2, 6):
+            for missing_swa in (False, True):
+                with self.subTest(
+                    requested_pages=requested_pages, missing_swa=missing_swa
+                ):
+                    keys = [f"tail-{i}" for i in range(requested_pages)]
+                    transfer = swa.build_external_linker_transfer(
+                        LinkerTransferPhase.LOOKUP, None, keys
+                    )
+                    present = [True, not missing_swa] + [False] * (requested_pages - 2)
+                    # Replace storage existence I/O; use the real hit policy.
+                    store = MooncakeStore.__new__(MooncakeStore)
+                    store.mem_pool_host = SimpleNamespace(kv_buffer=object())
+                    store.batch_exists = lambda keys, extra_info: 2
+                    store._get_hybrid_page_component_keys = lambda keys, t: (
+                        list(keys),
+                        1,
+                    )
+                    store._tag_keys = lambda keys: keys
+                    store._batch_exist = lambda keys: [int(p) for p in present]
+                    expected = [1] if missing_swa else [1, 2]
+                    self.assertEqual(
+                        store.batch_exists_v2(keys, [transfer]).restorable_prefix_pages,
+                        expected,
+                    )
+                    self.assertEqual(
+                        UMBPDirectLinker._apply_hit_policy([1, 2], present, transfer),
+                        expected,
+                    )
+                    # LOAD must rebuild keys at the chosen endpoint rather
+                    # than reuse LOOKUP's window at the end of a longer query.
+                    hit_keys = keys[: expected[-1]]
+                    swa.storage_and_sub_pool = lambda: (
+                        SimpleNamespace(
+                            available_units=lambda pool: 1024,
+                            take_units=lambda pool, n: torch.arange(n),
+                        ),
+                        object(),
+                    )
+                    loaded = swa.build_external_linker_transfer(
+                        LinkerTransferPhase.LOAD, None, hit_keys
+                    )
+                    self.assertEqual(loaded.keys, hit_keys)
+                    self.assertEqual(len(loaded.device_indices), len(hit_keys) * 128)
 
 
 class TestTransferReadyEvents(CustomTestCase):
