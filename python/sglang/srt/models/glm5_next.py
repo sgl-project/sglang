@@ -119,7 +119,6 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_mm,
     get_parallel,
-    get_schedule,
     get_spec,
     linear_attn_parallel_group,
     linear_attn_tp_size,
@@ -1951,10 +1950,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             or not self.config.mhc
             or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
         ):
-            return
-        # prewarm_mhc_pre gets its token counts from chunked_prefill_size.
-        chunked_prefill_size = get_schedule().chunked_prefill_size
-        if chunked_prefill_size is None or chunked_prefill_size <= 0:
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, Glm5NextDecoderLayer)),
