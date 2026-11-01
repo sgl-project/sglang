@@ -376,6 +376,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        runner_backend=None,
     ):
         if not use_deepep:
             raise ImportError(
@@ -388,6 +389,7 @@ class _DeepEPDispatcherImplBase:
                 )
             ) from _deepep_import_error
 
+        self.runner_backend = runner_backend
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -762,7 +764,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        if not (_is_npu and not _use_zbal):
+            # GPU DeepEP requires int64 expert ids. The NPU LL dispatch /
+            # combine kernels validate DT_INT32 natively, and their strategy
+            # layer already calls .int() — npu_moe_gating_top_k emits int32
+            # ids, so keep them as-is and skip the int32→int64→int32
+            # round-trip casts (3 aclnnInplaceCopy_Cast kernels per layer).
+            topk_ids = topk_ids.to(torch.int64)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
@@ -991,12 +999,14 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        runner_backend=None,
     ):
         super().__init__()
 
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
+            runner_backend=runner_backend,
             group=group,
             router_topk=router_topk,
             permute_fusion=permute_fusion,
