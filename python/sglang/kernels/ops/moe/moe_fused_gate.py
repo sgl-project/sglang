@@ -1,24 +1,15 @@
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.jit.utils import (
-    cache_once,
-    get_jit_cuda_arch,
-    is_arch_support_pdl,
-    load_jit,
-)
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
 
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
@@ -27,69 +18,81 @@ _SCORING_FUNC_MAP = {
 }
 
 
-@cache_once
-def _jit_moe_fused_gate_module() -> Module:
-    return load_jit(
-        "moe_fused_gate",
-        cuda_files=["moe/moe_fused_gate.cuh"],
-        cuda_wrappers=[("moe_fused_gate", "MoEFusedGateKernel::run")],
-    )
+@triton.jit
+def _sm120_router_top22_kernel(
+    scores_ptr,
+    bias_ptr,
+    weights_ptr,
+    ids_ptr,
+    stride_sm,
+    stride_sn,
+    scale,
+    RENORMALIZE: tl.constexpr,
+    APPLY_SCALE: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n = tl.arange(0, 512)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    scores = tl.load(scores_ptr + row * stride_sm + n * stride_sn).to(tl.float32)
+    bias = tl.load(bias_ptr + n).to(tl.float32)
+    activated = tl.sigmoid(scores)
+    biased = activated + bias
+    biased = tl.where(biased == biased, biased, -1e30)
+    biased = tl.where(biased == 0.0, 0.0, biased)
+    bits = biased.to(tl.uint32, bitcast=True)
+    ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    keys = (ordered.to(tl.uint64) << 32) | (0xFFFFFFFF - n.to(tl.uint32)).to(tl.uint64)
+    winners = tl.topk(keys, 32)
+    ids = (0xFFFFFFFF - (winners & 0xFFFFFFFF).to(tl.uint32)).to(tl.int32)
+    k = tl.arange(0, 32)
+    values = tl.gather(activated, ids, axis=0)
+    values = tl.where(k < 22, values, 0.0)
+    total = tl.sum(values, 0)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    if RENORMALIZE:
+        values = values / tl.where(total > 0.0, total, 1.0)
+    if APPLY_SCALE:
+        values = values * scale
+    tl.store(weights_ptr + row * 22 + k, values, k < 22)
+    tl.store(ids_ptr + row * 22 + k, ids, k < 22)
 
 
-@cache_once
-def can_use_moe_fused_gate() -> bool:
-    logger = logging.getLogger(__name__)
-    try:
-        _jit_moe_fused_gate_module()
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT MoE fused gate kernel: {e}")
-        return False
-
-
-def moe_fused_gate_jit(
-    input: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    scoring_func: str = "sigmoid",
-    num_fused_shared_experts: int = 0,
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    apply_routed_scaling_factor_on_output: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert scoring_func_int is not None, (
-        f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
-    )
-
-    assert input.dtype == torch.float32, "input must be float32"
-    assert bias.dtype == torch.float32, "bias must be float32"
-    assert input.ndim == 2, "input must be 2D"
-    assert bias.ndim == 1, "bias must be 1D"
-    assert input.size(1) == bias.size(0), "input and bias must have same num_experts"
-    assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
-
-    num_rows, _ = input.shape
-    device = input.device
-
-    output = torch.empty(num_rows, topk, dtype=torch.float32, device=device)
-    indices = torch.empty(num_rows, topk, dtype=torch.int32, device=device)
-
-    module = _jit_moe_fused_gate_module()
-    module.moe_fused_gate(
-        input,
+def _topk_gate_small_m(
+    scores,
+    bias,
+    topk=22,
+    renormalize=True,
+    routed_scaling_factor=1.0,
+    apply_routed_scaling_factor_on_output=False,
+):
+    assert scores.is_cuda and bias.device == scores.device
+    assert scores.ndim == 2 and scores.shape[1] == 512
+    assert scores.dtype == torch.float32
+    assert 1 <= scores.shape[0] <= 16
+    assert bias.shape == (512,) and bias.dtype == torch.float32 and bias.is_contiguous()
+    assert topk == 22
+    m = scores.shape[0]
+    weights = torch.empty((m, 22), device=scores.device, dtype=torch.float32)
+    ids = torch.empty((m, 22), device=scores.device, dtype=torch.int32)
+    pdl = is_arch_support_pdl()
+    _sm120_router_top22_kernel[(m,)](
+        scores,
         bias,
-        output,
-        indices,
-        topk,
-        scoring_func_int,
-        num_fused_shared_experts,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
+        weights,
+        ids,
+        scores.stride(0),
+        scores.stride(1),
+        float(routed_scaling_factor),
+        RENORMALIZE=bool(renormalize),
+        APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
+        USE_PDL=pdl,
+        num_warps=1,
+        **({"launch_pdl": True} if pdl else {}),
     )
-
-    return output, indices
+    return weights, ids
 
 
 @triton.jit
@@ -127,6 +130,7 @@ def _router_triton_kernel(
     HAS_PACKED: tl.constexpr,
     RENORMALIZE_EPSILON: tl.constexpr,
     USE_PDL: tl.constexpr,
+    SCORES_SPLIT_K: tl.constexpr,  # > 1: scores are split-K partials, summed in order
     stride_bias,
     stride_bias_alt,
     stride_input_ids,
@@ -138,6 +142,7 @@ def _router_triton_kernel(
     stride_ik,
     stride_pm,
     stride_pk,
+    stride_split,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -181,9 +186,16 @@ def _router_triton_kernel(
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = live_m[:, None] & mask_n[None, :]
-    scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
-        tl.float32
-    )  # [BLOCK_M, BLOCK_N]
+    if SCORES_SPLIT_K == 1:
+        scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
+            tl.float32
+        )  # [BLOCK_M, BLOCK_N]
+    else:
+        scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for split in tl.static_range(SCORES_SPLIT_K):
+            scores += tl.load(
+                row_ptr + split * stride_split, mask=mask2d, other=0.0
+            ).to(tl.float32)
 
     if SCORING_FUNC == 0:
         # sigmoid(x) = 1 / (1 + exp(-x)); bias is for ranking only, weight is bias-free.
@@ -279,15 +291,6 @@ def _router_triton_kernel(
         :, None
     ]  # [BLOCK_M, 1]
 
-    # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
-    # id = num_experts + (slot - K_ROUTED).
-    if K_ROUTED < K:
-        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
-        shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
-        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
-        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
-        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
-
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -299,6 +302,13 @@ def _router_triton_kernel(
         selected_vals = selected_vals / norm
     if APPLY_SCALE:
         selected_vals = selected_vals * routed_scaling_factor
+    if K_ROUTED < K:
+        # The shared expert's contribution is independent of routed normalization.
+        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
+        shared_weight = 1.0 if APPLY_SCALE else 1.0 / routed_scaling_factor
+        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]
+        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
+        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
     if HAS_PADDING:
         selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
         selected_idx = tl.where(live_m[:, None], selected_idx, -1)
@@ -357,11 +367,10 @@ def moe_fused_gate(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    Mirrors :func:`moe_fused_gate_jit` (the CUDA JIT kernel) for the shared
-    parameters; the keyword-only extras are Triton-only.
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
-    within). ``scores`` contains raw GEMM logits.
+    within). ``scores`` contains raw GEMM logits, ``[M, N]``, or their fp32 split-K
+    partials ``[S, M, N]``, which the kernel sums over S in order first.
 
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
@@ -379,7 +388,12 @@ def moe_fused_gate(
         torch.float16,
         torch.bfloat16,
     ), "scores must be float32/float16/bfloat16"
-    assert scores.ndim == 2, "scores must be 2D"
+    split_k, stride_split = 1, 0
+    if scores.ndim == 3:
+        assert scores.dtype == torch.float32, "split-K partials must be float32"
+        split_k, stride_split = scores.shape[0], scores.stride(0)
+        scores = scores[0]
+    assert scores.ndim == 2, "scores must be 2D, or 3D split-K partials"
     if bias is None:
         assert scoring_func.lower() == "softmax", (
             "bias is required for non-softmax routing"
@@ -404,11 +418,47 @@ def moe_fused_gate(
         assert input_ids.shape == (scores.size(0),)
     if packed_out is not None:
         assert packed_out.dtype == torch.int32, "packed_out must be int32"
-        assert packed_out.shape == (scores.size(0), topk), (
-            "packed_out must be [M, topk]"
-        )
+        assert packed_out.shape == (
+            scores.size(0),
+            topk,
+        ), "packed_out must be [M, topk]"
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
+
+    from sglang.srt.environ import envs
+
+    # The fast paths below read one 2-D score tensor, not split-K partials.
+    if (
+        split_k == 1
+        and envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
+        and scores.is_cuda
+        and torch.cuda.get_device_capability(scores.device) == (12, 0)
+        and 2 <= scores.shape[0] <= 16
+        and scores.shape[1] == 512
+        and scores.dtype == torch.float32
+        and scores.stride(1) == 1
+        and bias is not None
+        and bias.dtype == torch.float32
+        and bias.is_contiguous()
+        and topk == 22
+        and scoring_func.lower() == "sigmoid"
+        and num_fused_shared_experts == 0
+        and num_expert_group <= 1
+        and moe_softcapping == 0.0
+        and input_ids is None
+        and num_token_non_padded is None
+        and renormalize_epsilon == 0.0
+        and packed_out is None
+        and not sqrtsoftplus_log1p
+    ):
+        return _topk_gate_small_m(
+            scores,
+            bias,
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
 
     # K3 radix-select fast path: native-CUDA radix-select replaces the 16
     # dependent argmax rounds (single CTA per token; ids bit-identical to this
@@ -418,7 +468,8 @@ def moe_fused_gate(
     # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
     # kernel at [1..8192, 896] top-16 on B200.
     if (
-        scoring_func.lower() == "sigmoid"
+        split_k == 1
+        and scoring_func.lower() == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
@@ -510,6 +561,7 @@ def moe_fused_gate(
         HAS_PACKED=packed_out is not None,
         RENORMALIZE_EPSILON=renormalize_epsilon,
         USE_PDL=use_pdl,
+        SCORES_SPLIT_K=split_k,
         stride_bias=bias.stride(0) if bias is not None else 0,
         stride_bias_alt=bias_alt.stride(0) if bias_alt is not None else 0,
         stride_input_ids=input_ids.stride(0) if input_ids is not None else 0,
@@ -521,6 +573,7 @@ def moe_fused_gate(
         stride_ik=indices.stride(1),
         stride_pm=packed_out.stride(0) if packed_out is not None else 0,
         stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+        stride_split=stride_split,
         num_warps=num_warps,
         **extra,
     )

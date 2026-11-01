@@ -17,8 +17,14 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -256,6 +262,20 @@ class CudnnSDPAImpl(SDPAImpl):
         return nullcontext()
 
 
+# B300/sm_103 self-attention at head_dim 128 from this many tokens runs faster on
+# FA4 (hardware exp2) than on cuDNN under a sustained, power-capped load: 1.5-2%
+# from 16K to 75.6K tokens; at 8K and below the two are even
+_SM103_FA4_MIN_SELF_ATTN_TOKENS = 16384
+
+
+def _prefers_fa4_on_sm103(query: torch.Tensor, key: torch.Tensor) -> bool:
+    return (
+        query.shape[-1] == 128
+        and query.shape[1] == key.shape[1]
+        and query.shape[1] >= _SM103_FA4_MIN_SELF_ATTN_TOKENS
+    )
+
+
 class DynamicCudnnSDPABackend(SDPABackend):
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
@@ -284,9 +304,11 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
 
         self.causal = causal
         self.head_size = head_size
-        self._is_sm100 = (
-            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+        capability = (
+            torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         )
+        self._is_sm100 = capability is not None and capability[0] == 10
+        self._is_sm103 = capability == (10, 3)
         # Set once cuDNN SDPA raised for this layer; permanently pins the
         # fail-safe FA path so we do not retry a failing kernel every step.
         self._cudnn_failed = False
@@ -320,16 +342,42 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.dtype not in (torch.float16, torch.bfloat16):
             return False
-        if query.shape[2] != key.shape[2]:
+        # sm_10x keeps GQA on cuDNN; CudnnSDPAImpl passes enable_gqa.
+        if query.shape[2] != key.shape[2] and (
+            not self._is_sm100 or query.shape[2] % key.shape[2]
+        ):
+            return False
+        if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
             return False
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
             # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
-            return True
+            # FA4's faster sub-tile kernel pays off in captured segments, but
+            # its host dispatch loses to cuDNN in eager (including BCG breaks).
+            # Keep exact requests on the reference route: cuDNN and FA4 differ
+            # in rounding. The BCG scope includes warmup, priming FA4 for capture.
+            if not is_in_breakable_cuda_graph():
+                context = get_forward_context_or_none()
+                if context is not None and context.quality in ("lossless", "high"):
+                    return True
+            short_side, long_side = sorted((query.shape[1], key.shape[1]))
+            return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
+
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        if self._use_cudnn_sdpa(query, key, value):
+            return False
+        return self.fa_impl.forward_into(query, key, value, out, attn_metadata)
 
     def forward(
         self,

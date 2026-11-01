@@ -5,6 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
@@ -443,17 +444,16 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
-
-    def __init__(self, transformer, pipeline=None) -> None:
+    def __init__(
+        self, transformer, pipeline=None, stochastic_sampling: bool = False
+    ) -> None:
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
         )
+        # the release's few-step re-noising update (release metadata)
+        self.stochastic_sampling = stochastic_sampling
         self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
 
@@ -682,9 +682,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             or current_platform.is_mps()
             or current_platform.is_npu()
             or current_platform.is_xpu()
+            or current_platform.is_out_of_tree()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, "
+                "Ascend NPU, or an out-of-tree platform"
             )
 
         device = current_platform.get_local_torch_device()
@@ -783,6 +785,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            if model.final_layer._pdd_heads is not None:
+                initial_video, initial_audio = _scale_pdd_initial_noise(
+                    ctx, positive, initial_video, initial_audio
+                )
             rollout_ctx = None
             if getattr(batch, "rollout", False):
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
@@ -821,6 +827,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     collector=collector,
                 )
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
+            renoise_generator = None
+            if self.stochastic_sampling:
+                # The plan carries this output's own seed after output expansion
+                # (42 is latent preparation's default). A device generator keeps
+                # the stream independent of the CPU generators seeded with the
+                # same value for the initial and condition noise.
+                seed = 42 if ctx.plan.seed is None else int(ctx.plan.seed)
+                renoise_generator = torch.Generator(device=device).manual_seed(seed)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -831,6 +845,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ):
 
                 def on_step(_step, _video_rows, _audio_rows):
+                    self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
                         self.step_profile()
@@ -860,6 +875,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                     rollout_ctx=rollout_ctx,
+                    renoise_generator=renoise_generator,
                 )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
@@ -1054,30 +1070,31 @@ def _maybe_prepare_vsa_h3_step_metadata(
     latent_shape: tuple[int, int, int],
     server_args: ServerArgs,
     device: torch.device,
+    native_layout: bool = True,
 ) -> Callable[[int], Any] | None:
     """Per-step VSA-H3 metadata builder over the request-static packed layout,
-    or None off the VSA path."""
+    or None off the VSA path.
+
+    Ref2VA regions are read from the native packed layout's stream_layout;
+    ``native_layout=False`` marks a layout serialized by ComfyUI, whose
+    stream_layout does not tell reference images from reference videos."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend
         is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
     ):
         return None
-    if is_ref2va:
+    if is_ref2va and not native_layout:
         raise NotImplementedError(
-            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
-            "reference-block layout is not tiled yet. Use --attention-backend "
-            "fa for ref2va."
+            "VSA-H3 tiles Ref2VA references on SGLang's native packed layout; "
+            "a ComfyUI-serialized Ref2VA layout is not tiled. Use "
+            "--attention-backend fa for it."
         )
-
     config = server_args.attention_backend_config or {}
-    tile_size = int(config.get("vsa_tile_size", 64))
-    if tile_size != 64:
-        raise ValueError(
-            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
-            f"geometry; got vsa_tile_size={tile_size}."
-        )
-    default_sparsity = server_args.pipeline_config.vsa_sparsity
+    pipeline_config = server_args.pipeline_config
+    tile_size = int(config.get("vsa_tile_size", pipeline_config.vsa_tile_size))
+    ref_keep_rate = config.get("vsa_ref_keep_rate", pipeline_config.vsa_ref_keep_rate)
+    default_sparsity = pipeline_config.vsa_sparsity
     sparsity = float(
         config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
     )
@@ -1094,6 +1111,9 @@ def _maybe_prepare_vsa_h3_step_metadata(
     cond_rows = int(packed["img_pos"].numel()) - video_rows
     audio_rows = int(packed["audio_pos"].numel())
     patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+    packed_segments = (
+        _ref2va_vsa_segments(packed, latent_shape, patch_size) if is_ref2va else None
+    )
 
     from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
         VideoSparseAttentionH3MetadataBuilder,
@@ -1112,9 +1132,42 @@ def _maybe_prepare_vsa_h3_step_metadata(
             exempt=mode == "exempt",
             dense_layers=dense_layers,
             dense_first_n_steps=dense_first_n_steps,
+            packed_segments=packed_segments,
+            tile_size=tile_size,
+            ref_keep_rate=None if ref_keep_rate is None else float(ref_keep_rate),
         )
 
     return build
+
+
+def _ref2va_vsa_segments(
+    packed: Mapping[str, Any],
+    latent_shape: tuple[int, int, int],
+    patch_size: tuple[int, int, int],
+) -> tuple[int | tuple[int, int, int], ...]:
+    """Ref2VA packed order as VSA-H3 segments: text, keyframes, then each
+    reference (images and audio dense, videos as their own token-grid
+    regions), target audio, and the generated video's token grid last."""
+    layout = packed["stream_layout"]
+    shapes = layout["cond_image_shapes"]
+    roles = layout["cond_image_roles"]
+    audio_lens = layout["cond_audio_stream_lens"]
+    reference_visual_rows = sum(math.prod(shape) for shape in shapes)
+    cond_rows = int(packed["img_pos"].numel()) - int(packed["update_mask"].sum())
+    segments: list[int | tuple[int, int, int]] = [
+        int(packed["text_pos"].numel()),
+        cond_rows - reference_visual_rows,
+    ]
+    for kind, index in layout["cond_event_orders"]:
+        if kind == "audio":
+            segments.append(int(audio_lens[index]))
+        elif roles[index] == "independent_cube":
+            segments.append(tuple(int(v) for v in shapes[index]))
+        else:
+            segments.append(math.prod(shapes[index]))
+    segments.append(int(packed["audio_pos"].numel()) - sum(audio_lens))
+    segments.append(tuple(int(n) // int(p) for n, p in zip(latent_shape, patch_size)))
+    return tuple(segments)
 
 
 def _build_packed_layout(
@@ -1269,6 +1322,22 @@ def _expand_initial_rows(
         )
         full_audio[positive.audio_update_mask] = initial_audio
         initial_audio = full_audio
+    return initial_video, initial_audio
+
+
+def _scale_pdd_initial_noise(
+    ctx: _FullLoopContext,
+    positive: Any,
+    initial_video: torch.Tensor,
+    initial_audio: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Start PDD targets at the first node's noise level, as the students are
+    trained (``sigma_0 * eps``); condition rows stay as they are. A no-op on
+    grids that start at sigma 1."""
+    initial_video = initial_video.clone()
+    initial_audio = initial_audio.clone()
+    initial_video[positive.video_target_slice] *= float(ctx.sigmas["video"][0])
+    initial_audio[positive.audio_target_slice] *= float(ctx.sigmas["audio"][0])
     return initial_video, initial_audio
 
 

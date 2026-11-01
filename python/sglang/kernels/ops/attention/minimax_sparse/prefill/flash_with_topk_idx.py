@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import triton
@@ -8,6 +8,8 @@ import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported
 
+from ..common.nvfp4 import Nvfp4Cache
+from ..common.tile_ptr import tile_ptrs_2d
 from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
@@ -151,24 +153,31 @@ def _flash_attn_fwd_with_block_score_kernel(
         return
     block_num = (seq_len + block_size - 1) // block_size
     # init qkv pointer
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, qk_head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
-        order=(1, 0),
+    q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+        q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        q_len,
+        qk_head_dim,
+        stride_q_n,
+        stride_q_d,
+        pid_q * BLOCK_SIZE_Q,
+        0,
+        BLOCK_SIZE_Q,
+        BLOCK_SIZE_KD,
     )
-    s_ptrs = tl.make_block_ptr(
-        base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
-        shape=(q_len, block_num),
-        strides=(stride_s_q, stride_s_k),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
-        order=(1, 0),
+    s_ptrs_col = 0
+    s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+        score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
+        q_len,
+        block_num,
+        stride_s_q,
+        stride_s_k,
+        pid_q * BLOCK_SIZE_Q,
+        s_ptrs_col,
+        BLOCK_SIZE_Q,
+        BLOCKS_PER_K_BLOCK,
     )
     # load q
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
     if HAS_SINK:
         off_d = tl.arange(0, BLOCK_SIZE_KD)
         sink = tl.load(
@@ -257,7 +266,7 @@ def _flash_attn_fwd_with_block_score_kernel(
             noise = tl.clamp(noise, min=1e-9, max=1 - 1e-9)  # avoid log(0)
             noise = -tl.log(-tl.log(noise)) * 1.4426950409
             score += noise
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), mask=s_ptrs_mask)
         if not DISABLE_INDEX_VALUE:
             # compute m_ij and l_ij
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -285,20 +294,34 @@ def _flash_attn_fwd_with_block_score_kernel(
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        s_ptrs_col = s_ptrs_col + BLOCKS_PER_K_BLOCK
+        s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+            score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
+            q_len,
+            block_num,
+            stride_s_q,
+            stride_s_k,
+            pid_q * BLOCK_SIZE_Q,
+            s_ptrs_col,
+            BLOCK_SIZE_Q,
+            BLOCKS_PER_K_BLOCK,
+        )
     if not DISABLE_INDEX_VALUE:
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + seq_start * stride_o_n + pid_h * stride_o_h,
-            shape=(q_len, v_head_dim),
-            strides=(stride_o_n, stride_o_d),
-            offsets=(pid_q * BLOCK_SIZE_Q, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_VD),
-            order=(1, 0),
+        o_ptrs, o_ptrs_mask = tile_ptrs_2d(
+            o_ptr + seq_start * stride_o_n + pid_h * stride_o_h,
+            q_len,
+            v_head_dim,
+            stride_o_n,
+            stride_o_d,
+            pid_q * BLOCK_SIZE_Q,
+            0,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_VD,
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_ptrs_mask)
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
@@ -507,15 +530,18 @@ def _index_block_score_only_kernel(
         return
     sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
 
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, qk_head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
-        order=(1, 0),
+    q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+        q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        q_len,
+        qk_head_dim,
+        stride_q_n,
+        stride_q_d,
+        pid_q * BLOCK_SIZE_Q,
+        0,
+        BLOCK_SIZE_Q,
+        BLOCK_SIZE_KD,
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
     off_k = tl.arange(0, block_size)
@@ -580,10 +606,43 @@ def _index_block_score_only_kernel(
         tl.store(s_ptrs, score, mask=q_store_mask)
 
 
+def _use_fused_index_topk(
+    q: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    *,
+    disable_index_value: bool,
+    score_type: str,
+    sink: Optional[torch.Tensor],
+    q_scale: Optional[float],
+    k_scale: float,
+    topk: int,
+    local_blocks: int,
+    page_size: int,
+    block_size_q: int,
+    block_size_k: int,
+) -> bool:
+    # Scale-free max scores: a positive sm_scale cannot change which blocks win.
+    if not (
+        is_gfx95_supported()
+        and disable_index_value
+        and score_type == "max"
+        and sink is None
+        and q_scale in (None, 1.0)
+        and k_scale == 1.0
+        and block_size_q == 1
+    ):
+        return False
+    try:
+        from .index_topk_gfx950 import can_fuse_index_topk
+    except ImportError:  # Gluon without the CDNA4 MFMA op
+        return False
+    return can_fuse_index_topk(q, k_cache, topk, local_blocks, page_size, block_size_k)
+
+
 @torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
-    k_cache: torch.Tensor,  # paged
+    k_cache: Union[torch.Tensor, Nvfp4Cache],  # paged
     v_cache: Optional[torch.Tensor],  # paged; ignored when disable_index_value=True
     sink: Optional[torch.Tensor],
     req_to_token: torch.Tensor,
@@ -615,16 +674,28 @@ def flash_prefill_with_topk_index(
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
     triton.set_allocator(robust_allocator)
-    # dtype check (v_cache is None under disable_index_value)
-    is_fp8 = check_sparse_kv_fp8(
-        q, k_cache, None if disable_index_value else v_cache, label="prefill indexer"
-    )
+    is_nvfp4 = isinstance(k_cache, Nvfp4Cache)
+    if is_nvfp4:
+        assert disable_index_value and score_type == "max" and sink is None, (
+            "the NVFP4 index-K cache serves only the score-only max indexer "
+            "(no index V, no sink)"
+        )
+        is_fp8 = False
+        max_slots, num_kv_heads = 0, k_cache.num_heads
+    else:
+        # dtype check (v_cache is None under disable_index_value)
+        is_fp8 = check_sparse_kv_fp8(
+            q,
+            k_cache,
+            None if disable_index_value else v_cache,
+            label="prefill indexer",
+        )
+        max_slots, num_kv_heads, _ = k_cache.shape
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
     assert cu_seqlens.dtype == torch.int32
     # shape
     total_q, num_heads, qk_head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
     if disable_index_value:
         # placeholder for BLOCK_SIZE_VD; V is never loaded
         v_head_dim = qk_head_dim
@@ -650,6 +721,40 @@ def flash_prefill_with_topk_index(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k
         )
     max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
+    if _use_fused_index_topk(
+        q,
+        k_cache,
+        disable_index_value=disable_index_value,
+        score_type=score_type,
+        sink=sink,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        topk=topk,
+        local_blocks=local_blocks,
+        page_size=page_size,
+        block_size_q=block_size_q,
+        block_size_k=block_size_k,
+    ):
+        from .index_topk_gfx950 import fused_index_topk
+
+        return None, fused_index_topk(
+            q,
+            k_cache,
+            req_to_token,
+            slot_ids,
+            cu_seqlens,
+            prefix_lens,
+            max_seqlen_q,
+            max_seqlen_k,
+            topk,
+            init_blocks,
+            local_blocks,
+            block_size_k,
+        )
+    if is_nvfp4:
+        raise NotImplementedError(
+            "an NVFP4 index K is scored only by the fused gfx950 index top-k"
+        )
     if disable_index_value:
         o = None
     else:

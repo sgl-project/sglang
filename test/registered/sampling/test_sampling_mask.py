@@ -16,6 +16,7 @@ from sglang.srt.layers.sampler import Sampler, _SamplingMaskCapture
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
@@ -34,7 +35,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=221, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
@@ -56,6 +57,12 @@ _INVALID_SAMPLING_MASK_ERROR = (
 
 class TestSamplingMaskCapture(CustomTestCase):
     def setUp(self):
+        # The renorm policy (sampling_renorm.py) reads the published parallel /
+        # exec config on every call; the sampler's own get_exec is patched per
+        # test below for the sampling backend only.
+        override = get_context().override_server_args(tp_size=1)
+        override.install()
+        self.addCleanup(override.restore)
         self.sampler = Sampler.__new__(Sampler)
         torch.nn.Module.__init__(self.sampler)
         self.sampler.sampling_mask_max_tokens = 4096

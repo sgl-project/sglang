@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.utils import (
     log_debug_on_rank0,
+    round_up,
 )
 
 logger = logging.getLogger(__name__)
@@ -302,6 +303,17 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config, moe_intermediate_attr, intermediate_padding_size
         )
 
+    if model_config.hf_config.model_type == "muse_glimmer":
+        projector_hidden_size = model_config.hf_config.projector_hidden_size
+        padded_projector_hidden_size = projector_hidden_size
+        if projector_hidden_size % tp_size != 0:
+            padded_projector_hidden_size = round_up(projector_hidden_size, tp_size * 32)
+        update_config(
+            model_config.hf_config,
+            "padded_projector_hidden_size",
+            padded_projector_hidden_size,
+        )
+
     multimodal_config = [
         [
             model_config.hf_config,
@@ -316,6 +328,12 @@ def adjust_config_with_unaligned_cpu_tp(
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen4_exp", "num_heads"],
         [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "muse_glimmer_vision",
+            "num_attention_heads",
+        ],
         [
             model_config.hf_config,
             "vision_config",

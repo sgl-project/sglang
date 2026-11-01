@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 import unittest
@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
-from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    DisallowedTokensLogitsProcessor,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
@@ -857,6 +860,39 @@ class TestFromScheduleBatch(CustomTestCase):
         entry = left.custom_logit_processor[hash(processor_str)]
         self.assertEqual(entry.rows, [2])
         self.assertEqual(entry.indices.tolist(), [2])
+
+    def test_builtin_page_guard_reaches_logits_with_external_processors_disabled(self):
+        from array import array
+
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        req = self._make_req()
+        req.origin_input_ids = array("q", [7, 20])
+        req.output_ids = array("q", [7, 10, 11, 12, 13])
+        req.uocr_doc = None
+        req.page_guard_state = None
+        req.custom_logit_processor = UOCR_PAGE_GUARD_PROCESSOR
+        req.sampling_params.custom_params = dict(
+            __req__=req,
+            page_token_id=7,
+            eos_token_id=1,
+            max_page_tokens=3,
+        )
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertTrue(info.has_custom_logit_processor)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        apply_custom_logit_processor(logits, info)
+        self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
+        self.assertFalse(self._exec_ns.features.enable_custom_logit_processor)
+
+    def test_external_processor_still_requires_the_enable_flag(self):
+        req = self._make_req()
+        req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertIsNone(info.custom_logit_processor)
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
