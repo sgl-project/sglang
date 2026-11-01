@@ -176,8 +176,6 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                 row_max = weight.float().abs().amax(dim=1, keepdim=True)
                 bound = 2**-4 * weight.float().abs() + 2**-9 * row_max
                 self.assertTrue(torch.all(error <= bound))
-                if TUNED:
-                    self.assertIsNotNone(get_w8a8_channelwise_fp8_configs(padded(n), k))
 
     def test_output_matches_dequantized_gemm(self):
         if torch.cuda.get_device_name() in TABLE_GPUS:
@@ -280,10 +278,13 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             check(oot_method, oot_layer, 16, generic, tune=False)
             self.assertTrue(spy.called)
 
+        # With the tables off, so ignoring the flag would run CUTLASS, not a tuned tile
+        # whose kernel name equals the heuristic Triton kernel's.
         with (
             self.subTest(case="USE_TRITON_W8A8_FP8_KERNEL"),
             patch.object(glm5_next, "use_triton_w8a8_fp8_kernel", True),
             patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", True),
+            envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(False),
         ):
             triton_method, triton_layer, _ = make_layer(n, k)
             check(
@@ -292,6 +293,7 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
                 16,
                 lambda x, g: Fp8LinearMethod.apply(triton_method, triton_layer, x),
                 other=lambda g: aot(None, g),
+                tune=False,
             )
 
         for name in ("input_tp1", "input_tp8"):

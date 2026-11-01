@@ -409,20 +409,22 @@ class TestGlm5NextKdaFp8Switch(CustomTestCase):
             self.build(KDA_FP8_ALL_MODULES, MockFp8Config(("o_proj",)))
 
     def test_lora_is_rejected(self):
-        for enable_lora, paths in ((True, None), (False, ["adapter"])):
-            with (
-                self.subTest(enable_lora=enable_lora, paths=paths),
-                patch.object(
-                    glm5_next,
-                    "get_lora",
-                    return_value=SimpleNamespace(
-                        enable_lora=enable_lora, lora_paths=paths
-                    ),
-                ),
-            ):
-                with self.assertRaisesRegex(ValueError, "LoRA"):
-                    kda_fp8_modules("o_proj")
-                self.assertEqual(kda_fp8_modules(""), frozenset())
+        override = get_context().override_server_args(enable_lora=True)
+        override.install()
+        self.addCleanup(override.restore)
+        with self.assertRaisesRegex(ValueError, "LoRA"):
+            kda_fp8_modules("o_proj")
+        self.assertEqual(kda_fp8_modules(""), frozenset())
+        # As in _can_fuse_proj, adapter paths alone count as LoRA.
+        with (
+            patch.object(
+                glm5_next,
+                "get_lora",
+                return_value=SimpleNamespace(enable_lora=False, lora_paths=["adapter"]),
+            ),
+            self.assertRaisesRegex(ValueError, "LoRA"),
+        ):
+            kda_fp8_modules("o_proj")
 
     def test_fp8_scaled_mm_keeps_the_aot_kernel_below_8192_rows(self):
         # _apply_dynamic_per_token calls the AOT kernel directly below 8192 rows, where
