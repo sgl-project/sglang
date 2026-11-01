@@ -11,6 +11,7 @@ ForwardBatch to evaluate and so is not part of this predicate.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -36,6 +37,7 @@ def _attn(**overrides):
         dcp_size=1,
         kv_b_proj=SimpleNamespace(set_lora=False),
         _skip_rope_for_dsa_tilelang_fused=lambda: True,
+        _skip_rope_for_dsa_aiter_fused_prep=lambda: False,
     )
     for k, v in overrides.items():
         setattr(attn, k, v)
@@ -79,6 +81,83 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+
+    def test_aiter_uses_rope_cache_fusion_without_absorb_fusion(self):
+        backend = SimpleNamespace(
+            current_attention_backend="dsa",
+        )
+        backend._skip_rope_for_dsa_aiter_fused_prep = forward_mla_rocm.DeepseekMLARocmForwardMixin._skip_rope_for_dsa_aiter_fused_prep.__get__(
+            backend
+        )
+        saved = forward_mla_rocm.get_exec
+        forward_mla_rocm.get_exec = lambda: SimpleNamespace(
+            kernel=SimpleNamespace(dsa_decode_backend="aiter")
+        )
+        self.addCleanup(setattr, forward_mla_rocm, "get_exec", saved)
+
+        self.assertTrue(backend._skip_rope_for_dsa_aiter_fused_prep())
+        self.assertFalse(
+            _CAN_FUSE(
+                _attn(
+                    _skip_rope_for_dsa_tilelang_fused=lambda: False,
+                    _skip_rope_for_dsa_aiter_fused_prep=lambda: True,
+                )
+            )
+        )
+
+    def test_aiter_dsa_fused_prep_emits_fp8_q(self):
+        attn = SimpleNamespace(
+            kv_cache_dtype="fp8_e4m3",
+            current_attention_backend="dsa",
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale=torch.ones(())),
+            rotary_emb=SimpleNamespace(
+                cos_cache=object(),
+                sin_cache=object(),
+                is_neox_style=False,
+            ),
+        )
+        kv_pool = SimpleNamespace(get_key_buffer=Mock(return_value=torch.empty(1)))
+        fused_op = Mock(
+            return_value=(
+                torch.empty(1),
+                torch.empty(1),
+                torch.empty(1),
+                torch.empty(1),
+            )
+        )
+
+        with (
+            patch.object(
+                forward_mla_rocm,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    kernel=SimpleNamespace(dsa_decode_backend="aiter")
+                ),
+            ),
+            patch.object(
+                forward_mla_rocm,
+                "get_token_to_kv_pool",
+                return_value=kv_pool,
+            ),
+            patch.object(
+                forward_mla_rocm,
+                "fused_qk_rope_cat_and_cache_mla",
+                fused_op,
+            ),
+        ):
+            forward_mla_rocm._fused_rope_cat_and_cache(
+                attn,
+                q_nope_out=torch.empty(1, 16, 512, dtype=torch.bfloat16),
+                q_pe=torch.empty(1, 16, 64, dtype=torch.bfloat16),
+                k_nope=torch.empty(1, 512, dtype=torch.bfloat16),
+                k_pe=torch.empty(1, 64, dtype=torch.bfloat16),
+                positions=torch.zeros(1, dtype=torch.int64),
+                out_cache_loc=torch.zeros(1, dtype=torch.int32),
+            )
+
+        self.assertEqual(
+            fused_op.call_args.kwargs["q_out_dtype"], forward_mla_rocm.fp8_dtype
+        )
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
