@@ -958,11 +958,11 @@ class TestPackedDraftPairing(CustomTestCase):
                 packed_draft_device_pools=(partial,),
             )
 
-    def test_index_key_format_mismatch_is_rejected(self):
+    def test_index_key_layout_mismatch_is_rejected(self):
         target = _dsa_pool_stub(layer_num=2)
         wide = _dsa_pool_stub(layer_num=1)
         wide.index_head_dim = 256
-        with self.assertRaisesRegex(ValueError, "format"):
+        with self.assertRaisesRegex(ValueError, "layout"):
             prepare_host_pool_config(
                 root=target,
                 full_layer_mapping={i: i for i in range(target.layer_num)},
@@ -1249,7 +1249,7 @@ class TestHostPoolPreflight(CustomTestCase):
         # Same 132 bytes per row, different key/scale format.
         bad_index.index_head_dim = 132
         bad_index.quant_block_size = 256
-        for draft, error in ((bad_kv, "KV row"), (bad_index, "index key format")):
+        for draft, error in ((bad_kv, "KV row"), (bad_index, "index key layout")):
             with (
                 self.subTest(error=error),
                 patch.object(hybrid_pool_assembler, "build_kv_host_pool") as allocate,

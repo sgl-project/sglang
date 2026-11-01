@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.device_pool_info import IndexKeyFormat
+from sglang.srt.mem_cache.device_pool_info import IndexKeyLayout
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1611,7 +1611,7 @@ def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
 def _build_sidecar_host_pool(
     *, config: HostPoolConfig, root: Any, root_host_pool: Any
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
-    if config.buffer_info.key_format is IndexKeyFormat.KEY_ROWS:
+    if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
         return _build_key_rows_host_pool(config=config, root_host_pool=root_host_pool)
     host = DSAIndexerPoolHost(
         config.buffer_info,
@@ -1661,7 +1661,7 @@ def _kv_budget_index_bytes(config: HostPoolGroupConfig) -> int:
     return sum(
         buffer.nbytes
         for sidecar in config.sidecars
-        if sidecar.buffer_info.key_format is IndexKeyFormat.KEY_ROWS
+        if sidecar.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS
         for buffer in sidecar.buffer_info.buffers
     )
 

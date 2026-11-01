@@ -13,7 +13,7 @@ import msgspec
 from sglang.srt.mem_cache.device_pool_info import (
     DevicePoolInfo,
     IndexKeyBufferInfo,
-    IndexKeyFormat,
+    IndexKeyLayout,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 
@@ -146,16 +146,16 @@ def _prepare_sidecar(
         if (
             draft_buffers.page_size,
             draft_buffers.compress_ratio,
-            draft_buffers.key_format,
+            draft_buffers.key_layout,
             draft_buffers.kernel_page_bytes,
         ) != (
             buffers.page_size,
             buffers.compress_ratio,
-            buffers.key_format,
+            buffers.key_layout,
             buffers.kernel_page_bytes,
         ):
             raise ValueError(
-                f"{target.pool_name}: draft[{depth}] index key format differs from target"
+                f"{target.pool_name}: draft[{depth}] index key layout differs from target"
             )
         device_to_host[len(model_layer_ids) + depth] = len(packed_buffers)
         transfer_layers.add(len(model_layer_ids) + depth)
@@ -163,7 +163,7 @@ def _prepare_sidecar(
     packed = msgspec.structs.replace(buffers, buffers=tuple(packed_buffers))
     # The DSA indexer host copies kernel_page_bytes / page_size bytes per token.
     if (
-        packed.key_format is IndexKeyFormat.DSA_FP8
+        packed.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
         and packed.kernel_page_bytes % packed.page_size
     ):
         raise ValueError(
