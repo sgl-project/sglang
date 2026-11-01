@@ -1,0 +1,58 @@
+---
+title: "Shared multimodal preprocessing cache"
+description: "Reuse CPU image preprocessing across local tokenizer workers with a bounded, collision-checked artifact store."
+---
+
+Image preprocessing normally runs again in each tokenizer worker. The optional shared CPU artifact store lets compatible workers on one host reuse the same per-image preprocessing result. It reuses the existing media-artifact adapters; it does not cache prompt tokens, offsets, MRoPE positions, or vision embeddings.
+
+## Enable
+
+This example uses Linux, one NVIDIA CUDA GPU, one node and tensor parallelism 1. It requires a vision model supported by your SGLang installation and POSIX file locking. The public Hugging Face model ID is passed to `--model-path`; no access token is required for this model.
+
+```bash
+sglang serve --model-path Qwen/Qwen3-VL-2B-Instruct \
+  --tokenizer-worker-num 6 \
+  --image-processor-backend pil \
+  --mm-feature-transport cpu \
+  --mm-preprocess-cache-dir /dev/shm/sglang-mm-instance \
+  --mm-preprocess-cache-size-mb 3072
+```
+
+Use a private local POSIX directory for each serving instance. A tmpfs mount avoids disk I/O. Containers need an adequate `--shm-size` (for example, 8 GiB); separate containers share only if the same directory is explicitly mounted. Network filesystems are not supported. Without the directory option, existing per-worker caching behavior remains unchanged. The directory option requires an explicit positive size.
+
+The 3072 MiB budget is global across participating workers, not multiplied by or divided between them. All participants must use the same byte and entry budgets. CPU strided tensors are supported. Unsupported artifact values are returned to the current request without being retained; CUDA tensors are not implicitly copied by the store.
+
+## Identity and concurrency
+
+SHA-256 selects an index bucket. A cache hit also requires matching artifact type, exact source snapshot bytes (including decoded input type, shape, dtype and palette metadata where applicable), and the full processor/configuration description and per-image options. Caller-provided content hashes never bypass source verification in shared mode. This validation applies to the new preprocessing store; it does not replace downstream KV/vision-embedding cache identities.
+
+The public storage layer is model-independent. A model adapter supplies its existing concrete typed artifact and batch preprocessing method. Qwen image artifacts and the existing Kimi artifact contract can use the common store. Different processors or settings retain distinct artifacts; sharing storage does not make differently processed model inputs interchangeable.
+
+Fixed POSIX lock shards coordinate misses across processes. Duplicate images are computed once, partial hits compute only missing images, and request order is restored afterward. Readers map tensor files copy-on-write, so modifying a returned tensor does not modify another request's input. Metadata is typed JSON; artifacts are never unpickled.
+
+## Retention and cleanup
+
+The global LRU removes the least recently used artifacts when a publication would exceed the retained-file budget or 8192 entries. An individual artifact larger than the budget is not retained. The budget counts published source, configuration, metadata and tensor files; it excludes SQLite/lock overhead, temporary computation and live mappings retained by active requests after eviction. It is not a process RSS limit or a hard tmpfs quota.
+
+Existing processor flush, model update and shutdown hooks clear the index and advance a generation. Work started before a clear can finish its request but cannot repopulate the cleared cache. Existing readers remain valid after file unlink. Interrupted publication files are reclaimed when a participant opens the cache, without removing files belonging to an active writer. Broken artifacts are discarded and recomputed. Publication failure (for example, ENOSPC) returns the current preprocessing result without retention and logs a warning.
+
+The cache has no time-based TTL. A private directory on tmpfs disappears on host reboot or container tmpfs removal. Stop all participants before removing the whole directory manually; never delete active lock/index files underneath a running service.
+
+## Validation
+
+Run on Linux with the repository's runtime dependencies:
+
+```bash
+PYTHONPATH=python:test/registered/unit/multimodal python -m unittest \
+  test_shared_preprocess_cache test_shared_media_artifacts \
+  test_media_artifact_processor test_preprocess_cache -v
+```
+
+The tests cover cross-process single flight, forced key collisions, global byte/LRU limits, copy-on-write isolation, clear during snapshot/lock wait/computation, process termination, truncated files, empty/scalar/bfloat16 tensors, partial hits and caller-hash verification. GPU end-to-end measurements should use an actual vision model and distinguish warm preprocessing reuse from GPU prefix-cache and kernel warmup effects.
+
+Run the synthetic HTTP benchmark against the running server with and without the shared cache, after kernel warmup:
+
+```bash
+python benchmark/multimodal/bench_shared_preprocess_cache.py \
+  --model Qwen/Qwen3-VL-2B-Instruct --base-url http://127.0.0.1:30000 --label shared --large-batch
+```
