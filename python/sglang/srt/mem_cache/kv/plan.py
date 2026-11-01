@@ -343,13 +343,9 @@ def _chain_key(key: Tuple[KVLifetime, int]) -> tuple:
     return (rank, -window, unit)
 
 
-def _target_windows(groups) -> Tuple[Optional[int], ...]:
-    return tuple(lt.window for lt, _ in groups if isinstance(lt, WindowLifetime))
-
-
-def _sub_pool_name(lifetime: KVLifetime, target_windows) -> str:
+def _sub_pool_name(lifetime: KVLifetime) -> str:
     if isinstance(lifetime, WindowLifetime):
-        return window_sub_pool_name(lifetime.window, target_windows)
+        return window_sub_pool_name(lifetime.window)
     return _SUB_POOL_NAMES[type(lifetime)]
 
 
@@ -375,10 +371,7 @@ def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
     """The sub-pools a plan of these declarations holds, owner first: what the
     fused-draft placement needs before the plan exists."""
     keys = _group_parts(decls, page_size=1)
-    windows = _target_windows(keys)
-    return tuple(_sub_pool_name(lt, windows) for lt, _ in sorted(keys, key=_chain_key))[
-        ::-1
-    ]
+    return tuple(_sub_pool_name(lt) for lt, _ in sorted(keys, key=_chain_key))[::-1]
 
 
 def _spec_for(
@@ -442,8 +435,7 @@ def plan_kv_storage(
     groups = _group_parts(decls, page_size)
     if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
         raise ValueError("unified storage needs a FULL virtual-id owner")
-    target_windows = _target_windows(groups)
-    names_by_key = {key: _sub_pool_name(key[0], target_windows) for key in groups}
+    names_by_key = {key: _sub_pool_name(key[0]) for key in groups}
     target_window_keys = [key for key in groups if isinstance(key[0], WindowLifetime)]
     if fused_draft is not None:
         for name, band in fused_draft.new_bands.items():

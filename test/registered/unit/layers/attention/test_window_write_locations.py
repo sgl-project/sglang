@@ -464,7 +464,7 @@ def _fused_draft():
             },
         ),
         num_runners=1,
-        ctx=PlacementContext(host_names=("full", "swa"), target_windows=(16,)),
+        ctx=PlacementContext(host_names=("full", "window_16"), target_windows=(16,)),
         store_dtype=_DTYPE,
     ).placement
     storage, plan = _unified_storage((16,), fused_draft=placement)

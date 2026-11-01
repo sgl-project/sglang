@@ -172,6 +172,9 @@ class RunnerIds:
         # localizes its writes.
         self._spaces: Dict[str, IdSpace] = {}
         self.window_sub_pools: Tuple[str, ...] = ()
+        # The sub-pool playing each attention role this runner's pool names
+        # by role (a unified target's window).
+        self._role_sub_pools: Dict[str, str] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             if is_cp_sharded_padded():
@@ -193,6 +196,10 @@ class RunnerIds:
                 self.window_sub_pools = tuple(
                     sorted({s.name for s in plan.windows()} - drafts)
                 )
+                if plan.primary_window() is not None:
+                    self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = (
+                        plan.primary_window().name
+                    )
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
@@ -337,6 +344,12 @@ class RunnerIds:
             else IdSpaceKind.FULL
         )
 
+    @property
+    def window_kv_sub_pool(self) -> str:
+        """The sub-pool `window_kv_kind` reads, by its name."""
+        kind = self.window_kv_kind
+        return self._role_sub_pools.get(kind, kind)
+
     def write_ids(
         self, forward_batch, kind: IdSpaceKind = IdSpaceKind.FULL
     ) -> Optional[torch.Tensor]:
@@ -352,12 +365,6 @@ class RunnerIds:
             self, kind=kind, cols=getattr(forward_batch, "iteration_cols", None)
         )
         return pad_with_sink(ids, out_cache_loc.shape[0])
-
-    @property
-    def window_kv_sub_pool(self) -> str:
-        """The sub-pool `window_kv_kind` reads, by its name: the window
-        sub-pool, or the full one for a window draft it hosts."""
-        return self.window_kv_kind.value
 
     def capture_token_capacity(self, max_token_pool_size: int) -> int:
         """Host capture rows are indexed by request-token IDs, not kernel IDs.

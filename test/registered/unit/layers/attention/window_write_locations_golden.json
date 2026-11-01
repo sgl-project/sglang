@@ -8,7 +8,7 @@
    },
    "1": {
     "index": 0,
-    "storage": "swa_8",
+    "storage": "window_8",
     "sub_pool": "swa"
    }
   },
@@ -2708,7 +2708,7 @@
       24
      ]
     },
-    "window:swa_4": {
+    "window:window_4": {
      "indices": [
       769,
       770,
@@ -2842,7 +2842,7 @@
       15
      ]
     },
-    "window:swa_4": {
+    "window:window_4": {
      "indices": [
       765,
       766,
@@ -3048,7 +3048,7 @@
       0
      ]
     },
-    "window:swa_4": {
+    "window:window_4": {
      "indices": [],
      "indptr": [
       0,
@@ -3418,7 +3418,7 @@
      37
     ]
    },
-   "window:swa_3": {
+   "window:window_3": {
     "indices": [
      1367,
      1368,
@@ -3437,7 +3437,7 @@
      9
     ]
    },
-   "window:swa_8": {
+   "window:window_8": {
     "indices": [
      682,
      683,

@@ -180,7 +180,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         donated = swa.ids.virtual_to_physical[incoming.to(torch.int64)].clone()
 
-        allocator.storage.rehome_window("swa", kept, incoming)
+        allocator.storage.rehome_window("window_32", kept, incoming)
 
         self.assertEqual(
             swa.ids.virtual_to_physical[kept.to(torch.int64)].tolist(),
@@ -203,7 +203,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(incoming)  # donor no longer owns anything
         with self.assertRaises(AssertionError):
-            allocator.storage.rehome_window("swa", kept, incoming)
+            allocator.storage.rehome_window("window_32", kept, incoming)
 
 
 class TestRecoverActionHandler(_RecoverTestBase):

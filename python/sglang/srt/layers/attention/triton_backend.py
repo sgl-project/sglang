@@ -464,7 +464,7 @@ class TritonAttnBackend(AttentionBackend):
         names = [
             name
             for name in self.runner_ids.window_sub_pools
-            if name != self.runner_ids.window_kv_kind
+            if name != self.runner_ids.window_kv_sub_pool
         ]
         if not names:
             return {}
@@ -498,7 +498,7 @@ class TritonAttnBackend(AttentionBackend):
         plan = model_runner.token_to_kv_pool_allocator.storage.plan
         widths = {
             plan.sub_pool(name).geometry.v_head_dim
-            for name in (self.runner_ids.window_kv_kind, *self.other_windows)
+            for name in (self.runner_ids.window_kv_sub_pool, *self.other_windows)
         }
         return len(widths) == 1 and None not in self.other_windows.values()
 
@@ -2410,8 +2410,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
             and self.use_sliding_window_kv_pool
-            and self.kv_layers.route(layer.layer_id).sub_pool
-            == IdSpaceKind.SLIDING_WINDOW
+            and self.kv_layers.plays(layer.layer_id, IdSpaceKind.SLIDING_WINDOW)
         ):
             extend_kv_indices = self.forward_metadata.swa_out_cache_loc
             assert extend_kv_indices is not None, (
