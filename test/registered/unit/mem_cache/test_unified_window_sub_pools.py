@@ -101,24 +101,30 @@ class TestWindowNames(CustomTestCase):
         self.assertEqual(_plan((16,)).primary_window().name, "window_16")
 
     def test_external_names_follow_sub_pools_and_window_slots(self):
-        # A window's prefix tree slot is named by its sub-pool. Host stores
-        # name window entries by window slot and keep two; PD peers carry every
-        # window as the window state type, told apart by sub-pool.
+        # A window's prefix tree slot and host pool are named by its sub-pool.
+        # PD peers carry every window as the window state type, told apart by
+        # sub-pool.
         first = SubPoolExternal(
-            host_pool="swa", tree_component="WINDOW_16", metrics="swa", wire="swa"
+            host_pool="window_16",
+            tree_component="WINDOW_16",
+            metrics="swa",
+            wire="swa",
         )
         self.assertEqual(_plan((16,)).sub_pool("window_16").external, first)
         two = _plan((16, 64))
         self.assertEqual(
             two.sub_pool("window_64").external,
             SubPoolExternal(
-                host_pool="swa", tree_component="WINDOW_64", metrics="swa", wire="swa"
+                host_pool="window_64",
+                tree_component="WINDOW_64",
+                metrics="swa",
+                wire="swa",
             ),
         )
         self.assertEqual(
             two.sub_pool("window_16").external,
             SubPoolExternal(
-                host_pool="auxiliary_swa",
+                host_pool="window_16",
                 tree_component="WINDOW_16",
                 metrics="swa",
                 wire="swa",
@@ -129,7 +135,7 @@ class TestWindowNames(CustomTestCase):
             [slot.component for slot in slots], ["FULL", "WINDOW_64", "WINDOW_16"]
         )
         self.assertEqual(
-            [slot.host_pool for slot in slots], ["kv", "swa", "auxiliary_swa"]
+            [slot.host_pool for slot in slots], ["kv", "window_64", "window_16"]
         )
         self.assertEqual([slot.window for slot in slots][1:], [64, 16])
         # The tree's first window slot plays the window role.
