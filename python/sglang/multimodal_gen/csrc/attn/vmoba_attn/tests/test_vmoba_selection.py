@@ -85,10 +85,12 @@ def test_calc_chunks_layout():
     assert chunk_to_batch.tolist() == [0, 0, 1, 1]
 
 
-def _fake_varlen_attn(q, k, v, cu_q, cu_k, max_q, max_k, causal=False):
+def _fake_varlen_attn(
+    q, k, v, cu_q, cu_k, max_q, max_k, causal=False, softmax_scale=None
+):
     """Plain torch reference for flash_attn_varlen_func (external kernel)."""
     out = torch.zeros_like(q)
-    scale = q.shape[-1] ** -0.5
+    scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
     for i in range(len(cu_q) - 1):
         a, b = int(cu_q[i]), int(cu_q[i + 1])
         s = torch.einsum("qhd,khd->hqk", q[a:b], k[a:b]) * scale
@@ -96,9 +98,11 @@ def _fake_varlen_attn(q, k, v, cu_q, cu_k, max_q, max_k, causal=False):
     return out
 
 
-def _self_chunk_reference(q, k, v, seqlens, chunk_size):
+def _self_chunk_reference(q, k, v, seqlens, chunk_size, softmax_scale=None):
     _, cu_chunk, _, _ = _layout(seqlens, chunk_size)
-    return _fake_varlen_attn(q, k, v, cu_chunk, cu_chunk, 0, 0)
+    return _fake_varlen_attn(
+        q, k, v, cu_chunk, cu_chunk, 0, 0, softmax_scale=softmax_scale
+    )
 
 
 @pytest.fixture
@@ -118,6 +122,29 @@ def test_topk_one_means_self_chunk_only(fake_flash):
     assert torch.allclose(out, ref, atol=1e-5)
 
 
+def test_softmax_scale_is_respected(fake_flash):
+    torch.manual_seed(0)
+    seqlens, chunk, scale = [128, 128], 32, 0.2
+    q, k, v = (torch.randn(256, 2, 16) for _ in range(3))
+    cu = torch.tensor([0, 128, 256], dtype=torch.int32)
+    out = vmoba.moba_attn_varlen(
+        q,
+        k,
+        v,
+        cu,
+        128,
+        chunk,
+        1,
+        select_mode="topk",
+        threshold_type="query_head",
+        softmax_scale=scale,
+    )
+    ref = _self_chunk_reference(q, k, v, seqlens, chunk, softmax_scale=scale)
+    assert torch.allclose(out, ref, atol=1e-5)
+    default_ref = _self_chunk_reference(q, k, v, seqlens, chunk)
+    assert not torch.allclose(out, default_ref, atol=1e-5)
+
+
 def test_topk_head_global_stays_inside_each_sequence(monkeypatch):
     torch.manual_seed(0)
     chunk, heads = 64, 2
@@ -126,7 +153,7 @@ def test_topk_head_global_stays_inside_each_sequence(monkeypatch):
     captured = {}
 
     def capture(*args):
-        captured["moba_q_sh_indices"] = args[-1]
+        captured["moba_q_sh_indices"] = args[10]
         captured["cu_q"] = args[6]
         return torch.zeros_like(q)
 

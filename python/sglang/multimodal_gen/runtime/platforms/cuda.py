@@ -429,8 +429,9 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
-
+            from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba import (  # noqa: F401
+                moba_attn_varlen,
+            )
             from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                 VMOBAAttentionBackend,
             )
