@@ -163,9 +163,13 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 allocator, cache = self.build_cache()
                 records = self.mark_prefixes(allocator, cache, 96)
                 before = allocator.full_attn_allocator.available_size()
-                method = cache.evict_for_alloc if allocation else cache.evict
-                result = method(EvictParams(num_tokens=2))
-                # Allocation targets availability: a cascaded SWA free also
+                if allocation:
+                    # The demand: two tokens past what the owner serves now.
+                    demand = allocator.full_available_size() + 2
+                    result = cache.evict_for_alloc(EvictParams(num_tokens=demand))
+                else:
+                    result = cache.evict(EvictParams(num_tokens=2))
+                # Allocation asks for a demand: a cascaded SWA free also
                 # increases the FULL band's shared-arena borrowing capacity.
                 expected = 1 if allocation else 2
                 self.assertEqual(result.num_tokens_evicted, expected)
@@ -461,9 +465,9 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             return result
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
-            cache.evict_for_alloc(
+            cache.evict_until(
                 EvictParams(swa_num_tokens=2),
-                allocation_reclaim_satisfied=lambda: allocator.ensure_capacity(4, 4),
+                lambda: allocator.ensure_capacity(4, 4),
             )
         self.assertTrue(
             any(node is None and progress for (node, progress), _ in observed),
@@ -529,7 +533,7 @@ assert traces[0] == traces[1], traces
 quota, traces = traces[0][0], [traces[0][1]]
 assert quota > 0, quota
 assert any(f"num_tokens={quota}," in event for event in traces[0]), traces
-assert any("allocation_reclaim_satisfied is not None=True" in event for event in traces[0]), traces
+assert any(event.startswith("evict_until called") for event in traces[0]), traces
 assert not any("<function" in event for event in traces[0]), traces
 """
         env = dict(os.environ, SGLANG_ENABLE_RANK_CONSENSUS_CHECKER="1")

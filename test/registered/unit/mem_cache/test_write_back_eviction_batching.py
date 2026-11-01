@@ -329,7 +329,7 @@ class _WriteBackBatchingSuite:
         cache.sanity_check()
 
     def _evict_until_reclaimed(self, *, batched):
-        """evict_for_alloc with an allocator's reclaim predicate, met three
+        """evict_until with an allocator's reclaim predicate, met three
         victims into a quota of a whole batch; returns the tokens evicted and
         which sequences stay on device."""
         cache, allocator, _ = self._fill_host_with_one_batch()
@@ -338,9 +338,9 @@ class _WriteBackBatchingSuite:
         if not batched:
             cache._write_back_batch_tokens = lambda *args: 0
         target = allocator.available_size() + 3 * SEQ_TOKENS
-        result = cache.evict_for_alloc(
+        result = cache.evict_until(
             EvictParams(num_tokens=BATCH_TOKENS),
-            allocation_reclaim_satisfied=lambda: allocator.available_size() >= target,
+            satisfied=lambda: allocator.available_size() >= target,
         )
         cache.sanity_check()
         on_device = [

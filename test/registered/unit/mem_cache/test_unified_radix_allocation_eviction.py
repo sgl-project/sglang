@@ -32,7 +32,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         allocator = MagicMock()
         allocator.available_size.side_effect = lambda: capacity["available"]
         # Pools that share no memory: the tree walks each target itself.
-        allocator.reclaim_to_availability.return_value = None
+        allocator.reclaim_for_demand.return_value = None
         cache.token_to_kv_pool_allocator = allocator
         cache.req_to_token_pool = MagicMock()
 
@@ -59,7 +59,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
     def test_allocation_eviction_stops_when_shared_capacity_is_sufficient(self):
         cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=70)
 
-        result = cache.evict_for_alloc(EvictParams(num_tokens=70))
+        # 30 available: a 100-token demand is 70 short.
+        result = cache.evict_for_alloc(EvictParams(num_tokens=100))
 
         self.assertEqual(capacity["available"], 100)
         self.assertEqual(leaf_count["value"], 1)
@@ -68,8 +69,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_allocation_eviction_runs_to_the_target_when_frees_stay_hidden(self):
         """An allocator can hide freed pages behind a clamp or page rounding, so
-        freeing exactly the shortfall may leave its availability target unmet;
-        an allocation-driven FULL walk must keep going until the target shows."""
+        freeing exactly the shortfall may leave the demand unmet; an
+        allocation-driven FULL walk must keep going until the demand fits."""
         cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=0)
         cache.tree_core.full_evictable_size.return_value = 60
         quota = {}
@@ -83,7 +84,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         cache._evict_device_next_node.side_effect = next_node
 
-        result = cache.evict_for_alloc(EvictParams(num_tokens=20))
+        # 30 available: a 50-token demand is 20 short.
+        result = cache.evict_for_alloc(EvictParams(num_tokens=50))
 
         self.assertEqual(leaf_count["value"], 2)
         self.assertEqual(capacity["available"], 50)
@@ -124,7 +126,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
         cache.token_to_kv_pool_allocator = MagicMock()
-        cache.token_to_kv_pool_allocator.reclaim_to_availability.return_value = None
+        cache.token_to_kv_pool_allocator.reclaim_for_demand.return_value = None
 
         capacity = {"available": 0}
         mamba_allocator = MagicMock()
@@ -163,8 +165,43 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         evict_from_tree_cache(tree_cache, num_tokens=100)
 
-        tree_cache.evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=70))
+        tree_cache.evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=100))
         tree_cache.evict.assert_not_called()
+
+    def test_default_cache_evicts_the_shortfall_of_a_demand(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            BasePrefixCache,
+            EvictResult,
+        )
+
+        for supports_swa, demand, expected in [
+            (False, EvictParams(num_tokens=100), EvictParams(num_tokens=70)),
+            (False, EvictParams(num_tokens=30), None),
+            (
+                True,
+                EvictParams(num_tokens=100, swa_num_tokens=100),
+                EvictParams(num_tokens=60, swa_num_tokens=90),
+            ),
+            (True, EvictParams(num_tokens=40, swa_num_tokens=10), None),
+        ]:
+            with self.subTest(supports_swa=supports_swa, demand=demand):
+                allocator = SimpleNamespace(
+                    available_size=lambda: 30,
+                    full_available_size=lambda: 40,
+                    swa_available_size=lambda: 10,
+                )
+                cache = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    supports_swa=lambda: supports_swa,
+                    evict=MagicMock(return_value=EvictResult(num_tokens_evicted=1)),
+                )
+                BasePrefixCache.evict_for_alloc(cache, demand)
+                if expected is None:
+                    cache.evict.assert_not_called()
+                else:
+                    cache.evict.assert_called_once_with(expected)
 
 
 if __name__ == "__main__":

@@ -190,9 +190,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
-        shortfall = num_tokens - self.available_size()
-        if shortfall > 0:
-            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+        if self.available_size() < num_tokens:
+            tree_cache.evict_for_alloc(EvictParams(num_tokens=num_tokens))
             _evict_until_allocatable(tree_cache, self, num_tokens)
 
     def check_decode_capacity(
@@ -216,13 +215,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
-    def reclaim_to_availability(
-        self, tree_cache, targets: EvictParams
-    ) -> EvictResult | None:
-        """Evict until each pool named in ``targets`` (an `EvictParams` of
-        availabilities, not of eviction counts) can serve that much, when this
-        allocator's pools share their memory; None when each pool is its own,
-        so the prefix tree's walk per pool meets its target."""
+    def reclaim_for_demand(self, tree_cache, demand: EvictParams) -> EvictResult | None:
+        """Evict until ``demand`` (an `EvictParams` of what an allocation will
+        take) can be served, when this allocator's pools share their memory;
+        None when each pool is its own, so the prefix tree evicts each pool's
+        shortfall."""
         return None
 
     def debug_print(self) -> str:
