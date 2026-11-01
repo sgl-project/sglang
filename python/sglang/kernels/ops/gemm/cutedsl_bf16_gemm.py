@@ -1370,6 +1370,9 @@ _MUSE_SPARK_TGV_M_RANGES = {
     (8192, 1024): (1, 64),  # TP8 o_proj
     (512, 8192): (256, 512),  # TP8 pooler slice
     (1024, 4096): (1, 512),  # TP8 unpooler slice
+    (14336, 8192): (24, 32),  # hidden 8192 / inter 28672 TP4 gate_up (DFLASH draft)
+    (50512, 8192): (17, 32),  # DFLASH draft TP4 candidate head
+    (7168, 8192): (24, 32),  # hidden 8192 / inter 28672 TP8 gate_up (DFLASH draft)
 }
 
 

@@ -158,6 +158,7 @@ Several norms look interchangeable and are not. Start here.
 | `channel_rmsnorm_silu_nhwc` | JIT CUDA | close (own fp32 reduction over C in a lane group sized from C; optional fused conv bias with aten rounding) | Qwen-Image 2.1 VAE under `quality=extra-high`/`high`; dense channels_last, even `C <= 2048` |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
+| `aten_head_rmsnorm` | Triton | bit-exact vs ROCm aten `rms_norm` (`vectorized_layer_norm_kernel` fold order) | **ROCm only**; bf16 `[..., heads, 128]` views with packed heads (MiniMax-H3 QK norm), optionally fused with the bf16 NeoX `rotary_embedding` that follows |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
 | `triton_one_pass_rms_norm` | Triton | close | standalone RMSNorm, one pass |
 

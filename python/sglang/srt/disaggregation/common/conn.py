@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    MetadataBuffers,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
@@ -321,6 +322,9 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.customized_info_enabled = (
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
+        )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
@@ -516,13 +520,16 @@ class CommonKVManager(BaseKVManager):
         Prefill CP materializes global token order before writing state pools, so
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
-        exception because each CP rank owns different state layers.
+        exception because each CP rank owns different state layers. Page-sharded
+        DSA indexer state likewise needs every owner; Mooncake filters its page
+        lists before transfer instead of suppressing whole ranks.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
+            and getattr(self, "kv_shard_size", 1) <= 1
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -646,6 +653,38 @@ class CommonKVManager(BaseKVManager):
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> List[bytes]:
         raise NotImplementedError
+
+    def validate_aux_buffers(
+        self, dst_aux_ptrs: List[int], dst_aux_item_lens: Optional[List[int]]
+    ) -> None:
+        if not self.customized_info_enabled and dst_aux_item_lens is None:
+            return
+
+        src_ptrs = self.kv_args.aux_data_ptrs
+        src_item_lens = self.kv_args.aux_item_lens
+        required_buffers = len(src_ptrs) - int(
+            get_disagg().disaggregation_enable_kv_checksum
+        )
+        slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
+        if not (
+            self.customized_info_enabled
+            and dst_aux_item_lens is not None
+            and len(src_ptrs) == len(src_item_lens)
+            and len(dst_aux_ptrs) == len(dst_aux_item_lens)
+            and len(dst_aux_ptrs) in (required_buffers, required_buffers + 1)
+            and (len(dst_aux_ptrs) == required_buffers or dst_aux_item_lens[-1] == 64)
+            and min(len(src_item_lens), len(dst_aux_item_lens)) >= slots.stop
+            and src_item_lens[slots] == dst_aux_item_lens[slots]
+            and all(src <= dst for src, dst in zip(src_item_lens, dst_aux_item_lens))
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer layout mismatch: "
+                f"prefill has {len(src_ptrs)} buffers with item sizes {src_item_lens}, "
+                f"decode has {len(dst_aux_ptrs)} buffers with item sizes {dst_aux_item_lens}. "
+                "Both servers must support and enable customized-info transfer "
+                "with the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES and "
+                "compatible metadata buffers."
+            )
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -2058,7 +2097,9 @@ class CommonKVManager(BaseKVManager):
         """Handle failure of a prefill node."""
         with self.connection_lock:
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                k
+                for k in self.connection_pool
+                if k.startswith(f"{failed_bootstrap_addr}_")
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
@@ -2319,8 +2360,8 @@ class CommonKVSender(BaseKVSender):
         ):
             self._transfer_start_time = time.perf_counter()
 
-        # The early-send event belongs to exactly one chunk; the Mooncake and
-        # Mori workers synchronize on it before reading source KV.
+        # The early-send event belongs to exactly one chunk; the Mooncake, Mori
+        # and NIXL workers synchronize on it before reading source KV.
         wait_event = self._early_send_wait_event
         self._early_send_wait_event = None
         self.kv_mgr.add_transfer_request(
@@ -2489,6 +2530,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self._lifecycle_lock = threading.RLock()
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        # Filled by send_metadata; staging cleanup can run before it under overlap.
+        self.chunk_staging_infos: List[Tuple[int, int, int, int, int]] = []
         self.init_time: Optional[float] = None
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
@@ -3043,6 +3086,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -3323,8 +3368,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
+            if self._loop is not None:
+                if self._runner is not None:
+                    self._loop.run_until_complete(self._runner.cleanup())
+                self._loop.close()
 
     def close(self):
         """Shutdown"""

@@ -254,12 +254,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             ).hidden_states
         )
 
-    # Capture runs a break only to record its buffers, before any captured kernel has run:
-    # the routing ids are not computed yet, so the waves are skipped then (warmup and replay
-    # run them).
-    _run_eager_into = eager_on_graph(True, capture_stub=lambda *args, **kwargs: None)(
-        _run_eager_into_impl
-    )
+    _run_eager_into = eager_on_graph(True)(_run_eager_into_impl)
 
 
 def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
