@@ -260,11 +260,8 @@ def ensure_mamba_capacity(
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = state.slots
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
-    available = allocator.schedulable_available_size()
-    if available < needed and supports_mamba:
-        tree_cache.evict_for_alloc(
-            EvictParams(num_tokens=0, mamba_num=needed - available)
-        )
+    if allocator.schedulable_available_size() < needed and supports_mamba:
+        tree_cache.evict_for_alloc(EvictParams(mamba_num=needed))
     return allocator.schedulable_available_size() >= needed
 
 

@@ -218,7 +218,7 @@ class MambaComponent(TreeComponent):
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(EvictParams(mamba_num=1))
                 dst_index = storage.take_state_slots(sub_pool, 1)
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
@@ -553,7 +553,7 @@ class MambaComponent(TreeComponent):
                         ),
                     )
                     lock.receipt.skipped_lock_components += (ct,)
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(EvictParams(mamba_num=1))
             slot = storage.take_state_slots(sub_pool, 1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
@@ -573,7 +573,9 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         slot = storage.take_checkpoint_slot(sub_pool)
         if slot is None:
-            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            # The tree's states live in the checkpoint pool, which no
+            # allocation demand reads: free one cached state outright.
+            self.cache.evict(EvictParams(mamba_num=1))
             slot = storage.take_checkpoint_slot(sub_pool)
             assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
         return slot
@@ -811,7 +813,7 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         dst = storage.take_state_slots(sub_pool, 1)
         if dst is None:
-            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            self.cache.evict_for_alloc(EvictParams(mamba_num=1))
             dst = storage.take_state_slots(sub_pool, 1)
         if dst is not None:
             req.kv.mamba_pool_idx = dst[0]

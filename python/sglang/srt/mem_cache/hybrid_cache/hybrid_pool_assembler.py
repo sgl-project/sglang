@@ -67,21 +67,13 @@ def _get_allocator_type() -> str:
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-    available_size = cache.token_to_kv_pool_allocator.swa_available_size()
-    shortfall = max(0, required_size - available_size)
-    if shortfall > 0:
-        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+    cache.evict_for_alloc(EvictParams(swa_num_tokens=required_size))
 
 
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-    available_size = (
-        cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
-    )
-    shortfall = max(0, required_size - available_size)
-    if shortfall > 0:
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+    cache.evict_for_alloc(EvictParams(mamba_num=required_size))
 
 
 def _make_layer_mapper(
@@ -1547,16 +1539,14 @@ def _evict_for_host_load(
 ) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-    shortfall = max(0, required_size - storage.device_room(sub_pool))
-    if shortfall == 0:
-        return
     if component == ComponentType.SWA:
-        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+        demand = EvictParams(swa_num_tokens=required_size)
     elif component == ComponentType.MAMBA:
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+        demand = EvictParams(mamba_num=required_size)
     else:
         assert component in cache.window_slots(), component
-        cache.evict_for_alloc(EvictParams(window_num_tokens={component: shortfall}))
+        demand = EvictParams(window_num_tokens={component: required_size})
+    cache.evict_for_alloc(demand)
 
 
 def build_unified_host_stack(

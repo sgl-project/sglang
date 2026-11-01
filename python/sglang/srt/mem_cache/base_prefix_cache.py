@@ -539,27 +539,36 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(
-        self,
-        params: EvictParams,
-        *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    def evict_for_alloc(self, demand: EvictParams) -> EvictResult:
+        """Evict so that an allocation of ``demand`` (what it will take, not
+        what to evict) can be served: here, the shortfall of each pool the
+        allocator reads, evicted as counts."""
+        allocator = self.token_to_kv_pool_allocator
+        shortfall = EvictParams(mamba_num=demand.mamba_num)
+        if demand.num_tokens > 0:
+            available = (
+                allocator.full_available_size()
+                if self.supports_swa()
+                else allocator.available_size()
+            )
+            shortfall.num_tokens = max(0, demand.num_tokens - available)
+        if demand.swa_num_tokens > 0:
+            shortfall.swa_num_tokens = max(
+                0, demand.swa_num_tokens - allocator.swa_available_size()
+            )
+        if not (
+            shortfall.num_tokens or shortfall.swa_num_tokens or shortfall.mamba_num
+        ):
+            return EvictResult()
+        return self.evict(shortfall)
+
+    def evict_until(
+        self, params: EvictParams, satisfied: Callable[[], bool]
     ) -> EvictResult:
-        """Evict for allocation using shortfalls or joint-reclaim quotas.
-
-        Without ``allocation_reclaim_satisfied``, callers pass component
-        shortfalls in ``params``. The default implementation forwards these
-        counts to :meth:`evict`; multi-component caches may stop earlier when
-        collateral frees satisfy the requested allocation.
-
-        With ``allocation_reclaim_satisfied``, ``params`` instead contains
-        cumulative reclaim quotas. Supporting caches may stop at the pure
-        predicate before reaching those quotas. The allocator still owns
-        preparation and the actual capacity check after the walk.
-        """
-        if allocation_reclaim_satisfied is not None:
-            raise NotImplementedError("This cache does not support joint reclaim")
-        return self.evict(params)
+        """Evict up to ``params`` per component, stopping once ``satisfied``
+        holds; only caches whose allocator reclaims one joint demand over
+        shared memory support it."""
+        raise NotImplementedError("This cache does not support joint reclaim")
 
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:

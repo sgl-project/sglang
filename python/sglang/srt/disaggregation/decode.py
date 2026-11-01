@@ -2407,15 +2407,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             get_disagg().disaggregation_decode_enable_radix_cache
             and self._radix_full_available() < required_alloc_tokens
         ):
-            num_to_evict = required_alloc_tokens - self._radix_full_available()
             result = self.tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_to_evict)
+                EvictParams(num_tokens=required_alloc_tokens)
             )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
                     f"available {self._radix_full_available()} "
-                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
+                    f"after evicting {result.num_tokens_evicted} tokens. "
                     f"evictable_size={self._radix_full_evictable()}, "
                     f"protected_size={self._radix_full_protected()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, "

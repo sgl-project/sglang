@@ -1151,14 +1151,14 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(cache.window_evictable_size(DRAFT_WINDOW), 0)
                     self.assertEqual(cache.mamba_evictable_size(), 16)
                     phases = []
-                    original = cache.evict_for_alloc
+                    original = cache.evict_until
 
                     def walk(params, **kwargs):
                         result = original(params, **kwargs)
                         phases.append((params, result))
                         return result
 
-                    with patch.object(cache, "evict_for_alloc", side_effect=walk):
+                    with patch.object(cache, "evict_until", side_effect=walk):
                         self.assertTrue(a.evict_to_free_tokens(cache, demand))
                     self.assertIsNotNone(a.alloc(demand))
                     # Every token entry is locked, so the tokens are funded
@@ -1994,7 +1994,7 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(cache.swa_evictable_size(), 144)
                     self.assertFalse(a.ensure_capacity(4, 4))
                     self.assertEqual(a._windows[0].sub_pool_name, "draft_swa")
-                    original = cache.evict_for_alloc
+                    original = cache.evict_until
                     evicted = []
 
                     def walk(params, **kwargs):
@@ -2002,7 +2002,7 @@ class TestDeclaredParts(CustomTestCase):
                         evicted.append(result.swa_num_tokens_evicted)
                         return result
 
-                    with patch.object(cache, "evict_for_alloc", side_effect=walk):
+                    with patch.object(cache, "evict_until", side_effect=walk):
                         self.assertTrue(
                             a.check_decode_capacity(num_tokens=4, tree_cache=cache)
                         )
@@ -2471,7 +2471,7 @@ class TestDeclaredParts(CustomTestCase):
         release_band(a.full_attn_allocator)
         release_band(a.swa_attn_allocator)
         self.assertTrue(budget._fits(8, dict.fromkeys(budget.window_offsets, 8)))
-        cache.evict_for_alloc(
+        cache.evict(
             EvictParams(
                 num_tokens=80,
                 swa_num_tokens=8,

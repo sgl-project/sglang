@@ -1872,6 +1872,36 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
         self.assertEqual(ckpt_pool.available_size(), ckpt_initial)
         self.assertEqual(cache.mamba_evictable_size(), 0)
 
+    def test_full_checkpoint_pool_evicts_a_cached_checkpoint(self):
+        """With the checkpoint pool full of cached states and active slots
+        free, storing one more checkpoint evicts a cached one first."""
+        cache, allocator, req_to_token_pool = build_fixture(
+            replace(self.cfg, kv_size=256)
+        )
+        ckpt_pool = req_to_token_pool.mamba_ckpt_pool
+        capacity = ckpt_pool.available_size()
+
+        def finish_and_release(tokens):
+            req = self._make_req(req_to_token_pool, tokens)
+            kv_indices = allocator.alloc(len(tokens))
+            self.assertIsNotNone(kv_indices)
+            req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+            )
+            req.last_node = cache.root_node_handle()
+            finish_req(cache, req, req.owned_kv_len())
+            req_to_token_pool.free(req)
+
+        for i in range(capacity):
+            finish_and_release([100 + i, 2, 3, 4])
+        self.assertEqual(ckpt_pool.available_size(), 0)
+        self.assertEqual(cache.mamba_evictable_size(), capacity)
+        self.assertGreater(req_to_token_pool.mamba_allocator.available_size(), 0)
+
+        finish_and_release([7, 8, 9, 10])
+        self.assertEqual(ckpt_pool.available_size(), 0)
+        self.assertEqual(cache.mamba_evictable_size(), capacity)
+
 
 def _component_with_cache(component_type, cache):
     component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])

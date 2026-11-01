@@ -718,55 +718,52 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
-    @rank_consensus(
-        same_params=["params", "allocation_reclaim_satisfied is not None"],
-        same_results=True,
-    )
-    def evict_for_alloc(
-        self,
-        params: EvictParams,
-        *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
-    ) -> EvictResult:
-        """Evict using component shortfalls or cumulative joint-reclaim quotas.
+    @rank_consensus(same_params=True, same_results=True)
+    def evict_for_alloc(self, demand: EvictParams) -> EvictResult:
+        """Evict so that an allocation of ``demand`` (what it will take, not
+        what to evict) can be served.
 
-        Without ``allocation_reclaim_satisfied``, ``params`` contains component
-        shortfalls. These become availability targets, allowing collateral frees
-        to satisfy an allocation before its requested eviction count is reached.
-
-        With ``allocation_reclaim_satisfied``, ``params`` instead contains
-        cumulative reclaim quotas and component-local targets are bypassed.
-        The pure predicate may stop the walk before those quotas are reached;
-        the allocator must prepare and recheck actual capacity after the walk.
+        Pools sharing their memory answer for the whole demand at once
+        (`reclaim_for_demand`). Pools of their own evict each component's
+        shortfall, and a walk stops once its pool can serve its demand: a
+        FULL leaf cascade can free a window's or a state's entries too.
         """
         if self.disable:
             return EvictResult()
-        if allocation_reclaim_satisfied is not None:
-            return self._evict(
-                params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
-            )
-
-        request_by_type = self._evict_request_by_type(params)
-        targets = {
-            ct: self._component_available_size(ct) + request_cnt
-            for ct, request_cnt in request_by_type.items()
-            if request_cnt > 0
-        }
-        # Pools sharing their memory serve every target from one layout.
-        reclaimed = self.token_to_kv_pool_allocator.reclaim_to_availability(
-            self,
-            EvictParams(
-                num_tokens=targets.get(ComponentType.FULL, 0),
-                swa_num_tokens=targets.get(ComponentType.SWA, 0),
-                window_num_tokens={
-                    ct: targets[ct] for ct in self.window_slots()[1:] if ct in targets
-                },
-                mamba_num=targets.get(ComponentType.MAMBA, 0),
-            ),
-        )
+        reclaimed = self.token_to_kv_pool_allocator.reclaim_for_demand(self, demand)
         if reclaimed is not None:
             return reclaimed
-        return self._evict(params, {ct: (ct, t) for ct, t in targets.items()})
+        demand_by_type = {
+            ct: n for ct, n in self._evict_request_by_type(demand).items() if n > 0
+        }
+        shortfall = {
+            ct: n - self._pool_available(ct) for ct, n in demand_by_type.items()
+        }
+        short = {ct: n for ct, n in shortfall.items() if n > 0}
+        if not short:
+            return EvictResult()
+        return self._evict(
+            EvictParams(
+                num_tokens=short.get(ComponentType.FULL, 0),
+                swa_num_tokens=short.get(ComponentType.SWA, 0),
+                window_num_tokens={
+                    ct: short[ct] for ct in self.window_slots()[1:] if ct in short
+                },
+                mamba_num=short.get(ComponentType.MAMBA, 0),
+            ),
+            demand={ct: demand_by_type[ct] for ct in short},
+        )
+
+    @rank_consensus(same_params=["params"], same_results=True)
+    def evict_until(
+        self, params: EvictParams, satisfied: Callable[[], bool]
+    ) -> EvictResult:
+        """Evict up to ``params`` per component, stopping at the first victim
+        after which ``satisfied`` holds: the walk an allocator whose pools
+        share memory drives while it reclaims one joint demand."""
+        if self.disable:
+            return EvictResult()
+        return self._evict(params, satisfied=satisfied)
 
     def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
         fixed = {
@@ -780,12 +777,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not unknown, f"no further window slots {sorted(unknown)} in this tree"
         return fixed | {ct: params.window_num_tokens.get(ct, 0) for ct in further}
 
-    def _component_available_size(self, component_type: ComponentType) -> int:
-        """Return capacity usable by the component's next allocation.
-
-        Shared allocators expose schedulable capacity, which includes peer holes
-        that an urgent allocator flush can reclaim without further eviction.
-        """
+    def _pool_available(self, component_type: ComponentType) -> int:
+        """What the component's own pool can serve now: the read a cache over
+        pools of their own sizes a component's shortfall against."""
         if component_type == self.slot_id(TREE_TOKEN):
             if self.supports_swa():
                 return self.token_to_kv_pool_allocator.full_available_size()
@@ -796,19 +790,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return (
                 self.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
             )
-        if component_type in self.window_slots():
-            storage, sub_pool = self.components[component_type].storage_and_sub_pool()
-            return storage.device_room(sub_pool)
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(
         self,
         params: EvictParams,
-        available_size_targets: Optional[
-            dict[ComponentType, tuple[ComponentType, int]]
-        ] = None,
         *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+        demand: Optional[dict[ComponentType, int]] = None,
+        satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -817,10 +806,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         request_by_type = self._evict_request_by_type(params)
         self._evict_components(
-            request_by_type,
-            tracker,
-            available_size_targets=available_size_targets,
-            allocation_reclaim_satisfied=allocation_reclaim_satisfied,
+            request_by_type, tracker, demand=demand, satisfied=satisfied
         )
 
         if (
@@ -958,26 +944,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
-        available_size_targets: Optional[
-            dict[ComponentType, tuple[ComponentType, int]]
-        ] = None,
         *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+        demand: Optional[dict[ComponentType, int]] = None,
+        satisfied: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
         # after its recompute.
         def target_reached(component_type: ComponentType) -> bool:
-            if allocation_reclaim_satisfied is not None:
-                return allocation_reclaim_satisfied()
-            if available_size_targets is None:
+            if satisfied is not None:
+                return satisfied()
+            if demand is None or component_type not in demand:
                 return False
-            target = available_size_targets.get(component_type)
-            if target is None:
-                return False
-            target_component, target_size = target
             # A Full-leaf cascade can release Mamba or SWA state directly.
-            return self._component_available_size(target_component) >= target_size
+            return self._pool_available(component_type) >= demand[component_type]
 
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
@@ -991,8 +971,8 @@ class UnifiedRadixCache(BasePrefixCache):
             to_target = (
                 ct == self.slot_id(TREE_TOKEN)
                 and request_cnt > 0
-                and available_size_targets is not None
-                and ct in available_size_targets
+                and demand is not None
+                and ct in demand
             )
             # A preceding component may have cascade-evicted this component or,
             # on a shared pool, released enough bytes to satisfy its allocation.
@@ -1969,11 +1949,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
-        avail = self._component_available_size(self.slot_id(TREE_TOKEN))
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            self.evict_for_alloc(EvictParams(num_tokens=needed))
-            if self._component_available_size(self.slot_id(TREE_TOKEN)) < kv_tokens:
+        token_slot = self.slot_id(TREE_TOKEN)
+        if self._pool_available(token_slot) < kv_tokens:
+            self.evict_for_alloc(EvictParams(num_tokens=kv_tokens))
+            if self._pool_available(token_slot) < kv_tokens:
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False

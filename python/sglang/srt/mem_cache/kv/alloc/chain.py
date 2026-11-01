@@ -840,23 +840,23 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._reclaim(tree_cache, demands)
         return self._units_fit({n: d for n, d in demands.items() if d > 0})
 
-    def reclaim_to_availability(self, tree_cache, targets: EvictParams) -> EvictResult:
-        """The prefix tree's availability targets as one demand: every
-        sub-pool's target taken at once, since the sub-pools share bytes."""
+    def reclaim_for_demand(self, tree_cache, demand: EvictParams) -> EvictResult:
+        """An allocation's demand as the prefix tree states it, reclaimed as
+        one demand (`_reclaim`): the sub-pools share bytes."""
         page = self.page_size
         owner = self.full_attn_allocator
         swa = self.swa_attn_allocator
         state = self.mamba_allocator
-        demands = {owner.sub_pool_name: -(-targets.num_tokens // page)}
+        demands = {owner.sub_pool_name: -(-demand.num_tokens // page)}
         for window in self._windows:
             tokens = (
-                targets.swa_num_tokens
+                demand.swa_num_tokens
                 if window is swa
-                else targets.window_num_tokens.get(self.window_component(window), 0)
+                else demand.window_num_tokens.get(self.window_component(window), 0)
             )
             demands[window.sub_pool_name] = -(-tokens // page)
         if state is not None:
-            demands[state.sub_pool_name] = targets.mamba_num
+            demands[state.sub_pool_name] = demand.mamba_num
         return self._reclaim(tree_cache, demands)
 
     def _reclaim(self, tree_cache, demands: Dict[str, int]) -> EvictResult:
@@ -947,9 +947,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             or params.window_num_tokens
             or params.mamba_num
         ):
-            step = tree_cache.evict_for_alloc(
-                params,
-                allocation_reclaim_satisfied=lambda: self._fits_after_frees(demands),
+            step = tree_cache.evict_until(
+                params, satisfied=lambda: self._fits_after_frees(demands)
             )
             result.num_tokens_evicted += step.num_tokens_evicted
             result.swa_num_tokens_evicted += step.swa_num_tokens_evicted

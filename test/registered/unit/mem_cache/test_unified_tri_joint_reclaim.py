@@ -192,7 +192,7 @@ class TestTriJointReclaim(CustomTestCase):
                             receipts.append((node, c.inc_lock_ref(node)))
                     try:
                         with patch.object(
-                            c, "evict_for_alloc", wraps=c.evict_for_alloc
+                            c, "evict_until", wraps=c.evict_until
                         ) as walks:
                             for _ in range(3):
                                 evict_from_tree_cache(c, 4 if locked else 200)
@@ -237,13 +237,13 @@ class TestTriJointReclaim(CustomTestCase):
             self.assertEqual(c.full_evictable_size(), 0)
             self.assertGreater(c.mamba_evictable_size(), 0)
             phases = []
-            original = c.evict_for_alloc
+            original = c.evict_until
 
             def walk(params, **kw):
                 phases.append(params)
                 return original(params, **kw)
 
-            with patch.object(c, "evict_for_alloc", side_effect=walk):
+            with patch.object(c, "evict_until", side_effect=walk):
                 evict_from_tree_cache(c, demand)
                 got = a.alloc(demand)
             self.assertIsNotNone(got)
@@ -339,9 +339,7 @@ class TestTriJointReclaim(CustomTestCase):
                     else:
                         a.free_swa(pending)
                         a.free_full(pending)
-                    with patch.object(
-                        c, "evict_for_alloc", wraps=c.evict_for_alloc
-                    ) as walks:
+                    with patch.object(c, "evict_until", wraps=c.evict_until) as walks:
                         evict_from_tree_cache(c, 2)
                         got = a.alloc(2)
                     self.assertIsNotNone(got)
@@ -433,7 +431,7 @@ class TestTriJointReclaim(CustomTestCase):
         self.insert_parts(c, slots, states)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
-            patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
+            patch.object(c, "evict_until", wraps=c.evict_until) as walks,
         ):
             evict_from_tree_cache(c, 0)
             self.assertEqual(prep.call_count, 0)
@@ -445,7 +443,7 @@ class TestTriJointReclaim(CustomTestCase):
             hold_band(member)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
-            patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
+            patch.object(c, "evict_until", wraps=c.evict_until) as walks,
         ):
             evict_from_tree_cache(c, 90)
             got = a.alloc(90)
@@ -683,15 +681,24 @@ class TestTriJointReclaim(CustomTestCase):
                             )
                         )
                 phases = []
-                original = c.evict_for_alloc
+                fits = []
+                original = c.evict_until
 
                 def walk(params, **kw):
+                    satisfied = kw["satisfied"]
+                    fits.append([])
+
+                    def checked():
+                        fits[-1].append(satisfied())
+                        return fits[-1][-1]
+
+                    kw["satisfied"] = checked
                     result = original(params, **kw)
                     phases.append((params, result))
                     return result
 
                 try:
-                    with patch.object(c, "evict_for_alloc", side_effect=walk):
+                    with patch.object(c, "evict_until", side_effect=walk):
                         evict_from_tree_cache(c, demand)
                         self.assertIsNotNone(a.alloc(demand))
                     self.assertEqual(phases[0][1].mamba_num_evicted, group)
@@ -722,6 +729,10 @@ class TestTriJointReclaim(CustomTestCase):
                     else:
                         self.assertEqual(len(phases), 1)
                         self.assertEqual(evicted, group)
+                    # Only the last walk ever found the demand fitting: no
+                    # walk ran on after the fit.
+                    self.assertTrue(any(fits[-1]))
+                    self.assertFalse(any(any(f) for f in fits[:-1]))
                     for node, prior in records[1:]:
                         torch.testing.assert_close(
                             c.tree_core.get_component_device_value(
@@ -757,7 +768,7 @@ class TestTriJointReclaim(CustomTestCase):
                         checkpoints.append(c.full_evictable_size())
                     return ready
 
-                evict = c.evict_for_alloc
+                evict = c.evict_until
 
                 def checked_evict(*args, **kwargs):
                     result = evict(*args, **kwargs)
@@ -774,7 +785,7 @@ class TestTriJointReclaim(CustomTestCase):
 
                 with (
                     patch.object(a, "_units_fit", side_effect=checked_query),
-                    patch.object(c, "evict_for_alloc", side_effect=checked_evict),
+                    patch.object(c, "evict_until", side_effect=checked_evict),
                     patch.object(sa, "relocate_into", wraps=sa.relocate_into) as move,
                     patch.object(
                         a, "ensure_capacity", wraps=a.ensure_capacity
