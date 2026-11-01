@@ -3,7 +3,6 @@ import importlib.util
 from typing import Optional
 
 import torch
-from packaging.version import Version
 
 from sglang.srt.environ import envs
 
@@ -106,20 +105,8 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
     return _linear_bf16_fp32_algo == "hpc" and _hpc_gemm_bf16xfp32_available()
 
 
-@functools.cache
-def _supports_bf16_fp32_output(torch_version: str, hip_version: Optional[str]) -> bool:
-    # The Torch 2.9 dev build in the ROCm 7.0 image accepts out_dtype but
-    # rejects BF16 -> FP32 GEMM. Keep the existing FP32-input fallback there.
-    return hip_version is None or Version(torch_version) >= Version("2.9.1")
-
-
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if (
-        x.is_cuda
-        and x.dtype == torch.bfloat16
-        and y.dtype == torch.bfloat16
-        and _supports_bf16_fp32_output(torch.__version__, torch.version.hip)
-    ):
+    if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())
 

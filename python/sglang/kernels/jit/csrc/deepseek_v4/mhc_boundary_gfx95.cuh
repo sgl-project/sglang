@@ -135,8 +135,6 @@ constexpr int kStageCoefBytes = kBlockM * kCoefRowBytes;
 constexpr int kStageBytes = kStageTilesBytes + kStageCoefBytes;
 
 __device__ __forceinline__ void issue_coef_prefetch(const Params& p, int block, int lane, lds_u8* coef_stage) {
-  // ROCm 7.0's host pass rejects gfx950's 16-byte LDS load intrinsic.
-#if defined(__HIP_DEVICE_COMPILE__)
   // chunk c: row c / 6, part c % 6 (post, comb x4, pre); rows past M read row M - 1, never stored
 #pragma unroll
   for (int a = 0; a < 2; ++a) {
@@ -157,7 +155,6 @@ __device__ __forceinline__ void issue_coef_prefetch(const Params& p, int block, 
       __builtin_amdgcn_global_load_lds(const_cast<float*>(src), coef_stage + a * 1024, 16, 0, 0);
     }
   }
-#endif
 }
 
 // All 24 coefficients of this lane's row: post[4] comb[16] pre[4].
@@ -181,7 +178,6 @@ __device__ __forceinline__ void read_coefs(const lds_u8* coef_stage, int r, floa
 template <bool kPostCombine>
 __device__ __forceinline__ void
 issue_prefetch(const Params& p, int slice, int row_of_lane, int chunk_of_lane, lds_u8* stage_wave) {
-#if defined(__HIP_DEVICE_COMPILE__)
   // row_of_lane: the lane's clamped global row; chunk_of_lane: its chunk (+4 for the second 1 KB)
   const int col0 = slice * kBlockK;
   constexpr int tile0 = kPostCombine ? 0 : 1;
@@ -196,7 +192,6 @@ issue_prefetch(const Params& p, int slice, int row_of_lane, int chunk_of_lane, l
           const_cast<uint16_t*>(base + 32 * a), stage_wave + t * kStageTileBytes + a * 1024, 16, 0, 0);
     }
   }
-#endif
 }
 
 // Post form ([1,2] layout): piece m = columns 16m + 4g + 0..3, chunk 2m + (g >> 1), byte (g & 1) * 8.
