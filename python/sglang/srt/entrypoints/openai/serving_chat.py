@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from array import array
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
@@ -481,7 +482,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
-        self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
+        self._chat_template_cache: OrderedDict[bytes, tuple[array, Optional[str]]] = (
             OrderedDict()
         )
         self._doc_splitter = ChatDocSplitter.for_model(
@@ -2223,9 +2224,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
-            # Only a request with media needs the prompt text and its cache: the
-            # MM processor reads the text. A text-only request is decoded later,
-            # and only if it is not sent as ids.
+            # Only a request with media needs the prompt text: the MM processor
+            # reads it. A text-only request is decoded later, and only if it is
+            # not sent as ids.
             has_media = bool(image_data or video_data or audio_data or modalities)
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
@@ -2233,7 +2234,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
-                    use_cache=is_multimodal and has_media,
+                    use_cache=is_multimodal,
+                    decode_prompt=has_media,
                     add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
@@ -2250,7 +2252,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
-                        use_cache=is_multimodal and has_media,
+                        use_cache=is_multimodal,
+                        decode_prompt=has_media,
                         add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
@@ -2299,6 +2302,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
+        decode_prompt: bool = True,
         add_generation_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
         cache_key = None
@@ -2368,12 +2372,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None
+            if cache_key is not None and decode_prompt
             else None
         )
 
         if cache_key is not None:
-            self._chat_template_cache[cache_key] = (tuple(prompt_ids), decoded_prompt)
+            # An array holds an ID in 4 bytes. A tuple of Python ints needs about 25.
+            self._chat_template_cache[cache_key] = (
+                array("i", prompt_ids),
+                decoded_prompt,
+            )
             if len(self._chat_template_cache) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
                 self._chat_template_cache.popitem(last=False)
 

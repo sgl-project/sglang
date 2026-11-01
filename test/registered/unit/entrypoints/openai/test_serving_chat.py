@@ -1740,7 +1740,14 @@ class ServingChatTestCase(CustomTestCase):
 
         adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
         self.assertEqual(adapted.input_ids, [ord(c) for c in "Hi?"])
-        self.assertEqual(len(self.chat._chat_template_cache), 0)
+        tokenizer.decode.assert_not_called()
+
+        # A resend reuses the cached ids.
+        tokenizer.encode.reset_mock()
+        adapted, _ = self.chat._convert_to_internal_request(self.basic_req)
+        self.assertEqual(adapted.input_ids, [ord(c) for c in "Hi?"])
+        tokenizer.encode.assert_not_called()
+        tokenizer.decode.assert_not_called()
 
         # The Responses API sends text on multimodal models, decoded on demand.
         processed = self.chat._process_messages(self.basic_req, is_multimodal=True)
