@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -32,6 +33,13 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+
+
+class _FakeReq(SimpleNamespace):
+    """A request stand-in compared and hashed by identity, like Req."""
+
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
 
 
 class _PendingCopy:
@@ -78,6 +86,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
+        scheduler.running_reqs = RunningReqs()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -367,6 +376,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             with_tensors=True,
         )
         scheduler.chunked_req = MagicMock()
+        scheduler.running_reqs.join([run_req_a, run_req_b, last_req])
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -374,6 +384,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(
             [entry["req"] for entry in requeue_log], [run_req_a, run_req_b, last_req]
         )
+        self.assertEqual(len(scheduler.running_reqs), 0)
         self.assertTrue(all(entry["is_retracted"] for entry in requeue_log))
         self.assertEqual(
             [req.retraction_count for req in (run_req_a, run_req_b, last_req)],
@@ -644,7 +655,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
-        req = SimpleNamespace(
+        req = _FakeReq(
             finished=lambda: False,
             output_ids=[10, 11, 12],
             time_stats=MagicMock(),
@@ -673,7 +684,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
         def _req(rid, req_pool_idx):
-            return SimpleNamespace(
+            return _FakeReq(
                 rid=rid,
                 finished=lambda: False,
                 output_ids=[7],

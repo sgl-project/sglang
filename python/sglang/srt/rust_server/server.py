@@ -14,6 +14,8 @@ import ipaddress
 import logging
 import operator
 import os
+import signal
+import threading
 import time
 from array import array
 from itertools import chain
@@ -25,6 +27,7 @@ import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.managers.io_struct import ShutdownReq
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -40,6 +43,7 @@ from sglang.srt.rust_server.multimodal import (
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -81,6 +85,33 @@ def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
         return False
 
 
+def drain_notify_name(instance_id: str) -> str:
+    """The abstract Unix socket on which the launching process hears that the
+    rank-0 listener's drain ended (``Server.drain_signal_fd``'s ``notify``)."""
+    return f"sglang-rust-drain-{instance_id}"
+
+
+def claim_sigterm_before_compiles() -> None:
+    """Own SIGTERM in Python before this process can JIT-compile anything.
+
+    LLVM (inside Triton) registers its crash handlers on the first compile and,
+    when one of them fires (SIGUSR2, SIGHUP, SIGINT, ...), restores every
+    disposition it saw at registration. A SIGTERM still at SIG_DFL then would
+    silently revert the drain handler installed later; a Python handler is
+    restored as Python's own C handler, which then runs whichever Python
+    handler is current. Until ``install_sigterm_drain``, SIGTERM keeps its
+    default effect: the handler restores SIG_DFL and re-raises, so the process
+    dies of SIGTERM, once the main thread next runs Python code."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def terminate(signum, frame):
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -103,6 +134,10 @@ class RustServer:
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
         self.startup_time: Optional[Dict[str, Any]] = None
+        # Whether this listener's rank broadcasts to every scheduler rank
+        # (global TP rank 0), and so stops them once its drain completes.
+        self._broadcasts_shutdown = False
+        self._shutdown_sent = False
         # Batches whose customized_info could not be sent (see
         # `_customized_info_json`).
         self._dropped_customized_info = 0
@@ -198,7 +233,16 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
-        host = get_serving().host
+        if get_exec().moe.is_ep_joiner:
+            # An elastic-EP joiner stays out: the serving ranks gathered at
+            # their own startup and never enter this collective again, so a
+            # joiner's gather cannot meet them (a scale joiner's returns at
+            # once with unset slots, a recover joiner's waits on them; see
+            # #47505). With no endpoints the joiner's listener fans nothing
+            # out, and the serving ranks' table is untouched.
+            return []
+        bind_host = get_serving().host
+        host = bind_host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another
             # node; advertise the address the interfaces answer on.
@@ -219,19 +263,40 @@ class RustServer:
         config = None
         if hosts_listener:
             port = get_serving().port + cls._port_offset()
+            address = NetworkAddress(host, port)
             config = {
                 "dp_rank": select_kv_publisher_dp_rank(
                     get_parallel().attn_dp_size,
                     get_parallel().attn_dp_rank,
                     get_parallel().dp_rank,
                 ),
-                "endpoint": NetworkAddress(host, port).to_url(),
+                "endpoint": address.to_url(),
             }
+            if bind_host == "0.0.0.0" and address.is_ipv6:
+                config["address_error"] = (
+                    f"DP rank {config['dp_rank']} listens on IPv4 at {bind_host} "
+                    f"but advertises {address.to_url()}; set --host to :: or "
+                    "SGLANG_HOST_IP to an IPv4 address"
+                )
         gathered = get_parallel().world_group.all_gather_object(config)
-        return sorted(
+        table = sorted(
             (entry for entry in gathered if entry is not None),
             key=lambda entry: entry["dp_rank"],
         )
+        # Validate the collective result so every rank fails together, including
+        # ranks that host no listener, instead of leaving peers in the gather.
+        errors = [entry["address_error"] for entry in table if "address_error" in entry]
+        if errors:
+            raise ValueError("SGLANG_RUST_SERVER: " + "; ".join(errors))
+        attn_dp_size = get_parallel().attn_dp_size
+        if attn_dp_size > 1:
+            ranks = [entry["dp_rank"] for entry in table]
+            if ranks != list(range(attn_dp_size)):
+                raise ValueError(
+                    "SGLANG_RUST_SERVER: expected one Rust listener for each of "
+                    f"{attn_dp_size} attention-DP ranks, gathered {ranks}"
+                )
+        return table
 
     @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:
@@ -284,6 +349,7 @@ class RustServer:
             **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
+        instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
@@ -325,6 +391,43 @@ class RustServer:
         )
 
         return instance
+
+    def install_sigterm_drain(self, notify: Optional[str] = None) -> None:
+        """Drain this listener on SIGTERM, which the main process forwards
+        (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
+        manager drains: health answers 503 at once, requests are still
+        admitted, the listener closes once none is left in flight, and then
+        :meth:`drain` stops the schedulers. ``SGL_FORCE_SHUTDOWN`` skips the
+        wait for requests, as in Python.
+
+        The drain begins from a Rust thread woken through the signal wakeup
+        fd, so it begins at once even while this scheduler thread is blocked
+        in a GPU call or collective; a wedged scheduler's listener still closes
+        when its last health probe failed. On the rank that stops the
+        schedulers, ``notify`` names the main process's socket
+        (``drain_notify_name``) that hears when the listener closed.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            logger.warning(
+                "rust server: not on the main thread; SIGTERM will not drain"
+            )
+            return
+        force = get_bool_env_var("SGL_FORCE_SHUTDOWN")
+        if not self._broadcasts_shutdown:
+            notify = None
+
+        def on_sigterm(signum=None, frame=None):
+            # Already begun by the wakeup fd; repeated in case it was not.
+            self.server.begin_drain(force)
+
+        signal.signal(signal.SIGTERM, on_sigterm)
+        wakeup_fd = self.server.drain_signal_fd(signal.SIGTERM, force, notify)
+        previous = signal.set_wakeup_fd(wakeup_fd, warn_on_full_buffer=False)
+        if previous != -1:
+            logger.warning(
+                "rust server: replaced the signal wakeup fd %d to drain on SIGTERM",
+                previous,
+            )
 
     def _wrap_mm_result(self, buffers: dict) -> MultimodalProcessorOutput:
         """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
@@ -395,6 +498,18 @@ class RustServer:
                 continue
             settle_shm_buffers(buffers, admitted=True)
             out.append(obj)
+        if (
+            self._broadcasts_shutdown
+            and not self._shutdown_sent
+            and self.server.drain_complete()
+        ):
+            # Rides the broadcast to every scheduler rank, as Python mode's
+            # `sigterm_watchdog` dispatches it once its requests drained.
+            # TODO(attention DP): wait for every DP listener's drain, not just
+            # this one's; until then their last requests may be cut.
+            logger.info("rust server: drain complete; stopping the schedulers")
+            out.append(ShutdownReq())
+            self._shutdown_sent = True
         return out
 
     def _admit(self, header: bytes, buffers: dict):

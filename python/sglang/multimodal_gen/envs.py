@@ -59,10 +59,12 @@ if TYPE_CHECKING:
     # default while it is validated. Falls back to NCCL when unavailable.
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
     # head groups for pipelining the Ulysses exchange against dense attention
-    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path):
+    # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
+    # or over the collective one for MiniMax-H3 on aiter:
     # -1 picks the most groups that divide the heads per rank while each group's
-    # call still fills the GPU, and steps aside when the buffers do not fit; 0 or
-    # 1 keeps the sequential exchange; N >= 2 forces N groups
+    # call still fills the GPU (two on the collective path), and steps aside when
+    # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces
+    # N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
@@ -223,6 +225,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
+    ),
+    # Store the Wan-Animate-2 reference-video K/V cache in FP8 e4m3 with per-(token, head)
+    # scales, dequantized one block at a time into the attention buffer.
+    "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV": _lazy_bool(
+        "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV", "false"
     ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)

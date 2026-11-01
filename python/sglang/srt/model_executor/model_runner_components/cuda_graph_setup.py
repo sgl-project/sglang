@@ -433,6 +433,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
+        model_runner.maybe_init_uocr_greedy_graph()
         if current_platform.capabilities.graph_capture:
             decode = capture_decode_graph(model_runner=model_runner)
     else:
