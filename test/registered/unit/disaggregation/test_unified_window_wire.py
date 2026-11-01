@@ -41,7 +41,7 @@ from sglang.test.unified_allocator_fixtures import setup_allocator_context
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
-_WINDOWS = (16, 8)
+_WINDOWS = (16, 8, 4)
 
 
 def _storage(windows):
@@ -93,6 +93,7 @@ def _window_names(windows):
 class TestUnifiedWindowWire(CustomTestCase):
     def test_each_window_registers_an_entry_of_its_own(self):
         storage, kv_args = _registered(_WINDOWS)
+        self.assertEqual(kv_args.state_types, [StateType.SWA] * len(_WINDOWS))
         self.assertEqual(set(kv_args.state_sub_pools), _window_names(_WINDOWS))
         self.assertEqual(
             kv_args.state_sub_pools, [e.sub_pool for e in storage.wire_entries()]
@@ -160,7 +161,10 @@ class TestUnifiedWindowWire(CustomTestCase):
 
     def test_peers_with_other_entries_are_refused(self):
         _, prefill = _registered(_WINDOWS)
-        _, decode = _registered(_WINDOWS)
+        # Peers list the same entries whatever order the model declares its
+        # windows in.
+        _, decode = _registered(_WINDOWS[::-1])
+        self.assertEqual(state_wire(prefill), state_wire(decode))
         check_state_wire(state_wire(prefill), state_wire(decode))
         # A peer that does not report its entries is not checked.
         check_state_wire(None, state_wire(decode))
