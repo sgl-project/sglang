@@ -20,6 +20,10 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
 from sglang.kernels.ops.diffusion import apply_matrix_rope, residual_gate_fp32
+from sglang.kernels.ops.diffusion.rope.matrix_rope import (
+    can_qknorm_matrix_rope,
+    qknorm_matrix_rope,
+)
 from sglang.multimodal_gen.configs.models.dits.kandinsky6 import (
     Kandinsky6ArchConfig,
     Kandinsky6VideoAudioConfig,
@@ -301,6 +305,17 @@ def _apply_rotary(
 
 
 class Kandinsky6QKNorm(nn.RMSNorm):
+    def _eps(self) -> float:
+        return torch.finfo(torch.float32).eps if self.eps is None else self.eps
+
+    def can_fuse_rope(self, x: torch.Tensor, rope: torch.Tensor) -> bool:
+        return self.normalized_shape == (128,) and can_qknorm_matrix_rope(
+            x, self.weight.float(), rope
+        )
+
+    def fused_rope(self, x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+        return qknorm_matrix_rope(x, self.weight.float(), rope, self._eps())
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             x.is_cuda
@@ -404,21 +419,27 @@ class Kandinsky6Attention(nn.Module):
         value = value.reshape(*kv_shape, self.local_num_heads, -1)
 
         query_dtype, key_dtype = query.dtype, key.dtype
-        query = self.query_norm(query.float())
-        if rotary_emb is not None:
-            query = _apply_rotary(query, rotary_emb, query_dtype)
+        if rotary_emb is not None and self.query_norm.can_fuse_rope(query, rotary_emb):
+            query = self.query_norm.fused_rope(query, rotary_emb)
         else:
-            query = query.to(query_dtype)
+            query = self.query_norm(query.float())
+            if rotary_emb is not None:
+                query = _apply_rotary(query, rotary_emb, query_dtype)
+            else:
+                query = query.to(query_dtype)
         kv_rope = (
             rotary_emb_kv
             if rotary_emb_kv is not None
             else (rotary_emb if encoder_hidden_states is None else None)
         )
-        key = self.key_norm(key.float())
-        if kv_rope is not None:
-            key = _apply_rotary(key, kv_rope, key_dtype)
+        if kv_rope is not None and self.key_norm.can_fuse_rope(key, kv_rope):
+            key = self.key_norm.fused_rope(key, kv_rope)
         else:
-            key = key.to(key_dtype)
+            key = self.key_norm(key.float())
+            if kv_rope is not None:
+                key = _apply_rotary(key, kv_rope, key_dtype)
+            else:
+                key = key.to(key_dtype)
 
         if context_seq_len is not None:
             key = gather_seq(key, context_seq_len)
@@ -480,7 +501,7 @@ def _norm_scale_shift(
     norm: LayerNormScaleShift, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     """Compute LayerNorm and AdaLN affine in fp32, then restore the input dtype."""
-    return norm(x.float(), shift=shift, scale=scale).type_as(x)
+    return norm(x, shift=shift, scale=scale).type_as(x)
 
 
 class Kandinsky6OutLayer(nn.Module):
@@ -625,12 +646,12 @@ class Kandinsky6TransformerEncoderBlock(Kandinsky6TransformerBlock):
         shift, scale, gate = torch.chunk(self_attn_params, 3, dim=-1)
         out = _norm_scale_shift(self.self_attention_norm, x, shift, scale)
         out = self.self_attention(out, rotary_emb=rope)
-        x = (x.float() + gate.float() * out.float()).type_as(x)
+        x = residual_gate_fp32(x, out, gate)
 
         ff_shift, ff_scale, ff_gate = torch.chunk(ff_params, 3, dim=-1)
         out = _norm_scale_shift(self.feed_forward_norm, x, ff_shift, ff_scale)
         out = self.feed_forward(out)
-        x = (x.float() + ff_gate.float() * out.float()).type_as(x)
+        x = residual_gate_fp32(x, out, ff_gate)
 
         return x
 
@@ -661,35 +682,32 @@ class Kandinsky6TransformerDecoderBlock(Kandinsky6TransformerBlock):
             rotary_emb=rope,
             attn_mask_meta=attn_mask_meta,
         )
-        visual_embed = (
-            visual_embed.float() + self_gate.float() * visual_out.float()
-        ).type_as(visual_embed)
+        visual_embed = residual_gate_fp32(visual_embed, visual_out, self_gate)
 
         cross_shift, cross_scale, cross_gate = torch.chunk(cross_attn_params, 3, dim=-1)
         visual_out = _norm_scale_shift(
             self.cross_attention_norm, visual_embed, cross_shift, cross_scale
         )
         visual_out = self.cross_attention(visual_out, encoder_hidden_states=text_embed)
-        visual_embed = (
-            visual_embed.float() + cross_gate.float() * visual_out.float()
-        ).type_as(visual_embed)
+        visual_embed = residual_gate_fp32(visual_embed, visual_out, cross_gate)
 
         ff_shift, ff_scale, ff_gate = torch.chunk(ff_params, 3, dim=-1)
         visual_out = _norm_scale_shift(
             self.feed_forward_norm, visual_embed, ff_shift, ff_scale
         )
         visual_out = self.feed_forward(visual_out)
-        visual_embed = (
-            visual_embed.float() + ff_gate.float() * visual_out.float()
-        ).type_as(visual_embed)
+        visual_embed = residual_gate_fp32(visual_embed, visual_out, ff_gate)
 
         return visual_embed
 
 
 def _apply_scale_shift(
-    norm: nn.LayerNorm, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    norm: LayerNormScaleShift,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
 ) -> torch.Tensor:
-    return (norm(x.float()) * (scale.float() + 1.0) + shift.float()).type_as(x)
+    return norm(x, shift=shift, scale=scale).type_as(x)
 
 
 class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
@@ -759,8 +777,12 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             model_dim_a if not cross_gates else model_dim_a * 2 + model_dim,
             1 if cross_gates else 3,
         )
-        self.va_normalization = nn.LayerNorm(model_dim, elementwise_affine=False)
-        self.av_normalization = nn.LayerNorm(model_dim_a, elementwise_affine=False)
+        self.va_normalization = LayerNormScaleShift(
+            model_dim, eps=1e-5, elementwise_affine=False, dtype=torch.float32
+        )
+        self.av_normalization = LayerNormScaleShift(
+            model_dim_a, eps=1e-5, elementwise_affine=False, dtype=torch.float32
+        )
         self.ca_rope = ca_rope
         self.cross_gates = cross_gates
         self.fix_modulation = fix_modulation

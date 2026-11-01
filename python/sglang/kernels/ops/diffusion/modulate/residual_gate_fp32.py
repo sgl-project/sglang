@@ -15,7 +15,7 @@ def _residual_gate_fp32_kernel(
     gate,
     out,
     count,
-    TOKENS: tl.constexpr,
+    TOKENS,
     HIDDEN: tl.constexpr,
     GATE_BATCH_STRIDE: tl.constexpr,
     GATE_CHANNEL_STRIDE: tl.constexpr,
@@ -85,8 +85,11 @@ def residual_gate_fp32(
         and x.is_contiguous()
         and update.is_contiguous()
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and update.dtype == x.dtype
-        and gate.dtype in (x.dtype, torch.float32)
+        and (
+            update.dtype == x.dtype
+            or (x.dtype == torch.float32 and update.dtype != torch.float32)
+        )
+        and gate.dtype in (x.dtype, update.dtype, torch.float32)
         and gate.device == update.device == x.device
         and gate.ndim == 3
         and gate.shape[0] in (1, x.shape[0])
