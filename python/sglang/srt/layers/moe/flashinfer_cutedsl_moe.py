@@ -1,3 +1,5 @@
+import inspect
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -6,6 +8,34 @@ from flashinfer import (
     silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
+# The fused NVFP4 epilogue implements only FlashInfer's default quantization
+# recipe and rejects these switches.
+_NVFP4_RECIPE_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+)
+
+
+@lru_cache(maxsize=None)
+def supports_masked_gemm_fused_swiglu(device: torch.device) -> bool:
+    """Whether grouped_gemm_nt_masked can fuse SwiGLU and NVFP4 output on `device`."""
+    params = inspect.signature(grouped_gemm_nt_masked).parameters
+    return (
+        device.type == "cuda"
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+        and all(
+            name in params
+            for name in ("activation_type", "a_per_token_scale", "out_scale")
+        )
+    )
+
+
+def _fused_nvfp4_output_enabled() -> bool:
+    from flashinfer.quantization.nvfp4_quantization_utils import env_flag_enabled
+
+    return not any(env_flag_enabled(name) for name in _NVFP4_RECIPE_ENV_VARS)
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -206,3 +236,138 @@ def flashinfer_cutedsl_moe_masked(
         ),
     )  # in logical [m, k, l]
     return out.permute(2, 0, 1)
+
+
+def flashinfer_cutedsl_moe_masked_fused_swiglu(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    per_token_scale: torch.Tensor,
+    w1: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w1_alpha_up: torch.Tensor,
+    w2: torch.Tensor,
+    a2_global_scale: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    masked_m: torch.Tensor,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+    down_sm_count: Optional[int] = None,
+    down_signals: Optional[torch.Tensor] = None,
+    down_start_event: Optional[torch.cuda.Event] = None,
+) -> torch.Tensor:
+    """Masked NVFP4 MoE with per-token activation scales and a fused SwiGLU GEMM1.
+
+    GEMM1 applies the per-token and per-expert scales and the clamped SwiGLU in
+    its epilogue and, under FlashInfer's default NVFP4 recipe, also quantizes
+    its output for GEMM2.
+
+    Args:
+        hidden_states: [l, m, k // 2] uint8, packed E2M1 activations.
+        hidden_states_scale: E4M3 block scales of hidden_states in the swizzled
+            (32, 4, rm, 4, rk, l) layout.
+        per_token_scale: [l, m] float32 dequantization scale of each row.
+        w1: [l, 2 * n, k // 2] uint8, gate/up rows interleaved in 64-row
+            blocks with the up projection first.
+        w1_blockscale: swizzled E4M3 block scales of w1.
+        w1_alpha, w1_alpha_up: [l] float32 dequantization scales of the gate
+            and up projections.
+        w2: [l, k, n // 2] uint8.
+        a2_global_scale: [l] float32 NVFP4 global scale of the GEMM2 input.
+        w2_blockscale: swizzled E4M3 block scales of w2.
+        w2_alpha: [l] float32 GEMM2 dequantization scale.
+        masked_m: [l] int32 valid rows per expert.
+        swiglu_alpha, swiglu_beta, swiglu_limit: the activation is
+            gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta), with gate
+            clamped above and up clamped on both sides at swiglu_limit.
+
+    Returns:
+        [l, m, k] bfloat16.
+    """
+    from flashinfer import ActivationType
+
+    num_experts, m, k_by_2 = hidden_states.shape
+    k = k_by_2 * 2
+    n = w2.shape[-1] * 2
+    assert hidden_states.dtype == torch.uint8, hidden_states.dtype
+    assert per_token_scale.shape == (num_experts, m), per_token_scale.shape
+    assert w1.shape == (num_experts, 2 * n, k_by_2), w1.shape
+    assert w2.shape == (num_experts, k, n // 2), w2.shape
+    for name, scale in (
+        ("w1_alpha", w1_alpha),
+        ("w1_alpha_up", w1_alpha_up),
+        ("a2_global_scale", a2_global_scale),
+        ("w2_alpha", w2_alpha),
+    ):
+        assert scale.dtype == torch.float32 and scale.shape == (num_experts,), (
+            f"{name} must be float32 of shape ({num_experts},), got "
+            f"{scale.dtype} {tuple(scale.shape)}"
+        )
+
+    device = hidden_states.device
+    sf_vec_size = 16
+    gemm_kwargs = dict(
+        ab_dtype="float4_e2m1fn", sf_dtype="float8_e4m3fn", sf_vec_size=sf_vec_size
+    )
+    gemm1_kwargs = dict(
+        activation_type=ActivationType.Swiglu,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        alpha=w1_alpha,
+        alpha_dtype="float32",
+        alpha_up=w1_alpha_up,
+        a_per_token_scale=per_token_scale,
+        **gemm_kwargs,
+    )
+    lhs = (hidden_states.permute(1, 2, 0), hidden_states_scale)
+    rhs = (w1.permute(1, 2, 0), w1_blockscale)
+
+    if _fused_nvfp4_output_enabled():
+        diq = torch.empty((num_experts, m, n // 2), dtype=torch.uint8, device=device)
+        rm, rk = (m + 127) // 128, n // (sf_vec_size * 4)
+        # Physical (l, rm, rk, 32, 4, 4); GEMM2 reads the logical permuted view.
+        diq_sf = torch.empty(
+            (num_experts, rm, rk, 32, 4, 4), dtype=torch.float8_e4m3fn, device=device
+        )
+        grouped_gemm_nt_masked(
+            lhs,
+            rhs,
+            diq.permute(1, 2, 0),
+            masked_m,
+            c_dtype="float4_e2m1fn",
+            out_scale=diq_sf,
+            global_scale=a2_global_scale,
+            **gemm1_kwargs,
+        )
+        diq = diq.permute(1, 2, 0)
+        diq_sf = diq_sf.permute(3, 4, 1, 5, 2, 0)
+    else:
+        act = torch.empty((num_experts, m, n), dtype=torch.bfloat16, device=device)
+        grouped_gemm_nt_masked(
+            lhs, rhs, act.permute(1, 2, 0), masked_m, c_dtype="bfloat16", **gemm1_kwargs
+        )
+        diq, diq_sf = scaled_fp4_grouped_quantize(act, masked_m, a2_global_scale)
+
+    if down_start_event is not None:
+        down_start_event.record()
+
+    out = torch.empty((num_experts, m, k), dtype=torch.bfloat16, device=device)
+    grouped_gemm_nt_masked(
+        (diq, diq_sf),
+        (w2.permute(1, 2, 0), w2_blockscale),
+        out.permute(1, 2, 0),
+        masked_m,
+        c_dtype="bfloat16",
+        alpha=w2_alpha.view(1, 1, num_experts),
+        alpha_dtype="float32",
+        **gemm_kwargs,
+        **(
+            dict(sm_count=down_sm_count, dst_signals=down_signals)
+            if down_sm_count is not None or down_signals is not None
+            else {}
+        ),
+    )
+    return out

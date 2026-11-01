@@ -107,6 +107,45 @@ def _deepep_precompile_tp_barrier() -> None:
         get_parallel().tp_group.barrier()
 
 
+def _quantize_per_token_nvfp4(
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize to NVFP4 with linear E4M3 block scales and FP32 per-token scales."""
+    tokens, hidden = hidden_states.shape
+    device = hidden_states.device
+    if tokens == 0:
+        return (
+            torch.empty((0, hidden // 2), dtype=torch.uint8, device=device),
+            torch.empty((0, hidden // 16), dtype=torch.uint8, device=device),
+            torch.empty((0,), dtype=torch.float32, device=device),
+        )
+    from flashinfer import SfLayout, nvfp4_quantize
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        nvfp4_per_token_scale_inv,
+    )
+
+    # torch.full keeps the scale on device, so CUDA graph capture stays legal.
+    scale_inv = torch.full(
+        (1,),
+        nvfp4_per_token_scale_inv(current_nvfp4_4over6_config()),
+        dtype=torch.float32,
+        device=device,
+    )
+    x, x_scales, x_per_token_scale = nvfp4_quantize(
+        hidden_states,
+        scale_inv,
+        sfLayout=SfLayout.layout_linear,
+        per_token_activation=True,
+        backend="cute-dsl",
+    )
+    return (
+        x.view(torch.uint8).reshape(tokens, hidden // 2),
+        x_scales.view(torch.uint8).reshape(tokens, hidden // 16),
+        x_per_token_scale.reshape(tokens),
+    )
+
+
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
@@ -136,6 +175,9 @@ class DeepEPLLDispatchOutput(NamedTuple):
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
+    # Per-token FP32 activation scales, [num_local_experts, capacity], for
+    # per-token NVFP4 dispatch.
+    per_token_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -500,6 +542,15 @@ class _DeepEPDispatcherImplBase:
         self.use_mxfp4 = config["use_mxfp4"]
         self.use_mxfp8 = config["use_mxfp8"]
         self.use_nvfp4 = config["use_nvfp4"]
+        self.use_per_token_nvfp4 = self.use_nvfp4 and bool(
+            self.quant_config
+            and self.quant_config.get("nvfp4_per_token_activation", False)
+        )
+        if self.use_per_token_nvfp4 and not hasattr(Buffer, "low_latency_dispatch_fp4"):
+            raise RuntimeError(
+                "Per-token NVFP4 DeepEP dispatch requires a DeepEP build that "
+                "provides Buffer.low_latency_dispatch_fp4."
+            )
 
         # Handle environment variables
         if _is_npu:
@@ -806,7 +857,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        if isinstance(hidden_states, tuple):
+        per_token_scale = None
+        if self.use_per_token_nvfp4:
+            hidden_states, hidden_states_scale, per_token_scale = hidden_states
+        elif isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states_scale = None
@@ -818,6 +872,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_weights,
             masked_m,
             expected_m,
+            per_token_scale,
         )
         return deepep_output
 
@@ -827,6 +882,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        if self.use_per_token_nvfp4:
+            return self._dispatch_core_per_token_nvfp4(hidden_states, topk_ids)
+
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
@@ -870,6 +928,28 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
+
+    def _dispatch_core_per_token_nvfp4(
+        self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
+    ):
+        x, x_scales, x_per_token_scale = _quantize_per_token_nvfp4(hidden_states)
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+        # Swizzled block scales feed the masked grouped GEMM without a relayout.
+        packed_recv, self.packed_recv_count, self.handle, event, hook = (
+            buffer.low_latency_dispatch_fp4(
+                x,
+                x_scales,
+                topk_ids,
+                self.num_max_dispatch_tokens_per_rank,
+                self.num_experts,
+                per_token_scale=x_per_token_scale,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+                swizzle_scales=True,
+            )
+        )
+        return packed_recv, self.packed_recv_count, event, hook
 
     def _get_npu_mxfp_quantization_kwargs(self, buffer: Buffer) -> dict:
         if not _is_npu:
