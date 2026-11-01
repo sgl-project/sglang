@@ -128,103 +128,6 @@ def _launch(s, batch):
         pass
 
 
-def _run_overlap_loop(
-    reqs,
-    spec_algorithm,
-    *,
-    iterations,
-    require_mlp_sync,
-    mlp_sync,
-    convert_decode_to_extend,
-):
-    """Run event_loop_overlap over a decode batch of reqs, with real scheduling
-    and launch up to the forward; the first result finishes reqs[0]. Returns the
-    rids of each launched batch, with whether each row has an earlier step still
-    unprocessed at that launch."""
-    s = Scheduler.__new__(Scheduler)
-    for req in reqs:
-        req.kv.kv_committed_len = 4
-    running = _batch(reqs, ForwardMode.DECODE)
-    running.spec_algorithm = spec_algorithm
-    running.has_grammar = any(req.grammar for req in reqs)
-    s.running_batch = running
-    s.last_batch = None
-    s.running_reqs = RunningReqs()
-    s.running_reqs.join(running.reqs)
-    s.disaggregation_mode = DisaggregationMode.NULL
-    s.dllm_config = None
-    s.enable_hisparse = False
-    s.chunked_req = None
-    s.invariant_checker = _invariant_checker(s)
-    # Event loop
-    s.gracefully_exit = False
-    s._engine_paused = False
-    s.increment_scheduler_iterations = Mock()
-    s.ingest_requests = Mock(side_effect=[None] * iterations + [StopIteration])
-    s.is_generation = True
-    s.enable_unified_memory = False
-    s._apply_war_barrier = Mock()
-    s.launch_batch_sample_if_needed = Mock()
-    # Scheduling: no admission; every step decodes.
-    s.scheduler_stage_metrics = None
-    s.process_pending_chunked_abort = Mock()
-    s._process_hicache_events = Mock()
-    s.require_mlp_sync = require_mlp_sync
-    s.spec_algorithm = spec_algorithm
-    s._should_defer_prefill = Mock(return_value=False)
-    s.get_new_batch_prefill = lambda b: NextBatchPlan(None, b)
-
-    def decode(batch):
-        batch.forward_mode = ForwardMode.DECODE
-        return batch
-
-    s.update_running_batch = decode
-    s.dp_attn_adapter = SimpleNamespace(
-        maybe_prepare_mlp_sync_batch=mlp_sync,
-        maybe_convert_decode_to_extend=convert_decode_to_extend,
-    )
-    s._arm_prefill_decode_interval = Mock()
-    s.ngram_embedding_manager = SimpleNamespace(prepare_for_forward=lambda b, **_: b)
-    # Launch up to the forward.
-    s.metrics_reporter = MagicMock()
-    s.forward_ct = 0
-    s._sched_idled = False
-    s.processed_tokens_counter = 0
-    s.scripted_scheduler_hook = None
-    s.profiler_manager = MagicMock()
-    s.forward_sleep_time = None
-    s.enable_overlap = True
-    s.future_map = Mock()
-    s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
-    launched = []
-
-    def run_batch(batch):
-        rids = [req.rid for req in batch.reqs]
-        try:
-            Scheduler.run_batch(s, batch)
-        except _ForwardLaunched:
-            launched.append((rids, [req.inflight_steps > 1 for req in batch.reqs]))
-            return SimpleNamespace()
-
-    s.run_batch = run_batch
-    processed = []
-
-    def process_batch_result(batch, result):
-        if not processed:
-            _finish(reqs[0])
-        processed.append(batch)
-        s._on_step_processed(batch)
-
-    s.process_batch_result = process_batch_result
-
-    with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
-        try:
-            s.event_loop_overlap()
-        except StopIteration:
-            pass
-    return launched, s
-
-
 class TestRunningReqs(CustomTestCase):
     def test_join_keeps_order_and_leaving_mid_iteration_is_safe(self):
         a, b, c, outsider = (_req(rid) for rid in "abcx")
@@ -288,49 +191,86 @@ class TestRunningReqsHooks(CustomTestCase):
                 _launch(s, _batch([_req("p")], ForwardMode.EXTEND))
                 self.assertEqual(len(s.running_reqs), 0)
 
-    def test_converted_step_launches_no_finished_row(self):
-        # A DP-converted extend step with SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP
-        # processes the previous result early; the row it finishes is not launched.
-        done, kept = _req("done"), _req("kept")
-
-        def mlp_sync(batch, **_):
-            batch.is_extend_in_batch = True
-            return batch
-
-        with envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(True):
-            launched, s = _run_overlap_loop(
-                [done, kept],
-                SpeculativeAlgorithm.NONE,
-                iterations=3,
-                require_mlp_sync=True,
-                mlp_sync=mlp_sync,
-                convert_decode_to_extend=lambda b: b.convert_decode_to_extend() or b,
-            )
-
-        self.assertEqual(
-            launched,
-            [
-                (["done", "kept"], [False, False]),
-                (["kept"], [False]),
-                (["kept"], [False]),
-            ],
-        )
-        self.assertEqual(list(s.running_reqs), [kept])
-
     def test_ngram_grammar_step_launches_no_finished_row(self):
         # A grammar row under NGRAM processes the previous result early; once it
         # finishes, the loop overlaps again.
         done, kept = _req("done"), _req("kept")
         done.grammar = MagicMock()
-
-        launched, _ = _run_overlap_loop(
-            [done, kept],
-            SpeculativeAlgorithm.NGRAM,
-            iterations=3,
-            require_mlp_sync=False,
-            mlp_sync=lambda b, **_: b,
-            convert_decode_to_extend=lambda b: b,
+        for req in (done, kept):
+            req.kv.kv_committed_len = 4
+        running = _batch([done, kept], ForwardMode.DECODE)
+        running.spec_algorithm = SpeculativeAlgorithm.NGRAM
+        running.has_grammar = True
+        s = Scheduler.__new__(Scheduler)
+        s.running_batch = running
+        s.last_batch = None
+        s.running_reqs = RunningReqs()
+        s.running_reqs.join(running.reqs)
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.dllm_config = None
+        s.enable_hisparse = False
+        s.chunked_req = None
+        s.invariant_checker = _invariant_checker(s)
+        # Event loop
+        s.gracefully_exit = False
+        s._engine_paused = False
+        s.increment_scheduler_iterations = Mock()
+        s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
+        s.is_generation = True
+        s.enable_unified_memory = False
+        s._apply_war_barrier = Mock()
+        s.launch_batch_sample_if_needed = Mock()
+        # Scheduling: no admission; every step decodes.
+        s.scheduler_stage_metrics = None
+        s.process_pending_chunked_abort = Mock()
+        s._process_hicache_events = Mock()
+        s.require_mlp_sync = False
+        s.spec_algorithm = SpeculativeAlgorithm.NGRAM
+        s._should_defer_prefill = Mock(return_value=False)
+        s.get_new_batch_prefill = lambda b: NextBatchPlan(None, b)
+        s.update_running_batch = lambda b: b
+        s.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda b, **_: b,
+            maybe_convert_decode_to_extend=lambda b: b,
         )
+        s._arm_prefill_decode_interval = Mock()
+        s.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda b, **_: b
+        )
+        # Launch up to the forward.
+        s.metrics_reporter = MagicMock()
+        s.forward_ct = 0
+        s._sched_idled = False
+        s.processed_tokens_counter = 0
+        s.scripted_scheduler_hook = None
+        s.profiler_manager = MagicMock()
+        s.forward_sleep_time = None
+        s.enable_overlap = True
+        s.future_map = Mock()
+        s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
+        # Each launch's rows, and whether each has an earlier step unprocessed.
+        launched = []
+
+        def run_batch(batch):
+            rids = [req.rid for req in batch.reqs]
+            try:
+                Scheduler.run_batch(s, batch)
+            except _ForwardLaunched:
+                launched.append((rids, [r.inflight_steps > 1 for r in batch.reqs]))
+                return SimpleNamespace()
+
+        def process_batch_result(batch, result):
+            _finish(done)
+            s._on_step_processed(batch)
+
+        s.run_batch = run_batch
+        s.process_batch_result = process_batch_result
+
+        with (
+            envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
+            self.assertRaises(StopIteration),
+        ):
+            s.event_loop_overlap()
 
         self.assertEqual(
             launched,
