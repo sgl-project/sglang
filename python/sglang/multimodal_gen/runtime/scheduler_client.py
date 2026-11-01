@@ -165,9 +165,16 @@ class SchedulerClient:
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
 
-    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
-        return self._forward_routed(batch, timeout_ms)
+    def forward(
+        self, batch: Any, timeout_ms: int | None = None, *, replica: int | None = None
+    ) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response.
+
+        `replica` pins an ordinary request to one replica, bypassing the
+        round-robin so the counter only advances for real traffic. Control
+        requests always reach every replica.
+        """
+        return self._forward_routed(batch, timeout_ms, replica)
 
     def _forward_one(self, endpoint: str, batch: Any, timeout_ms: int | None) -> Any:
         socket = self.context.socket(zmq.REQ)
@@ -190,14 +197,17 @@ class SchedulerClient:
         finally:
             socket.close()
 
-    def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
+    def _forward_routed(
+        self, batch: Any, timeout_ms: int | None, replica: int | None = None
+    ) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
         if isinstance(batch, _CONTROL_REQ_TYPES):
             results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
             output_batch = _merge_fanout_results(results)
         else:
-            replica = _select_replica(batch, len(endpoints), self._replica_counter)
+            if replica is None:
+                replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
         self.request_logger.log_finished_request(batch, output_batch)
         return output_batch
@@ -268,8 +278,15 @@ class AsyncSchedulerClient:
             for task in self._pending_requests:
                 task.cancel()
 
-    async def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
+    async def forward(
+        self, batch: Any, timeout_ms: int | None = None, *, replica: int | None = None
+    ) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response.
+
+        `replica` pins an ordinary request to one replica, bypassing the
+        round-robin so the counter only advances for real traffic. Control
+        requests always reach every replica.
+        """
         self.request_logger.log_received_request(batch)
         if self.context is None:
             raise RuntimeError(
@@ -284,7 +301,8 @@ class AsyncSchedulerClient:
             ]
             output_batch = _merge_fanout_results(results)
         else:
-            replica = _select_replica(batch, len(endpoints), self._replica_counter)
+            if replica is None:
+                replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = await self._forward_one(
                 endpoints[replica], batch, timeout_ms
             )
