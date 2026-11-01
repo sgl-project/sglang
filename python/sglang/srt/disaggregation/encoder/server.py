@@ -1752,7 +1752,7 @@ class MMEncoder:
                 mm_hashes = [mm_item.hash for mm_item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get(mm_hashes)
+                    mm_cache = self.mm_cache.get(mm_hashes, combined_hash=mm_hash)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                         cache_hit = True
