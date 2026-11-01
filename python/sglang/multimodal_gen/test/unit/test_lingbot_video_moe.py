@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -15,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
 )
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    resolve_sequence_shard,
 )
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.layers.moe import (
@@ -111,7 +116,7 @@ def test_router_bias_shifts_selection_but_not_gate_weights():
     assert abs(picked[3] - float(raw[1])) < 1e-5
 
 
-def _sdpa(q, k, v, attn_mask=None, attn_mask_meta=None):
+def _sdpa(q, k, v, attn_mask=None, attn_mask_meta=None, **_sp_kwargs):
     q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     if attn_mask is not None and attn_mask.dim() == 2:
         attn_mask = attn_mask[:, None, None, :]
@@ -173,7 +178,7 @@ def test_attention_forwards_2d_mask_and_varlen_metadata(monkeypatch):
     hidden = num_heads * head_dim
     captured = {}
 
-    def capture_attention(q, k, v, attn_mask=None, attn_mask_meta=None):
+    def capture_attention(q, k, v, attn_mask=None, attn_mask_meta=None, **_sp_kwargs):
         captured["mask"] = attn_mask
         captured["meta"] = attn_mask_meta
         return _sdpa(q, k, v, attn_mask=attn_mask)
@@ -394,3 +399,30 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         torch.testing.assert_close(
             vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
         )
+
+
+def test_lingbot_uses_model_level_sequence_sharding():
+    config = LingBotVideoMoEPipelineConfig()
+    assert resolve_sequence_shard(config, None)
+
+    latents = torch.zeros(1, 16, 21, 4, 4)
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe.get_sp_world_size",
+        return_value=2,
+    ):
+        sharded, did_shard = config.shard_latents_for_sp(
+            SimpleNamespace(enable_sequence_shard=True), latents
+        )
+        with pytest.raises(ValueError, match="model-level sequence sharding"):
+            config.shard_latents_for_sp(
+                SimpleNamespace(enable_sequence_shard=False), latents
+            )
+
+    assert not did_shard
+    assert sharded is latents
+
+
+def test_lingbot_sp_rejects_dynamic_batching():
+    config = LingBotVideoMoEPipelineConfig()
+    with pytest.raises(ValueError, match="dynamic batching"):
+        config.validate_server_args(SimpleNamespace(sp_degree=2, batching_max_size=2))
