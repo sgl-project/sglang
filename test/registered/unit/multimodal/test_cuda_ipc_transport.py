@@ -329,7 +329,7 @@ class TestCudaIpcTransport(CustomTestCase):
             args=(proxy_queue, consumer_done, producer_results),
         )
         producer.start()
-        proxy = None
+        proxy = item = output = None
         producer_result = None
         original_empty = torch.empty
         try:
@@ -370,7 +370,8 @@ class TestCudaIpcTransport(CustomTestCase):
             torch.cuda.synchronize()
             self.assertTrue(proxy._consumer_acknowledged)
         finally:
-            del proxy
+            # the processor output also owns the proxy and its imported mapping
+            del output, item, proxy
             _pool_handle_cache_clear()
             gc.collect()
             torch.cuda.ipc_collect()
