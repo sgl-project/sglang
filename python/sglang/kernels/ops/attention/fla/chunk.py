@@ -110,7 +110,9 @@ def chunk_gated_delta_rule_fwd_pipelined(
         o[:, seq_len:].zero_()
     nt = triton.cdiv(seq_len, CHUNK_SIZE)
     cuts = [nt * i // parts * CHUNK_SIZE for i in range(parts)] + [seq_len]
-    g = chunk_local_cumsum(g[:, :seq_len], chunk_size=CHUNK_SIZE)
+    # Each part's kkt + solve takes the chunk-local cumsum of its rows of g.
+    g_raw = g[:, :seq_len]
+    g = torch.empty_like(g_raw, dtype=torch.float32)
     h = k.new_empty(1, nt, H, V, K)
 
     def rows(x, i):
@@ -121,7 +123,11 @@ def chunk_gated_delta_rule_fwd_pipelined(
 
     def intra(i):
         w, u, _ = chunk_gated_delta_rule_fwd_intra(
-            k=rows(k, i), v=rows(v, i), g=rows(g, i), beta=rows(beta, i)
+            k=rows(k, i),
+            v=rows(v, i),
+            g=rows(g_raw, i),
+            beta=rows(beta, i),
+            g_out=rows(g, i),
         )
         return w, u
 
