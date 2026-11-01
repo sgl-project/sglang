@@ -1091,24 +1091,28 @@ def megakernel_disable_reasons(
         f"{f.value} is in use and {spec.name} does not accept it"
         for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
     ]
-    one_of = [
-        ("tp_size", cfg.tp_size, req.tp_sizes),
-        (
-            "decode CUDA graphs",
-            cfg.cuda_graph_config.decode.backend,
-            req.decode_graph_backends,
-        ),
-    ] + (
+    one_of = (
         [
+            ("tp_size", cfg.tp_size, req.tp_sizes),
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend,
-                req.prefill_graph_backends,
-            )
+                "decode CUDA graphs",
+                cfg.cuda_graph_config.decode.backend,
+                req.decode_graph_backends,
+            ),
         ]
-        if req.prefill_graph_backends
-        else []
-    ) + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
+        + (
+            [
+                (
+                    "prefill CUDA graphs",
+                    cfg.cuda_graph_config.prefill.backend,
+                    req.prefill_graph_backends,
+                )
+            ]
+            if req.prefill_graph_backends
+            else []
+        )
+        + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
+    )
     exactly = [
         # another model's config may not have the field at all
         (f"config.{key}", getattr(hf_config, key, None), want)
@@ -1209,7 +1213,9 @@ def install_megakernel(
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
-        prefill_widths=_prefill_widths() if spec.requires.prefill_graph_backends else (),
+        prefill_widths=_prefill_widths()
+        if spec.requires.prefill_graph_backends
+        else (),
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
     )

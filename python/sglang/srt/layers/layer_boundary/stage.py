@@ -395,7 +395,10 @@ class StageBoundary:
                 and plan.enters_stack
             ):
                 get_forward().set(
-                    "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
+                    "sp_active",
+                    layernorm_sp.runs_sp(
+                        forward_batch.forward_mode, hidden_states.shape[0]
+                    ),
                 )
                 if get_forward().sp_active:
                     hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)

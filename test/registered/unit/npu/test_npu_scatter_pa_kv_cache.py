@@ -206,7 +206,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
         )
 
         inner_pool.set_kv_buffer.assert_called_once_with(
-            None,
+            layer,
             swa_loc,
             cache_k,
             cache_v,

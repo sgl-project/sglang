@@ -67,6 +67,11 @@ SPEC = MegakernelSpec(
 )
 # an empty field accepts any value
 ANY_TP = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
+# a spec that also covers prefill steps, under breakable prefill graphs
+PREFILL = replace(
+    SPEC,
+    requires=replace(SPEC.requires, prefill_graph_backends=frozenset({"breakable"})),
+)
 # a draft spec: builds no width, offers only the draft sampler
 DRAFT = replace(
     SPEC,
