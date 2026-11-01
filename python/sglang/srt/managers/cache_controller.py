@@ -1392,7 +1392,12 @@ class HiCacheController:
     def can_fit_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
     ) -> bool:
-        """Whether a prefetch bounce can fit when its host pools are empty."""
+        """Whether a prefetch bounce can fit when its host pools are empty.
+
+        Overrides must depend only on pool capacities and the operation,
+        never on live occupancy: the buffer pipeline cuts hits on this
+        result without a collective, so it must be identical on every rank.
+        """
         # need_size is in logical tokens; under DCP each row holds dcp_size.
         return need_size <= self.mem_pool_host.logical_size
 

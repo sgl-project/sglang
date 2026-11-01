@@ -389,6 +389,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_anchor_lost": 0,
             "declined_device_covered": 0,
             "declined_host_oversize": 0,
+            "cut_host_oversize": 0,
+            "declined_host_capacity": 0,
             "declined_unservable_prefix": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,

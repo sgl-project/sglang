@@ -1255,43 +1255,198 @@ class BufferModePipeline:
     ) -> bool:
         """Allocate the hit-sized bounce and queue its storage read.
 
-        False parks the operation for another allocation attempt; True means
-        the operation was queued or declined.
+        A hit too large for one load (``_fit_oversized_prefetch``) is first
+        cut to the longest prefix one load can stage. A busy arena parks an
+        un-cut hit whole; a cut hit it cannot hold now is declined instead
+        (``_decline_cut_prefetch``), never parked. False parks the operation
+        for another allocation attempt; True means the operation was queued
+        or declined.
         """
         cache = self._cache
         cc = cache.cache_controller
-        if self._reject_oversized_prefetch(operation, hit_tokens):
+        span_tokens = self._fit_oversized_prefetch(operation, hit_tokens)
+        if span_tokens == 0:
             return True
+        cut = span_tokens < hit_tokens
+        # The trailing sidecars' endpoint moves with the cut.
+        aux_hit_tokens -= hit_tokens - span_tokens
         host_indices, alloc_len = self._allocate_prefetch_host_indices(
-            operation, hit_tokens
+            operation, span_tokens
         )
         if host_indices is None:
+            if cut:
+                return self._decline_cut_prefetch(
+                    operation, max(alloc_len, aux_hit_tokens)
+                )
             return self._defer_prefetch_for_host_capacity(
                 operation.handle, max(alloc_len, aux_hit_tokens)
             )
         if not cache._alloc_prefetch_aux_staging(info, aux_hit_tokens):
-            # Same outcome as a KV shortfall: nothing stays staged.
-            cc.append_host_mem_release(host_indices=host_indices)
+            # Same outcome as a KV shortfall: nothing stays staged. Free the
+            # bounce (and any pool the shared arena allocated with it) now;
+            # a queued release would hold it until the next drain.
+            cc.free_prefetch_host_buffers(operation, host_indices)
+            if cut:
+                return self._decline_cut_prefetch(
+                    operation, max(alloc_len, aux_hit_tokens)
+                )
             return self._defer_prefetch_for_host_capacity(
                 operation.handle, max(alloc_len, aux_hit_tokens)
             )
-        self._queue_prefetch(operation, info, hit_tokens, host_indices, alloc_len)
+        self._queue_prefetch(operation, info, span_tokens, host_indices, alloc_len)
         return True
 
-    def _reject_oversized_prefetch(
-        self, operation: PrefetchOperation, tokens: int
-    ) -> bool:
+    def _decline_cut_prefetch(self, operation: PrefetchOperation, tokens: int) -> bool:
+        """Decline a cut hit the arena cannot hold now, as cache mode declines
+        a hit it cannot allocate: the remaining span resolves as a
+        host-capacity shortfall and the operation is revoked (holding
+        nothing). No re-issue is armed: a re-issued span that fits one load
+        would come back as an un-cut hit and park under the same backlog,
+        which is the trap this decline avoids; main declined the oversized
+        hit without a retry too.
+
+        A cut hit is never parked: its load needs the whole load budget free,
+        which a write backlog (staged up to the budget while nothing is
+        granted) can withhold for as long as writes keep coming, and a parked
+        head blocks every later hit. Declining is what the un-cut hit got
+        before the cut existed; un-cut hits keep park-on-busy.
+        """
         cache = self._cache
-        if cache.cache_controller.can_fit_prefetch_host_buffers(operation, tokens):
-            return False
-        cache._prefetch_outcome_stats["declined_host_oversize"] += 1
-        prefetch_logger.warning(
-            "HiCache buffer prefetch declined req=%s: the Full/sidecar "
-            "bounce cannot fit in an empty host arena",
-            operation.handle,
+        request = operation.handle
+        cache._prefetch_outcome_stats["declined_host_capacity"] += 1
+        prefetch_logger.info(
+            "HiCache buffer prefetch declined req=%s: the arena cannot hold the "
+            "%d-token cut hit now",
+            request,
+            operation.storage_hit_count,
         )
-        cache.revoke_pending_prefetch(operation.handle)
+        cache._finish_storage_prefetch(
+            request, fulfilled_tokens=0, reason="host_capacity"
+        )
+        cache.revoke_pending_prefetch(request)
+        cache._log_storage_prefetch_deferred(tokens, "host_capacity")
         return True
+
+    def _fit_oversized_prefetch(
+        self, operation: PrefetchOperation, hit_tokens: int
+    ) -> int:
+        """The span to stage: the hit, or a hit one load cannot hold cut to
+        the longest page-aligned prefix one load can (0 declines the hit).
+
+        One load holds at most the load budget (``prefetch_capacity_limit``,
+        the occupancy the parked retry is gated on) inside an empty arena
+        (``can_fit_prefetch_host_buffers``). Both read pool capacities and
+        the agreed hit, never occupancy, so every rank cuts identically
+        without a collective. A hit carrying trailing sidecars (SWA windows,
+        Mamba state) may only end on a prefix every rank agreed restorable;
+        with no such prefix inside the fit, or only one below the prefetch
+        threshold, the hit is declined as before.
+        """
+        cache = self._cache
+        if self._prefetch_span_fits(operation, hit_tokens):
+            return hit_tokens
+        page_size = cache.page_size
+        # Staging need grows with the prefix: bisect for the longest fit.
+        low, high = 0, hit_tokens // page_size
+        while low < high:
+            mid = (low + high + 1) // 2
+            if self._prefetch_span_fits(operation, mid * page_size):
+                low = mid
+            else:
+                high = mid - 1
+        fit_pages = self._restorable_fit_pages(operation, low)
+        span_tokens = fit_pages * page_size
+        if span_tokens < cache.prefetch_threshold:
+            cache._prefetch_outcome_stats["declined_host_oversize"] += 1
+            prefetch_logger.warning(
+                "HiCache buffer prefetch declined req=%s: no restorable prefix "
+                "of the %d-token Full/sidecar hit fits one load (%d tokens fit, "
+                "threshold %d)",
+                operation.handle,
+                hit_tokens,
+                span_tokens,
+                cache.prefetch_threshold,
+            )
+            cache.revoke_pending_prefetch(operation.handle)
+            return 0
+        self._trim_prefetch_tail(operation, hit_tokens, span_tokens)
+        cache._prefetch_outcome_stats["cut_host_oversize"] += 1
+        prefetch_logger.info(
+            "HiCache buffer prefetch req=%s cut from %d to %d tokens: the hit "
+            "does not fit one load",
+            operation.handle,
+            hit_tokens,
+            span_tokens,
+        )
+        return span_tokens
+
+    def _prefetch_span_fits(self, operation: PrefetchOperation, tokens: int) -> bool:
+        """Whether one load of the hit's first ``tokens`` can be staged: it
+        fits the empty arena (KV plus the sidecar pools' needs) and its
+        anchor-unit occupancy stays within the load budget."""
+        cc = self._cache.cache_controller
+        return (
+            cc.can_fit_prefetch_host_buffers(operation, tokens)
+            and self._host_request_units(tokens, operation.pool_transfers)
+            <= cc.prefetch_capacity_limit
+        )
+
+    @staticmethod
+    def _restorable_fit_pages(operation: PrefetchOperation, fit_pages: int) -> int:
+        """The longest prefix of the hit, at most ``fit_pages`` of its chain,
+        the trailing sidecars can restore; the fit itself without them.
+
+        Contract: ``operation.restorable_hit_pages`` is the rank-agreed set
+        the hit-query sync stores (chain prefix lengths in pages from the
+        queried span's start). A controller that agrees the hit elsewhere
+        and leaves it None gets no cut for such hits: nothing proves a
+        shorter window exists, so the hit is declined as before.
+        """
+        if not any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or ()
+        ):
+            return fit_pages
+        restorable = operation.restorable_hit_pages
+        if restorable is None:
+            return 0
+        head_pages = (
+            len(operation.sidecar_hash_values) - len(operation.hash_value)
+            if operation.sidecar_hash_values is not None
+            else 0
+        )
+        return max(
+            (
+                page - head_pages
+                for page in restorable
+                if head_pages < page <= head_pages + fit_pages
+            ),
+            default=0,
+        )
+
+    def _trim_prefetch_tail(
+        self, operation: PrefetchOperation, hit_tokens: int, span_tokens: int
+    ) -> None:
+        """Cut the hit to its first ``span_tokens`` before the bounce alloc,
+        which sizes and keys the trailing sidecars from the operation: the KV
+        chain and hit count, the trailing sidecars' endpoint
+        (``sidecar_hash_values`` stays the chain ending where ``hash_value``
+        ends, as after a head trim), and the dropped tokens resolved as a
+        host-capacity shortfall, as cache mode resolves a partial
+        allocation."""
+        cache = self._cache
+        assert 0 < span_tokens < hit_tokens and span_tokens % cache.page_size == 0
+        cut_pages = (hit_tokens - span_tokens) // cache.page_size
+        cache._resolve_storage_prefetch_tokens(
+            operation.handle, hit_tokens - span_tokens, reason="host_capacity"
+        )
+        operation.hash_value = operation.hash_value[: span_tokens // cache.page_size]
+        operation.storage_hit_count = span_tokens
+        if operation.sidecar_hash_values is not None:
+            operation.sidecar_hit_pages -= cut_pages
+            operation.sidecar_hash_values = operation.sidecar_hash_values[
+                : operation.sidecar_hit_pages
+            ]
 
     def _allocate_prefetch_host_indices(
         self, operation: PrefetchOperation, tokens: int
