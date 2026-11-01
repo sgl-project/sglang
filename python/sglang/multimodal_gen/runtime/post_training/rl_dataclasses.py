@@ -50,12 +50,24 @@ def _cat_per_output(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
     return torch.cat(tensors, dim=0)
 
 
+# Env entries whose axis 0 is a sequence position (RoPE caches), not a sample.
+# They are shared across outputs, so merge and selection must pass them through.
+_SEQUENCE_CACHE_KEYS = frozenset({"freqs_cis", "freqs_complex"})
+
+
 def _map_env_tensors(value: Any, fn) -> Any:
-    """Apply ``fn`` to tensors nested in the denoising environment."""
+    """Apply ``fn`` to sample-aligned tensors nested in the denoising environment."""
     if isinstance(value, torch.Tensor):
         return fn(value)
     if isinstance(value, dict):
-        return {key: _map_env_tensors(item, fn) for key, item in value.items()}
+        return {
+            key: (
+                item
+                if key in _SEQUENCE_CACHE_KEYS
+                else _map_env_tensors(item, fn)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, tuple):
         return tuple(_map_env_tensors(item, fn) for item in value)
     if isinstance(value, list):
@@ -80,7 +92,12 @@ def _concat_denoising_envs(
             if not all(value.keys() == keys for value in values):
                 return values[0]
             return {
-                key: concat_values([value[key] for value in values]) for key in keys
+                key: (
+                    values[0][key]
+                    if key in _SEQUENCE_CACHE_KEYS
+                    else concat_values([value[key] for value in values])
+                )
+                for key in keys
             }
         if all(isinstance(value, tuple) for value in values):
             if not all(len(value) == len(values[0]) for value in values):

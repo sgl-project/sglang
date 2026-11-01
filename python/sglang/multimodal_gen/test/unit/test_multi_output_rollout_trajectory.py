@@ -19,7 +19,10 @@ def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
     return RolloutTrajectoryData(
         rollout_log_probs=torch.full((1, _STEPS), tag),
         denoising_env=RolloutDenoisingEnv(
-            pos_cond_kwargs={"prompt_embedding": torch.full((1, 2), tag)},
+            pos_cond_kwargs={
+                "prompt_embedding": torch.full((1, 2), tag),
+                "freqs_cis": (torch.ones(5, 4), torch.zeros(5, 4)),
+            },
             guidance=torch.full((1,), tag),
         ),
         dit_trajectory=RolloutDitTrajectory(
@@ -102,6 +105,18 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             [env.pos_cond_kwargs["prompt_embedding"][0, 0].item() for env in selected],
             [1.0, 2.0, 3.0],
         )
+
+    def test_sequence_rope_caches_are_not_merged_or_sliced(self):
+        merged = concat_rollout_trajectory_data(
+            [_per_output_trajectory(i) for i in range(3)]
+        )
+        cos, sin = merged.denoising_env.pos_cond_kwargs["freqs_cis"]
+        self.assertEqual(tuple(cos.shape), (5, 4))
+        self.assertEqual(tuple(sin.shape), (5, 4))
+        for index in range(3):
+            env = select_output_rollout_trajectory(merged, index).denoising_env
+            cos, _ = env.pos_cond_kwargs["freqs_cis"]
+            self.assertEqual(tuple(cos.shape), (5, 4))
 
     def test_select_without_output_index_returns_group_trajectory(self):
         merged = concat_rollout_trajectory_data(
