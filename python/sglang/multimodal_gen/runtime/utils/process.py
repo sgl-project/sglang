@@ -113,7 +113,11 @@ def kill_process_tree(
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
+    try:
+        children = itself.children(recursive=True)
+    except psutil.NoSuchProcess:
+        # The parent can exit after Process() succeeds but before traversal.
+        return
     killed = []
     for child in children:
         if child.pid == skip_pid:
