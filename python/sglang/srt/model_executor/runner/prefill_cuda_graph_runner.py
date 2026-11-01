@@ -307,6 +307,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _use_draft_input_embeds = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
+    # Preserve the default for runner fixtures that bypass __init__.
+    # Normal initialization assigns the architecture-specific eligibility below.
+    _eager_mm_prefill = False
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
@@ -345,6 +348,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
+        # Image-input replay is validated only for allowlisted architectures.
+        self._eager_mm_prefill = (
+            self.is_multimodal
+            and not model_runner.model_config.is_multimodal_breakable_cuda_graph_supported
+        )
         self.is_dsv41_model = (
             model_runner.model_config.hf_config.model_type == "deepseek_v41"
         )
@@ -1425,7 +1433,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or self._eager_mm_prefill
         ):
             return False
         # Full replay bypasses forward_extend's Python image-mask guard.

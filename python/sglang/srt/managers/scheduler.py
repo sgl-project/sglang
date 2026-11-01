@@ -316,6 +316,9 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
+from sglang.srt.model_executor.dsv4_prefill_graph import (
+    maybe_enable_dsv4_prefill_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -844,6 +847,10 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        # Before any collaborator reads cuda_graph_config.
+        maybe_enable_dsv4_prefill_cuda_graph(
+            server_args=self.server_args, hf_config=self.model_config.hf_config
+        )
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
