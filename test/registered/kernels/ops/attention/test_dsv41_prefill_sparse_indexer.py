@@ -1,7 +1,9 @@
 """The DeepGEMM two-level indexer on the dense prefill path against the torch
 block selection and the dense implementation of the same protocol."""
 
+import os
 import unittest
+from contextlib import contextmanager
 from typing import NamedTuple
 
 import msgspec
@@ -9,6 +11,10 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
+)
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    index_logits_dtype,
+    index_weights_dtype,
 )
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
@@ -373,6 +379,27 @@ def picks(positions: torch.Tensor, row: int) -> set:
     return set(positions[row].tolist()) - {-1}
 
 
+@contextmanager
+def fp32_index_logits():
+    """Pin the index logits (and weights) to fp32: bf16 logits vary with the
+    tile's row count, so the shard and replicated passes -- equal by
+    construction -- still pick differently a few ulps from the floor."""
+    key = "SGLANG_OPT_DSV41_BF16_INDEX_LOGITS"
+    old = os.environ.get(key)
+    os.environ[key] = "0"
+    index_logits_dtype.cache_clear()
+    index_weights_dtype.cache_clear()
+    try:
+        yield
+    finally:
+        if old is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = old
+        index_logits_dtype.cache_clear()
+        index_weights_dtype.cache_clear()
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
     "DeepGEMM's paged sparse MQA logits need SM100",
@@ -551,42 +578,44 @@ class TestPrefillSparseIndexer(CustomTestCase):
         path's own top-k and table bit for bit, and a schedule that drives the
         same scores: shares that pad, come out empty, or cut a request in two
         included."""
-        cases = [
-            (make_case(rows, ctx, seed=rows + ctx), world)
-            for rows, ctx, world in SHARD_CASES
-        ]
-        cases.append((make_multi_case([100, 37, 120], 40000, seed=7), 4))
-        for case, world in cases:
-            with self.subTest(rows=case.data.num_rows, world=world):
-                table, own = publish_sparse(case)
-                ranks = on_every_rank(
-                    world,
-                    case.data.num_rows,
-                    lambda s: publish_sparse(case, s),
-                    {TOPK: own, TOPK_BLOCKS: table.blocks},
-                )
-                for rank, (got_table, got_own) in enumerate(ranks):
-                    # the own top-k is unordered within a row
-                    self.assertTrue(
-                        torch.equal(got_own.sort(-1).values, own.sort(-1).values),
-                        f"rank {rank}: own top-k",
+        with fp32_index_logits():
+            cases = [
+                (make_case(rows, ctx, seed=rows + ctx), world)
+                for rows, ctx, world in SHARD_CASES
+            ]
+            cases.append((make_multi_case([100, 37, 120], 40000, seed=7), 4))
+            for case, world in cases:
+                with self.subTest(rows=case.data.num_rows, world=world):
+                    table, own = publish_sparse(case)
+                    ranks = on_every_rank(
+                        world,
+                        case.data.num_rows,
+                        lambda s: publish_sparse(case, s),
+                        {TOPK: own, TOPK_BLOCKS: table.blocks},
                     )
-                    for field in ("blocks", "phys_blocks", "valid_lens"):
+                    for rank, (got_table, got_own) in enumerate(ranks):
+                        # the own top-k is unordered within a row
+                        self.assertTrue(
+                            torch.equal(got_own.sort(-1).values, own.sort(-1).values),
+                            f"rank {rank}: own top-k",
+                        )
+                        for field in ("blocks", "phys_blocks", "valid_lens"):
+                            self.assertTrue(
+                                torch.equal(
+                                    getattr(got_table, field), getattr(table, field)
+                                ),
+                                f"rank {rank}: {field}",
+                            )
+                        # The schedule buffer holds bytes its build never writes,
+                        # so two replicated builds of one input already differ
+                        # byte for byte; what it must reproduce is the scores it
+                        # drives.
                         self.assertTrue(
                             torch.equal(
-                                getattr(got_table, field), getattr(table, field)
+                                valid_scores(got_table, case), valid_scores(table, case)
                             ),
-                            f"rank {rank}: {field}",
+                            f"rank {rank}: schedule",
                         )
-                    # The schedule buffer holds bytes its build never writes, so
-                    # two replicated builds of one input already differ byte for
-                    # byte; what it must reproduce is the scores it drives.
-                    self.assertTrue(
-                        torch.equal(
-                            valid_scores(got_table, case), valid_scores(table, case)
-                        ),
-                        f"rank {rank}: schedule",
-                    )
 
     @torch.inference_mode()
     def test_row_shards_select_the_replicated_full_topk(self):
@@ -597,24 +626,27 @@ class TestPrefillSparseIndexer(CustomTestCase):
             sharded_dense_prefill_topk,
         )
 
-        for rows, ctx, world in SHARD_CASES:
-            with self.subTest(rows=rows, world=world):
-                case = make_case(rows, ctx, seed=rows * 5 + ctx)
-                expected = case.data.empty_selection(TOPK)
-                dense_prefill_topk(case.data, case.kv, out=expected)
+        with fp32_index_logits():
+            for rows, ctx, world in SHARD_CASES:
+                with self.subTest(rows=rows, world=world):
+                    case = make_case(rows, ctx, seed=rows * 5 + ctx)
+                    expected = case.data.empty_selection(TOPK)
+                    dense_prefill_topk(case.data, case.kv, out=expected)
 
-                def run(shard):
-                    out = case.data.empty_selection(TOPK)
-                    sharded_dense_prefill_topk(case.data, case.kv, out=out, shard=shard)
-                    return out
+                    def run(shard):
+                        out = case.data.empty_selection(TOPK)
+                        sharded_dense_prefill_topk(
+                            case.data, case.kv, out=out, shard=shard
+                        )
+                        return out
 
-                for rank, got in enumerate(
-                    on_every_rank(world, rows, run, {TOPK: expected})
-                ):
-                    self.assertTrue(
-                        torch.equal(got.sort(-1).values, expected.sort(-1).values),
-                        f"rank {rank}",
-                    )
+                    for rank, got in enumerate(
+                        on_every_rank(world, rows, run, {TOPK: expected})
+                    ):
+                        self.assertTrue(
+                            torch.equal(got.sort(-1).values, expected.sort(-1).values),
+                            f"rank {rank}",
+                        )
 
 
 if __name__ == "__main__":
