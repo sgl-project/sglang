@@ -186,6 +186,13 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        # With trailing sidecars, the chain prefix lengths (in pages from the
+        # span start) every rank agreed it can restore; set by the hit-query
+        # sync. None before it, for hits without trailing sidecars, for an
+        # assumed-stored hit, and under a controller that agrees hits
+        # elsewhere: the buffer pipeline then declines an oversized hit
+        # instead of cutting it.
+        self.restorable_hit_pages: Optional[list[int]] = None
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
 
@@ -749,7 +756,17 @@ class HybridCacheController(BaseHiCacheController):
     ) -> bool:
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
-            return super().can_fit_prefetch_host_buffers(operation, need_size)
+            # A pool of its own must hold its window when empty too; a
+            # sidecar staged through the anchor's pool adds to its need.
+            anchor_need = need_size
+            requests, _ = self._shared_prefetch_requests(operation, need_size)
+            for name, size in requests[1:]:
+                pool = self.mem_pool_host.entry_map[name].host_pool
+                if pool is anchor.host_pool:
+                    anchor_need += size
+                elif size > pool.logical_size:
+                    return False
+            return super().can_fit_prefetch_host_buffers(operation, anchor_need)
         domain = anchor.host_pool.shared_allocation_domain
         requests, _ = self._shared_prefetch_requests(operation, need_size)
         domain_requests = [
@@ -1521,6 +1538,14 @@ class HybridCacheController(BaseHiCacheController):
         if len(hits) == 1:
             return int(reduced[0])
         restorable = reduced[: len(hits)]
+        # Keep the agreed set: a host-capacity cut of the hit may only end on
+        # a prefix every rank can restore. An assumed-stored hit synthesized
+        # its flags (nothing was queried), so only its endpoint is evidence.
+        operation.restorable_hit_pages = (
+            None
+            if operation.assume_stored
+            else [page for page, ok in enumerate(restorable) if ok and page > 0]
+        )
         return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
 
     def _move_pool_indices(
