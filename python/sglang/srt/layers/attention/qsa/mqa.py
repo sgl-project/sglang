@@ -453,6 +453,28 @@ def _prefill_key_splits(row_blocks: int, width: int, block_n: int, device) -> in
     return _PREFILL_KEY_SPLIT_LEVELS[-1]
 
 
+@functools.lru_cache(maxsize=None)
+def _max_shared_memory(device_index: int) -> int:
+    import triton
+
+    properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
+    return int(properties["max_shared_mem"])
+
+
+def _prefill_num_stages(
+    q_rows: int, block_n: int, head_dim: int, element_size: int, device
+) -> int:
+    """K pipeline depth for the relative prefill kernel. On ROCm, cap it to the
+    workgroup's LDS: a bf16 [128, 128] Q tile plus three [64, 128] K tiles is
+    80 KiB, over gfx942's 64 KiB."""
+    if not is_hip():
+        return 3
+    q_bytes = q_rows * head_dim * element_size
+    k_bytes = block_n * head_dim * element_size
+    budget = _max_shared_memory(device.index or 0) - q_bytes
+    return max(1, min(3, budget // k_bytes))
+
+
 def torch_qsa_mqa_prefill_relative(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -520,6 +542,9 @@ def tilelang_qsa_mqa_prefill_relative(
         head_dim=head_dim,
         block_n=block_n,
         block_q=block_q,
+        num_stages=_prefill_num_stages(
+            block_q * heads, block_n, head_dim, q_padded.element_size(), q.device
+        ),
         key_splits=_prefill_key_splits(
             padded_rows // block_q, width, block_n, q.device
         ),
