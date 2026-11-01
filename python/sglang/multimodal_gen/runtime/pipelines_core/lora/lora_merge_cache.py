@@ -92,8 +92,12 @@ class LoraMergeCache:
         for meta in entries.values():
             if not os.path.exists(os.path.join(self.root, meta.get("file", ""))):
                 return False
+        try:
+            os.utime(self.root)  # most recently used: evicted last
+        except OSError:
+            # Evicted by another instance after the file checks: a cache miss.
+            return False
         self._entries = entries
-        os.utime(self.root)  # most recently used: evicted last
         return True
 
     def get(
