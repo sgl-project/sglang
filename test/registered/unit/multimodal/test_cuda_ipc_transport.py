@@ -113,6 +113,13 @@ class TestCudaIpcTransport(CustomTestCase):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
         publisher = BoundedFeaturePublisher(pool, 0, cpu_tensors=False)
         source = torch.arange(120000, dtype=torch.float32, device="cuda")
+        publish = pool.publish_reserved_batch
+
+        def isolated_publish(*args):
+            self.assertNotEqual(
+                torch.cuda.current_stream(0), torch.cuda.default_stream(0)
+            )
+            return publish(*args)
 
         def request():
             return MultimodalProcessorOutput(
@@ -157,7 +164,8 @@ class TestCudaIpcTransport(CustomTestCase):
             self.assertEqual(publisher.admission.pending_bytes, 0)
 
         try:
-            asyncio.run(run())
+            with patch.object(pool, "publish_reserved_batch", isolated_publish):
+                asyncio.run(run())
         finally:
             publisher.shutdown()
             pool.shutdown()

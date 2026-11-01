@@ -138,6 +138,10 @@ class MmItemMemoryPool:
     def publication_capacity(self):
         return self._pool.usable_size
 
+    @property
+    def publication_device_id(self):
+        return self.device_id
+
     def reservation_size(self, nbytes):
         return align_up(nbytes, DATA_ALIGNMENT)
 

@@ -406,6 +406,10 @@ class CudaVmmMemoryPool:
     def publication_capacity(self):
         return self.allocation_size
 
+    @property
+    def publication_device_id(self):
+        return self.device_index
+
     def set_capacity_callback(self, callback):
         self.on_capacity_change = callback
 

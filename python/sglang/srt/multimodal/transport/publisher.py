@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import torch
 
@@ -28,6 +29,7 @@ class BoundedFeaturePublisher:
         self.pool = pool
         self.cpu_tensors = cpu_tensors
         self.pack_features = pack_features
+        self.copy_stream = None
         self.admission = FeaturePublicationAdmission(
             pool.publication_capacity, timeout_ms
         )
@@ -123,12 +125,28 @@ class BoundedFeaturePublisher:
 
     def _publish(self, tensors, reservations, events):
         try:
-            for device, event in events:
-                torch.cuda.current_stream(device).wait_event(event)
+            if events and self.copy_stream is None:
+                self.copy_stream = torch.cuda.Stream(
+                    device=self.pool.publication_device_id
+                )
         except BaseException:
             self.pool.release_reserved_batch(reservations)
             raise
-        return self.pool.publish_reserved_batch(tensors, reservations)
+        context = (
+            torch.cuda.stream(self.copy_stream)
+            if self.copy_stream is not None
+            else nullcontext()
+        )
+        with context:
+            try:
+                # a copy completion must not wait for unrelated preprocessing
+                # subsequently enqueued on the tokenizer's default stream
+                for _, event in events:
+                    self.copy_stream.wait_event(event)
+            except BaseException:
+                self.pool.release_reserved_batch(reservations)
+                raise
+            return self.pool.publish_reserved_batch(tensors, reservations)
 
     def _cancel_completed(self, future):
         error = future.exception()
