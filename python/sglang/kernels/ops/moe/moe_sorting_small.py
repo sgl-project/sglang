@@ -609,10 +609,12 @@ def _leads_with(fn, names: tuple) -> bool:
 
 
 @functools.cache
-def apply_aiter_small_moe_sort_patch() -> None:
-    """Patch a stock aiter so decode-sized MoE sorting (+ stage1 mxfp8 quant) is one launch."""
+def apply_aiter_small_moe_sort_patch() -> bool:
+    """Patch a stock aiter so decode-sized MoE sorting (+ stage1 mxfp8 quant) is one launch.
+
+    True once aiter is patched; False where it keeps its own sort."""
     if not is_gfx95_supported():
-        return
+        return False
 
     try:
         import aiter.fused_moe as fm
@@ -623,7 +625,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         orig_mx_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
     except (ImportError, AttributeError) as exc:
         logger.info("aiter small-batch MoE sorting patch not applied: %s", exc)
-        return
+        return False
     # the wrappers below name aiter's leading parameters; a reordered aiter stays unpatched
     if not (
         _leads_with(orig_sorting_impl, _SORT_PARAMS)
@@ -632,7 +634,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
         logger.info(
             "aiter small-batch MoE sorting patch not applied: signature changed"
         )
-        return
+        return False
     try:
         orig_fp4_quant = fm.fused_dynamic_mxfp4_quant_moe_sort
         fp4_act_min_tokens = fm._SWIGLU_MXFP4_BF16_BOUND
@@ -875,3 +877,4 @@ def apply_aiter_small_moe_sort_patch() -> None:
 
         fm.fused_dynamic_mxfp4_quant_moe_sort = fp4_quant_wrapper
     logger.info("aiter small-batch MoE sorting patch applied")
+    return True
