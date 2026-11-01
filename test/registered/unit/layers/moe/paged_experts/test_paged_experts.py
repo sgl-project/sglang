@@ -1,14 +1,16 @@
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod, formats
+from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod, formats, sizing
 from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat, after_loading
 from sglang.srt.layers.moe.paged_experts.method import (
     _cap_decode_capture_batch_sizes,
     check_paged_experts_compat,
+    make_for_layer,
 )
 from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
@@ -132,11 +134,21 @@ def _load(method, layer):
 
 
 def _paged_layer(
-    contract=CONTRACTS[0], extra_params=(), global_params=(), freed=(), load=True
+    contract=CONTRACTS[0],
+    extra_params=(),
+    global_params=(),
+    freed=(),
+    load=True,
+    num_resident=K,
+    auto_size=False,
+    top_k=None,
+    seed=0,
 ):
     """A paged method over random experts, its layer created through the base method on a CPU
-    store; ``load`` fills the store with the experts and runs the post-load step."""
-    torch.manual_seed(0)
+    store; ``load`` fills the store with the experts and runs the post-load step. ``auto_size``
+    builds it with K = ``num_resident`` slots that sizing then grows, as for
+    --paged-experts-num-resident auto; ``top_k`` sets the layer's router top-k."""
+    torch.manual_seed(seed)
     full = {
         name: torch.randn(E, H, H)
         for name in ("w13_weight", "w2_weight", *extra_params)
@@ -156,10 +168,16 @@ def _paged_layer(
     expert_format = UnquantizedFormat()
     expert_format.freed = freed
     method = PagedExpertsMoEMethod(
-        base_method=_Base(), expert_format=expert_format, num_experts=E, num_resident=K
+        base_method=_Base(),
+        expert_format=expert_format,
+        num_experts=E,
+        num_resident=num_resident,
+        auto_size=auto_size,
     )
     layer = torch.nn.Module()
     layer.weight_load_method = None
+    layer.top_k = top_k
+    layer.quant_method = method  # as FusedMoE holds it
     _create(method, layer, contract)
     if load:
         for name, t in full.items():
@@ -526,13 +544,14 @@ class TestResidency(CustomTestCase):
 
 
 class TestDecodeCaptureCap(CustomTestCase):
-    def _capped(self, bs, max_bs):
+    def _capped(self, bs, max_bs, full=True):
         decode = SimpleNamespace(bs=list(bs), max_bs=max(bs))
         exec_ctx = SimpleNamespace(
             graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=decode))
         )
-        with patch(
-            "sglang.srt.layers.moe.paged_experts.method.get_exec", return_value=exec_ctx
+        with (
+            patch(_METHOD + "get_exec", return_value=exec_ctx),
+            patch(_METHOD + "check_cuda_graph_backend", return_value=full),
         ):
             _cap_decode_capture_batch_sizes(max_bs)
         return decode.bs, decode.max_bs
@@ -540,6 +559,40 @@ class TestDecodeCaptureCap(CustomTestCase):
     def test_only_shrinks_the_configured_sizes(self):
         self.assertEqual(self._capped([1, 2, 4], 16), ([1, 2, 4], 4))
         self.assertEqual(self._capped([1, 2, 4, 8], 3), ([1, 2, 3], 3))
+        self.assertEqual(self._capped([1, 2, 4], 0), ([1], 1))  # at least one request
+
+    def test_only_full_decode_graphs_are_capped(self):
+        """Breakable or disabled decode graphs break out for host-planned waves: their sizes
+        stay. Control: the same call under a full decode graph caps them."""
+        self.assertEqual(self._capped([1, 2, 4, 8], 3, full=False), ([1, 2, 4, 8], 8))
+        self.assertEqual(self._capped([1, 2, 4, 8], 3, full=True), ([1, 2, 3], 3))
+
+    def test_an_explicit_k_caps_at_construction_and_auto_does_not(self):
+        """An explicit K caps the capture sizes when the layer is built; auto (None, or the
+        string a Python caller passes) waits for the sized K, building with K = top_k."""
+        layer = SimpleNamespace(num_local_experts=E, top_k=TOP_K)
+        for requested, caps_expected, k in (
+            (K, [K // TOP_K], K),
+            (None, [], TOP_K),
+            ("auto", [], TOP_K),
+        ):
+            with self.subTest(requested=requested):
+                caps = []
+                moe = SimpleNamespace(paged_experts_num_resident=requested)
+                with (
+                    patch(_METHOD + "get_exec", return_value=SimpleNamespace(moe=moe)),
+                    patch(_METHOD + "format_for", return_value=UnquantizedFormat()),
+                    patch(_METHOD + "check_paged_experts_compat"),
+                    patch(_METHOD + "cuda_graph_fully_disabled", return_value=False),
+                    patch(
+                        _METHOD + "_cap_decode_capture_batch_sizes",
+                        side_effect=caps.append,
+                    ),
+                ):
+                    method = make_for_layer(layer, _LinearMoE())
+                self.assertEqual(caps, caps_expected)
+                self.assertEqual(method.num_resident, k)
+                self.assertEqual(method.auto_size, requested != K)
 
 
 class TestFormats(CustomTestCase):
@@ -570,13 +623,20 @@ class TestFormats(CustomTestCase):
 
 
 class TestCompat(CustomTestCase):
-    def _check(self, num_resident=K, speculative_algorithm=None):
+    def _check(self, num_resident=K, speculative_algorithm=None, **flags):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
             paged_experts_num_resident=num_resident,
             enable_fused_moe_sum_all_reduce=False,
         )
+        features = SimpleNamespace(
+            enable_memory_saver=flags.get("enable_memory_saver", False)
+        )
+        kernel = SimpleNamespace(
+            enable_nvidia_megakernel=flags.get("enable_nvidia_megakernel", False)
+        )
+        lora = SimpleNamespace(enable_lora=flags.get("enable_lora", False))
         layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
         with (
             patch(
@@ -585,7 +645,11 @@ class TestCompat(CustomTestCase):
                     tp_size=1, ep_size=1, pp_size=1, dp_size=1
                 ),
             ),
-            patch(method + "get_exec", return_value=SimpleNamespace(moe=moe)),
+            patch(
+                method + "get_exec",
+                return_value=SimpleNamespace(moe=moe, features=features, kernel=kernel),
+            ),
+            patch(method + "get_lora", return_value=lora),
             patch(
                 method + "get_spec",
                 return_value=SimpleNamespace(
@@ -606,9 +670,415 @@ class TestCompat(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
             self._check(speculative_algorithm="EAGLE")
 
-    def test_requires_num_resident(self):
-        with self.assertRaisesRegex(RuntimeError, "--paged-experts-num-resident"):
-            self._check(num_resident=None)
+    def test_num_resident_auto_is_accepted(self):
+        self._check(num_resident=None)  # auto: sized when the KV cache is configured
+        self._check(num_resident="auto")  # as a Python caller passes it
+
+    def test_rejects_num_resident_below_top_k(self):
+        with self.assertRaisesRegex(RuntimeError, "at least the router's top-k"):
+            self._check(num_resident=TOP_K - 1)
+
+    def test_auto_refuses_what_binds_or_moves_the_slot_tables(self):
+        for flag in ("enable_memory_saver", "enable_lora", "enable_nvidia_megakernel"):
+            with self.subTest(flag=flag):
+                for auto in (None, "auto"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "explicit --paged-experts"
+                    ):
+                        self._check(num_resident=auto, **{flag: True})
+                self._check(num_resident=K, **{flag: True})  # an explicit K is fine
+
+
+class TestSizing(CustomTestCase):
+    _SIZING = "sglang.srt.layers.moe.paged_experts.sizing."
+
+    def _schedule(self, **over):
+        return SimpleNamespace(
+            **{
+                "max_total_tokens": None,
+                "max_running_requests": None,
+                "max_mamba_cache_size": None,
+                "mamba_full_memory_ratio": 0.9,
+                "page_size": 1,
+                **over,
+            }
+        )
+
+    @contextlib.contextmanager
+    def _patched(self, context_length=None, **schedule):
+        """sizing's view of the server arguments; yields the overrides it makes."""
+        overrides = []
+        context = SimpleNamespace(override=lambda source, **f: overrides.append(f))
+        with (
+            patch(
+                self._SIZING + "get_schedule", return_value=self._schedule(**schedule)
+            ),
+            patch(
+                self._SIZING + "get_model",
+                return_value=SimpleNamespace(context_length=context_length),
+            ),
+            patch(self._SIZING + "get_context", return_value=context),
+        ):
+            yield overrides
+
+    def _floor(self, model_context, context_length=None, **schedule):
+        with self._patched(context_length, **schedule):
+            return sizing.kv_floor(model_context)
+
+    def test_kv_floor_promises_one_request_and_aims_for_the_rest(self):
+        f = self._floor(262144, max_total_tokens=10240, max_running_requests=4)
+        self.assertEqual((f.tokens, f.minimum, f.hard), (10240, 10240, True))
+        f = self._floor(8192, context_length=8192, max_running_requests=4)
+        self.assertEqual((f.tokens, f.minimum, f.hard), (8192 * 4, 8192, True))
+        f = self._floor(262144)  # nothing set: one request of the model's context, soft
+        self.assertEqual((f.tokens, f.minimum, f.hard), (262144, 262144, False))
+        f = self._floor(4096, max_running_requests=2)
+        self.assertEqual((f.tokens, f.minimum, f.hard), (4096 * 2, 4096, False))
+
+    def test_kv_floor_holds_a_full_request_in_whole_pages(self):
+        """The KV cache rounds down to whole pages, so a request of 10001 tokens needs 10016
+        at page size 16 (control: at page size 1, 10001)."""
+        f = self._floor(
+            10001, context_length=10001, max_running_requests=2, page_size=16
+        )
+        self.assertEqual((f.tokens, f.minimum), (10016 * 2, 10016))
+        f = self._floor(10001, context_length=10001, max_running_requests=2)
+        self.assertEqual((f.tokens, f.minimum), (10001 * 2, 10001))
+
+    def test_slots_grow_in_whole_rounds_until_a_layer_holds_every_expert(self):
+        grow = sizing.ExpertSlotSizing._grow
+        self.assertEqual(grow([2, 2], [32, 32], [100, 100], 2050), [12, 12])
+        # The small layer stops at E; the rest goes to the big one alone.
+        self.assertEqual(grow([2, 2], [8, 32], [100, 100], 3000), [8, 26])
+        self.assertEqual(grow([2, 2], [32, 32], [100, 100], 199), [2, 2])
+
+    def _sized(
+        self,
+        budget_slots,
+        kv_tokens=10240,
+        top_ks=(TOP_K, TOP_K),
+        context_length=None,
+        refuse=False,
+        **schedule,
+    ):
+        """Two layers built with K = top_k, sized through ``ExpertSlotSizing`` against a static
+        budget of ``budget_slots`` slots per layer (each layer's slot bytes). Returns K per
+        layer, the layers, the decode caps applied and the overrides made."""
+        built = [
+            _paged_layer(seed=seed, num_resident=top_k, top_k=top_k, auto_size=True)
+            for seed, top_k in enumerate(top_ks)
+        ]
+        layers = [layer for _, layer, _ in built]
+        row = sizing._bytes_per_slot(built[0][0])
+        kvc = self._kvc()
+        caps = []
+        with (
+            self._patched(context_length, **schedule) as overrides,
+            patch(
+                self._SIZING + "static_budget_bytes",
+                return_value=budget_slots * row * len(layers),
+            ),
+            patch(
+                _METHOD + "runner_config", side_effect=lambda config, num_slots: config
+            ),
+            patch(_METHOD + "runner_of", return_value=_LinearMoE.runner),
+            patch(_METHOD + "_cap_decode_capture_batch_sizes", side_effect=caps.append),
+        ):
+            model = torch.nn.ModuleList(layers)
+            slots = sizing.ExpertSlotSizing.for_model(model, kvc, 0)
+            # ``refuse``: the allocator refuses the slab (only around ``size``).
+            refused = torch.OutOfMemoryError("refused")
+            with (
+                patch(self._SIZING + "torch.empty", side_effect=refused)
+                if refuse
+                else (contextlib.nullcontext())
+            ):
+                ks = slots.size(kv_tokens)
+        return ks, built, caps, overrides
+
+    @staticmethod
+    def _kvc():
+        return SimpleNamespace(
+            mambaish_config=None,
+            post_capture_kv_active=False,
+            model_config=SimpleNamespace(context_len=4096),
+        )
+
+    def test_layers_with_an_explicit_k_are_not_sized(self):
+        """Layers built with an explicit K leave the KV cache alone: no sizing, no
+        --max-total-tokens override. Control: an auto layer gets both."""
+        for auto_size, sized in ((False, False), (True, True)):
+            with self.subTest(auto_size=auto_size):
+                _, layer, _ = _paged_layer(
+                    num_resident=TOP_K, top_k=TOP_K, auto_size=auto_size
+                )
+                with (
+                    self._patched() as overrides,
+                    patch(self._SIZING + "static_budget_bytes", return_value=0),
+                ):
+                    slots = sizing.ExpertSlotSizing.for_model(
+                        torch.nn.ModuleList([layer]), self._kvc(), 0
+                    )
+                self.assertEqual(slots is not None, sized)
+                self.assertEqual(bool(overrides), sized)
+
+    def test_the_kv_target_is_applied_as_max_total_tokens_unless_set(self):
+        _, _, _, overrides = self._sized(budget_slots=4, max_running_requests=2)
+        self.assertEqual(overrides, [{"max_total_tokens": 4096 * 2}])
+        _, _, _, overrides = self._sized(budget_slots=4, max_total_tokens=10240)
+        self.assertEqual(overrides, [])
+
+    def test_slots_take_the_measured_remainder_and_serve_the_unpaged_forward(self):
+        """K = 4 per layer from a budget of 4 slots each; every token routes to experts 2 and
+        3, which only the grown slots hold. The negative control corrupts grown slot 3."""
+        ks, built, caps, _ = self._sized(budget_slots=4)
+        self.assertEqual(ks, [K, K])
+        self.assertEqual(
+            caps, [K // TOP_K]
+        )  # the decode capture cap, once, at the final K
+        storage = {
+            layer.w13_weight.untyped_storage().data_ptr() for _, layer, _ in built
+        }
+        self.assertEqual(len(storage), 1)  # every slot table lives in one allocation
+        method, layer, full = built[0]
+        paged = []
+        page_in = method.store.page_in
+        method.store.page_in = lambda layer, loads: (
+            paged.extend(loads),
+            page_in(layer, loads),
+        )
+        for corrupt in (False, True):
+            if corrupt:
+                layer.w13_weight.data[3] += 1.0
+            step = _step(5)
+            step.topk_output.topk_ids.copy_(torch.tensor([2, 3]).int().expand(5, TOP_K))
+            out = method.apply(layer, step).hidden_states
+            same = torch.allclose(out, _reference(full, step), atol=1e-4)
+            self.assertEqual(same, not corrupt)
+            self.assertEqual(paged, [])  # served from the grown slots: nothing paged in
+
+    def test_the_decode_cap_holds_for_every_layer(self):
+        """Layers with top_k 2 and 4 grow to K = 7 and 9: the cap is the smallest K // top_k
+        of any layer (9 // 4 = 2), not the smallest K over the smallest top_k (7 // 2 = 3)."""
+        ks, _, caps, _ = self._sized(budget_slots=8, top_ks=(2, 4))
+        self.assertEqual(ks, [7, 9])
+        self.assertEqual(caps, [2])
+
+    def test_a_refused_allocation_fails_naming_the_flags(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "lower --max-total-tokens, --context-length or --max-running"
+        ):
+            self._sized(budget_slots=4, refuse=True)
+
+    def test_a_kv_floor_the_user_set_that_does_not_fit_fails_naming_its_source(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "fewer than the 20000 from --max-total-tokens"
+        ):
+            self._sized(budget_slots=4, kv_tokens=8000, max_total_tokens=20000)
+        with self.assertRaisesRegex(
+            RuntimeError, r"fewer than one request of 4096 \(--context-length"
+        ):
+            self._sized(budget_slots=4, kv_tokens=1000, context_length=4096)
+
+    def test_a_model_context_that_does_not_fit_sizes_and_warns(self):
+        """The model's own context is soft: a KV cache shorter than it is a warning naming
+        --context-length, and the slots are still sized. Control: one that fits, no warning."""
+        with self.assertLogs(sizing.logger, level="WARNING") as logs:
+            ks, _, _, _ = self._sized(budget_slots=4, kv_tokens=1000)
+        self.assertEqual(ks, [K, K])
+        self.assertTrue(any("--context-length" in line for line in logs.output))
+        with self.assertNoLogs(sizing.logger, level="WARNING"):
+            self._sized(budget_slots=4, kv_tokens=4096)
+
+    def test_the_log_names_k_the_kv_cache_its_aim_and_how_to_pin(self):
+        with self.assertLogs(sizing.logger, level="INFO") as logs:
+            self._sized(budget_slots=4, max_total_tokens=10240)
+        line = logs.output[0]
+        for part in (
+            f"K={K} of {E} experts",
+            "KV cache 10240 tokens (aim 10240: --max-total-tokens)",
+            f"To pin: --paged-experts-num-resident {K}",
+        ):
+            self.assertIn(part, line)
+
+    def test_more_requests_are_a_target_one_request_the_promise(self):
+        """--context-length x --max-running-requests is aimed for; a KV cache that holds one
+        full-length request but not all of them sizes, logs how many fit, and does not fail."""
+        with self.assertLogs(sizing.logger, level="INFO") as logs:
+            self._sized(
+                budget_slots=4,
+                kv_tokens=6000,
+                context_length=4096,
+                max_running_requests=4,
+            )
+        self.assertTrue(
+            any("1 request(s) of 4096 at once" in line for line in logs.output)
+        )
+
+    def test_auto_refuses_post_capture_kv_sizing(self):
+        built = [_paged_layer(num_resident=TOP_K, top_k=TOP_K, auto_size=True)]
+        kvc = SimpleNamespace(post_capture_kv_active=True)
+        with self.assertRaisesRegex(
+            RuntimeError, "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING"
+        ):
+            sizing.ExpertSlotSizing.for_model(
+                torch.nn.ModuleList([built[0][1]]), kvc, 0
+            )
+
+    def _mamba_slots(self, budget, context_length=None, kv_bytes=1, **schedule):
+        """Mamba slots of 1000 B, 2 per request; ``kv_bytes`` per KV token, rounded down to
+        whole pages like the KV cache."""
+        page = schedule.get("page_size", 1)
+        kvc = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1000)
+            ),
+            extra_mamba_cache_bytes_per_req=0,
+            _calculate_mamba_ratio=lambda: 2,
+            model_config=SimpleNamespace(context_len=context_length or 4096),
+        )
+        with (
+            self._patched(context_length, **schedule) as overrides,
+            patch(
+                self._SIZING + "_kv_tokens",
+                side_effect=lambda kvc, nbytes: (
+                    max(nbytes, 0) // kv_bytes // page * page
+                ),
+            ),
+        ):
+            sizing.ExpertSlotSizing([], kvc, 0, budget)
+        return [
+            o["max_mamba_cache_size"] for o in overrides if "max_mamba_cache_size" in o
+        ]
+
+    def _sglang_mamba(self, rest_bytes, per_slot, **schedule):
+        """SGLang's own Mamba accounting (``KVCacheConfigurator._handle_max_mamba_cache``) on
+        a configurator of one GPU without speculative decoding: the bytes it deducts and the
+        Mamba pool size it settles on."""
+        from sglang.srt.mem_cache import kv_cache_configurator as kvc_mod
+
+        sched = self._schedule(**schedule)
+        context = SimpleNamespace(
+            override=lambda source, **f: [setattr(sched, k, v) for k, v in f.items()]
+        )
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1], mamba_cache_per_req=per_slot
+                )
+            ),
+            pp_size=1,
+            fused_entry_bytes=lambda name: None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            hybrid_gdn_config=None,
+            hybrid_kda_config=None,
+            extra_mamba_cache_bytes_per_req=0,
+            attn_dp_size=1,
+        )
+        exec_ = SimpleNamespace(
+            mamba=SimpleNamespace(enable_linear_replayssm_spec=False)
+        )
+        with (
+            patch.object(kvc_mod, "get_schedule", return_value=sched),
+            patch.object(kvc_mod, "get_context", return_value=context),
+            patch.object(kvc_mod, "get_exec", return_value=exec_),
+            patch.object(
+                kvc_mod,
+                "get_memory",
+                return_value=SimpleNamespace(disable_radix_cache=False),
+            ),
+        ):
+            rest = kvc_mod.KVCacheConfigurator._handle_max_mamba_cache(
+                fake, rest_bytes / sizing._GIB
+            )
+        return round(
+            (rest_bytes / sizing._GIB - rest) * sizing._GIB
+        ), sched.max_mamba_cache_size
+
+    def test_mamba_charge_and_share_match_sglang(self):
+        """Our Mamba charge and share are SGLang's own: with --max-mamba-cache-size set (as
+        auto sets it) SGLang deducts exactly ``_mamba_charge``, and with it unset its ratio
+        branch settles on ``_mamba_share``. Control: a charge without the padding slot does
+        not match."""
+        per_slot = 1_000_000
+        for slots in (1, 3, 16):
+            charged, _ = self._sglang_mamba(
+                10 * sizing._GIB, per_slot, max_mamba_cache_size=slots
+            )
+            self.assertEqual(charged, sizing._mamba_charge(slots, per_slot))
+            self.assertNotEqual(charged, slots * per_slot)
+        for budget, ratio in (
+            (10 * sizing._GIB, 0.9),
+            (3 * sizing._GIB, 9),
+            (sizing._GIB, 0.5),
+        ):
+            _, size = self._sglang_mamba(
+                budget, per_slot, mamba_full_memory_ratio=ratio
+            )
+            self.assertEqual(size, sizing._mamba_share(budget, ratio, per_slot))
+
+    def test_mamba_state_holds_the_requests_the_kv_cache_aims_for(self):
+        """2 state slots per request: one request by default, the --max-running-requests set
+        (8: 16 slots), capped at SGLang's share (0.9 / 1.9 of 19,000 B = 9,000 B, less the
+        pool's padding slot: 8 slots of 1000 B), at least one request; nothing when
+        --max-mamba-cache-size is set."""
+        self.assertEqual(self._mamba_slots(10**6), [2])
+        self.assertEqual(self._mamba_slots(10**6, max_running_requests=8), [16])
+        self.assertEqual(self._mamba_slots(19_000, max_running_requests=8), [8])
+        self.assertEqual(self._mamba_slots(100, max_running_requests=8), [2])
+        self.assertEqual(self._mamba_slots(10**6, max_mamba_cache_size=5), [])
+
+    def test_one_full_request_comes_before_more_mamba_state(self):
+        """Near the limit, the Mamba state grows only as far as one full-length request still
+        fits next to it; more requests queue. The pool holds one padding slot beyond its size.
+        20,000 B, a share of 17 slots (ratio 9), 8 requests of 4096 tokens at 2 B: 16 slots
+        (17 with the padding) would leave 3,000 B, short of the 8,192 one request needs, so
+        10 (5 requests; 11 charged) leave 9,000 B. Control: in the old order, 16 slots leave
+        the KV cache short of one request, which startup rejects."""
+        args = dict(context_length=4096, kv_bytes=2, max_running_requests=8)
+        args["mamba_full_memory_ratio"] = 9
+        self.assertEqual(self._mamba_slots(20_000, **args), [10])
+        self.assertLess((20_000 - 17 * 1000) // 2, 4096)
+        # Room for all 8 requests: no change. No room even for one: one request's state,
+        # and startup names the context that does not fit.
+        self.assertEqual(self._mamba_slots(10**6, **args), [16])
+        self.assertEqual(self._mamba_slots(5_000, **args), [2])
+        # --max-total-tokens is the minimum when set. 2000 tokens: 16 slots fit only without
+        # the padding slot (4,000 B left vs 3,000 B with it), so 14.
+        args = dict(kv_bytes=2, max_running_requests=8, mamba_full_memory_ratio=9)
+        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [14])
+        self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [8])
+
+    def test_the_log_says_how_many_requests_run_and_how_to_run_more(self):
+        """Each running request needs its own Mamba state, so the log says how many run at a
+        time; without --max-running-requests it names that flag, with it it says how many of
+        them queue. Control: all requests set fit, no hint."""
+        self.assertEqual(
+            sizing._mamba_text(3, 3, None),
+            "Mamba state for 1 request(s) at a time (3 slot(s)); "
+            "set --max-running-requests to run more",
+        )
+        self.assertEqual(
+            sizing._mamba_text(9, 2, 8),
+            "Mamba state for 4 request(s) at a time (9 slot(s)) "
+            "of --max-running-requests 8; the rest queue",
+        )
+        self.assertEqual(
+            sizing._mamba_text(16, 2, 8),
+            "Mamba state for 8 request(s) at a time (16 slot(s))",
+        )
+
+    def test_kv_minimum_by_size_rule_in_whole_pages(self):
+        """A --max-total-tokens that is no page multiple: the KV cache can hold at most
+        9,984 of 10,000 tokens at page size 64, which size() accepts, so the Mamba state
+        keeps all 8 requests when 9,984 fit (26,990 B less 17 slots of 1000 B = 9,990 B).
+        Control: "fewer tokens than asked" would call 9,984 short and drop one request."""
+        args = dict(max_running_requests=8, mamba_full_memory_ratio=9, page_size=64)
+        self.assertEqual(
+            self._mamba_slots(26_990, max_total_tokens=10_000, **args), [16]
+        )
+        self.assertLess(9_984, 10_000)
+        self.assertGreater(9_984 + 64, 10_000)
 
 
 if __name__ == "__main__":

@@ -1022,9 +1022,21 @@ class ModelRunner:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator(draft_parallel_layout)
+        expert_slots = None
+        if get_exec().moe.enable_paged_experts and (
+            get_exec().moe.paged_experts_num_resident in (None, "auto")
+        ):
+            # --paged-experts-num-resident auto: the KV cache first, then the expert slots.
+            from sglang.srt.layers.moe.paged_experts.sizing import ExpertSlotSizing
+
+            expert_slots = ExpertSlotSizing.for_model(
+                self.model, self.kv_cache_configurator, self.pre_model_load_memory
+            )
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
+        if expert_slots is not None:
+            expert_slots.size(result.max_total_num_tokens)
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
