@@ -103,10 +103,17 @@ class Mm(msgspec.Struct):
                 "CPU memory budget for content-addressed multimodal preprocessing "
                 "artifacts. Unset selects a model-specific default (256 MiB for "
                 "Kimi-K3); 0 disables the cache. The budget is divided across "
-                "tokenizer workers and does not reserve GPU memory."
+                "tokenizer workers unless --mm-preprocess-cache-dir is set. "
+                "It does not reserve GPU memory."
             ),
             resolvable=True,
         ),
+    ] = None
+    mm_preprocess_cache_dir: A[
+        Optional[str],
+        "Private local directory for a shared CPU artifact cache across tokenizer "
+        "workers. Prefer tmpfs. With this option, the size budget is global; "
+        "raw media is always verified, including caller-provided hashes.",
     ] = None
     trust_mm_content_hashes: A[
         bool,
