@@ -200,9 +200,9 @@ def _maybe_load_tokenizer(*, tokenizer_arg: Optional[str], dir_pair: Pair[Path])
     try:
         from transformers import AutoTokenizer
 
-        from sglang.srt.utils.hf_transformers_patches import apply_all
+        from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 
-        apply_all()
+        apply_all_hf_patches()
         return AutoTokenizer.from_pretrained(tokenizer_path)
     except Exception:
         return None

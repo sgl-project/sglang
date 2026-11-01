@@ -571,9 +571,9 @@ def _load_hf_config(name_or_path: str):
 
     from transformers import AutoConfig
 
-    from sglang.srt.utils.hf_transformers_patches import apply_all
+    from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 
-    apply_all()
+    apply_all_hf_patches()
     try:
         return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception as e:

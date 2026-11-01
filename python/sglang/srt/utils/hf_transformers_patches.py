@@ -36,11 +36,11 @@ _applied = False
 
 
 # ---------------------------------------------------------------------------
-# Public API: apply_all() -- import-time patches (idempotent)
+# Public API: apply_all_hf_patches() -- import-time patches (idempotent)
 # ---------------------------------------------------------------------------
 
 
-def apply_all():
+def apply_all_hf_patches():
     """Apply all transformers compatibility patches (idempotent).
 
     Call this once at import time.  It is safe to call multiple times.

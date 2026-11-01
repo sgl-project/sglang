@@ -23,9 +23,12 @@ path ``sglang.srt.utils.hf_transformers_utils`` is preserved by a
 separate shim module.
 """
 
-from ..hf_transformers_patches import apply_all, normalize_rope_scaling_compat
+from ..hf_transformers_patches import (
+    apply_all_hf_patches,
+    normalize_rope_scaling_compat,
+)
 
-apply_all()
+apply_all_hf_patches()
 
 from .common import (
     CONTEXT_LENGTH_KEYS,
