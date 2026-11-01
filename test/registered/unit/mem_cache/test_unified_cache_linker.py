@@ -794,10 +794,26 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         tokens = list(range(1, 13))
         prefix = tokens[:8]
+        stored_keys = defaultdict(set)
+        producer, producer_allocator, producer_req_pool = build_fixture(self.cfg)
+        producer_backend = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_backend)
+        # Use the decode writer's prefix-skipping path: the prefill owns the
+        # prompt, while this writer publishes only its short continuation.
+        with producer.linker.skip_offload_prefix(len(prefix)):
+            self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        self.assertTrue(producer_backend.offload_calls)
+        for _ in producer_backend.offload_calls:
+            producer_backend.complete_next_offload(True)
+        producer.check_hicache_events()
+        self.assertEqual(len(stored_keys[PoolName.KV]), 2)
+        self.assertEqual(stored_keys[PoolName.KV], stored_keys[PoolName.SWA])
+        producer.sanity_check()
+
         for evict_head in (False, True):
             with self.subTest(evict_head=evict_head):
                 cache, allocator, req_pool = build_fixture(self.cfg)
-                backend = _InMemoryUnifiedCacheLinker()
+                backend = _InMemoryUnifiedCacheLinker(stored_keys)
                 cache.init_cache_linker(backend)
                 cache.write_through_threshold = sys.maxsize
                 inserted = self._insert(cache, allocator, req_pool, prefix)
@@ -810,12 +826,6 @@ class TestUnifiedCacheLinkerPythonBackend(
                 key = RadixKey(array("q", tokens))
                 params = MatchPrefixParams(key=key, req=req)
 
-                # First obtain the real chained hashes; publish only the tail.
-                miss = cache.match_prefix(params)
-                self.assertEqual(miss.device_prefix_len, len(prefix))
-                self.assertEqual(miss.host_hit_length, 0)
-                for transfer in backend.lookup_calls[-1][1]:
-                    backend.stored_keys[transfer.name].update(transfer.keys)
                 matched = cache.match_prefix(params)
                 self.assertEqual(matched.device_prefix_len, 8)
                 self.assertEqual(matched.host_hit_length, 4)
