@@ -1019,9 +1019,19 @@ release's `sigma_max` of 0.999 (FastGen's `max_t`).
 sglang serve \
   --model-path FastVideo/FastVideo-FastH3-Omni-8-Step-V1 \
   --num-gpus 2 --ulysses-degree 2 \
-  --dit-cpu-offload true --text-encoder-cpu-offload true --vae-cpu-offload true \
   --port 30010
 ```
+
+Everything stays resident on 141 GB and 180 GB cards. On a card that cannot
+hold it, add `--dit-cpu-offload true --text-encoder-cpu-offload true
+--vae-cpu-offload true`; on H200 and B200 the three offloads only cost time
+(image reference, 768 short edge, 124 frames, median of two requests after
+three warmups):
+
+| GPUs | Resident | With the three offloads |
+| --- | --- | --- |
+| 2× H200, Ulysses 2 | 39.0 s | 43.8 s |
+| 4× B200, Ulysses 4 | 10.3 s | 15.3 s |
 
 ```json Request
 {
@@ -1042,9 +1052,9 @@ region and take a per-region top-k, while text, reference images and audio
 rows stay dense. `--attention-backend-config` keys `vsa_tile_size`,
 `vsa_ref_keep_rate` and `VSA_sparsity` override the trained values.
 
-Warm request latency on 2× H200 (Ulysses 2, DiT / text encoder / VAE CPU
-offload; median of three requests after one full warmup, 124 frames at 24 FPS
-with audio, until the MP4 is saved):
+Warm request latency on 2× H200 with the three CPU offloads (Ulysses 2; median
+of three requests after one full warmup, 124 frames at 24 FPS with audio,
+until the MP4 is saved):
 
 | References | Short edge | Latency |
 | --- | --- | --- |
