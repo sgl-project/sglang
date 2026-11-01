@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import linear, vocab_parallel_embedding
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -219,6 +220,52 @@ class TestDFlashDPMetadata(CustomTestCase):
                     torch.testing.assert_close(result.input_ids, ids)
                     self.assertTrue(result.needs_forward_metadata_init())
                     self.assertEqual(can_graph, graph_eligible)
+
+
+class TestDFlashDPIdleGraphStatus(CustomTestCase):
+    def test_idle_result_reports_actual_target_graph_status(self):
+        """Idle results must report target replay, not force eager or invent replay."""
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        for dp_enabled, target_graph in ((True, True), (True, False), (False, True)):
+            with self.subTest(dp_enabled=dp_enabled, target_graph=target_graph):
+                worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+                worker.device = "cpu"
+                worker.block_size = 8
+                forward = SimpleNamespace(can_run_decode_cuda_graph=True)
+
+                def target_forward(**kwargs):
+                    self.assertIs(kwargs["forward_batch"], forward)
+                    self.assertTrue(forward.can_run_decode_cuda_graph)
+                    return SimpleNamespace(can_run_cuda_graph=target_graph)
+
+                worker._target_worker = SimpleNamespace(
+                    forward_batch_generation=target_forward
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.IDLE,
+                    is_extend_in_batch=False,
+                    spec_info=None,
+                    sampling_info=None,
+                )
+                published = []
+                with (
+                    get_parallel().override(attn_dp_enabled=dp_enabled),
+                    patch.object(
+                        DFlashVerifyInput,
+                        "prepare_for_verify",
+                        return_value=(forward, True),
+                    ),
+                ):
+                    result = worker.forward_batch_generation(
+                        batch, on_publish=published.append
+                    )
+                self.assertEqual(result.can_run_cuda_graph, dp_enabled and target_graph)
+                self.assertEqual(result.next_token_ids.numel(), 0)
+                self.assertEqual(result.accept_lens.numel(), 0)
+                self.assertEqual(result.new_seq_lens.numel(), 0)
+                self.assertEqual(len(published), 1)
+                self.assertIs(published[0], result.new_seq_lens)
 
 
 if __name__ == "__main__":
