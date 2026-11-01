@@ -246,6 +246,10 @@ def _dsv3_fused_a_gemm_kernel(
                         acc[nb][i] = cutlass.Float32(d[i])
             cute.arch.mbarrier_arrive(empty + buf)
             ph = (ph ^ 1) if buf == nstage - 1 else ph
+
+        # All compute warps must finish reading sA/sB before any of them reuses
+        # that shared memory for the split-K partial accumulators in sC.
+        cute.arch.barrier(barrier_id=1, number_of_threads=COMPUTE_THREADS)
         for nb in cutlass.range_constexpr(NB):
             for i in cutlass.range_constexpr(4):
                 m = r0 + (8 if i >= 2 else 0)
