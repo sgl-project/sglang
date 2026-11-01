@@ -155,6 +155,7 @@ class VMOBAAttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.prefix = prefix
+        self.softmax_scale = softmax_scale
         self.layer_idx = self._get_layer_idx(prefix)
 
         self.pad_input = pad_input
@@ -241,6 +242,7 @@ class VMOBAAttentionImpl(AttentionImpl):
             select_mode=attn_metadata.moba_select_mode,
             simsum_threshold=attn_metadata.moba_threshold,
             threshold_type=attn_metadata.moba_threshold_type,
+            softmax_scale=self.softmax_scale,
         )
         hidden_states = self.pad_input(
             hidden_states, indices_q, batch_size, sequence_length
