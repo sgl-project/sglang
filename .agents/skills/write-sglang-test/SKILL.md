@@ -100,12 +100,14 @@ per-purpose split; kernel, eval, perf, and precision all share their machine's s
 
 ### Choosing a Tier
 
-The stage sets how often a test runs. Pick the lowest tier that still catches a regression in time. Tests in the extra, nightly, and weekly tiers do not run on a normal PR; a PR that touches their path runs them with `/rerun-test` (see the [rerun-test](../rerun-test/SKILL.md) skill), which takes a test of any tier.
+The stage sets how often a test runs; when each tier runs is in [ci-workflow-guide, Tiers](../ci-workflow-guide/SKILL.md#tiers). Tests outside base do not run on a normal PR, but `/rerun-test` runs a test of any tier on a PR (see the [rerun-test](../rerun-test/SKILL.md) skill). As a rough guide:
 
-- **base** (`base-a`, `base-b`, `base-c`; every PR, required to merge): core default paths that most users hit with default settings, such as the scheduler, radix cache, the default attention backend, chunked prefill, default speculative decoding, the OpenAI API, and the basic forms of PD, TP, DP attention, and PP; cheap unit tests; one representative e2e per feature. A failure here is attributable to one PR and would break most users.
-- **extra** (`extra-a`, `extra-b`; PRs with `run-ci-nv-extra`, and main twice daily): e2e for the current flagship models; features with real users that are off the default path (PD variants, HiCache storage backends, non-default speculative decoding, LoRA variants, non-default backends); important accuracy gates; heavy variants of core features.
-- **nightly** (every two days): niche paths bound to one checkpoint or one configuration; accuracy or performance gates for less-used models; variants whose main logic another test already covers, such as the B300 copy of a kernel test that runs on B200 per PR.
-- **weekly** (Sundays): models that are old, little used, or superseded in their family by a newer version on the same model file. The coverage stays; finding a regression a week late is acceptable.
+- **base**: core paths that most users hit with default settings, cheap unit tests, and a representative e2e for each major feature. Every PR pays for it, so keep it small.
+- **extra**: features with real users that are off the default path, the current flagship models, and important accuracy gates.
+- **nightly**: niche configurations, and accuracy or performance gates for less-used models.
+- **weekly**: older or rarely used models, kept covered at low cost.
+
+When unsure, follow where similar tests are registered and raise the choice in the PR.
 
 Across tiers:
 
