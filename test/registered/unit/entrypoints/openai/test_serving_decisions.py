@@ -1,10 +1,12 @@
 """Unit tests for /v1/decisions and /v1/systemone: request limits, prompt text, answer labels, and scoring."""
 
+import argparse
 import asyncio
 import json
 import math
 import re
 import string
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -12,6 +14,7 @@ import torch
 from pydantic import ValidationError
 from transformers import AddedToken, AutoTokenizer
 
+from sglang.srt.arg_groups.fields.serving import load_decision_temperature_config
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import (
@@ -979,6 +982,158 @@ def _systemone_request(questions, **kwargs):
         questions=questions,
         **kwargs,
     )
+
+
+def _softmax_at(manager, tokens, temperature):
+    logprobs = manager.logprobs[manager.tokenizer.convert_tokens_to_ids(tokens)]
+    return torch.softmax(logprobs / temperature, dim=0).tolist()
+
+
+def _assert_probabilities(answer, expected):
+    torch.testing.assert_close(
+        torch.tensor(list(answer["probabilities"].values()), dtype=torch.float64),
+        torch.tensor(expected, dtype=torch.float64),
+    )
+
+
+class TestDecisionTemperatures(unittest.IsolatedAsyncioTestCase):
+    """--decision-config: a default temperature per question type on both routes."""
+
+    TABLE = {"temperature": 1.0, "temperature_by_type": {"choice": 2.0, "noul": 3.0}}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    def _manager(self, table=TABLE):
+        return ScoringManager(self.tokenizer, decision_config=table)
+
+    async def test_systemone_reads_each_question_at_its_types_temperature(self):
+        manager = self._manager()
+        request = _systemone_request(
+            {
+                "team": {
+                    "type": "choice",
+                    "instructions": "Which team?",
+                    "criteria": {"billing": None, "sales": None},
+                },
+                "urgent": {"type": "noul", "instructions": "Urgent?"},
+                "mood": {
+                    "type": "score",
+                    "instructions": "Mood?",
+                    "criteria": [
+                        {"label": "Calm", "examples": ["calm"]},
+                        {"label": "Angry", "examples": ["caps"]},
+                    ],
+                },
+            }
+        )
+        response = await _handler(
+            manager, serving_class=SystemOneServing
+        ).handle_request(request, None)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(manager.requests), 1)
+        answers = json.loads(response.body)["answers"]
+        _assert_probabilities(answers["team"], _softmax_at(manager, ["A", "B"], 2.0))
+        # The score type is not in the table, so it takes the scalar 1.0.
+        _assert_probabilities(answers["mood"], _softmax_at(manager, ["0", "1"], 1.0))
+        self.assertAlmostEqual(
+            answers["urgent"]["noul"], _softmax_at(manager, ["yes", "no"], 3.0)[0]
+        )
+
+    async def test_decisions_route_applies_the_table_unless_the_request_sets_one(self):
+        questions = {
+            "team": _question("choice", {"billing": None, "sales": None}),
+            "urgent": _question("yes_no"),
+        }
+        manager = self._manager()
+        response = await _handler(manager).handle_request(
+            _request("x", questions), None
+        )
+        answers = json.loads(response.body)["answers"]
+        _assert_probabilities(answers["team"], _softmax_at(manager, ["A", "B"], 2.0))
+        _assert_probabilities(
+            answers["urgent"], _softmax_at(manager, ["yes", "no"], 3.0)
+        )
+
+        manager = self._manager()
+        response = await _handler(manager).handle_request(
+            _request("x", questions, temperature=1.0), None
+        )
+        answers = json.loads(response.body)["answers"]
+        _assert_probabilities(answers["team"], _softmax_at(manager, ["A", "B"], 1.0))
+        _assert_probabilities(
+            answers["urgent"], _softmax_at(manager, ["yes", "no"], 1.0)
+        )
+
+    async def test_without_a_table_questions_are_read_at_one(self):
+        manager = self._manager(None)
+        request = _systemone_request(
+            {"urgent": {"type": "noul", "instructions": "Urgent?"}}
+        )
+        response = await _handler(
+            manager, serving_class=SystemOneServing
+        ).handle_request(request, None)
+        self.assertAlmostEqual(
+            json.loads(response.body)["answers"]["urgent"]["noul"],
+            _softmax_at(manager, ["yes", "no"], 1.0)[0],
+        )
+
+    def test_decision_checkpoints_refuse_the_table(self):
+        manager = self._manager()
+        manager.model_config.decision_config = {
+            "codes": ["A"],
+            "token_ids": [0],
+            "temperature": 2.0,
+        }
+        with self.assertRaisesRegex(ValueError, "decision-config"):
+            _handler(manager, serving_class=SystemOneServing)
+
+    async def test_a_scalar_temperature_covers_every_type(self):
+        manager = self._manager({"temperature": 2.0, "temperature_by_type": {}})
+        request = _systemone_request(
+            {"urgent": {"type": "noul", "instructions": "Urgent?"}}
+        )
+        response = await _handler(
+            manager, serving_class=SystemOneServing
+        ).handle_request(request, None)
+        self.assertAlmostEqual(
+            json.loads(response.body)["answers"]["urgent"]["noul"],
+            _softmax_at(manager, ["yes", "no"], 2.0)[0],
+        )
+
+    def test_the_file_is_the_temperature_subset_of_decision_config(self):
+        def load(config):
+            with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+                json.dump(config, f)
+                f.flush()
+                return load_decision_temperature_config(f.name)
+
+        self.assertEqual(
+            load({"format_version": 1, "temperature_by_type": {"choice": 2.5}}),
+            {"temperature": 1.0, "temperature_by_type": {"choice": 2.5}},
+        )
+        self.assertEqual(
+            load({"format_version": 1, "temperature": 3}),
+            {"temperature": 3.0, "temperature_by_type": {}},
+        )
+        for config in (
+            [1],
+            {"temperature": 2},
+            {"format_version": 2, "temperature": 2},
+            {"format_version": 1},
+            {"format_version": 1, "temperature": 0},
+            {"format_version": 1, "temperature": True},
+            {"format_version": 1, "temperature_by_type": {"yes_no": 2}},
+            {"format_version": 1, "temperature_by_type": {"choice": "2"}},
+            {"format_version": 1, "temperature": 2, "codes": ["A"]},
+            {"format_version": 1, "temperature": 2, "attention_mode": "causal"},
+        ):
+            with self.subTest(config), self.assertRaises(argparse.ArgumentTypeError):
+                load(config)
 
 
 class TestSystemOne(unittest.IsolatedAsyncioTestCase):

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
 import string
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import msgspec
 from fastapi import Request
@@ -28,7 +29,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_serving
 from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
@@ -54,6 +55,8 @@ _PARSER_TOGGLE_MODES = (
 )
 # Answer text of a finished reply, rendered only to see what precedes an answer.
 _REPLY_SENTINEL = "DECISION_ANSWER"
+# A question kind to its temperature_by_type key.
+_TEMPERATURE_KEYS = {"choice": "choice", "yes_no": "noul", "score": "score"}
 
 
 class QuestionView(msgspec.Struct, frozen=True):
@@ -85,6 +88,17 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self.decision_config = self.tokenizer_manager.model_config.decision_config
         self.joint_head_config = self.tokenizer_manager.model_config.joint_head_config
         self.pointer_head = self.tokenizer_manager.model_config.pointer_head
+        # The server-side default of a model that is not a decision checkpoint.
+        self.default_temperatures = get_serving().decision_config
+        if self.default_temperatures is not None and (
+            self.decision_config is not None
+            or self.joint_head_config is not None
+            or self.pointer_head is not None
+        ):
+            raise ValueError(
+                "--decision-config is for ordinary generation models, "
+                "a decision checkpoint carries its own calibration"
+            )
         tokenizer = self.tokenizer_manager.tokenizer
         # Other tokenizers skip the shortcut in _encode_labels and check the full prompt.
         self.added_tokens = (
@@ -394,23 +408,53 @@ class OpenAIServingDecisions(OpenAIServingBase):
             # The generation prompt checks above still apply.
             return None
 
+    def _question_temperatures(
+        self, views: List[QuestionView], requested: Optional[float] = None
+    ) -> Union[float, List[float]]:
+        """The request's temperature, else each question's default from --decision-config."""
+        if requested is not None:
+            return requested
+        defaults = self.default_temperatures
+        if defaults is None:
+            return 1.0
+        return [
+            defaults["temperature_by_type"].get(
+                _TEMPERATURE_KEYS[view.kind], defaults["temperature"]
+            )
+            for view in views
+        ]
+
     async def _score(
         self,
         adapted_request: Iterator[EncodedQuestion],
         raw_request: Request,
-        temperature: float = 1.0,
+        temperature: Union[float, List[float]] = 1.0,
     ):
-        """Encode every question, then score them all in one call."""
+        """Encode every question, then score them all in one call.
+
+        A list gives each question its own temperature."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
+        per_question = isinstance(temperature, list)
         result = await self.tokenizer_manager.score_prompts(
             prompts=prompts,
             label_token_ids=label_token_ids,
             apply_softmax=True,
             request=raw_request,
-            temperature=temperature,
+            temperature=1.0 if per_question else temperature,
             return_token_logprobs=True,
             image_data=image_data if any(image_data) else None,
         )
+        if per_question:
+            # The logprobs are the raw ones, so each question can take its own softmax.
+            scores = [
+                self.tokenizer_manager._convert_logprobs_to_scores(
+                    dict(zip(labels, logprobs)), labels, True, question_temperature
+                )
+                for labels, logprobs, question_temperature in zip(
+                    label_token_ids, result.token_logprobs, temperature
+                )
+            ]
+            result = dataclasses.replace(result, scores=scores)
         return prompts, label_token_ids, result
 
     async def _handle_non_streaming_request(
@@ -422,7 +466,14 @@ class OpenAIServingDecisions(OpenAIServingBase):
         prompts, label_token_ids, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
-            temperature=request.temperature,
+            temperature=self._question_temperatures(
+                [_decision_view(question) for question in request.questions],
+                (
+                    request.temperature
+                    if "temperature" in request.model_fields_set
+                    else None
+                ),
+            ),
         )
         answers = {}
         for i, question in enumerate(request.questions):

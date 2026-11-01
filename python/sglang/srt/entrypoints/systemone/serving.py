@@ -420,7 +420,7 @@ class SystemOneServing(OpenAIServingDecisions):
             adapted_request=adapted_request,
             raw_request=raw_request,
             temperature=(
-                1.0
+                self._question_temperatures(views)
                 if self.decision_config is None
                 else self.decision_config["temperature"]
             ),
