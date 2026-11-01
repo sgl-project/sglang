@@ -5682,6 +5682,32 @@ class MHATokenToKOnlyPool(KVCache):
     """K-only pool for MiniMax sparse layers whose index branch never reads V
     (``sparse_disable_index_value``); allocating V would waste memory."""
 
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            IndexKeyBufferInfo,
+            IndexKeyLayout,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return (
+            DevicePoolInfo(
+                pool_name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                layer_ids=self.model_layer_ids,
+                buffer_info=IndexKeyBufferInfo(
+                    page_size=self.page_size,
+                    compress_ratio=1,
+                    key_layout=IndexKeyLayout.KEY_ROWS,
+                    # NPU stores these rows with an explicit physical page axis.
+                    buffers=tuple(
+                        buffer.view(-1, self.head_num, self.head_dim)
+                        for buffer in self.k_buffer
+                    ),
+                ),
+            ),
+        )
+
     def __init__(
         self,
         size: int,
@@ -5704,6 +5730,9 @@ class MHATokenToKOnlyPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+        )
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.head_num = head_num
         self.head_dim = head_dim
@@ -5963,6 +5992,7 @@ class MiniMaxSparseKVPool(KVCache):
         if self.index_kv_pool is not None:
             self.mem_usage += self.index_kv_pool.mem_usage
         if self.index_k_pool is not None:
+            self.index_k_pool.model_layer_ids = tuple(local_k_only_sparse_layer_ids)
             self.mem_usage += self.index_k_pool.mem_usage
 
         # HiCacheController reads these from the top-level KV pool wrapper.
