@@ -1151,6 +1151,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decision-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path of a JSON file with the temperature subset of a decision checkpoint's <code>decision_config.json</code>, for <code>/v1/systemone</code> and <code>/v1/decisions</code> on an ordinary generation model: <code>format_version</code> 1 and <code>temperature</code> and/or <code>temperature_by_type</code> (<code>choice</code>, <code>noul</code>, <code>score</code>). A question type takes its <code>temperature_by_type</code> entry, else <code>temperature</code>, else 1. A <code>/v1/decisions</code> request that sets <code>temperature</code> overrides it. Readout keys such as <code>codes</code> are refused, and so is the flag with a decision checkpoint, which carries its own file.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON file path</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--completion-template`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

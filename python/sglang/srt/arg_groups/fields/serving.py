@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
 from typing import (
     Any,
     Dict,
@@ -17,6 +19,67 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
 )
 from sglang.srt.utils.common import json_list_type
+
+DECISION_QUESTION_TYPES = ("choice", "noul", "score")
+
+
+def load_decision_temperature_config(path: str) -> Dict[str, Any]:
+    """The temperature subset of decision_config.json, for a model without a readout.
+
+    ``temperature`` and ``temperature_by_type`` mean what they mean in a decision
+    checkpoint's decision_config.json: a type takes its entry in
+    ``temperature_by_type``, else ``temperature``, else 1.
+    """
+
+    def invalid(reason: str):
+        return argparse.ArgumentTypeError(f"{path}: {reason}")
+
+    with open(path) as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise invalid("must be a JSON object")
+    if config.get("format_version") != 1:
+        raise invalid("format_version must be 1")
+    keys = {"format_version", "temperature", "temperature_by_type"}
+    if set(config) - keys:
+        raise invalid(
+            f"{sorted(set(config) - keys)} are readout keys that need a decision "
+            "checkpoint, an ordinary model takes only format_version, temperature "
+            "and temperature_by_type"
+        )
+    if "temperature" not in config and "temperature_by_type" not in config:
+        raise invalid("needs temperature or temperature_by_type")
+    by_type = config.get("temperature_by_type", {})
+    if not isinstance(by_type, dict):
+        raise invalid("temperature_by_type must be an object")
+    unknown = set(by_type) - set(DECISION_QUESTION_TYPES)
+    if unknown:
+        raise invalid(
+            f"temperature_by_type has unknown question types {sorted(unknown)}, "
+            f"expected a subset of {list(DECISION_QUESTION_TYPES)}"
+        )
+
+    def temperature(name: str, value: Any) -> float:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise invalid(f"{name} must be a finite number above 0")
+        return float(value)
+
+    return {
+        "temperature": (
+            temperature("temperature", config["temperature"])
+            if "temperature" in config
+            else 1.0
+        ),
+        "temperature_by_type": {
+            kind: temperature(f"temperature_by_type[{kind!r}]", value)
+            for kind, value in by_type.items()
+        },
+    }
 
 
 class Serving(msgspec.Struct):
@@ -214,6 +277,19 @@ class Serving(msgspec.Struct):
             "expects (e.g. enable_thinking, thinking, reasoning_effort). Per-request "
             "chat_template_kwargs takes precedence.",
             type_parser=json.loads,
+        ),
+    ] = None
+    decision_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Path of a JSON file with the temperature subset of a decision "
+            "checkpoint's decision_config.json, for /v1/systemone and /v1/decisions on "
+            "an ordinary generation model: format_version 1, temperature and/or "
+            "temperature_by_type (choice, noul, score). A question type takes its "
+            "temperature_by_type entry, else temperature, else 1. A /v1/decisions "
+            "request that sets temperature overrides it. Readout keys are refused, "
+            "and so is the flag with a decision checkpoint, which carries its own.",
+            type_parser=load_decision_temperature_config,
         ),
     ] = None
     strip_thinking_cache: A[
