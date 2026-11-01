@@ -391,7 +391,12 @@ class TestMambaDonationCheckpointIntegration(CustomTestCase):
         )
 
     def test_locked_pool_skips_checkpoint_then_recovers(self):
-        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        # build_fixture defaults to an accelerator, but this test uses CPU tensors.
+        with patch(
+            "sglang.test.kits.unified_radix_cache.fixtures.get_device",
+            return_value="cpu",
+        ):
+            cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
 
         prefix = list(range(100, 108))
         seed = self._req("seed", [])
