@@ -823,6 +823,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         num_init_tokens=0,
         num_local_tokens=0,
         logits_with_pp_recv=False,
+        use_prefill_lite_topk=False,
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )
