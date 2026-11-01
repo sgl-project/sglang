@@ -134,13 +134,14 @@ def _minimax_h3_renoise_target_rows_(
     ``x_next = (1 - sigma_next) * x0 + sigma_next * noise`` with fresh noise.
     The terminal ``sigma_next == 0`` returns ``x0`` and draws nothing.
     """
-    state.add_(velocity, alpha=sigma)
+    # Keep the release's separate FP32 multiply/add rounding.
+    state.copy_(state + sigma * velocity)
     if sigma_next == 0.0:
         return
     noise = torch.randn(
         state.shape, generator=generator, device=state.device, dtype=torch.float32
     )
-    state.mul_(1.0 - sigma_next).add_(noise, alpha=sigma_next)
+    state.mul_(1.0 - sigma_next).add_(sigma_next * noise)
 
 
 def _build_local_embedding_layout(

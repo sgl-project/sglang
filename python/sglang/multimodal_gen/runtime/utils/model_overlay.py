@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 from typing import Any, Callable, cast
 
@@ -66,7 +67,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Pika-Labs/Pika-H3-Flex": {
         "overlay_repo_id": "Niehen6174/Pika-H3-Flex-overlay",
         "overlay_revision": "2d8d5e4d81d2ad0ba4b0bbcf7049231bfbe3e9c2",
-        "source_revision": "3ff166447d5edb1406107ab8370c42000ce173e4",
+        "source_revision": "0ddf55ad7067ca1e76812253bd7b4600df87f759",
     },
 }
 
@@ -182,19 +183,40 @@ def resolve_model_overlay_target(
                 f"models--{source_model_id.lower().replace('/', '--')}"
             )
             if cache_repo_fragment in path_parts:
+                suffix = path_parts[path_parts.index(cache_repo_fragment) + 1 :]
+                revision = spec.get("source_revision")
+                if (
+                    revision
+                    and re.fullmatch(r"[0-9a-fA-F]{40}", revision)
+                    and len(suffix) >= 2
+                    and suffix[0] == "snapshots"
+                    and suffix[1] != revision.lower()
+                ):
+                    raise ValueError(
+                        f"{source_model_id} requires pinned source revision {revision}; got cached snapshot {suffix[1]}"
+                    )
                 return source_model_id, spec
 
     return None
 
 
 def is_model_overlay(model_name_or_path: str) -> bool:
-    """A registered overlay source id, or a local overlay dir (no network).
+    """A registered source id/cache path, or a local overlay dir (no network).
 
-    Unlike ``resolve_model_overlay_target``, a local dir is not matched to a
-    registered source by its basename: only its own overlay manifest counts.
+    A local directory's basename alone does not identify a registered source;
+    require a canonical HF cache component or its own overlay manifest.
     """
     if resolve_model_overlay(model_name_or_path) is not None:
         return True
+    target = resolve_model_overlay_target(model_name_or_path)
+    if target is not None:
+        source_model_id, _ = target
+        cache_repo_fragment = f"models--{source_model_id.lower().replace('/', '--')}"
+        path_parts = (
+            os.path.normpath(model_name_or_path).lower().replace(os.sep, "/").split("/")
+        )
+        if cache_repo_fragment in path_parts:
+            return True
     return (
         os.path.isdir(model_name_or_path)
         and load_overlay_manifest_if_present(model_name_or_path) is not None

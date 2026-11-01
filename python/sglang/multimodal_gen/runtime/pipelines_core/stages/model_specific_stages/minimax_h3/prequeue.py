@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import msgspec
+
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_MAX_DURATION_SECONDS,
     MINIMAX_H3_MIN_DURATION_SECONDS,
@@ -23,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     MINIMAX_H3_BASE_SHORT_EDGE,
+    MINIMAX_H3_MAX_PIXELS,
     MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY,
     MiniMaxH3ResolvedPlan,
     minimax_h3_plan_from_batch,
@@ -41,20 +44,7 @@ MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY = "minimax_h3_resolved_material_sh
 def _replace_plan_shape(
     plan: MiniMaxH3ResolvedPlan, shape: dict[str, Any]
 ) -> MiniMaxH3ResolvedPlan:
-    return MiniMaxH3ResolvedPlan(
-        task=plan.task,
-        prompt=plan.prompt,
-        seed=plan.seed,
-        materials=plan.materials,
-        encoders=plan.encoders,
-        branches=plan.branches,
-        default_flow_shift=plan.default_flow_shift,
-        default_audio_flow_shift=plan.default_audio_flow_shift,
-        flow_shift=plan.flow_shift,
-        audio_flow_shift=plan.audio_flow_shift,
-        shape=shape,
-        condition_mask=plan.condition_mask,
-    )
+    return msgspec.structs.replace(plan, shape=shape)
 
 
 def _display_shape(facts: dict[str, Any], *, label: str) -> tuple[float, float]:
@@ -260,6 +250,30 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
 
         shape = dict(plan.shape)
         _validate_reference_start_times(plan, probe_facts)
+        if plan.policy is not None:
+            totals = {"video": 0.0, "audio": 0.0}
+            for material in plan.materials:
+                kind = material.condition_type
+                if kind not in {"video", "video_audio", "audio"}:
+                    continue
+                stream = "audio" if kind == "audio" else "video"
+                duration = (
+                    float(
+                        probe_facts[material.condition_index][
+                            f"{stream}_duration_seconds"
+                        ]
+                    )
+                    - material.start_time_seconds
+                )
+                if not 2.0 <= duration <= 15.0 + 1e-6:
+                    raise ValueError(
+                        f"Pika H3 Flex conditions[{material.condition_index}] must be 2–15 seconds"
+                    )
+                totals[stream] += duration
+            if any(value > 15.0 + 1e-6 for value in totals.values()):
+                raise ValueError(
+                    "Pika H3 Flex video-reference and standalone-audio totals must each be at most 15 seconds"
+                )
         _resolve_deferred_spatial_shape(plan, shape, probe_facts)
         _resolve_deferred_temporal_shape(plan, shape, probe_facts)
         if str(shape.get("geometry")) != "resolved_v2":
@@ -298,7 +312,17 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                 resolved = minimax_h3_resolve_spatial_shape(
                     width=width,
                     height=height,
-                    base_short_edge=MINIMAX_H3_BASE_SHORT_EDGE,
+                    base_short_edge=(
+                        int(shape["base_short_edge"])
+                        if plan.policy is not None
+                        else MINIMAX_H3_BASE_SHORT_EDGE
+                    ),
+                    max_pixels=(
+                        int(shape["max_pixels"])
+                        if plan.policy is not None
+                        else MINIMAX_H3_MAX_PIXELS
+                    ),
+                    warn_unverified=plan.policy is None,
                 )
             elif material.material_chain == "image.reference_preserve":
                 width, height = _display_shape(
@@ -320,6 +344,11 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                     canvas_width=int(shape["width"]),
                     canvas_height=int(shape["height"]),
                     mode=reference_resize_mode,
+                    **(
+                        {"reference_short_edge": int(shape["reference_short_edge"])}
+                        if "reference_short_edge" in shape
+                        else {}
+                    ),
                 )
             else:
                 continue

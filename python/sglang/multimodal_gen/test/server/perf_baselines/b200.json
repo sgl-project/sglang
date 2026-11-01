@@ -344,6 +344,68 @@
             "runtime_peak_vram_mb": 34903.58,
             "load_peak_allocated_mb": 13661.57,
             "runtime_peak_allocated_mb": 31120.37
+        },
+        "pika_h3_flex_t2va_b200": {
+            "stages_ms": {
+                "InputValidationStage": 0.044166925363242626,
+                "MiniMaxH3PartitionAdmissionStage": 0.018147984519600868,
+                "MiniMaxH3TextEncodingStage": 291.67829803191125,
+                "MiniMaxH3VisualEncodingStage": 0.6408810149878263,
+                "MiniMaxH3AudioEncodingStage": 0.01186795998364687,
+                "MiniMaxH3LatentPreparationStage": 4.859306034632027,
+                "MiniMaxH3TimestepPreparationStage": 0.18732098396867514,
+                "MiniMaxH3DenoisingStage": 4027.2697790060192,
+                "MiniMaxH3DecodingStage": 1389.3535550450906
+            },
+            "denoise_step_ms": {
+                "0": 1028.9354040287435,
+                "1": 95.14729504007846,
+                "2": 717.4510559998453,
+                "3": 718.9816839527339,
+                "4": 717.3716370016336,
+                "5": 711.8735029362142
+            },
+            "expected_e2e_ms": 6350.244611967355,
+            "expected_load_ms": 108541.68,
+            "load_peak_vram_mb": 127772.0,
+            "runtime_peak_vram_mb": 125922.0,
+            "warmup_peak_vram_mb": 0.0,
+            "load_peak_allocated_mb": 127631.04,
+            "runtime_peak_allocated_mb": 122178.96,
+            "expected_avg_denoise_ms": 664.9600964932082,
+            "expected_median_denoise_ms": 717.4113465007395,
+            "estimated_full_test_time_s": 130
+        },
+        "pika_h3_flex_ref2va_b200": {
+            "stages_ms": {
+                "InputValidationStage": 0.06824196316301823,
+                "MiniMaxH3PartitionAdmissionStage": 0.016484991647303104,
+                "MiniMaxH3TextEncodingStage": 484.53869903460145,
+                "MiniMaxH3VisualEncodingStage": 332.49322697520256,
+                "MiniMaxH3AudioEncodingStage": 0.024577020667493343,
+                "MiniMaxH3LatentPreparationStage": 4.703150014393032,
+                "MiniMaxH3TimestepPreparationStage": 0.21485204342752695,
+                "MiniMaxH3DenoisingStage": 5027.934803976677,
+                "MiniMaxH3DecodingStage": 1295.9685639943928
+            },
+            "denoise_step_ms": {
+                "0": 1187.6680549466982,
+                "1": 121.487095952034,
+                "2": 919.3512679776177,
+                "3": 920.8579089026898,
+                "4": 919.664227985777,
+                "5": 908.810795051977
+            },
+            "expected_e2e_ms": 7980.076943058521,
+            "expected_load_ms": 104722.24,
+            "load_peak_vram_mb": 127772.0,
+            "runtime_peak_vram_mb": 125818.0,
+            "warmup_peak_vram_mb": 0.0,
+            "load_peak_allocated_mb": 127631.04,
+            "runtime_peak_allocated_mb": 122210.03,
+            "expected_avg_denoise_ms": 829.639891802799,
+            "expected_median_denoise_ms": 919.5077479816973,
+            "estimated_full_test_time_s": 130
         }
     }
 }

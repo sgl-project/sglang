@@ -1248,11 +1248,21 @@ def _apply_condition_noise_aug(
 ) -> None:
     """Apply condition noise augmentation to cond rows."""
 
+    policy = ctx.plan.policy if ctx.plan is not None else None
+    if policy is not None and ctx.cond_rows is not None:
+        # Cached anchors are on CPU; the release draws and mixes on the DiT device.
+        ctx.cond_rows = ctx.cond_rows.to(current_platform.get_local_torch_device())
+        if ctx.plan.task != "ref2va":
+            # The released FL2VA adapter rounds clean conditioning to BF16 first.
+            ctx.cond_rows = ctx.cond_rows.to(torch.bfloat16).float()
+
     noise_visual_conditions = (
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0
     )
     noise_audio_conditions = (
-        ctx.audio_ref_rows is not None and float(audio_noise_aug) < 1.0
+        policy is None
+        and ctx.audio_ref_rows is not None
+        and float(audio_noise_aug) < 1.0
     )
     if not (noise_visual_conditions or noise_audio_conditions):
         return
@@ -1265,6 +1275,8 @@ def _apply_condition_noise_aug(
     noise_seed = getattr(ctx.plan, "seed", None) if ctx.plan is not None else None
     if noise_seed is None:
         noise_seed = getattr(sampling, "seed", None)
+    if isinstance(noise_seed, list):
+        noise_seed = noise_seed[0] if noise_seed else None
     if noise_seed is None:
         noise_seed = 42
 
@@ -1286,6 +1298,13 @@ def _apply_condition_noise_aug(
             imgvid_cond_num_frames=imgvid_cond_num_frames,
             seed=int(noise_seed),
             noise_aug=float(imgvid_noise_aug),
+            generator=(
+                torch.Generator(device=ctx.cond_rows.device).manual_seed(
+                    int(noise_seed) + policy.condition_noise_seed_offset
+                )
+                if policy is not None
+                else None
+            ),
         )
 
     if noise_audio_conditions:

@@ -16,6 +16,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
+    TI2I_QWEN_IMAGE_EDIT_INPUT,
     COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -34,6 +35,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
+    PIKA_H3_FLEX_T2VA_sampling_params,
     REALTIME_MODEL_sampling_params,
     SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
@@ -790,7 +792,79 @@ else:
         ),
     ]
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
+# Released PEFT projections use the dedicated checkpoint-backed component test;
+# the generic Diffusers engine cannot load this pack.
+PIKA_H3_FLEX_B200_CASES = [
+    DiffusionTestCase(
+        "pika_h3_flex_t2va_b200",
+        DiffusionServerArgs(
+            model_path="Pika-Labs/Pika-H3-Flex",
+            modality="video",
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--attention-backend",
+                "fa",
+                "--performance-mode",
+                "speed",
+                "--enable-torch-compile",
+                "false",
+                "--enable-breakable-cuda-graph",
+                "false",
+                "--warmup-mode",
+                "off",
+            ],
+        ),
+        PIKA_H3_FLEX_T2VA_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        reference_quality="lossless",
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "pika_h3_flex_ref2va_b200",
+        DiffusionServerArgs(
+            model_path="Pika-Labs/Pika-H3-Flex",
+            modality="video",
+            extras=[
+                "--model-variant",
+                "ref2va",
+                "--attention-backend",
+                "fa",
+                "--performance-mode",
+                "speed",
+                "--enable-torch-compile",
+                "false",
+                "--enable-breakable-cuda-graph",
+                "false",
+                "--warmup-mode",
+                "off",
+            ],
+        ),
+        replace(
+            PIKA_H3_FLEX_T2VA_sampling_params,
+            extras={
+                **PIKA_H3_FLEX_T2VA_sampling_params.extras,
+                "task": "ref2va",
+                "conditions": [
+                    {
+                        "type": "image",
+                        "uri": TI2I_QWEN_IMAGE_EDIT_INPUT,
+                        "role": "reference",
+                    }
+                ],
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        reference_quality="lossless",
+        run_t2v_input_reference_check=False,
+    ),
+]
+
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + PIKA_H3_FLEX_B200_CASES
 
 MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(

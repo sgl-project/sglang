@@ -29,8 +29,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_TASK_FL2VA,
     MINIMAX_H3_TASK_REF2VA,
     MINIMAX_H3_TASK_T2VA,
+    MiniMaxH3RequestPolicy,
     MiniMaxH3TaskProfile,
     canonical_minimax_h3_task,
+    minimax_h3_request_policy,
     minimax_h3_task_profile,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
@@ -67,7 +69,12 @@ def _optional_nonnegative_finite_float(value: Any, path: str) -> float | None:
     return normalized
 
 
-def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str, Any]:
+def _validate_target(
+    target: Any,
+    *,
+    profile: MiniMaxH3TaskProfile,
+    policy: MiniMaxH3RequestPolicy | None = None,
+) -> dict[str, Any]:
     path = "target"
     if not isinstance(target, Mapping):
         raise ValueError(f"{path} is required and must be an object")
@@ -77,20 +84,30 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
     if short_edge <= 0:
         raise ValueError(f"{path}.short_edge must be positive, got {short_edge}")
-    if short_edge != MINIMAX_H3_RECOMMENDED_SHORT_EDGE:
+    if policy is None and short_edge != MINIMAX_H3_RECOMMENDED_SHORT_EDGE:
         # Same guard the resolver applies. Without it the recommended value warns
         # that it is "outside the verified configuration", naming itself as the
         # verified one.
         warn_unverified_short_edge(short_edge)
     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
-    if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
+    if policy is not None:
+        if short_edge not in policy.max_pixels:
+            raise ValueError("Pika H3 Flex target.short_edge must be 480 or 768")
+        if aspect_ratio not in policy.aspect_ratios:
+            raise ValueError(
+                f"Pika H3 Flex target.aspect_ratio must be one of {policy.aspect_ratios}"
+            )
+        if target.get("duration_seconds") is None:
+            raise ValueError("Pika H3 Flex target.duration_seconds is required")
+    elif profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
         raise ValueError(
             f'{path}.aspect_ratio must be "auto" for task {profile.task!r}, '
             f"got {aspect_ratio!r}"
         )
     has_duration = target.get("duration_seconds") is not None
     if (
-        profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
+        policy is None
+        and profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
         and aspect_ratio != "auto"
         and aspect_ratio not in MINIMAX_H3_FINITE_ASPECT_RATIOS
     ):
@@ -123,6 +140,13 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
                 f"{path}.duration_seconds must be in "
                 f"[{MINIMAX_H3_MIN_DURATION_SECONDS:g}, "
                 f"{MINIMAX_H3_MAX_DURATION_SECONDS:g}], got {duration}"
+            )
+        if policy is not None and (
+            not float(duration).is_integer()
+            or not policy.duration_seconds[0] <= duration <= policy.duration_seconds[1]
+        ):
+            raise ValueError(
+                "Pika H3 Flex target.duration_seconds must be whole seconds from 5 to 15"
             )
         out["duration_seconds"] = float(duration)
     return out
@@ -274,6 +298,7 @@ def minimax_h3_validate_canonical_request(
     flow_shift: Any = None,
     audio_flow_shift: Any = None,
     seed: Any = None,
+    request_policy: str | None = None,
     **_extra_kwargs: Any,
 ) -> dict[str, Any]:
     """Validate and normalize a `minimax_h3.request/v1` canonical request.
@@ -288,10 +313,14 @@ def minimax_h3_validate_canonical_request(
     # Normalize the task name before profile lookup so offline callers match
     # the adapter behaviour.
     task_name = canonical_minimax_h3_task(_require_str(task, "task"))
+    policy = minimax_h3_request_policy(request_policy)
+    requested_task = task_name
+    if policy is not None and task_name in policy.keyframe_task_aliases:
+        task_name = "fl2va"
     profile = minimax_h3_task_profile(task_name)
     prompt_text = _require_str(prompt, "prompt")
 
-    normalized_target = _validate_target(target, profile=profile)
+    normalized_target = _validate_target(target, profile=profile, policy=policy)
     requested_frame_count = None
     if normalized_target.get("duration_seconds") is not None:
         requested_frame_count = int(
@@ -341,6 +370,37 @@ def minimax_h3_validate_canonical_request(
                 "audio-bearing references are provided"
             )
 
+    if policy is not None:
+        if requested_task in policy.keyframe_task_aliases:
+            expected = [policy.keyframe_task_aliases[requested_task]]
+            if [c.get("frame_index") for c in normalized_conditions] != expected:
+                raise ValueError(
+                    f"Pika H3 Flex {requested_task} requires frame_index {expected}"
+                )
+        if task_name == "ref2va":
+            counts = {
+                kind: sum(c["type"] == kind for c in normalized_conditions)
+                for kind in ("image", "video", "video_audio", "audio")
+            }
+            if any(c["role"] != "reference" for c in normalized_conditions):
+                raise ValueError(
+                    "Pika H3 Flex ref2va accepts reference conditions only"
+                )
+            videos = counts["video"] + counts["video_audio"]
+            if (
+                len(normalized_conditions) > 12
+                or counts["image"] > 9
+                or videos > 3
+                or counts["audio"] > 3
+            ):
+                raise ValueError(
+                    "Pika H3 Flex reference limits: 9 images, 3 videos, 3 audio, 12 total"
+                )
+            if counts["image"] + videos == 0:
+                raise ValueError(
+                    "Pika H3 Flex ref2va requires at least one image or video reference"
+                )
+
     canonical: dict[str, Any] = {
         "schema": MINIMAX_H3_REQUEST_SCHEMA,
         "task": task_name,
@@ -348,10 +408,17 @@ def minimax_h3_validate_canonical_request(
         "conditions": normalized_conditions,
         "target": normalized_target,
     }
+    if request_policy is not None:
+        canonical["request_policy"] = request_policy
     normalized_flow_shift = optional_positive_finite_float(flow_shift, "flow_shift")
     normalized_audio_flow_shift = optional_positive_finite_float(
         audio_flow_shift, "audio_flow_shift"
     )
+    if policy is not None and (
+        normalized_flow_shift not in (None, 12.0)
+        or normalized_audio_flow_shift not in (None, 3.0)
+    ):
+        raise ValueError("Pika H3 Flex requires video/audio flow shifts 12/3")
     if normalized_flow_shift is not None:
         canonical["flow_shift"] = normalized_flow_shift
     if normalized_audio_flow_shift is not None:
