@@ -16,8 +16,11 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
+from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
@@ -82,6 +85,42 @@ class TestSessionTokenShare(CustomTestCase):
         req.refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
+
+    def test_refused_turn_leaves_the_running_turn_in_charge(self):
+        """A turn refused for overlapping a running one never took the session,
+        so dropping it must not free the session for yet another turn."""
+        self._decode_and_finish(self._create("r1", [1, 2]), [3])
+        self._create("r2", [4])
+        streaming = StreamingSession(cache=None)
+        streaming.slots["s"] = SessionSlot(kv=ReqKvInfo(req_pool_idx=0))
+
+        with get_parallel().override(tp_size=1, tp_rank=0):
+            refused = self._create("r3", [5])
+            self.assertIsNotNone(refused.to_finish)
+            self.assertIsNone(streaming.find_active_slot(refused))
+            self.assertIsNotNone(self._create("r4", [6]).to_finish)
+
+    def test_turn_aborted_on_retract_oom_is_not_carried_over(self):
+        """A turn that cannot fit even after retracting all others is aborted
+        while it is released: the next turn is accepted and builds on the last
+        finished turn, without the aborted turn's tokens."""
+        in1, out1 = [1, 2], [3]
+        self._decode_and_finish(self._create("r1", in1), out1)
+        aborted = self._create("r2", [4, 5])
+        aborted.output_ids.extend([6, 7])
+        aborted.kv.kv_committed_len = aborted.kv.kv_allocated_len = 5
+        streaming = StreamingSession(
+            cache=SimpleNamespace(page_size=1, free_kv_row=lambda *_: None)
+        )
+        streaming.slots["s"] = SessionSlot(kv=aborted.kv)
+
+        aborted.request_finish(FINISH_ABORT("out of memory"))
+        self.assertFalse(streaming.try_cache_finished_req(aborted))
+
+        self.assertNotIn("s", streaming.slots)
+        turn_after = self._create("r3", [8])
+        self.assertIsNone(turn_after.to_finish)
+        self.assertEqual(list(turn_after.origin_input_ids), in1 + out1 + [8])
 
     def test_normal_multi_turn_share_and_carry(self):
         in1, out1 = list(range(100, 110)), [1, 2, 3]

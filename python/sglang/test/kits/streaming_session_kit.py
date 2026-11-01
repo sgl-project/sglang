@@ -11,6 +11,7 @@ the fixture only launches the server; the kit owns the `test_*` methods.
 
 import asyncio
 import time
+import uuid
 
 import requests
 
@@ -245,6 +246,57 @@ class StreamingSessionKitMixin:
 
         health = requests.get(self.base_url + "/health", timeout=10)
         self.assertEqual(health.status_code, 200)
+
+    def test_refused_turn_leaves_the_running_turn_in_charge(self) -> None:
+        """A turn refused for overlapping a running one must not free the
+        session: the next overlapping turn is refused as well."""
+        requests.post(self.base_url + "/flush_cache")
+        session_id = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        ).json()
+
+        def turn(prompt: str, *, rid=None, stream=False) -> requests.Response:
+            return requests.post(
+                self.base_url + "/generate",
+                json={
+                    "rid": rid,
+                    "input_ids": self.tokenizer.encode(prompt),
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 100000 if stream else 8,
+                        "ignore_eos": True,
+                    },
+                    "session_params": {"id": session_id, "rid": None},
+                    "stream": stream,
+                },
+                stream=stream,
+                timeout=60,
+            )
+
+        first = turn("Tell me a story.")
+        self.assertEqual(first.status_code, 200, first.text)
+        rid = uuid.uuid4().hex
+        stream = turn(" Continue.", rid=rid, stream=True)
+        try:
+            # Keep this iterator: dropping it disconnects and aborts the turn.
+            lines = stream.iter_lines()
+            next(line for line in lines if line.startswith(b"data:"))
+            for prompt in (" Overlap.", " Overlap again."):
+                overlap = turn(prompt)
+                self.assertEqual(overlap.status_code, 400, overlap.text)
+                self.assertIn("active request", overlap.text)
+        finally:
+            requests.post(
+                self.base_url + "/abort_request", json={"rid": rid}, timeout=30
+            )
+            stream.close()
+            requests.post(
+                self.base_url + "/close_session", json={"session_id": session_id}
+            )
+        self.assertEqual(
+            requests.get(self.base_url + "/health", timeout=10).status_code, 200
+        )
 
     def test_first_mid_abort_recovery(self) -> None:
         """Abort the very first request mid-decode (no slot yet; ephemeral
