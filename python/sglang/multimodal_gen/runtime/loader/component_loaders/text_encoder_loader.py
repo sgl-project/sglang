@@ -588,9 +588,6 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ) -> EncoderConfig:
-        diffusers_pretrained_config = AutoConfig.from_pretrained(
-            component_model_path, trust_remote_code=True
-        )
         encoder_index = self._extract_encoder_index(
             self.structural_component_name(component_name)
         )
@@ -605,6 +602,10 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         )
 
         if encoder_index == 0:
+            diffusers_pretrained_config = AutoConfig.from_pretrained(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+            )
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
         return encoder_config

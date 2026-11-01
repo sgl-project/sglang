@@ -1199,3 +1199,28 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_ming_image_encoder_loader_rejects_overrides():
+    from sglang.multimodal_gen.runtime.loader.component_loaders.ming_image import (
+        MingImageEncoderLoader,
+    )
+
+    loader = MingImageEncoderLoader()
+    server_args = SimpleNamespace(
+        component_weights_paths={"text_encoder": "/some/weights"},
+        component_quantizations={"text_encoder": "fp8"},
+    )
+    with pytest.raises(ComponentCheckpointUnsupportedError, match="weights-only"):
+        loader.resolve_component_weight_override(server_args, "text_encoder")
+    with pytest.raises(ComponentCheckpointUnsupportedError, match="quantization"):
+        loader.resolve_component_quantization_override(server_args, "text_encoder")
+
+    server_args = SimpleNamespace(
+        component_weights_paths={}, component_quantizations={}
+    )
+    assert loader.resolve_component_weight_override(server_args, "text_encoder") is None
+    assert (
+        loader.resolve_component_quantization_override(server_args, "text_encoder")
+        is None
+    )
