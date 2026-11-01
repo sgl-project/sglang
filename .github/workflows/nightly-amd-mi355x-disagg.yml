@@ -166,6 +166,12 @@ jobs:
       # Shared-NFS HuggingFace cache dir; the launcher resolves the live snapshot
       # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
       MODEL_PATH: ${{ matrix.config.model_path }}
+      # launch_mi355x.sh's default TIME_LIMIT (02:30:00) is sized for the
+      # heaviest EP16 4-node sweep. A 2-node 1P1D leg normally finishes in
+      # 20-35 minutes, so give it a tighter cap: a stuck leg then frees its
+      # nodes for the rest of the queue much sooner. 4n/EP16 keeps the
+      # launcher's own default.
+      TIME_LIMIT: ${{ github.job == 'nightly-mi355x-2n' && '01:00:00' || '02:30:00' }}
 
     steps: &mi355x-steps
       - name: Checkout code
@@ -191,6 +197,16 @@ jobs:
           STALE_JOBS=$(squeue --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '{print $1}' || true)
           if [ -n "$STALE_JOBS" ]; then
             echo "Cancelling stale jobs for ${RUNNER_NAME}: $STALE_JOBS"
+            # Servers are detached (-d on spur) docker containers, so scancel
+            # alone leaves them holding GPU memory. Reap them by name first.
+            for job in $STALE_JOBS; do
+              NODES=$(scontrol show job "$job" 2>/dev/null | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+              for node in $NODES; do
+                ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$node" \
+                  'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
+                  >/dev/null 2>&1 || true
+              done
+            done
             scancel $STALE_JOBS
           fi
 
