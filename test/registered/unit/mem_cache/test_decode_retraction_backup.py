@@ -437,7 +437,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         group = env.cache.host_pool_group
         full_host = group.get_pool(PoolName.KV)
         # The window's state entry lands in its own host pool.
-        ((window_pool, swa_host, window_reserved),) = queue.host_window_entries
+        ((window_pool, swa_host, window_reserved, _),) = queue.host_window_entries
         self.assertIs(group.get_pool(window_pool), swa_host)
         capacities = (full_host.available_size(), swa_host.available_size())
         req = Req(
