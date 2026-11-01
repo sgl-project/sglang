@@ -83,7 +83,9 @@ curl http://localhost:30000/v1/chat/completions \
   -d '{"model": "qwen3", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-`--model-id` is required. `--tokenizer-path` takes a local `tokenizer.json` or a
+`--model-id` is required. `--model-alias` (repeatable) serves another `model`
+name as `--model-id`, for example a gateway that sends the engine's
+`--model-path`; `/v1/models` lists only `--model-id`. `--tokenizer-path` takes a local `tokenizer.json` or a
 HuggingFace repo id; when omitted, the tokenizer for `--model-id` is downloaded
 from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). `sgl-router --help` lists
 every flag.
@@ -112,7 +114,7 @@ engine's [native gRPC](#native-grpc) API.
 
 | Area | Flags |
 | --- | --- |
-| Model | `--model-id`, `--tokenizer-path`, `--no-tokenizer` |
+| Model | `--model-id`, `--model-alias`, `--tokenizer-path`, `--no-tokenizer` |
 | Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) |
 | Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
 | Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
@@ -275,7 +277,8 @@ tools) go to the engine's own route unchanged. See
 conditions, and [chat rendering](REFERENCE.md#chat-rendering) plus the
 per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [GLM-5.3](REFERENCE.md#glm-53), [Qwen3.8](REFERENCE.md#qwen38),
-[Kimi-K3](REFERENCE.md#kimi-k3)) for which chats forward `input_ids`.
+[Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3)) for which
+chats forward `input_ids`.
 
 ### Anthropic Messages
 

@@ -14,7 +14,8 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::py::{
-    MAX_INT_DIGITS, py_strip, python_dict, python_float, python_json, python_json_reencode,
+    MAX_INT_DIGITS, py_strip, py_truthy, python_dict, python_float, python_json,
+    python_json_reencode,
 };
 use crate::tool_call::{Parsed, ToolCallItem, ToolDetector};
 
@@ -371,17 +372,6 @@ fn infer_type(schema: &Value) -> Option<String> {
         return Some("object".into());
     }
     schema.contains_key("items").then(|| "array".into())
-}
-
-fn py_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64() != Some(0.0),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(fields) => !fields.is_empty(),
-    }
 }
 
 /// `_convert_param_value`, as `json.dumps(value, ensure_ascii=False)`.
