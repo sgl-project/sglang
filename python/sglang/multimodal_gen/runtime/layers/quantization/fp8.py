@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
@@ -64,7 +65,6 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
-from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
 from sglang.srt.utils.common import is_gfx1250_supported
 
 if TYPE_CHECKING:
