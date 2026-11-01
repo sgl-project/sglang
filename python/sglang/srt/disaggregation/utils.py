@@ -7,6 +7,9 @@ from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
     Iterable,
     List,
     Literal,
@@ -195,21 +198,23 @@ def record_network_transfer(
         req, storage.owner, page_indices, unit_tokens=page_size, writes=writes
     )
     if state_indices is not None:
-        sub_pools = {
-            _wire_state_type(entry.state_type): entry.sub_pool
-            for entry in storage.wire_entries()
-            if entry.part in (KV_PART, STATE_PART)
-        }
-        for state_type, ids in zip(state_types, state_indices):
-            sub_pool = sub_pools.get(_wire_state_type(state_type))
-            if sub_pool is None or ids is None:
+        # State entries are registered in the storage's wire order, so the
+        # i-th entry carries the i-th wire entry's sub-pool.
+        for entry, state_type, ids in zip(
+            storage.wire_entries(), state_types, state_indices
+        ):
+            if (
+                ids is None
+                or entry.part not in (KV_PART, STATE_PART)
+                or _wire_state_type(entry.state_type) != _wire_state_type(state_type)
+            ):
                 continue
             for part in ids if isinstance(ids, list) else [ids]:
                 storage.record_network_transfer(
                     req,
-                    sub_pool,
+                    entry.sub_pool,
                     part,
-                    unit_tokens=storage.unit_tokens(sub_pool),
+                    unit_tokens=storage.unit_tokens(entry.sub_pool),
                     writes=writes,
                 )
     if isinstance(kv_manager, CommonKVManager):
@@ -293,6 +298,59 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
     )
     raw = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
     return int.from_bytes(raw, "big") >> 1 | 1
+
+
+def state_wire(kv_args: KVArgs) -> Optional[List[List[Optional[str]]]]:
+    """The state entries a PD peer registers, in order, as (state type,
+    sub-pool) pairs: two peers transfer state entry by entry, so theirs must
+    be equal. None when the peer registered no state entries yet."""
+    state_types = getattr(kv_args, "state_types", None)
+    if state_types is None:
+        return None
+    sub_pools = getattr(kv_args, "state_sub_pools", None) or [None] * len(state_types)
+    return [
+        [_wire_state_type(state_type).value, sub_pool]
+        for state_type, sub_pool in zip(state_types, sub_pools)
+    ]
+
+
+def check_state_wire(
+    prefill_wire: Optional[List[List[Optional[str]]]],
+    decode_wire: Optional[List[List[Optional[str]]]],
+) -> None:
+    """Refuse peers whose state entries differ: entries pair by position."""
+    if prefill_wire is None or decode_wire is None or prefill_wire == decode_wire:
+        return
+    raise RuntimeError(
+        f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
+        f"decode server registers {decode_wire} (state type, sub-pool). Both "
+        "servers must hold the same attention and state sub-pools (model, window "
+        "lengths, draft model and unified memory settings)."
+    )
+
+
+def state_indices_per_entry(
+    kv_args: KVArgs,
+    state_types: Sequence,
+    payloads: Dict,
+    window_payload: Callable[[str], Any],
+) -> List:
+    """One payload per registered state entry: a window entry carries the
+    pages of its own sub-pool; any other entry, and an entry without a
+    sub-pool (a static pool's), its state type's payload (None when the type
+    has none)."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    return [
+        (
+            window_payload(sub_pool)
+            if sub_pool is not None and st in (StateType.SWA, StateType.AUXILIARY_SWA)
+            else payloads[st]()
+            if st in payloads
+            else None
+        )
+        for st, sub_pool in zip(state_types, kv_args.state_sub_pools)
+    ]
 
 
 def all_reduce_flags(
@@ -1269,10 +1327,12 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    sub_pool: Optional[str] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
     kv_args.state_types.append(state_type)
+    kv_args.state_sub_pools.append(sub_pool)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
@@ -1481,15 +1541,6 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
-def wire_sub_pool(storage, state_type) -> str:
-    """The sub-pool a storage transfers as ``state_type``."""
-    return next(
-        entry.sub_pool
-        for entry in storage.wire_entries()
-        if _wire_state_type(entry.state_type) == state_type
-    )
-
-
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
@@ -1501,8 +1552,10 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
     kv_args.state_types = []
+    kv_args.state_sub_pools = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1518,6 +1571,7 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+    static = isinstance(storage, StaticKVStorage)
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
@@ -1531,6 +1585,8 @@ def setup_state_kv_args(
             list(region.conv_shard_groups),
             list(region.slice_outer_counts),
             list(region.layer_ids),
+            # A static pool's entries are slices of its pools, not sub-pools.
+            sub_pool=None if static else entry.sub_pool,
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout

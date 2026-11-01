@@ -67,7 +67,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     record_network_transfer,
     setup_state_kv_args,
-    wire_sub_pool,
+    state_indices_per_entry,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -1682,15 +1682,6 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.AUXILIARY_SWA: lambda: _swa_payload(
-                    wire_sub_pool(
-                        kv_storage_of(
-                            self.req_to_token_pool, self.token_to_kv_pool_allocator
-                        ),
-                        StateType.AUXILIARY_SWA,
-                    ),
-                    None,
-                ),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
@@ -1718,9 +1709,12 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            state_indices = state_indices_per_entry(
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args,
+                state_types,
+                payloads,
+                _swa_payload,
+            )
 
         transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:
