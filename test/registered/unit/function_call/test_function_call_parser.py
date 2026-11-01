@@ -4092,6 +4092,16 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
 
+    def test_whitespace_prefix_before_array_stays_unstreamed(self):
+        """Whitespace before the constrained JSON array gains no content
+        chunk; the first-call prefix drain only applies to real prose."""
+        detector = JsonArrayParser()
+        result = detector.parse_streaming_increment(
+            '\n[{"name": "get_weather", "parameters": {"location": "Tokyo"}}]',
+            self.tools,
+        )
+        self.assertEqual(result.normal_text, "")
+
     def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
         """Calls that arrive whole in the last chunk still stream their
         arguments at stream end, exactly once."""
@@ -5578,6 +5588,61 @@ class TestQwen25Detector(unittest.TestCase):
         self.assertEqual(len(result), 2, f"Expected 2 tool calls, got {len(result)}")
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
+
+    def test_streaming_prefix_text_arriving_with_tool_call(self):
+        """Prose that arrives in the same delta as the tool call it precedes
+        (multi-token deltas: larger --stream-interval, speculative decoding)
+        must still reach the client instead of being swallowed."""
+        chunks = [
+            'Sure! <tool_call>\n{"name": "get_current_weather", ',
+            '"arguments": {"city": "NYC", "state": "NY", "unit": "celsius"}}',
+            "\n</tool_call>",
+        ]
+        content = ""
+        result = {}
+        for chunk in chunks:
+            parsed = self.detector.parse_streaming_increment(chunk, self.tools)
+            content += parsed.normal_text
+            for call in parsed.calls:
+                entry = result.setdefault(
+                    call.tool_index, {"name": "", "parameters": ""}
+                )
+                if call.name:
+                    entry["name"] = call.name
+                if call.parameters:
+                    entry["parameters"] += call.parameters
+
+        self.assertEqual(content, "Sure! ")
+        self.assertEqual(result[0]["name"], "get_current_weather")
+        self.assertEqual(
+            json.loads(result[0]["parameters"]),
+            {"city": "NYC", "state": "NY", "unit": "celsius"},
+        )
+
+    def test_streaming_whitespace_only_prefix_stays_unstreamed(self):
+        """A whitespace-only prefix before the bot_token keeps the old drop
+        behavior so constrained pure-JSON output gains no content chunks."""
+        parsed = self.detector.parse_streaming_increment(
+            '\n<tool_call>\n{"name": "get_current_weather", '
+            '"arguments": {"city": "NYC", "state": "NY", "unit": "celsius"}}'
+            "\n</tool_call>",
+            self.tools,
+        )
+        self.assertEqual(parsed.normal_text, "")
+
+    def test_streaming_inter_call_markup_not_streamed_as_content(self):
+        """Markup between two tool calls must not leak into the streamed
+        content now that first-call prefixes are drained as text."""
+        call1 = '<tool_call>\n{"name": "get_current_weather", "arguments": {"city": "NYC", "state": "NY", "unit": "celsius"}}\n</tool_call>'
+        call2 = '<tool_call>\n{"name": "get_current_weather", "arguments": {"city": "LA", "state": "CA", "unit": "celsius"}}\n</tool_call>'
+        content = ""
+        for chunk in ["Sure! ", call1 + call2]:
+            content += self.detector.parse_streaming_increment(
+                chunk, self.tools
+            ).normal_text
+
+        self.assertEqual(content, "Sure! ")
+        self.assertNotIn("</tool_call>", content)
 
 
 class TestGemma4Detector(unittest.TestCase):
