@@ -10,8 +10,10 @@ contract.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import operator
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import sqrt
@@ -21,10 +23,36 @@ from typing import Any, Callable, Optional
 import torch
 import torch.fx
 import torch.nn.functional as F
+from torch.export.graph_signature import OutputKind
+
+logger = logging.getLogger(__name__)
 
 
 class UnsupportedMlxFxGraphError(RuntimeError):
     """Raised when one FX graph cannot be lowered as a single MLX region."""
+
+
+def _torch_entry_point(path: str) -> Any:
+    """Resolve a semi-private Torch entry point the lowering depends on.
+
+    These names are stable across the Torch >= 2.13 floor but carry no public
+    guarantee; failing here names the missing symbol instead of surfacing as
+    an unrelated lookup error at first use.
+    """
+    value: Any = torch
+    for part in path.split("."):
+        value = getattr(value, part, None)
+        if value is None:
+            raise RuntimeError(
+                f"torch.{path} is not available in torch {torch.__version__}; "
+                "the MLX FX lowering requires torch >= 2.13"
+            )
+    return value
+
+
+_AUTO_FUNCTIONALIZED = _torch_entry_point("ops.higher_order.auto_functionalized_v2")
+_NN_LINEAR = _torch_entry_point("_C._nn.linear")
+_NN_SDPA = _torch_entry_point("_C._nn.scaled_dot_product_attention")
 
 
 @dataclass(frozen=True)
@@ -54,13 +82,15 @@ class MlxFxGraphPlan:
     def fully_supported(self) -> bool:
         return not self.unsupported
 
+    def describe_unsupported(self) -> str:
+        return ", ".join(f"{node.node_op}:{node.target}" for node in self.unsupported)
+
     def require_fully_supported(self) -> None:
-        unsupported = self.unsupported
-        if not unsupported:
+        if self.fully_supported:
             return
-        details = ", ".join(f"{node.node_op}:{node.target}" for node in unsupported)
         raise UnsupportedMlxFxGraphError(
-            "FX forward cannot run as one MLX region; unsupported nodes: " + details
+            "FX forward cannot run as one MLX region; unsupported nodes: "
+            + self.describe_unsupported()
         )
 
 
@@ -87,7 +117,7 @@ class MlxFxLoweringRegistry:
         if node.op in {"placeholder", "get_attr", "output"}:
             return node.op
         if node.op == "call_function":
-            if node.target is torch.ops.higher_order.auto_functionalized_v2:
+            if node.target is _AUTO_FUNCTIONALIZED:
                 custom_target = node.args[0]
                 lowering = self._functions.get(custom_target)
                 return None if lowering is None else f"functionalized_{lowering}"
@@ -263,7 +293,7 @@ def _lower_layer_norm(mx, args, kwargs):
 @_lowering(
     "linear",
     aten=(torch.ops.aten.linear.default,),
-    functions=(torch._C._nn.linear,),
+    functions=(_NN_LINEAR,),
 )
 def _lower_linear(mx, args, kwargs):
     value, weight = args[:2]
@@ -289,7 +319,7 @@ def _lower_mean(mx, args, kwargs):
 @_lowering(
     "sdpa",
     aten=(torch.ops.aten.scaled_dot_product_attention.default,),
-    functions=(torch._C._nn.scaled_dot_product_attention,),
+    functions=(_NN_SDPA,),
 )
 def _lower_sdpa(mx, args, kwargs):
     query, key, value = args[:3]
@@ -581,10 +611,13 @@ def _resolve_graph_attr(graph_module: torch.fx.GraphModule, target: str) -> Any:
 def make_mlx_fx_executor(
     plan: MlxFxGraphPlan,
     example_inputs: list[Any],
-    *,
-    shapeless: bool = False,
 ) -> Callable[..., Any]:
-    """Build one compiled MLX callable for a fully admitted FX graph."""
+    """Build one compiled MLX callable for a fully admitted FX graph.
+
+    The graph is compiled with static shapes: lowerings read Python-level
+    shapes (causal masks, chunk and flatten arithmetic), which a shapeless
+    trace cannot carry, so a new input shape is a new compile.
+    """
     import mlx.core as mx
 
     from sglang.srt.utils.tensor_bridge import MlxTensorView, mlx_call_multi
@@ -664,7 +697,7 @@ def make_mlx_fx_executor(
             values[node] = _lower_mlx_node(node_plan.lowering, args, kwargs)
         raise UnsupportedMlxFxGraphError("FX graph has no output node")
 
-    compiled_graph = mx.compile(mlx_graph, shapeless=shapeless)
+    compiled_graph = mx.compile(mlx_graph, shapeless=False)
 
     def execute(*torch_inputs):
         if len(torch_inputs) != len(placeholder_nodes):
@@ -723,7 +756,7 @@ def export_mlx_plan(
     mutations = tuple(
         str(spec.target)
         for spec in functional.graph_signature.output_specs
-        if str(spec.kind).endswith("USER_INPUT_MUTATION")
+        if spec.kind is OutputKind.USER_INPUT_MUTATION
     )
     return MlxExportPlan(
         exported_program=exported,
@@ -740,6 +773,8 @@ class MlxFxCaptureBackend:
     can be tested without pretending that MLX execution is implemented. A
     production ``executor_factory`` receives the complete admitted graph once
     and must return one callable containing the Torch/MLX bridge boundary.
+    Dynamo owns the compiled callables; the backend keeps at most
+    ``max_plans`` recent plans for reports and tests.
     """
 
     def __init__(
@@ -751,12 +786,13 @@ class MlxFxCaptureBackend:
         ] = None,
         fallback_to_torch: bool = False,
         report_path: Optional[str] = None,
+        max_plans: int = 32,
     ) -> None:
         self.registry = registry or MlxFxLoweringRegistry.standard_decoder()
         self.executor_factory = executor_factory
         self.fallback_to_torch = fallback_to_torch
         self.report_path = report_path
-        self.plans: list[MlxFxGraphPlan] = []
+        self.plans: deque[MlxFxGraphPlan] = deque(maxlen=max_plans)
 
     def __call__(
         self, graph_module: torch.fx.GraphModule, example_inputs: list[Any]
@@ -785,6 +821,11 @@ class MlxFxCaptureBackend:
             )
         if not plan.fully_supported:
             if self.fallback_to_torch:
+                logger.warning(
+                    "MLX region cannot lower this graph; it runs on Torch. "
+                    "Unsupported nodes: %s",
+                    plan.describe_unsupported(),
+                )
                 return graph_module.forward
             plan.require_fully_supported()
         if self.executor_factory is None:
@@ -801,9 +842,5 @@ __all__ = [
     "UnsupportedMlxFxGraphError",
     "build_mlx_fx_plan",
     "export_mlx_plan",
-    "make_mlx_decode_export_executor",
     "make_mlx_fx_executor",
-    "make_mlx_prefill_export_executor",
-    "run_torch_decode_export_reference",
-    "run_torch_prefill_export_reference",
 ]

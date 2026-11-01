@@ -23,6 +23,7 @@ import importlib.util
 
 import pytest
 import torch
+from packaging.version import Version
 
 from sglang.srt.hardware_backend.mlx.fx_lowering import (
     _LOWERINGS,
@@ -34,8 +35,11 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=2, suite="stage-a-unit-test-mlx")
 
+# The Torch/MLX bridge floor; the executor tests gate on the same predicate.
 _HAS_MLX_RUNTIME = (
-    importlib.util.find_spec("mlx") is not None and torch.backends.mps.is_available()
+    importlib.util.find_spec("mlx") is not None
+    and torch.backends.mps.is_available()
+    and Version(torch.__version__) >= Version("2.13")
 )
 
 # Lowerings with no comparable eager output: assert_metadata returns None,
@@ -254,9 +258,12 @@ def test_lowering_matches_eager_for_schema_variants(
     mlx_kwargs = {key: _to_mlx(value) for key, value in kwargs.items()}
     try:
         actual = _lower_mlx_node(name, mlx_args, mlx_kwargs)
-    except UnsupportedMlxFxGraphError:
-        if expect_raise or kwargs:
-            return  # declared rejection, or a variant the lowering declines
+    except UnsupportedMlxFxGraphError as error:
+        if expect_raise:
+            return  # declared rejection
+        if kwargs:
+            # A declined variant is visible as a skip, never a silent pass.
+            pytest.skip(f"lowering {name!r} declines {kwargs}: {error}")
         raise AssertionError(
             f"lowering {name!r} rejected its base case; the plain-arguments "
             "form must be supported"

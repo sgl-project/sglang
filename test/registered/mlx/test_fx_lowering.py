@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 from unittest import mock
 
@@ -9,6 +10,7 @@ import pytest
 import torch
 from packaging.version import Version
 
+import sglang.srt.hardware_backend.mlx.fx_lowering as fx_lowering
 from sglang.srt.hardware_backend.mlx.fx_lowering import (
     MlxFxCaptureBackend,
     MlxFxLoweringRegistry,
@@ -22,9 +24,14 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
-_HAS_WHOLE_GRAPH_MLX_RUNTIME = torch.backends.mps.is_available() and Version(
-    torch.__version__
-) >= Version("2.13")
+# The Torch/MLX bridge needs Torch >= 2.13 and MLX on MPS; the parity suite
+# gates on the same floor.
+_HAS_MLX_RUNTIME = (
+    torch.backends.mps.is_available()
+    and importlib.util.find_spec("mlx") is not None
+    and Version(torch.__version__) >= Version("2.13")
+)
+_HAS_WHOLE_GRAPH_MLX_RUNTIME = _HAS_MLX_RUNTIME
 
 
 @torch.library.custom_op("sglang_mlx_fx_test::kv_commit", mutates_args={"cache"})
@@ -82,6 +89,11 @@ def _decoder_registry() -> MlxFxLoweringRegistry:
     return registry
 
 
+def test_all_names_are_importable():
+    for name in fx_lowering.__all__:
+        assert hasattr(fx_lowering, name), f"{name} listed in __all__ but undefined"
+
+
 def test_dynamo_captures_dense_decoder_and_kv_commit_as_one_supported_graph():
     torch._dynamo.reset()
     model = _TinyDecoder().eval()
@@ -124,7 +136,7 @@ def test_executor_factory_receives_the_complete_graph_once():
     compiled = torch.compile(_TinyDecoder().eval(), backend=backend, fullgraph=True)
     compiled(torch.tensor([1, 2]), torch.zeros(2, 8))
 
-    assert executor_plans == backend.plans
+    assert executor_plans == list(backend.plans)
     assert len(executor_plans) == 1
 
 
@@ -134,6 +146,7 @@ def test_executor_factory_receives_the_complete_graph_once():
 )
 def test_generic_mlx_executor_matches_torch_in_one_region():
     torch._dynamo.reset()
+    torch.manual_seed(0)
     model = _TinyMlp().to(device="mps", dtype=torch.bfloat16).eval()
     backend = MlxFxCaptureBackend(
         executor_factory=make_mlx_fx_executor,
@@ -154,6 +167,7 @@ def test_generic_mlx_executor_matches_torch_in_one_region():
 )
 def test_generic_mlx_executor_reuses_one_torch_graph_across_token_counts():
     torch._dynamo.reset()
+    torch.manual_seed(0)
     model = _TinyMlp().to(device="mps", dtype=torch.bfloat16).eval()
     backend = MlxFxCaptureBackend(
         executor_factory=make_mlx_fx_executor,
@@ -181,6 +195,7 @@ def test_generic_mlx_executor_reuses_one_torch_graph_across_token_counts():
 )
 def test_generic_mlx_executor_observes_weight_mutation_and_replacement():
     torch._dynamo.reset()
+    torch.manual_seed(0)
     model = _TinyMlp().to(device="mps", dtype=torch.bfloat16).eval()
     backend = MlxFxCaptureBackend(executor_factory=make_mlx_fx_executor)
     compiled = torch.compile(model, backend=backend, fullgraph=True)
@@ -220,6 +235,7 @@ def test_same_mlx_executor_runs_real_sglang_mlp_architectures(architecture):
     from sglang.srt.models.qwen3 import Qwen3MLP
     from sglang.srt.runtime_context import _CONTEXT, get_parallel
 
+    torch.manual_seed(0)
     old_server_args = _CONTEXT._server_args
     old_config_bags = _CONTEXT._config_bags
     old_parallel_config = get_parallel()._config
@@ -419,7 +435,7 @@ def test_unsupported_operation_rejects_the_complete_region():
         raise AssertionError("unsupported FX graph was accepted")
 
 
-def test_unsupported_compiled_graph_falls_back_as_one_torch_region():
+def test_unsupported_compiled_graph_falls_back_as_one_torch_region(caplog):
     class UnsupportedModel(torch.nn.Module):
         def forward(self, value):
             return torch.sin(value) + 1
@@ -428,11 +444,22 @@ def test_unsupported_compiled_graph_falls_back_as_one_torch_region():
     backend = MlxFxCaptureBackend(fallback_to_torch=True)
     model = UnsupportedModel()
     value = torch.randn(4)
-    actual = torch.compile(model, backend=backend, fullgraph=True)(value)
+    with caplog.at_level("WARNING", logger=fx_lowering.__name__):
+        actual = torch.compile(model, backend=backend, fullgraph=True)(value)
 
     torch.testing.assert_close(actual, model(value))
     assert len(backend.plans) == 1
     assert not backend.plans[0].fully_supported
+    # A whole-graph fallback is never silent: the log names what blocked it.
+    assert any("sin" in record.getMessage() for record in caplog.records)
+
+
+def test_backend_keeps_a_bounded_number_of_plans():
+    backend = MlxFxCaptureBackend(fallback_to_torch=True, max_plans=2)
+    for _ in range(3):
+        torch._dynamo.reset()
+        torch.compile(torch.sin, backend=backend, fullgraph=True)(torch.randn(3))
+    assert len(backend.plans) == 2
 
 
 @pytest.mark.skipif(
@@ -461,6 +488,7 @@ def test_review_flagged_ops_match_eager_through_the_export_path():
             added = torch.add(product, self.shift, alpha=0.5)
             return added, subbed, x[:, :-1], x[:, 1:], x[:, -3:]
 
+    torch.manual_seed(0)
     model = ReviewOps().eval()
     x = torch.randn(4, 8, device="mps", dtype=torch.bfloat16)
     w = torch.randn(8, 4, device="mps", dtype=torch.bfloat16)
