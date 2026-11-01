@@ -166,7 +166,13 @@ class TestUnifiedTriPool(_PoolTestCase):
         # capacity accounting still run through the real sub-allocators.
         with patch(_TAKE_NEW_PAGES, side_effect=_take_new_pages_on_host):
             virtual = allocator.alloc_extend_swa_tail(
-                prefix, prefix, seq, seq, torch.tensor([-1]), 12, swa_tail_len=5
+                prefix,
+                prefix,
+                seq,
+                seq,
+                torch.tensor([-1]),
+                12,
+                window_tail_lens=dict.fromkeys(allocator.window_pool_names(), 5),
             )
         self.assertIsNotNone(virtual)
         self.assertEqual(len(virtual), 12)
@@ -207,7 +213,7 @@ class TestUnifiedTriPool(_PoolTestCase):
                             seq,
                             torch.tensor([-1]),
                             length,
-                            tail_len,
+                            dict.fromkeys(allocator.window_pool_names(), tail_len),
                         )
                     self.assertIsNotNone(virtual)
                     self.assertEqual(full.allocated_count(), length)
@@ -229,7 +235,13 @@ class TestUnifiedTriPool(_PoolTestCase):
         with patch(_TAKE_NEW_PAGES) as extend:
             self.assertIsNone(
                 allocator.alloc_extend_swa_tail(
-                    prefix, prefix, seq, seq, torch.tensor([-1]), length, 0
+                    prefix,
+                    prefix,
+                    seq,
+                    seq,
+                    torch.tensor([-1]),
+                    length,
+                    dict.fromkeys(allocator.window_pool_names(), 0),
                 )
             )
         extend.assert_not_called()
