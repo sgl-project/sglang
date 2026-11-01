@@ -716,14 +716,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if target_dp_enabled and capture_decode_cuda_graph:
-                # Keep the eager-draft policy for idle/unequal DP batches.
-                # The narrowed draft scope hides the target's DP flag.
+            # The draft has no cross-DP collective, so on CUDA each DP rank keys
+            # its own graphs by local batch size; other devices stay eager.
+            if target_dp_enabled and capture_decode_cuda_graph and not is_cuda():
                 capture_decode_cuda_graph = False
                 if self._target_tp_rank == 0:
                     logger.warning(
                         "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
+                        "is enabled on a non-CUDA device (draft runs eager)."
                     )
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
@@ -2457,6 +2457,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # verify forward (IDLE mode) so its cross-DP collectives stay in
             # lockstep with the active DP group; the draft block's
             # collectives are within-rank and skipped.
+            can_run_cuda_graph = False
             if get_parallel().attn_dp_enabled:
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -2468,17 +2469,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
                     batch, self._target_worker, defer_metadata_init=True
                 )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
-                self._target_worker.forward_batch_generation(
+                # Graph or eager must match the active ranks so DP-gather offsets
+                # agree; NPU active ranks go eager via the idle-DP guard.
+                if _is_npu:
+                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                idle_out = self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
                     skip_attn_backend_init=True if _is_npu else None,
                 )
+                can_run_cuda_graph = idle_out.can_run_cuda_graph
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -2492,7 +2493,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.block_size),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
@@ -2876,12 +2877,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
+        # Idle-DP guard: NPU idle ranks verify eagerly with raw counts, which
+        # disagree with a replayed graph's padded bucket on DP-gather offsets.
         if (
-            get_parallel().attn_dp_enabled
+            _is_npu
+            and get_parallel().attn_dp_enabled
             and verify_forward_batch.original_global_num_tokens_cpu is not None
             and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
         ):

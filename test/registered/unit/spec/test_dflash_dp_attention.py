@@ -1,6 +1,7 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -10,11 +11,13 @@ from sglang.srt.arg_groups.speculative_hook import _handle_dflash
 from sglang.srt.environ import envs
 from sglang.srt.layers import linear, vocab_parallel_embedding
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -219,6 +222,144 @@ class TestDFlashDPMetadata(CustomTestCase):
                     torch.testing.assert_close(result.input_ids, ids)
                     self.assertTrue(result.needs_forward_metadata_init())
                     self.assertEqual(can_graph, graph_eligible)
+
+
+class TestDFlashDPCudaGraphs(CustomTestCase):
+    def _init_draft_graphs(self, *, attention_dp, cuda):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_module
+
+        tp_sync = Mock()
+        tp_sync.available_memory_gb.return_value = 64.0
+        worker = SimpleNamespace(
+            draft_parallel_layout=None,
+            _target_tp_rank=0,
+            _draft_worker=Mock(),
+            _maybe_build_draft_sampler=Mock(return_value=None),
+            _tp_sync=tp_sync,
+            device="cuda",
+            gpu_id=0,
+            selector=None,
+        )
+        execution = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend=Backend.FULL)
+                )
+            )
+        )
+        with (
+            patch.object(worker_module, "draft_pp_context", nullcontext),
+            patch.object(worker_module, "draft_tp_context", lambda _: nullcontext()),
+            patch.object(worker_module, "get_exec", return_value=execution),
+            patch.object(
+                worker_module,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    attn_dp_enabled=attention_dp, tp_group=Mock()
+                ),
+            ),
+            patch.object(worker_module, "is_cuda", return_value=cuda),
+            patch.object(worker_module, "_is_npu", not cuda),
+            patch.object(
+                worker_module.current_platform, "is_out_of_tree", return_value=False
+            ),
+        ):
+            worker_module.DFlashWorkerV2.init_cuda_graphs(worker)
+        return worker
+
+    def test_non_cuda_dp_draft_stays_eager(self):
+        for attention_dp in (False, True):
+            with self.subTest(attention_dp=attention_dp):
+                worker = self._init_draft_graphs(attention_dp=attention_dp, cuda=False)
+                worker._draft_worker.init_cuda_graphs.assert_called_once_with(
+                    capture_decode_cuda_graph=not attention_dp
+                )
+                if attention_dp:
+                    worker._maybe_build_draft_sampler.assert_not_called()
+                else:
+                    worker._maybe_build_draft_sampler.assert_called_once_with()
+
+    def test_cuda_dp_draft_captures_graph_with_sampler(self):
+        # The draft is attn-TP-local, so dp attention no longer forces eager.
+        for attention_dp in (False, True):
+            with self.subTest(attention_dp=attention_dp):
+                worker = self._init_draft_graphs(attention_dp=attention_dp, cuda=True)
+                worker._draft_worker.init_cuda_graphs.assert_called_once_with(
+                    capture_decode_cuda_graph=True
+                )
+                worker._maybe_build_draft_sampler.assert_called_once_with()
+
+    def test_dflash_draft_graph_keys_by_local_batch(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        for algorithm, is_draft, expected in (
+            (SpeculativeAlgorithm.DFLASH, True, True),
+            (SpeculativeAlgorithm.DFLASH, False, False),
+            (SpeculativeAlgorithm.EAGLE, True, False),
+        ):
+            with self.subTest(algorithm=algorithm, is_draft=is_draft):
+                runner = SimpleNamespace(
+                    is_draft_worker=is_draft, spec_algorithm=algorithm
+                )
+                self.assertIs(
+                    DecodeCudaGraphRunner._forward_is_dp_local(runner), expected
+                )
+
+    def _run_idle_verify(self, *, npu):
+        from sglang.srt.speculative import dflash_worker_v2 as worker_module
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        idle_forward = SimpleNamespace(can_run_decode_cuda_graph=True)
+        target_worker = Mock()
+        target_worker.forward_batch_generation.side_effect = lambda **kw: (
+            SimpleNamespace(
+                can_run_cuda_graph=kw["forward_batch"].can_run_decode_cuda_graph
+            )
+        )
+        worker = SimpleNamespace(
+            device="cpu",
+            block_size=4,
+            _target_worker=target_worker,
+            _validate_phase1_sampling_support=Mock(),
+            _make_next_draft_input_decode=Mock(
+                return_value=SimpleNamespace(new_seq_lens=torch.empty((0,)))
+            ),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            is_extend_in_batch=False,
+            spec_info=DFlashDraftInputV2.create_idle_input(device="cpu"),
+        )
+        with (
+            patch.object(
+                worker_module,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_enabled=True),
+            ),
+            patch.object(worker_module, "_is_npu", npu),
+            patch.object(
+                DFlashVerifyInput,
+                "prepare_for_verify",
+                return_value=(idle_forward, True),
+            ),
+        ):
+            result = worker_module.DFlashWorkerV2.forward_batch_generation(
+                worker, batch
+            )
+        target_worker.forward_batch_generation.assert_called_once()
+        return idle_forward, result
+
+    def test_cuda_idle_rank_replays_verify_graph(self):
+        idle_forward, result = self._run_idle_verify(npu=False)
+        self.assertTrue(idle_forward.can_run_decode_cuda_graph)
+        self.assertTrue(result.can_run_cuda_graph)
+
+    def test_npu_idle_rank_keeps_eager_verify(self):
+        idle_forward, result = self._run_idle_verify(npu=True)
+        self.assertFalse(idle_forward.can_run_decode_cuda_graph)
+        self.assertFalse(result.can_run_cuda_graph)
 
 
 if __name__ == "__main__":
