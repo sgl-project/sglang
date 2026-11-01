@@ -1329,6 +1329,10 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # trtllm_mla eager decode: reuse flashinfer's MLA decode autotuner tactic per
+    # shape instead of re-selecting it on every call. Outputs are unchanged and
+    # CUDA-graph replay is unaffected.
+    SGLANG_TRTLLM_MLA_CACHE_DECODE_RUNNER = EnvBool(False)
     # Split TRTLLM-GEN decode attention into sorted, equal-size request groups.
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
