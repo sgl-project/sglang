@@ -171,6 +171,9 @@ class ConfigArgumentMerger:
                 action = self.unsupported_actions[key_norm]
                 msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
                 raise ValueError(msg)
+            # argparse has no spelling for None; str(None) would set the literal "None".
+            if value is None:
+                continue
             if isinstance(value, bool):
                 self._add_boolean_arg(args, key, value)
             elif isinstance(value, list):
