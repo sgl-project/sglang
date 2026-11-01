@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.tree_slots import index_slots
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
@@ -188,12 +189,12 @@ class TestUnifiedTriPool(_PoolTestCase):
                     length = allocator.available_size() + 4
                     self.assertFalse(
                         allocator.admits(
-                            length, allocator._window_demand(length, length)
+                            length, demand_windows(allocator, length, length)
                         )
                     )
                     self.assertTrue(
                         allocator.admits(
-                            length, allocator._window_demand(length, tail_len)
+                            length, demand_windows(allocator, length, tail_len)
                         )
                     )
                     prefix = torch.tensor([0], dtype=torch.int64)
@@ -377,7 +378,11 @@ class TestUnifiedTriPool(_PoolTestCase):
         holes = sa._hole_pages()
         self.assertGreater(holes, 0)
         # A layout that compacts the ends leaves the float's holes in place.
-        demands = {n: d for n, d in allocator.page_demands(1, 1).items() if d}
+        demands = {
+            n: d
+            for n, d in allocator.page_demands(token_demand(allocator, 1, 1)).items()
+            if d
+        }
         layout = plan(allocator.pricing_snapshot(), demands, FLUSH_ENDS)
         self.assertNotIn(sa.sub_pool_name, layout.flush)
         allocator._lay_out(layout)
@@ -1258,9 +1263,17 @@ class TestTriPoolHardening(_PoolTestCase):
         # be taken, and no layout that leaves the float in place holds it.
         need = allocator.available_size()
         page = allocator.page_size
-        demands = {n: d for n, d in allocator.page_demands(need, need).items() if d}
+        demands = {
+            n: d
+            for n, d in allocator.page_demands(
+                token_demand(allocator, need, need)
+            ).items()
+            if d
+        }
         self.assertIsNone(plan(allocator.pricing_snapshot(), demands, FLUSH_ENDS))
-        self.assertFalse(allocator.ensure_capacity(need + page, need + page))
+        self.assertFalse(
+            allocator.ensure_capacity(token_demand(allocator, need + page, need + page))
+        )
         live_before = sa._live_pages()
         moves_before = len(sa._inverse_history)
         v1 = allocator.alloc(need)
@@ -1580,12 +1593,13 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         self.assertLessEqual(full_demand, allocator.full_available_size())
         self.assertLessEqual(swa_demand, allocator.swa_available_size())
         # ... yet the two draw on the same bytes, so the grid refuses the pair.
-        self.assertFalse(allocator.ensure_capacity(full_demand, swa_demand))
+        self.assertFalse(
+            allocator.ensure_capacity(token_demand(allocator, full_demand, swa_demand))
+        )
         self.assertFalse(
             allocator.prealloc_fits(
                 self._empty_tree(),
-                full_demand,
-                swa_demand,
+                token_demand(allocator, full_demand, swa_demand),
                 full_budget_tokens=full_demand,
                 swa_budget_tokens=swa_demand,
             )
@@ -1603,8 +1617,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         self.assertTrue(
             allocator.prealloc_fits(
                 self._empty_tree(),
-                page_size,
-                page_size,
+                token_demand(allocator, page_size, page_size),
                 full_budget_tokens=full_budget,
                 swa_budget_tokens=swa_budget,
             )
@@ -1613,8 +1626,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         self.assertFalse(
             allocator.prealloc_fits(
                 self._empty_tree(),
-                page_size,
-                page_size,
+                token_demand(allocator, page_size, page_size),
                 full_budget_tokens=page_size - 1,
                 swa_budget_tokens=swa_budget,
             )
@@ -1624,8 +1636,7 @@ class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
         self.assertFalse(
             allocator.prealloc_fits(
                 self._empty_tree(),
-                page_size,
-                page_size,
+                token_demand(allocator, page_size, page_size),
                 full_budget_tokens=page_size,
                 swa_budget_tokens=page_size,
             )

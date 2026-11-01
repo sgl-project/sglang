@@ -63,6 +63,7 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.test.token_demand import demand_windows, token_demand
 
 _DEV = "cpu"
 
@@ -664,8 +665,8 @@ class TestWindowChainAllocator(unittest.TestCase):
         full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
         allocator.free_swa(indices)
 
-        self.assertTrue(allocator.admits(0, allocator._window_demand(0, 8)))
-        self.assertTrue(allocator.ensure_capacity(0, 8))
+        self.assertTrue(allocator.admits(0, demand_windows(allocator, 0, 8)))
+        self.assertTrue(allocator.ensure_capacity(token_demand(allocator, 0, 8)))
         allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
         self.assertTrue(
             torch.equal(
@@ -713,15 +714,17 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertTrue(
             allocator.admits(
                 full_pages * page_size,
-                allocator._window_demand(full_pages * page_size, swa_pages * page_size),
+                demand_windows(
+                    allocator, full_pages * page_size, swa_pages * page_size
+                ),
                 empty_pool=True,
             )
         )
         self.assertFalse(
             allocator.admits(
                 full_pages * page_size + 1,
-                allocator._window_demand(
-                    full_pages * page_size + 1, swa_pages * page_size
+                demand_windows(
+                    allocator, full_pages * page_size + 1, swa_pages * page_size
                 ),
                 empty_pool=True,
             )
@@ -763,8 +766,8 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertTrue(
             allocator.admits(
                 reservation_full_tokens,
-                allocator._window_demand(
-                    reservation_full_tokens, reservation_swa_tokens
+                demand_windows(
+                    allocator, reservation_full_tokens, reservation_swa_tokens
                 ),
                 empty_pool=True,
             )
@@ -772,8 +775,8 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertFalse(
             allocator.admits(
                 reservation_full_tokens,
-                allocator._window_demand(
-                    reservation_full_tokens, reservation_swa_with_tail
+                demand_windows(
+                    allocator, reservation_full_tokens, reservation_swa_with_tail
                 ),
                 empty_pool=True,
             )

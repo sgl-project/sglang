@@ -431,6 +431,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_tail_len = MagicMock(return_value=8)
+        queue._window_tails = MagicMock(return_value={"swa": 8})
         queue._prealloc_required_tokens = MagicMock(return_value=(8, 8))
         queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 8))
         queue._swa_tail_allocatable_token_budget = MagicMock(return_value=8)

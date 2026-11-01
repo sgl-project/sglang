@@ -31,7 +31,7 @@ import torch
 from torch.profiler import record_function
 
 from sglang.srt.environ import InvariantCheckLevel
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator, TokenDemand
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
@@ -603,59 +603,27 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return ComponentType.SWA
         return ComponentType.of(window_tree_component(window.sub_pool_name))
 
-    def _window_demand(self, full_tokens, swa_tokens, window_tokens=None):
-        """A token demand per window sub-pool: ``window_tokens`` names any
-        window's tokens; otherwise the target's window takes ``swa_tokens``
-        and every further window the owner's."""
-        window_tokens = window_tokens or {}
-        return {
-            window.sub_pool_name: window_tokens.get(
-                window.sub_pool_name,
-                swa_tokens if window is self.swa_attn_allocator else full_tokens,
-            )
-            for window in self._windows
-        }
+    def window_pool_names(self) -> Tuple[str, ...]:
+        return tuple(window.sub_pool_name for window in self._windows)
 
-    def page_demands(
-        self,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        window_tokens: Optional[Mapping[str, int]] = None,
-        state_slots: int = 0,
-    ) -> Dict[str, int]:
-        """Pages per band for a token demand: the owner's tokens, each window's
-        (`_window_demand`), and state slots."""
+    def page_demands(self, demand: TokenDemand) -> Dict[str, int]:
+        """Pages per band for a token demand: the owner's tokens, each
+        window's, and state slots."""
+        demand = demand.checked(self.window_pool_names())
         page = self.page_size
-        demands = {self.full_attn_allocator.sub_pool_name: -(-int(full_tokens) // page)}
-        for name, tokens in self._window_demand(
-            full_tokens, swa_tokens, window_tokens
-        ).items():
+        demands = {
+            self.full_attn_allocator.sub_pool_name: -(-int(demand.full_tokens) // page)
+        }
+        for name, tokens in demand.window_tokens.items():
             demands[name] = -(-int(tokens) // page)
         if self.mamba_allocator is not None:
-            demands[self.mamba_allocator.sub_pool_name] = int(state_slots)
+            demands[self.mamba_allocator.sub_pool_name] = int(demand.state_slots)
         return demands
 
-    def ensure_capacity(
-        self,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        window_tokens: Optional[Mapping[str, int]] = None,
-        state_slots: int = 0,
-    ) -> bool:
+    def ensure_capacity(self, demand: TokenDemand) -> bool:
         """Whether an allocation of this demand succeeds now: the question the
         take itself answers, so a yes here is a successful take."""
-        if full_tokens < 0 or swa_tokens < 0:
-            return False
-        return self._units_fit(
-            self.page_demands(
-                full_tokens,
-                swa_tokens,
-                window_tokens=window_tokens,
-                state_slots=state_slots,
-            )
-        )
+        return self._units_fit(self.page_demands(demand))
 
     def admission_windows(
         self, tree_cache
@@ -701,10 +669,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     ) -> bool:
         """Whether a demand fits once ``evictable`` cached entries are evicted
         (or in an empty pool): FULL tokens against the FULL cap and the owner's
-        ids, each window sub-pool's tokens (a window missing from
-        ``window_tokens`` is charged nothing), state slots in full, then one
-        layout search over the shared bytes. Every admission question asks
-        this, so an admitted demand is one the take serves."""
+        ids, every window sub-pool's tokens (``window_tokens`` names each one),
+        state slots in full, then one layout search over the shared bytes.
+        Every admission question asks this, so an admitted demand is one the
+        take serves."""
+        if set(window_tokens) != set(self.window_pool_names()):
+            raise ValueError(
+                f"admission must name every window: got {sorted(window_tokens)}, "
+                f"the pool keeps {sorted(self.window_pool_names())}"
+            )
         if full_tokens < 0 or any(t < 0 for t in window_tokens.values()):
             return False
         evictable = {} if empty_pool or evictable is None else evictable
@@ -723,7 +696,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         owner_pages = owner.ids.num_virtual_ids - owner.min_page_index
         for window in self._windows:
             name = window.sub_pool_name
-            demands[name] = -(-math.ceil(window_tokens.get(name, 0)) // page)
+            demands[name] = -(-math.ceil(window_tokens[name]) // page)
             # A window binds the owner's virtual pages: it can never hold more.
             if demands[name] > owner_pages:
                 return False
@@ -756,33 +729,42 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         admission credits before it takes: chains with a window do."""
         return bool(self._windows)
 
-    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+    def prealloc_ceiling_fits(self, demand: TokenDemand) -> bool | None:
+        demand = demand.checked(self.window_pool_names())
         return self.admits(
-            full_tokens,
-            self._window_demand(full_tokens, swa_tokens),
+            demand.full_tokens,
+            dict(demand.window_tokens),
+            demand.state_slots,
             empty_pool=True,
         )
 
     def prealloc_fits(
         self,
         tree_cache,
-        full_tokens,
-        swa_tokens,
+        demand: TokenDemand,
         *,
         full_budget_tokens: int,
         swa_budget_tokens: int | None = None,
-        state_slots: int = 0,
-        window_tokens: Optional[Mapping[str, int]] = None,
     ) -> bool:
-        """A decode-node preallocation on the admission rule: its tokens and
-        the ``state_slots`` it takes with them, priced together since they
-        share bytes; ``window_tokens`` names any window's own tail tokens
-        (`_window_demand`). The budgets are the scheduler's per-side token views
-        after decode headroom and retraction: the request stays within them,
-        and what they hold back from this side's reachable tokens is pending
-        demand, charged alongside the request."""
+        """A decode-node preallocation on the admission rule: its tokens, every
+        window's own tail and the state slots it takes with them, priced
+        together since they share bytes. The budgets are the scheduler's
+        token views of the owner and of the target's window after decode
+        headroom and retraction: the request stays within them, and what
+        they hold back from that side's reachable tokens is pending demand,
+        charged alongside the request."""
+        demand = demand.checked(self.window_pool_names())
+        full_tokens = demand.full_tokens
+        windows = dict(demand.window_tokens)
+        target = (
+            None
+            if self.swa_attn_allocator is None
+            else self.swa_attn_allocator.sub_pool_name
+        )
         if full_tokens > full_budget_tokens or (
-            swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
+            swa_budget_tokens is not None
+            and target is not None
+            and windows[target] > swa_budget_tokens
         ):
             return False
         evictable = self.admission_evictable(tree_cache)
@@ -793,41 +775,32 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_tokens += max(
             0, self.full_available_size() + evictable[owner] - full_budget_tokens
         )
-        windows = self._window_demand(full_tokens, swa_tokens, window_tokens)
-        if swa_budget_tokens is not None and self.swa_attn_allocator is not None:
-            name = self.swa_attn_allocator.sub_pool_name
-            windows[name] += max(
-                0, self.swa_available_size() + evictable[name] - swa_budget_tokens
+        if swa_budget_tokens is not None and target is not None:
+            windows[target] += max(
+                0, self.swa_available_size() + evictable[target] - swa_budget_tokens
             )
-        return self.admits(full_tokens, windows, state_slots, evictable=evictable)
+        return self.admits(
+            full_tokens, windows, demand.state_slots, evictable=evictable
+        )
 
-    def reclaim_for_load_back(
-        self, tree_cache, full_tokens: int, swa_tokens: int, **demand
-    ) -> str | None:
+    def reclaim_for_load_back(self, tree_cache, demand: TokenDemand) -> str | None:
         """Reclaim before a host load takes its rows; None means ready."""
-        return self.reclaim_for_prealloc(tree_cache, full_tokens, swa_tokens, **demand)
+        return self.reclaim_for_prealloc(tree_cache, demand)
 
-    def reclaim_for_prealloc(
-        self,
-        tree_cache,
-        full_tokens: int,
-        swa_tokens: int,
-        *,
-        window_tokens: Optional[Mapping[str, int]] = None,
-        state_slots: int = 0,
-    ) -> str | None:
+    def reclaim_for_prealloc(self, tree_cache, demand: TokenDemand) -> str | None:
         """Free room for a preallocation; None means it is ready, else a
         description of the shortfall for the caller to attach to its request."""
-        demand = dict(window_tokens=window_tokens, state_slots=state_slots)
-        self.evict_to_free_tokens(
-            tree_cache, full_tokens, swa_num_tokens=swa_tokens, **demand
-        )
-        if self.ensure_capacity(full_tokens, swa_tokens, **demand):
+        pages = self.page_demands(demand)
+        if tree_cache is not None and tree_cache.supports_prefix_sharing():
+            self.flush_deferred_full_frees()
+            self.reclaim(tree_cache, pages)
+        if self._units_fit(pages):
             return None
         return (
             "Unified memory reclamation insufficient: "
-            f"needed=(full={full_tokens}, swa={swa_tokens}, "
-            f"windows={dict(window_tokens or {})}, state_slots={state_slots})"
+            f"needed=(full={demand.full_tokens}, "
+            f"windows={dict(demand.window_tokens)}, "
+            f"state_slots={demand.state_slots})"
         )
 
     def _reclaimable_units(self, tree_cache) -> Dict[str, int]:
@@ -1062,30 +1035,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             prefix_lens=prefix_lens_cpu,
         )
 
-    def evict_to_free_tokens(
-        self,
-        tree_cache,
-        num_tokens: int,
-        *,
-        swa_num_tokens: Optional[int] = None,
-        window_tokens: Optional[Mapping[str, int]] = None,
-        state_slots: int = 0,
-    ) -> bool | None:
-        """Evict cached entries until this token demand (every window taking
-        ``swa_num_tokens``, else the same tokens) can be taken, the way static
-        pools would (`reclaim`). Return whether it can, or None without
-        a prefix cache."""
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
+        """Evict cached entries until ``num_tokens`` new tokens, which every
+        window keeps too, can be taken (`reclaim`). Return whether they can,
+        or None without a prefix cache."""
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return None
         self.flush_deferred_full_frees()
         return self.reclaim(
-            tree_cache,
-            self.page_demands(
-                num_tokens,
-                num_tokens if swa_num_tokens is None else swa_num_tokens,
-                window_tokens=window_tokens,
-                state_slots=state_slots,
-            ),
+            tree_cache, self.page_demands(TokenDemand.same_tokens(self, num_tokens))
         )
 
     def check_decode_capacity(
@@ -1094,7 +1052,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Whether the next decode step's allocation fits after eviction: the
         same question the decode take answers."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
-        return self.ensure_capacity(num_tokens, num_tokens)
+        return self.ensure_capacity(TokenDemand.same_tokens(self, num_tokens))
 
     def resize(self, config) -> None:
         if (
@@ -1388,7 +1346,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self,
         *,
         full_tokens: int,
-        swa_tokens: int,
         num_owner_pages: int,
         owner_take: Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]],
         window_tail_pages: Optional[Mapping[str, int]] = None,
@@ -1397,9 +1354,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         layout, then bind the windows to the owner's new virtual pages. None
         exactly when no reachable layout serves the demand.
 
-        With ``window_tail_pages``, each window binds only the last that many
-        of the new pages (its live tail); otherwise the target's window binds
-        ``swa_tokens`` worth of them and every further window all of them."""
+        With ``window_tail_pages`` (naming every window), each window binds
+        only the last that many of the new pages (its live tail); without it
+        every window binds all of them."""
         owner = self.full_attn_allocator
         if self._full_cap_reclaim(full_tokens) or num_owner_pages > len(
             owner.free_virtual_ids
@@ -1407,13 +1364,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return None
         demands = {owner.sub_pool_name: num_owner_pages}
         for window in self._windows:
-            if window_tail_pages is not None:
-                pages = window_tail_pages[window.sub_pool_name]
-            elif window is self.swa_attn_allocator:
-                pages = -(-swa_tokens // self.page_size)
-            else:
-                pages = num_owner_pages
-            demands[window.sub_pool_name] = pages
+            demands[window.sub_pool_name] = (
+                num_owner_pages
+                if window_tail_pages is None
+                else window_tail_pages[window.sub_pool_name]
+            )
         physical = self._plan_and_take(demands)
         if physical is None:
             return None
@@ -1575,24 +1530,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             bands[name].relocate_into(*plan.targets[name])
 
     @contextmanager
-    def scoped_physical_takes(
-        self, full_tokens, swa_tokens, *, window_tokens=None, state_slots=0
-    ):
+    def scoped_physical_takes(self, demand: TokenDemand):
         """Consume a pre-realized reservation across independently issued H2D takes."""
         if len(self._windows) <= 1:
             yield
             return
         if any(band._physical_take_scope is not None for band in self.members):
             raise RuntimeError("physical reservation scopes cannot be nested")
-        scope = _ScopedPhysicalTakes(
-            self,
-            self.page_demands(
-                full_tokens,
-                swa_tokens,
-                window_tokens=window_tokens,
-                state_slots=state_slots,
-            ),
-        )
+        scope = _ScopedPhysicalTakes(self, self.page_demands(demand))
         for band in self.members:
             band._physical_take_scope = scope
         try:
@@ -1619,7 +1564,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         with record_function("ChainAllocator.alloc"):
             return self._allocate(
                 full_tokens=need_size,
-                swa_tokens=need_size,
                 num_owner_pages=need_size // self.page_size,
                 owner_take=lambda physical: self._take_owner_tokens(
                     need_size, physical
@@ -1683,7 +1627,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             need_tokens = num_new_pages * self.page_size
             return self._allocate(
                 full_tokens=need_tokens,
-                swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
                 owner_take=self._paged_take(
                     prefix_lens,
@@ -1754,14 +1697,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 )
                 for window in self._windows
             }
-            num_swa_pages = (
-                0
-                if self.swa_attn_allocator is None
-                else tail_pages[self.swa_attn_allocator.sub_pool_name]
-            )
             return self._allocate(
                 full_tokens=num_new_pages * self.page_size,
-                swa_tokens=num_swa_pages * self.page_size,
                 num_owner_pages=num_new_pages,
                 owner_take=self._paged_take(
                     prefix_lens,
@@ -1805,7 +1742,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             need_tokens = num_new_pages * self.page_size
             return self._allocate(
                 full_tokens=need_tokens,
-                swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
                 owner_take=lambda physical: take_new_pages(
                     self.full_attn_allocator,

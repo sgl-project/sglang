@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.runtime_context import mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     hold_band,
@@ -366,13 +367,17 @@ class TestChainRealize(CustomTestCase):
             self._history(rng, allocator)
             tokens = rng.choice((1, 2, 4, 8, 16, 24, 32))
             if rng.random() < 0.5 or allocator.mamba_allocator is None:
-                fits = allocator.ensure_capacity(tokens, tokens)
+                fits = allocator.ensure_capacity(
+                    token_demand(allocator, tokens, tokens)
+                )
                 admitted = allocator.admits(
-                    tokens, allocator._window_demand(tokens, tokens)
+                    tokens, demand_windows(allocator, tokens, tokens)
                 )
                 taken = allocator.alloc(tokens)
             else:
-                fits = allocator.ensure_capacity(0, 0, state_slots=tokens % 4 + 1)
+                fits = allocator.ensure_capacity(
+                    token_demand(allocator, 0, 0, state_slots=tokens % 4 + 1)
+                )
                 admitted = fits
                 taken = allocator.alloc_state_slots(tokens % 4 + 1)
             self.assertEqual(fits, taken is not None)
@@ -410,7 +415,7 @@ class TestChainRealize(CustomTestCase):
                     )
             self.assertEqual(allocator.pricing_snapshot(), before)
             tokens = rng.choice((1, 2, 4, 8, 16, 24, 32))
-            fits = allocator.ensure_capacity(tokens, tokens)
+            fits = allocator.ensure_capacity(token_demand(allocator, tokens, tokens))
             # The engines finish on their own threads, as a status path would.
             done = threading.Thread(
                 target=lambda: (time.sleep(0.01), [f.publish() for f in running])
@@ -461,8 +466,14 @@ class TestChainRealize(CustomTestCase):
                 if b is not allocator.mamba_allocator
             ]
             shared += joint < min(tokens)
-            self.assertTrue(allocator.ensure_capacity(joint, joint))
-            self.assertFalse(allocator.ensure_capacity(joint + page, joint + page))
+            self.assertTrue(
+                allocator.ensure_capacity(token_demand(allocator, joint, joint))
+            )
+            self.assertFalse(
+                allocator.ensure_capacity(
+                    token_demand(allocator, joint + page, joint + page)
+                )
+            )
             # Taking exactly a read succeeds, through the allocator's takes: a
             # token take binds the owner and every window together.
             state = allocator.mamba_allocator

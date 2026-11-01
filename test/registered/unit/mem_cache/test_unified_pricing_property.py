@@ -24,6 +24,7 @@ from typing import Dict, List, Tuple
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import token_demand
 from sglang.test.unified_allocator_fixtures import chain_snapshot
 from sglang.test.unified_allocator_trace import (
     BuilderAdapter,
@@ -118,7 +119,9 @@ class TestUnifiedPricingProperty(CustomTestCase):
             with self.subTest(config=config.key(), state=name, tokens=tokens):
                 adapter = _rebuild(config, ops)
                 before = chain_snapshot(adapter.allocator)
-                priced = adapter.allocator.ensure_capacity(tokens, tokens)
+                priced = adapter.allocator.ensure_capacity(
+                    token_demand(adapter.allocator, tokens, tokens)
+                )
                 self.assertEqual(chain_snapshot(adapter.allocator), before)
                 self.assertEqual(self._allocate(adapter, tokens), priced)
 

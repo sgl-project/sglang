@@ -16,6 +16,7 @@ from test_unified_chain_realize import _allocator, _live_pages
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import token_demand
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
     setup_allocator_context,
@@ -173,10 +174,11 @@ class TestDecodePreallocationTakesItsStateSlots(CustomTestCase):
                             swa_allocatable_tokens=10**9,
                         )
                         alone = queue._prealloc_reservation_fits(
-                            tokens, tokens, **budgets
+                            token_demand(allocator, tokens, tokens), **budgets
                         )
                         if not queue._prealloc_reservation_fits(
-                            tokens, tokens, **budgets, state_slots=slots
+                            token_demand(allocator, tokens, tokens, state_slots=slots),
+                            **budgets,
                         ):
                             split_admits += alone
                             continue

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
@@ -44,7 +45,7 @@ register_cpu_ci(est_time=39, suite="base-a-test-cpu")
 
 def _pages(allocator, full_tokens, swa_tokens):
     """A token demand as the planner reads it: pages per demanded band."""
-    demands = allocator.page_demands(full_tokens, swa_tokens)
+    demands = allocator.page_demands(token_demand(allocator, full_tokens, swa_tokens))
     return {name: pages for name, pages in demands.items() if pages}
 
 
@@ -147,7 +148,9 @@ class TestTriJointReclaim(CustomTestCase):
                     # Eviction is needed exactly when the records' first prefix
                     # in eviction order must go: without it the demand does not
                     # fit (5 states leave room already).
-                    self.assertEqual(a.ensure_capacity(demand, demand), count == 5)
+                    self.assertEqual(
+                        a.ensure_capacity(token_demand(a, demand, demand)), count == 5
+                    )
                     with patch.object(
                         a, "ensure_capacity", wraps=a.ensure_capacity
                     ) as prep:
@@ -232,7 +235,7 @@ class TestTriJointReclaim(CustomTestCase):
         # Require one token pair beyond free space, so the unlocked state
         # checkpoints must make room while every token binding stays locked.
         demand = a.available_size() + 1
-        self.assertFalse(a.admits(demand, a._window_demand(demand, demand)))
+        self.assertFalse(a.admits(demand, demand_windows(a, demand, demand)))
         try:
             self.assertEqual(c.full_evictable_size(), 0)
             self.assertGreater(c.mamba_evictable_size(), 0)
@@ -301,7 +304,7 @@ class TestTriJointReclaim(CustomTestCase):
                 self.assertFalse(
                     a.admits(
                         400,
-                        a._window_demand(400, 400),
+                        demand_windows(a, 400, 400),
                         evictable=a.admission_evictable(c),
                     )
                 )
@@ -484,7 +487,7 @@ class TestTriJointReclaim(CustomTestCase):
                     feasible(a.pricing_snapshot(), _pages(a, demand, demand))
                 )
                 if entry == "direct":
-                    self.assertTrue(a.ensure_capacity(demand, demand))
+                    self.assertTrue(a.ensure_capacity(token_demand(a, demand, demand)))
                 elif entry == "helper":
                     self.assertTrue(evict_from_tree_cache(c, demand))
                 else:
@@ -573,7 +576,13 @@ class TestTriJointReclaim(CustomTestCase):
                     cache.insert(InsertParams(key=key, value=slots))
                     # Six tokens fit only if the float moves: not in place, while
                     # the reads, which credit the move, report them.
-                    six = {n: d for n, d in allocator.page_demands(6, 6).items() if d}
+                    six = {
+                        n: d
+                        for n, d in allocator.page_demands(
+                            token_demand(allocator, 6, 6)
+                        ).items()
+                        if d
+                    }
                     self.assertIsNone(
                         plan(allocator.pricing_snapshot(), six, FLUSH_ENDS)
                     )
@@ -582,7 +591,9 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertGreaterEqual(allocator.available_size(), 6)
                     self.assertTrue(feasible(allocator.pricing_snapshot(), six))
                     if recovery == "prepare":
-                        self.assertTrue(allocator.ensure_capacity(6, 6))
+                        self.assertTrue(
+                            allocator.ensure_capacity(token_demand(allocator, 6, 6))
+                        )
                     elif recovery == "decode":
                         self.assertTrue(
                             allocator.check_decode_capacity(
@@ -591,7 +602,9 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                     else:
                         evict_from_tree_cache(cache, 6)
-                    self.assertTrue(allocator.ensure_capacity(6, 6))
+                    self.assertTrue(
+                        allocator.ensure_capacity(token_demand(allocator, 6, 6))
+                    )
                     self.assertEqual(cache.full_evictable_size(), 4)
                     matched = cache.match_prefix(MatchPrefixParams(key=key))
                     torch.testing.assert_close(
@@ -833,10 +846,10 @@ class TestTriJointReclaim(CustomTestCase):
                 member = members[owner]
                 # Admitted before the pin: a take that reused that answer would
                 # move the pinned band. It must plan again from what is pinned.
-                self.assertTrue(a.ensure_capacity(4, 4))
+                self.assertTrue(a.ensure_capacity(token_demand(a, 4, 4)))
                 hold_band(member)
                 bound = member.ids.virtual_to_physical.clone()
-                fits = a.ensure_capacity(4, 4)
+                fits = a.ensure_capacity(token_demand(a, 4, 4))
                 got = a.alloc(4)
                 # With the owner pinned the float still moves out of its way;
                 # a pinned state end or float leaves no layout that serves it.
@@ -851,7 +864,7 @@ class TestTriJointReclaim(CustomTestCase):
                     a.free(got)
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 release_band(member)
-                self.assertTrue(a.ensure_capacity(4, 4))
+                self.assertTrue(a.ensure_capacity(token_demand(a, 4, 4)))
                 self.assertIsNotNone(a.alloc(4))
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
@@ -879,7 +892,7 @@ class TestTriJointReclaim(CustomTestCase):
                 lo, hi = sa._span_range()
                 self.assertTrue(end <= lo or first >= hi, (first, end, lo, hi))
                 with patch.object(sa, "relocate_into", wraps=sa.relocate_into) as whole:
-                    self.assertTrue(a.ensure_capacity(12, 12))
+                    self.assertTrue(a.ensure_capacity(token_demand(a, 12, 12)))
                     self.assertIsNotNone(a.alloc(12))
                 self.assertEqual(whole.call_count, 1)
                 self.check_payload(
@@ -920,7 +933,7 @@ class TestTriJointReclaim(CustomTestCase):
                 existing = slots[-extra:] if extra else slots[:0]
                 if extra:
                     a.free_swa(existing)
-                prepared = a.ensure_capacity(full, swa)
+                prepared = a.ensure_capacity(token_demand(a, full, swa))
                 self.assertTrue(prepared)
                 fresh = a.full_attn_allocator.alloc(full)
                 self.assertIsNotNone(fresh)
@@ -986,7 +999,7 @@ class TestTriGeometry(CustomTestCase):
                         self.assertEqual(sa.low_wm_page, low_before - 1)
                         before = snapshot(a)
                         # Pricing moves nothing, and its answer is the take's.
-                        fits = a.ensure_capacity(demand, demand)
+                        fits = a.ensure_capacity(token_demand(a, demand, demand))
                         self.assertEqual(snapshot(a), before)
                         self.assertEqual(a.alloc(demand) is not None, fits)
                         self.assertFalse(a.verify_byte_accounting())
@@ -995,7 +1008,9 @@ class TestTriGeometry(CustomTestCase):
                     with patch.object(
                         sa, "relocate_into", wraps=sa.relocate_into
                     ) as moves:
-                        self.assertTrue(a.ensure_capacity(demand, demand))
+                        self.assertTrue(
+                            a.ensure_capacity(token_demand(a, demand, demand))
+                        )
                         self.assertIsNotNone(a.alloc(demand))
                     self.assertEqual(moves.call_count, 1)
                     self.check_saved(a, saved)
@@ -1035,7 +1050,9 @@ class TestTriGeometry(CustomTestCase):
                     }
                     for member in a.members
                 }
-                self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
+                self.assertTrue(
+                    a.ensure_capacity(token_demand(a, npage * ps, npage * ps))
+                )
                 self.assertIsNotNone(a.alloc(npage * ps))
                 # A held float is laid out around its pages: none of them moves.
                 for member in a.members:
@@ -1061,7 +1078,11 @@ class TestTriGeometry(CustomTestCase):
             ma.free(vp[1:-1:cut])
             # Cases the ends must compact for: no layout without moves holds them.
             demands = {
-                n: d for n, d in a.page_demands(npage * ps, npage * ps).items() if d
+                n: d
+                for n, d in a.page_demands(
+                    token_demand(a, npage * ps, npage * ps)
+                ).items()
+                if d
             }
             if (
                 plan(a.pricing_snapshot(), demands, NO_MOVE) is not None
@@ -1086,7 +1107,9 @@ class TestTriGeometry(CustomTestCase):
                         sa, "flush_for_allocation", wraps=sa.flush_for_allocation
                     ) as flush,
                 ):
-                    self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
+                    self.assertTrue(
+                        a.ensure_capacity(token_demand(a, npage * ps, npage * ps))
+                    )
                     self.assertIsNotNone(a.alloc(npage * ps))
                 self.assertEqual(moves.call_count, 0)
                 self.assertEqual(flush.call_count, 0)
@@ -1099,7 +1122,9 @@ class TestTriGeometry(CustomTestCase):
                 a, kv, mk = build_geometry(1, (1, 4), True, "swa_edges", False)
                 # Five tokens need the float to move: no layout without moves
                 # holds them, and the read, which credits the move, reports them.
-                five = {n: d for n, d in a.page_demands(5, 5).items() if d}
+                five = {
+                    n: d for n, d in a.page_demands(token_demand(a, 5, 5)).items() if d
+                }
                 self.assertIsNone(plan(a.pricing_snapshot(), five, NO_MOVE))
                 self.assertGreaterEqual(a.available_size(), 5)
                 self.assertTrue(feasible(a.pricing_snapshot(), five))
@@ -1118,7 +1143,7 @@ class TestTriGeometry(CustomTestCase):
                     }
                     for member in a.members
                 }
-                fits = a.ensure_capacity(5, 5)
+                fits = a.ensure_capacity(token_demand(a, 5, 5))
                 got = a.alloc(5)
                 self.assertEqual(fits, got is not None)
                 for member in a.members:
@@ -1132,7 +1157,7 @@ class TestTriGeometry(CustomTestCase):
                 for member in a.members:
                     release_band(member, "pd")
                     release_band(member, "host")
-                self.assertTrue(a.ensure_capacity(5, 5))
+                self.assertTrue(a.ensure_capacity(token_demand(a, 5, 5)))
                 self.assertIsNotNone(a.alloc(5))
                 self.check_saved(a, saved)
 
@@ -1167,11 +1192,17 @@ class TestTriGeometry(CustomTestCase):
                 for member in a.members:
                     hold_band(member)
                 before = snapshot(a)
-                predictions = [a.ensure_capacity(n * ps, n * ps) for n in range(1, 10)]
+                predictions = [
+                    a.ensure_capacity(token_demand(a, n * ps, n * ps))
+                    for n in range(1, 10)
+                ]
                 for _ in range(20):
                     self.assertEqual(
                         predictions,
-                        [a.ensure_capacity(n * ps, n * ps) for n in range(1, 10)],
+                        [
+                            a.ensure_capacity(token_demand(a, n * ps, n * ps))
+                            for n in range(1, 10)
+                        ],
                     )
                 self.assertEqual(snapshot(a), before)
                 for member in a.members:
@@ -1183,9 +1214,11 @@ class TestTriGeometry(CustomTestCase):
                     fa.flush_for_allocation()
                     self.assertFalse(fa.usage.pending_by_key())
                     n = max(
-                        n for n in range(1, 10) if a.ensure_capacity(n * ps, n * ps)
+                        n
+                        for n in range(1, 10)
+                        if a.ensure_capacity(token_demand(a, n * ps, n * ps))
                     )
-                    self.assertTrue(a.ensure_capacity(n * ps, n * ps))
+                    self.assertTrue(a.ensure_capacity(token_demand(a, n * ps, n * ps)))
                     self.assertIsNotNone(a.alloc(n * ps))
                 self.assertEqual(stream.waits > 0, urgent)
                 self.check_saved(a, saved)

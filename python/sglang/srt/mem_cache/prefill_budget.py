@@ -20,8 +20,9 @@ realizes the selected reservation before a host transfer pins device rows.
 """
 
 from contextlib import nullcontext
-from typing import Mapping, Optional
+from typing import Dict, Mapping, Optional
 
+from sglang.srt.mem_cache.allocator.base import TokenDemand
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
@@ -424,6 +425,9 @@ class ChainPrefillBudget(PrefillBudget):
     def request_state_slots(self, req) -> int:
         return self.allocator.storage.pending_state_slots(req)
 
+    def _no_window_tokens(self) -> Dict[str, int]:
+        return {name: 0 for name, _, _ in self.windows}
+
     def _fits(self, full_tokens, window_tokens, state_slots=0, *, empty_pool=False):
         """Whether the pending work plus this demand is admitted (or this demand
         alone, in an empty pool)."""
@@ -431,7 +435,7 @@ class ChainPrefillBudget(PrefillBudget):
         return self.allocator.admits(
             full_tokens + (self.total_offset if pending else 0),
             {
-                name: window_tokens.get(name, 0)
+                name: window_tokens[name]
                 + (self.window_offsets[name] if pending else 0)
                 for name, _, _ in self.windows
             },
@@ -458,10 +462,12 @@ class ChainPrefillBudget(PrefillBudget):
         )
 
     def has_capacity(self) -> bool:
-        return self._fits(0, {})
+        return self._fits(0, self._no_window_tokens())
 
     def state_slots_fit(self, state_slots: int) -> bool:
-        return not self.has_state_slots or self._fits(0, {}, state_slots)
+        return not self.has_state_slots or self._fits(
+            0, self._no_window_tokens(), state_slots
+        )
 
     def state_slots_exhausted(self) -> bool:
         return not self.state_slots_fit(1)
@@ -627,24 +633,19 @@ class ChainPrefillBudget(PrefillBudget):
                 host_hit_lengths=dict(window_host_hit_lengths or {}),
             ).items()
         }
-        demand = {"window_tokens": windows}
-        if self.has_state_slots:
-            demand["state_slots"] = state_slots + self.pending_state_slots
-        swa_tokens = next(
-            (windows[name] for name, component, _ in self.windows if component.is_swa),
-            0,
+        return TokenDemand(
+            full_tokens,
+            windows,
+            state_slots + self.pending_state_slots if self.has_state_slots else 0,
         )
-        return full_tokens, swa_tokens, demand
 
     def prepare_load_back(self, **kwargs) -> bool:
-        full_tokens, swa_tokens, demand = self._load_back_demand(**kwargs)
         return (
             self.allocator.reclaim_for_load_back(
-                self.tree_cache, full_tokens, swa_tokens, **demand
+                self.tree_cache, self._load_back_demand(**kwargs)
             )
             is None
         )
 
     def load_back_scope(self, **kwargs):
-        full_tokens, swa_tokens, demand = self._load_back_demand(**kwargs)
-        return self.allocator.scoped_physical_takes(full_tokens, swa_tokens, **demand)
+        return self.allocator.scoped_physical_takes(self._load_back_demand(**kwargs))

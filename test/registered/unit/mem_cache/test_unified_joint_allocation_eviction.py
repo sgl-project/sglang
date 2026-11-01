@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     build_swa_cache,
     hold_band,
@@ -105,7 +106,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 # Not even an empty pool holds it, so reclaim must keep every prefix.
                 self.assertFalse(
                     allocator.admits(
-                        101, allocator._window_demand(101, 101), empty_pool=True
+                        101, demand_windows(allocator, 101, 101), empty_pool=True
                     )
                 )
                 for _ in range(3):
@@ -285,9 +286,9 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertLess(demand * sa.entry_bytes_per_page, fa._current_gap_bytes())
         self.assertLess(demand, sa.num_pages - sa.min_page_index)
         self.assertFalse(
-            allocator.admits(0, allocator._window_demand(0, demand), empty_pool=True)
+            allocator.admits(0, demand_windows(allocator, 0, demand), empty_pool=True)
         )
-        self.assertFalse(allocator.ensure_capacity(0, demand))
+        self.assertFalse(allocator.ensure_capacity(token_demand(allocator, 0, demand)))
         self.assertEqual(cache.full_evictable_size(), 0)
         self.assertFalse(allocator.verify_byte_accounting())
 
@@ -409,7 +410,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                     hold_band(member)
             for _ in range(20):
                 # The reclaim walks' stop predicate.
-                allocator.ensure_capacity(4, 4)
+                allocator.ensure_capacity(token_demand(allocator, 4, 4))
             self.assertEqual(snapshot(), before)
         for member in allocator.members:
             release_band(member)
@@ -463,13 +464,15 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         def step(component, tracker):
             result = original(component, tracker)
-            observed.append((result, allocator.ensure_capacity(4, 4)))
+            observed.append(
+                (result, allocator.ensure_capacity(token_demand(allocator, 4, 4)))
+            )
             return result
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
             cache.evict_until(
                 EvictParams(window_num_tokens={ComponentType.SWA: 2}),
-                lambda: allocator.ensure_capacity(4, 4),
+                lambda: allocator.ensure_capacity(token_demand(allocator, 4, 4)),
             )
         self.assertTrue(
             any(node is None and progress for (node, progress), _ in observed),

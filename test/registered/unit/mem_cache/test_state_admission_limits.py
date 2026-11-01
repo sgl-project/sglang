@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_de
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.token_demand import demand_windows
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
     setup_allocator_context,
@@ -118,7 +119,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
                     self.assertFalse(allocator.verify_byte_accounting())
                     self.assertEqual(allocator.full_attn_allocator.allocated_count(), 6)
                     self.assertFalse(
-                        allocator.admits(507, allocator._window_demand(507, 1))
+                        allocator.admits(507, demand_windows(allocator, 507, 1))
                     )
 
     def test_fractional_pending_tokens_round_up_at_the_physical_boundary(self):

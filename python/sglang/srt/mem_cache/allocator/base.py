@@ -16,7 +16,8 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Optional
+import dataclasses
+from typing import TYPE_CHECKING, Dict, Hashable, Mapping, Optional, Tuple
 
 import torch
 
@@ -26,6 +27,45 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenDemand:
+    """What an allocation takes: tokens of the token pool, tokens of every
+    window pool the allocator keeps, by the window pool's name, and state
+    slots. A demand names every window: one it leaves out is an error, not a
+    window that takes nothing, so no window's share is ever guessed."""
+
+    full_tokens: int
+    window_tokens: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    state_slots: int = 0
+
+    @classmethod
+    def same_tokens(
+        cls, allocator: BaseTokenToKVPoolAllocator, tokens: int, *, state_slots=0
+    ) -> TokenDemand:
+        """Every pool takes ``tokens``: the new tokens of an extend or decode
+        step, which every window keeps."""
+        return cls(
+            tokens,
+            {name: tokens for name in allocator.window_pool_names()},
+            state_slots,
+        )
+
+    def checked(self, window_pool_names) -> TokenDemand:
+        """This demand, once it names exactly the windows ``window_pool_names``
+        lists."""
+        names = set(window_pool_names)
+        if set(self.window_tokens) != names:
+            raise ValueError(
+                f"a demand must name every window pool: it names "
+                f"{sorted(self.window_tokens)}, the allocator keeps {sorted(names)}"
+            )
+        if self.full_tokens < 0 or self.state_slots < 0:
+            raise ValueError(f"negative demand {self}")
+        if any(t < 0 for t in self.window_tokens.values()):
+            raise ValueError(f"negative window demand {self}")
+        return self
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -135,22 +175,25 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         return False
 
-    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
-        """Whether a demand this size could EVER be preallocated, or None when
-        this pool has no ceiling of its own and the caller's token capacity is
-        the only bound.
+    def window_pool_names(self) -> Tuple[str, ...]:
+        """The window pools this allocator keeps, by the names a
+        `TokenDemand` uses for them; none for a pool without windows."""
+        return ()
+
+    def prealloc_ceiling_fits(self, demand: TokenDemand) -> bool | None:
+        """Whether ``demand`` could EVER be preallocated, or None when this
+        pool has no ceiling of its own and the caller's token capacity is the
+        only bound.
         """
         return None
 
     def prealloc_fits(
         self,
         tree_cache,
-        full_tokens: int,
-        swa_tokens: int,
+        demand: TokenDemand,
         *,
         full_budget_tokens: int,
         swa_budget_tokens: int | None = None,
-        state_slots: int = 0,
     ) -> bool:
         """Whether a decode-node preallocation of this size fits.
 
@@ -164,8 +207,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         together, since a per-side budget cannot express a shared byte
         envelope.
         """
-        return full_tokens <= full_budget_tokens and (
-            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        demand = demand.checked(self.window_pool_names())
+        return demand.full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None
+            or all(t <= swa_budget_tokens for t in demand.window_tokens.values())
         )
 
     def get_extend_allocation_demand(

@@ -183,9 +183,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int, *, state_slots: int = 0
-    ) -> str | None:
+    def window_pool_names(self):
+        from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+
+        return (window_sub_pool_of(self),)
+
+    def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
         """Free room for a decode-node preallocation; None means it is ready.
 
         Returns a description of the shortfall when it cannot be met, for the
@@ -196,6 +199,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """
         from sglang.srt.mem_cache.base_prefix_cache import AllocDemand
 
+        (swa_tokens,) = demand.checked(self.window_pool_names()).window_tokens.values()
         available = self.swa_available_size()
         if available < swa_tokens:
             tree_cache.evict_for_alloc(
