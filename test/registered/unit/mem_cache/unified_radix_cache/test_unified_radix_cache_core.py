@@ -2032,6 +2032,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="scheduler")
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
+        cache.swa_recompute_len = None
         cache.session = mock.Mock()
         cache.session.try_match_prefix.return_value = None
         cache.tree_core = mock.Mock()
