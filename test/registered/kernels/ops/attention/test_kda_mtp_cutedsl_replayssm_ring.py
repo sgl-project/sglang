@@ -20,15 +20,16 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
+# SM90 builds the scalar-FMA recurrence and SM100 the packed f32x2 one, so each
+# pool compiles different code. SM100 has no single-GPU runner_config, hence
+# 4-gpu-b200 for a one-GPU test.
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-# SM100-only, and hard: libNVVM refuses the generated device IR when the CuTe
-# DSL kernel is compiled for sm_90a, so this is a build failure rather than a
-# numeric one. The SM100 pool has no single-GPU runner_config, hence 4-gpu-b200
-# for a one-GPU test.
-if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+_CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+if _CAPABILITY is None or _CAPABILITY[0] not in (9, 10):
     pytest.skip(
-        "KDA CuTe MTP ReplaySSM ring parity needs SM100 (CuTe DSL kernel).",
+        "KDA CuTe MTP ReplaySSM ring parity needs SM90 or SM100 (CuTe DSL kernel).",
         allow_module_level=True,
     )
 
