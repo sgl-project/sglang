@@ -396,6 +396,84 @@ class TestBatchSizeRouting(CustomTestCase):
 
 
 class TestResolveCandidateSteps(CustomTestCase):
+    def _check_invalid_config(self, config, message):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(config, f)
+            f.flush()
+            # Buffer sizing reads the config before workers or graphs are built.
+            for load in (
+                lambda: resolve_candidate_steps_from_config(f.name),
+                lambda: AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name),
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    load()
+
+    def test_rejects_non_object_configs_and_slots(self):
+        for config in (None, [], 1, "config"):
+            with self.subTest(config=config):
+                self._check_invalid_config(config, "must be a JSON object")
+        for entry in (None, [], 1, "slot"):
+            with self.subTest(entry=entry):
+                self._check_invalid_config({"1": entry}, "BS 1:.*JSON object")
+
+    def test_rejects_boolean_candidate_steps(self):
+        for steps in ([True], [False], [0, True, 3]):
+            with self.subTest(steps=steps):
+                self._check_invalid_config(
+                    {"1": {"candidate_steps": steps}}, "BS 1: candidate_steps"
+                )
+
+    def test_rejects_invalid_effective_policy_options(self):
+        invalid_options = {
+            "update_interval": (0, -1, 1.5, True, None, "5"),
+            "warmup_batches": (-1, 1.5, True, None, "10"),
+            "ema_alpha": (-0.1, 1.1, float("nan"), float("inf"), True, None, "0.2"),
+            "up_hysteresis": (float("nan"), float("inf"), True, None, "0"),
+            "down_hysteresis": (float("nan"), -float("inf"), True, None, "0"),
+            "ceiling_coeff": (-1, float("nan"), float("inf"), True, None, "1"),
+        }
+        for name, values in invalid_options.items():
+            for value in values:
+                for global_option in (True, False):
+                    with self.subTest(
+                        name=name, value=value, global_option=global_option
+                    ):
+                        config = {"8": {"candidate_steps": [0, 1, 3]}}
+                        destination = config if global_option else config["8"]
+                        destination[name] = value
+                        self._check_invalid_config(config, f"BS 8: {name}")
+
+    def test_slot_overrides_are_validated_after_global_defaults(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "update_interval": 0,
+                    "ema_alpha": 0.2,
+                    "1": {
+                        "candidate_steps": [0, 1],
+                        "update_interval": 1,
+                        "warmup_batches": 0,
+                        "ema_alpha": 1,
+                        "down_hysteresis": -0.25,
+                        "ceiling_coeff": 0,
+                    },
+                    "8": {
+                        "candidate_steps": [0],
+                        "update_interval": 2,
+                        "ema_alpha": 0,
+                    },
+                },
+                f,
+            )
+            f.flush()
+            self.assertEqual(resolve_candidate_steps_from_config(f.name), [0, 1])
+            params = AdaptiveSpeculativeParams(initial_steps=1, cfg_path=f.name)
+        self.assertEqual(params._route(1).update_interval, 1)
+        self.assertEqual(params._route(1).warmup_batches, 0)
+        self.assertEqual(params._route(1).ema_alpha, 1)
+        self.assertEqual(params._route(8).update_interval, 2)
+        self.assertEqual(params._route(8).ema_alpha, 0)
+
     def test_default_config(self):
         steps = resolve_candidate_steps_from_config()
         self.assertEqual(steps, [0, 1, 3, 5, 7])
