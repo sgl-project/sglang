@@ -4391,6 +4391,13 @@ class Scheduler(
             else 0
         )
         evictable = self.tree_cache.mamba_evictable_size()
+        # Remaining slot budget: the static pool's adder-level count, or the
+        # shared pool's memory_budget.rem_state_slots (the adder count is
+        # None there).
+        rem_mamba_slots = adder.rem_mamba_slots
+        if rem_mamba_slots is None:
+            budget = getattr(adder, "memory_budget", None)
+            rem_mamba_slots = getattr(budget, "rem_state_slots", None)
         logger.info(
             "[MambaAudit] size=%d free=%d allocated=%d | hold: running=%d "
             "can_run=%d chunked=%d evictable=%d | unaccounted=%d | queue=%d "
@@ -4408,7 +4415,7 @@ class Scheduler(
             - chunked_hold
             - evictable,
             len(self.waiting_queue),
-            adder.rem_mamba_slots if adder.rem_mamba_slots is not None else -1,
+            rem_mamba_slots if rem_mamba_slots is not None else -1,
             stats["alloc_total"],
             stats["free_total"],
             stats["group_degraded"],
@@ -4631,10 +4638,16 @@ class Scheduler(
             # mamba cache") even though the gate would have throttled one
             # request later — so stop pulling new requests from the queue once
             # the remaining mamba slot budget can't cover a worst-case cold
-            # request. No-op without a mamba pool.
+            # request. No-op without a mamba pool. The remaining budget is the
+            # static pool's adder-level count, or the shared pool's
+            # memory_budget.rem_state_slots (the adder count is None there).
+            rem_mamba_slots = adder.rem_mamba_slots
+            if rem_mamba_slots is None:
+                budget = getattr(adder, "memory_budget", None)
+                rem_mamba_slots = getattr(budget, "rem_state_slots", None)
             if (
-                adder.rem_mamba_slots is not None
-                and adder.rem_mamba_slots < adder._mamba_match_headroom()
+                rem_mamba_slots is not None
+                and rem_mamba_slots < adder._mamba_match_headroom()
             ):
                 # Throttled like the [MambaAudit] line: the pre-check can trip
                 # on every scheduling pass while the pool hovers near empty,
@@ -4647,7 +4660,7 @@ class Scheduler(
                     logger.info(
                         "[MambaAudit] match pre-check stopped pulling: "
                         "rem=%d headroom=%d free=%d queue=%d can_run=%d running=%d",
-                        adder.rem_mamba_slots,
+                        rem_mamba_slots,
                         adder._mamba_match_headroom(),
                         mamba_allocator.schedulable_available_size(),
                         len(self.waiting_queue),
