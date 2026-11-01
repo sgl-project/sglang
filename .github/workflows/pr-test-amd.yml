@@ -237,14 +237,17 @@ jobs:
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd.yml"
+              - "docker/rocm.Dockerfile"
             sgl_kernel:
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd.yml"
+              - "docker/rocm.Dockerfile"
             jit_kernel:
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**"
               - "test/registered/kernels/**"
               - ".github/workflows/pr-test-amd.yml"
+              - "docker/rocm.Dockerfile"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
@@ -254,6 +257,7 @@ jobs:
               - "test/registered/kernels/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
+              - "docker/rocm.Dockerfile"
 
   # =============================================== extra (scheduled) ====================================================
   # Chain the label-gated AMD extra tier into the scheduled run, mirroring
