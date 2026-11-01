@@ -26,7 +26,9 @@ from sglang.srt.utils import is_cuda, is_npu
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sglang.kernels.ops.speculative.dflash import dflash_simulated_accept
+    from sglang.kernels.ops.speculative.dflash_simulated_accept import (
+        dflash_simulated_accept,
+    )
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 _DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})

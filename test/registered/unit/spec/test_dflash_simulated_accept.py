@@ -178,9 +178,11 @@ class TestDFlashSimulatedAccept(CustomTestCase):
         rounds=4,
         seed=0,
         seen_lens=None,
+        pass_new_seq_lens=True,
     ):
         # Successive rounds on one RNG stream; each round must match the reference
-        # in every output and in the CPU RNG state it leaves behind.
+        # in every output and in the CPU RNG state it leaves behind. Without
+        # new_seq_lens (the sampling branch) the op must leave that buffer alone.
         torch.manual_seed(seed)
         target_predict = None if logits is not None else case.target_predict
         for _ in range(rounds):
@@ -214,7 +216,7 @@ class TestDFlashSimulatedAccept(CustomTestCase):
                 simulate_acc_token_mode=token_mode,
                 next_token_logits=logits,
                 prefix_lens=case.prefix_lens,
-                new_seq_lens=views[4],
+                new_seq_lens=views[4] if pass_new_seq_lens else None,
             )
             self.assertTrue(torch.equal(torch.get_rng_state(), rng_ref))
 
@@ -291,6 +293,7 @@ class TestDFlashSimulatedAccept(CustomTestCase):
                     from_logits=from_logits,
                     mean=mean,
                     layout=layout,
+                    new_seq_lens=case_index % 2 == 0,
                 ):
                     self._check_rounds(
                         case=case,
@@ -300,6 +303,7 @@ class TestDFlashSimulatedAccept(CustomTestCase):
                         logits=logits,
                         seed=case_index,
                         seen_lens=seen_lens,
+                        pass_new_seq_lens=case_index % 2 == 0,
                     )
                 case_index += 1
             # The matrix must reach both clamps and an interior length.
@@ -410,8 +414,13 @@ class TestDFlashSimulatedAccept(CustomTestCase):
                 vocab=257,
                 large_ids=large_ids,
             )
+            pass_new_seq_lens = case_index % 2 == 0
             with self.subTest(
-                dtypes=dtypes, large_ids=large_ids, layout=layout, token_mode=token_mode
+                dtypes=dtypes,
+                large_ids=large_ids,
+                layout=layout,
+                token_mode=token_mode,
+                new_seq_lens=pass_new_seq_lens,
             ):
                 self._check_rounds(
                     case=case,
@@ -420,6 +429,7 @@ class TestDFlashSimulatedAccept(CustomTestCase):
                     mean=block_size / 2,
                     rounds=6,
                     seed=case_index,
+                    pass_new_seq_lens=pass_new_seq_lens,
                 )
             case_index += 1
 
@@ -454,6 +464,7 @@ class TestDFlashSimulatedAccept(CustomTestCase):
                     logits=logits,
                     rounds=6,
                     seed=case_index,
+                    pass_new_seq_lens=case_index % 2 == 0,
                 )
             del logits
             case_index += 1
