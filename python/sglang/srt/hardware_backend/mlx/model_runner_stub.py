@@ -94,6 +94,32 @@ class _DummyModel:
         pass
 
 
+class _MlxWeightUpdater:
+    """Fails online weight updates; the served weights live in the MLX model."""
+
+    _UNSUPPORTED = (False, "Online weight updates are not supported on the MLX backend")
+
+    def _reject(self, *args, **kwargs) -> Tuple[bool, str]:
+        return self._UNSUPPORTED
+
+    update_weights_from_disk = _reject
+    update_weights_from_tensor = _reject
+    update_weights_from_ipc = _reject
+    load_weights_from_distributed = _reject
+    init_weights_update_group = _reject
+    destroy_weights_update_group = _reject
+
+    def receive_weights_from_distributed(self, **kwargs):
+        raise RuntimeError(self._UNSUPPORTED[1])
+
+    # A session opens before the tensor and distributed loads; they then fail.
+    def begin_weight_update(self) -> None:
+        pass
+
+    def end_weight_update(self, *, run_post_load: bool) -> None:
+        pass
+
+
 class MlxModelRunnerStub(ModelRunner):
     """ModelRunner that skips PyTorch weight loading and KV cache allocation.
 
@@ -248,6 +274,11 @@ class MlxModelRunnerStub(ModelRunner):
                 resolved,
             )
         return resolved
+
+    def init_weight_updater(self):
+        # The Torch updater would walk or reload `_DummyModel`, and an
+        # exception in the scheduler's request dispatch stops the server.
+        self.weight_updater = _MlxWeightUpdater()
 
     def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
