@@ -196,6 +196,7 @@ class HcReadCall(HcRead):
                 if self.attention
                 else mhc.mega_moe_input_of(self.layer, self.batch)
             ),
+            extend=mhc.is_local_extend(self.batch),
         )
 
     def _after_post(self, residual, norm):
