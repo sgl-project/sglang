@@ -138,7 +138,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
             if batch.penalty_update_pending:
                 # mix_with_running appends the running rows after the prefill rows.
-                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                orchestrator = batch.sampling_info.penalizer_orchestrator
+                orchestrator.cumulate_output_tokens_on_forward_stream(
                     decode_gpu, row_start=len(batch.reqs) - decode_gpu.shape[0]
                 )
                 batch.penalty_update_pending = False
@@ -154,7 +155,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             )
         if batch.penalty_update_pending:
             # Penalizers are reqs-aligned; rows past len(reqs) are a beam tail.
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            orchestrator = batch.sampling_info.penalizer_orchestrator
+            orchestrator.cumulate_output_tokens_on_forward_stream(
                 batch.input_ids[: len(batch.reqs)]
             )
             batch.penalty_update_pending = False

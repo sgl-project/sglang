@@ -230,5 +230,86 @@ class TestPrepareForDecodePenaltyHistory(unittest.TestCase):
         self.assertEqual(counts[:, REQ_LAST_OUTPUT_TOKEN].tolist(), [1.0, 1.0])
 
 
+class _LoggedEvent:
+    def __init__(self, log):
+        self.log = log
+
+    def record(self):
+        self.log.append(("record", self))
+
+
+class _LoggedStream:
+    def __init__(self, log):
+        self.log = log
+
+    def wait_event(self, event):
+        self.log.append(("wait", event))
+
+
+class _LoggedDeviceModule:
+    """Stands in for torch.cuda: logs event records and cross-stream waits."""
+
+    def __init__(self, log):
+        self.Event = lambda: _LoggedEvent(log)
+        self.current_stream = lambda: _LoggedStream(log)
+
+
+class TestOverlapPenaltyStreamOrder(unittest.TestCase):
+    """The overlap resolve writes the penalty buffers on the forward stream; a
+    schedule-stream filter or merge must not copy them before that write lands."""
+
+    _prepare_for_decode = TestPrepareForDecodePenaltyHistory._prepare_for_decode
+
+    def setUp(self):
+        self.log = []
+        patcher = patch(
+            "sglang.srt.sampling.penaltylib.orchestrator.torch.get_device_module",
+            return_value=_LoggedDeviceModule(self.log),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _resolve(self, batch):
+        self._prepare_for_decode(batch)
+        future_map = types.SimpleNamespace(
+            output_tokens_buf=torch.full((2,), RELAYED_TOKEN, dtype=torch.int64),
+            spec_algo=types.SimpleNamespace(is_none=lambda: True),
+        )
+        resolve_forward_inputs(batch, future_map)
+        self.assertEqual([kind for kind, _ in self.log], ["record"])
+        return self.log[0][1]
+
+    def _log_buffer_copies(self, penalizer, method):
+        original = getattr(penalizer, method)
+
+        def logged(*args, **kwargs):
+            self.log.append((method, None))
+            return original(*args, **kwargs)
+
+        setattr(penalizer, method, logged)
+
+    def test_filter_waits_for_the_forward_token_write(self):
+        batch, penalizer = _make_penalized_decode_batch(enable_overlap=True)
+        event = self._resolve(batch)
+        self._log_buffer_copies(penalizer, "_filter")
+
+        batch.sampling_info.penalizer_orchestrator.filter(torch.tensor([1]))
+
+        self.assertEqual(self.log[1:], [("wait", event), ("_filter", None)])
+        self.assertEqual(penalizer.cumulated_frequency_penalties[0, RELAYED_TOKEN], 1)
+
+    def test_merge_waits_for_the_forward_token_write(self):
+        batch, penalizer = _make_penalized_decode_batch(enable_overlap=True)
+        event = self._resolve(batch)
+        self._log_buffer_copies(penalizer, "_merge")
+        other, _ = _make_penalized_decode_batch(enable_overlap=True)
+
+        batch.sampling_info.penalizer_orchestrator.merge(
+            other.sampling_info.penalizer_orchestrator
+        )
+
+        self.assertEqual(self.log[1:], [("wait", event), ("_merge", None)])
+
+
 if __name__ == "__main__":
     unittest.main()

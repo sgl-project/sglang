@@ -21,6 +21,8 @@ class BatchedPenalizerOrchestrator:
         self._batch_ref = weakref.ref(batch)
         self.device = batch.device
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
+        # Recorded after a forward-stream token feed; None when there is none to wait for.
+        self._forward_write_done = None
 
         is_required = False
         for penalizer in self.penalizers.values():
@@ -53,6 +55,24 @@ class BatchedPenalizerOrchestrator:
         """
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids, row_start=row_start)
+
+    def cumulate_output_tokens_on_forward_stream(
+        self, output_ids: torch.Tensor, row_start: int = 0
+    ):
+        # The overlap resolve feeds tokens on the forward stream, while filter and
+        # merge run on the schedule stream; they wait for this write before copying.
+        self.cumulate_output_tokens(output_ids=output_ids, row_start=row_start)
+        if self.is_required:
+            self._forward_write_done = torch.get_device_module(self.device).Event()
+            self._forward_write_done.record()
+
+    def _wait_for_forward_write(self):
+        if self._forward_write_done is None:
+            return
+        torch.get_device_module(self.device).current_stream().wait_event(
+            self._forward_write_done
+        )
+        self._forward_write_done = None
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -112,6 +132,7 @@ class BatchedPenalizerOrchestrator:
         Args:
             keep_indices (torch.Tensor): Tensor of indices to keep in the batch.
         """
+        self._wait_for_forward_write()
         if not self.is_required:
             return
 
@@ -158,6 +179,8 @@ class BatchedPenalizerOrchestrator:
         Args:
             their (BatchedPenalizerOrchestrator): The orchestrator to merge into this one.
         """
+        self._wait_for_forward_write()
+        their._wait_for_forward_write()
         if not self.is_required and not their.is_required:
             return
 
