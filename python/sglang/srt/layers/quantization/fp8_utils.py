@@ -930,8 +930,22 @@ def can_serve_block_fp8_as_mxfp8(
     return not resolve_block_fp8_mxfp8_backend().is_unsupported()
 
 
+def _b12x_or_cutlass_mxfp8_linear(input, weight, *args, **kwargs):
+    # SM12x: b12x has small-M tiles and beats CUTLASS at every M, but needs
+    # K % 128 == 0.
+    backend = "b12x" if weight.shape[1] % 128 == 0 else "cutlass"
+    return flashinfer_mxfp8_blockscaled_linear(
+        input, weight, *args, backend=backend, pin_tactic=True, **kwargs
+    )
+
+
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    if (
+        backend.is_flashinfer_cutlass()
+        and _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
+    ):
+        return _b12x_or_cutlass_mxfp8_linear
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
