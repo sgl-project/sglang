@@ -1918,7 +1918,9 @@ class ServingChatTestCase(CustomTestCase):
         def parameters(marker):
             return {
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": marker}},
+                "properties": {
+                    "query": {"type": ["string", "null"], "description": marker}
+                },
             }
 
         marker = uuid.uuid4().hex
