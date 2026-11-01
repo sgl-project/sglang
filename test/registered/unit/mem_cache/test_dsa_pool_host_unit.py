@@ -4,21 +4,42 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
-    alloc_with_pin_memory,
-)
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _make_indexer_host(pool, anchor, *, packed_draft_device_pools=(), **kwargs):
+    from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+        prepare_host_pool_config,
+    )
+
+    config = prepare_host_pool_config(
+        root=pool,
+        full_layer_mapping={i: i for i in range(pool.layer_num)},
+        transfer_layer_id_max=pool.layer_num,
+        transfer_page_size=anchor.page_size,
+        packed_draft_device_pools=packed_draft_device_pools,
+    ).sidecars[0]
+    return DSAIndexerPoolHost(
+        config.buffer_info,
+        layer_mapping=config.device_to_host_layer,
+        target_device_layer_num=pool.layer_num,
+        num_host_pages=anchor.page_num,
+        transfer_page_size=anchor.page_size,
+        layout=anchor.layout,
+        buffer_device=pool.device,
+        dtype=pool.store_dtype,
+        layer_sharded=pool.layer_shard_enabled,
+        **kwargs,
+    )
 
 
 class TestDSAOffloadSignatures(unittest.TestCase):
@@ -72,51 +93,47 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             index_head_dim=128,
         )
         pin_memory = io_backend == "kernel"
-        original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
-        if pin_memory:
-            ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
-        try:
-            mla_host = MLATokenToKVPoolHost(
-                buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
-                host_to_device_ratio=2.0,
-                host_size=0,
-                page_size=page_size,
-                layout="layer_first",
-                pin_memory=pin_memory,
-                device="cpu",
-                allocator_type="default",
-                override_kv_cache_dim=device_pool.kv_cache_dim,
-                device_capacity_tokens=(
-                    device_pool.size
-                    if device_pool.host_capacity_tokens is None
-                    else device_pool.host_capacity_tokens
-                ),
-                start_layer=device_pool.start_layer,
-                end_layer=device_pool.end_layer,
-                target_layer_num=(
-                    (device_pool.layer_num + device_pool.layer_shard_size - 1)
-                    // device_pool.layer_shard_size
-                    if device_pool.layer_shard_enabled
-                    else device_pool.layer_num
-                ),
-                layer_shard_enabled=device_pool.layer_shard_enabled,
-            )
-            indexer_host = DSAIndexerPoolHost(
-                decl=make_dsa_indexer_pool_decl(device_pool),
-                anchor_host=mla_host,
-                pin_memory=pin_memory,
-                device="cpu",
-                allocator_type="default",
-            )
-        finally:
-            ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
+        mla_host = MLATokenToKVPoolHost(
+            buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=page_size,
+            layout="layer_first",
+            pin_memory=pin_memory,
+            device="cpu",
+            allocator_type="default",
+            override_kv_cache_dim=device_pool.kv_cache_dim,
+            device_capacity_tokens=(
+                device_pool.size
+                if device_pool.host_capacity_tokens is None
+                else device_pool.host_capacity_tokens
+            ),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=(
+                (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                // device_pool.layer_shard_size
+                if device_pool.layer_shard_enabled
+                else device_pool.layer_num
+            ),
+            layer_shard_enabled=device_pool.layer_shard_enabled,
+        )
+        indexer_host = _make_indexer_host(
+            device_pool,
+            mla_host,
+            pin_memory=pin_memory,
+            device="cpu",
+            allocator_type="default",
+        )
 
+        self.addCleanup(mla_host.destroy)
+        self.addCleanup(indexer_host.destroy)
         for layer_id in range(layer_num):
             buf = device_pool.index_k_with_scale_buffer[layer_id]
             data = torch.arange(
-                buf.numel(), device=buf.device, dtype=torch.uint8
+                buf.numel(), device=buf.device, dtype=torch.int32
             ).view_as(buf)
-            buf.copy_((data + layer_id) % 256)
+            buf.copy_((data + layer_id).remainder(251).to(torch.uint8))
             kv_buf = device_pool.kv_buffer[layer_id]
             kv_data = torch.arange(
                 kv_buf.numel(), device=kv_buf.device, dtype=kv_buf.dtype
@@ -163,6 +180,23 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                     device_start : device_start + page_size
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
+
+        expected_index_pages = [
+            buffer[device_pages].clone()
+            for buffer in device_pool.index_k_with_scale_buffer
+        ]
+        for buffer in device_pool.index_k_with_scale_buffer:
+            buffer.zero_()
+        for layer_id in range(layer_num):
+            indexer_host.load_to_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id, io_backend
+            )
+        torch.cuda.synchronize()
+        for buffer, expected in zip(
+            device_pool.index_k_with_scale_buffer, expected_index_pages, strict=True
+        ):
+            self.assertTrue(torch.equal(buffer[device_pages], expected))
+            self.assertEqual(torch.count_nonzero(buffer[0]).item(), 0)
 
     @unittest.skipIf(
         is_hip(),

@@ -20,7 +20,7 @@ from sglang.srt.sampling.penaltylib.orchestrator import (  # noqa: E402
     BatchedPenalizerOrchestrator,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req():

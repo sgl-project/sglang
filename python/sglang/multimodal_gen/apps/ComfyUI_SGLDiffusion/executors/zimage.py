@@ -8,7 +8,16 @@ class ZImageAdapter(ComfyUIModelAdapter):
     model_types = ("lumina2",)
     pipeline_class_name = "ZImagePipeline"
 
-    def pack(self, x, timestep, context, **kwargs) -> PackedForward:
+    def pack(
+        self, x, timestep, context, siglip_feats=None, ref_contexts=None, **kwargs
+    ) -> PackedForward:
+        # The worker has no path for Z-Image Omni's reference conditioning.
+        if siglip_feats or ref_contexts:
+            raise ValueError(
+                "ZImageAdapter does not support Z-Image Omni reference "
+                "conditioning (siglip_feats / ref_contexts); running this "
+                "workflow would silently drop the reference images."
+            )
         context = context.squeeze(0)
         return PackedForward(
             latents=x.unsqueeze(2),
