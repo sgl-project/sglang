@@ -372,15 +372,18 @@ class TestUnifiedTriPool(_PoolTestCase):
         relieve_for_alloc(allocator, 1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
-    def test_full_donor_stops_after_float_exposes_mamba_capacity(self):
+    def test_state_target_stops_after_float_exposes_state_capacity(self):
         for page_size, lazy_compaction in ((1, False), (4, True)):
             with self.subTest(page_size=page_size, lazy_compaction=lazy_compaction):
                 _, allocator, _, _ = self._build(
                     page_size=page_size, lazy_compaction=lazy_compaction
                 )
+                # Wired as production wires it: the chain takes and prices slots.
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
                     device=_DEV,
+                    take=allocator.alloc_state_slots,
+                    capacity=allocator.state_slots_available,
                 )
 
                 full_leaves = []
@@ -407,8 +410,10 @@ class TestUnifiedTriPool(_PoolTestCase):
                 )
                 index_slots(cache, cache.tree_components)
                 cache.is_swa_enabled = True
+                cache.is_mamba_enabled = True
                 cache.cache_controller = None
                 cache.metrics_collector = None
+                cache.window_retain_size = MagicMock(return_value=0)
                 allocator.state = SimpleNamespace(slots=mamba_slots)
                 cache.token_to_kv_pool_allocator = allocator
                 cache.req_to_token_pool = MagicMock()
@@ -416,6 +421,8 @@ class TestUnifiedTriPool(_PoolTestCase):
                 tree_core = MagicMock()
                 tree_core.full_evictable_size.return_value = len(full_leaves)
                 tree_core.mamba_evictable_size.return_value = 0
+                tree_core.swa_evictable_size.return_value = 0
+                tree_core.auxiliary_swa_evictable_size.return_value = 0
                 walk = {"request_cnt": 0, "freed_leaves": 0}
 
                 def start(component_type, request_cnt):
@@ -517,7 +524,7 @@ class TestTriPagedFreeGroup(_PoolTestCase):
         # Capacity fully recovered: the float parked, both ends rewound.
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
-    def test_mamba_donor_flushes_full_only_group_without_closing_it(self):
+    def test_deferred_full_frees_flush_full_only_group_without_closing_it(self):
         _, allocator = self._build_paged(page_size=1)
         full_indices = allocator.alloc(8)
         self.assertIsNotNone(full_indices)
@@ -528,9 +535,7 @@ class TestTriPagedFreeGroup(_PoolTestCase):
         allocator.free_full_segment(full_indices, start_pos=0)
         self.assertTrue(allocator.full_page_reps_group)
 
-        donor = allocator.mamba_full_cache_donor()
-        self.assertIsNotNone(donor)
-        donor.flush_deferred_full_frees()
+        allocator.flush_deferred_full_frees()
 
         self.assertEqual(allocator.free_group, [])
         self.assertEqual(allocator.free_page_reps_group, [])

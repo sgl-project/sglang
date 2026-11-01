@@ -100,7 +100,12 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             with self.subTest(lazy=lazy):
                 allocator, cache = self.build_cache(lazy=lazy)
                 records = self.mark_prefixes(allocator, cache, 96)
-                self.assertIsNone(allocator.reclaim_plan(101, 101, empty_pool=True))
+                # Not even an empty pool holds it, so reclaim must keep every prefix.
+                self.assertFalse(
+                    allocator.admits(
+                        101, allocator._window_demand(101, 101), empty_pool=True
+                    )
+                )
                 for _ in range(3):
                     evict_from_tree_cache(cache, 101)
                     self.assertIsNone(allocator.alloc(101))
@@ -274,7 +279,9 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             demand * sa.entry_bytes_per_page, allocator._policy._empty_shared_gap_bytes
         )
         self.assertLess(demand, sa.num_pages - sa.min_page_index)
-        self.assertIsNone(allocator.reclaim_plan(0, demand, empty_pool=True))
+        self.assertFalse(
+            allocator.admits(0, allocator._window_demand(0, demand), empty_pool=True)
+        )
         self.assertFalse(allocator.ensure_capacity(0, demand))
         self.assertEqual(cache.full_evictable_size(), 0)
         self.assertFalse(allocator.verify_byte_accounting())
@@ -396,7 +403,8 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 if not gate:
                     hold_band(member)
             for _ in range(20):
-                allocator.reclaim_plan(4, 4)
+                # The reclaim walks' stop predicate.
+                allocator.ensure_capacity(4, 4)
             self.assertEqual(snapshot(), before)
         for member in allocator._flush_targets():
             release_band(member)
@@ -450,15 +458,13 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         def step(component, tracker):
             result = original(component, tracker)
-            observed.append((result, allocator.reclaim_plan(4, 4) == (0, 0)))
+            observed.append((result, allocator.ensure_capacity(4, 4)))
             return result
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
             cache.evict_for_alloc(
                 EvictParams(swa_num_tokens=2),
-                allocation_reclaim_satisfied=lambda: (
-                    allocator.reclaim_plan(4, 4) == (0, 0)
-                ),
+                allocation_reclaim_satisfied=lambda: allocator.ensure_capacity(4, 4),
             )
         self.assertTrue(
             any(node is None and progress for (node, progress), _ in observed),
@@ -507,16 +513,23 @@ for _ in range(2):
     try:
         allocator, cache = fixture.build_cache()
         records = fixture.mark_prefixes(allocator, cache, 96)
+        # The owner is short, so its cached entries are walked first, capped
+        # at all of them; the walk stops at the first victim that suffices.
+        quota = allocator.admission_evictable(cache)[
+            allocator.full_attn_allocator.sub_pool_name
+        ]
         q = queue.Queue()
         with patch.object(checker, "_q", q), patch.object(checker, "_scheduler_thread", threading.current_thread()):
             assert module["evict_from_tree_cache"](cache, 6)
             assert allocator.alloc(6) is not None
         fixture.check_prefixes(allocator, cache, records, range(3, 96))
-        traces.append(list(q.queue))
+        traces.append((quota, list(q.queue)))
     finally:
         fixture.tearDown()
 assert traces[0] == traces[1], traces
-assert any("num_tokens=6" in event for event in traces[0]), traces
+quota, traces = traces[0][0], [traces[0][1]]
+assert quota > 0, quota
+assert any(f"num_tokens={quota}," in event for event in traces[0]), traces
 assert any("allocation_reclaim_satisfied is not None=True" in event for event in traces[0]), traces
 assert not any("<function" in event for event in traces[0]), traces
 """
