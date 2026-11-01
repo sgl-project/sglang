@@ -1318,6 +1318,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         language_model_cls=Qwen3LLMModel,
+        create_lm_head: bool = True,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
@@ -1359,7 +1360,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("model.language_model", prefix),
             )
-            if self.pp_group.is_last_rank:
+            if not create_lm_head:
+                self.lm_head = None
+            elif self.pp_group.is_last_rank:
                 if (
                     self.pp_group.world_size == 1
                     and self.config.tie_word_embeddings
@@ -1608,6 +1611,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self._lora_pattern.match(module_name))
 
+    def _pool_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        return self.pooler(hidden_states, forward_batch)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1673,7 +1684,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     aux_hidden_states,
                 )
             else:
-                return self.pooler(hidden_states, forward_batch)
+                return self._pool_hidden_states(input_ids, hidden_states, forward_batch)
         else:
             return hidden_states
 
