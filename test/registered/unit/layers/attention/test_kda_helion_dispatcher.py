@@ -248,6 +248,7 @@ class TestKDACuteDslVerifySelection(unittest.TestCase):
             conv_weights=torch.zeros(3 * width, 4, dtype=torch.float32),
         )
         backend = KDAAttnBackend.__new__(KDAAttnBackend)
+        backend.state_pool = None
         backend.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend=LinearAttnKernelBackend.TRITON,
             prefill_backend=LinearAttnKernelBackend.TRITON,
