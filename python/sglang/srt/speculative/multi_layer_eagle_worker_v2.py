@@ -199,6 +199,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "GigaChat35ForCausalLMNextN",
         ]
         self.tree_mask_mode = default_tree_mask_mode()
+
+        # Both models are fully loaded now (see EagleDraftWorker.__init__):
+        # rebind every step's draft embed/lm_head to the target's copies and
+        # drop the redundant per-step tensors before the scheduler sizes the
+        # KV pools. alloc_memory_pool re-runs this idempotently as a fallback.
+        self.init_lm_head()
+
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
