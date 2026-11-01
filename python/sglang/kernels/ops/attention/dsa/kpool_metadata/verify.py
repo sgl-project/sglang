@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.dsa.kpool_metadata.scan import bounded_scan_nu
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
+        "bs",
         "max_seqlen_k",
         "num_splits",
     ]
@@ -39,7 +40,7 @@ def _fused_dsa_target_verify_metadata_kpool_kernel(
     real_page_table_stride_1: tl.constexpr,
     paged_mqa_ctx_lens_stride_0: tl.constexpr,
     paged_mqa_ctx_lens_stride_1: tl.constexpr,
-    bs: tl.constexpr,
+    bs,
     max_seqlen_k,
     num_splits,
     dsa_index_topk: tl.constexpr,
@@ -54,7 +55,7 @@ def _fused_dsa_target_verify_metadata_kpool_kernel(
     BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    expanded_size: tl.constexpr = bs * next_n
+    expanded_size = bs * next_n
 
     if pid == 0:
         offs_b = tl.arange(0, BLOCK_BS)
