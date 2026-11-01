@@ -249,16 +249,23 @@ def _lower_concatenate(mx, args, kwargs):
     return mx.concatenate(tuple(args[0]), axis=_arg(args, kwargs, 1, "dim", 0))
 
 
-@_lowering(
-    "embedding", aten=(torch.ops.aten.embedding.default,), functions=(F.embedding,)
-)
+# aten.embedding(weight, indices, padding_idx, scale_grad_by_freq, sparse): the
+# trailing flags only affect backward, so every forward is admissible.
+@_lowering("embedding", aten=(torch.ops.aten.embedding.default,))
 def _lower_embedding(mx, args, kwargs):
-    if isinstance(args[0], mx.array) and args[0].ndim >= 2:
-        weight, input_ids = args[:2]
-    else:
-        input_ids, weight = args[:2]
-    if len(args) > 3 and args[3] is not None:
-        raise UnsupportedMlxFxGraphError("embedding max_norm is unsupported")
+    weight, input_ids = args[:2]
+    return mx.take(weight, input_ids, axis=0)
+
+
+# F.embedding(input, weight, padding_idx, max_norm, ...): the eager spelling
+# takes ids first, so it is its own lowering rather than a shape guess.
+@_lowering("embedding_functional", functions=(F.embedding,))
+def _lower_functional_embedding(mx, args, kwargs):
+    input_ids, weight = args[:2]
+    if _arg(args, kwargs, 3, "max_norm") is not None:
+        raise UnsupportedMlxFxGraphError(
+            "embedding max_norm renormalizes the weight in place"
+        )
     return mx.take(weight, input_ids, axis=0)
 
 
@@ -591,21 +598,32 @@ def _mlx_dtype(dtype: torch.dtype, mx: Any) -> Any:
         ) from exc
 
 
-def _resolve_graph_attr(graph_module: torch.fx.GraphModule, target: str) -> Any:
-    """Resolve a ``get_attr`` target: parameter, buffer, or plain attribute.
+def _resolve_graph_attrs(
+    graph_module: torch.fx.GraphModule, attr_nodes: Sequence[torch.fx.Node]
+) -> tuple[tuple[Any, str, Any], ...]:
+    """Resolve ``get_attr`` targets once: (owner module, attribute, value).
 
     FX ``get_attr`` nodes are not limited to parameters and registered
     buffers: a module may hang constant tensors or scalars directly on
     itself, and ``torch.export``'s ``module()`` re-registers lifted tensor
-    constants the same way.
+    constants the same way. The owner/attribute pair is what a later step
+    re-reads to notice a replaced tensor without walking the module again.
     """
-    if target in dict(graph_module.named_parameters()):
-        return graph_module.get_parameter(target)
-    if target in dict(graph_module.named_buffers()):
-        return graph_module.get_buffer(target)
-    module_path, _, attr_name = target.rpartition(".")
-    owner = graph_module.get_submodule(module_path) if module_path else graph_module
-    return getattr(owner, attr_name)
+    parameters = dict(graph_module.named_parameters())
+    buffers = dict(graph_module.named_buffers())
+    resolved = []
+    for node in attr_nodes:
+        target = str(node.target)
+        module_path, _, attr_name = target.rpartition(".")
+        owner = graph_module.get_submodule(module_path) if module_path else graph_module
+        if target in parameters:
+            value = parameters[target]
+        elif target in buffers:
+            value = buffers[target]
+        else:
+            value = getattr(owner, attr_name)
+        resolved.append((owner, attr_name, value))
+    return tuple(resolved)
 
 
 def make_mlx_fx_executor(
@@ -626,23 +644,22 @@ def make_mlx_fx_executor(
     attr_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "get_attr"
     )
-    attr_values = tuple(
-        _resolve_graph_attr(plan.graph_module, str(node.target)) for node in attr_nodes
-    )
+    attrs = _resolve_graph_attrs(plan.graph_module, attr_nodes)
     # Parameters, buffers, and constant-tensor attributes ride as borrowed
     # views; non-tensor attributes (scalars, shapes) are captured by value.
-    tensor_attr_nodes = tuple(
-        node
-        for node, value in zip(attr_nodes, attr_values)
+    tensor_attrs = tuple(
+        (node, owner, attr_name)
+        for node, (owner, attr_name, value) in zip(attr_nodes, attrs)
         if isinstance(value, torch.Tensor)
     )
+    tensor_attr_nodes = tuple(node for node, _, _ in tensor_attrs)
     constant_attr_values = {
         node: value
-        for node, value in zip(attr_nodes, attr_values)
+        for node, (_, _, value) in zip(attr_nodes, attrs)
         if not isinstance(value, torch.Tensor)
     }
     attr_views = tuple(
-        MlxTensorView(value) for value in attr_values if isinstance(value, torch.Tensor)
+        MlxTensorView(getattr(owner, attr_name)) for _, owner, attr_name in tensor_attrs
     )
     placeholder_nodes = tuple(
         node for node in plan.graph_module.graph.nodes if node.op == "placeholder"
@@ -711,8 +728,8 @@ def make_mlx_fx_executor(
             for index in tensor_positions
         ):
             raise RuntimeError("compiled MLX graph requires Torch MPS tensors")
-        for node, view in zip(tensor_attr_nodes, attr_views):
-            tensor = _resolve_graph_attr(plan.graph_module, str(node.target))
+        for (_, owner, attr_name), view in zip(tensor_attrs, attr_views):
+            tensor = getattr(owner, attr_name)
             if not view.matches(tensor):
                 view.refresh(tensor)
         return mlx_call_multi(

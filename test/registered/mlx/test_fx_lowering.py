@@ -112,7 +112,7 @@ def test_dynamo_captures_dense_decoder_and_kv_commit_as_one_supported_graph():
     assert backend.plans[0].fully_supported
     lowerings = {node.lowering for node in backend.plans[0].nodes}
     assert {
-        "embedding",
+        "embedding_functional",
         "rms_norm",
         "linear",
         "sdpa",
@@ -522,16 +522,22 @@ def test_review_flagged_ops_match_eager_through_the_export_path():
     reason="requires Torch 2.13 and MLX on MPS",
 )
 def test_eager_spellings_lower_through_the_dynamo_path():
-    """``a - b`` and ``torch.add/sub/mul`` as Dynamo spells them.
+    """``operator.sub``, ``torch.sub/add/mul`` and 2-D ``F.embedding`` ids.
 
-    Dynamo emits the eager functions rather than ATen overloads, so a
-    residual subtraction must not make the whole region decline.
+    Dynamo spells these differently from ``torch.export``: the eager
+    functions rather than ATen overloads, and ``F.embedding(ids, weight)``
+    with the ids first, in the batched [B, T] shape serving uses.
     """
 
     class EagerOps(torch.nn.Module):
-        def forward(self, x, y):
+        def __init__(self):
+            super().__init__()
+            self.table = torch.nn.Embedding(16, 8)
+
+        def forward(self, ids, x, y):
+            rows = torch.nn.functional.embedding(ids, self.table.weight)
             return (
-                x - y,
+                rows - x,
                 torch.sub(x, y, alpha=2),
                 torch.add(x, y, alpha=0.5),
                 torch.mul(x, y),
@@ -539,17 +545,18 @@ def test_eager_spellings_lower_through_the_dynamo_path():
 
     torch._dynamo.reset()
     torch.manual_seed(0)
-    model = EagerOps().eval()
-    x = torch.randn(2, 8, device="mps", dtype=torch.bfloat16)
-    y = torch.randn(2, 8, device="mps", dtype=torch.bfloat16)
-    expected = model(x, y)
+    model = EagerOps().to(device="mps", dtype=torch.bfloat16).eval()
+    ids = torch.randint(0, 16, (2, 3), device="mps")
+    x = torch.randn(2, 3, 8, device="mps", dtype=torch.bfloat16)
+    y = torch.randn(2, 3, 8, device="mps", dtype=torch.bfloat16)
+    expected = model(ids, x, y)
 
     backend = MlxFxCaptureBackend(executor_factory=make_mlx_fx_executor)
-    actual = torch.compile(model, backend=backend, fullgraph=True)(x, y)
+    actual = torch.compile(model, backend=backend, fullgraph=True)(ids, x, y)
 
     torch.mps.synchronize()
     assert backend.plans[0].fully_supported
-    assert {"subtract", "add", "multiply"} <= {
+    assert {"embedding_functional", "subtract", "add", "multiply"} <= {
         node.lowering for node in backend.plans[0].nodes
     }
     for actual_item, expected_item in zip(actual, expected):
