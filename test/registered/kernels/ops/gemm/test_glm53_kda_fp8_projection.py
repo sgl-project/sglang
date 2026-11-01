@@ -278,8 +278,8 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             check(oot_method, oot_layer, 16, generic, tune=False)
             self.assertTrue(spy.called)
 
-        # With the tables off, so ignoring the flag would run CUTLASS, not a tuned tile
-        # whose kernel name equals the heuristic Triton kernel's.
+        # Tables off: ignoring the flag then runs CUTLASS, which the kernel-name check
+        # sees; a tuned tile has the same kernel name as the heuristic Triton kernel.
         with (
             self.subTest(case="USE_TRITON_W8A8_FP8_KERNEL"),
             patch.object(glm5_next, "use_triton_w8a8_fp8_kernel", True),

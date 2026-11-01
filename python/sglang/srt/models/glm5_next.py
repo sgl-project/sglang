@@ -215,8 +215,9 @@ def _kda_fp8_modules() -> frozenset:
             "--remote-instance-weight-loader-start-seed-via-transfer-engine: "
             "the KDA projections are quantized at load"
         )
-    # Elastic EP reloads lost experts with update_weights_from_disk, which these
-    # projections refuse, and it does not check the refusal.
+    # Without an expert backup, elastic EP reloads lost experts with
+    # update_weights_from_disk, which these projections refuse, and it does not check
+    # the refusal.
     if get_exec().moe.elastic_ep_backend is not None:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES is not supported with "
@@ -640,8 +641,8 @@ class Glm5NextLinearAttention(nn.Module):
         if fp8_input_proj and not self.do_fuse_qkvbfg:
             raise ValueError(
                 "SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj needs "
-                "the fused [q|k|v|b|f_a|g_a] projection, which the quant config does not "
-                "allow here (it must leave these projections in BF16)"
+                "the fused [q|k|v|b|f_a|g_a] projection; the quant config must support "
+                "the fusion and leave these projections in BF16"
             )
         if (
             "o_proj" in fp8_modules
