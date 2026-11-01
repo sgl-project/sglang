@@ -100,6 +100,12 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
+# AITER fused AR+RMSNorm 1-stage kernel: one block per token up to kMaxBlocks,
+# and every rank reads every peer, so its read volume is payload * world_size
+# (128 KiB of payload at world_size 8).
+_FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
+_FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -850,17 +856,16 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
+        # AITER's C++ dispatch further limits 1-stage to the hidden_dims it supports.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            token_num = input_.numel() // input_.shape[-1]
+            use_1stage_ar = (
+                token_num <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+                and total_bytes * self.world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            )
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
