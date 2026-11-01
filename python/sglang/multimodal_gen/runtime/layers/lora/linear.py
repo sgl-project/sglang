@@ -231,6 +231,8 @@ class BaseLayerWithLoRA(nn.Module):
         if self.merged:
             out, output_bias = self.base_layer(x)
             return self._add_lora_output_offset(out), output_bias
+        if self._runtime_lora_scale() == 0.0:
+            return self.base_layer(x)
         return self._forward_with_delta(x)
 
     @torch.compile()
@@ -1004,8 +1006,19 @@ class LinearWithLoRA(BaseLayerWithLoRA):
     not a tuple of (output, bias).
     """
 
-    @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Match BaseLayerWithLoRA: pass-through and merged weights must use
+        # the original eager dispatch, including after a layerwise rebind.
+        if self.disable_lora or (self.merged and not self.has_lora_output_offset):
+            return self.base_layer(x)
+        if self.merged:
+            return self._add_lora_output_offset(self.base_layer(x))
+        if self._runtime_lora_scale() == 0.0:
+            return self.base_layer(x)
+        return self._forward_with_delta(x)
+
+    @torch.compile()
+    def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
         # TODO: Support multiple LoRA adapters when use not merged mode
         runtime_lora_scale = self._runtime_lora_scale()
         if runtime_lora_scale == 0.0:
