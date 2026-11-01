@@ -233,6 +233,7 @@ class RequestWindow:
         page_size,
         capacity,
         workspace_rows: Optional[int] = None,
+        row_layout: Optional[KVLayout] = None,
     ):
         self.capacity = ((capacity + page_size - 1) // page_size) * page_size
         self.page_size = page_size
@@ -241,6 +242,8 @@ class RequestWindow:
         self.rows = num_slots * self.capacity
 
         self.state = pool_factory(self.rows + page_size, layers)
+        # Row format the copies move; trtllm's uniform-FP8 pools report V4.
+        self.row_layout = row_layout or self.state.kv_layout
         self.zero_row = self.rows
         self.sink_row = self.rows + 1
         self.tags = torch.full(
@@ -346,7 +349,7 @@ class RequestWindow:
                 src,
                 layout.history_loc,
                 page_size=self.page_size,
-                layout=self.state.kv_layout,
+                layout=self.row_layout,
             )
             self.prepared = prepared_key
         return self.workspace.kv_buffer[0]
@@ -360,5 +363,5 @@ class RequestWindow:
             layout,
             page_size=self.page_size,
             capacity=self.capacity,
-            layout=self.state.kv_layout,
+            layout=self.row_layout,
         )
