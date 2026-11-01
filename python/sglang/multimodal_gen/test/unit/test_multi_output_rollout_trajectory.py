@@ -19,8 +19,9 @@ def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
         rollout_log_probs=torch.full((1, _STEPS), tag),
         dit_trajectory=RolloutDitTrajectory(
             latents=torch.full((1, _STEPS + 1, 2), tag),
-            timesteps=torch.arange(_STEPS).float(),
+            timesteps=torch.arange(_STEPS + 1).float(),
             sigmas=torch.linspace(1.0, 0.0, _STEPS + 1),
+            latent_step_indices=torch.arange(_STEPS + 1),
         ),
     )
 
@@ -44,10 +45,15 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             [_per_output_trajectory(i) for i in range(3)]
         )
 
-        # timesteps/sigmas describe the shared schedule, so they must not gain a
-        # batch dim when K outputs are merged.
-        self.assertEqual(tuple(merged.dit_trajectory.timesteps.shape), (_STEPS,))
+        # timesteps/sigmas/latent_step_indices describe the shared schedule, so they
+        # must not gain a batch dim when K outputs are merged.
+        self.assertEqual(tuple(merged.dit_trajectory.timesteps.shape), (_STEPS + 1,))
         self.assertEqual(tuple(merged.dit_trajectory.sigmas.shape), (_STEPS + 1,))
+        self.assertTrue(
+            torch.equal(
+                merged.dit_trajectory.latent_step_indices, torch.arange(_STEPS + 1)
+            )
+        )
 
     def test_merge_drops_trajectory_when_only_some_outputs_have_one(self):
         """Drop a partial trajectory group that cannot stay output-aligned."""
@@ -78,6 +84,11 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             self.assertEqual(tuple(entry.rollout_log_probs.shape), (1, _STEPS))
             self.assertEqual(
                 tuple(entry.dit_trajectory.latents.shape), (1, _STEPS + 1, 2)
+            )
+            self.assertTrue(
+                torch.equal(
+                    entry.dit_trajectory.latent_step_indices, torch.arange(_STEPS + 1)
+                )
             )
 
     def test_select_without_output_index_returns_group_trajectory(self):
