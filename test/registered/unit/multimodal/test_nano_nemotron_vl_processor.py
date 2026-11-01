@@ -8,9 +8,10 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSConfig, EVSProcessor
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.nano_nemotron_vl import (
     NanoNemotronVLImageProcessor,
     _create_visual_items,

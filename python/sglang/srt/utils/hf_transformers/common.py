@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.configs import (
+from sglang.srt.configs.all_configs import (
     AfmoeConfig,
     BailingHybridConfig,
     BailingMM2Config,

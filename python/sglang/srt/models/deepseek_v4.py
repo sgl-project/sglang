@@ -113,21 +113,20 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,

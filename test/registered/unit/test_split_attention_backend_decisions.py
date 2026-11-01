@@ -87,11 +87,11 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
     def test_inkling_selects_the_half_serving_the_forward(self):
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
         )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models.inkling_common.attn import serving_attention_backend
 
         self._publish(

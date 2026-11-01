@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (  # noqa: E4
 )
 from sglang.srt.managers import schedule_batch as sb  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

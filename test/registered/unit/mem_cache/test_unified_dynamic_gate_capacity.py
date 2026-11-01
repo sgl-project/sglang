@@ -95,10 +95,8 @@ class TestDynamicGateCapacity(CustomTestCase):
                     self.assert_dynamic_views(a, state)
 
     def test_real_prefill_queue_gate(self):
-        from sglang.srt.disaggregation.utils import (
-            DisaggregationMode,
-            disagg_transfers_in_flight,
-        )
+        from sglang.srt.disaggregation.mode import DisaggregationMode
+        from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
 
         a = build_swa_pool()
         slots = a.alloc(96)

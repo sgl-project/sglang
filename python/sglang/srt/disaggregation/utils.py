@@ -25,6 +25,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -50,7 +51,6 @@ if TYPE_CHECKING:
 #########################
 # Constants & Enums
 #########################
-FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
 def pp_sync_polls(
@@ -145,20 +145,6 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     if req_pool_idx is None:
         raise ValueError("QSA pending-state transfer requires an allocated request row")
     return np.array([int(req_pool_idx)], dtype=np.int32)
-
-
-class DisaggregationMode(Enum):
-    NULL = "null"
-    PREFILL = "prefill"
-    DECODE = "decode"
-
-    @staticmethod
-    def to_engine_type(mode: str) -> str:
-        if mode == DisaggregationMode.PREFILL.value:
-            return "prefill"
-        elif mode == DisaggregationMode.DECODE.value:
-            return "decode"
-        return "unified"
 
 
 def disagg_transfers_in_flight(scheduler):

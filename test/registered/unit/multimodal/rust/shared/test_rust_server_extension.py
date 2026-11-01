@@ -133,7 +133,7 @@ def build_rust_frame_metadata_fixture() -> dict:
     collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,

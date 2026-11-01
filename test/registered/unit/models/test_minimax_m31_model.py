@@ -425,7 +425,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
 
     def test_verify_replans_after_prefix_growth_without_mutating_input_lengths(self):
         from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         class Plan:
             def __init__(self, **kwargs):

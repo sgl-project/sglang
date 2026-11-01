@@ -19,11 +19,7 @@ import torch
 from PIL import Image
 from transformers.utils.hub import cached_file
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.muse_spark_omni import MuseSparkForConditionalGeneration
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
@@ -31,6 +27,7 @@ from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,

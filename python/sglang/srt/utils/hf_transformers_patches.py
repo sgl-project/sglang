@@ -22,8 +22,11 @@ Import this module early (before any ``from_pretrained`` call) to activate
 all patches.  It is safe to import multiple times -- patches are idempotent.
 """
 
+import importlib.abc
+import importlib.util
 import inspect
 import logging
+import sys
 
 # Plain logger: importing sglang.srt.utils here pulls torch/transformers/triton
 # into every `import sglang` (this module runs from sglang/__init__.py).
@@ -33,11 +36,11 @@ _applied = False
 
 
 # ---------------------------------------------------------------------------
-# Public API: apply_all() -- import-time patches (idempotent)
+# Public API: apply_all_hf_patches() -- import-time patches (idempotent)
 # ---------------------------------------------------------------------------
 
 
-def apply_all():
+def apply_all_hf_patches():
     """Apply all transformers compatibility patches (idempotent).
 
     Call this once at import time.  It is safe to call multiple times.
@@ -59,7 +62,6 @@ def apply_all():
     _mute_diffusers_torchao_probe()
 
     # v5.4 patches
-    _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
     _patch_layer_types_validation()
     _patch_removed_symbols()
@@ -182,28 +184,6 @@ def _patch_rope_parameters_validation():
         PretrainedConfig.standardize_rope_params = _safe_standardize
 
 
-def _patch_flash_attn_availability():
-    """Prevent flash-attn-4 from masquerading as flash-attn-2.
-
-    flash-attn-4 registers a bare ``flash_attn`` namespace that makes
-    ``is_flash_attn_2_available()`` return True, but lacks the v2 API.
-    Remote model code (e.g. Kimi-VL) guarded by that check will crash.
-
-    TODO(upstream): model authors should check for specific API symbols.
-    """
-    try:
-        import flash_attn as _fa
-
-        if not hasattr(_fa, "flash_attn_func"):
-            import transformers.utils as _u
-            import transformers.utils.import_utils as _ui
-
-            _ui.is_flash_attn_2_available = lambda: False
-            _u.is_flash_attn_2_available = lambda: False
-    except ImportError:
-        pass
-
-
 def _patch_layer_types_validation():
     from transformers import PretrainedConfig
 
@@ -242,39 +222,65 @@ def _patch_removed_symbols():
     Remote model code (e.g. DeepSeek-OCR) still imports it.
     ``check_imports`` in ``dynamic_module_utils.py`` validates imports at
     config-load time, so it must exist before any ``from_pretrained``.
+    The patch lands when ``modeling_llama`` is imported rather than importing
+    it here: its chain (modeling_utils, quantizers, generation) costs seconds.
 
     TODO(upstream): DeepSeek-OCR / deepseek_vl_v2 remote code needs update.
     """
-    try:
-        import logging
+    module = sys.modules.get(_LLAMA_MODELING)
+    if module is not None:
+        _add_llama_flash_attention_2(module)
+    else:
+        sys.meta_path.insert(0, _PatchLlamaModelingOnImport())
 
-        # Importing modeling_llama triggers a deep import chain:
-        #   modeling_llama -> modeling_utils -> quantizers -> torchao
-        # torchao emits a noisy warning about incompatible torch versions, and
-        # its register_as_pytree_constant() calls on Enum types make
-        # torch.utils._pytree log a deprecation warning once per Enum and per
-        # rank. Neither is actionable here — suppress both during this import.
-        _muted = [
-            logging.getLogger("torchao"),
-            logging.getLogger("torch.utils._pytree"),
-        ]
-        _prev_levels = [lg.level for lg in _muted]
-        for lg in _muted:
-            lg.setLevel(logging.ERROR)
-        try:
-            from transformers.models.llama import modeling_llama
-        finally:
-            for lg, level in zip(_muted, _prev_levels):
-                lg.setLevel(level)
 
-        if not hasattr(modeling_llama, "LlamaFlashAttention2"):
-            if hasattr(modeling_llama, "LlamaAttention"):
-                modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
-    except ImportError:
-        logger.warning(
-            "Could not import transformers.models.llama.modeling_llama; "
-            "LlamaFlashAttention2 compat patch not applied."
-        )
+_LLAMA_MODELING = "transformers.models.llama.modeling_llama"
+
+
+def _add_llama_flash_attention_2(modeling_llama):
+    if not hasattr(modeling_llama, "LlamaFlashAttention2"):
+        if hasattr(modeling_llama, "LlamaAttention"):
+            modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+
+
+class _PatchLlamaModelingOnImport(importlib.abc.MetaPathFinder):
+    """Runs ``_add_llama_flash_attention_2`` right after modeling_llama executes."""
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _LLAMA_MODELING:
+            return None
+        sys.meta_path.remove(self)
+        spec = importlib.util.find_spec(fullname)
+        if spec is None or spec.loader is None:
+            logger.warning(
+                f"Could not import {_LLAMA_MODELING}; "
+                "LlamaFlashAttention2 compat patch not applied."
+            )
+            return spec
+        exec_module = spec.loader.exec_module
+
+        def exec_and_patch(module):
+            # modeling_llama -> modeling_utils -> quantizers -> torchao: torchao
+            # warns about incompatible torch versions, and its
+            # register_as_pytree_constant() calls on Enum types make
+            # torch.utils._pytree log a deprecation warning once per Enum and per
+            # rank. Neither is actionable here, so both are muted for this import.
+            muted = [
+                logging.getLogger("torchao"),
+                logging.getLogger("torch.utils._pytree"),
+            ]
+            prev_levels = [lg.level for lg in muted]
+            for lg in muted:
+                lg.setLevel(logging.ERROR)
+            try:
+                exec_module(module)
+            finally:
+                for lg, level in zip(muted, prev_levels):
+                    lg.setLevel(level)
+            _add_llama_flash_attention_2(module)
+
+        spec.loader.exec_module = exec_and_patch
+        return spec
 
 
 def _patch_image_processor_kwargs():
@@ -354,7 +360,7 @@ def _patch_image_process_cuda_tensor():
         import torch
         import transformers.image_processing_backends as ipb
 
-        for cls_name in ("PilBackend", "PilImageProcessingMixin"):
+        for cls_name in ("PilBackend",):
             cls = getattr(ipb, cls_name, None)
             if cls is None or not hasattr(cls, "process_image"):
                 continue
@@ -411,8 +417,6 @@ def _ensure_is_torch_fx_available_compat() -> None:
 # CI-only patches
 # ---------------------------------------------------------------------------
 
-_is_base_mistral_patched = False
-
 
 def patch_is_base_mistral_in_ci():
     """Patch transformers' _patch_mistral_regex to avoid HF API calls in CI.
@@ -427,10 +431,6 @@ def patch_is_base_mistral_in_ci():
     TODO(upstream): remove once transformers stops calling model_info()
     inside _patch_mistral_regex (or removes the method entirely).
     """
-    global _is_base_mistral_patched
-    if _is_base_mistral_patched:
-        return
-
     from sglang.srt.environ import envs
 
     if not envs.SGLANG_IS_IN_CI.get():
@@ -446,5 +446,3 @@ def patch_is_base_mistral_in_ci():
 
         PreTrainedTokenizerFast._patch_mistral_regex = _noop_patch_mistral_regex
         logger.info("CI: patched _patch_mistral_regex to skip HF API calls")
-
-    _is_base_mistral_patched = True

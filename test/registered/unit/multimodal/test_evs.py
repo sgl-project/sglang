@@ -55,7 +55,7 @@ def test_replace_offsets_with_tokens_per_frame():
 
 
 def test_evs_items_store_wire_data_in_model_specific_data():
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.multimodal.evs import EVSConfig, EVSProcessor
 
     processor = EVSProcessor.__new__(EVSProcessor)

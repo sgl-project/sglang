@@ -35,12 +35,9 @@ from sglang.srt.layers.moe.token_dispatcher import (
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    compute_position,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, compute_position
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,

@@ -52,7 +52,7 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
-from sglang.srt.configs import MoonViTConfig
+from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
     VisionAttentionMetadata,

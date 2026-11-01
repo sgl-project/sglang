@@ -10,7 +10,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     build_detailed_annotation_suffix,
     detailed_annotations_enabled,

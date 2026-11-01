@@ -40,7 +40,7 @@ from sglang.benchmark.stream_metrics import (
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
 from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell
@@ -571,6 +571,9 @@ def _load_hf_config(name_or_path: str):
 
     from transformers import AutoConfig
 
+    from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+
+    apply_all_hf_patches()
     try:
         return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception as e:

@@ -18,10 +18,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    disagg_transfers_in_flight,
-)
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.runtime_context import get_parallel

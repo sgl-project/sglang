@@ -70,7 +70,7 @@ class TestDCPMatchesFullAttention(CustomTestCase):
     ):
         from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         group._rank.value = rank
         device, dcp_size, bs = "xpu", group.world_size, len(q)

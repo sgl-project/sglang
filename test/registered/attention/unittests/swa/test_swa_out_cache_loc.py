@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.dots_hybrid_backend import DotsSWAMLAAttnBacken
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MLATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

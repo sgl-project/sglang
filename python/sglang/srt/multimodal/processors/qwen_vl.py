@@ -16,11 +16,7 @@ from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
     InternS2MobiusForConditionalGeneration,
@@ -42,6 +38,7 @@ from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )

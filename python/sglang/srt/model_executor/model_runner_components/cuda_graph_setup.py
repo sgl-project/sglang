@@ -26,9 +26,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,

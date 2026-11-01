@@ -21,7 +21,7 @@ from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci

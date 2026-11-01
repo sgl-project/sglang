@@ -11,7 +11,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.server_args import ServerArgs

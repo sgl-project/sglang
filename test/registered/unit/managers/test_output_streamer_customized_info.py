@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from sglang.api.v1.api_types import GenerateMetaInfo
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskOutput,

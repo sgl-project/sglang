@@ -457,7 +457,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         layer's window. Checked on the replay prep: the window table's live
         window holds the window sub-pool's ids of the request's tokens, not the
         owner's."""
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         window, seq_len = 64, 300
         self._fixture(window, 128)

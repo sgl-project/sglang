@@ -24,8 +24,8 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_modu
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,

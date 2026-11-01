@@ -16,7 +16,7 @@ from unittest import mock
 
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,

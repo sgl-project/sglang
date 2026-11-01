@@ -171,7 +171,8 @@ class TestUnlimitedOCRPageSlices(CustomTestCase):
         """Pickling a page's crop view used to serialize the whole document's
         crop tensor, so request bytes and TTFT grew with pages squared."""
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.processors.unlimited_ocr_v2 import (
             UnlimitedOCRV2Processor,
         )

@@ -13,7 +13,8 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_pp_proxy_dspark_hidden_size,
 )

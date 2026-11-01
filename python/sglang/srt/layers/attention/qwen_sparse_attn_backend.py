@@ -52,7 +52,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 

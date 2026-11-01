@@ -13,14 +13,12 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import (  # noqa: E402
-    DisaggregationMode,
-    pre_alloc_fill_len,
-)
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402

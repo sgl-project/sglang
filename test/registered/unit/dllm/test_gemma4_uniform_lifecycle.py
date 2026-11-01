@@ -13,7 +13,7 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -369,7 +369,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return SchedulerDllmMixin.validate_dllm_request(scheduler, req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.runtime_context import get_context, get_parallel

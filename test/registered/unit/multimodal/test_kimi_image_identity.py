@@ -20,14 +20,10 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     get_new_expanded_mm_items,
 )
-from sglang.srt.managers.schedule_batch import (
-    MM_PAD_SHIFT_VALUE,
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.multimodal.cache import snapshot_media
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,

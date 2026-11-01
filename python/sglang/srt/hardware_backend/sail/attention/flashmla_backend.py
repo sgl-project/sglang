@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.flashmla_backend import (
     FlashMLAMultiStepDraftBackend,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

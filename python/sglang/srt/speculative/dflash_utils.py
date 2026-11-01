@@ -191,7 +191,7 @@ def scale_kv_cell_size_per_token_for_dflash(
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     backend = attn_backend
     for _ in range(4):

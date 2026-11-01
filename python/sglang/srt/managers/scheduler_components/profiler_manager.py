@@ -19,7 +19,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
