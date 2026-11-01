@@ -214,7 +214,10 @@ template <
     bool SCALE_UE8M0,
     bool FUSE_SILU_AND_MUL,
     bool kUsePDL,
-    typename scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>>
+    // Column-major UE8M0 scales are packed 4 x uint8 per int32 (SM100 DeepGEMM) unless
+    // kFp32Scale: power-of-two scales stored as fp32 (MN-major, the SM90 DeepGEMM layout).
+    bool kFp32Scale = false,
+    typename scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR && !kFp32Scale, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_v2_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -226,7 +229,8 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
-  using scale_element_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint8_t, float>;
+  constexpr bool kPackedUE8M0 = SCALE_UE8M0 && IS_COLUMN_MAJOR && !kFp32Scale;
+  using scale_element_t = std::conditional_t<kPackedUE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -283,7 +287,7 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
           scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
         }
 
-        if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
+        if constexpr (kPackedUE8M0) {
           const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
           if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
               (lane_id < num_elems_per_pack - remainder_num_groups)) {
@@ -316,7 +320,7 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
         // which otherwise amplifies error ~14x and degrades EAGLE accept rate on Blackwell.
         calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
         if (lane_id == 0) {
-          *scale_output = extract_required_scale_format < SCALE_UE8M0 && IS_COLUMN_MAJOR > (y_scale_inv);
+          *scale_output = extract_required_scale_format<kPackedUE8M0>(y_scale_inv);
         }
         float2 y_scale_repeated = {y_scale, y_scale};
 
@@ -368,7 +372,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
       int THREADS_PER_SUBWARP,
       bool IS_COLUMN_MAJOR,
       bool SCALE_UE8M0,
-      bool FUSE_SILU_AND_MUL>
+      bool FUSE_SILU_AND_MUL,
+      bool kFp32Scale>
   static void launch(
       const DLDevice& device,
       dim3 grid,
@@ -382,7 +387,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
       void* output_q,
       void* output_s,
       const int32_t* masked_m) {
-    using scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR, uint32_t, float>;
+    using scale_packed_t = std::conditional_t<SCALE_UE8M0 && IS_COLUMN_MAJOR && !kFp32Scale, uint32_t, float>;
     auto kernel = per_token_group_quant_8bit_v2_kernel<
         SCHEDULER,
         GROUP_SIZE,
@@ -392,7 +397,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
         IS_COLUMN_MAJOR,
         SCALE_UE8M0,
         FUSE_SILU_AND_MUL,
-        kUsePDL>;
+        kUsePDL,
+        kFp32Scale>;
     host::LaunchKernel(grid, block, device)
         .enable_pdl(kUsePDL)(
             kernel,
@@ -414,6 +420,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
       bool scale_ue8m0,
       bool fuse_silu_and_mul,
       bool masked_layout,
+      bool scale_fp32,
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
@@ -426,7 +433,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
       const int32_t* masked_m) {
     constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;
 
-    auto launch_with_config = [&](auto sched_tag, auto colmajor_tag, auto ue8m0_tag, auto silu_tag) {
+    auto launch_with_config = [&](auto sched_tag, auto colmajor_tag, auto ue8m0_tag, auto silu_tag, auto fp32_tag) {
       using SCHEDULER = typename decltype(sched_tag)::type;
       int subwarps_per_block;
       dim3 grid, block;
@@ -438,7 +445,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
           THREADS_PER_SUBWARP,
           decltype(colmajor_tag)::value,
           decltype(ue8m0_tag)::value,
-          decltype(silu_tag)::value>(
+          decltype(silu_tag)::value,
+          decltype(fp32_tag)::value>(
           device,
           grid,
           block,
@@ -457,20 +465,33 @@ struct PerTokenGroupQuant8bitV2Kernel {
       if (scale_ue8m0) {
         if (fuse_silu_and_mul) {
           if (masked_layout)
-            launch_with_config(TypeTag<MaskedLayoutScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
+            launch_with_config(
+                TypeTag<MaskedLayoutScheduler>{},
+                std::true_type{},
+                std::true_type{},
+                std::true_type{},
+                std::false_type{});
           else
-            launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{});
+            launch_with_config(
+                TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::true_type{}, std::false_type{});
+        } else if (scale_fp32) {
+          launch_with_config(
+              TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{}, std::true_type{});
         } else {
-          launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{});
+          launch_with_config(
+              TypeTag<NaiveScheduler>{}, std::true_type{}, std::true_type{}, std::false_type{}, std::false_type{});
         }
       } else {
-        launch_with_config(TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{});
+        launch_with_config(
+            TypeTag<NaiveScheduler>{}, std::true_type{}, std::false_type{}, std::false_type{}, std::false_type{});
       }
     } else {
       if (scale_ue8m0) {
-        launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::true_type{}, std::false_type{});
+        launch_with_config(
+            TypeTag<NaiveScheduler>{}, std::false_type{}, std::true_type{}, std::false_type{}, std::false_type{});
       } else {
-        launch_with_config(TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{});
+        launch_with_config(
+            TypeTag<NaiveScheduler>{}, std::false_type{}, std::false_type{}, std::false_type{}, std::false_type{});
       }
     }
   }
@@ -490,7 +511,8 @@ struct PerTokenGroupQuant8bitV2Kernel {
       int64_t hidden_dim_num_groups,
       int64_t num_tokens_per_expert,
       int64_t scale_expert_stride,
-      int64_t scale_hidden_stride) {
+      int64_t scale_hidden_stride,
+      bool scale_fp32) {
     const DLDevice dev = input.device();
     const void* in = input.data_ptr();
     void* oq = output_q.data_ptr();
@@ -506,6 +528,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
           scale_ue8m0,
           fuse_silu_and_mul,
           masked_layout,
+          scale_fp32,
           static_cast<int>(num_local_experts),
           static_cast<int>(hidden_dim_num_groups),
           static_cast<int>(num_groups),
