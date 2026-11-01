@@ -201,6 +201,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
             **({"page_size": page_size} if page_size > 1 else {}),
             **({"size_swa": self.pool_size} if hybrid_swa else {}),
         )
+        kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+            8 if hybrid_swa else None, {"swa": draft_reach} if draft_reach else None
+        )
         params = CacheInitParams(
             disable=not radix_cache,
             req_to_token_pool=req_to_token_pool,
@@ -216,7 +219,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 window=max(8, draft_reach) if hybrid_swa else None,
             ),
             sliding_window_size=8 if hybrid_swa else None,
-            draft_window_reaches={"swa": draft_reach} if draft_reach else None,
             mtp_draft_device_pools=(
                 (draft_pool,) if draft_mode == HiCacheDraftMode.PACKED else ()
             ),

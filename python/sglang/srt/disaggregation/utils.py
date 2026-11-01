@@ -300,28 +300,6 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
     return int.from_bytes(raw, "big") >> 1 | 1
 
 
-def retained_window_lengths(
-    allocator, reaches: Optional[Dict[str, int]], unstated: Optional[int]
-) -> Dict[str, int]:
-    """The tail of each window sub-pool a running request keeps, by name: its
-    window, widened by a reader reaching further back (a fused draft's front
-    rows). The prefix cache retains, backs up and restores this much of a
-    request's window, so a PD peer sends it and a decode node binds and
-    receives all of it. A static pool's single window goes by ``unstated``,
-    as does a unified window that states no length."""
-    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
-
-    storage = getattr(allocator, "storage", None)
-    if storage is not None:
-        lengths = storage.window_lengths(unstated)
-    elif unstated is not None:
-        lengths = {window_sub_pool_of(allocator): unstated}
-    else:
-        lengths = {}
-    reaches = reaches or {}
-    return {name: max(window, reaches.get(name, 0)) for name, window in lengths.items()}
-
-
 def state_wire(kv_args: KVArgs) -> Optional[List[List[Optional[str]]]]:
     """The state entries a PD peer registers, in order, as (state type,
     sub-pool) pairs, with the tail a window entry carries when the peer
@@ -1630,7 +1608,7 @@ def setup_state_kv_args(
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
-    window sub-pool carries (`retained_window_lengths`); peers agree on it."""
+    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool

@@ -57,46 +57,27 @@ def _window_rows(scheduler, req: Req, ids, window, seq_len, start_idx):
     return _to_page_indices_gpu(ids.ids(window_full), page_size)
 
 
-def _kept_tails(scheduler) -> dict:
-    """Each window's tail the peers send, by sub-pool: its length widened by
-    readers reaching further back."""
-    from sglang.srt.disaggregation.utils import retained_window_lengths
-
-    return retained_window_lengths(
-        scheduler.token_to_kv_pool_allocator,
-        getattr(getattr(scheduler, "tree_cache", None), "draft_window_reaches", None),
-        scheduler.sliding_window_size,
-    )
-
-
 def state_indices_for_request(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
 ) -> Union[None, torch.Tensor, List[torch.Tensor]]:
     """The state rows the transfer of ``req`` digests: one tensor for every
     state entry, or, for a unified pool of several windows, one per state
     entry in entry order, each window's from its own sub-pool and kept tail."""
-    allocator = scheduler.token_to_kv_pool_allocator
-    storage = getattr(allocator, "storage", None)
-    if storage is not None:
-        lengths = _kept_tails(scheduler)
-        if len(lengths) > 1:
-            shared = _state_indices(scheduler, req, seq_len, start_idx)
-            id_spaces = storage.allocator.id_spaces()
-            return [
-                (
-                    _window_rows(
-                        scheduler,
-                        req,
-                        id_spaces[entry.sub_pool],
-                        lengths[entry.sub_pool],
-                        seq_len,
-                        start_idx,
-                    )
-                    if entry.sub_pool in lengths
-                    else shared
-                )
-                for entry in storage.wire_entries()
-            ]
+    storage = scheduler.token_to_kv_pool_allocator.storage
+    if storage is not None and storage.retained_window_lengths():
+        windows = storage.retained_window_lengths()
+        shared = _state_indices(scheduler, req, seq_len, start_idx)
+        # Each window entry digests the units the transfer sends of it.
+        return [
+            (
+                storage.resume_units(
+                    entry.sub_pool, req, token_start=start_idx, token_boundary=seq_len
+                ).unit_ids
+                if entry.sub_pool in windows
+                else shared
+            )
+            for entry in storage.wire_entries()
+        ]
     return _state_indices(scheduler, req, seq_len, start_idx)
 
 
@@ -116,14 +97,18 @@ def _state_indices(
             .reshape(-1)
         )
     if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-        tails = _kept_tails(scheduler)
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        tails = kv_storage_of(
+            scheduler.req_to_token_pool, scheduler.token_to_kv_pool_allocator
+        ).retained_window_lengths()
         return _window_rows(
             scheduler,
             req,
             scheduler.token_to_kv_pool_allocator.id_spaces()[
                 IdSpaceKind.SLIDING_WINDOW
             ],
-            max(tails.values(), default=scheduler.sliding_window_size),
+            max(tails.values()),
             seq_len,
             start_idx,
         )

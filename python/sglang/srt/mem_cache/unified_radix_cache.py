@@ -269,7 +269,6 @@ class UnifiedRadixCache(BasePrefixCache):
             None,
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
-        self.draft_window_reaches = params.draft_window_reaches
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)

@@ -221,6 +221,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler = self._new_scheduler(page_size=4)
         scheduler.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
         scheduler.sliding_window_size = 4
+        # As the cache builder does: the pool's window states no length.
+        bundle.token_to_kv_pool_allocator.storage.bind_window_retention(4, None)
         scheduler.chunked_prefill_size = 4
         scheduler.max_new_tokens_limit = None
         for prompt_len in (4, 5, 6, 7):

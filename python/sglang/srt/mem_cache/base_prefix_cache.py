@@ -435,8 +435,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
-    # Additional reader reaches keyed by actual storage band, not attention role.
-    draft_window_reaches: Optional[dict[str, int]] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -758,11 +756,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # every other SWA rule uses sliding_window_size.
         if self.sliding_window_size is None:
             return None
-        return max(
-            self.sliding_window_size,
-            (self.draft_window_reaches or {}).get(
-                window_sub_pool_of(self.token_to_kv_pool_allocator), 0
-            ),
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        allocator = self.token_to_kv_pool_allocator
+        return (
+            kv_storage_of(self.req_to_token_pool, allocator)
+            .retained_window_lengths()
+            .get(window_sub_pool_of(allocator), self.sliding_window_size)
         )
 
     def swa_retain_floor(self, req) -> int | None:

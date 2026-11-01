@@ -23,7 +23,6 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.utils import (
     check_state_wire,
-    retained_window_lengths,
     state_wire,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -77,17 +76,18 @@ def _storage(windows=_WINDOWS, device="cpu"):
         model_context_len=128,
         lazy_compaction=True,
     )
-    return build_kv_storage(plan, sized, ctx)
+    storage = build_kv_storage(plan, sized, ctx)
+    storage.bind_window_retention(_TARGET_WINDOW, None)
+    return storage
 
 
 def _window_sub_pools(storage):
     return [e.sub_pool for e in storage.wire_entries()]
 
 
-def _prefill_pages(storage, seq_len, reaches=None):
+def _prefill_pages(storage, seq_len):
     """The pages a prefill sends per window entry for a ``seq_len`` request
     that decode holds no prefix of."""
-    kept = retained_window_lengths(storage.allocator, reaches, _TARGET_WINDOW)
     req = SimpleNamespace(kv=ReqKvInfo())
     row = storage.acquire([req])[0]
     tokens = storage.allocator.alloc(-(-seq_len // _PAGE) * _PAGE)
@@ -99,7 +99,6 @@ def _prefill_pages(storage, seq_len, reaches=None):
                 req,
                 token_start=0,
                 token_boundary=seq_len,
-                retain=kept.get(sub_pool),
             ).unit_ids
         )
         for sub_pool in _window_sub_pools(storage)
@@ -125,7 +124,7 @@ class _HostPool:
         pass
 
 
-def _host_receive_queue(storage, sliding_window_size, reaches=None):
+def _host_receive_queue(storage, sliding_window_size):
     sub_pools = _window_sub_pools(storage)
     window_pools = {name: _HostPool() for name in sub_pools}
     queue = SimpleNamespace(
@@ -138,9 +137,7 @@ def _host_receive_queue(storage, sliding_window_size, reaches=None):
         ),
         host_window_entries=[
             (name, window_pools[name], 0, window)
-            for name, window in DecodePreallocQueue._window_lengths_of(
-                storage, sliding_window_size, reaches
-            ).items()
+            for name, window in storage.retained_window_lengths().items()
         ],
         scheduler=SimpleNamespace(
             sliding_window_size=sliding_window_size,
@@ -187,19 +184,19 @@ class TestUnifiedWindowLengths(CustomTestCase):
         decode receives all of it; peers keeping different tails refuse to
         pair."""
         storage = _storage()
-        reaches = {"window_8": 13}
+        storage.bind_window_retention(_TARGET_WINDOW, {"window_8": 13})
         self.assertEqual(
-            retained_window_lengths(storage.allocator, reaches, _TARGET_WINDOW),
+            storage.retained_window_lengths(),
             {"window_16": 16, "window_8": 13, "window_4": 4},
         )
         for seq_len in (5, 23, 37, 64):
             with self.subTest(seq_len=seq_len):
-                sent = _prefill_pages(storage, seq_len, reaches)
+                sent = _prefill_pages(storage, seq_len)
                 self.assertEqual(
                     sent["window_8"],
                     -(-seq_len // _PAGE) - max(0, seq_len - 13) // _PAGE,
                 )
-                queue, _ = _host_receive_queue(storage, _TARGET_WINDOW, reaches)
+                queue, _ = _host_receive_queue(storage, _TARGET_WINDOW)
                 req = SimpleNamespace(
                     origin_input_ids=array("q", [1] * seq_len), kv=ReqKvInfo()
                 )
@@ -253,13 +250,12 @@ class TestUnifiedWindowLengths(CustomTestCase):
         storage = _storage()
         allocator = storage.allocator
         for reaches, seq_len in product(({}, {"window_8": 13}), (23, 37)):
+            storage.bind_window_retention(_TARGET_WINDOW, reaches)
             scheduler = SimpleNamespace(
                 token_to_kv_pool_allocator=allocator,
                 req_to_token_pool=storage.requests,
                 sliding_window_size=_TARGET_WINDOW,
-                tree_cache=SimpleNamespace(draft_window_reaches=reaches),
             )
-            tails = retained_window_lengths(allocator, reaches, _TARGET_WINDOW)
             with self.subTest(reaches=reaches, seq_len=seq_len):
                 req = SimpleNamespace(kv=ReqKvInfo())
                 row = storage.acquire([req])[0]
@@ -275,7 +271,6 @@ class TestUnifiedWindowLengths(CustomTestCase):
                         req,
                         token_start=0,
                         token_boundary=seq_len,
-                        retain=tails.get(entry.sub_pool),
                     )
                     torch.testing.assert_close(
                         entry_rows, sent.unit_ids.to(entry_rows.dtype)
@@ -291,9 +286,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
             with self.subTest(seq_len=seq_len):
                 req = SimpleNamespace(kv=ReqKvInfo())
                 row = storage.acquire([req])[0]
-                tails = DecodePreallocQueue._window_tails_of(
-                    storage, _TARGET_WINDOW, seq_len, keep_insert_boundary=False
-                )
+                tails = storage.window_tails(seq_len, keep_insert_boundary=False)
                 kv_loc = alloc_for_decode_prealloc(
                     storage,
                     allocator,
@@ -313,9 +306,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     name = band.sub_pool_name
                     ids = allocator.id_spaces()[name].ids(kv_loc.to(torch.int64))
                     bound = int((ids > 0).sum())
-                    tail = DecodePreallocQueue._window_tails_of(
-                        storage, _TARGET_WINDOW, seq_len, keep_insert_boundary=False
-                    )[name]
+                    tail = tails[name]
                     # Each window binds the tokens of its own tail, no more.
                     self.assertEqual(bound, tail, name)
                     # The pages the decode receives for the window are all

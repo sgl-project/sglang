@@ -27,7 +27,12 @@ from sglang.srt.mem_cache.kv.plan import (
     WireEntry,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
-from sglang.srt.mem_cache.kv.storage import Region, ResumeUnits, SubPoolUsage
+from sglang.srt.mem_cache.kv.storage import (
+    Region,
+    ResumeUnits,
+    SubPoolUsage,
+    window_tail_len,
+)
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -144,8 +149,6 @@ class StaticKVStorage:
         *,
         token_start: int,
         token_boundary: int,
-        window: Optional[int] = None,
-        retain: Optional[int] = None,
     ) -> ResumeUnits:
         if not 0 <= token_start <= token_boundary:
             raise ValueError("invalid continuation token span")
@@ -167,13 +170,7 @@ class StaticKVStorage:
         request_window = pool.request_window if sub_pool == "swa" else None
         begin = token_start
         if sub_pool == "swa":
-            retained = pool.sliding_window if request_window is not None else window
-            if retained is None:
-                raise ValueError("window handoff requires its retention length")
-            if request_window is None:
-                # A per-request window ring holds the window alone.
-                retained = max(retained, retain or 0)
-            begin = max(begin, token_boundary - retained)
+            begin = max(begin, token_boundary - self.retained_window_lengths()["swa"])
         begin = begin // page_size * page_size
         if request_window is not None:
             units = torch.as_tensor(
@@ -623,15 +620,51 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def tree_slots(
-        self, *, window_reaches: Optional[Dict[str, int]] = None
-    ) -> Tuple[TreeSlot, ...]:
-        shape = self._shape
-        window = (
-            max(shape.window, (window_reaches or {}).get("swa", 0))
-            if shape.window is not None
-            else None
+    def bind_window_retention(
+        self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
+    ) -> None:
+        """See `KVStorage.bind_window_retention`; kept on the allocator, which
+        outlives this view."""
+        names = self._allocator.window_pool_names()
+        self._allocator.window_retention = (
+            {}
+            if sliding_window is None
+            else {
+                name: max(sliding_window, (reaches or {}).get(name, 0))
+                for name in names
+            }
         )
+
+    def retained_window_lengths(self) -> Dict[str, int]:
+        """See `KVStorage.retained_window_lengths`. A per-request window ring
+        holds the window alone."""
+        if not self._allocator.window_pool_names():
+            return {}
+        pool = self._allocator.get_kvcache()
+        if pool.request_window is not None:
+            return {"swa": pool.sliding_window}
+        retention = self._allocator.window_retention
+        if retention is None:
+            raise ValueError("the window's retention was never bound")
+        return dict(retention)
+
+    def window_tails(
+        self, seq_len: int, *, keep_insert_boundary: bool
+    ) -> Dict[str, int]:
+        """See `KVStorage.window_tails`."""
+        page_size = self._allocator.page_size
+        return {
+            name: window_tail_len(
+                seq_len, window, page_size, keep_insert_boundary=keep_insert_boundary
+            )
+            for name, window in self.retained_window_lengths().items()
+        }
+
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
+        shape = self._shape
+        window = None
+        if shape.window is not None:
+            window = (self._allocator.window_retention or {}).get("swa", shape.window)
         return (
             (TreeSlot(component="FULL", family=TREE_TOKEN),)
             + (

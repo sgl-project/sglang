@@ -59,8 +59,6 @@ class CacheInitParams:
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
-    # Additional reader reaches keyed by actual storage band, not attention role.
-    draft_window_reaches: Optional[dict[str, int]] = None
 
     # The prefix tree's slots in drive order; the KV storage supplies them.
     tree_slots: Optional[tuple[TreeSlot, ...]] = None
@@ -92,10 +90,11 @@ class CacheInitParams:
         if self.sliding_window_size is None:
             return None
         from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 
-        return max(
-            self.sliding_window_size,
-            (self.draft_window_reaches or {}).get(
-                window_sub_pool_of(self.token_to_kv_pool_allocator), 0
-            ),
+        allocator = self.token_to_kv_pool_allocator
+        return (
+            kv_storage_of(self.req_to_token_pool, allocator)
+            .retained_window_lengths()
+            .get(window_sub_pool_of(allocator), self.sliding_window_size)
         )
