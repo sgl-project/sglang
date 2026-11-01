@@ -28,17 +28,28 @@ class TestDFlashDominoRollout(CustomTestCase):
         self.hidden = torch.randn(3, 16, 8, device="cuda", dtype=torch.bfloat16)
         self.bonus_tokens = torch.tensor([1, 4, 9], device="cuda")
 
-    def rollout(self, hidden, bonus_tokens, pool_size=5, shift_label=True):
+    def rollout(
+        self,
+        hidden,
+        bonus_tokens,
+        pool_size=5,
+        shift_label=True,
+        lm_head_weight=None,
+        logits_mup_width_multiplier=None,
+    ):
         return domino_greedy_rollout(
             draft_hidden=hidden,
             bonus_tokens=bonus_tokens,
             target_embedding=self.embedding,
-            lm_head_weight=self.lm_head_weight,
+            lm_head_weight=(
+                self.lm_head_weight if lm_head_weight is None else lm_head_weight
+            ),
             prefix_gru=self.prefix_gru,
             embed_proj=self.embed_proj,
             vocab_size=31,
             shift_label=shift_label,
             candidate_pool_size=pool_size,
+            logits_mup_width_multiplier=logits_mup_width_multiplier,
             in_cuda_graph=False,
         )
 
@@ -84,7 +95,34 @@ class TestDFlashDominoRollout(CustomTestCase):
                 )
                 torch.testing.assert_close(batched, individual, rtol=0, atol=0)
 
+    def test_mup_multiplier_divides_only_the_base_logits(self):
+        # muP targets: the draft trained its base logits against the folded
+        # head W / m. A power-of-two m keeps bf16 scaling exact, so dividing
+        # the draft hidden must match folding the head bit for bit while the
+        # correction path keeps reading the unscaled hidden.
+        multiplier = 32.0
+        for pool_size in (0, 5):
+            with self.subTest(pool_size=pool_size):
+                divided = self.rollout(
+                    self.hidden,
+                    self.bonus_tokens,
+                    pool_size,
+                    logits_mup_width_multiplier=multiplier,
+                )
+                folded = self.rollout(
+                    self.hidden,
+                    self.bonus_tokens,
+                    pool_size,
+                    lm_head_weight=self.lm_head_weight / multiplier,
+                )
+                torch.testing.assert_close(divided, folded, rtol=0, atol=0)
+
     def test_sampler_replays_with_new_inputs(self):
+        for multiplier in (None, 32.0):
+            with self.subTest(multiplier=multiplier):
+                self._check_sampler_replays_with_new_inputs(multiplier)
+
+    def _check_sampler_replays_with_new_inputs(self, multiplier):
         sampler = _DominoDraftSampler(
             target_embedding=self.embedding,
             lm_head_weight=self.lm_head_weight,
@@ -95,6 +133,7 @@ class TestDFlashDominoRollout(CustomTestCase):
             shift_label=True,
             max_bs=3,
             candidate_pool_size=5,
+            logits_mup_width_multiplier=multiplier,
         )
         block_ids = torch.zeros(3, 16, device="cuda", dtype=torch.long)
         block_ids[:, 0].copy_(self.bonus_tokens)
@@ -114,7 +153,9 @@ class TestDFlashDominoRollout(CustomTestCase):
         for _ in range(2):
             self.hidden.copy_(torch.randn_like(self.hidden))
             block_ids[:, 0].copy_(torch.randint(31, (3,), device="cuda"))
-            expected = self.rollout(self.hidden, block_ids[:, 0])
+            expected = self.rollout(
+                self.hidden, block_ids[:, 0], logits_mup_width_multiplier=multiplier
+            )
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(

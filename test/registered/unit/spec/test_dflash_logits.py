@@ -78,6 +78,7 @@ def test_selector_rejects_a_quantized_target_lm_head():
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
+        logits_mup_width_multiplier=None,
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
@@ -136,6 +137,7 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=4),
         _transform_unary_logits=lambda logits: logits.float(),
+        logits_mup_width_multiplier=None,
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
@@ -153,6 +155,40 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     assert quant_method.called
     torch.testing.assert_close(candidate_ids, expected_ids)
     torch.testing.assert_close(unary_logits, expected_logits)
+
+
+def test_selector_divides_the_draft_hidden_for_mup_targets(monkeypatch):
+    """muP targets (Inkling) feed hidden / m into their LM head and the draft
+    trains against that folded head, so the unary logits are (h / m) @ W.T;
+    projecting through the raw head would scale them by m against the
+    selector's trained pairwise term."""
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 4)
+    weight = torch.randn(6, 4)
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+    )
+    for multiplier in (None, 24.0):
+        model = SimpleNamespace(
+            lm_head=SimpleNamespace(weight=weight, org_vocab_size=6),
+            candidate_selector=SimpleNamespace(top_k=4),
+            _transform_unary_logits=lambda logits: logits.float(),
+            logits_mup_width_multiplier=multiplier,
+        )
+
+        candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(
+            model, hidden
+        )
+
+        expected_logits, expected_ids = torch.topk(
+            torch.matmul(hidden / (multiplier or 1.0), weight.T), 4, dim=-1
+        )
+        torch.testing.assert_close(candidate_ids, expected_ids)
+        torch.testing.assert_close(unary_logits, expected_logits)
 
 
 def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
@@ -179,6 +215,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=k),
         _transform_unary_logits=lambda logits: logits.float(),
+        logits_mup_width_multiplier=None,
     )
 
     # Rank 0's gathered contribution, synthesized from the reference weights.
