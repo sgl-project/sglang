@@ -15,11 +15,12 @@ from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestHcConsumer(unittest.TestCase):
     def test_dspark_tap_hands_materialized_stream_to_next_layer(self):
+        from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.models import deepseek_v4
@@ -58,7 +59,7 @@ class TestHcConsumer(unittest.TestCase):
             residual_stream=None,
         )
         source = torch.arange(24.0).reshape(3, 2, 4)
-        aux = []
+        aux = AuxHiddenStatePacker(1)
         recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
         with (
             patch.object(deepseek_v4, "_is_cuda", True),
@@ -75,7 +76,7 @@ class TestHcConsumer(unittest.TestCase):
                 positions, source, batch, positions, positions, True, aux
             )
         torch.testing.assert_close(output, source + 3)
-        torch.testing.assert_close(aux[0], (source + 1).mean(1))
+        torch.testing.assert_close(aux.finalize(), (source + 1).mean(1))
         torch.testing.assert_close(pre, torch.ones(3, 2))
         self.assertIsNone(tail)
         self.assertIsNone(batch.residual_stream)
@@ -248,6 +249,58 @@ class TestMoeSourceRows(unittest.TestCase):
                 torch.testing.assert_close(result, expected * 2)
                 call.release()
         interleave.assert_called_once()
+
+    def test_a2a_output_finalizes_locally_only_after_its_combine_summed(self):
+        from sglang.srt.layers.layer_boundary.layout import TokenAxis
+        from sglang.srt.layers.moe import utils as moe_utils
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.models.deepseek_v2 import MergedMoEOutput
+
+        layer = SimpleNamespace(
+            boundary_mhc_fusions=False,
+            mlp=SimpleNamespace(),
+            config=SimpleNamespace(model_type="deepseek_v4"),
+        )
+        local = Layout.sharded_over(
+            TokenAxis.ATTN_DP, axis_sizes={TokenAxis.ATTN_DP: 2}
+        )
+        rows = TransportRows(local, local, local, None)
+        shared = torch.full((2, 3), 0.5)
+        # A rank other than TP rank 0 adds the replicated shared output only
+        # when no later sum would count it again.
+        parallel = SimpleNamespace(dwdp_size=1, tp_size=2, tp_rank=1)
+        batch = SimpleNamespace(dp_padding_mode=None)
+        for backend in (MoeA2ABackend.FLASHINFER_MEGAMOE, MoeA2ABackend.MEGAMOE):
+            # The local finalize adds the shared output into routed in place.
+            routed = torch.arange(6.0).reshape(2, 3)
+            expected = routed + shared
+            with (
+                self.subTest(backend=backend.value),
+                patch.object(boundary, "get_moe_a2a_backend", return_value=backend),
+                patch.object(
+                    moe_transport, "get_moe_a2a_backend", return_value=backend
+                ),
+                patch.object(moe_utils, "get_moe_a2a_backend", return_value=backend),
+                patch.object(moe_utils, "get_parallel", return_value=parallel),
+                patch(
+                    "sglang.srt.layers.moe.post_experts_all_reduce",
+                    side_effect=AssertionError("an a2a output takes no TP sum"),
+                ),
+            ):
+                call = boundary.MoeTransport(
+                    layer, torch.ones(2, 3), batch, boundary.LayerCall(), rows
+                )
+                output = call.prepare_output(
+                    MergedMoEOutput(routed, shared, None, 1.0, True)
+                )
+                if backend.is_flashinfer_megamoe():
+                    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+                else:
+                    # The DeepGEMM fallback leaves expert sums that no declared
+                    # group completes, so the transport must still reject it.
+                    self.assertIsInstance(output, boundary.MoeFinalize)
+                    self.assertIs(output.completion_group, SumGroup.MOE_OUTPUT)
+                call.release()
 
 
 if __name__ == "__main__":

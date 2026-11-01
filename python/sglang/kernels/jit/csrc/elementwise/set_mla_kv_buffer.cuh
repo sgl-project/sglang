@@ -69,7 +69,7 @@ struct SetMlaKVBufferKernel {
     auto dtype = SymbolicDType{};
     auto loc_dtype = SymbolicDType{};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     using device::warp::LoadStorePattern;
     using enum LoadStorePattern::type;

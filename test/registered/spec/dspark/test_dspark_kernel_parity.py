@@ -12,9 +12,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention import (
-    dsv4_attn_metadata_kernels as attn_metadata_kernels,
-)
+from sglang.kernels.ops.attention.dsv4 import attn_metadata_kernels
 from sglang.kernels.ops.speculative import ragged_verify_kernels
 from sglang.kernels.ops.speculative.dspark import (
     dspark_accept,
@@ -28,9 +26,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels import dspark as dspark_kernels
 from sglang.test.test_utils import CustomTestCase, get_device
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = get_device()
 VOCAB = 129280
@@ -250,13 +249,13 @@ def _case_compact_layout(tc):
     total = int(verify_lens.sum().item())
     for padded_total in (total, bs * t):  # exact and bucket padding
         tc._parity(
-            dspark_verify_window.CompactRowIndex,
+            dspark_kernels.CompactRowIndex,
             verify_lens=verify_lens,
             padded_total=padded_total,
             device=DEVICE,
         )
         tc._parity(
-            dspark_verify_window.CompactVerifyIds,
+            dspark_kernels.CompactVerifyIds,
             draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             layout=_layout(verify_lens, padded_total),
@@ -327,6 +326,18 @@ def _case_expand_prefill_causally(tc):
         extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
         extend_start_loc=None,
         seq_lens_cpu=[int(x) for x in seq_lens[:bs2].tolist()],
+        extend_seq_lens_cpu=[block] * bs2,
+        num_tokens=bs2 * block,
+        padded_num_tokens=None,
+    )
+    # Device lengths only: the DSpark draft block without host lens.
+    tc._parity(
+        attn_metadata_kernels.ExpandPrefillCausally,
+        req_pool_indices=req_pool_indices[:bs2],
+        seq_lens=seq_lens[:bs2],
+        extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
+        extend_start_loc=None,
+        seq_lens_cpu=None,
         extend_seq_lens_cpu=[block] * bs2,
         num_tokens=bs2 * block,
         padded_num_tokens=None,

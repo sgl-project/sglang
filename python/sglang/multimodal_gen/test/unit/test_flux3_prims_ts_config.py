@@ -4,7 +4,11 @@
 import unittest
 from unittest import mock
 
-from flashinfer.prims_ts import gemm as prims_ts_gemm
+import pytest
+
+prims_ts_gemm = pytest.importorskip(
+    "flashinfer.prims_ts.gemm", reason="PrimsTS ships with flashinfer (CUDA-only)"
+)
 
 from sglang.kernels.ops.diffusion.gemm import flux3_prims_ts_config as config_module
 
