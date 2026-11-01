@@ -113,7 +113,8 @@ jobs:
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}"
+            -t "rocm/sgl-dev:${image_tag}" \
+            --no-cache
           if [ "${PUSH_IMAGES}" = "true" ]; then
             docker push "rocm/sgl-dev:${image_tag}"
           else
@@ -190,7 +191,8 @@ jobs:
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}"
+            -t "rocm/sgl-dev:${image_tag}" \
+            --no-cache
           if [ "${PUSH_IMAGES}" = "true" ]; then
             docker push "rocm/sgl-dev:${image_tag}"
           else
@@ -270,7 +272,8 @@ jobs:
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}"
+            -t "rocm/sgl-dev:${image_tag}" \
+            --no-cache
           if [ "${PUSH_IMAGES}" = "true" ]; then
             docker push "rocm/sgl-dev:${image_tag}"
           else
