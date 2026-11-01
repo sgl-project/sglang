@@ -29,10 +29,18 @@ class _SwaCache(RadixCache):
                 "free_group_end",
                 "page_size",
                 "storage",
+                "window_pool_names",
+                "get_kvcache",
+                "window_retention",
             ]
         )
-        self.token_to_kv_pool_allocator.page_size = 16
-        self.token_to_kv_pool_allocator.storage = None
+        allocator = self.token_to_kv_pool_allocator
+        allocator.page_size = 16
+        allocator.storage = None
+        # A static window pool keeping the 128-token window.
+        allocator.window_pool_names = lambda: ("swa",)
+        allocator.get_kvcache = lambda: SimpleNamespace(request_window=None)
+        allocator.window_retention = {"swa": 128}
         self.trim_calls = 0
 
     def supports_swa(self):

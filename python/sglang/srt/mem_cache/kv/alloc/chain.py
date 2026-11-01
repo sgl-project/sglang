@@ -977,14 +977,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         cap this pool applies."""
         from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 
-        windows = {
-            window.sub_pool_name: (
-                sliding_window_size
-                if window is self.swa_attn_allocator or self.storage is None
-                else self.storage.plan.sub_pool(window.sub_pool_name).lifetime.window
-            )
-            for window in self._windows
-        }
+        # Each window is charged the tail a running request keeps of it.
+        windows = (
+            self.storage.retained_window_lengths()
+            if self.storage is not None
+            else {window.sub_pool_name: sliding_window_size for window in self._windows}
+        )
         state_slots = 0 if self.mamba_allocator is None else 1
 
         def fits(new_tokens):

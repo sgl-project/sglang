@@ -440,6 +440,7 @@ class TestDeclaredParts(CustomTestCase):
                     )
                     reaches = worker.draft_window_reaches
                     self.assertEqual(reaches, {"draft_swa": draft_window + front})
+                    storage.bind_window_retention(16, reaches)
                     cache = UnifiedRadixCache(
                         CacheInitParams(
                             disable=False,
@@ -447,8 +448,7 @@ class TestDeclaredParts(CustomTestCase):
                             token_to_kv_pool_allocator=a,
                             page_size=4,
                             sliding_window_size=16,
-                            draft_window_reaches=reaches,
-                            tree_slots=storage.tree_slots(window_reaches=reaches),
+                            tree_slots=storage.tree_slots(),
                             tree_core_backend="python",
                         )
                     )
@@ -2189,6 +2189,7 @@ class TestDeclaredParts(CustomTestCase):
                     lazy_compaction=lazy,
                 )
                 a = storage.allocator
+                storage.bind_window_retention(16, {"draft_swa": 12})
                 cache = UnifiedRadixCache(
                     CacheInitParams(
                         disable=False,
@@ -2196,7 +2197,7 @@ class TestDeclaredParts(CustomTestCase):
                         token_to_kv_pool_allocator=a,
                         page_size=4,
                         sliding_window_size=16,
-                        tree_slots=storage.tree_slots(window_reaches={"draft_swa": 12}),
+                        tree_slots=storage.tree_slots(),
                         tree_core_backend="python",
                     )
                 )

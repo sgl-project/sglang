@@ -50,6 +50,26 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 
 
+def window_tail_len(
+    seq_len: int, window: Optional[int], page_size: int, *, keep_insert_boundary: bool
+) -> int:
+    """The tokens of ``seq_len`` a window keeping ``window`` tokens holds live,
+    from a page boundary: what a decode preallocation binds of it and what a
+    peer sends of it. With ``keep_insert_boundary`` (a decode radix cache),
+    enough stays before the page-aligned insert boundary for the cached key
+    to contain a complete window; ``seq_len - 1`` is the last committed
+    position."""
+    if seq_len <= 0:
+        return max(seq_len, 0)
+    if window is None or window <= 0:
+        return seq_len
+    if keep_insert_boundary:
+        window_start = max(0, seq_len - 1 - max(window, page_size))
+    else:
+        window_start = max(0, seq_len - window)
+    return seq_len - window_start // page_size * page_size
+
+
 class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
     name: str
     external: SubPoolExternal
@@ -129,6 +149,11 @@ class KVStorage:
         # stream waits on and the logical release every rank sets alike.
         self._network_transfers: Dict[str, Tuple[CompletionFlag, TransferRelease]] = {}
         self._network_flags: Optional[CompletionFlagPool] = None
+        # Readers reaching a window further back than its own layers (a fused
+        # draft's front rows), by sub-pool, and the length of a window the
+        # model does not state: bound once at startup (`bind_window_retention`).
+        self._window_reaches: Dict[str, int] = {}
+        self._unstated_window: Optional[int] = None
         state = allocator.state
         self._views: Dict[str, Any] = {}
         sub_pools = []
@@ -637,12 +662,10 @@ class KVStorage:
         every sub-pool pins."""
         return tuple(s.name for s in self._sub_pools)
 
-    def tree_slots(
-        self, *, window_reaches: Optional[Dict[str, int]] = None
-    ) -> Tuple[TreeSlot, ...]:
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
         """The prefix tree's slot per sub-pool, in the order the tree drives
-        their eviction. Extra reader reaches widen only their named storage band."""
-        return self._plan.tree_slots(window_reaches=window_reaches)
+        their eviction; a window slot keeps the window's retained length."""
+        return self._plan.tree_slots(window_reaches=self._window_reaches)
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
@@ -676,20 +699,45 @@ class KVStorage:
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
 
-    def window_lengths(self, unstated: Optional[int] = None) -> Dict[str, int]:
-        """Each window sub-pool's retention length, by name: the window its
-        layers declare, or ``unstated`` for a window the model does not state.
-        What a peer sends of a window (`resume_units`) is this long."""
+    def bind_window_retention(
+        self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
+    ) -> None:
+        """Bind, once at startup, how far back readers beyond a window's own
+        layers read it (``reaches``, by sub-pool) and the length of a window
+        the model does not state (``sliding_window``)."""
+        self._window_reaches = dict(reaches or {})
+        self._unstated_window = sliding_window
+
+    def retained_window_lengths(self) -> Dict[str, int]:
+        """The tail a running request keeps of each window sub-pool, by name:
+        the window its layers declare, widened by a reader reaching further
+        back. The prefix tree retains, backs up and restores this much, a PD
+        peer sends it, and a decode node binds and receives it."""
         lengths = {}
         for s in self._plan.sub_pools:
             if isinstance(s.lifetime, WindowLifetime):
                 window = (
-                    s.lifetime.window if s.lifetime.window is not None else unstated
+                    s.lifetime.window
+                    if s.lifetime.window is not None
+                    else self._unstated_window
                 )
                 if window is None:
                     raise ValueError(f"window {s.name!r} states no retention length")
-                lengths[s.name] = window
+                lengths[s.name] = max(window, self._window_reaches.get(s.name, 0))
         return lengths
+
+    def window_tails(
+        self, seq_len: int, *, keep_insert_boundary: bool
+    ) -> Dict[str, int]:
+        """The tail of ``seq_len`` tokens each window sub-pool keeps live, by
+        name (`window_tail_len` over its retained length)."""
+        page_size = self._allocator.page_size
+        return {
+            name: window_tail_len(
+                seq_len, window, page_size, keep_insert_boundary=keep_insert_boundary
+            )
+            for name, window in self.retained_window_lengths().items()
+        }
 
     def resume_units(
         self,
@@ -698,12 +746,10 @@ class KVStorage:
         *,
         token_start: int,
         token_boundary: int,
-        window: Optional[int] = None,
-        retain: Optional[int] = None,
     ) -> ResumeUnits:
         """The units of ``sub_pool`` a peer continues ``req`` from. A window
-        keeps the tail its length states (``window`` when it states none),
-        widened to ``retain`` when a reader reaches further back."""
+        sends the tail a running request keeps of it
+        (`retained_window_lengths`)."""
         if not 0 <= token_start <= token_boundary:
             raise ValueError("invalid continuation token span")
         planned = self._plan.sub_pool(sub_pool)
@@ -724,12 +770,7 @@ class KVStorage:
             )
         begin = token_start
         if isinstance(planned.lifetime, WindowLifetime):
-            retained = planned.lifetime.window
-            if retained is None:
-                retained = window
-            if retained is None:
-                raise ValueError("window handoff requires its retention length")
-            retained = max(retained, retain or 0)
+            retained = self.retained_window_lengths()[sub_pool]
             begin = max(begin, token_boundary - retained)
         begin = begin // planned.unit * planned.unit
         tokens = self.requests.req_to_token[req.kv.req_pool_idx, begin:token_boundary]

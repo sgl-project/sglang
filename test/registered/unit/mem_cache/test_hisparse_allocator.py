@@ -267,6 +267,10 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator = SimpleNamespace(
             state=None,
             storage=None,
+            # The window pool, keeping the scheduler's window.
+            window_pool_names=lambda: ("swa",),
+            window_retention={"swa": sliding_window_size},
+            get_kvcache=lambda: SimpleNamespace(request_window=None),
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
