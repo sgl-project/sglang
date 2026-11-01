@@ -1079,7 +1079,8 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     # Run Quark MXFP4 (W4A4) MoE checkpoints as W4A16 via triton_kernels on
-    # gfx1151 (Strix Halo), which has no FP4 hardware or AITER FP4 MoE kernel.
+    # consumer RDNA (gfx11 / gfx120, e.g. gfx1151 Strix Halo, gfx1201), which has
+    # no FP4 hardware or AITER FP4 MoE kernel. gfx1250 stays on AITER.
     SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16 = EnvBool(True)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
