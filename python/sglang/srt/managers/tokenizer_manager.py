@@ -32,6 +32,7 @@ from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
+from functools import partial
 from http import HTTPStatus
 from typing import (
     Any,
@@ -622,6 +623,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
         )
+        if self.enable_metrics:
+            publishers = [
+                ("cuda_vmm", self.cuda_vmm_feature_transport._guarded_publisher)
+            ]
+            if self.mm_processor is not None:
+                publishers.append(("cuda_ipc", self.mm_processor.cuda_ipc_publisher))
+            for transport, publisher in publishers:
+                if publisher is not None:
+                    publisher.admission.observer = partial(
+                        self.metrics_collector.observe_mm_publication,
+                        transport,
+                        publisher.pool,
+                    )
 
     def init_model_config(self):
         server_args = self.server_args
@@ -1914,16 +1928,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _cancel_cuda_ipc_features(self, tokenized_objs) -> None:
         """Return the CUDA IPC feature slices preprocessing published for
         requests that are never dispatched: no scheduler acknowledges them."""
-        pool = getattr(self.mm_processor, "cudaipc_mmfeature_pool", None)
+        pool = (
+            self.mm_processor.cudaipc_mmfeature_pool
+            if self.mm_processor is not None
+            else None
+        )
         if pool is None:
             return
+        errors = []
         for tokenized_obj in tokenized_objs:
             if tokenized_obj.mm_inputs is None:
                 continue
             for item in tokenized_obj.mm_inputs.mm_items:
-                for tensor in (item.feature, item.precomputed_embeddings):
+                for field, tensor in (
+                    ("feature", item.feature),
+                    ("precomputed_embeddings", item.precomputed_embeddings),
+                ):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
-                        pool.cancel_proxy(tensor)
+                        try:
+                            pool.cancel_proxy(tensor)
+                        except BaseException as error:
+                            errors.append(error)
+                        finally:
+                            setattr(item, field, None)
+        if errors:
+            raise RuntimeError(
+                f"Failed to cancel {len(errors)} IPC transport slice(s)"
+            ) from errors[0]
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.

@@ -9,6 +9,7 @@ import asyncio
 import gc
 import multiprocessing as mp
 import queue
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -34,9 +35,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-large")
 
 
-def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
+def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue, guarded=False):
     """Create a tokenizer-worker-like CUDA IPC pool in a spawned producer."""
-    pool = source = proxy = None
+    pool = source = proxy = publisher = None
     try:
         torch.cuda.set_device(0)
         pool = MmItemMemoryPool(
@@ -47,10 +48,17 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
         )
         source = torch.arange(35, dtype=torch.float32, device="cuda").reshape(5, 7)
         expected = torch.arange(35, dtype=torch.float32).reshape(5, 7).tolist()
-        proxy = pool.wrap_tensor(
-            source,
-            use_pool_handle_cache=True,
-        )
+        if guarded:
+            publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=False)
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature=source)],
+            )
+            asyncio.run(publisher.prepare([output]))
+            proxy = output.mm_items[0].feature
+            del output
+        else:
+            proxy = pool.wrap_tensor(source, use_pool_handle_cache=True)
         if proxy is None:
             raise RuntimeError("test tensor did not fit in the CUDA IPC pool")
         # Intentionally do not synchronize the producer. The consumer stream
@@ -70,6 +78,8 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
         return
     finally:
         del proxy, source
+        if publisher is not None:
+            publisher.shutdown()
         if pool is not None:
             pool.shutdown()
             del pool
@@ -124,7 +134,61 @@ class TestCudaIpcTransport(CustomTestCase):
             pool.shutdown()
             _pool_handle_cache_clear()
 
+    def test_cancelled_native_publication_retains_charge_until_completion(self):
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=False)
+        started, complete = threading.Event(), threading.Event()
+        publish = pool.publish_reserved_batch
+
+        def delayed_publish(*args):
+            started.set()
+            if not complete.wait(10):
+                raise TimeoutError("test did not release publisher")
+            return publish(*args)
+
+        async def run():
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(
+                        modality=Modality.IMAGE, feature=torch.ones(100, device="cuda")
+                    )
+                ],
+            )
+            with patch.object(pool, "publish_reserved_batch", delayed_publish):
+                task = asyncio.create_task(publisher.prepare([output]))
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                task.cancel()
+                self.assertEqual(publisher.admission.pending_count, 1)
+                self.assertEqual(pool.active_lease_count, 1)
+                complete.set()
+                deadline = time.monotonic() + 10
+                while (
+                    publisher.admission.pending_count or pool.active_lease_count
+                ) and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                self.assertEqual(
+                    (publisher.admission.pending_count, pool.active_lease_count), (0, 0)
+                )
+                self.assertIsInstance(output.mm_items[0].feature, torch.Tensor)
+
+        try:
+            asyncio.run(run())
+        finally:
+            complete.set()
+            publisher.shutdown()
+            pool.shutdown()
+
     def test_pooled_tensor_reconstructs_in_spawned_process(self):
+        self._run_spawned_round_trip(guarded=False)
+
+    def test_guarded_tensor_reconstructs_in_spawned_process(self):
+        self._run_spawned_round_trip(guarded=True)
+
+    def _run_spawned_round_trip(self, *, guarded):
         """Consumer releases the pool mapping before the producer tears down."""
         ctx = mp.get_context("spawn")
         proxy_queue = ctx.Queue()
@@ -132,7 +196,7 @@ class TestCudaIpcTransport(CustomTestCase):
         consumer_done = ctx.Event()
         producer = ctx.Process(
             target=_produce_pooled_tensor,
-            args=(proxy_queue, consumer_done, producer_results),
+            args=(proxy_queue, consumer_done, producer_results, guarded),
         )
         producer.start()
         proxy = reconstructed = None

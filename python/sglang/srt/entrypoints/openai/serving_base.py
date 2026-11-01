@@ -212,12 +212,15 @@ class OpenAIServingBase(ABC):
 
     def create_error_response(
         self,
-        message: str,
+        message: str | ValueError,
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
+        if isinstance(message, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+            err_type, status_code = message.error_code, message.status_code
+        message = str(message)
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
@@ -230,11 +233,14 @@ class OpenAIServingBase(ABC):
 
     def create_streaming_error_response(
         self,
-        message: str,
+        message: str | Exception,
         err_type: str = "BadRequestError",
         status_code: int = 400,
     ) -> str:
         """Create a streaming error response"""
+        if isinstance(message, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+            err_type, status_code = message.error_code, message.status_code
+        message = str(message)
         error = ErrorResponse(
             object="error",
             message=message,

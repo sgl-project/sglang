@@ -1087,6 +1087,43 @@ class TestTokenspeedMlaAlias(CustomTestCase):
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
+    @override_platform(is_cuda=True)
+    def test_gpu_admission_preserves_transport_and_describes_overflow(self):
+        for transport in ("cuda_ipc", "cuda_vmm"):
+            for timeout in (0, 1000):
+                with self.subTest(transport=transport, timeout=timeout):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        mm_feature_transport=transport,
+                        mm_admission_timeout_ms=timeout,
+                    )
+                    with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                        handle_multimodal_feature_transport(args)
+                    self.assertEqual(
+                        resolution_result(args, "mm_feature_transport"), transport
+                    )
+                    self.assertIn("without CPU spill", "\n".join(logs.output))
+                    self.assertNotIn("falls back", "\n".join(logs.output))
+
+    @override_platform(is_cuda=True)
+    def test_gpu_admission_rejects_invalid_combinations(self):
+        cases = (
+            ({"mm_admission_timeout_ms": -1}, "non-negative"),
+            ({"mm_feature_transport": "cpu"}, "requires GPU"),
+            ({"disaggregation_mode": "prefill"}, "normal serving"),
+            ({"encoder_only": True}, "requires GPU"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                kwargs = dict(
+                    model_path="dummy",
+                    mm_feature_transport="cuda_ipc",
+                    mm_admission_timeout_ms=0,
+                )
+                kwargs.update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_multimodal_feature_transport(ServerArgs(**kwargs))
+
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
         server_args._model_config = SimpleNamespace(is_multimodal=is_multimodal)

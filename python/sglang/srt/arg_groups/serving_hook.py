@@ -903,6 +903,11 @@ def handle_multimodal_feature_transport(server_args: Any):
             cfg.mm_admission_timeout_ms,
         )
 
+    overflow_behavior = (
+        "capacity pressure uses bounded admission without CPU spill"
+        if cfg.mm_admission_timeout_ms is not None
+        else "a full pool falls back to CPU transport"
+    )
     if requested_transport == "cuda_vmm":
         if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_vmm requires NVIDIA CUDA.")
@@ -915,12 +920,12 @@ def handle_multimodal_feature_transport(server_args: Any):
         logger.info(
             "Using CUDA VMM for multimodal features with %s sharing: "
             "reserving up to %d MiB on base GPU %d across %d tokenizer "
-            "worker(s). This reduces KV cache headroom; a full pool falls "
-            "back to inline CPU transport.",
+            "worker(s). This reduces KV cache headroom; %s.",
             handle_kind,
             pool_budget_mb,
             cfg.base_gpu_id,
             cfg.tokenizer_worker_num,
+            overflow_behavior,
         )
 
     if requested_transport == "cuda_ipc":
@@ -935,10 +940,11 @@ def handle_multimodal_feature_transport(server_args: Any):
         logger.info(
             "Using CUDA IPC for multimodal features: reserving up to %d MiB "
             "on base GPU %d across %d tokenizer worker(s). This reduces KV "
-            "cache headroom; a full pool falls back to CPU transport.",
+            "cache headroom; %s.",
             pool_budget_mb,
             cfg.base_gpu_id,
             cfg.tokenizer_worker_num,
+            overflow_behavior,
         )
         logger.info(
             "CUDA IPC pool-handle caching is %s. It reuses mappings to the "

@@ -8,10 +8,50 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import torch
 
+from sglang.srt.multimodal.transport.admission import MmMemoryRequestTooLarge
+from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.cuda_vmm_transport_utils import (
+    CudaVmmMemoryPool,
+    _CudaVmmMemoryChunk,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestVmmAtomicReservation(CustomTestCase):
+    def make_pool(self):
+        pool = object.__new__(CudaVmmMemoryPool)
+        pool.consumer_count = 1
+        pool.allocation_size = 2048
+        pool._lock = threading.Lock()
+        pool._publisher_condition = threading.Condition(pool._lock)
+        pool._active_publishers = 0
+        pool._closing = pool._closed = False
+        pool._pool_error = pool._fd_broker = None
+        pool.available_chunks = [_CudaVmmMemoryChunk(0, 2048)]
+        pool.occupied_chunks = []
+        return pool
+
+    def test_fragmentation_rolls_back_batch_and_publisher_count(self):
+        pool = self.make_pool()
+        chunks = pool.try_reserve_batch([256] * 4)
+        pool.release_reserved_batch([chunks[0], chunks[2]])
+        self.assertIsNone(pool.try_reserve_batch([256, 512]))
+        self.assertEqual(pool._active_publishers, 2)
+        self.assertEqual(
+            [(c.start, c.end) for c in pool.available_chunks], [(0, 512), (1024, 1536)]
+        )
+        pool.release_reserved_batch([chunks[1], chunks[3]])
+        self.assertEqual(pool._active_publishers, 0)
+        self.assertEqual(pool.available_chunks, [_CudaVmmMemoryChunk(0, 2048)])
+
+    def test_control_overhead_is_part_of_capacity(self):
+        pool = self.make_pool()
+        with self.assertRaises(MmMemoryRequestTooLarge):
+            pool.try_reserve_batch([2048])
+        self.assertEqual(pool._active_publishers, 0)
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
@@ -344,6 +384,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.positional_embeds_transport = MagicMock()
 
         with (
+            get_context().override_server_args(mm_admission_timeout_ms=None),
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
             self.assertRaisesRegex(RuntimeError, "send failed"),
         ):
@@ -383,6 +424,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.positional_embeds_transport = MagicMock()
 
         with (
+            get_context().override_server_args(mm_admission_timeout_ms=None),
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
             self.assertRaisesRegex(RuntimeError, "bookkeeping failed"),
         ):

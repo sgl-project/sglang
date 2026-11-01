@@ -2079,6 +2079,37 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_e2e_request_latency,
         )
 
+        mm_labels = [*labels.keys(), "transport"]
+        self.mm_publication_requests = Counter(
+            "sglang:mm_publication_requests_total",
+            "GPU publication admission outcomes",
+            labelnames=[*mm_labels, "outcome"],
+        )
+        self.mm_publication_wait = Histogram(
+            "sglang:mm_publication_wait_seconds",
+            "Time waiting for atomic GPU pool admission",
+            labelnames=mm_labels,
+        )
+        self.mm_publication_state = Gauge(
+            "sglang:mm_publication_state",
+            "GPU publication queue and allocator state (bytes or counts as named)",
+            labelnames=[*mm_labels, "quantity"],
+            multiprocess_mode="livesum",
+        )
+
+    def observe_mm_publication(
+        self, transport, pool, outcome, wait_seconds, pending_count, pending_bytes
+    ):
+        labels = {**self.labels, "transport": transport}
+        if outcome is not None:
+            self.mm_publication_requests.labels(**labels, outcome=outcome).inc()
+        if wait_seconds is not None:
+            self.mm_publication_wait.labels(**labels).observe(wait_seconds)
+        state = pool.capacity_snapshot()
+        state.update(pending_count=pending_count, pending_bytes=pending_bytes)
+        for quantity, value in state.items():
+            self.mm_publication_state.labels(**labels, quantity=quantity).set(value)
+
     def emit_startup_time(self, startup_time: Mapping[str, Any]) -> None:
         for phase in (
             "load_weight",

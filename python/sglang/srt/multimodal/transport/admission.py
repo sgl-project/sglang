@@ -39,29 +39,53 @@ class FeaturePublicationAdmission:
         self._waiting = deque()
         self._loop = None
         self._closed = False
+        self.observer = None
+
+    def _observe(self, outcome=None, wait_seconds=None):
+        if self.observer is not None:
+            self.observer(outcome, wait_seconds, self.pending_count, self.pending_bytes)
 
     def notify(self) -> None:
         """Wake the FIFO head from the recycler or publisher thread."""
         if self._loop is not None and not self._closed:
-            self._loop.call_soon_threadsafe(self._wake_head)
+            try:
+                self._loop.call_soon_threadsafe(self._wake_head)
+            except RuntimeError:
+                if not self._loop.is_closed():
+                    raise
+
+    def finish_from_thread(self, ticket: _PublicationTicket) -> None:
+        """Native completion owns cleanup even after the request loop shuts down."""
+        try:
+            self._loop.call_soon_threadsafe(self.finish, ticket)
+        except RuntimeError:
+            if not self._loop.is_closed():
+                raise
+            # the closed loop cannot run another request or touch these counters
+            self.pending_count -= 1
+            self.pending_bytes -= ticket.nbytes
 
     def _wake_head(self) -> None:
+        self._observe()
         if self._waiting:
             self._waiting[0].changed.set()
 
     async def acquire(self, nbytes: int, try_reserve):
         """Return a reservation and its ticket; the caller must finish the ticket."""
         if nbytes > self.capacity_bytes:
+            self._observe("oversized")
             raise MmMemoryRequestTooLarge(
                 f"Multimodal publication requires {nbytes} bytes, but the worker "
                 f"pool can hold only {self.capacity_bytes} bytes"
             )
         if self._closed:
+            self._observe("shutdown")
             raise MmMemoryOverloaded("Multimodal feature publisher is shutting down")
         if (
             self.pending_count >= self.max_pending
             or self.pending_bytes + nbytes > self.capacity_bytes
         ):
+            self._observe("queue_full")
             raise MmMemoryOverloaded("Multimodal publication queue is full")
 
         self._loop = asyncio.get_running_loop()
@@ -69,10 +93,13 @@ class FeaturePublicationAdmission:
         self.pending_count += 1
         self.pending_bytes += nbytes
         self._waiting.append(ticket)
-        deadline = time.monotonic() + self.timeout_ms / 1000
+        started = time.monotonic()
+        deadline = started + self.timeout_ms / 1000
+        self._observe()
         try:
             while True:
                 if self._closed:
+                    self._observe("shutdown")
                     raise MmMemoryOverloaded(
                         "Multimodal feature publisher is shutting down"
                     )
@@ -83,16 +110,19 @@ class FeaturePublicationAdmission:
                     reservation = try_reserve()
                     if reservation is not None:
                         self._waiting.popleft()
+                        self._observe("admitted", time.monotonic() - started)
                         self._wake_head()
                         return reservation, ticket
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self._observe("timeout", time.monotonic() - started)
                     raise MmMemoryOverloaded(
                         "Timed out waiting for multimodal feature pool capacity"
                     )
                 try:
                     await asyncio.wait_for(ticket.changed.wait(), remaining)
                 except asyncio.TimeoutError as error:
+                    self._observe("timeout", time.monotonic() - started)
                     raise MmMemoryOverloaded(
                         "Timed out waiting for multimodal feature pool capacity"
                     ) from error

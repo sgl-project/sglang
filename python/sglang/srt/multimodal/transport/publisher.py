@@ -6,7 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.admission import FeaturePublicationAdmission
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +22,12 @@ class BoundedFeaturePublisher:
     Requests waiting for capacity own no slices and occupy no executor thread.
     """
 
-    def __init__(self, pool, timeout_ms: int, *, cpu_tensors: bool):
+    def __init__(
+        self, pool, timeout_ms: int, *, cpu_tensors: bool, pack_features: bool = False
+    ):
         self.pool = pool
         self.cpu_tensors = cpu_tensors
+        self.pack_features = pack_features
         self.admission = FeaturePublicationAdmission(
             pool.publication_capacity, timeout_ms
         )
@@ -30,10 +37,11 @@ class BoundedFeaturePublisher:
         )
 
     async def prepare(self, mm_inputs_batch):
-        fields = []
+        groups = []
         for mm_inputs in mm_inputs_batch:
             if mm_inputs is None:
                 continue
+            packed = []
             for item in mm_inputs.mm_items:
                 for name, tensor in (
                     ("feature", item.feature),
@@ -48,17 +56,32 @@ class BoundedFeaturePublisher:
                         and tensor.numel() > 0
                         and (self.cpu_tensors or tensor.is_cuda)
                     ):
-                        fields.append((item, name, tensor))
-        if not fields:
+                        entry = (item, name, tensor)
+                        if (
+                            self.pack_features
+                            and name == "feature"
+                            and item.modality in (Modality.IMAGE, Modality.VIDEO)
+                            and not item.model_specific_data.get(
+                                DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY, False
+                            )
+                        ):
+                            packed.append(entry)
+                        else:
+                            groups.append([entry])
+            # only tensors with the same request/consumer lifetime may be packed
+            if packed:
+                groups.append(packed)
+        if not groups:
             return []
 
+        fields = [entry for group in groups for entry in group]
         tensors = [tensor for _, _, tensor in fields]
-        sizes = [tensor.numel() * tensor.element_size() for tensor in tensors]
+        tensor_groups = [[tensor for _, _, tensor in group] for group in groups]
+        sizes = [self.pool.publication_data_size(group) for group in tensor_groups]
         required = sum(self.pool.reservation_size(size) for size in sizes)
         reservations, ticket = await self.admission.acquire(
             required, lambda: self.pool.try_reserve_batch(sizes)
         )
-        loop = asyncio.get_running_loop()
         try:
             # source streams are thread-local; capture readiness on the caller
             events = []
@@ -66,7 +89,9 @@ class BoundedFeaturePublisher:
                 event = torch.cuda.Event()
                 event.record(torch.cuda.current_stream(device))
                 events.append((device, event))
-            future = self.executor.submit(self._publish, tensors, reservations, events)
+            future = self.executor.submit(
+                self._publish, tensor_groups, reservations, events
+            )
         except BaseException:
             self.pool.release_reserved_batch(reservations)
             self.admission.finish(ticket)
@@ -81,7 +106,7 @@ class BoundedFeaturePublisher:
                 try:
                     self._cancel_completed(done)
                 finally:
-                    loop.call_soon_threadsafe(self.admission.finish, ticket)
+                    self.admission.finish_from_thread(ticket)
 
             future.add_done_callback(cancel_completed)
             raise

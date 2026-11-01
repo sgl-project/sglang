@@ -229,6 +229,7 @@ class StreamOrderedMmFeaturePool:
         self._available_slots = list(reversed(range(max_inflight_slices)))
         self._slot_generations = [0] * max_inflight_slices
         self._occupied: dict[int, PoolLease] = {}
+        self._cancelling: set[int] = set()
         self._lock = threading.Lock()
         self.on_capacity_change = None
         self._pool_error = None
@@ -244,6 +245,19 @@ class StreamOrderedMmFeaturePool:
     @property
     def usable_size(self) -> int:
         return self.memory_size - self.data_start
+
+    def capacity_snapshot(self):
+        """Allocator-only diagnostics; never query or synchronize CUDA here."""
+        with self._lock:
+            free = sum(end - start for start, end in self._available_ranges)
+            return {
+                "occupied_bytes": self.usable_size - free,
+                "free_bytes": free,
+                "largest_free_bytes": max(
+                    (end - start for start, end in self._available_ranges), default=0
+                ),
+                "free_slots": len(self._available_slots),
+            }
 
     @property
     def active_lease_count(self) -> int:
@@ -385,7 +399,11 @@ class StreamOrderedMmFeaturePool:
         reclaimed = False
         with self._lock:
             for lease, is_complete in zip(leases, completed):
-                if is_complete and self._occupied.get(lease.slot) is lease:
+                if (
+                    is_complete
+                    and self._occupied.get(lease.slot) is lease
+                    and lease.slot not in self._cancelling
+                ):
                     self._release_locked(lease)
                     reclaimed = True
             self._merge_ranges_locked()
@@ -474,6 +492,12 @@ class StreamOrderedMmFeaturePool:
                     f"(slot={slot}, generation={generation})"
                 )
 
+            if slot in self._cancelling:
+                return
+            self._cancelling.add(slot)
+
+        # keep the lease pinned, not the allocator lock, across driver calls
+        try:
             with torch.cuda.device(self.device_id):
                 stream_wait_value32(
                     self.device_id,
@@ -488,6 +512,12 @@ class StreamOrderedMmFeaturePool:
                         generation,
                         self.transport_name,
                     )
+        except BaseException as error:
+            self._pool_error = error
+            raise
+        else:
+            with self._lock:
+                self._cancelling.remove(slot)
 
     def shutdown(self) -> None:
         self._recycler_stop_event.set()

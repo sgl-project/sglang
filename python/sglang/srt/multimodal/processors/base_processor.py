@@ -241,6 +241,7 @@ def _forget_parent_executor_wakeups():
 
 class BaseMultimodalProcessor(ABC):
     cuda_ipc_publisher = None
+    cudaipc_mmfeature_pool = None
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
