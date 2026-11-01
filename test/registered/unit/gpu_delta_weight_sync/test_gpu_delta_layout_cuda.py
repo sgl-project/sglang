@@ -567,6 +567,10 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
             "mxfp8": preprocess_mxfp8_cutedsl_mega_weights,
             "mxfp4": preprocess_mega_weights,
         }[layout.format]
+        if layout.format == "nvfp4" and layout.quant_mode == "w4a16":
+            from flashinfer.moe_ep import preprocess_bf16_nvfp4_cutedsl_mega_weights
+
+            preprocess = preprocess_bf16_nvfp4_cutedsl_mega_weights
         weights = MoEWeightPack(
             w13=layer.w13_weight,
             w2=layer.w2_weight,
@@ -609,10 +613,13 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
             prepare_static_weights_for_trtllm_fp4_moe,
         )
 
+        # The current ModelOpt loader stores TRTLLM weights/scales [Up, Gate].
+        w13_input = torch.cat([values["up", "weight"], values["gate", "weight"]], 1)
+        s13_input = torch.cat([values["up", "scale"], values["gate", "scale"]], 1)
         w13, s13, w2, s2 = prepare_static_weights_for_trtllm_fp4_moe(
-            layer.w13_weight,
+            w13_input,
             layer.w2_weight,
-            layer.w13_weight_scale,
+            s13_input,
             layer.w2_weight_scale,
             hidden,
             intermediate,
@@ -659,20 +666,21 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
 
 
 @pytest.mark.parametrize(
-    "format,backend,intermediate",
+    "format,backend,intermediate,quant_mode",
     [
-        ("bf16", "trtllm", 256),
-        ("fp8-block128-ue8m0", "trtllm", 256),
-        ("nvfp4", "trtllm", 256),
-        ("mxfp8", "trtllm", 256),
-        ("mxfp4", "trtllm", 160),  # separate gate/up and down padding
-        ("nvfp4", "megamoe", 256),
-        ("mxfp8", "megamoe", 256),
-        ("mxfp4", "megamoe", 256),
+        ("bf16", "trtllm", 256, ""),
+        ("fp8-block128-ue8m0", "trtllm", 256, ""),
+        ("nvfp4", "trtllm", 256, "w4a4"),
+        ("mxfp8", "trtllm", 256, ""),
+        ("mxfp4", "trtllm", 160, ""),  # separate gate/up and down padding
+        ("nvfp4", "megamoe", 256, "w4a4"),
+        ("nvfp4", "megamoe", 320, "w4a16"),
+        ("mxfp8", "megamoe", 256, ""),
+        ("mxfp4", "megamoe", 256, ""),
     ],
 )
 def test_flashinfer_matrix_matches_native_preprocessing(
-    format, backend, intermediate, monkeypatch
+    format, backend, intermediate, quant_mode, monkeypatch
 ):
     from sglang.srt.weight_sync.gpu_delta.bindings import (
         _moe_binding,
@@ -685,8 +693,8 @@ def test_flashinfer_matrix_matches_native_preprocessing(
         format,
         backend,
         True,
-        "w4a4",
-        up_first=format == "mxfp4" and backend == "trtllm",
+        quant_mode,
+        up_first=format in {"nvfp4", "mxfp4"} and backend == "trtllm",
     )
     old, new = (
         _matrix_canonical(format, seed, hidden, intermediate) for seed in (17, 43)

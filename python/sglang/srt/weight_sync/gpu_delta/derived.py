@@ -214,7 +214,7 @@ def _trtllm_scale_helper():
     return _compute_g1_scale_c
 
 
-def nvfp4_derived_update(layer, backend):
+def nvfp4_derived_update(layer, backend, quant_mode="w4a4"):
     """Describe the selected FlashInfer consumer's small NVFP4 scale updates.
 
     This mirrors the ordinary loader's scale policy and reuses its pure helpers.
@@ -232,7 +232,7 @@ def nvfp4_derived_update(layer, backend):
     wrapper = layer._cutedsl_wrapper if cute else None
     if cute and (wrapper is None or wrapper.quant_mode not in {"w4a4", "w4a16"}):
         raise ValueError("CuTe DSL wrapper must be warmed before GPU delta admission")
-    w4a16 = cute and wrapper.quant_mode == "w4a16"
+    w4a16 = (cute and wrapper.quant_mode == "w4a16") or (mega and quant_mode == "w4a16")
     per_token = bool(layer.quant_config.use_per_token_activation)
     neutral_input = w4a16 or per_token
     config = layer.moe_runner_config
@@ -269,7 +269,7 @@ def nvfp4_derived_update(layer, backend):
             raise ValueError("CuTe DSL scale metadata must be warmed before admission")
         destinations.extend((scales[0], scales[2]) if w4a16 else (*scales, input_scale))
     mega_scalar = None
-    if mega:
+    if mega and not w4a16:
         if per_token:
             raise ValueError("FlashInfer MegaMOE does not support per-token NVFP4")
         consumer = layer._flashinfer_megamoe_layer
@@ -294,6 +294,18 @@ def nvfp4_derived_update(layer, backend):
     clamp = config.gemm1_clamp_limit or config.swiglu_limit
     if "gemm1_clamp_limit" in extra_names and (clamp is None or activation == "situ"):
         raise ValueError("unsupported TRTLLM activation clamp metadata")
+    tied_clamp = "gemm1_clamp_limit" in extra_names
+    tied_clamp_error = (
+        "GPU delta requires tied TRTLLM gate/up scales with activation clamping; "
+        "unequal scales require block-scale requantization"
+    )
+    if tied_clamp:
+        # The ordinary loader otherwise rescales one half of the checkpoint
+        # block scales. Those bytes cannot be updated by canonical XOR masks.
+        weight13 = layer.w13_weight_scale_2
+        _validate_checks(
+            (((weight13[:, 0] == weight13[:, 1]).all(), tied_clamp_error),)
+        )
     situ_beta = config.gemm1_clamp_limit
     neutral13, neutral2 = layer.w13_input_scale_quant, layer.w2_input_scale_quant
 
@@ -304,7 +316,7 @@ def nvfp4_derived_update(layer, backend):
                 gate, up = weight13[:, 0], weight13[:, 1]
             else:
                 gate = up = weight13.reshape(weight13.shape[0])
-            return gate, up, weight2, gate, weight2
+            return (gate, up, weight2, gate, weight2) if cute else (gate, up, weight2)
 
         shadow = SimpleNamespace(
             num_local_experts=local_experts,
@@ -366,7 +378,7 @@ def nvfp4_derived_update(layer, backend):
             elif activation == "situ":
                 outputs.append(torch.full_like(shadow.g1_alphas, situ_beta))
             else:
-                outputs.append((1 / shadow.g1_alphas).to(torch.float32))
+                outputs.append((1 / shadow.g1_alphas_up).to(torch.float32))
         if cute:
             w1, fc2_input, w2, input_scale = cutedsl_values(shadow)
             if per_token:
@@ -374,24 +386,28 @@ def nvfp4_derived_update(layer, backend):
             outputs.extend((w1, fc2_input, w2, input_scale))
         return tuple(outputs)
 
-    def mega_checks(outputs):
-        checks = [
-            (
-                # Match the former Python-float comparison exactly, including a
-                # captured scalar that is not representable as an FP32 value.
-                outputs[3].max().to(torch.float64) == mega_scalar,
-                "FlashInfer MegaMOE input normalization changed; CUDA graph recapture is required",
+    def checks(outputs):
+        predicates = []
+        if mega and not w4a16:
+            predicates.append(
+                (
+                    # Match the former Python-float comparison exactly, including a
+                    # captured scalar that is not representable as an FP32 value.
+                    outputs[3].max().to(torch.float64) == mega_scalar,
+                    "FlashInfer MegaMOE input normalization changed; CUDA graph recapture is required",
+                )
             )
-        ]
-        if gated:
-            checks.append(
+        if mega and gated:
+            predicates.append(
                 (
                     torch.isclose(outputs[0], outputs[1]).all(),
                     "FlashInfer MegaMOE requires matching gate/up FC1 alphas",
                 )
             )
-        return tuple(checks)
+        if tied_clamp:
+            predicates.append(((outputs[0] == outputs[1]).all(), tied_clamp_error))
+        return tuple(predicates)
 
     return DerivedUpdate(
-        sources, tuple(destinations), compute, mega_checks if mega else None
+        sources, tuple(destinations), compute, checks if mega or tied_clamp else None
     )

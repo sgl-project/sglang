@@ -61,7 +61,7 @@ def _layer(backend, w4a16=False):
         moe_runner_config=SimpleNamespace(
             is_gated=True,
             activation="silu",
-            gemm1_clamp_limit=24.0,
+            gemm1_clamp_limit=None,
             swiglu_limit=None,
             gemm1_alpha=1.0,
         ),
@@ -75,7 +75,7 @@ def _layer(backend, w4a16=False):
         g1_scale_c=torch.zeros(2),
         w13_input_scale_quant=torch.ones(2) if vector_input else torch.tensor(1.0),
         w2_input_scale_quant=torch.ones(2) if cute or mega else torch.tensor(1.0),
-        gemm1_clamp_limit=torch.zeros(2) if not (cute or mega) else None,
+        gemm1_clamp_limit=None,
         gemm1_beta=torch.zeros(2) if not (cute or mega) else None,
         _cutedsl_wrapper=(
             SimpleNamespace(quant_mode="w4a16" if w4a16 else "w4a4") if cute else None
@@ -167,10 +167,7 @@ class TestDerivedNvfp4(unittest.TestCase):
                     _value(copies, layer.g1_scale_c), torch.tensor([3.0, 5.0])
                 )
                 torch.testing.assert_close(
-                    _value(copies, layer.gemm1_clamp_limit), torch.tensor([1.5, 0.75])
-                )
-                torch.testing.assert_close(
-                    _value(copies, layer.gemm1_beta), torch.tensor([1 / 16, 1 / 32])
+                    _value(copies, layer.gemm1_beta), torch.tensor([1 / 24, 1 / 40])
                 )
                 for tensor, old, pointer in before:
                     torch.testing.assert_close(tensor, old)
@@ -179,6 +176,24 @@ class TestDerivedNvfp4(unittest.TestCase):
                 torch.testing.assert_close(
                     _value(copies, layer.g1_alphas), torch.tensor([16.0, 32.0])
                 )
+
+    def test_trtllm_clamping_rejects_block_scale_requantization(self):
+        layer = _layer("flashinfer_trtllm")
+        layer.moe_runner_config.gemm1_clamp_limit = 24.0
+        layer.gemm1_clamp_limit = torch.zeros(2)
+        with self.assertRaisesRegex(ValueError, "block-scale requantization"):
+            derived.nvfp4_derived_update(layer, "trtllm")
+        layer.w13_weight_scale_2[:, 1].copy_(layer.w13_weight_scale_2[:, 0])
+        update = derived.nvfp4_derived_update(layer, "trtllm")
+        copies = update.prepare({})
+        torch.testing.assert_close(
+            _value(copies, layer.gemm1_clamp_limit), torch.tensor([3.0, 1.5])
+        )
+        with self.assertRaisesRegex(ValueError, "block-scale requantization"):
+            update.prepare(
+                {id(layer.w13_weight_scale_2): torch.tensor([[2.0, 3.0], [4.0, 4.0]])}
+            )
+        torch.testing.assert_close(layer.g1_alphas, torch.zeros(2))
 
     def test_cutedsl_local_experts_and_shared_fc2_quantization(self):
         layer = _layer("flashinfer_cutedsl")
@@ -223,6 +238,25 @@ class TestDerivedNvfp4(unittest.TestCase):
         self.assertTrue(
             all(copy.destination is not layer._cutedsl_input_scale for copy in copies)
         )
+        # MegaMoE W4A16 has the same weight bytes, but no captured input norm.
+        layer = _layer("flashinfer_megamoe", w4a16=True)
+        layer._flashinfer_megamoe_input_norm_const = None
+        layer._flashinfer_megamoe_layer._megakernel_config = SimpleNamespace()
+        update = derived.nvfp4_derived_update(layer, "megamoe", "w4a16")
+        self.assertEqual((len(update.sources), len(update.destinations)), (2, 3))
+        with patch.object(derived, "_normal_scale_helpers", side_effect=AssertionError):
+            copies = update.prepare(
+                {
+                    id(layer.w13_weight_scale_2): torch.tensor(
+                        [[11.0, 11.0], [17.0, 17.0]]
+                    )
+                }
+            )
+        torch.testing.assert_close(
+            _value(copies, layer.g1_alphas), torch.tensor([11.0, 17.0])
+        )
+        with self.assertRaisesRegex(ValueError, "matching gate/up"):
+            update.prepare({id(layer.w13_weight_scale_2): weight})
 
     def test_megamoe_rejects_captured_scalar_change_and_gate_up_mismatch(self):
         layer = _layer("flashinfer_megamoe")

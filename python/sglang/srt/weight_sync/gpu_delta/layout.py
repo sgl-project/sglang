@@ -51,7 +51,9 @@ class GpuDeltaLayout:
         for prefix, layer in mapping.parameters.moe_layers.items():
             layout = mapping.parameters.moe_layouts[prefix]
             if layout.format == "nvfp4":
-                self.derived_updates.append(nvfp4_derived_update(layer, layout.backend))
+                self.derived_updates.append(
+                    nvfp4_derived_update(layer, layout.backend, layout.quant_mode)
+                )
             self._consumers.append(
                 ConsumerSnapshot(
                     lambda layer=layer, layout=layout: consumer_objects(layer, layout)
