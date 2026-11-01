@@ -625,6 +625,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._pp_pd_send_consensus_release_ids = Mock(return_value=([], None))
         scheduler.process_prefill_chunk = Mock()
         scheduler._process_hicache_events = Mock()
+        scheduler.invariant_checker = Mock()
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )

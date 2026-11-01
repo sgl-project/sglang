@@ -7,6 +7,7 @@ from typing import (
     TYPE_CHECKING,
     Callable,
     Deque,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -63,9 +64,8 @@ class SchedulerInvariantChecker:
     get_last_batch: Callable
     get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks is in neither batch;
-    # it still owns its KV row.
-    get_chunked_req: Callable = field(default=lambda: None)
+    # The lists that hold the live requests, by name (`Scheduler.request_lists`).
+    get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
     get_running_reqs: Callable = field(default=lambda: None)
     # Under PP, the micro-batches' running batches and step batches.
     get_pp_running_mbs: Callable = field(default=lambda: ())
@@ -267,16 +267,12 @@ class SchedulerInvariantChecker:
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
     def _requests_owning_rows(self) -> List[Req]:
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        reqs = [] if last_batch is None else list(last_batch.reqs)
-        # After decode running_batch IS last_batch. Compare by identity:
-        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
-        if running_batch is not None and running_batch is not last_batch:
-            reqs += running_batch.reqs
-        chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
-            reqs.append(chunked_req)
+        reqs = [req for reqs in self.get_request_lists().values() for req in reqs]
+        # A request PD prefill or HiSparse launched is in no list until its
+        # result is processed.
+        for batch in (self.get_last_batch(), self.get_running_batch()):
+            if batch is not None:
+                reqs += batch.reqs
 
         # A request running on a session's record does not own that row.
         session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
@@ -482,15 +478,25 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
-    def maybe_check_running_reqs(
+    def maybe_check_request_lists(
         self,
         running_batch: Optional[ScheduleBatch],
         last_batch: Optional[ScheduleBatch],
     ) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the batches hold, apart from the chunked request."""
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, no request is in two lists, and
+        the running requests are exactly the unfinished ones the batches hold,
+        apart from the chunked request."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
+        request_lists = self.get_request_lists()
+        owners: Dict[Req, str] = {}
+        for name, reqs in request_lists.items():
+            for req in reqs:
+                if req in owners:
+                    raise RuntimeError(
+                        f"Request {req.rid} is in both {owners[req]} and {name}"
+                    )
+                owners[req] = name
         step_batches = [last_batch, *self.get_pp_mbs()]
         if not self.prefill_launch_starts_running():
             step_batches = [
@@ -500,7 +506,7 @@ class SchedulerInvariantChecker:
             ]
         self.get_running_reqs().check(
             [running_batch, *self.get_pp_running_mbs(), *step_batches],
-            chunked_req=self.get_chunked_req(),
+            chunked_reqs=request_lists["chunked"],
         )
 
     def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:

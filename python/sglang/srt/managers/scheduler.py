@@ -2661,7 +2661,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_chunked_req=lambda: self.chunked_req,
+            get_request_lists=self.request_lists,
             get_running_reqs=lambda: self.running_reqs,
             get_pp_running_mbs=lambda: (
                 self.running_mbs if get_parallel().pp_size > 1 else ()
@@ -4220,7 +4220,7 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch)
+        self.invariant_checker.maybe_check_request_lists(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -4752,6 +4752,36 @@ class Scheduler(
             for req in batch.reqs
             if not req.finished()
         ]
+
+    def request_lists(self) -> Dict[str, List[Req]]:
+        """The lists that hold the live requests, by name, in the same order on
+        every rank. A request is in at most one; one that PD prefill or HiSparse
+        launched is in none until its result is processed."""
+        lists = {
+            "waiting": self.waiting_queue,
+            "grammar": self.grammar_manager.grammar_queue,
+            "chunked": [] if self.chunked_req is None else [self.chunked_req],
+            "running": list(self.running_reqs),
+        }
+        if self.disagg_prefill_bootstrap_queue is not None:
+            lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
+        if self.disagg_prefill_inflight_queue is not None:
+            lists["prefill_transfer"] = self.disagg_prefill_inflight_queue
+        if self.disagg_decode_prealloc_queue is not None:
+            lists.update(self.disagg_decode_prealloc_queue.request_lists())
+        if self.disagg_decode_transfer_queue is not None:
+            lists.update(self.disagg_decode_transfer_queue.request_lists())
+        if self.dllm_config is not None:
+            lists.update(self.dllm_manager.request_lists())
+        if self.enable_hisparse:
+            lists["hisparse_staging"] = [
+                act.req for act in self.hisparse_coordinator.ack_staging_queue
+            ]
+        if self.uocr_doc_hooks is not None:
+            lists["uocr_parked"] = self.uocr_doc_hooks.held_reqs()
+        if self._deferred_responses:
+            lists["deferred"] = [req for req, _ in self._deferred_responses.values()]
+        return lists
 
     def _prefill_launch_starts_running(self) -> bool:
         """Whether launching a request's last prefill chunk starts it running: not
