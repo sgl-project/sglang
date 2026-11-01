@@ -1612,7 +1612,9 @@ def _build_sidecar_host_pool(
     *, config: HostPoolConfig, root: Any, root_host_pool: Any
 ) -> DSAIndexerPoolHost | QSAIndexerPoolHost:
     if config.buffer_info.key_layout is IndexKeyLayout.KEY_ROWS:
-        return _build_key_rows_host_pool(config=config, root_host_pool=root_host_pool)
+        return _build_qsa_indexer_host_pool(
+            config=config, root_host_pool=root_host_pool
+        )
     host = DSAIndexerPoolHost(
         config.buffer_info,
         layer_mapping=config.device_to_host_layer,
@@ -1629,7 +1631,7 @@ def _build_sidecar_host_pool(
     return host
 
 
-def _build_key_rows_host_pool(
+def _build_qsa_indexer_host_pool(
     *, config: HostPoolConfig, root_host_pool: Any
 ) -> QSAIndexerPoolHost:
     info = config.buffer_info
@@ -1641,7 +1643,7 @@ def _build_key_rows_host_pool(
         or any(host != device for device, host in config.device_to_host_layer.items())
     ):
         raise ValueError(
-            f"{config.pool_name}: key-row host requires compressed keys on "
+            f"{config.pool_name}: QSA indexer host requires compressed keys on "
             f"{root_host_pool.page_size}-token pages with every device layer, got "
             f"compress_ratio={info.compress_ratio}, page_size={info.page_size}, "
             f"device_to_host_layer={config.device_to_host_layer}"
